@@ -28,6 +28,8 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Look and layout:** three message densities (comfortable, compact, minimal), text size, accent color and reduced motion. **Themes and backgrounds:** Dark (default), Midnight, Dim, Ember and Light themes; 22 background presets (adaptive glows and patterns, dark and bright gradients); your own gradient builder (linear, radial, mesh, conic, 2–3 colors) or your own image/GIF, with panel transparency, darken/fade, blur and a slow-drift animation. Saved per device.
 - **Settings** grouped into Account (profile, security, sessions), App (appearance, chat, notifications, voice & audio), Privacy & safety, and Server settings.
 
+- **Fast:** messages send instantly (they show as "sending…" until delivered, and you can keep typing), long chats stay light, the app's files are sent compressed, and **Performance mode** (Settings → Appearance) turns off blur, moving backgrounds and decorative animations on slower computers — it switches on by itself on low-powered devices.
+
 No build step, no external services required. One Node process and a SQLite file.
 
 ---

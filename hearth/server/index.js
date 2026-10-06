@@ -544,6 +544,41 @@ app.get('/downloads/:file', (req, res) => {
   if (!hit) return res.status(404).send('Not found');
   res.download(path.join(DOWNLOADS_DIR, hit.name), hit.name);
 });
+// The app's text files (JavaScript, styles, pages) are sent compressed, about 4-5x smaller, and kept
+// compressed in memory. Behind Caddy this changes nothing; without it, first loads get much faster.
+const zlib = require('zlib');
+const TEXT_TYPES = { '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.webmanifest': 'application/manifest+json' };
+const packed = new Map(); // file -> { mtime, tag, raw, br, gzip }
+const pickEncoding = (req) => { const ae = String(req.headers['accept-encoding'] || ''); return /\bbr\b/.test(ae) ? 'br' : /\bgzip\b/.test(ae) ? 'gzip' : null; };
+app.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+  let rel;
+  try { rel = decodeURIComponent(req.path); } catch { return next(); }
+  if (rel === '/') rel = '/index.html';
+  const type = TEXT_TYPES[path.extname(rel).toLowerCase()];
+  const enc = type && pickEncoding(req);
+  if (!enc) return next();
+  const file = path.join(PUBLIC_DIR, rel);
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) return next();
+  let st;
+  try { st = fs.statSync(file); } catch { return next(); }
+  if (!st.isFile()) return next();
+  let e = packed.get(file);
+  if (!e || e.mtime !== st.mtimeMs) {
+    e = { mtime: st.mtimeMs, tag: `${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}`, raw: fs.readFileSync(file) };
+    packed.set(file, e);
+  }
+  if (!e[enc]) e[enc] = enc === 'br' ? zlib.brotliCompressSync(e.raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 9 } }) : zlib.gzipSync(e.raw, { level: 9 });
+  const etag = `W/"${e.tag}-${enc}"`;
+  res.setHeader('Vary', 'Accept-Encoding');
+  res.setHeader('Cache-Control', 'public, max-age=0');
+  res.setHeader('ETag', etag);
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  res.setHeader('Content-Encoding', enc);
+  res.type(type);
+  res.setHeader('Content-Length', e[enc].length);
+  res.end(req.method === 'HEAD' ? undefined : e[enc]);
+});
 app.use(express.static(PUBLIC_DIR, { index: 'index.html' }));
 // Argon2id (WebAssembly) for password hardening in the browser, served from the npm package.
 const ARGON2_JS = require.resolve('hash-wasm/dist/argon2.umd.min.js');
@@ -614,6 +649,20 @@ function auth(req, res, next) {
 
 const api = express.Router();
 app.use('/api', api);
+// Bigger API answers (the start-up data, message history) go out gzip-compressed.
+api.use((req, res, next) => {
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return json(body);
+    const text = JSON.stringify(body);
+    if (text === undefined || text.length < 4096) return json(body);
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    res.type('application/json');
+    return res.end(zlib.gzipSync(text, { level: 4 }));
+  };
+  next();
+});
 
 // ---------------------------------------------------------------- public config
 // ---------------------------------------------------------------- installable app: push, manifest, service worker, downloads
@@ -820,6 +869,15 @@ api.get('/bootstrap', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- profile
+// Coming online, going offline and status changes only send the new presence (a few bytes),
+// not the whole profile, so a busy server doesn't flood everyone's app.
+function broadcastPresence(userId) {
+  const row = getUserRow(userId);
+  if (!row) return;
+  const presence = isOnline(row.id) && row.status !== 'invisible' ? row.status : 'offline';
+  io.except(`user:${userId}`).emit('user:presence', { id: userId, presence });
+  io.to(`user:${userId}`).emit('user:update', selfUser(row));
+}
 function broadcastUser(userId) {
   const row = getUserRow(userId);
   io.except(`user:${userId}`).emit('user:update', publicUser(row));
@@ -843,7 +901,7 @@ api.patch('/me/status', auth, (req, res) => {
   const status = (req.body || {}).status;
   if (!['online', 'idle', 'dnd', 'invisible'].includes(status)) fail(400, 'Unknown status.');
   db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, req.userId);
-  broadcastUser(req.userId);
+  broadcastPresence(req.userId);
   res.json({ ok: true });
 });
 
@@ -1318,6 +1376,13 @@ function requireCurrentEpoch(serverId, epoch) {
   return s.key_epoch;
 }
 
+// The sender's app tags each message with a random nonce so it can swap its "sending…" copy for the
+// real one the moment it arrives. It's echoed back, never stored.
+function withNonce(msg, body) {
+  const n = body && body.nonce;
+  if (typeof n === 'string' && /^[a-z0-9]{8,40}$/i.test(n)) msg.nonce = n;
+  return msg;
+}
 // Channel messages are end-to-end encrypted by the sender. The server stores ciphertext only.
 api.post('/channels/:id/messages', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
@@ -1348,6 +1413,7 @@ api.post('/channels/:id/messages', auth, (req, res) => {
     .run(id, c.id, req.userId, '', ciphertext, ep, replyTo, now(), threadId);
   attachBlobs(files, req.userId, id);
   const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
+  withNonce(msg, req.body);
   toChannel(c).emit('message:new', msg);
   notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions);
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
@@ -1518,6 +1584,7 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id });
   db.prepare('UPDATE dm_channels SET last_message_at = ? WHERE id = ?').run(t, d.id);
   const msg = serializeDmMessage(db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id));
+  withNonce(msg, req.body);
   for (const uid of [d.user_a, d.user_b]) {
     const dm = serializeDm({ ...d, last_message_at: t }, uid);
     io.to(`user:${uid}`).emit('dm:message', { dm, message: msg, user: publicUser(getUserRow(dm.userId)) });
@@ -2905,7 +2972,7 @@ function setupSockets(server) {
     const wasOnline = isOnline(uid);
     if (!onlineSockets.has(uid)) onlineSockets.set(uid, new Set());
     onlineSockets.get(uid).add(socket.id);
-    if (!wasOnline) broadcastUser(uid);
+    if (!wasOnline) broadcastPresence(uid);
 
     const guard = (fn) => (...args) => {
       const cb = typeof args[args.length - 1] === 'function' ? args.pop() : () => {};
@@ -3002,7 +3069,7 @@ function setupSockets(server) {
       if (s && s.socketId === socket.id) leaveVoice(uid);
       const set = onlineSockets.get(uid);
       if (set) { set.delete(socket.id); if (!set.size) onlineSockets.delete(uid); }
-      if (!isOnline(uid)) broadcastUser(uid);
+      if (!isOnline(uid)) broadcastPresence(uid);
     });
   });
 }

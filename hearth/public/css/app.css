@@ -175,8 +175,11 @@ kbd { font: 600 12px var(--mono); background: rgb(var(--s3)); border: 1px solid 
   position: absolute; inset: calc(var(--img-blur) * -2);
   filter: blur(var(--img-blur)); background-size: cover; background-position: center;
 }
-#app-bg .bg-layer.animate { background-size: 220% 220% !important; animation: bg-drift 40s ease-in-out infinite alternate; }
-@keyframes bg-drift { 0% { background-position: 0% 30%; } 50% { background-position: 100% 60%; } 100% { background-position: 30% 100%; } }
+/* The drift moves a bigger layer around (handled by the graphics card) instead of repainting the
+   whole screen every frame. */
+#app-bg .bg-layer.animate { inset: -35%; animation: bg-drift 60s ease-in-out infinite alternate; will-change: transform; }
+@keyframes bg-drift { 0% { transform: translate(-12%, -6%) scale(1); } 50% { transform: translate(12%, 4%) scale(1.04); } 100% { transform: translate(-4%, 10%) scale(1); } }
+html:not(.has-bg) #app-bg .bg-layer.animate { animation: none; }
 #app-bg .bg-dim { position: absolute; inset: 0; background: rgb(var(--dim-rgb) / var(--dim)); }
 
 /* ------------------------------------------------------------------ primitives */
@@ -2073,3 +2076,18 @@ html.reduce-motion .mys-page *, html.reduce-motion .mys-name.glitter { animation
 
 .mys-modal .modal-head { display: none; }
 .mys-host { position: relative; height: 100%; }
+
+/* Your own message while it's on its way */
+.msg.sending { opacity: .55; }
+.msg.sending .msg-actions, .msg.sending .msg-hover { display: none; }
+.sending-note { font-size: 12px; color: var(--muted); padding-left: 72px; }
+
+/* ------------------------------------------------------------------ performance mode
+   For slower computers and phones (Settings → Appearance → Performance): no frosted-glass blur,
+   no moving backgrounds, and decorative animations (rings, name effects, profile effects) stand still. */
+html.lite *, html.lite *::before, html.lite *::after { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+html.lite #app-bg .bg-layer { animation: none !important; filter: none !important; inset: 0; }
+html.lite .av::before, html.lite .uname, html.lite .mys-name.glitter, html.lite .mys-marquee span { animation: none !important; }
+html.lite .pfx { display: none; }
+html.lite .modal-backdrop { background: rgb(6 4 10 / .78); }
+html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }

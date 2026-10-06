@@ -64,7 +64,14 @@ export const DEFAULTS = {
   dim: 0.2,
   font: 'default',
   corners: 'normal',
+  performance: 'auto', // auto | on | off
 };
+// "Auto" turns performance mode on for clearly low-powered devices.
+export function lowPowerDevice() {
+  const cores = navigator.hardwareConcurrency || 8;
+  const mem = navigator.deviceMemory || 8;
+  return cores <= 2 || mem <= 2 || matchMedia('(prefers-reduced-transparency: reduce)').matches;
+}
 
 export function loadAppearance() {
   let saved = {};
@@ -255,6 +262,7 @@ export function applyAppearance() {
   if (font && font.css) { root.style.setProperty('--font', font.css); root.style.setProperty('--font-display', font.css); }
   else { root.style.removeProperty('--font'); root.style.removeProperty('--font-display'); }
   root.dataset.corners = CORNERS.some(([id]) => id === a.corners) ? a.corners : 'normal';
+  root.classList.toggle('lite', a.performance === 'on' || (a.performance !== 'off' && lowPowerDevice()));
 
   applyLayout(root, a.layout);
   const solid = isSolid(a);

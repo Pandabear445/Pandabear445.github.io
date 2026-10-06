@@ -810,6 +810,9 @@ function appearanceTab(app) {
           h('span', { class: 'field-hint' }, 'Comfortable has larger avatars and spacing. Compact fits more on screen. Minimal is dense and text-only.')),
         toggle('Reduce motion', a.reduceMotion, (v) => { a.reduceMotion = v; commit(); }, 'Turns off animated rings, name effects, profile effects and moving backgrounds.')),
       fontSection(),
+      section('Performance',
+        h('p', { class: 'set-sub' }, 'If Hearth feels slow or your fans spin up, turn this on. It switches off the frosted-glass blur, moving backgrounds and decorative animations (spinning rings, name and profile effects) on this device.'),
+        chips([['auto', 'Automatic'], ['on', 'On \u2014 faster'], ['off', 'Off \u2014 all effects']], a.performance || 'auto', (v) => { a.performance = v; commit(); })),
       shareSection(),
       section(null, h('button', { class: 'btn ghost', onclick: async () => {
         if (!(await confirmDialog({ title: 'Reset appearance?', text: 'Theme, background, accent, font and layout go back to the defaults on this device.', confirm: 'Reset' }))) return;

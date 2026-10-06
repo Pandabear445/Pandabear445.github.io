@@ -40,7 +40,6 @@ const S = {
   mentions: new Map(),
   typing: {},
   speaking: new Set(),
-  sending: false,
 };
 let socket;
 let voice;
@@ -48,10 +47,33 @@ const sec = createSecure({ S, onKeysChanged, onKeyWarning });
 const fetchingUsers = new Set();
 
 // ---- per-device preferences
+// Kept in memory after the first read: these are read constantly while drawing (every channel's
+// notification level, the saved list for every message…), and parsing them each time was slow.
+const lsCache = new Map();
 const LS = {
-  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { localStorage.setItem(k, JSON.stringify(v)); },
+  get(k, d) {
+    if (lsCache.has(k)) return lsCache.get(k);
+    let v = d;
+    try { const raw = localStorage.getItem(k); if (raw != null) v = JSON.parse(raw); } catch { /* default */ }
+    lsCache.set(k, v);
+    return v;
+  },
+  set(k, v) { lsCache.set(k, v); try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* full or blocked */ } },
 };
+// Another tab changed something: forget our copy so the next read picks it up.
+window.addEventListener('storage', (e) => { if (e.key) lsCache.delete(e.key); else lsCache.clear(); });
+
+// Several things asking to redraw the same part in one go (a burst of messages, people coming
+// online) redraw it once, on the next frame.
+const queuedDraws = new Set();
+let drawFrame = 0;
+function later(fn) {
+  queuedDraws.add(fn);
+  if (drawFrame) return;
+  const run = () => { drawFrame = 0; const fns = [...queuedDraws]; queuedDraws.clear(); fns.forEach((f) => f()); };
+  // Hidden tabs don't get animation frames; a timer keeps them up to date anyway.
+  drawFrame = document.hidden ? setTimeout(run, 250) : requestAnimationFrame(run);
+}
 const mine = (k) => `hearth.${k}.${S.me.id}`;
 const P = {
   get favorites() { return LS.get(mine('favs'), []); },
@@ -264,6 +286,17 @@ function startApp() {
   socket.on('server:restarting', () => showUpdating());
   socket.on('server:maintenance', ({ text }) => showUpdating('Down for maintenance', text || 'Back soon.'));
 
+  // Someone came online, went offline or changed status: just update their dots and lists.
+  socket.on('user:presence', ({ id, presence }) => {
+    if (!S.me || !S.users[id]) return;
+    S.users[id] = { ...S.users[id], presence };
+    $$(`[data-user-av="${id}"][data-status="1"] .status-dot`).forEach((d) => {
+      d.className = d.className.replace(/\bst-\S+/, `st-${presence}`);
+      d.title = STATUS_LABEL[presence] || '';
+    });
+    if (S.panel === 'members' || S.view.type === 'dm') later(renderPanel);
+    if (['friends', 'home'].includes(S.view.type) && S.view.tab !== 'add') later(renderMain);
+  });
   socket.on('user:update', (u) => {
     if (!S.me) return;
     const roleBefore = S.me.staffRole;
@@ -672,17 +705,23 @@ function serverUnread(s) {
 }
 function markRead(key) {
   if (!key || document.hidden) return;
-  S.unread.delete(key);
-  S.mentions.delete(key);
-  const store = S.msgs[key];
-  if (store && store.list.length && !store.hasNewer) {
+  const st = S.msgs[key];
+  const lastId = st && st.list.length && !st.hasNewer ? st.list[st.list.length - 1].id : null;
+  const badges = S.unread.has(key) || S.mentions.has(key);
+  // Called on every scroll near the bottom: only do the work when something actually changes.
+  if (!badges && (!lastId || P.lastRead[key] === lastId)) return;
+  if (lastId && P.lastRead[key] !== lastId) {
     const lr = P.lastRead;
-    lr[key] = store.list[store.list.length - 1].id;
+    lr[key] = lastId;
     P.lastRead = lr;
   }
+  // Only unread dots and mention counts show in the server bar and channel list.
+  if (!badges) return;
+  S.unread.delete(key);
+  S.mentions.delete(key);
   updateTitle();
-  renderRail();
-  renderSidebar();
+  later(renderRail);
+  later(renderSidebar);
 }
 function markUnread(key, msgId) {
   const lr = P.lastRead;
@@ -1563,7 +1602,10 @@ const msgUrl = (key) => (key.startsWith('c:') ? `/channels/${key.slice(2)}/messa
 // mode: 'latest' | 'older' | 'newer' | { around: id }
 async function loadMessages(key, mode = 'latest') {
   let store = S.msgs[key];
-  if (mode === 'latest' && store && store.loaded && !store.hasNewer) { await decryptAll(key); return renderMessages(true); }
+  if (mode === 'latest' && store && store.loaded && !store.hasNewer) {
+    trimStore(store, 120);
+    await decryptAll(key); return renderMessages(true);
+  }
   if (!store || (mode === 'latest' && store.hasNewer) || typeof mode === 'object') store = S.msgs[key] = { list: [], hasMore: true, hasNewer: false, loaded: false, loading: false };
   if (store.loading || (mode === 'older' && !store.hasMore) || (mode === 'newer' && !store.hasNewer)) return;
   store.loading = true;
@@ -1586,7 +1628,7 @@ async function loadMessages(key, mode = 'latest') {
     if (mode === 'older') {
       const prevH = sc.scrollHeight;
       const prevTop = sc.scrollTop;
-      renderMessages(false);
+      if (!prependOlder(sc, store, fresh)) renderMessages(false);
       sc.scrollTop = sc.scrollHeight - prevH + prevTop;
     } else if (mode === 'newer') {
       const top = sc.scrollTop;
@@ -1597,6 +1639,42 @@ async function loadMessages(key, mode = 'latest') {
   } catch (e) {
     toast(e.message, 'error');
   } finally { store.loading = false; }
+}
+// Keep only the newest messages of a conversation in memory and on screen; older ones load again
+// when you scroll up. Without this, a long session made the page heavier and heavier.
+function trimStore(store, keep) {
+  if (store.list.length <= keep * 1.5 || store.hasNewer) return false;
+  store.list.splice(0, store.list.length - keep);
+  store.hasMore = true;
+  return true;
+}
+// Scrolling up: add just the older messages at the top instead of redrawing everything.
+function prependOlder(sc, store, fresh) {
+  const first = sc.querySelector('.msg[data-mid]');
+  if (!first) return false;
+  const firstMsg = store.list.find((x) => x.id === first.dataset.mid);
+  const older = fresh.filter((m) => !firstMsg || m.id < firstMsg.id).sort((a, b) => (a.id < b.id ? -1 : 1));
+  if (fresh.length !== older.length) return false;
+  const frag = document.createDocumentFragment();
+  if (!store.hasMore) frag.append(welcomeBlock());
+  let prev = null;
+  for (const m of older) {
+    if (!prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()) {
+      frag.append(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
+      prev = null;
+    }
+    frag.append(messageEl(m, prev, 'main'));
+    prev = m;
+  }
+  // The message that used to be first may now join the group above it, and its day divider may be a repeat.
+  if (prev && firstMsg) {
+    const before = first.previousElementSibling;
+    if (before && before.classList.contains('day-div') && new Date(prev.createdAt).toDateString() === new Date(firstMsg.createdAt).toDateString()) before.remove();
+    const top = first.previousElementSibling && first.previousElementSibling.classList.contains('day-div') ? null : prev;
+    first.replaceWith(messageEl(firstMsg, top, 'main'));
+  }
+  sc.prepend(frag);
+  return true;
 }
 function onMessagesScroll(e) {
   const sc = e.target;
@@ -1726,6 +1804,7 @@ function renderMessages(stick) {
     if (marker && marker.offsetTop > sc.clientHeight * 0.6) sc.scrollTop = marker.offsetTop - 80;
     else sc.scrollTop = sc.scrollHeight;
   }
+  if (!store.hasNewer) redrawPendingSends(key);
   const jl = $('#jump-latest');
   if (jl) jl.hidden = !store.hasNewer;
   renderTyping();
@@ -2184,6 +2263,7 @@ async function toPng(blob) {
 async function onNewMessage(key, m) {
   const store = S.msgs[key];
   await decryptMessage(m);
+  if (m.nonce) dropPendingSend(m.nonce);
   if (key.startsWith('d:')) { S.previews[key] = previewText(m); }
   else {
     const s = S.servers.find((x) => x.id === m.serverId);
@@ -2191,21 +2271,29 @@ async function onNewMessage(key, m) {
   }
   if (store && store.loaded && !store.hasNewer && !store.list.find((x) => x.id === m.id)) {
     store.list.push(m);
-    if (currentKey() === key) {
+    const viewingThis = currentKey() === key;
+    const scNow = viewingThis && $('#messages');
+    const atEnd = scNow && scNow.scrollHeight - scNow.scrollTop - scNow.clientHeight < 160;
+    // Busy channel: drop the oldest when you're reading the latest (or not looking at it at all).
+    if ((!viewingThis || atEnd) && trimStore(store, 150) && viewingThis) { renderMessages(true); }
+    else if (viewingThis) {
       const sc = $('#messages');
       const near = sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160;
       const prev = store.list[store.list.length - 2];
       if (sc) {
         const newDay = !prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString();
-        if (newDay) sc.append(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
-        sc.append(messageEl(m, newDay ? null : prev, 'main'));
+        // Real messages go above any of your own still "sending…".
+        const firstPending = sc.querySelector('.msg.sending');
+        const put = (node) => (firstPending ? sc.insertBefore(node, firstPending) : sc.append(node));
+        if (newDay) put(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
+        put(messageEl(m, newDay ? null : prev, 'main'));
         if (near || m.authorId === S.me.id) sc.scrollTop = sc.scrollHeight;
       }
     }
   }
   const t = S.typing[key];
   if (t && t.has(m.authorId)) { clearTimeout(t.get(m.authorId)); t.delete(m.authorId); if (currentKey() === key) renderTyping(); }
-  if (m.authorId === S.me.id) { if (!S.view.serverId) renderSidebar(); return; }
+  if (m.authorId === S.me.id) { if (!S.view.serverId) later(renderSidebar); return; }
   const viewing = currentKey() === key && !document.hidden;
   const level = notifyLevel(key);
   const isDm = key.startsWith('d:') || isGroup(S.servers.find((x) => x.id === m.serverId));
@@ -2225,10 +2313,12 @@ async function onNewMessage(key, m) {
       text: textOf(m).slice(0, 140),
     });
   }
+  // Reading this very channel: nothing in the server bar or channel list changes.
+  if (viewing && !isDm && !mentioned && !repliedToMe) return;
   updateTitle();
-  renderRail();
-  if ((isDm && !S.view.serverId) || (!isDm && S.view.serverId === m.serverId) || (isDm && isGroup(currentServer()))) renderSidebar();
-  if (S.view.type === 'home') renderMain();
+  later(renderRail);
+  if ((isDm && !S.view.serverId) || (!isDm && S.view.serverId === m.serverId) || (isDm && isGroup(currentServer()))) later(renderSidebar);
+  if (S.view.type === 'home') later(renderMain);
 }
 function notify(author, body, key) {
   if (!('Notification' in window) || Notification.permission !== 'granted' || (!document.hidden && document.hasFocus())) return;
@@ -2681,38 +2771,51 @@ function createComposer({ id, key, threadId, placeholder }) {
     if (!slowNote.hidden && !slowUntil) slowNote.textContent = `Slowmode is on: one message every ${fmtDuration(ch.slowmode)}`;
     update();
   }
-  async function send(overrideText) {
+  // Sending never blocks typing: the box clears at once, the message shows up right away as
+  // "sending…", and messages go out one after another in the background (so they stay in order).
+  let queue = Promise.resolve();
+  function send(overrideText) {
     const text = overrideText != null ? overrideText : ta.value;
     const files = overrideText != null ? [] : state.pending.slice();
     if (!text.trim() && !files.length) return;
-    if (S.sending) return;
     const kk = key();
-    S.sending = true;
-    sendBtn.disabled = true;
+    const tid = threadId();
+    const replyTo = state.replyTo ? state.replyTo.id : null;
+    if (overrideText == null) {
+      ta.value = '';
+      drafts.delete(kk + (tid || ''));
+      state.pending = [];
+    }
+    const old = state.replyTo;
+    state.replyTo = null;
+    if (old) replaceMessageEl(old);
+    renderExtras(); autosize(); update();
+    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)), (x) => x.toString(16).padStart(2, '0')).join('');
+    if (id === 'main' && !tid) showPendingSend(kk, nonce, text, files.length, replyTo);
+    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce }));
+    return queue;
+  }
+  async function deliver({ kk, tid, text, files, replyTo, nonce }) {
     const bar = extras.querySelector('.upload-progress');
     const setProgress = (f) => { if (!bar) return; bar.hidden = f >= 1; bar.firstChild.style.width = Math.round(f * 100) + '%'; };
     try {
       const f = await uploadEncryptedFiles(kk, files, setProgress);
-      await sendTo(kk, threadId(), { t: text, f }, state.replyTo ? state.replyTo.id : null);
+      const msg = await sendTo(kk, tid, { t: text, f }, replyTo, nonce);
+      files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
       playSound('sent');
-      if (overrideText == null) {
-        ta.value = '';
-        drafts.delete(kk + (threadId() || ''));
-        files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
-        state.pending = [];
-      }
-      const old = state.replyTo;
-      state.replyTo = null;
-      if (old) replaceMessageEl(old);
-      renderExtras(); autosize();
+      // Normally the live connection delivers it first; this covers a slow or dropped connection.
+      if (msg && msg.id) { if (msg.threadId) onThreadMessage(msg); else onNewMessage(kk, msg); }
+      dropPendingSend(nonce);
       const sch = kk.startsWith('c:') ? channelById(kk.slice(2)) : null;
       if (sch && sch.slowmode > 0 && !canIn(sch, PERMS.MANAGE_MESSAGES)) startSlow(sch.slowmode);
-      if (id === 'main') { const sc = $('#messages'); if (sc) sc.scrollTop = sc.scrollHeight; }
     } catch (e) {
+      dropPendingSend(nonce);
       const wait = /in (\d+)s/.exec(e.message || '');
       if (e.code === 'slowmode' && wait) startSlow(+wait[1]);
       toast(e.message, 'error');
-    } finally { S.sending = false; setProgress(1); update(); }
+      // Give the words back so nothing is lost (unless they've already typed something new).
+      if (!ta.value.trim() && key() === kk) { ta.value = text; if (!state.pending.length) state.pending = files; renderExtras(); autosize(); update(); }
+    } finally { setProgress(1); }
   }
   setTimeout(() => { autosize(); update(); }, 0);
   return { el, state, focus: () => ta.focus(), addFiles, setReply, renderExtras, send };
@@ -2796,20 +2899,49 @@ function mentionedIds(server, text) {
     || ((server.memberRoles || {})[id] || []).some((r) => roleIds.has(r))));
 }
 
-async function sendTo(key, threadId, payload, replyTo) {
+async function sendTo(key, threadId, payload, replyTo, nonce) {
   const files = (payload.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
   if (key.startsWith('c:')) {
     const channelId = key.slice(2);
     const server = serverOfChannel(channelId);
     if (!server) throw new Error('Channel not found.');
-    await withKeyRetry(server.id, async () => {
+    return withKeyRetry(server.id, async () => {
       const { ciphertext, epoch } = await sec.encryptChannel(server.id, channelId, payload);
-      await api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t) });
+      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), nonce });
     });
-  } else {
-    const ciphertext = await sec.encryptDm(key.slice(2), payload);
-    await api('POST', `/dms/${key.slice(2)}/messages`, { ciphertext, replyTo, files });
   }
+  const ciphertext = await sec.encryptDm(key.slice(2), payload);
+  return api('POST', `/dms/${key.slice(2)}/messages`, { ciphertext, replyTo, files, nonce });
+}
+// "Sending…" copies of your own messages, shown until the real one arrives.
+const pendingSends = new Map(); // nonce -> { key, text, files, replyTo, el }
+function pendingEl(p) {
+  const prevList = (S.msgs[p.key] || { list: [] }).list;
+  const fake = { id: 'pending-' + p.nonce, authorId: S.me.id, createdAt: Date.now(), dec: { t: p.text, f: [] }, reactions: [], replyTo: null };
+  let el;
+  try { el = messageEl(fake, prevList[prevList.length - 1] || null, 'main'); } catch { el = h('div', { class: 'msg' }, h('div', { class: 'msg-gutter' }), h('div', { class: 'msg-body' }, p.text)); }
+  el.classList.add('sending');
+  el.removeAttribute('data-mid');
+  el.oncontextmenu = null;
+  if (p.files) el.append(h('div', { class: 'sending-note' }, `Uploading ${p.files} file${p.files === 1 ? '' : 's'}\u2026`));
+  return el;
+}
+function showPendingSend(key, nonce, text, files, replyTo) {
+  const p = { key, nonce, text, files, replyTo };
+  pendingSends.set(nonce, p);
+  const sc = $('#messages');
+  if (sc && currentKey() === key) { p.el = pendingEl(p); sc.append(p.el); sc.scrollTop = sc.scrollHeight; }
+}
+function dropPendingSend(nonce) {
+  const p = pendingSends.get(nonce);
+  if (!p) return;
+  pendingSends.delete(nonce);
+  if (p.el) p.el.remove();
+}
+function redrawPendingSends(key) {
+  const sc = $('#messages');
+  if (!sc) return;
+  for (const p of pendingSends.values()) if (p.key === key) { p.el = pendingEl(p); sc.append(p.el); }
 }
 
 // ======================================================================= emoji + GIF pickers

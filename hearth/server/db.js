@@ -397,4 +397,15 @@ CREATE INDEX IF NOT EXISTS idx_profile_comments ON profile_comments(profile_id, 
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
+// Reuse compiled SQL statements instead of compiling the same query on every request (there are
+// hundreds of them, many run per message). Statements are only used with get/all/run, so sharing is safe.
+// Queries built with a variable number of placeholders stop being cached once the cache is full.
+const compile = db.prepare.bind(db);
+const statements = new Map();
+db.prepare = (sql) => {
+  let st = statements.get(sql);
+  if (!st) { st = compile(sql); if (statements.size < 3000) statements.set(sql, st); }
+  return st;
+};
+
 module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey };
