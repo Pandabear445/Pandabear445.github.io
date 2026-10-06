@@ -1,0 +1,38 @@
+{
+  "name": "hearth-desktop",
+  "productName": "Hearth",
+  "version": "1.1.0",
+  "description": "Desktop app for Hearth, the self-hosted encrypted chat.",
+  "main": "main.js",
+  "author": { "name": "Hearth", "email": "admin@example.com" },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "app.hearth.desktop",
+    "productName": "Hearth",
+    "files": ["main.js", "preload.js", "connect.html", "hearth.config.json", "build/icon.png", "build/tray*.png"],
+    "directories": { "buildResources": "build", "output": "dist" },
+    "win": { "target": ["nsis"], "icon": "build/icon.png" },
+    "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "artifactName": "${productName}-Setup-${version}.${ext}" },
+    "mac": {
+      "target": ["dmg"], "category": "public.app-category.social-networking", "icon": "build/icon.png",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "extendInfo": { "NSMicrophoneUsageDescription": "Hearth uses your microphone for voice chat." }
+    },
+    "linux": { "target": ["AppImage", "deb"], "category": "Network;Chat;InstantMessaging", "icon": "build/icon.png", "artifactName": "${productName}-${version}-${arch}.${ext}" }
+  }
+}

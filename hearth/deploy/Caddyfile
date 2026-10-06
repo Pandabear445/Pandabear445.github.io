@@ -1,0 +1,11 @@
+# Replace chat.example.com with your domain (its DNS A record must point at this server).
+# Caddy gets a real HTTPS certificate automatically and passes WebSockets through.
+chat.example.com {
+	encode gzip
+	reverse_proxy hearth:3000 {
+		# While Hearth restarts (updates take a second or two), hold requests and retry
+		# instead of showing visitors an error page.
+		lb_try_duration 30s
+		lb_try_interval 250ms
+	}
+}

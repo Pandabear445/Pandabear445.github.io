@@ -1,0 +1,17 @@
+# systemd unit to run Hearth on a Linux VPS without Docker.
+# Copy to /etc/systemd/system/hearth.service, fix the paths/user, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hearth
+[Unit]
+Description=Hearth chat server
+After=network.target
+
+[Service]
+Type=simple
+User=hearth
+WorkingDirectory=/opt/hearth
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

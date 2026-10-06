@@ -1,0 +1,9 @@
+{
+  "appName": "Hearth",
+  "appId": "app.hearth.desktop",
+  "defaultServer": "",
+  "lockServer": false,
+  "closeToTray": true,
+  "autoUpdate": true,
+  "trustedSelfSignedHosts": []
+}

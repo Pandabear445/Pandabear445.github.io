@@ -1,0 +1,36 @@
+# Quick start:   docker compose up -d            -> https://<this-machine>:3000 (self-signed)
+# With a domain: edit deploy/Caddyfile, set HTTPS=false + TRUST_PROXY=1 below,
+#                then: docker compose --profile domain up -d
+services:
+  hearth:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /data
+      # HTTPS: "false"
+      # TRUST_PROXY: "1"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+
+  caddy:
+    image: caddy:2
+    profiles: ["domain"]
+    restart: unless-stopped
+    depends_on: [hearth]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
