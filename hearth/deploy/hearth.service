@@ -11,6 +11,8 @@ User=hearth
 WorkingDirectory=/opt/hearth
 ExecStart=/usr/bin/node server/index.js
 Restart=on-failure
+# Each open app window is one connection; the usual default (1024) would cap you at about 1000 people online.
+LimitNOFILE=65535
 Environment=NODE_ENV=production
 
 [Install]

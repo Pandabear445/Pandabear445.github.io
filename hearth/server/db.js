@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -393,6 +393,30 @@ CREATE TABLE IF NOT EXISTS profile_comments (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_profile_comments ON profile_comments(profile_id, created_at);
+`);
+
+// v9: supporters (people who chip in for hosting).
+addColumn('users', 'supporter', 'INTEGER NOT NULL DEFAULT 0');
+// v9: the server's own GIF library (no API key, no limits).
+db.exec(`
+CREATE TABLE IF NOT EXISTS gif_library (
+  id TEXT PRIMARY KEY,
+  file TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '',
+  width INTEGER NOT NULL DEFAULT 0,
+  height INTEGER NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,
+  sticker INTEGER NOT NULL DEFAULT 0,
+  uses INTEGER NOT NULL DEFAULT 0,
+  last_used INTEGER,
+  source TEXT NOT NULL DEFAULT 'upload',
+  source_id TEXT,
+  added_by TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gif_library_uses ON gif_library(uses DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gif_library_source ON gif_library(source, source_id);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);

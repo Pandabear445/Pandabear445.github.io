@@ -119,6 +119,7 @@ export function renderPage(d, u, opts = {}) {
         prof.customStatus && prof.customStatus.text ? h('p', null, `${prof.customStatus.emoji || ''} ${prof.customStatus.text}`.trim()) : null,
         h('p', { class: `mys-online${online ? ' on' : ''}` }, online ? '● Online now!' : d.lastSeen ? `Last seen ${fmtDay(d.lastSeen)}` : 'Offline'),
         h('p', { class: 'mys-since' }, `Member since ${fmtDay(u.createdAt)}`),
+        u.supporter ? h('p', null, h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter')) : null,
         p.showViews ? h('p', { class: 'mys-views' }, h('b', null, 'Profile views: '), h('span', { class: 'mys-counter' }, String(d.views).padStart(6, '0'))) : null)));
   const left = [identity];
   if (!self && opts.actions) left.push(box(`Contacting ${name}`, 'mys-contact', h('div', { class: 'mys-contact-grid' }, opts.actions)));

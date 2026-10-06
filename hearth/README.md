@@ -28,6 +28,9 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Look and layout:** three message densities (comfortable, compact, minimal), text size, accent color and reduced motion. **Themes and backgrounds:** Dark (default), Midnight, Dim, Ember and Light themes; 22 background presets (adaptive glows and patterns, dark and bright gradients); your own gradient builder (linear, radial, mesh, conic, 2–3 colors) or your own image/GIF, with panel transparency, darken/fade, blur and a slow-drift animation. Saved per device.
 - **Settings** grouped into Account (profile, security, sessions), App (appearance, chat, notifications, voice & audio), Privacy & safety, and Server settings.
 
+- **Watch together:** in any call (voice channels, DMs, groups) share a YouTube, Vimeo, Twitch (live) or video-file link and everyone watches the same moment — play, pause, seek and speed stay in sync, people who join late jump right in, there's an "up next" queue, and the starter can keep control to themselves.
+- **GIFs without limits:** besides KLIPY/GIPHY, every Hearth has its own GIF library (upload GIFs, search them, no key, no limits). When a provider says "too many requests", the picker quietly switches to recent results and the library instead of failing.
+- **Owner tools:** server health (CPU, memory, disk, connections, responsiveness), one-click and automatic daily database backups with download, server name and tagline, feature switches (watch together, GIFs, comment walls, custom CSS, who can create servers), and a funding card with 💜 supporter badges and optional extra storage for supporters.
 - **Fast:** messages send instantly (they show as "sending…" until delivered, and you can keep typing), long chats stay light, the app's files are sent compressed, and **Performance mode** (Settings → Appearance) turns off blur, moving backgrounds and decorative animations on slower computers — it switches on by itself on low-powered devices.
 
 No build step, no external services required. One Node process and a SQLite file.
@@ -394,6 +397,10 @@ Stop the server (or copy while idle) for a clean copy of the database.
 ## Not included (yet)
 
 Video and screen sharing, App Store / Play Store builds, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
+
+## Capacity, regions and costs
+
+See [docs/RUNNING-HEARTH.md](docs/RUNNING-HEARTH.md): measured capacity (how many people one VPS holds), cheap extra regions for calls, cost per person, non-invasive ways to fund it, and how to talk about it.
 
 ## Project layout
 

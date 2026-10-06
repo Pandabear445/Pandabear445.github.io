@@ -90,6 +90,7 @@ function publicUser(row) {
     profile,
     publicKey: row.public_key,
     signPublicKey: row.sign_public_key || null,
+    supporter: !!row.supporter || undefined,
     createdAt: row.created_at,
   };
 }
@@ -332,8 +333,8 @@ app.use(express.json({ limit: '2mb' }));
 // for password hashing); no plugins; can't be framed by other sites.
 const CSP = [
   "default-src 'self'", "script-src 'self' 'wasm-unsafe-eval'", "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-  "font-src 'self' data: https://fonts.gstatic.com", "img-src 'self' data: blob: https:", "media-src 'self' blob: data:",
-  "connect-src 'self' ws: wss:", "worker-src 'self' blob:", "frame-src 'self' blob:", "object-src 'none'", "base-uri 'self'",
+  "font-src 'self' data: https://fonts.gstatic.com", "img-src 'self' data: blob: https:", "media-src 'self' blob: data: https:",
+  "connect-src 'self' ws: wss:", "worker-src 'self' blob:", "frame-src 'self' blob: https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://player.twitch.tv", "object-src 'none'", "base-uri 'self'",
   "form-action 'self'", "frame-ancestors 'none'", "manifest-src 'self'",
 ].join('; ');
 app.use((req, res, next) => {
@@ -411,7 +412,9 @@ function quotaOf(uid) {
   const row = getUserRow(uid);
   const lim = uploadLimits();
   const exempt = isInstanceAdmin(uid);
-  const quotaMb = exempt ? 0 : (row && row.upload_quota_mb != null ? row.upload_quota_mb : lim.quotaMb);
+  let quotaMb = exempt ? 0 : (row && row.upload_quota_mb != null ? row.upload_quota_mb : lim.quotaMb);
+  const sq = +(getSetting('supporterQuotaMb') || 0);
+  if (!exempt && row && row.supporter && row.upload_quota_mb == null && sq && quotaMb && sq > quotaMb) quotaMb = sq;
   return { ...lim, quotaMb, dailyMb: exempt ? 0 : lim.dailyMb, used: usedBytes(uid), today: dayBytes(uid), blocked: !!(row && row.uploads_blocked), exempt };
 }
 const fmtMb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
@@ -510,7 +513,7 @@ app.get('/uploads/:file', (req, res) => {
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 app.get('/manifest.webmanifest', (req, res) => {
   res.type('application/manifest+json').json({
-    id: '/', name: INSTANCE_NAME, short_name: INSTANCE_NAME.slice(0, 12),
+    id: '/', name: brand().name, short_name: brand().name.slice(0, 12),
     description: 'Private, self-hosted chat with end-to-end encryption.',
     start_url: '/?source=app', scope: '/', display: 'standalone', orientation: 'any',
     background_color: '#100e16', theme_color: '#100e16', categories: ['social', 'communication'],
@@ -728,11 +731,15 @@ api.get('/config', (req, res) => {
     pushEnabled: !!vapid,
     downloads: listDownloads(),
     desktopUrl: process.env.DESKTOP_DOWNLOAD_URL || null,
-    name: INSTANCE_NAME,
+    name: brand().name,
+    tagline: brand().tagline,
+    features: features(),
+    funding: fundingPublic(),
     registrationOpen: regMode() !== 'closed',
     registrationRequiresCode: regMode() === 'code',
     termsVersion: termsInfo().version || 0,
-    gifsEnabled: !!gifKey(),
+    gifsEnabled: true, // the server's own library always works
+    gifLibraryOnly: !gifKey(),
     gifProvider: gifProvider(),
     gifProxy: gifProxyOn(),
     maxUploadMb: uploadLimits().fileMb,
@@ -871,11 +878,21 @@ api.get('/bootstrap', auth, (req, res) => {
 // ---------------------------------------------------------------- profile
 // Coming online, going offline and status changes only send the new presence (a few bytes),
 // not the whole profile, so a busy server doesn't flood everyone's app.
+// Changes are collected for a second and sent as one list, so when hundreds of people reconnect at once
+// (after an update, say) it's a handful of messages instead of one per person per person.
+const presenceQueue = new Map();
+let presenceTimer = null;
+function flushPresence() {
+  presenceTimer = null;
+  const list = [...presenceQueue].map(([id, presence]) => ({ id, presence }));
+  presenceQueue.clear();
+  if (list.length) io.emit('user:presence', list);
+}
 function broadcastPresence(userId) {
   const row = getUserRow(userId);
   if (!row) return;
-  const presence = isOnline(row.id) && row.status !== 'invisible' ? row.status : 'offline';
-  io.except(`user:${userId}`).emit('user:presence', { id: userId, presence });
+  presenceQueue.set(userId, isOnline(row.id) && row.status !== 'invisible' ? row.status : 'offline');
+  if (!presenceTimer) presenceTimer = setTimeout(flushPresence, 1000);
   io.to(`user:${userId}`).emit('user:update', selfUser(row));
 }
 function broadcastUser(userId) {
@@ -1011,7 +1028,7 @@ api.delete('/friends/:id', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- servers
-api.post('/servers', auth, limited('image', uploadImage, 'icon'), (req, res) => {
+api.post('/servers', auth, (req, res, next) => (features().createServers === 'staff' && !isStaff(req.userId) ? next(new HttpError(403, 'On this Hearth, only staff can create servers. Ask an admin.')) : next()), limited('image', uploadImage, 'icon'), (req, res) => {
   const name = String((req.body || {}).name || '').trim().slice(0, 64);
   if (!name) fail(400, 'Give your server a name.');
   const id = newId();
@@ -2000,16 +2017,22 @@ const GIPHY_API = process.env.GIPHY_API_BASE || 'https://api.giphy.com';
 const klipyKey = () => getSetting('klipyKey') || process.env.KLIPY_API_KEY || '';
 const gifProvider = () => {
   const p = getSetting('gifProvider');
-  if (p === 'klipy' || p === 'giphy') return p;
+  if (p === 'klipy' || p === 'giphy' || p === 'library') return p;
   return klipyKey() ? 'klipy' : giphyKey() ? 'giphy' : 'klipy';
 };
-const gifKey = (provider = gifProvider()) => (provider === 'klipy' ? klipyKey() : giphyKey());
+const gifKey = (provider = gifProvider()) => (provider === 'library' ? '' : provider === 'klipy' ? klipyKey() : giphyKey());
 const KLIPY_API = process.env.KLIPY_API_BASE || 'https://api.klipy.com';
 const gifCache = new Map(); // key -> { at, ttl, value }
+let gifLimitedUntil = 0; // after a "too many requests", use the library for a while instead of asking again
 async function cachedGif(key, ttlMs, fetcher) {
   const hit = gifCache.get(key);
   if (hit && Date.now() - hit.at < hit.ttl) return hit.value;
-  const value = await fetcher();
+  let value;
+  try { value = await fetcher(); } catch (e) {
+    // Limit reached or provider down: an older answer is much better than an error.
+    if (hit) return { ...hit.value, stale: true };
+    throw e;
+  }
   gifCache.set(key, { at: Date.now(), ttl: ttlMs, value });
   if (gifCache.size > 600) gifCache.delete(gifCache.keys().next().value); // forget the oldest
   return value;
@@ -2024,7 +2047,7 @@ async function gifFetch(provider, base, pathname, params, key = gifKey(provider)
   try {
     const r = await fetch(url, { signal: ctl.signal });
     if (r.status === 401 || r.status === 403) fail(502, `${name} rejected the API key. An admin can fix it in Settings \u2192 Instance.`);
-    if (r.status === 429) fail(503, `${name}\u2019s hourly limit was reached. Request a free production key in ${name}\u2019s dashboard to remove the limit.`);
+    if (r.status === 429) { gifLimitedUntil = Date.now() + 10 * 60000; fail(503, `${name}\u2019s hourly limit was reached. Request a free production key in ${name}\u2019s dashboard to remove the limit.`, 'gif_limit'); }
     if (!r.ok) fail(502, 'GIF search is unavailable right now.');
     return await r.json();
   } catch (e) {
@@ -2090,16 +2113,148 @@ async function gifForEmoji(id) {
 }
 
 api.get('/gifs', auth, wrap(async (req, res) => {
-  if (!gifKey()) fail(404, 'GIF search isn\u2019t set up yet. The server administrator can add a free KLIPY key in Settings \u2192 Instance.');
+  if (!features().gifs) fail(404, 'GIFs are turned off on this server.');
   rateLimit('gif:' + req.userId, 90, 60000);
   const q = String(req.query.q || '').trim().slice(0, 100);
   const type = req.query.type === 'stickers' ? 'stickers' : 'gifs';
-  res.json(await gifSearch({ q, type, pos: String(req.query.offset || '').slice(0, 200) }));
+  const pos = String(req.query.offset || '').slice(0, 200);
+  // The server's own library: always free, never limited.
+  if (req.query.source === 'library' || !gifKey() || Date.now() < gifLimitedUntil) {
+    return res.json({ ...librarySearch({ q, sticker: type === 'stickers', offset: parseInt(pos, 10) || 0 }), library: true, limited: Date.now() < gifLimitedUntil && req.query.source !== 'library' });
+  }
+  try { res.json(await gifSearch({ q, type, pos })); } catch (e) {
+    if (e.code !== 'gif_limit' && !(e.status >= 500)) throw e;
+    res.json({ ...librarySearch({ q, sticker: type === 'stickers', offset: 0 }), library: true, limited: true });
+  }
 }));
 api.get('/gifs/categories', auth, wrap(async (req, res) => {
-  if (!gifKey()) fail(404, 'GIF search isn\u2019t set up yet.');
-  res.json(await gifCategories());
+  if (req.query.source === 'library' || !gifKey() || Date.now() < gifLimitedUntil) return res.json(libraryCategories());
+  try { res.json(await gifCategories()); } catch { res.json(libraryCategories()); }
 }));
+
+// ---------------------------------------------------------------- the server's own GIF library
+// GIFs live on this server, so searching and sending them costs nothing and has no limits. They come
+// from people uploading them (Settings \u2192 GIFs) and, if the admin turns it on, from GIFs people
+// send from KLIPY/GIPHY (each one is downloaded once, so popular GIFs stop costing API calls).
+const LIB_MAX_MB = 8;
+const libSetting = (k, d) => getSetting(k) ?? d;
+const libraryWho = () => (['everyone', 'staff'].includes(libSetting('gifLibraryWho')) ? libSetting('gifLibraryWho') : 'everyone');
+const libraryLearn = () => libSetting('gifLibraryLearn', 'false') === 'true';
+const libraryCapMb = () => Math.max(100, Math.min(500000, parseInt(libSetting('gifLibraryCapMb', '5000'), 10) || 5000));
+const libOut = (g) => ({ id: 'lib:' + g.id, title: g.title, url: '/uploads/' + g.file, preview: '/uploads/' + g.file, width: g.width || 200, height: g.height || 200, library: true, uses: g.uses });
+function librarySearch({ q, sticker, offset = 0 }) {
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 5);
+  const where = ['sticker = ?'];
+  const args = [sticker ? 1 : 0];
+  words.forEach((w) => { where.push("(lower(title) LIKE ? OR (' ' || tags || ' ') LIKE ?)"); args.push(`%${w}%`, `% ${w}%`); });
+  const rows = db.prepare(`SELECT * FROM gif_library WHERE ${where.join(' AND ')} ORDER BY uses DESC, created_at DESC LIMIT 25 OFFSET ?`).all(...args, Math.max(0, offset));
+  const items = rows.slice(0, 24).map(libOut);
+  return { items, nextOffset: rows.length > 24 ? String(offset + 24) : null };
+}
+function libraryCategories() {
+  const counts = new Map();
+  db.prepare('SELECT tags, file FROM gif_library WHERE sticker = 0 ORDER BY uses DESC LIMIT 400').all().forEach((r) => {
+    r.tags.split(' ').filter((t) => t.length > 2).forEach((t) => { const c = counts.get(t) || { n: 0, file: r.file }; c.n++; counts.set(t, c); });
+  });
+  return [...counts.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 24).map(([name, c]) => ({ name, preview: '/uploads/' + c.file }));
+}
+const cleanTags = (...parts) => [...new Set(parts.join(' ').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((t) => t.length > 1 && t.length < 24))].slice(0, 24).join(' ');
+function imageDims(buf) {
+  if (buf.length > 10 && buf.toString('ascii', 0, 3) === 'GIF') return [buf.readUInt16LE(6), buf.readUInt16LE(8)];
+  if (buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47) return [buf.readUInt32BE(16), buf.readUInt32BE(20)];
+  if (buf.length > 30 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 12, 16) === 'VP8X') return [1 + buf.readUIntLE(24, 3), 1 + buf.readUIntLE(27, 3)];
+  return [0, 0];
+}
+function addToLibrary({ buf, ext, title, tags, sticker, source, sourceId, userId }) {
+  const file = `${newId()}${crypto.randomBytes(6).toString('hex')}${ext}`;
+  fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
+  const [w, hgt] = imageDims(buf);
+  const id = newId();
+  db.prepare(`INSERT INTO gif_library (id, file, title, tags, width, height, size, sticker, source, source_id, added_by, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, file, String(title || '').slice(0, 120), cleanTags(title || '', tags || ''), w, hgt, buf.length, sticker ? 1 : 0, source, sourceId || null, userId || null, now());
+  trimLibrary();
+  return db.prepare('SELECT * FROM gif_library WHERE id = ?').get(id);
+}
+// Over the size the admin allows: the least used GIFs that were collected automatically go first.
+function trimLibrary() {
+  const cap = libraryCapMb() * MB;
+  let total = db.prepare('SELECT COALESCE(SUM(size), 0) n FROM gif_library').get().n;
+  if (total <= cap) return;
+  for (const g of db.prepare("SELECT id, file, size FROM gif_library ORDER BY (source = 'upload') ASC, uses ASC, created_at ASC LIMIT 200").all()) {
+    if (total <= cap) break;
+    db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
+    fs.promises.unlink(path.join(UPLOAD_DIR, g.file)).catch(() => {});
+    total -= g.size;
+  }
+}
+const uploadGif = {
+  storage: multer.memoryStorage(),
+  fileFilter: (req, file, cb) => (['.gif', '.webp', '.png'].includes(safeExt(file.originalname)) && /^image\//.test(file.mimetype) ? cb(null, true) : cb(new HttpError(400, 'Use a GIF, animated WebP or PNG.'))),
+};
+api.get('/gifs/library', auth, (req, res) => {
+  const total = db.prepare('SELECT COUNT(*) n, COALESCE(SUM(size), 0) bytes FROM gif_library').get();
+  res.json({ count: total.n, bytes: total.bytes, capMb: libraryCapMb(), who: libraryWho(), learn: libraryLearn(), canAdd: libraryWho() === 'everyone' || isStaff(req.userId) });
+});
+api.post('/gifs/library', auth, (req, res, next) => {
+  if (libraryWho() === 'staff' && !isStaff(req.userId)) return next(new HttpError(403, 'Only staff can add GIFs to this server\u2019s library.'));
+  if (quotaOf(req.userId).blocked) return next(new HttpError(403, 'Uploads are turned off for your account.'));
+  multer({ ...uploadGif, limits: { fileSize: LIB_MAX_MB * MB, files: 1 } }).single('file')(req, res, (err) => {
+    if (err && err.code === 'LIMIT_FILE_SIZE') return next(new HttpError(413, `GIFs for the library can be up to ${LIB_MAX_MB} MB.`));
+    next(err);
+  });
+}, (req, res) => {
+  if (!req.file) fail(400, 'Choose a GIF.');
+  rateLimit('giflib:' + req.userId, 60, 3600000);
+  const b = req.body || {};
+  checkWords(b.title, b.tags);
+  const g = addToLibrary({ buf: req.file.buffer, ext: safeExt(req.file.originalname) || '.gif', title: b.title, tags: b.tags, sticker: b.sticker === 'true', source: 'upload', userId: req.userId });
+  res.json(libOut(g));
+});
+// Someone sent a GIF: count it (library GIFs) or, if allowed, keep a copy of a KLIPY/GIPHY one.
+api.post('/gifs/used', auth, wrap(async (req, res) => {
+  const b = req.body || {};
+  rateLimit('gifused:' + req.userId, 60, 60000);
+  if (typeof b.id === 'string' && b.id.startsWith('lib:')) {
+    db.prepare('UPDATE gif_library SET uses = uses + 1, last_used = ? WHERE id = ?').run(now(), b.id.slice(4));
+    return res.json({ ok: true });
+  }
+  if (!libraryLearn() || typeof b.url !== 'string' || typeof b.id !== 'string' || !/^[\w-]{2,64}$/.test(b.id)) return res.json({ ok: true });
+  const source = gifProvider();
+  const have = db.prepare('SELECT id FROM gif_library WHERE source = ? AND source_id = ?').get(source, b.id);
+  if (have) { db.prepare('UPDATE gif_library SET uses = uses + 1, last_used = ? WHERE id = ?').run(now(), have.id); return res.json({ ok: true }); }
+  let u;
+  try { u = new URL(b.url); } catch { return res.json({ ok: true }); }
+  if (!(u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname))) return res.json({ ok: true });
+  res.json({ ok: true }); // the download happens in the background
+  try {
+    const r = await fetch(u, { headers: { 'User-Agent': 'Hearth' }, signal: AbortSignal.timeout(15000) });
+    const type = r.headers.get('content-type') || '';
+    if (!r.ok || !/^image\/(gif|webp|png)/.test(type)) return;
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > LIB_MAX_MB * MB) return;
+    const ext = type.includes('webp') ? '.webp' : type.includes('png') ? '.png' : '.gif';
+    addToLibrary({ buf, ext, title: b.title, tags: b.query, sticker: !!b.sticker, source, sourceId: b.id, userId: null });
+  } catch { /* not important */ }
+}));
+api.delete('/gifs/library/:id', auth, (req, res) => {
+  if (!isStaff(req.userId)) fail(403, 'Only staff can remove GIFs from the library.');
+  const g = db.prepare('SELECT * FROM gif_library WHERE id = ?').get(String(req.params.id).replace(/^lib:/, ''));
+  if (!g) fail(404, 'Already gone.');
+  db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
+  fs.promises.unlink(path.join(UPLOAD_DIR, g.file)).catch(() => {});
+  adminLog(req, 'gif_removed', g.id, g.title);
+  res.json({ ok: true });
+});
+api.put('/admin/gif-library', auth, (req, res) => {
+  requireInstanceAdmin(req.userId);
+  const b = req.body || {};
+  if (['everyone', 'staff'].includes(b.who)) setSetting('gifLibraryWho', b.who);
+  if (b.learn !== undefined) setSetting('gifLibraryLearn', b.learn ? 'true' : 'false');
+  if (b.capMb !== undefined) { setSetting('gifLibraryCapMb', String(Math.max(100, Math.min(500000, parseInt(b.capMb, 10) || 5000)))); trimLibrary(); }
+  adminLog(req, 'gif_library_settings', null, `who=${libraryWho()} learn=${libraryLearn()} cap=${libraryCapMb()}MB`);
+  io.emit('config:update', { gifsEnabled: true });
+  res.json({ who: libraryWho(), learn: libraryLearn(), capMb: libraryCapMb() });
+});
 
 // GIF privacy proxy: viewers load GIPHY media through this server, so GIPHY never sees their IP.
 // Links carry a short-lived signed token (images can't send login headers), and only GIPHY's media
@@ -2154,10 +2309,10 @@ api.patch('/admin/settings', auth, (req, res) => {
   const b = req.body || {};
   if (b.giphyKey !== undefined) setSetting('giphyKey', String(b.giphyKey || '').trim().slice(0, 100) || null);
   if (b.klipyKey !== undefined) setSetting('klipyKey', String(b.klipyKey || '').trim().slice(0, 200) || null);
-  if (b.gifProvider === 'klipy' || b.gifProvider === 'giphy') { setSetting('gifProvider', b.gifProvider); gifCache.clear(); }
+  if (['klipy', 'giphy', 'library'].includes(b.gifProvider)) { setSetting('gifProvider', b.gifProvider); gifCache.clear(); gifLimitedUntil = 0; }
   if (b.giphyRating !== undefined && ['g', 'pg', 'pg-13', 'r'].includes(b.giphyRating)) setSetting('giphyRating', b.giphyRating);
   if (b.gifProxy !== undefined) setSetting('gifProxy', b.gifProxy ? 'true' : 'false');
-  io.emit('config:update', { gifsEnabled: !!gifKey(), gifProvider: gifProvider(), gifProxy: gifProxyOn() });
+  io.emit('config:update', { gifsEnabled: true, gifLibraryOnly: !gifKey(), gifProvider: gifProvider(), gifProxy: gifProxyOn() });
   res.json({ ok: true });
 });
 api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
@@ -2201,7 +2356,7 @@ api.get('/admin/turn', auth, (req, res) => {
 api.put('/admin/turn', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
   const b = req.body || {};
-  if (b.urls !== undefined) setSetting('turnUrls', String(b.urls || '').split(/[\s,]+/).filter((u) => /^turns?:/.test(u)).slice(0, 6).join(',') || null);
+  if (b.urls !== undefined) setSetting('turnUrls', String(b.urls || '').split(/[\s,]+/).filter((u) => /^turns?:/.test(u)).slice(0, 12).join(',') || null);
   if (b.secret !== undefined) setSetting('turnSecret', String(b.secret || '').trim().slice(0, 200) || null);
   res.json({ ok: true, urls: turnUrls(), secretSet: !!turnSecret() });
 });
@@ -2374,7 +2529,7 @@ api.post('/reports', auth, (req, res) => {
 // adminOnly: admins and the owner. staffOnly: moderators too. ownerOnly: just the owner.
 const adminOnly = (req, res, next) => { try { requireInstanceAdmin(req.userId); next(); } catch (e) { next(e); } };
 const staffOnly = (req, res, next) => (isStaff(req.userId) ? next() : next(new HttpError(403, 'Only staff can see this.')));
-const ownerOnly = (req, res, next) => (staffRole(req.userId) === 'owner' ? next() : next(new HttpError(403, 'Only the owner can change staff roles.')));
+const ownerOnly = (req, res, next) => (staffRole(req.userId) === 'owner' ? next() : next(new HttpError(403, 'Only the owner can do that.')));
 // Staff can only act on people ranked below them (the owner on everyone else).
 function requireOutranks(req, targetId) {
   const r = getUserRow(targetId);
@@ -2415,7 +2570,7 @@ api.get('/admin/stats', auth, staffOnly, (req, res) => {
     suspended: count('SELECT COUNT(*) n FROM users WHERE suspended_at IS NOT NULL'), openReports: count("SELECT COUNT(*) n FROM reports WHERE status IN ('open','reviewing')"),
     inVoice: [...voiceChannels.values()].reduce((a, m) => a + m.size, 0),
     uploadsBytes: uploadsBytes(), dbBytes, uptime: Math.round(process.uptime()), version: require('../package.json').version, node: process.version,
-    regMode: regMode(), series,
+    regMode: regMode(), series, health: health(),
   });
 });
 api.get('/admin/online', auth, staffOnly, async (req, res) => {
@@ -2449,7 +2604,7 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     ...brief(r.id), createdAt: r.created_at, lastSeen: r.last_seen_at, lastIp: r.last_ip, suspendedAt: r.suspended_at, suspendReason: r.suspend_reason,
     online: onlineSockets.has(r.id), isAdmin: isInstanceAdmin(r.id), ips: ipsOf(r.id), suspendedUntil: r.suspended_until,
     canAct: r.id !== req.userId && staffRank(req.userId) > staffRank(r.id), myRole: staffRole(req.userId),
-    storage: quotaOf(r.id), quotaOverride: r.upload_quota_mb, profileLocked: !!r.profile_locked,
+    storage: quotaOf(r.id), quotaOverride: r.upload_quota_mb, profileLocked: !!r.profile_locked, supporter: !!r.supporter,
     commentsWritten: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE author_id = ?').get(r.id).n,
     notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
       .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
@@ -2704,6 +2859,7 @@ api.put('/admin/terms', auth, adminOnly, (req, res) => {
 const pageViews = new Map(); // "viewer:owner" -> last counted, so reloading doesn't inflate the counter
 setInterval(() => { const t = now() - 3600000; for (const [k, v] of pageViews) if (v < t) pageViews.delete(k); }, 600000).unref();
 function canCommentOn(viewerId, row, page) {
+  if (!features().comments) return false;
   if (viewerId === row.id) return true;
   if (page.comments === 'off' || isBlocked(viewerId, row.id)) return false;
   return page.comments === 'everyone' ? true : areFriends(viewerId, row.id);
@@ -2723,7 +2879,7 @@ api.get('/users/:id/page', auth, (req, res) => {
   const prof = parseProfile(row);
   const blocked = isBlocked(req.userId, row.id);
   res.json({
-    page, pageBg: row.page_bg || null, views,
+    page: features().customCss ? page : { ...page, css: '' }, pageBg: row.page_bg || null, views,
     friendCount: db.prepare("SELECT COUNT(*) n FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)").get(row.id, row.id).n,
     topFriends: prof.topFriends.map((id) => publicUser(getUserRow(id))).filter(Boolean),
     isFriend: areFriends(req.userId, row.id),
@@ -2808,6 +2964,11 @@ api.patch('/admin/users/:id/limits', auth, staffOnly, (req, res) => {
   const b = req.body || {};
   const changes = [];
   if (b.uploadsBlocked !== undefined) { db.prepare('UPDATE users SET uploads_blocked = ? WHERE id = ?').run(b.uploadsBlocked ? 1 : 0, r.id); changes.push(b.uploadsBlocked ? 'uploads_blocked' : 'uploads_allowed'); }
+  if (b.supporter !== undefined) {
+    if (!isInstanceAdmin(req.userId)) fail(403, 'Only admins can mark supporters.');
+    db.prepare('UPDATE users SET supporter = ? WHERE id = ?').run(b.supporter ? 1 : 0, r.id);
+    changes.push(b.supporter ? 'supporter_added' : 'supporter_removed'); broadcastUser(r.id);
+  }
   if (b.profileLocked !== undefined) { db.prepare('UPDATE users SET profile_locked = ? WHERE id = ?').run(b.profileLocked ? 1 : 0, r.id); changes.push(b.profileLocked ? 'profile_locked' : 'profile_unlocked'); broadcastUser(r.id); }
   if (b.quotaMb !== undefined) {
     if (!isInstanceAdmin(req.userId)) fail(403, 'Only admins can change storage limits.');
@@ -2836,6 +2997,110 @@ api.delete('/admin/users/:id/comments', auth, staffOnly, (req, res) => {
   adminLog(req, 'comments_deleted', r.id, `${n} comments`);
   res.json({ ok: true, count: n });
 });
+
+// ---------------------------------------------------------------- owner tools
+// Branding, feature switches, funding, backups and server health.
+const brand = () => ({ name: (getSetting('brandName') || INSTANCE_NAME).slice(0, 40), tagline: (getSetting('brandTagline') || '').slice(0, 140) });
+const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, createServers: 'everyone' };
+function features() {
+  let v = {};
+  try { v = JSON.parse(getSetting('features') || '{}') || {}; } catch { /* defaults */ }
+  return { ...FEATURE_DEFAULTS, ...v };
+}
+function funding() {
+  let v = {};
+  try { v = JSON.parse(getSetting('funding') || '{}') || {}; } catch { /* none */ }
+  return { enabled: !!v.enabled, url: typeof v.url === 'string' ? v.url : '', monthly: +v.monthly || 0, raised: +v.raised || 0, currency: typeof v.currency === 'string' ? v.currency.slice(0, 3) : 'USD', note: typeof v.note === 'string' ? v.note : '' };
+}
+const fundingPublic = () => { const f = funding(); return f.enabled ? { ...f, supporters: db.prepare('SELECT COUNT(*) n FROM users WHERE supporter = 1').get().n } : null; };
+// How the machine is doing: CPU, memory, disk, connections and how responsive the server is.
+const { monitorEventLoopDelay } = require('perf_hooks');
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
+function health() {
+  let disk = null;
+  try { const st = fs.statfsSync(DATA_DIR); disk = { free: st.bavail * st.bsize, total: st.blocks * st.bsize }; } catch { /* older Node */ }
+  const h = {
+    cores: os.cpus().length, load: os.loadavg().map((x) => Math.round(x * 100) / 100), memTotal: os.totalmem(), memFree: os.freemem(),
+    rss: process.memoryUsage().rss, disk, sockets: io ? io.engine.clientsCount : 0, lagMs: Math.round(loopDelay.percentile(99) / 1e6), uptime: Math.round(process.uptime()),
+  };
+  loopDelay.reset();
+  return h;
+}
+api.get('/admin/owner', auth, ownerOnly, (req, res) => {
+  res.json({ brand: brand(), features: features(), funding: funding(), supporterQuotaMb: +(getSetting('supporterQuotaMb') || 0),
+    supporters: db.prepare('SELECT id FROM users WHERE supporter = 1').all().map((r) => brief(r.id)), backups: listBackups(), autoBackup: autoBackup() });
+});
+api.put('/admin/owner', auth, ownerOnly, (req, res) => {
+  const b = req.body || {};
+  if (b.brand) {
+    checkWords(b.brand.name, b.brand.tagline);
+    if (b.brand.name !== undefined) setSetting('brandName', String(b.brand.name).trim().slice(0, 40) || null);
+    if (b.brand.tagline !== undefined) setSetting('brandTagline', String(b.brand.tagline).trim().slice(0, 140) || null);
+  }
+  if (b.features) {
+    const f = features();
+    for (const k of ['customCss', 'comments', 'watch', 'gifs']) if (b.features[k] !== undefined) f[k] = !!b.features[k];
+    if (['everyone', 'staff'].includes(b.features.createServers)) f.createServers = b.features.createServers;
+    setSetting('features', JSON.stringify(f));
+  }
+  if (b.funding) {
+    const f = { ...funding(), ...b.funding };
+    if (f.url && !/^https:\/\/[^\s]+$/i.test(f.url)) fail(400, 'The donation link must start with https://');
+    setSetting('funding', JSON.stringify({ enabled: !!f.enabled, url: String(f.url || '').slice(0, 300), monthly: Math.max(0, Math.min(1e6, +f.monthly || 0)), raised: Math.max(0, Math.min(1e6, +f.raised || 0)),
+      currency: /^[A-Z]{3}$/.test(f.currency) ? f.currency : 'USD', note: String(f.note || '').slice(0, 300) }));
+  }
+  if (b.supporterQuotaMb !== undefined) setSetting('supporterQuotaMb', String(Math.max(0, Math.min(1e6, Math.round(+b.supporterQuotaMb) || 0))));
+  if (b.autoBackup) setSetting('autoBackup', JSON.stringify({ enabled: !!b.autoBackup.enabled, keep: Math.max(1, Math.min(60, Math.round(+b.autoBackup.keep) || 7)) }));
+  adminLog(req, 'owner_settings', null, Object.keys(b).join(', '));
+  io.emit('config:update', { name: brand().name, tagline: brand().tagline, features: features(), funding: fundingPublic() });
+  res.json({ ok: true });
+});
+// Database backups (copies of hearth.db made while the server runs). Uploaded files live in
+// data/uploads and are best backed up with the VPS's own snapshots.
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const autoBackup = () => { try { return { enabled: true, keep: 7, ...JSON.parse(getSetting('autoBackup') || '{}') }; } catch { return { enabled: true, keep: 7 }; } };
+function listBackups() {
+  try {
+    return fs.readdirSync(BACKUP_DIR).filter((f) => /^hearth-[\w.-]+\.db$/.test(f)).map((f) => { const st = fs.statSync(path.join(BACKUP_DIR, f)); return { name: f, size: st.size, at: st.mtimeMs }; }).sort((a, b) => b.at - a.at);
+  } catch { return []; }
+}
+async function makeBackup(kind) {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  const name = `hearth-${kind}-${new Date().toISOString().replace(/[:.]/g, '-')}.db`;
+  await db.backup(path.join(BACKUP_DIR, name));
+  return name;
+}
+api.post('/admin/backups', auth, ownerOnly, wrap(async (req, res) => {
+  rateLimit('backup:' + req.userId, 6, 3600000);
+  const name = await makeBackup('manual');
+  adminLog(req, 'backup_made', null, name);
+  res.json({ name, backups: listBackups() });
+}));
+api.get('/admin/backups/:name', auth, ownerOnly, (req, res) => {
+  const hit = listBackups().find((b) => b.name === req.params.name);
+  if (!hit) fail(404, 'Backup not found.');
+  adminLog(req, 'backup_downloaded', null, hit.name);
+  res.download(path.join(BACKUP_DIR, hit.name), hit.name);
+});
+api.delete('/admin/backups/:name', auth, ownerOnly, (req, res) => {
+  const hit = listBackups().find((b) => b.name === req.params.name);
+  if (!hit) fail(404, 'Backup not found.');
+  fs.unlinkSync(path.join(BACKUP_DIR, hit.name));
+  adminLog(req, 'backup_deleted', null, hit.name);
+  res.json({ backups: listBackups() });
+});
+// A copy of the database every day, keeping the newest few.
+setInterval(async () => {
+  const a = autoBackup();
+  if (!a.enabled) return;
+  const autos = listBackups().filter((b) => b.name.startsWith('hearth-auto-'));
+  if (autos.length && Date.now() - autos[0].at < 23.5 * 3600000) return;
+  try {
+    await makeBackup('auto');
+    listBackups().filter((b) => b.name.startsWith('hearth-auto-')).slice(a.keep).forEach((b) => fs.promises.unlink(path.join(BACKUP_DIR, b.name)).catch(() => {}));
+  } catch (e) { console.error('Automatic backup failed:', e.message); }
+}, 3600000).unref();
 
 // One-time: list files uploaded before storage tracking existed, so quotas count them too.
 function indexOldFiles() {
@@ -2916,12 +3181,56 @@ function callees(room, callerId) {
   if (!srv || srv.kind !== 'group') return [];
   return db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(srv.id).map((r) => r.user_id).filter((u) => u !== callerId);
 }
+// ---------------------------------------------------------------- watch together
+// One shared player per call: what's playing, where it was at `updatedAt` and whether it's playing.
+// Everyone in the call keeps their player in step with it; late joiners jump straight in.
+const watchRooms = new Map(); // room -> { item, queue, playing, position, rate, updatedAt, by, hostOnly }
+function parseWatchUrl(raw) {
+  let u;
+  try { u = new URL(String(raw || '').trim()); } catch { fail(400, 'Paste a link to a video.'); }
+  const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, '');
+  const secs = (t) => { if (!t) return 0; if (/^\d+$/.test(t)) return +t; const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(t); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0; };
+  if (!/^https?:$/.test(u.protocol)) fail(400, 'Paste a link to a video.');
+  if (['youtube.com', 'youtube-nocookie.com'].includes(host) || host === 'youtu.be') {
+    const id = host === 'youtu.be' ? u.pathname.slice(1, 12) : (u.searchParams.get('v') || (u.pathname.match(/^\/(?:shorts|embed|live|v)\/([\w-]{11})/) || [])[1]);
+    if (!/^[\w-]{11}$/.test(id || '')) fail(400, 'That YouTube link doesn\u2019t point to a video.');
+    return { kind: 'youtube', src: id, start: secs(u.searchParams.get('t') || u.searchParams.get('start')), link: `https://www.youtube.com/watch?v=${id}` };
+  }
+  if (host === 'vimeo.com' || host === 'player.vimeo.com') {
+    const id = (u.pathname.match(/(\d{5,12})/) || [])[1];
+    if (!id) fail(400, 'That Vimeo link doesn\u2019t point to a video.');
+    return { kind: 'vimeo', src: id, start: 0, link: `https://vimeo.com/${id}` };
+  }
+  if (host === 'twitch.tv') {
+    const ch = u.pathname.split('/')[1] || '';
+    if (!/^[a-z0-9_]{3,25}$/i.test(ch) || ['videos', 'directory', 'settings'].includes(ch)) fail(400, 'Paste the link of a live Twitch channel (twitch.tv/name).');
+    return { kind: 'twitch', src: ch.toLowerCase(), start: 0, link: `https://twitch.tv/${ch}`, live: true };
+  }
+  if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(u.pathname) && /^https?:$/.test(u.protocol)) return { kind: 'video', src: u.href, start: 0, link: u.href };
+  fail(400, 'That site isn\u2019t supported yet. YouTube, Vimeo, Twitch (live) and direct video files (.mp4, .webm) work. For anything else, share your screen.');
+}
+async function watchTitle(item) {
+  try {
+    const api = item.kind === 'youtube' ? `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(item.link)}`
+      : item.kind === 'vimeo' ? `https://vimeo.com/api/oembed.json?url=${encodeURIComponent(item.link)}` : null;
+    if (!api) return item.kind === 'twitch' ? `${item.src} (live on Twitch)` : decodeURIComponent(item.src.split('/').pop()).slice(0, 120);
+    const r = await fetch(api, { signal: AbortSignal.timeout(4000) });
+    if (!r.ok) return '';
+    const j = await r.json();
+    return String(j.title || '').slice(0, 150);
+  } catch { return ''; }
+}
+const watchOut = (room) => { const w = watchRooms.get(room); return w ? { ...w, serverNow: Date.now() } : null; };
+const emitWatch = (room) => io.to(`voice:${room}`).emit('watch:state', { room, state: watchOut(room) });
+// Where the video is right now, according to the shared state.
+const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 1000) * w.rate : 0);
+
 function leaveVoice(userId, notifyUser = false) {
   const channelId = userVoice.get(userId);
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
   const state = m && m.get(userId);
-  if (m) { m.delete(userId); if (!m.size) voiceChannels.delete(channelId); }
+  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); } }
   userVoice.delete(userId);
   if (state) {
     const sock = io.sockets.sockets.get(state.socketId);
@@ -3016,6 +3325,7 @@ function setupSockets(server) {
       userVoice.set(uid, c.id);
       socket.join(`voice:${c.id}`);
       emitVoiceState(c.id);
+      if (watchRooms.has(c.id)) socket.emit('watch:state', { room: c.id, state: watchOut(c.id) });
       // First one in a DM or group call: ring everyone else (and push-notify them if their app is closed).
       if (!peers.length) {
         const ring = callees(c.id, uid);
@@ -3055,6 +3365,78 @@ function setupSockets(server) {
       const m = voiceChannels.get(room);
       if (m) for (const [u] of m) io.to(`user:${u}`).emit('call:declined', { room, userId: uid });
       io.to(`user:${uid}`).emit('call:end', { room });
+    }));
+
+    // Watch together (only people in the call).
+    const myWatchRoom = () => {
+      const room = userVoice.get(uid);
+      if (!room || voiceChannels.get(room)?.get(uid)?.socketId !== socket.id) fail(400, 'Join the call first.');
+      return room;
+    };
+    const mayControl = (room, w) => !w.hostOnly || w.by === uid || isStaff(uid)
+      || (!room.startsWith('dm:') && (() => { const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(room); return c && (perms.channel(serverOf(c), c, uid) & PM.MANAGE_CHANNELS); })());
+    socket.on('watch:start', guard((p = {}) => {
+      if (!features().watch) fail(403, 'Watch together is turned off on this server.');
+      const room = myWatchRoom();
+      const item = { ...parseWatchUrl(p.url), id: newId(), title: '', addedBy: uid };
+      const cur = watchRooms.get(room);
+      if (cur && p.queue) {
+        if (!mayControl(room, cur) && cur.hostOnly) fail(403, 'Only the host can add videos.');
+        if (cur.queue.length >= 25) fail(400, 'The queue is full (25).');
+        cur.queue.push(item);
+      } else {
+        if (cur && !mayControl(room, cur)) fail(403, 'Only the host can change the video.');
+        watchRooms.set(room, { item, queue: cur ? cur.queue : [], playing: true, position: item.start || 0, rate: 1, updatedAt: Date.now(), by: cur && cur.hostOnly ? cur.by : uid, hostOnly: cur ? cur.hostOnly : !!p.hostOnly });
+      }
+      emitWatch(room);
+      watchTitle(item).then((t) => { if (t) { item.title = t; emitWatch(room); } });
+      return { ok: true };
+    }));
+    socket.on('watch:control', guard((p = {}) => {
+      const room = myWatchRoom();
+      const w = watchRooms.get(room);
+      if (!w) fail(404, 'Nothing is playing.');
+      if (!mayControl(room, w)) fail(403, 'Only the host controls playback.');
+      if (p.itemId && p.itemId !== w.item.id) return { ok: true }; // about an older video
+      const pos = Number.isFinite(+p.position) ? Math.max(0, +p.position) : watchPos(w);
+      if (p.action === 'play') { w.playing = true; w.position = pos; }
+      else if (p.action === 'pause') { w.playing = false; w.position = pos; }
+      else if (p.action === 'seek') { w.position = pos; }
+      else if (p.action === 'rate' && [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].includes(+p.rate)) { w.position = watchPos(w); w.rate = +p.rate; }
+      else if (p.action === 'hostOnly' && (w.by === uid || isStaff(uid))) { w.hostOnly = !!p.value; }
+      else return { ok: true };
+      w.updatedAt = Date.now();
+      emitWatch(room);
+      return { ok: true };
+    }));
+    // The video ended (or someone pressed "next"): play the next one in the queue.
+    socket.on('watch:next', guard((p = {}) => {
+      const room = myWatchRoom();
+      const w = watchRooms.get(room);
+      if (!w || (p.itemId && p.itemId !== w.item.id)) return { ok: true };
+      if (p.skip && !mayControl(room, w)) fail(403, 'Only the host can skip.');
+      if (!w.queue.length) { w.playing = false; w.position = watchPos(w); w.updatedAt = Date.now(); emitWatch(room); return { ok: true }; }
+      w.item = w.queue.shift();
+      Object.assign(w, { playing: true, position: w.item.start || 0, rate: 1, updatedAt: Date.now() });
+      emitWatch(room);
+      return { ok: true };
+    }));
+    socket.on('watch:remove', guard((p = {}) => {
+      const room = myWatchRoom();
+      const w = watchRooms.get(room);
+      if (!w) return { ok: true };
+      const it = w.queue.find((x) => x.id === p.itemId);
+      if (it && (it.addedBy === uid || mayControl(room, w))) { w.queue = w.queue.filter((x) => x !== it); emitWatch(room); }
+      return { ok: true };
+    }));
+    socket.on('watch:stop', guard(() => {
+      const room = myWatchRoom();
+      const w = watchRooms.get(room);
+      if (!w) return { ok: true };
+      if (!mayControl(room, w)) fail(403, 'Only the host can stop it.');
+      watchRooms.delete(room);
+      io.to(`voice:${room}`).emit('watch:state', { room, state: null });
+      return { ok: true };
     }));
 
     socket.on('voice:leave', guard(() => {

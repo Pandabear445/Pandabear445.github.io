@@ -1147,17 +1147,18 @@ function instanceTab(app) {
       h('p', { class: 'muted-p' }, 'Settings for this whole Hearth server. Only you see this page.'),
       h('div', null, h('button', { class: 'btn primary', onclick: () => { document.querySelector('.set-close')?.click(); app.openAdmin(); } }, icon('shield'), 'Open admin dashboard')),
       section('GIF search',
-        h('p', { class: 'muted-p' }, st.klipyKeySet || st.giphyKeySet ? `GIF search is on, using ${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'}. Popular results are cached and shared, so they don\u2019t use up your limit.` : 'GIF search is off until you add a free key.'),
-        h('div', { class: 'chips' }, [['klipy', 'KLIPY (recommended, free)'], ['giphy', 'GIPHY']].map(([k, l]) => h('button', {
+        h('p', { class: 'muted-p' }, st.gifProvider === 'library' ? 'Only this server\u2019s own GIF library is used: free, no key, no limits. Add GIFs from the GIF picker \u2192 This server tab.'
+          : st.klipyKeySet || st.giphyKeySet ? `GIF search is on, using ${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'}. Popular results are cached and shared, and if the limit is ever reached the picker switches to this server\u2019s own library instead of failing.` : 'No key yet: the GIF picker uses this server\u2019s own library (free, no limits) until you add one.'),
+        h('div', { class: 'chips' }, [['klipy', 'KLIPY (recommended, free)'], ['giphy', 'GIPHY'], ['library', 'Only our own library']].map(([k, l]) => h('button', {
           class: `chip${st.gifProvider === k ? ' active' : ''}`, onclick: async () => { await api('PATCH', '/admin/settings', { gifProvider: k }); toast('Saved.'); draw(); },
         }, l))),
-        st.gifProvider === 'giphy' ? h('p', { class: 'field-hint' }, 'GIPHY\u2019s free beta keys allow about 100 searches an hour for the whole server. KLIPY offers free production keys with no limit.') : h('ol', { class: 'steps' },
+        st.gifProvider === 'library' ? null : st.gifProvider === 'giphy' ? h('p', { class: 'field-hint' }, 'GIPHY\u2019s free beta keys allow about 100 searches an hour for the whole server. KLIPY offers free production keys with no limit.') : h('ol', { class: 'steps' },
           h('li', null, 'Sign up at ', h('a', { href: 'https://partner.klipy.com/api-keys', target: '_blank', rel: 'noopener' }, 'partner.klipy.com'), ' (free) and create an API key ("Add platform").'),
           h('li', null, 'Paste it below, click Test, then Save.'),
           h('li', null, 'Test keys allow 100 searches an hour. In the KLIPY panel, ', h('strong', null, 'request production access'), ' \u2014 it\u2019s free and removes the limit.')),
-        h('div', { class: 'row gap' }, keyIn, h('button', { class: 'btn ghost', onclick: test }, 'Test')),
-        result,
-        h('div', { class: 'row gap' },
+        st.gifProvider === 'library' ? null : h('div', { class: 'row gap' }, keyIn, h('button', { class: 'btn ghost', onclick: test }, 'Test')),
+        st.gifProvider === 'library' ? null : result,
+        st.gifProvider === 'library' ? null : h('div', { class: 'row gap' },
           h('button', { class: 'btn primary', onclick: async () => {
             if (!keyIn.value.trim()) return toast('Paste a key first.', 'error');
             if (!(await test())) return;

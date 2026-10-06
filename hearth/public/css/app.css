@@ -2091,3 +2091,45 @@ html.lite .av::before, html.lite .uname, html.lite .mys-name.glitter, html.lite 
 html.lite .pfx { display: none; }
 html.lite .modal-backdrop { background: rgb(6 4 10 / .78); }
 html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
+
+/* GIF library */
+.gif-notice { font-size: 12px; color: var(--text-2); background: rgb(var(--accent-rgb) / .12); border-radius: 8px; padding: 6px 10px; }
+.gif-credit { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.gif-del { position: absolute; top: 4px; left: 4px; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; background: rgb(0 0 0 / .6); color: #fff; opacity: 0; transition: opacity .12s; }
+.gif-del .ic { width: 12px; height: 12px; }
+.gif-btn:hover .gif-del { opacity: 1; }
+
+/* ------------------------------------------------------------------ watch together */
+.cs-watch-host { min-height: 0; }
+.wt { display: flex; flex-direction: column; gap: 8px; }
+.wt-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; max-height: 62vh; background: #000; border-radius: 12px; overflow: hidden; }
+.wt-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+.wt-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.wt-title { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.wt-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-kind { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--accent-ink); }
+.wt-sub { font-size: 12px; color: var(--muted); }
+.wt-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.wt-actions .btn.active { background: rgb(var(--accent-rgb) / .18); }
+.wt-queue:empty { display: none; }
+.wt-queue { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 10px; background: var(--hover); }
+.wt-qh { font-size: 12px; font-weight: 700; color: var(--text-2); }
+.wt-qi { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto auto; align-items: center; gap: 8px; font-size: 13px; }
+.wt-qn { color: var(--muted); text-align: right; }
+.wt-qt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.call-stage.watching .cs-grid, .call-stage.watching .cs-spot { max-height: 180px; }
+.call-stage.watching .cs-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+.call-stage.watching { overflow-y: auto; }
+
+/* Funding + supporters */
+.auth-tagline { margin: -6px 0 10px; color: var(--text-2); text-align: center; }
+.fund-card { display: flex; align-items: center; gap: 16px; padding: 14px 16px; border-radius: 14px; border: 1px solid rgb(var(--accent-rgb) / .35); background: linear-gradient(135deg, rgb(var(--accent-rgb) / .14), rgb(var(--accent-rgb) / .04)); }
+.fund-text { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; font-size: 13.5px; color: var(--text-2); }
+.fund-text strong { color: var(--text); font-size: 15px; }
+.fund-bar { height: 8px; border-radius: 99px; background: var(--active); overflow: hidden; margin-top: 4px; }
+.fund-bar > i { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.fund-meta { font-size: 12px; color: var(--muted); }
+.fund-actions { display: flex; flex-direction: column; gap: 6px; }
+.supporter-tag { display: inline-flex; align-items: center; margin-left: 8px; padding: 1px 8px; border-radius: 99px; font-size: 11.5px; font-weight: 700; background: rgb(176 124 255 / .18); color: #c9a6ff; }
+@media (max-width: 600px) { .fund-card { flex-direction: column; align-items: stretch; } .fund-actions { flex-direction: row; } }
+.mono-sm { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }

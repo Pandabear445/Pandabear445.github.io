@@ -172,7 +172,8 @@ export function profileCard(u, { meId = '', actions = null, compact = false, mut
   }
   const inner = h('div', { class: 'pc-inner' });
   inner.append(nameEl(u, { tag: 'div', cls: 'pc-name' }));
-  inner.append(h('div', { class: 'pc-handle' }, u.username, p.pronouns ? h('span', { class: 'pc-pronouns' }, p.pronouns) : null));
+  inner.append(h('div', { class: 'pc-handle' }, u.username, p.pronouns ? h('span', { class: 'pc-pronouns' }, p.pronouns) : null,
+    u.supporter ? h('span', { class: 'supporter-tag', title: 'Helps pay for this server' }, '\uD83D\uDC9C Supporter') : null));
   if (p.bio) {
     inner.append(h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'About me'), h('div', { class: 'pc-bio', html: md(p.bio) })));
   }

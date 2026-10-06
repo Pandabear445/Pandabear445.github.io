@@ -6,7 +6,7 @@ import { modal, confirmDialog, field, menu } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['storage', 'Storage & limits', 'download', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['storage', 'Storage & limits', 'download', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['owner', 'Owner', 'flame', 3]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
 export const ROLE_LABEL = { owner: 'Owner', admin: 'Admin', moderator: 'Moderator' };
 const ROLE_HINT = {
@@ -62,7 +62,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
-    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, owner })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
 
   async function overview() {
@@ -86,7 +86,23 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         card('Storage', fmtSize(s.uploadsBytes + s.dbBytes), `files ${fmtSize(s.uploadsBytes)} \u00b7 database ${fmtSize(s.dbBytes)}`),
         card('Registration', { open: 'Open', closed: 'Closed', code: 'Invite code' }[s.regMode], ''),
         card('Running', dur(s.uptime * 1000), `v${s.version} \u00b7 Node ${s.node}`)),
-      h('div', { class: 'charts' }, chart('Messages per day', 'messages', max, ''), chart('New accounts per day', 'signups', maxU, 'alt'), chart('Active people per day', 'active', maxU, 'alt2')));
+      h('div', { class: 'charts' }, chart('Messages per day', 'messages', max, ''), chart('New accounts per day', 'signups', maxU, 'alt'), chart('Active people per day', 'active', maxU, 'alt2')),
+      healthCards(s.health));
+  }
+  function healthCards(hl) {
+    if (!hl) return '';
+    const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+    const memUsed = hl.memTotal - hl.memFree;
+    const cpu = Math.round((hl.load[0] / hl.cores) * 100);
+    const card = (label, value, sub, warn) => h('div', { class: `stat${warn ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, label), h('strong', null, value), sub ? h('span', { class: 'stat-sub' }, sub) : null);
+    return h('div', null,
+      h('div', { class: 'admin-head' }, h('h3', null, 'Server health'), h('span', { class: 'field-hint' }, 'Right now, on this machine')),
+      h('div', { class: 'stats' },
+        card('CPU', `${cpu}%`, `load ${hl.load.join(' / ')} on ${hl.cores} cores`, cpu > 80),
+        card('Memory', `${pct(memUsed, hl.memTotal)}%`, `${fmtSize(memUsed)} of ${fmtSize(hl.memTotal)} \u00b7 Hearth uses ${fmtSize(hl.rss)}`, pct(memUsed, hl.memTotal) > 90),
+        hl.disk ? card('Disk', `${pct(hl.disk.total - hl.disk.free, hl.disk.total)}% used`, `${fmtSize(hl.disk.free)} free of ${fmtSize(hl.disk.total)}`, hl.disk.free < 5 * 1024 ** 3) : null,
+        card('Connections', String(hl.sockets), 'open app windows'),
+        card('Responsiveness', `${hl.lagMs} ms`, hl.lagMs < 50 ? 'snappy' : hl.lagMs < 200 ? 'a little busy' : 'struggling \u2014 consider a bigger server', hl.lagMs >= 200)));
   }
 
   async function online() {
@@ -231,7 +247,19 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   }
 
   async function storage() {
-    const st = await api('GET', '/admin/storage');
+    const [st, gl] = await Promise.all([api('GET', '/admin/storage'), api('GET', '/gifs/library')]);
+    const gifCap = h('input', { class: 'input', type: 'number', min: '100', step: '100', value: String(gl.capMb) });
+    const saveGif = async (patch) => { try { await api('PUT', '/admin/gif-library', patch); toast('Saved.'); storage(); } catch (e) { toast(e.message, 'error'); } };
+    const gifSection = [
+      h('div', { class: 'admin-head' }, h('h3', null, 'GIF library')),
+      h('p', { class: 'field-hint' }, `${gl.count} GIFs, ${fmtSize(gl.bytes)}. These live on this server: free to search and send, no limits, and the picker falls back to them whenever KLIPY or GIPHY says "too many requests".`),
+      h('div', { class: 'kv' }, h('span', null, 'Who can add GIFs'), h('div', { class: 'chips' }, [['everyone', 'Everyone'], ['staff', 'Staff only']].map(([k, l]) => h('button', { class: `chip${gl.who === k ? ' active' : ''}`, onclick: () => saveGif({ who: k }) }, l)))),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Keep a copy of GIFs people send from KLIPY/GIPHY'),
+        h('span', { class: 'field-hint' }, 'Popular GIFs then work even when the API limit is reached. Check your provider\u2019s terms first: some don\u2019t allow storing their GIFs.')),
+      h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: gl.learn, onchange: (e) => saveGif({ learn: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+      h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'Largest the library may get'), h('div', { class: 'row gap tight' }, gifCap, h('span', { class: 'stat-sub' }, 'MB'), h('button', { class: 'btn ghost sm', onclick: () => saveGif({ capMb: gifCap.value }) }, 'Save')),
+        h('span', { class: 'field-hint' }, 'When it\u2019s full, the least-used automatically collected GIFs make room first.')),
+    ];
     const L = { ...st.limits };
     const num = (k, label, hint) => {
       const inp = h('input', { class: 'input', type: 'number', min: '0', step: '1', value: String(L[k]), oninput: (e) => { L[k] = e.target.value; } });
@@ -264,6 +292,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', null, `${fmtSize(r.bytes)}${r.quotaMb ? ` / ${r.quotaMb} MB` : ''}`, r.blocked ? h('span', { class: 'badge-tag bad' }, 'Uploads off') : null),
           h('span', { class: 'stat-sub' }, ago(r.last)),
           h('button', { class: 'btn ghost sm', onclick: () => r.user && openUser(r.user.id) }, 'Manage')))),
+      ...gifSection,
       h('div', { class: 'admin-head' }, h('h3', null, 'Word filter')),
       h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so they can\u2019t be filtered.'),
       words,
@@ -349,6 +378,61 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         : h('p', { class: 'field-hint' }, 'Only the owner can change roles.'));
   }
 
+  async function owner() {
+    const o = await api('GET', '/admin/owner');
+    const save = async (patch, msg = 'Saved.') => { try { await api('PUT', '/admin/owner', patch); toast(msg); owner(); } catch (e) { toast(e.message, 'error'); } };
+    const name = h('input', { class: 'input', maxlength: '40', value: o.brand.name });
+    const tagline = h('input', { class: 'input', maxlength: '140', value: o.brand.tagline, placeholder: 'e.g. Our little corner of the internet' });
+    const sw = (label, key, hint) => h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, label), hint ? h('span', { class: 'field-hint' }, hint) : null),
+      h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!o.features[key], onchange: (e) => save({ features: { [key]: e.target.checked } }) }), h('span', { class: 'switch-track' })));
+    const F = o.funding;
+    const fund = { url: h('input', { class: 'input', value: F.url, placeholder: 'https://ko-fi.com/yourname' }), monthly: h('input', { class: 'input', type: 'number', min: '0', value: String(F.monthly || '') }),
+      raised: h('input', { class: 'input', type: 'number', min: '0', value: String(F.raised || '') }), currency: h('input', { class: 'input', maxlength: '3', value: F.currency || 'USD' }),
+      note: h('input', { class: 'input', maxlength: '300', value: F.note, placeholder: 'Optional: your own message' }) };
+    const supQuota = h('input', { class: 'input', type: 'number', min: '0', value: String(o.supporterQuotaMb || '') , placeholder: '0 = same as everyone' });
+    const keep = h('input', { class: 'input', type: 'number', min: '1', max: '60', value: String(o.autoBackup.keep) });
+    const download = async (b) => {
+      try {
+        const r = await fetch(`/api/admin/backups/${encodeURIComponent(b.name)}`, { headers: { authorization: 'Bearer ' + localStorage.getItem('hearth.token') } });
+        if (!r.ok) throw new Error('Download failed.');
+        const url = URL.createObjectURL(await r.blob());
+        h('a', { href: url, download: b.name }).click();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      } catch (e) { toast(e.message, 'error'); }
+    };
+    clear(body).append(
+      h('div', { class: 'admin-head' }, h('h3', null, 'Name and welcome')),
+      h('div', { class: 'grid-2' }, field('Server name', name, 'Shown in the browser tab, on the login screen and in installed apps.'), field('Tagline', tagline, 'One line under the name on the login screen.')),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ brand: { name: name.value, tagline: tagline.value } }) }, 'Save')),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Features')),
+      h('p', { class: 'field-hint' }, 'Turn whole features on or off for everyone. Nothing is deleted when you turn something off.'),
+      sw('Watch together', 'watch', 'Synced YouTube, Vimeo, Twitch and video links in calls.'),
+      sw('GIF picker', 'gifs'),
+      sw('Profile comment walls', 'comments'),
+      sw('Custom CSS on profile pages', 'customCss', 'Turned off, everyone\u2019s page shows without their CSS (it\u2019s kept, not deleted).'),
+      h('div', { class: 'kv' }, h('span', null, 'Who can create servers'), h('div', { class: 'chips' }, [['everyone', 'Everyone'], ['staff', 'Staff only']].map(([k, l]) => h('button', { class: `chip${o.features.createServers === k ? ' active' : ''}`, onclick: () => save({ features: { createServers: k } }) }, l)))),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Funding and supporters')),
+      h('p', { class: 'field-hint' }, 'Show people what the server costs and where to chip in (Ko-fi, Patreon, Open Collective, Stripe link\u2026). It appears as a small card on everyone\u2019s Home screen that they can hide. Mark people who chip in as supporters under Users: they get a \uD83D\uDC9C badge and, if you like, more storage.'),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Show the funding card')), h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: F.enabled, onchange: (e) => save({ funding: { enabled: e.target.checked } }) }), h('span', { class: 'switch-track' }))),
+      h('div', { class: 'grid-2' }, field('Donation link', fund.url), field('Monthly cost', fund.monthly), field('Raised this month', fund.raised), field('Currency (USD, EUR\u2026)', fund.currency)),
+      field('Message', fund.note),
+      field('Storage for supporters (MB)', supQuota, 'More room for people who help pay. Empty or 0 = same limit as everyone.'),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value }) }, 'Save')),
+      o.supporters.length ? h('div', { class: 'adm-table' }, ...o.supporters.map((u) => h('div', { class: 'adm-row three' }, userCell(u, openUser), h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter'), h('button', { class: 'btn ghost sm', onclick: () => openUser(u.id) }, 'Manage')))) : h('p', { class: 'field-hint' }, 'No supporters yet.'),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Backups')),
+      h('p', { class: 'field-hint' }, 'A copy of the database (accounts, servers, encrypted messages) while everything keeps running. Pictures and files live in data/uploads; your VPS snapshots cover those. Keep downloaded backups somewhere safe: they contain everyone\u2019s encrypted data.'),
+      h('div', { class: 'row gap wrap' },
+        h('button', { class: 'btn primary', onclick: async (e) => { e.currentTarget.disabled = true; try { await api('POST', '/admin/backups'); toast('Backup made.'); owner(); } catch (x) { toast(x.message, 'error'); e.currentTarget.disabled = false; } } }, 'Back up now'),
+        h('label', { class: 'row gap tight' }, h('input', { type: 'checkbox', checked: o.autoBackup.enabled, onchange: (e) => save({ autoBackup: { enabled: e.target.checked, keep: keep.value } }) }), 'Automatic daily backup, keep'),
+        keep, h('button', { class: 'btn ghost sm', onclick: () => save({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save')),
+      o.backups.length ? h('div', { class: 'adm-table' }, ...o.backups.map((b) => h('div', { class: 'adm-row' }, h('span', { class: 'mono-sm' }, b.name), h('span', { class: 'stat-sub' }, fmtSize(b.size)), h('span', { class: 'stat-sub' }, ago(b.at)),
+        h('button', { class: 'btn ghost sm', onclick: () => download(b) }, 'Download'),
+        h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: 'Delete this backup?', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`); owner(); } } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No backups yet.'));
+  }
+
   async function log() {
     const list = await api('GET', '/admin/log');
     clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Audit log'), h('span', { class: 'field-hint' }, 'Every admin action, newest first')),
@@ -412,6 +496,7 @@ async function userModal(id, refresh, myRank = 2) {
         h('div', { class: 'kv' }, h('span', null, 'Profile comments written'), h('strong', null, String(u.commentsWritten))),
         u.canAct ? h('div', { class: 'row gap wrap' },
           h('button', { class: `chip${u.storage.blocked ? ' active' : ''}`, onclick: () => setLimits({ uploadsBlocked: !u.storage.blocked }, u.storage.blocked ? 'Uploads turned back on.' : 'Uploads turned off.') }, u.storage.blocked ? 'Uploads are off \u2014 turn on' : 'Turn off uploads'),
+          myRank >= 2 ? h('button', { class: `chip${u.supporter ? ' active' : ''}`, onclick: () => setLimits({ supporter: !u.supporter }, u.supporter ? 'No longer a supporter.' : 'Marked as a supporter. Thank you, them!') }, u.supporter ? '\uD83D\uDC9C Supporter \u2014 remove' : 'Mark as supporter') : null,
           h('button', { class: `chip${u.profileLocked ? ' active' : ''}`, onclick: () => setLimits({ profileLocked: !u.profileLocked }, u.profileLocked ? 'Profile unlocked.' : 'Profile locked.') }, u.profileLocked ? 'Profile is locked \u2014 unlock' : 'Lock profile'),
           myRank >= 2 ? h('button', { class: 'chip', onclick: () => {
             const inp = h('input', { class: 'input', type: 'number', min: '0', placeholder: 'empty = server default', value: u.quotaOverride != null ? String(u.quotaOverride) : '' });

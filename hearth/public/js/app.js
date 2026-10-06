@@ -14,12 +14,14 @@ import { Voice } from './voice.js';
 import { createSecure } from './secure.js';
 import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
+import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
 import { openSettings, applyAppearance } from './settings.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 
 // ======================================================================= state
 const S = {
+  watch: {}, // call room -> shared video (watch together)
   config: null,
   me: null,
   privateKey: null,
@@ -130,6 +132,7 @@ async function init() {
   try { S.config = await api('GET', '/config'); } catch { S.config = { name: 'Hearth', iceServers: [] }; }
   document.title = S.config.name;
   $$('[data-instance-name]').forEach((el) => { el.textContent = S.config.name; });
+  $$('[data-instance-tagline]').forEach((el) => { el.textContent = S.config.tagline || ''; el.hidden = !S.config.tagline; });
 
   const uid = localStorage.getItem('hearth.userId');
   if (getToken() && uid) {
@@ -287,13 +290,19 @@ function startApp() {
   socket.on('server:maintenance', ({ text }) => showUpdating('Down for maintenance', text || 'Back soon.'));
 
   // Someone came online, went offline or changed status: just update their dots and lists.
-  socket.on('user:presence', ({ id, presence }) => {
-    if (!S.me || !S.users[id]) return;
-    S.users[id] = { ...S.users[id], presence };
-    $$(`[data-user-av="${id}"][data-status="1"] .status-dot`).forEach((d) => {
-      d.className = d.className.replace(/\bst-\S+/, `st-${presence}`);
-      d.title = STATUS_LABEL[presence] || '';
-    });
+  socket.on('user:presence', (list) => {
+    if (!S.me) return;
+    let changed = false;
+    for (const { id, presence } of Array.isArray(list) ? list : [list]) {
+      if (!S.users[id] || id === S.me.id || S.users[id].presence === presence) continue;
+      changed = true;
+      S.users[id] = { ...S.users[id], presence };
+      $$(`[data-user-av="${id}"][data-status="1"] .status-dot`).forEach((d) => {
+        d.className = d.className.replace(/\bst-\S+/, `st-${presence}`);
+        d.title = STATUS_LABEL[presence] || '';
+      });
+    }
+    if (!changed) return;
     if (S.panel === 'members' || S.view.type === 'dm') later(renderPanel);
     if (['friends', 'home'].includes(S.view.type) && S.view.tab !== 'add') later(renderMain);
   });
@@ -325,6 +334,8 @@ function startApp() {
   socket.on('profile:comment', ({ from }) => toast(`${displayName(getUser(from))} commented on your profile.`));
   socket.on('config:update', (c) => {
     Object.assign(S.config, c);
+    if ('name' in c || 'tagline' in c) { document.title = S.config.name; $$('[data-instance-name]').forEach((el) => { el.textContent = S.config.name; }); }
+    if ('funding' in c && S.view.type === 'home') later(renderMain);
     if ('announcement' in c) renderAnnouncement();
     if (c.termsVersion) askToAcceptTerms();
     if (composers.main) composers.main.renderExtras();
@@ -458,6 +469,13 @@ function startApp() {
     clearTimeout(t.get(p.userId));
     t.set(p.userId, setTimeout(() => { t.delete(p.userId); if (currentKey() === key) renderTyping(); }, 6000));
     if (currentKey() === key) renderTyping();
+  });
+  socket.on('watch:state', ({ room, state }) => {
+    if (!S.me) return;
+    if (!voice || voice.channelId !== room) return;
+    S.watch[room] = state;
+    watchPlayer(room, watchCtx(room)).apply(state);
+    renderCallStages();
   });
   socket.on('voice:state', ({ channelId, users }) => {
     if (!S.me) return;
@@ -1423,6 +1441,26 @@ function notifyMenu(key) {
 }
 
 // ---- Home: a quick launchpad, not a wall of content
+// "Keep this server running": the owner's monthly cost, how much is covered, and where to chip in.
+// No ads, no tracking: just an honest number. It can be hidden for a month.
+function fundingCard() {
+  const f = S.config.funding;
+  if (!f || !f.enabled || !f.url) return null;
+  const hidKey = `hearth.fundHidden.${S.me.id}`;
+  if (+(localStorage.getItem(hidKey) || 0) > Date.now()) return null;
+  const money = (n) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: f.currency || 'USD', maximumFractionDigits: 0 }).format(n); } catch { return `${n} ${f.currency}`; } };
+  const pct = f.monthly ? Math.min(100, Math.round((f.raised / f.monthly) * 100)) : 0;
+  const card = h('section', { class: 'fund-card' },
+    h('div', { class: 'fund-text' },
+      h('strong', null, `Keep ${S.config.name} running`),
+      h('span', null, f.note || `No ads, no selling your data. This server costs ${money(f.monthly)} a month and is paid for by the people who use it.`),
+      f.monthly ? h('div', { class: 'fund-bar', role: 'progressbar', 'aria-valuenow': String(pct), 'aria-valuemin': '0', 'aria-valuemax': '100' }, h('i', { style: { width: pct + '%' } })) : null,
+      h('span', { class: 'fund-meta' }, f.monthly ? `${money(f.raised)} of ${money(f.monthly)} this month` : '', f.supporters ? ` \u00b7 ${f.supporters} supporter${f.supporters === 1 ? '' : 's'} \uD83D\uDC9C` : '')),
+    h('div', { class: 'fund-actions' },
+      h('a', { class: 'btn primary sm', href: f.url, target: '_blank', rel: 'noopener noreferrer' }, 'Chip in'),
+      h('button', { class: 'btn ghost sm', onclick: () => { localStorage.setItem(hidKey, String(Date.now() + 30 * 86400000)); card.remove(); } }, 'Hide for a month')));
+  return card;
+}
 function homeView() {
   const wrap = h('div', { class: 'home-view' });
   const hour = new Date().getHours();
@@ -1435,6 +1473,8 @@ function homeView() {
   const pinned = convs.filter((c) => favs.includes(c.fav));
   const section = (title, action, ...kids) => h('section', { class: 'home-sec' }, h('div', { class: 'home-sec-head' }, h('h3', null, title), action), ...kids);
 
+  const fundCard = fundingCard();
+  if (fundCard) wrap.append(fundCard);
   if (pinned.length) wrap.append(section('Pinned conversations', null, h('div', { class: 'conv-cards' }, pinned.map(convCard))));
   wrap.append(section('Recent conversations', h('button', { class: 'link-btn', onclick: () => openNewConversation() }, 'New message'),
     convs.length ? h('div', { class: 'conv-cards' }, convs.filter((c) => !favs.includes(c.fav)).slice(0, 6).map(convCard))
@@ -2616,7 +2656,7 @@ function createComposer({ id, key, threadId, placeholder }) {
     ta,
     h('div', { class: 'composer-tools' },
       h('button', { class: 'icon-btn', 'aria-label': 'Emoji', 'data-tip': 'Emoji', 'data-pop-anchor': '', onclick: (e) => emojiPicker(e.currentTarget, (em) => insertAtCursor(ta, em), { keepOpen: true }) }, icon('smile')),
-      h('button', { class: 'icon-btn', 'aria-label': 'GIFs', 'data-tip': 'GIFs', 'data-pop-anchor': '', onclick: (e) => gifPicker(e.currentTarget, (url) => send(url)) }, icon('gif')),
+      (S.config.features || {}).gifs === false ? null : h('button', { class: 'icon-btn', 'aria-label': 'GIFs', 'data-tip': 'GIFs', 'data-pop-anchor': '', onclick: (e) => gifPicker(e.currentTarget, (url) => send(url)) }, icon('gif')),
       sendBtn),
     fileIn);
   const slowNote = h('div', { class: 'slow-note', hidden: true });
@@ -2992,20 +3032,30 @@ function emojiPicker(anchor, onPick, { keepOpen = false } = {}) {
 const GIF_FAVS = 'hearth.gifFavs';
 const gifFavs = () => LS.get(GIF_FAVS, []);
 function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
-  let tab = startTab;
+  const libOnly = !!S.config.gifLibraryOnly;
+  let tab = libOnly && startTab !== 'favs' ? 'library' : startTab;
   let q = '';
   let next = null;
   let loading = false;
   let reqId = 0;
+  let lib = null; // { canAdd, count }
   const provName = S.config.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY';
-  const input = h('input', { class: 'input', placeholder: `Search ${provName}`, 'aria-label': 'Search GIFs' });
+  const input = h('input', { class: 'input', placeholder: libOnly ? 'Search this server’s GIFs' : `Search ${provName}`, 'aria-label': 'Search GIFs' });
   const seg = h('div', { class: 'seg' });
   const grid = h('div', { class: 'gif-grid', role: 'listbox' });
   const status = h('div', { class: 'gif-status' });
+  const notice = h('div', { class: 'gif-notice', hidden: true });
+  const credit = h('div', { class: 'gif-credit' });
+  // Picking a GIF: library GIFs are sent as a link to this server; the server also counts what's popular.
+  const pick = (g) => {
+    const out = g.library ? { ...g, url: location.origin + g.url } : g;
+    api('POST', '/gifs/used', { id: g.id, url: g.url, title: g.title, query: q, sticker: tab === 'stickers' }).catch(() => {});
+    onPick(out);
+  };
   const tile = (g) => {
     const fav = gifFavs().some((x) => x.id === g.id);
     return h('div', { class: 'gif-btn', role: 'option', tabindex: '0', 'aria-label': g.title || 'GIF',
-      onclick: () => onPick(g), onkeydown: (e) => { if (e.key === 'Enter') onPick(g); } },
+      onclick: () => pick(g), onkeydown: (e) => { if (e.key === 'Enter') pick(g); } },
     h('img', { src: mediaUrl(g.preview), alt: '', loading: 'lazy', style: { aspectRatio: `${g.width} / ${g.height}` } }),
     h('button', { class: `gif-fav${fav ? ' on' : ''}`, 'aria-label': fav ? 'Remove from favorites' : 'Add to favorites', 'data-tip': fav ? 'Unfavorite' : 'Favorite',
       onclick: (e) => {
@@ -3015,7 +3065,13 @@ function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
         LS.set(GIF_FAVS, has ? list.filter((x) => x.id !== g.id) : [g, ...list].slice(0, 100));
         e.currentTarget.classList.toggle('on', !has);
         if (tab === 'favs') draw();
-      } }, icon('star')));
+      } }, icon('star')),
+    g.library && S.me.staffRole ? h('button', { class: 'gif-del', 'aria-label': 'Remove from library', 'data-tip': 'Remove from library', onclick: async (e) => {
+      e.stopPropagation();
+      if (!(await confirmDialog({ title: 'Remove this GIF from the library?', confirm: 'Remove', danger: true }))) return;
+      await api('DELETE', `/gifs/library/${g.id}`).catch((x) => toast(x.message, 'error'));
+      e.target.closest('.gif-btn').remove();
+    } }, icon('close')) : null);
   };
   const showError = (msg) => {
     clear(grid);
@@ -3023,36 +3079,68 @@ function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
     grid.append(h('div', { class: 'gif-empty' }, h('p', null, msg),
       S.me && S.me.instanceAdmin && /set up|key/i.test(msg) ? h('button', { class: 'btn primary sm', onclick: () => { closePopover(); openSettings(app, 'instance'); } }, 'Set up GIF search') : null));
   };
+  // Add a GIF to this server's library (title + words people will search for).
+  const addGif = () => {
+    const fileIn = h('input', { type: 'file', accept: 'image/gif,image/webp,image/png', hidden: true });
+    fileIn.addEventListener('change', () => {
+      const f = fileIn.files[0];
+      if (!f) return;
+      if (f.size > 8 * 1024 * 1024) return toast('GIFs for the library can be up to 8 MB.', 'error');
+      const title = h('input', { class: 'input', maxlength: '120', placeholder: 'e.g. cat falling off couch', value: f.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ') });
+      const tags = h('input', { class: 'input', maxlength: '200', placeholder: 'funny, cat, fail' });
+      const sticker = h('input', { type: 'checkbox' });
+      closePopover();
+      modal({ title: 'Add to this server’s GIFs', size: 'sm',
+        body: h('div', { class: 'stack' }, field('Name', title), field('Search words', tags, 'Words people might type to find it.'), h('label', { class: 'row gap' }, sticker, 'It’s a sticker (transparent background)')),
+        actions: [{ label: 'Cancel' }, { label: 'Add GIF', kind: 'primary', action: async () => {
+          const fd = new FormData(); fd.append('file', f, f.name); fd.append('title', title.value); fd.append('tags', tags.value); fd.append('sticker', String(sticker.checked));
+          await upload('/gifs/library', fd); toast('Added. Everyone on this server can use it now.');
+        } }] });
+    });
+    fileIn.click();
+  };
   const load = async (more = false) => {
     if (loading || (more && next == null)) return;
     loading = true;
     const id = ++reqId;
     if (!more) { clear(grid); status.textContent = ''; grid.append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' }))); }
     try {
-      const res = await api('GET', `/gifs?type=${tab === 'stickers' ? 'stickers' : 'gifs'}&q=${encodeURIComponent(q)}&offset=${more ? encodeURIComponent(next) : ''}`);
+      const src = tab === 'library' ? '&source=library' : '';
+      const res = await api('GET', `/gifs?type=${tab === 'stickers' ? 'stickers' : 'gifs'}&q=${encodeURIComponent(q)}&offset=${more ? encodeURIComponent(next) : ''}${src}`);
       if (id !== reqId) return;
       if (!more) clear(grid);
+      notice.hidden = !res.limited && !res.stale;
+      notice.textContent = res.limited ? `${provName}’s limit was reached for now, so these come from this server’s own GIFs.` : res.stale ? 'Showing saved results while GIF search catches its breath.' : '';
       res.items.forEach((g) => grid.append(tile(g)));
       next = res.nextOffset;
-      if (!more && !res.items.length) grid.append(h('div', { class: 'gif-empty' }, h('p', null, 'No results. Try another word.')));
+      if (!more && !res.items.length) {
+        grid.append(h('div', { class: 'gif-empty' }, h('p', null, res.library ? (q ? 'No GIFs here match that yet.' : 'This server has no GIFs of its own yet.') : 'No results. Try another word.'),
+          res.library && lib && lib.canAdd ? h('button', { class: 'btn primary sm', onclick: addGif }, '+ Add a GIF') : null));
+      }
     } catch (e) { if (id === reqId) showError(e.message); } finally { loading = false; }
   };
   const categories = async () => {
     const id = ++reqId;
     clear(grid).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     try {
-      const cats = await api('GET', '/gifs/categories');
+      const cats = await api('GET', `/gifs/categories${tab === 'library' ? '?source=library' : ''}`);
       if (id !== reqId) return;
       clear(grid);
-      grid.append(h('button', { class: 'gif-cat trending', onclick: () => { q = ''; tab = 'gifs'; draw(true); } }, icon('arrowUp'), h('span', null, 'Trending')));
+      grid.append(h('button', { class: 'gif-cat trending', onclick: () => { q = ''; draw(true); } }, icon('arrowUp'), h('span', null, tab === 'library' ? 'Most used' : 'Trending')));
       cats.forEach((c) => grid.append(h('button', { class: 'gif-cat', onclick: () => { input.value = c.name; q = c.name; draw(); } },
         h('img', { src: mediaUrl(c.preview), alt: '', loading: 'lazy' }), h('span', null, c.name))));
+      if (tab === 'library' && !cats.length) draw(true);
     } catch (e) { if (id === reqId) showError(e.message); }
   };
   const draw = (trending = false) => {
     clear(seg);
-    [['gifs', 'GIFs'], ['stickers', 'Stickers'], ['favs', '\u2605 Favorites']].forEach(([k, l]) => seg.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
-    grid.classList.toggle('cats', tab === 'gifs' && !q && !trending);
+    const tabs = libOnly ? [['library', 'GIFs'], ['stickers', 'Stickers'], ['favs', '★ Favorites']]
+      : [['gifs', 'GIFs'], ['stickers', 'Stickers'], ['library', 'This server'], ['favs', '★ Favorites']];
+    tabs.forEach(([k, l]) => seg.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
+    clear(credit).append(tab === 'library' || libOnly ? h('span', null, 'This server’s own GIFs — free, no limits') : h('span', null, `Powered by ${provName}`),
+      (tab === 'library' || libOnly) && lib && lib.canAdd ? h('button', { class: 'link-btn', onclick: addGif }, '+ Add a GIF') : null);
+    grid.classList.toggle('cats', (tab === 'gifs' || tab === 'library') && !q && !trending);
+    notice.hidden = true;
     if (tab === 'favs') {
       reqId++;
       clear(grid);
@@ -3061,16 +3149,15 @@ function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
       favs.forEach((g) => grid.append(tile(g)));
       return;
     }
-    if (tab === 'gifs' && !q && !trending) return categories();
+    if ((tab === 'gifs' || tab === 'library') && !q && !trending) return categories();
     load();
   };
   input.addEventListener('input', debounce(() => { q = input.value.trim(); if (tab === 'favs') return draw(); draw(); }, 300));
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const first = grid.querySelector('.gif-btn'); if (first) first.click(); } });
   grid.addEventListener('scroll', () => { if (tab !== 'favs' && grid.scrollTop + grid.clientHeight > grid.scrollHeight - 300) load(true); });
-  if (!S.config.gifsEnabled) showError(S.me && S.me.instanceAdmin ? 'GIF search isn\u2019t set up yet. Add a free GIPHY key to turn it on for everyone.' : 'GIF search isn\u2019t turned on for this server yet. Ask the server admin to set it up.');
-  else draw();
+  api('GET', '/gifs/library').then((x) => { lib = x; draw(); }).catch(() => draw());
   setTimeout(() => input.focus(), 30);
-  return h('div', { class: 'gif-picker', style: { height: height + 'px' } }, input, seg, grid, status, h('div', { class: 'gif-credit' }, `Powered by ${provName}`));
+  return h('div', { class: 'gif-picker', style: { height: height + 'px' } }, input, seg, notice, grid, status, credit);
 }
 function gifPicker(anchor, onPick) {
   popover(anchor, gifPanel({ onPick: (g) => { closePopover(); onPick(g.url); } }), { side: 'top', align: 'end' });
@@ -4123,6 +4210,7 @@ function callControls(room) {
     h('button', { class: `round-btn${voice.muted ? ' off' : ''}`, 'data-tip': voice.muted ? 'Unmute' : 'Mute', 'aria-label': voice.muted ? 'Unmute' : 'Mute', onclick: () => { toggleMute(); renderCallStages(); } }, icon(voice.muted ? 'micOff' : 'mic')),
     h('button', { class: `round-btn${voice.deafened ? ' off' : ''}`, 'data-tip': voice.deafened ? 'Undeafen' : 'Deafen', 'aria-label': voice.deafened ? 'Undeafen' : 'Deafen', onclick: () => { toggleDeafen(); renderCallStages(); } }, icon(voice.deafened ? 'headphonesOff' : 'headphones')),
     h('button', { class: `round-btn${camOn ? ' on' : ''}`, 'data-tip': camOn ? 'Turn camera off' : 'Turn camera on', 'aria-label': camOn ? 'Turn camera off' : 'Turn camera on', 'aria-pressed': String(camOn), onclick: () => toggleCamera() }, icon(camOn ? 'video' : 'videoOff')),
+    (S.config.features || {}).watch === false ? null : h('button', { class: `round-btn${S.watch[room] ? ' on' : ''}`, 'data-tip': S.watch[room] ? 'Add a video to the queue' : 'Watch together', 'aria-label': 'Watch together', onclick: () => openWatchStart(room, !!S.watch[room]) }, icon('eye')),
     h('button', { class: `round-btn${scrOn ? ' on' : ''}`, 'data-tip': scrOn ? 'Stop sharing' : 'Share your screen', 'aria-label': scrOn ? 'Stop sharing your screen' : 'Share your screen', 'aria-pressed': String(scrOn), onclick: () => toggleScreen() }, icon('monitor')),
     h('button', { class: 'round-btn hang', 'data-tip': 'Leave call', 'aria-label': 'Leave call', onclick: () => { voice.leave(); playSound('selfLeave'); } }, icon('phoneOff')));
 }
@@ -4143,7 +4231,42 @@ function fillStage(el) {
   const body = spot
     ? h('div', { class: 'cs-spot' }, tileEl(room, tiles.find((t) => t.key === spot), true), h('div', { class: 'cs-strip' }, tiles.filter((t) => t.key !== spot).map((t) => tileEl(room, t, false))))
     : h('div', { class: `cs-grid n${Math.min(tiles.length, 9)}` }, tiles.map((t) => tileEl(room, t, false)));
-  clear(el).append(head, tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room));
+  // The shared video player sits in its own box that redraws leave alone (moving it would reload the video).
+  const inCall = voice && voice.channelId === room;
+  let host = el.querySelector(':scope > .cs-watch-host');
+  if (inCall && S.watch[room]) {
+    const p = watchPlayer(room, watchCtx(room));
+    if (!host) host = h('div', { class: 'cs-watch-host' });
+    if (p.el.parentNode !== host) { host.append(p.el); p.apply(S.watch[room]); }
+  } else {
+    if (!inCall) { dropWatchPlayer(room); delete S.watch[room]; }
+    if (host) { host.remove(); host = null; }
+  }
+  [...el.children].forEach((c) => { if (c !== host) c.remove(); });
+  const rest = [tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)];
+  if (host) { if (!host.parentNode) el.append(host); el.insertBefore(head, host); el.append(...rest); el.classList.add('watching'); }
+  else { el.append(head, ...rest); el.classList.remove('watching'); }
+}
+const watchCtx = (room) => ({
+  socket, me: S.me, isStaff: !!S.me.staffRole,
+  userName: (id) => (id ? displayName(getUser(id)) : 'someone'),
+  openStart: (queue) => openWatchStart(room, queue),
+});
+// Start (or queue) a video for everyone in the call.
+function openWatchStart(room, queue = false) {
+  const url = h('input', { class: 'input', placeholder: 'https://www.youtube.com/watch?v=\u2026', autocomplete: 'off', spellcheck: 'false' });
+  const hostOnly = h('input', { type: 'checkbox' });
+  modal({
+    title: queue ? 'Add to the queue' : 'Watch together', size: 'sm',
+    body: h('div', { class: 'stack' },
+      h('p', { class: 'muted-p' }, 'Everyone in this call sees the same video at the same moment. YouTube, Vimeo, Twitch (live) and video files (.mp4, .webm) work. For anything else (like Netflix), share your screen instead.'),
+      field('Link', url),
+      queue ? null : h('label', { class: 'row gap' }, hostOnly, 'Only I can play, pause and skip'),
+      h('p', { class: 'field-hint' }, 'The video loads straight from YouTube/Vimeo/Twitch, so they can see each viewer\u2019s IP address, like when you watch there.')),
+    actions: [{ label: 'Cancel' }, { label: queue ? 'Add to queue' : 'Start watching', kind: 'primary', action: () => new Promise((resolve, reject) => {
+      socket.emit('watch:start', { url: url.value, queue, hostOnly: hostOnly.checked }, (r) => (r && r.error ? reject(new Error(r.error)) : resolve()));
+    }) }],
+  });
 }
 function renderCallStages() { $$('.call-stage').forEach(fillStage); }
 

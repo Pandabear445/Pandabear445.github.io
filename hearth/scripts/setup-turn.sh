@@ -1,13 +1,48 @@
 #!/usr/bin/env bash
-# One-time setup of a TURN relay (coturn) so calls connect on every network: mobile data, CGNAT home
-# internet, school/office Wi-Fi. Run on the VPS as root:   bash scripts/setup-turn.sh
-# Safe to run again (it re-applies the same settings with a fresh secret).
+# Sets up a TURN relay (coturn) so calls connect on every network: mobile data, CGNAT home internet,
+# school/office Wi-Fi.
+#
+#   On the Hearth server:              bash scripts/setup-turn.sh
+#   Extra relay in another region      bash setup-turn.sh --relay-only --secret <secret>
+#   (a small, cheap VPS near people):  (get the secret with:  node server/cli.js get-turn-secret)
+#
+# Calls try every relay and use whichever works best, so people far from the main server get a
+# nearby relay. Safe to run again: it keeps the existing secret, so other relays keep working.
 set -Eeuo pipefail
 c_y=$'\033[1;33m'; c_g=$'\033[1;32m'; c_r=$'\033[1;31m'; c_0=$'\033[0m'
 step() { printf '%s▸%s %s\n' "$c_y" "$c_0" "$*"; }
 ok()   { printf '%s✓%s %s\n' "$c_g" "$c_0" "$*"; }
 die()  { printf '%s✗ %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Run this as root (or with sudo)."
+RELAY_ONLY=no; SECRET=""; NEW_SECRET=no
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --relay-only) RELAY_ONLY=yes ;;
+    --secret) SECRET="${2:-}"; shift ;;
+    --new-secret) NEW_SECRET=yes ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+[ "$RELAY_ONLY" = yes ] && [ -z "$SECRET" ] && die "An extra relay needs the main server's secret: --secret <secret> (on the Hearth server: node server/cli.js get-turn-secret)"
+
+# Find Hearth on this machine (not needed for --relay-only).
+find_hearth() {
+  local d="${HEARTH_DIR:-$(cat /etc/hearth-update.conf 2>/dev/null || true)}"
+  if [ -z "$d" ] || [ ! -f "$d/server/index.js" ]; then
+    d="$(find / \( -path /proc -o -path /sys -o -path /var/lib/docker -o -path /root/hearth-backups \) -prune -o -path '*/data/hearth.db' -print 2>/dev/null | head -1 | xargs -r dirname | xargs -r dirname)"
+  fi
+  echo "$d"
+}
+hearth_cli() { # run server/cli.js inside Hearth (Docker or plain)
+  ( cd "$DIR" && if docker compose ps -q hearth 2>/dev/null | grep -q .; then docker compose exec -T hearth node server/cli.js "$@"; else node server/cli.js "$@"; fi )
+}
+DIR=""
+if [ "$RELAY_ONLY" = no ]; then
+  DIR="$(find_hearth)"
+  # Keep the secret Hearth already uses, so relays in other regions keep working.
+  if [ -z "$SECRET" ] && [ "$NEW_SECRET" = no ] && [ -n "$DIR" ] && [ -f "$DIR/server/cli.js" ]; then SECRET="$(hearth_cli get-turn-secret 2>/dev/null | tail -1 || true)"; fi
+fi
 
 step "Installing coturn (the standard TURN relay)…"
 { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq coturn curl openssl; } >/dev/null 2>&1 || die "Couldn't install coturn."
@@ -17,7 +52,7 @@ PUBLIC_IP="$(curl -fsS --max-time 8 https://api.ipify.org || curl -fsS --max-tim
 PRIVATE_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}' | head -1)"
 EXTERNAL="$PUBLIC_IP"
 [ -n "$PRIVATE_IP" ] && [ "$PRIVATE_IP" != "$PUBLIC_IP" ] && EXTERNAL="$PUBLIC_IP/$PRIVATE_IP"
-SECRET="$(openssl rand -hex 32)"
+[ -n "$SECRET" ] || SECRET="$(openssl rand -hex 32)"
 
 step "Writing /etc/turnserver.conf…"
 [ -f /etc/turnserver.conf ] && cp /etc/turnserver.conf "/etc/turnserver.conf.bak-$(date +%s)"
@@ -70,19 +105,19 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: a
 fi
 
 URLS="turn:$PUBLIC_IP:3478?transport=udp,turn:$PUBLIC_IP:3478?transport=tcp"
-step "Connecting Hearth to the relay…"
-DIR="${HEARTH_DIR:-$(cat /etc/hearth-update.conf 2>/dev/null || true)}"
-if [ -z "$DIR" ] || [ ! -f "$DIR/server/index.js" ]; then
-  DIR="$(find / \( -path /proc -o -path /sys -o -path /var/lib/docker -o -path /root/hearth-backups \) -prune -o -path '*/data/hearth.db' -print 2>/dev/null | head -1 | xargs -r dirname | xargs -r dirname)"
+if [ "$RELAY_ONLY" = yes ]; then
+  printf '\n%s✓ Extra relay ready.%s Now add it to Hearth. On the Hearth server run:\n\n  node server/cli.js add-turn "%s"\n\n(or Settings → Instance → Calls → add these to the relay addresses).\n' "$c_g" "$c_0" "$URLS"
+  printf '\nIf this VPS provider has its own firewall (in their control panel), open UDP+TCP 3478 and UDP 49160-49400 there too.\n'
+  exit 0
 fi
+step "Connecting Hearth to the relay…"
 saved=no
 if [ -n "$DIR" ] && [ -f "$DIR/server/cli.js" ]; then
-  cd "$DIR"
-  if docker compose ps -q hearth 2>/dev/null | grep -q .; then docker compose exec -T hearth node server/cli.js set-turn "$URLS" "$SECRET" && saved=yes
-  elif command -v node >/dev/null 2>&1; then node server/cli.js set-turn "$URLS" "$SECRET" && saved=yes; fi
+  hearth_cli add-turn "$URLS" "$SECRET" && saved=yes
 fi
 if [ "$saved" = yes ]; then
   ok "Done. Calls now fall back to the relay automatically when a direct connection isn't possible."
+  printf 'To add a relay in another region later, run this on a small VPS there:\n  bash setup-turn.sh --relay-only --secret %s\n' "$SECRET"
 else
   printf '\nCouldn'"'"'t save it into Hearth automatically. In Hearth go to Settings \u2192 Instance \u2192 Calls and enter:\n  Relay addresses: %s\n  Shared secret:   %s\n' "$URLS" "$SECRET"
 fi

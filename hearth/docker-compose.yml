@@ -16,6 +16,9 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/data
+    # Each open app window is one connection; keep the limit high so it never caps how many can be online.
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
 
   caddy:
     image: caddy:2

@@ -279,6 +279,20 @@ if [ "$ACTION" = status ]; then
   printf '  database:  %s\n' "$(du -sh data/hearth.db 2>/dev/null | cut -f1 || echo '?')"
   printf '  backups:   %s in %s (newest: %s)\n' "$(backups | wc -l)" "$BACKUP_ROOT" "$(basename "$(backups | head -1)" 2>/dev/null || echo none)"
   [ -f .env ] || warn "There's no .env file, so every setting is at its default (that's fine for a quick start)."
+  # How many connections Hearth may hold open (each open app window is one).
+  HPID=""
+  case $MODE in
+    docker) HPID="$(docker inspect -f '{{.State.Pid}}' "$($DC ps -q hearth 2>/dev/null | head -1)" 2>/dev/null || true)" ;;
+    systemd) HPID="$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || true)" ;;
+    *) HPID="$(plain_pid | head -1)" ;;
+  esac
+  if [ -n "$HPID" ] && [ "$HPID" != 0 ] && [ -r "/proc/$HPID/limits" ]; then
+    NOFILE="$(awk '/Max open files/ { print $4 }' "/proc/$HPID/limits")"
+    printf '  max connections: about %s\n' "$NOFILE"
+    if [ "${NOFILE:-0}" -lt 10000 ] 2>/dev/null; then
+      warn "Hearth can only keep about $NOFILE connections open, so roughly that many people can be online. Raise it: systemd: add LimitNOFILE=65535 under [Service] in $UNIT; Docker: add 'ulimits: nofile: 65535' to the hearth service in docker-compose.yml. Then restart."
+    fi
+  fi
   if [ "$MODE" = docker ] && [ -f deploy/Caddyfile ] && grep -q 'chat.example.com' deploy/Caddyfile && [ -n "$($DC --profile domain ps -q caddy 2>/dev/null || true)" ]; then
     warn "deploy/Caddyfile still says chat.example.com — replace it with your domain."
   fi
@@ -322,6 +336,8 @@ step "Unpacking the update…"
 unzip -q "$ZIP" -d "$WORK"
 NEW="$WORK/hearth"
 ok "New version: $(version "$NEW")"
+# Keep the updater itself up to date too (when run as "hearth-update <zip>", the old copy is what's running).
+if [ -f "$NEW/scripts/hearth-update.sh" ]; then cp "$NEW/scripts/hearth-update.sh" /usr/local/bin/hearth-update && chmod +x /usr/local/bin/hearth-update; fi
 
 BK="$BACKUP_ROOT/$(date +%F-%H%M%S)"
 mkdir -p "$BK"
