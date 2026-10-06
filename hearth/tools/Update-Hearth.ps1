@@ -1,7 +1,8 @@
 # Hearth updater for Windows.
 # Double-click Update-Hearth.bat, or drag an update .zip onto it.
 # It uploads the update to your server and runs the safe updater there (backups + automatic rollback).
-param([string]$Zip, [switch]$Rollback, [switch]$Setup)
+# Remote commands below never contain double quotes: Windows PowerShell 5.1 strips them when it starts ssh.
+param([string]$Zip, [switch]$Rollback, [switch]$Setup, [switch]$Status)
 
 # 'Continue' on purpose: Windows PowerShell 5.1 turns harmless SSH messages into fatal errors under 'Stop'.
 # Every step checks its own result instead.
@@ -36,24 +37,58 @@ if (-not $cfg -or -not $cfg.host) {
   $cfg | ConvertTo-Json | Set-Content -Path $cfgFile -Encoding ASCII
 }
 $target = "$($cfg.user)@$($cfg.host)"
-$sshOpts = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ServerAliveInterval=15')
 $sudo = if ($cfg.user -eq 'root') { '' } else { 'sudo ' }
 Say "Server: $target (port $($cfg.port))"
 
 # ---------------------------------------------------------------- password-free login (optional, once)
+# The key is always passed with -i: another ssh on PATH (e.g. Git's) may look in a different .ssh folder,
+# which is why the password could still be asked for right after "Password-free login is set up".
 $key = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
-& ssh @sshOpts -p $cfg.port -o BatchMode=yes -o ConnectTimeout=8 $target 'true' 2>$null
-if ($LASTEXITCODE -ne 0) {
+function SshOpts {
+  $o = @('-o', 'StrictHostKeyChecking=accept-new', '-o', 'ServerAliveInterval=15')
+  if (Test-Path $key) { $o += @('-i', $key) }
+  return $o
+}
+function KeyWorks {
+  $o = SshOpts
+  & ssh @o -p $cfg.port -o BatchMode=yes -o ConnectTimeout=8 $target 'true' 2>$null
+  return ($LASTEXITCODE -eq 0)
+}
+if (-not (KeyWorks)) {
   $ans = Read-Host "Set up password-free login, so you only type the server password this one time? [Y/n]"
   if ($ans -notmatch '^[Nn]') {
     if (-not (Test-Path $key)) {
       New-Item -ItemType Directory -Force -Path (Split-Path $key) | Out-Null
+      # "" must reach ssh-keygen as an empty passphrase; Start-Process passes this string through unchanged.
       Start-Process -FilePath 'ssh-keygen' -ArgumentList ('-t ed25519 -q -N "" -C hearth-updater -f "' + $key + '"') -NoNewWindow -Wait
     }
     Say 'Enter your server password once to install the key:' Yellow
-    Get-Content "$key.pub" -Raw | & ssh @sshOpts -p $cfg.port $target "umask 077; mkdir -p ~/.ssh && tr -d '\r' >> ~/.ssh/authorized_keys"
-    if ($LASTEXITCODE -eq 0) { Say '[OK] Password-free login is set up.' Green } else { Say 'Could not install the key; you will be asked for the password instead.' Yellow }
+    # Adds the key once (no duplicates), on its own line even if the file didn't end with a newline,
+    # with the permissions sshd insists on.
+    # Single-quoted on purpose: nothing in it is touched by PowerShell. sed '$a\' adds a final newline if missing.
+    $install = 'umask 077; mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; ' +
+               't=$(mktemp); tr -d ''\r'' > $t; [ -s $t ] || exit 3; sed -i -e ''$a\'' ~/.ssh/authorized_keys; ' +
+               'grep -qxF -f $t ~/.ssh/authorized_keys || cat $t >> ~/.ssh/authorized_keys; rm -f $t; ' +
+               'command -v restorecon >/dev/null 2>&1 && restorecon -R ~/.ssh; true'
+    $pub = (Get-Content "$key.pub" -Raw).Trim()
+    $o = SshOpts
+    $pub | & ssh @o -p $cfg.port $target $install
+    if ((KeyWorks)) { Say '[OK] Password-free login is set up.' Green }
+    else {
+      Say 'The key was sent, but the server still asks for a password.' Yellow
+      Say '  Common causes: the server only allows passwords (PubkeyAuthentication no in /etc/ssh/sshd_config),' Gray
+      Say '  or the home folder on the server is writable by others. You can keep using the password.' Gray
+    }
   }
+}
+$sshOpts = SshOpts
+
+# ---------------------------------------------------------------- status (health check, no changes)
+if ($Status) {
+  Say ''
+  Say 'Checking the server (nothing is changed)...' Yellow
+  & ssh @sshOpts -t -p $cfg.port $target "if ${sudo}grep -q -- --status /usr/local/bin/hearth-update 2>/dev/null; then ${sudo}hearth-update --status; else echo 'The updater on the server is an older one without --status. Install an update first (Update-Hearth.bat).'; fi"
+  Done 0
 }
 
 # ---------------------------------------------------------------- rollback
@@ -122,10 +157,12 @@ switch ($code) {
   default { Say "The update stopped on the server. Your site is still on the previous version (or was rolled back)." Red }
 }
 $logFile = Join-Path $here 'last-update-log.txt'
-& ssh @sshOpts -p $cfg.port $target 'cat /root/hearth-backups/last-update.log 2>/dev/null || echo "(no log on the server - the updater never started)"' > $logFile
-if (Test-Path $logFile) {
+# No double quotes in here (PowerShell 5.1 would strip them and bash would see a syntax error).
+$logText = & ssh @sshOpts -p $cfg.port $target "${sudo}cat /root/hearth-backups/last-update.log 2>/dev/null || echo '(no log on the server - the updater never started)'"
+if ($logText) {
+  $logText | Out-File -FilePath $logFile -Encoding utf8
   Say ''
   Say "Last lines of the server log (full log saved to $logFile):" Yellow
-  Get-Content $logFile -Tail 25 | ForEach-Object { Say "  $_" }
+  $logText | Select-Object -Last 25 | ForEach-Object { Say "  $_" }
 }
 Fail 'The update did not finish. Send the lines above (or last-update-log.txt) to whoever gave you the update.'

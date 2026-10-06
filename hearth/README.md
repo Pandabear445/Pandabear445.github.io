@@ -22,6 +22,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Your layout:** rearrange the server bar, channels, conversation and side panel in any order (or pick a preset), put the server bar across the top, drag panel edges to resize, and choose floating, attached or spacious panels.
 - **Pictures you can position:** move and zoom your avatar, banner and profile background after uploading — animated GIFs keep animating.
 - **Installable apps:** install from the browser on Windows, Mac, Linux, Android and iPhone, with push notifications when the app is closed; plus a desktop app (Windows/Mac/Linux) built automatically by GitHub Actions and a `/download` page for your users.
+- **Fonts, corners and shareable looks:** pick the interface font (Figtree, System, Readable, Rounded, Serif, Mono) and corner style (sharp, normal, round), then save your whole look to a small file to back it up, move it to another device or give it to a friend (Settings → Appearance → Save or share your look).
 - **Look and layout:** three message densities (comfortable, compact, minimal), text size, accent color and reduced motion. **Themes and backgrounds:** Dark (default), Midnight, Dim, Ember and Light themes; 22 background presets (adaptive glows and patterns, dark and bright gradients); your own gradient builder (linear, radial, mesh, conic, 2–3 colors) or your own image/GIF, with panel transparency, darken/fade, blur and a slow-drift animation. Saved per device.
 - **Settings** grouped into Account (profile, security, sessions), App (appearance, chat, notifications, voice & audio), Privacy & safety, and Server settings.
 
@@ -107,10 +108,10 @@ Open ports 80 and 443 in the VPS firewall. Port 3000 doesn't need to be public i
 
 **The easy way: the update tool.** Keep the `tools/` folder from this download on your computer.
 
-- **Windows:** double-click `tools/Update-Hearth.bat` (or drag the new zip onto it). Undo with `Rollback-Hearth.bat`.
-- **Mac/Linux:** `tools/update-hearth.sh path/to/update.zip` (undo: `--rollback`).
+- **Windows:** double-click `tools/Update-Hearth.bat` (or drag the new zip onto it). Undo with `Rollback-Hearth.bat`. `Check-Server.bat` shows the version, whether Hearth is answering, free disk space and backups without changing anything.
+- **Mac/Linux:** `tools/update-hearth.sh path/to/update.zip` (undo: `--rollback`, check: `--status`, logs: `--logs`).
 
-The first time, it asks for your server address and offers password-free login. On the server it backs up the program files and database, copies in the new files (never touching `data/`, `.env`, `docker-compose.yml` or `deploy/Caddyfile`), builds the new version while the old one keeps running, switches over, checks the new version answers, and **rolls back automatically** if it doesn't. It works with Docker, systemd, pm2 or plain `node`. On the server you can also run `hearth-update <zip>` or `hearth-update --rollback` directly. Backups go to `/root/hearth-backups` (the last 5 are kept).
+The first time, it asks for your server address and offers password-free login. On the server it backs up the program files and database, copies in the new files (never touching `data/`, `.env`, `docker-compose.yml` or `deploy/Caddyfile`), builds the new version while the old one keeps running, switches over, checks the new version answers, and **rolls back automatically** if it doesn't. It works with Docker, systemd, pm2 or plain `node`. On the server you can also run `hearth-update <zip>`, `hearth-update --rollback [backup]`, `hearth-update --list`, `hearth-update --status` or `hearth-update --logs` directly. If an update stops, the log names the exact step that failed ("Step failed …") and the Windows tool saves the whole log as `tools/last-update-log.txt`. Backups go to `/root/hearth-backups` (the last 5 are kept).
 
 **The manual way:**
 

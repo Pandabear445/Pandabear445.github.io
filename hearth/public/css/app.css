@@ -1529,6 +1529,12 @@ button.media-thumb:hover { outline: 2px solid var(--accent); outline-offset: 2px
   [data-rail-size='compact'] .rail-btn > img { border-radius: 11px; }
   [data-layout-style='spacious'] { --gap: 12px; --island-r: 20px; }
   [data-layout-style='attached'] { --gap: 0px; --island-r: 0px; }
+  /* Corner style (Settings → Appearance). The attached layout keeps square edges. */
+  :root[data-corners='sharp']:not([data-layout-style='attached']) { --island-r: 6px; }
+  :root[data-corners='round']:not([data-layout-style='attached']) { --island-r: 24px; }
+  :root[data-corners='sharp'] .btn, :root[data-corners='sharp'] .input { border-radius: 4px; }
+  :root[data-corners='round'] .btn, :root[data-corners='round'] .input { border-radius: 999px; }
+  :root[data-corners='round'] textarea.input { border-radius: 16px; }
   [data-layout-style='attached'] #sidebar, [data-layout-style='attached'] #main, [data-layout-style='attached'] #members { border-width: 0; box-shadow: none; }
   [data-layout-style='attached'][data-sidebar-side='left'] #sidebar { border-right: 1px solid var(--line); }
   [data-layout-style='attached'][data-sidebar-side='right'] #sidebar { border-left: 1px solid var(--line); }

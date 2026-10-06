@@ -37,6 +37,17 @@ export const BACKGROUNDS = [
   { id: 'cotton', name: 'Cotton candy', group: 'Bright gradients', css: 'radial-gradient(60% 60% at 20% 20%, #ffd1ff, transparent 70%), radial-gradient(60% 60% at 80% 80%, #a1c4fd, transparent 70%), #fbc2eb' },
 ];
 
+// Interface fonts. All are fonts every device already has (or Hearth already loads), so nothing extra downloads.
+export const UI_FONTS = [
+  { id: 'default', name: 'Figtree', hint: 'The default', css: null },
+  { id: 'system', name: 'System', hint: "Your device's own font", css: "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif" },
+  { id: 'readable', name: 'Readable', hint: 'Wide, very clear letters', css: "Verdana, Tahoma, 'DejaVu Sans', 'Segoe UI', sans-serif" },
+  { id: 'rounded', name: 'Rounded', hint: 'Soft and friendly', css: "ui-rounded, 'SF Pro Rounded', 'Nunito', 'Varela Round', 'Segoe UI', system-ui, sans-serif" },
+  { id: 'serif', name: 'Serif', hint: 'Like a book', css: "Charter, 'Iowan Old Style', Georgia, Cambria, 'Times New Roman', serif" },
+  { id: 'mono', name: 'Mono', hint: 'Typewriter style', css: "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace" },
+];
+export const CORNERS = [['sharp', 'Sharp'], ['normal', 'Normal'], ['round', 'Round']];
+
 const KEY = 'hearth.appearance';
 export const DEFAULTS = {
   theme: 'dark',
@@ -51,6 +62,8 @@ export const DEFAULTS = {
   layout: { order: ['rail', 'sidebar', 'main', 'panel'], rail: 'side', railSize: 'normal', sideW: 256, panelW: 272, threadW: 400, style: 'floating' },
   imgBlur: 0,
   dim: 0.2,
+  font: 'default',
+  corners: 'normal',
 };
 
 export function loadAppearance() {
@@ -66,6 +79,33 @@ export function loadAppearance() {
 export function saveAppearance(a) {
   localStorage.setItem(KEY, JSON.stringify(a));
   applyAppearance();
+}
+// Share or back up a look: everything above except the background image (that stays in this browser).
+export function exportAppearance() {
+  const a = loadAppearance();
+  return { hearthAppearance: 1, exported: new Date().toISOString(), settings: { ...a, bg: { ...a.bg, kind: a.bg.kind === 'image' ? 'preset' : a.bg.kind } } };
+}
+// Accepts what exportAppearance made. Unknown keys are dropped and values are checked when applied,
+// so a broken or hand-edited file can't break the app. Returns false if the file isn't a Hearth look.
+export function importAppearance(data) {
+  const src = data && data.hearthAppearance && data.settings;
+  if (!src || typeof src !== 'object') return false;
+  const clean = {};
+  for (const k of Object.keys(DEFAULTS)) {
+    if (!(k in src)) continue;
+    const v = src[k];
+    const d = DEFAULTS[k];
+    if (d && typeof d === 'object' && !Array.isArray(d)) { if (v && typeof v === 'object' && !Array.isArray(v)) clean[k] = { ...d, ...v }; }
+    else if (typeof v === typeof d) clean[k] = v;
+  }
+  if (clean.bg) {
+    if (!['preset', 'gradient'].includes(clean.bg.kind)) clean.bg.kind = 'preset';
+    if (!Array.isArray(clean.bg.colors) || clean.bg.colors.length < 3) clean.bg.colors = [...DEFAULTS.bg.colors];
+    clean.bg.colors = clean.bg.colors.slice(0, 3).map((c) => (HEX.test(c) ? c : '#000000'));
+  }
+  const current = loadAppearance();
+  saveAppearance({ ...clean, bg: clean.bg ? clean.bg : current.bg.kind === 'image' ? current.bg : DEFAULTS.bg });
+  return true;
 }
 export function resetAppearance() {
   localStorage.removeItem(KEY);
@@ -211,6 +251,10 @@ export function applyAppearance() {
   root.style.fontSize = `${Math.min(125, Math.max(85, +a.scale || 100))}%`;
   root.dataset.density = ['comfortable', 'compact', 'minimal'].includes(a.density) ? a.density : 'comfortable';
   root.classList.toggle('reduce-motion', !!a.reduceMotion);
+  const font = UI_FONTS.find((f) => f.id === a.font);
+  if (font && font.css) { root.style.setProperty('--font', font.css); root.style.setProperty('--font-display', font.css); }
+  else { root.style.removeProperty('--font'); root.style.removeProperty('--font-display'); }
+  root.dataset.corners = CORNERS.some(([id]) => id === a.corners) ? a.corners : 'normal';
 
   applyLayout(root, a.layout);
   const solid = isSolid(a);

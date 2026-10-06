@@ -7,6 +7,8 @@ WINDOWS
   Install an update:   double-click Update-Hearth.bat
                        (it finds the newest Hearth zip in Downloads/Desktop, or drag a zip onto it)
   Undo the last update: double-click Rollback-Hearth.bat
+  Check the server:     double-click Check-Server.bat
+                        (version, is it answering, free disk space, backups - changes nothing)
   Change server:        double-click Change-Server.bat
 
   The first time, it asks for your server address and offers password-free login
@@ -15,6 +17,9 @@ WINDOWS
 MAC / LINUX
   ./update-hearth.sh path/to/update.zip
   ./update-hearth.sh --rollback
+  ./update-hearth.sh --status        check the server (changes nothing)
+  ./update-hearth.sh --logs          Hearth's last log lines
+  ./update-hearth.sh --setup         change server
 
 WHAT IT DOES ON THE SERVER
   1. Backs up the program files and the database (in /root/hearth-backups, last 5 kept).
@@ -23,4 +28,16 @@ WHAT IT DOES ON THE SERVER
   4. Switches over (a few seconds of downtime) and checks the new version answers.
   5. If it doesn't, it puts the previous version and database back automatically.
 
-On the server itself you can also run:  hearth-update /path/to/update.zip   or   hearth-update --rollback
+On the server itself you can also run:
+  hearth-update /path/to/update.zip      install an update
+  hearth-update --rollback               undo the last update
+  hearth-update --list                   list the saved backups
+  hearth-update --rollback <name>        go back to a specific backup from --list
+  hearth-update --status                 version, health, disk space, backups
+  hearth-update --logs                   Hearth's last 80 log lines
+
+IF AN UPDATE STOPS
+  Your site stays on the version it was on (or is put back automatically).
+  The window shows the last lines of the server's log, and saves all of it next to
+  these tools as last-update-log.txt. The line starting with "Step failed" says
+  exactly what went wrong. Send that file to whoever gave you the update.

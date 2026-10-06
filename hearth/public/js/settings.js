@@ -7,8 +7,8 @@ import { profileCard, FONT_STACKS, cropStyle } from './profile-ui.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import {
-  THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
-  gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage,
+  THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, UI_FONTS, CORNERS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
+  gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage, exportAppearance, importAppearance,
 } from './appearance.js';
 
 export { applyAppearance };
@@ -683,6 +683,52 @@ function appearanceTab(app) {
     return section('Accent color', h('p', { class: 'set-sub' }, 'Buttons, highlights and the adaptive backgrounds use it.'), swatches, custom);
   }
 
+  function fontSection() {
+    return section('Font and corners',
+      h('p', { class: 'set-sub' }, 'The font used across the app. Name fonts on profiles are kept.'),
+      h('div', { class: 'chips', role: 'radiogroup', 'aria-label': 'Interface font' }, UI_FONTS.map((f) => h('button', {
+        type: 'button',
+        class: `chip${(a.font || 'default') === f.id ? ' active' : ''}`,
+        role: 'radio',
+        'aria-checked': String((a.font || 'default') === f.id),
+        title: f.hint,
+        style: f.css ? { fontFamily: f.css } : null,
+        onclick: () => { a.font = f.id; commit(true); },
+      }, f.name))),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Corners'),
+        chips(CORNERS, a.corners || 'normal', (v) => { a.corners = v; commit(); }),
+        h('span', { class: 'field-hint' }, 'How rounded panels, buttons and text boxes are (on bigger screens).')));
+  }
+
+  // Save the look to a file to back it up, move it to another device or give it to a friend.
+  const lookInput = h('input', { type: 'file', accept: 'application/json,.json', hidden: true });
+  lookInput.addEventListener('change', async () => {
+    const f = lookInput.files[0];
+    lookInput.value = '';
+    if (!f) return;
+    if (f.size > 64 * 1024) return toast("That file is too big to be a Hearth look.", 'error');
+    let data = null;
+    try { data = JSON.parse(await f.text()); } catch { /* handled below */ }
+    if (!importAppearance(data)) return toast("That file isn't a Hearth look (export one with “Save my look”).", 'error');
+    app.rerender();
+    Object.assign(a, loadAppearance());
+    draw();
+    toast('Look loaded.');
+  });
+  function shareSection() {
+    return section('Save or share your look',
+      h('p', { class: 'set-sub' }, 'Theme, background, accent, font and layout in one small file. A background image stays on this device.'),
+      h('div', { class: 'row gap' },
+        h('button', { class: 'btn ghost sm', onclick: () => {
+          const blob = new Blob([JSON.stringify(exportAppearance(), null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          h('a', { href: url, download: 'hearth-look.json' }).click();
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+        } }, 'Save my look'),
+        h('button', { class: 'btn ghost sm', onclick: () => lookInput.click() }, 'Load a look…'),
+        lookInput));
+  }
+
   function draw() {
     const top = root.closest('.set-content');
     const scroll = top ? top.scrollTop : 0;
@@ -701,8 +747,10 @@ function appearanceTab(app) {
           chips([['comfortable', 'Comfortable'], ['compact', 'Compact'], ['minimal', 'Minimal']], a.density || 'comfortable', (v) => { a.density = v; commit(); }),
           h('span', { class: 'field-hint' }, 'Comfortable has larger avatars and spacing. Compact fits more on screen. Minimal is dense and text-only.')),
         toggle('Reduce motion', a.reduceMotion, (v) => { a.reduceMotion = v; commit(); }, 'Turns off animated rings, name effects, profile effects and moving backgrounds.')),
+      fontSection(),
+      shareSection(),
       section(null, h('button', { class: 'btn ghost', onclick: async () => {
-        if (!(await confirmDialog({ title: 'Reset appearance?', text: 'Theme, background, accent and layout go back to the defaults on this device.', confirm: 'Reset' }))) return;
+        if (!(await confirmDialog({ title: 'Reset appearance?', text: 'Theme, background, accent, font and layout go back to the defaults on this device.', confirm: 'Reset' }))) return;
         await clearBgImage();
         resetAppearance();
         app.rerender();
