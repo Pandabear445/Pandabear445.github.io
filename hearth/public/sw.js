@@ -26,7 +26,9 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/uploads/') || url.pathname.startsWith('/downloads/')) return;
+  // Only the app's own files are cached here. Everything else (API, uploads, GIFs passed through the
+  // server) goes straight to the network and the browser's normal cache.
+  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/uploads/') || url.pathname.startsWith('/downloads/') || url.pathname.startsWith('/media/')) return;
   if (url.pathname.startsWith('/socket.io/') && url.pathname !== '/socket.io/socket.io.js') return;
 
   // Pages: try the network first (fresh HTML), fall back to the cached app shell when offline.
@@ -34,9 +36,11 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(fetch(req).catch(async () => (await caches.match('/')) || Response.error()));
     return;
   }
-  // App files: cache first, then network (and remember it).
+  if (!ASSETS.includes(url.pathname)) return;
+  // App files: cache first, then network (and remember it). Matched exactly: ignoring the "?…" part once
+  // made every GIF show as the same one, because GIFs differ only in their query string.
   e.respondWith((async () => {
-    const hit = await caches.match(req, { ignoreSearch: true });
+    const hit = await caches.match(req);
     if (hit) return hit;
     const res = await fetch(req);
     if (res.ok && res.type === 'basic') { const c = await caches.open(CACHE); c.put(req, res.clone()); }

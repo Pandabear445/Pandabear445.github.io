@@ -3137,8 +3137,8 @@ function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
     const tabs = libOnly ? [['library', 'GIFs'], ['stickers', 'Stickers'], ['favs', '★ Favorites']]
       : [['gifs', 'GIFs'], ['stickers', 'Stickers'], ['library', 'This server'], ['favs', '★ Favorites']];
     tabs.forEach(([k, l]) => seg.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
-    clear(credit).append(tab === 'library' || libOnly ? h('span', null, 'This server’s own GIFs — free, no limits') : h('span', null, `Powered by ${provName}`),
-      (tab === 'library' || libOnly) && lib && lib.canAdd ? h('button', { class: 'link-btn', onclick: addGif }, '+ Add a GIF') : null);
+    clear(credit).append(tab === 'library' || libOnly ? h('span', null, 'This server’s own GIFs — free, no limits') : h('span', null, `Powered by ${provName}`));
+    if ((tab === 'library' || libOnly) && lib && lib.canAdd) credit.append(h('button', { class: 'link-btn', onclick: addGif }, '+ Add a GIF'));
     grid.classList.toggle('cats', (tab === 'gifs' || tab === 'library') && !q && !trending);
     notice.hidden = true;
     if (tab === 'favs') {
