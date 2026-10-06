@@ -159,7 +159,7 @@ export function modal({ title, body, actions = [], size = 'md', onClose, classNa
   backdrop.dataset.locked = dismissable ? '' : '1';
   layer().append(backdrop);
   const first = box.querySelector('input:not([type=file]), textarea, select');
-  if (first) setTimeout(() => first.focus(), 30);
+  if (first && !className.includes('mys-modal')) setTimeout(() => first.focus({ preventScroll: true }), 30);
   // enter submits primary
   box.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && e.target.tagName === 'INPUT') {

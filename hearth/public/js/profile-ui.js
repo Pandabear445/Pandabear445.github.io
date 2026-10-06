@@ -43,7 +43,10 @@ export function avatarEl(u, size = 40, { status = false, meId = '', speaking = f
   const ring = p.avatarRing || 'none';
   const wrap = h('span', {
     class: `av shape-${shape} ring-${ring}${speaking ? ' speaking' : ''}`,
-    style: { '--size': size + 'px', '--ring': p.ringColor || '#f2a541', '--ring2': p.accentColor || '#f2a541' },
+    style: {
+      '--size': size + 'px', '--ring': p.ringColor || '#f2a541', '--ring2': p.ringColor2 || p.accentColor || '#f2a541',
+      '--ring3': p.ringColor3 || p.ringColor2 || p.accentColor || p.ringColor || '#f2a541', '--ring-dur': `${11 - (+p.ringSpeed || 4)}s`,
+    },
     dataset: { userAv: u ? u.id : '', size: String(size), status: status ? '1' : '' },
   });
   const inner = h('span', { class: 'av-inner', style: { background: u && u.avatar ? 'transparent' : hashColor(u ? u.id : '?') } });
@@ -57,7 +60,7 @@ export function avatarEl(u, size = 40, { status = false, meId = '', speaking = f
 export function nameEl(u, { tag = 'span', cls = '', roleColor = '' } = {}) {
   const p = (u && u.profile) || {};
   const effect = p.nameEffect || 'none';
-  const gradient = !!p.nameColor2;
+  const gradient = !!p.nameColor2 || effect === 'flow';
   // The default white name follows the theme's text color so it stays readable in light mode.
   // Server role colors show for people who haven't picked their own name color.
   const plain = !p.nameColor || p.nameColor.toLowerCase() === '#ffffff';
@@ -67,18 +70,50 @@ export function nameEl(u, { tag = 'span', cls = '', roleColor = '' } = {}) {
     style: {
       '--n1': n1,
       '--n2': p.nameColor2 || n1,
+      '--n3': p.nameColor3 || p.nameColor2 || n1,
+      '--n4': p.nameColor4 || p.nameColor3 || p.nameColor2 || n1,
+      '--nglow': p.nameGlow || 'var(--n1x)',
       fontFamily: FONT_STACKS[p.nameFont] || 'inherit',
     },
     dataset: { userName: u ? u.id : '' },
   }, displayName(u));
+  if (effect === 'glitch') el.dataset.text = displayName(u);
+  if (p.nameColor3) el.classList.add('grad-multi');
   if (p.nameFont === 'Press Start 2P') el.classList.add('font-tiny');
   if (p.nameFont === 'Monoton' || p.nameFont === 'Bungee') el.classList.add('font-wide');
   return el;
 }
 
 const EFFECT_GLYPHS = { sparkles: '✦', snow: '❄', hearts: '♥', stars: '★', bubbles: '', embers: '', sakura: '✿', confetti: '■', rain: '│', fireflies: '' };
-function effectLayer(effect) {
+// Split into characters/emoji the way people see them (a flag or 👍🏽 is one).
+export function splitGlyphs(t) {
+  t = String(t || '');
+  return typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter().segment(t)].map((x) => x.segment).filter((g) => g.trim()) : Array.from(t).filter((g) => g.trim());
+}
+// A build-your-own effect: the person's own characters, count, motion, speed, size and color.
+export function customFxLayer(fx) {
+  const f = fx || {};
+  const glyphs = splitGlyphs(f.glyphs || '✦');
+  if (!glyphs.length) return null;
+  const count = Math.min(40, Math.max(4, +f.count || 16));
+  const speed = Math.min(10, Math.max(1, +f.speed || 5));
+  const layer = h('div', {
+    class: `pfx pfx-custom m-${f.motion || 'fall'}${f.glow ? ' glow' : ''}`, 'aria-hidden': 'true',
+    style: { '--fx-size': `${Math.min(48, Math.max(8, +f.size || 16))}px`, '--fx-dur': `${(22 - speed * 2)}s`, '--fx-color': f.color || 'currentColor' },
+  });
+  for (let i = 0; i < count; i++) {
+    const x = (i * 37 + 11) % 100;
+    const y = (i * 61 + 7) % 100;
+    const d = ((i * 53) % 100) / 10;
+    const sc = 0.6 + ((i * 29) % 10) / 12;
+    const still = ['twinkle', 'spin', 'zoom', 'bounce'].includes(f.motion); // these stay in place, scattered over the card
+    layer.append(h('span', { style: { left: x + '%', top: still ? y + '%' : null, animationDelay: `-${d}s`, '--s': sc } }, glyphs[i % glyphs.length]));
+  }
+  return layer;
+}
+export function effectLayer(effect, customFx) {
   if (!effect || effect === 'none') return null;
+  if (effect === 'custom') return customFxLayer(customFx);
   const layer = h('div', { class: `pfx pfx-${effect}`, 'aria-hidden': 'true' });
   // deterministic positions so re-renders don't jump
   for (let i = 0; i < 16; i++) {
@@ -101,7 +136,8 @@ export function bannerEl(u, height = 110) {
 // One shared player, so only one profile song plays at a time.
 let songAudio = null;
 let songOwner = null;
-function songPlayer(u, p) {
+export function stopSong() { if (songAudio) songAudio.pause(); }
+export function songPlayer(u, p) {
   const btn = h('button', { class: 'pc-song', 'aria-label': `Play ${p.songTitle || 'profile song'}` },
     h('span', { class: 'pc-song-ic' }, '\u25B6'), h('span', { class: 'pc-song-title' }, p.songTitle || 'Profile song'), h('span', { class: 'pc-song-bars', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')));
   const sync = () => { const on = songOwner === u.id && songAudio && !songAudio.paused; btn.classList.toggle('playing', on); btn.firstChild.textContent = on ? '\u275A\u275A' : '\u25B6'; };
@@ -125,7 +161,7 @@ export function profileCard(u, { meId = '', actions = null, compact = false, mut
     style: { '--c1': p.themePrimary, '--c2': p.themeSecondary, '--acc': p.accentColor },
   });
   if (u.background) card.append(h('div', { class: 'pc-bg' }, h('img', { class: 'cropped pc-bg-img', src: u.background, alt: '', draggable: 'false', style: cropStyle(p.backgroundCrop) })));
-  const fx = effectLayer(p.profileEffect);
+  const fx = effectLayer(p.profileEffect, p.customFx);
   // With the banner turned off, the profile background shows through the whole card.
   card.append(noBanner ? h('div', { class: 'pc-banner-space' }) : bannerEl(u, compact ? 96 : 120));
   const body = h('div', { class: 'pc-body' });

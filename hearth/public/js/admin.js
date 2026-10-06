@@ -6,7 +6,7 @@ import { modal, confirmDialog, field, menu } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['storage', 'Storage & limits', 'download', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
 export const ROLE_LABEL = { owner: 'Owner', admin: 'Admin', moderator: 'Moderator' };
 const ROLE_HINT = {
@@ -62,7 +62,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
-    ({ overview, online, reports, users, servers, security, broadcast, admins, registration, log })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
 
   async function overview() {
@@ -230,6 +230,48 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         e.ip ? ipChip(e.ip) : h('span', { class: 'stat-sub' }, '\u2014'), h('span', { class: 'stat-sub' }, `${e.detail ? e.detail + ' \u00b7 ' : ''}${ago(e.at)}`))) : [h('div', { class: 'adm-row three' }, h('span', { class: 'stat-sub' }, 'Nothing yet.'))])));
   }
 
+  async function storage() {
+    const st = await api('GET', '/admin/storage');
+    const L = { ...st.limits };
+    const num = (k, label, hint) => {
+      const inp = h('input', { class: 'input', type: 'number', min: '0', step: '1', value: String(L[k]), oninput: (e) => { L[k] = e.target.value; } });
+      return h('label', { class: 'field' }, h('span', { class: 'field-label' }, label), h('div', { class: 'row gap tight' }, inp, h('span', { class: 'stat-sub' }, 'MB')), hint ? h('span', { class: 'field-hint' }, hint) : null);
+    };
+    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji' };
+    const words = h('textarea', { class: 'input', rows: '5', placeholder: 'one word or phrase per line' });
+    words.value = (st.words || []).join('\n');
+    clear(body).append(
+      h('div', { class: 'stats' },
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploads in total'), h('strong', null, fmtSize(st.total))),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploaded today'), h('strong', null, fmtSize(st.today))),
+        st.diskFree != null ? h('div', { class: `stat${st.diskFree < 2 * 1024 ** 3 ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Free disk space'), h('strong', null, fmtSize(st.diskFree))) : null,
+        ...st.byKind.map((k) => h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, kinds[k.kind] || k.kind), h('strong', null, fmtSize(k.bytes)), h('span', { class: 'stat-sub' }, `${k.files} files`)))),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Upload limits')),
+      h('p', { class: 'field-hint' }, '0 means no limit. Admins and the owner aren\u2019t held to the storage or daily limits. You can give one person more (or less) room from their page under Users.'),
+      h('div', { class: 'grid-2' },
+        num('fileMb', 'Largest file in a message'),
+        num('imageMb', 'Largest picture', 'Avatars, banners, backgrounds, server icons.'),
+        num('songMb', 'Largest profile song'),
+        num('quotaMb', 'Storage per person', 'Everything one person has uploaded, together.'),
+        num('dailyMb', 'Uploads per person per day', 'Stops someone filling your disk in one go.')),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: async () => {
+        try { await api('PUT', '/admin/limits', L); toast('Limits saved.'); storage(); } catch (e) { toast(e.message, 'error'); }
+      } }, 'Save limits')),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Who uses the most space')),
+      h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row head' }, h('span', null, 'Person'), h('span', null, 'Files'), h('span', null, 'Used'), h('span', null, 'Last upload'), h('span', null, '')),
+        ...st.top.map((r) => h('div', { class: 'adm-row' }, userCell(r.user, openUser), h('span', null, String(r.files)),
+          h('span', null, `${fmtSize(r.bytes)}${r.quotaMb ? ` / ${r.quotaMb} MB` : ''}`, r.blocked ? h('span', { class: 'badge-tag bad' }, 'Uploads off') : null),
+          h('span', { class: 'stat-sub' }, ago(r.last)),
+          h('button', { class: 'btn ghost sm', onclick: () => r.user && openUser(r.user.id) }, 'Manage')))),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Word filter')),
+      h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so they can\u2019t be filtered.'),
+      words,
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: async () => {
+        try { const r = await api('PUT', '/admin/words', { words: words.value }); toast(`Word filter saved (${r.words.length}).`); } catch (e) { toast(e.message, 'error'); }
+      } }, 'Save word filter')));
+  }
+
   async function broadcast() {
     const cfg = await api('GET', '/config');
     const text = h('textarea', { class: 'input', rows: '3', maxlength: '500', placeholder: 'e.g. Voice calls will be down for 10 minutes tonight at 9pm.' });
@@ -347,6 +389,9 @@ export function suspendDialog(user, after) {
 async function userModal(id, refresh, myRank = 2) {
   const u = await api('GET', `/admin/users/${id}`).catch((e) => { toast(e.message, 'error'); return null; });
   if (!u) return;
+  const setLimits = async (patch, msg) => {
+    try { await api('PATCH', `/admin/users/${id}/limits`, patch); toast(msg); m.close(); userModal(id, refresh, myRank); refresh(); } catch (e) { toast(e.message, 'error'); }
+  };
   const m = modal({
     title: `${u.displayName} (@${u.username})`, size: 'lg', className: 'admin-user',
     body: h('div', { class: 'stack' },
@@ -361,6 +406,26 @@ async function userModal(id, refresh, myRank = 2) {
       h('div', { class: 'adm-table' }, ...u.sessions.map((x) => h('div', { class: 'adm-row three' }, h('span', null, device(x.ua)), x.ip ? ipChip(x.ip) : h('span'), h('span', { class: 'stat-sub' }, `active ${ago(x.lastSeen)}`)))),
       u.reportsAgainst.length ? h('h4', null, `Reports about them \u2014 ${u.reportsAgainst.length}`) : null,
       u.reportsAgainst.length ? h('div', { class: 'adm-table' }, ...u.reportsAgainst.map((r) => h('div', { class: 'adm-row three' }, h('span', null, CATEGORY_LABEL[r.category] || r.category), h('span', { class: 'stat-sub' }, r.status), h('span', { class: 'stat-sub' }, fmtStamp(r.createdAt))))) : null,
+      h('h4', null, 'Uploads & profile'),
+      h('div', { class: 'stack' },
+        h('div', { class: 'kv' }, h('span', null, 'Storage used'), h('strong', null, `${fmtSize(u.storage.used)}${u.storage.quotaMb ? ` of ${u.storage.quotaMb} MB` : ' (no limit)'}${u.quotaOverride != null ? ' \u00b7 custom limit' : ''}`)),
+        h('div', { class: 'kv' }, h('span', null, 'Profile comments written'), h('strong', null, String(u.commentsWritten))),
+        u.canAct ? h('div', { class: 'row gap wrap' },
+          h('button', { class: `chip${u.storage.blocked ? ' active' : ''}`, onclick: () => setLimits({ uploadsBlocked: !u.storage.blocked }, u.storage.blocked ? 'Uploads turned back on.' : 'Uploads turned off.') }, u.storage.blocked ? 'Uploads are off \u2014 turn on' : 'Turn off uploads'),
+          h('button', { class: `chip${u.profileLocked ? ' active' : ''}`, onclick: () => setLimits({ profileLocked: !u.profileLocked }, u.profileLocked ? 'Profile unlocked.' : 'Profile locked.') }, u.profileLocked ? 'Profile is locked \u2014 unlock' : 'Lock profile'),
+          myRank >= 2 ? h('button', { class: 'chip', onclick: () => {
+            const inp = h('input', { class: 'input', type: 'number', min: '0', placeholder: 'empty = server default', value: u.quotaOverride != null ? String(u.quotaOverride) : '' });
+            modal({ title: 'Storage limit for this person', size: 'sm', body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'In MB. 0 means no limit; leave it empty to use the server\u2019s default.'), inp),
+              actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: () => setLimits({ quotaMb: inp.value === '' ? null : +inp.value }, 'Storage limit saved.') }] });
+          } }, 'Change storage limit') : null,
+          u.commentsWritten ? h('button', { class: 'chip', onclick: async () => {
+            if (!(await confirmDialog({ title: 'Delete all their profile comments?', text: `${u.commentsWritten} comments on people\u2019s pages are removed.`, confirm: 'Delete', danger: true }))) return;
+            const r = await api('DELETE', `/admin/users/${id}/comments`); toast(`Deleted ${r.count} comments.`); m.close(); userModal(id, refresh, myRank);
+          } }, 'Delete their comments') : null,
+          myRank >= 2 && u.storage.used ? h('button', { class: 'chip danger-text', onclick: async () => {
+            if (!(await confirmDialog({ title: 'Delete everything they uploaded?', text: 'Pictures, songs and every file they attached to messages are deleted for good. Their messages stay, without the files.', confirm: 'Delete files', danger: true }))) return;
+            const r = await api('DELETE', `/admin/users/${id}/files`); toast(`Deleted ${r.count} files.`); m.close(); userModal(id, refresh, myRank);
+          } }, 'Delete all their files') : null) : null),
       notesBox(u, () => { m.close(); userModal(id, refresh, myRank); }, myRank),
       u.myRole === 'owner' && u.canAct ? h('div', { class: 'row gap wrap' }, h('span', { class: 'field-label' }, 'Staff role'),
         ...[['moderator', 'Moderator'], ['admin', 'Admin'], [null, 'None']].map(([r, l]) => h('button', { class: `chip${(u.role || null) === r ? ' active' : ''}`, onclick: async () => {

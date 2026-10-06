@@ -11,6 +11,7 @@ const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
 const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey } = require('./db');
 const { sanitizeProfile, parseProfile } = require('./profile');
+const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
 const perms = makePerms(db);
 
@@ -98,6 +99,8 @@ function selfUser(row) {
   u.kdf = row.kdf;
   u.kdfSalt = row.kdf_salt;
   u.privacy = privacyOf(row);
+  u.pageBg = row.page_bg || null;
+  u.profileLocked = !!row.profile_locked;
   u.staffRole = staffRole(row.id);
   u.instanceAdmin = (STAFF_RANK[u.staffRole] || 0) >= 2;
   return u;
@@ -364,20 +367,99 @@ const encryptedStorage = multer.diskStorage({
   destination: UPLOAD_DIR,
   filename: (req, file, cb) => cb(null, fileName('.bin')),
 });
-const uploadEncrypted = multer({ storage: encryptedStorage, limits: { fileSize: (MAX_UPLOAD_MB + 1) * 1024 * 1024, files: 1 } });
-const uploadImage = multer({
+// Upload kinds. Size limits come from the admin's settings (Admin → Storage & limits), see limited().
+const uploadEncrypted = { storage: encryptedStorage };
+const uploadImage = {
   storage: diskStorage,
-  limits: { fileSize: 12 * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
     if (IMAGE_EXT.includes(safeExt(file.originalname)) && /^image\//.test(file.mimetype)) cb(null, true);
     else cb(new HttpError(400, 'Use a PNG, JPG, GIF or WebP image.'));
   },
-});
+};
 
+// Every uploaded file is listed with who uploaded it and its size, for storage quotas and the admin's
+// Storage tab. Removing a file removes its row.
+function recordFile(userId, name, kind, size) {
+  if (!userId || !name) return;
+  db.prepare('INSERT OR REPLACE INTO user_files (name, user_id, kind, size, created_at) VALUES (?, ?, ?, ?, ?)').run(name, userId, kind, size || 0, now());
+}
 function removeUpload(url) {
   if (!url || !url.startsWith('/uploads/')) return;
-  const p = path.join(UPLOAD_DIR, path.basename(url));
-  fs.promises.unlink(p).catch(() => {});
+  const name = path.basename(url);
+  db.prepare('DELETE FROM user_files WHERE name = ?').run(name);
+  fs.promises.unlink(path.join(UPLOAD_DIR, name)).catch(() => {});
+}
+
+// ---------------------------------------------------------------- upload limits
+// fileMb: largest attachment · imageMb: avatars, banners, icons, emoji sources · songMb: profile songs
+// quotaMb: total storage per person · dailyMb: uploads per person per 24 hours. 0 = no limit.
+// Admins and the owner aren't limited by quota/daily (per-file limits still apply).
+const LIMIT_DEFAULTS = { fileMb: MAX_UPLOAD_MB, imageMb: 12, songMb: 10, quotaMb: 1000, dailyMb: 500 };
+function uploadLimits() {
+  let v = {};
+  try { v = JSON.parse(getSetting('uploadLimits') || '{}') || {}; } catch { /* defaults */ }
+  const n = (x, d, max) => (Number.isFinite(+x) && +x >= 0 ? Math.min(max, Math.round(+x)) : d);
+  return {
+    fileMb: Math.max(1, n(v.fileMb, LIMIT_DEFAULTS.fileMb, 2048)), imageMb: Math.max(1, n(v.imageMb, LIMIT_DEFAULTS.imageMb, 100)),
+    songMb: Math.max(1, n(v.songMb, LIMIT_DEFAULTS.songMb, 200)), quotaMb: n(v.quotaMb, LIMIT_DEFAULTS.quotaMb, 1e6), dailyMb: n(v.dailyMb, LIMIT_DEFAULTS.dailyMb, 1e6),
+  };
+}
+const MB = 1024 * 1024;
+const usedBytes = (uid) => db.prepare('SELECT COALESCE(SUM(size), 0) n FROM user_files WHERE user_id = ?').get(uid).n;
+const dayBytes = (uid) => db.prepare('SELECT COALESCE(SUM(size), 0) n FROM user_files WHERE user_id = ? AND created_at > ?').get(uid, now() - 86400000).n;
+function quotaOf(uid) {
+  const row = getUserRow(uid);
+  const lim = uploadLimits();
+  const exempt = isInstanceAdmin(uid);
+  const quotaMb = exempt ? 0 : (row && row.upload_quota_mb != null ? row.upload_quota_mb : lim.quotaMb);
+  return { ...lim, quotaMb, dailyMb: exempt ? 0 : lim.dailyMb, used: usedBytes(uid), today: dayBytes(uid), blocked: !!(row && row.uploads_blocked), exempt };
+}
+const fmtMb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
+// Wraps multer: refuses blocked accounts, caps the size at whatever is smallest of the per-file limit,
+// the space left in the person's quota and what's left of today's allowance, and records the file.
+// If the request then fails, the file is removed again so it doesn't count against anyone.
+function limited(kind, base, field) {
+  const perFile = { file: 'fileMb', image: 'imageMb', song: 'songMb' }[kind];
+  return (req, res, next) => {
+    const q = quotaOf(req.userId);
+    if (q.blocked) return next(new HttpError(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.'));
+    const fileCap = q[perFile] * MB + (kind === 'file' ? MB : 0); // encrypted attachments carry a little overhead
+    const quotaLeft = q.quotaMb ? q.quotaMb * MB - q.used : Infinity;
+    const dayLeft = q.dailyMb ? q.dailyMb * MB - q.today : Infinity;
+    if (quotaLeft <= 0) return next(new HttpError(413, `You\u2019ve used all ${q.quotaMb} MB of your storage. Delete some old files or ask an admin for more room.`, 'quota'));
+    if (dayLeft <= 0) return next(new HttpError(413, `You\u2019ve reached today\u2019s upload limit (${q.dailyMb} MB per day). Try again tomorrow.`, 'quota'));
+    const cap = Math.max(1, Math.floor(Math.min(fileCap, quotaLeft, dayLeft)));
+    multer({ ...base, limits: { fileSize: cap, files: 1 } }).single(field)(req, res, (err) => {
+      if (err && err.code === 'LIMIT_FILE_SIZE') {
+        if (cap >= fileCap) return next(new HttpError(413, `That file is too big. ${{ file: 'Files', image: 'Images', song: 'Songs' }[kind]} can be up to ${q[perFile]} MB.`));
+        if (cap >= dayLeft) return next(new HttpError(413, `That would go over today\u2019s upload limit. You have ${fmtMb(dayLeft)} left today.`, 'quota'));
+        return next(new HttpError(413, `That would go over your storage limit. You have ${fmtMb(quotaLeft)} left of ${q.quotaMb} MB.`, 'quota'));
+      }
+      if (err) return next(err);
+      if (req.file) {
+        recordFile(req.userId, req.file.filename, kind === 'file' ? 'attachment' : kind, req.file.size);
+        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + req.file.filename); });
+      }
+      next();
+    });
+  };
+}
+// Admin-wide word filter for text the server can read: names, bios, profile pages and profile comments.
+// (Chats are end-to-end encrypted, so they can't be filtered here.)
+const blockedWords = () => { try { return JSON.parse(getSetting('blockedWords') || '[]'); } catch { return []; } };
+function checkWords(...texts) {
+  const words = blockedWords();
+  if (!words.length) return;
+  const hay = texts.flat(3).filter((t) => typeof t === 'string').join('\n').toLowerCase();
+  for (const w of words) {
+    const esc = w.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`(^|[^\\p{L}\\p{N}])${esc}($|[^\\p{L}\\p{N}])`, 'u').test(hay)) fail(400, 'That contains a word that isn\u2019t allowed on this server.');
+  }
+}
+// An admin can freeze someone's profile (after abuse) so it can't be changed until unlocked.
+function requireUnlocked(uid) {
+  const r = getUserRow(uid);
+  if (r && r.profile_locked) fail(403, 'An admin has locked your profile, so it can\u2019t be changed right now.');
 }
 
 // Encrypted attachments are opaque blobs. The sender lists the blob URLs (not their contents) when
@@ -604,7 +686,9 @@ api.get('/config', (req, res) => {
     gifsEnabled: !!gifKey(),
     gifProvider: gifProvider(),
     gifProxy: gifProxyOn(),
-    maxUploadMb: MAX_UPLOAD_MB,
+    maxUploadMb: uploadLimits().fileMb,
+    imageMb: uploadLimits().imageMb,
+    songMb: uploadLimits().songMb,
     iceServers: [iceServers[0]], // STUN only here; TURN relay details are given to signed-in users
   });
 });
@@ -743,8 +827,10 @@ function broadcastUser(userId) {
 }
 
 api.patch('/me/profile', auth, (req, res) => {
+  requireUnlocked(req.userId);
   const row = getUserRow(req.userId);
   const profile = sanitizeProfile(req.body || {}, parseProfile(row));
+  checkWords(profile.displayName, profile.pronouns, profile.bio, profile.aboutMe, profile.headline, profile.mood.text, profile.customStatus.text, profile.interests, profile.songTitle, profile.links.map((l) => l.label));
   if (!profile.displayName) profile.displayName = row.username;
   // Top friends must actually be friends.
   profile.topFriends = profile.topFriends.filter((id) => areFriends(req.userId, id));
@@ -761,22 +847,21 @@ api.patch('/me/status', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-const MEDIA_KINDS = { avatar: 'avatar', banner: 'banner', background: 'background' };
+const MEDIA_KINDS = { avatar: 'avatar', banner: 'banner', background: 'background', pagebg: 'page_bg' };
 function setMediaCrop(userId, kind, c) {
   const row = getUserRow(userId);
   const profile = sanitizeProfile({ [kind + 'Crop']: c }, parseProfile(row));
   db.prepare('UPDATE users SET profile = ? WHERE id = ?').run(JSON.stringify(profile), userId);
 }
 // Profile song (MySpace-style). Plays only when someone presses play on your profile.
-const uploadAudio = multer({
+const uploadAudio = {
   storage: diskStorage,
-  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
     if (['.mp3', '.ogg', '.m4a', '.wav'].includes(safeExt(file.originalname)) && /^audio\//.test(file.mimetype)) cb(null, true);
-    else cb(new HttpError(400, 'Use an MP3, M4A, OGG or WAV file (up to 10 MB).'));
+    else cb(new HttpError(400, `Use an MP3, M4A, OGG or WAV file (up to ${uploadLimits().songMb} MB).`));
   },
-});
-api.post('/me/song', auth, uploadAudio.single('file'), (req, res) => {
+};
+api.post('/me/song', auth, (req, res, next) => { try { requireUnlocked(req.userId); next(); } catch (e) { next(e); } }, limited('song', uploadAudio, 'file'), (req, res) => {
   if (!req.file) fail(400, 'Choose a song.');
   const row = getUserRow(req.userId);
   db.prepare('UPDATE users SET song = ? WHERE id = ?').run('/uploads/' + req.file.filename, req.userId);
@@ -793,7 +878,7 @@ api.delete('/me/song', auth, (req, res) => {
   broadcastUser(req.userId);
   res.json(selfUser(getUserRow(req.userId)));
 });
-api.post('/me/media/:kind', auth, uploadImage.single('file'), (req, res) => {
+api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(req.userId); next(); } catch (e) { next(e); } }, limited('image', uploadImage, 'file'), (req, res) => {
   const col = MEDIA_KINDS[req.params.kind];
   if (!col) fail(404, 'Unknown media type.');
   if (!req.file) fail(400, 'Choose an image.');
@@ -868,7 +953,7 @@ api.delete('/friends/:id', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- servers
-api.post('/servers', auth, uploadImage.single('icon'), (req, res) => {
+api.post('/servers', auth, limited('image', uploadImage, 'icon'), (req, res) => {
   const name = String((req.body || {}).name || '').trim().slice(0, 64);
   if (!name) fail(400, 'Give your server a name.');
   const id = newId();
@@ -909,7 +994,7 @@ api.patch('/servers/:id', auth, (req, res) => {
   res.json(serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(srv.id), req.userId));
 });
 
-api.post('/servers/:id/icon', auth, uploadImage.single('icon'), (req, res) => {
+api.post('/servers/:id/icon', auth, limited('image', uploadImage, 'icon'), (req, res) => {
   const srv = requirePerm(req.params.id, req.userId, PM.MANAGE_SERVER);
   if (!req.file) fail(400, 'Choose an image.');
   db.prepare('UPDATE servers SET icon = ? WHERE id = ?').run('/uploads/' + req.file.filename, srv.id);
@@ -1464,7 +1549,7 @@ api.delete('/dm-messages/:id', auth, (req, res) => {
 });
 
 // Encrypted attachment blobs. The client encrypts each file with its own random key before upload.
-api.post('/upload/encrypted', auth, uploadEncrypted.single('file'), (req, res) => {
+api.post('/upload/encrypted', auth, limited('file', uploadEncrypted, 'file'), (req, res) => {
   if (!req.file) fail(400, 'No file.');
   rateLimit('blob:' + req.userId, 120, 60 * 1000);
   db.prepare('INSERT INTO blobs (name, uploader_id, created_at) VALUES (?, ?, ?)').run(req.file.filename, req.userId, now());
@@ -1501,7 +1586,7 @@ function cleanTheme(t, cur) {
   return out;
 }
 // Banner and background images for the server.
-api.post('/servers/:id/media/:kind', auth, uploadImage.single('file'), (req, res) => {
+api.post('/servers/:id/media/:kind', auth, limited('image', uploadImage, 'file'), (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.MANAGE_SERVER, 'You need the Manage Server permission.');
   if (!['banner', 'background'].includes(req.params.kind)) fail(404, 'Unknown media type.');
   if (!req.file) fail(400, 'Choose an image.');
@@ -1657,7 +1742,7 @@ function addEmoji(s, name, url, animated, userId) {
   emitServer(s.id);
   return { id, name, animated: !!animated };
 }
-api.post('/servers/:id/emojis', auth, uploadImage.single('file'), (req, res) => {
+api.post('/servers/:id/emojis', auth, limited('image', uploadImage, 'file'), (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.MANAGE_EMOJIS, 'You need the Manage Emoji permission.');
   if (!req.file) fail(400, 'Choose an image.');
   const url = '/uploads/' + req.file.filename;
@@ -1685,6 +1770,7 @@ api.post('/servers/:id/emojis/from-giphy', auth, wrap(async (req, res) => {
   if (buf.length > EMOJI_MAX) fail(400, 'That GIF is too big to use as an emoji.');
   const file = `${newId()}${crypto.randomBytes(8).toString('hex')}.gif`;
   fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
+  recordFile(req.userId, file, 'emoji', buf.length);
   try { res.json(addEmoji(s, name, '/uploads/' + file, isAnimatedImage(buf), req.userId)); } catch (e) { removeUpload('/uploads/' + file); throw e; }
 }));
 api.patch('/emojis/:id', auth, (req, res) => {
@@ -2296,6 +2382,8 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     ...brief(r.id), createdAt: r.created_at, lastSeen: r.last_seen_at, lastIp: r.last_ip, suspendedAt: r.suspended_at, suspendReason: r.suspend_reason,
     online: onlineSockets.has(r.id), isAdmin: isInstanceAdmin(r.id), ips: ipsOf(r.id), suspendedUntil: r.suspended_until,
     canAct: r.id !== req.userId && staffRank(req.userId) > staffRank(r.id), myRole: staffRole(req.userId),
+    storage: quotaOf(r.id), quotaOverride: r.upload_quota_mb, profileLocked: !!r.profile_locked,
+    commentsWritten: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE author_id = ?').get(r.id).n,
     notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
       .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
     sessions: db.prepare('SELECT ua, ip, created_at AS createdAt, last_seen AS lastSeen FROM sessions WHERE user_id = ? ORDER BY last_seen DESC').all(r.id),
@@ -2337,8 +2425,8 @@ api.delete('/admin/notes/:id', auth, staffOnly, (req, res) => {
 // Clear an offensive profile: pictures, song, name, bio, status and links go back to the defaults.
 api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
   const r = requireOutranks(req, req.params.id);
-  db.prepare("UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, profile = '{}' WHERE id = ?").run(r.id);
-  [r.avatar, r.banner, r.background, r.song].forEach((u) => removeUpload(u));
+  db.prepare("UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, page_bg = NULL, page = NULL, profile = '{}' WHERE id = ?").run(r.id);
+  [r.avatar, r.banner, r.background, r.song, r.page_bg].forEach((u) => removeUpload(u));
   broadcastUser(r.id);
   adminLog(req, 'profile_reset', r.id, r.username);
   res.json({ ok: true });
@@ -2544,6 +2632,159 @@ api.put('/admin/terms', auth, adminOnly, (req, res) => {
   io.emit('config:update', { termsVersion: termsInfo().version || 0 });
   res.json({ ok: true, version: termsInfo().version });
 });
+
+// ---------------------------------------------------------------- profile pages (MySpace style)
+const pageViews = new Map(); // "viewer:owner" -> last counted, so reloading doesn't inflate the counter
+setInterval(() => { const t = now() - 3600000; for (const [k, v] of pageViews) if (v < t) pageViews.delete(k); }, 600000).unref();
+function canCommentOn(viewerId, row, page) {
+  if (viewerId === row.id) return true;
+  if (page.comments === 'off' || isBlocked(viewerId, row.id)) return false;
+  return page.comments === 'everyone' ? true : areFriends(viewerId, row.id);
+}
+const commentOut = (c) => ({ id: c.id, text: c.text, createdAt: c.created_at, author: publicUser(getUserRow(c.author_id)) });
+api.get('/users/:id/page', auth, (req, res) => {
+  const row = getUserRow(req.params.id);
+  if (!row) fail(404, 'User not found.');
+  let views = row.page_views || 0;
+  const key = `${req.userId}:${row.id}`;
+  if (row.id !== req.userId && !pageViews.has(key)) {
+    pageViews.set(key, now());
+    db.prepare('UPDATE users SET page_views = page_views + 1 WHERE id = ?').run(row.id);
+    views++;
+  }
+  const page = parsePage(row);
+  const prof = parseProfile(row);
+  const blocked = isBlocked(req.userId, row.id);
+  res.json({
+    page, pageBg: row.page_bg || null, views,
+    friendCount: db.prepare("SELECT COUNT(*) n FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)").get(row.id, row.id).n,
+    topFriends: prof.topFriends.map((id) => publicUser(getUserRow(id))).filter(Boolean),
+    isFriend: areFriends(req.userId, row.id),
+    lastSeen: row.last_seen_at || null,
+    comments: blocked ? [] : db.prepare('SELECT * FROM profile_comments WHERE profile_id = ? ORDER BY created_at DESC LIMIT 100').all(row.id).map(commentOut),
+    commentCount: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE profile_id = ?').get(row.id).n,
+    canComment: canCommentOn(req.userId, row, page),
+    locked: !!row.profile_locked,
+  });
+});
+api.put('/me/page', auth, (req, res) => {
+  requireUnlocked(req.userId);
+  const row = getUserRow(req.userId);
+  const page = sanitizePage(req.body || {}, parsePage(row));
+  checkWords(page.meet, page.details.map((d) => [d.label, d.value]), Object.values(page.interests));
+  db.prepare('UPDATE users SET page = ? WHERE id = ?').run(JSON.stringify(page), req.userId);
+  res.json({ page });
+});
+api.post('/users/:id/comments', auth, (req, res) => {
+  const row = getUserRow(req.params.id);
+  if (!row) fail(404, 'User not found.');
+  if (!canCommentOn(req.userId, row, parsePage(row))) fail(403, 'You can\u2019t comment on this profile.');
+  rateLimit('pcomment:' + req.userId, 8, 60 * 1000);
+  const text = String((req.body || {}).text || '').trim().slice(0, 1000);
+  if (!text) fail(400, 'Write something first.');
+  checkWords(text);
+  const c = { id: newId(), profile_id: row.id, author_id: req.userId, text, created_at: now() };
+  db.prepare('INSERT INTO profile_comments (id, profile_id, author_id, text, created_at) VALUES (?, ?, ?, ?, ?)').run(c.id, c.profile_id, c.author_id, c.text, c.created_at);
+  // Keep walls from growing forever: the newest 500 stay.
+  db.prepare('DELETE FROM profile_comments WHERE profile_id = ? AND id NOT IN (SELECT id FROM profile_comments WHERE profile_id = ? ORDER BY created_at DESC LIMIT 500)').run(row.id, row.id);
+  if (row.id !== req.userId) io.to(`user:${row.id}`).emit('profile:comment', { from: req.userId });
+  res.json(commentOut(c));
+});
+// The writer, the profile's owner and staff can remove a comment.
+api.delete('/profile-comments/:id', auth, (req, res) => {
+  const c = db.prepare('SELECT * FROM profile_comments WHERE id = ?').get(req.params.id);
+  if (!c) fail(404, 'That comment is already gone.');
+  const mine = c.author_id === req.userId || c.profile_id === req.userId;
+  if (!mine && !isStaff(req.userId)) fail(403, 'You can\u2019t delete that comment.');
+  db.prepare('DELETE FROM profile_comments WHERE id = ?').run(c.id);
+  if (!mine) adminLog(req, 'profile_comment_deleted', c.profile_id, c.text.slice(0, 200));
+  res.json({ ok: true });
+});
+// Your own storage use (Settings → Account).
+api.get('/me/storage', auth, (req, res) => {
+  const q = quotaOf(req.userId);
+  const byKind = db.prepare('SELECT kind, COUNT(*) files, COALESCE(SUM(size), 0) bytes FROM user_files WHERE user_id = ? GROUP BY kind').all(req.userId);
+  res.json({ ...q, byKind });
+});
+
+// ---------------------------------------------------------------- admin: storage, limits, words, per-account switches
+api.get('/admin/storage', auth, adminOnly, (req, res) => {
+  let diskFree = null;
+  try { const st = fs.statfsSync(UPLOAD_DIR); diskFree = st.bavail * st.bsize; } catch { /* older Node */ }
+  const top = db.prepare('SELECT user_id, COUNT(*) files, SUM(size) bytes, MAX(created_at) last FROM user_files GROUP BY user_id ORDER BY bytes DESC LIMIT 50').all()
+    .map((r) => ({ user: brief(r.user_id), files: r.files, bytes: r.bytes, last: r.last, quotaMb: quotaOf(r.user_id).quotaMb, blocked: !!(getUserRow(r.user_id) || {}).uploads_blocked }));
+  const byKind = db.prepare('SELECT kind, COUNT(*) files, COALESCE(SUM(size), 0) bytes FROM user_files GROUP BY kind ORDER BY bytes DESC').all();
+  const today = db.prepare('SELECT COALESCE(SUM(size), 0) n FROM user_files WHERE created_at > ?').get(now() - 86400000).n;
+  const total = db.prepare('SELECT COALESCE(SUM(size), 0) n FROM user_files').get().n;
+  res.json({ limits: uploadLimits(), total, today, diskFree, top, byKind, words: blockedWords() });
+});
+api.put('/admin/limits', auth, adminOnly, (req, res) => {
+  const b = req.body || {};
+  const cur = uploadLimits();
+  const next = { ...cur };
+  for (const k of Object.keys(LIMIT_DEFAULTS)) if (b[k] !== undefined && Number.isFinite(+b[k]) && +b[k] >= 0) next[k] = Math.round(+b[k]);
+  setSetting('uploadLimits', JSON.stringify(next));
+  adminLog(req, 'upload_limits', null, Object.entries(uploadLimits()).map(([k, v]) => `${k}=${v}`).join(' '));
+  io.emit('config:update', { maxUploadMb: uploadLimits().fileMb, imageMb: uploadLimits().imageMb, songMb: uploadLimits().songMb });
+  res.json(uploadLimits());
+});
+api.put('/admin/words', auth, adminOnly, (req, res) => {
+  const list = [...new Set((Array.isArray((req.body || {}).words) ? req.body.words : String((req.body || {}).words || '').split(/[\n,]/))
+    .map((w) => String(w).trim().toLowerCase().slice(0, 40)).filter((w) => w.length >= 2))].slice(0, 500);
+  setSetting('blockedWords', JSON.stringify(list));
+  adminLog(req, 'word_filter', null, `${list.length} words`);
+  res.json({ words: list });
+});
+// Per-account switches: block uploads, lock profile, custom storage limit (null = the server default).
+api.patch('/admin/users/:id/limits', auth, staffOnly, (req, res) => {
+  const r = requireOutranks(req, req.params.id);
+  const b = req.body || {};
+  const changes = [];
+  if (b.uploadsBlocked !== undefined) { db.prepare('UPDATE users SET uploads_blocked = ? WHERE id = ?').run(b.uploadsBlocked ? 1 : 0, r.id); changes.push(b.uploadsBlocked ? 'uploads_blocked' : 'uploads_allowed'); }
+  if (b.profileLocked !== undefined) { db.prepare('UPDATE users SET profile_locked = ? WHERE id = ?').run(b.profileLocked ? 1 : 0, r.id); changes.push(b.profileLocked ? 'profile_locked' : 'profile_unlocked'); broadcastUser(r.id); }
+  if (b.quotaMb !== undefined) {
+    if (!isInstanceAdmin(req.userId)) fail(403, 'Only admins can change storage limits.');
+    const v = b.quotaMb === null || b.quotaMb === '' ? null : Math.max(0, Math.min(1e6, Math.round(+b.quotaMb) || 0));
+    db.prepare('UPDATE users SET upload_quota_mb = ? WHERE id = ?').run(v, r.id);
+    changes.push(`quota=${v === null ? 'default' : v + 'MB'}`);
+  }
+  changes.forEach((c) => adminLog(req, c.startsWith('quota') ? 'storage_limit' : c, r.id, c));
+  res.json({ ok: true });
+});
+// Remove everything someone uploaded (attachments included). For spam or abuse; can't be undone.
+api.delete('/admin/users/:id/files', auth, adminOnly, (req, res) => {
+  const r = requireOutranks(req, req.params.id);
+  const files = db.prepare('SELECT name FROM user_files WHERE user_id = ?').all(r.id);
+  files.forEach((f) => removeUpload('/uploads/' + f.name));
+  db.prepare('UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, page_bg = NULL WHERE id = ?').run(r.id);
+  db.prepare('DELETE FROM blobs WHERE uploader_id = ?').run(r.id);
+  broadcastUser(r.id);
+  adminLog(req, 'files_deleted', r.id, `${files.length} files`);
+  res.json({ ok: true, count: files.length });
+});
+// Clear everyone's comments by one person (spam waves).
+api.delete('/admin/users/:id/comments', auth, staffOnly, (req, res) => {
+  const r = requireOutranks(req, req.params.id);
+  const n = db.prepare('DELETE FROM profile_comments WHERE author_id = ?').run(r.id).changes;
+  adminLog(req, 'comments_deleted', r.id, `${n} comments`);
+  res.json({ ok: true, count: n });
+});
+
+// One-time: list files uploaded before storage tracking existed, so quotas count them too.
+function indexOldFiles() {
+  if (getSetting('filesIndexed')) return;
+  const sizeOf = (url) => { try { return fs.statSync(path.join(UPLOAD_DIR, path.basename(url))).size; } catch { return -1; } };
+  const add = (uid, url, kind) => { if (!uid || !url || !url.startsWith('/uploads/')) return; const sz = sizeOf(url); if (sz >= 0) db.prepare('INSERT OR IGNORE INTO user_files (name, user_id, kind, size, created_at) VALUES (?, ?, ?, ?, ?)').run(path.basename(url), uid, kind, sz, now()); };
+  db.transaction(() => {
+    db.prepare('SELECT name, uploader_id, created_at FROM blobs').all().forEach((b) => add(b.uploader_id, '/uploads/' + b.name, 'attachment'));
+    db.prepare('SELECT id, avatar, banner, background, song, page_bg FROM users').all().forEach((u) => {
+      add(u.id, u.avatar, 'image'); add(u.id, u.banner, 'image'); add(u.id, u.background, 'image'); add(u.id, u.song, 'song'); add(u.id, u.page_bg, 'image');
+    });
+    db.prepare('SELECT owner_id, icon FROM servers').all().forEach((x) => add(x.owner_id, x.icon, 'image'));
+    db.prepare('SELECT created_by, url FROM emojis').all().forEach((e) => add(e.created_by, e.url, 'emoji'));
+  })();
+  setSetting('filesIndexed', '1');
+}
 
 // ---------------------------------------------------------------- errors + SPA fallback
 api.use((req, res) => res.status(404).json({ error: 'Not found.' }));
@@ -2771,6 +3012,7 @@ function setupSockets(server) {
   if (USE_HTTPS) server = https.createServer(await loadTls(), app);
   else server = http.createServer(app);
   setupSockets(server);
+  try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
     console.log(`\n  ${INSTANCE_NAME} is running.\n`);

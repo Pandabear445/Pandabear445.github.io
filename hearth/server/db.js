@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -369,6 +369,31 @@ CREATE TABLE IF NOT EXISTS admin_log (
 
 // v7: timed suspensions (staff roles live in instance_settings).
 addColumn('users', 'suspended_until', 'INTEGER');
+// v8: profile pages, upload limits, per-account admin switches.
+addColumn('users', 'page', 'TEXT');
+addColumn('users', 'page_bg', 'TEXT');
+addColumn('users', 'page_views', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'upload_quota_mb', 'INTEGER');
+addColumn('users', 'uploads_blocked', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'profile_locked', 'INTEGER NOT NULL DEFAULT 0');
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_files (
+  name TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_files_user ON user_files(user_id, created_at);
+CREATE TABLE IF NOT EXISTS profile_comments (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  author_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_profile_comments ON profile_comments(profile_id, created_at);
+`);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

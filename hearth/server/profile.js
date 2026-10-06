@@ -3,11 +3,13 @@ const HEX = /^#[0-9a-fA-F]{6}$/;
 
 const FONTS = ['default', 'Pacifico', 'Orbitron', 'Press Start 2P', 'Caveat', 'Righteous',
   'Bungee', 'Space Mono', 'Playfair Display', 'Creepster', 'Comfortaa', 'Monoton'];
-const RINGS = ['none', 'solid', 'gradient', 'rainbow', 'glow', 'pulse'];
+const RINGS = ['none', 'solid', 'gradient', 'rainbow', 'glow', 'pulse', 'spin', 'double', 'dashed'];
 const CARD_STYLES = ['solid', 'gradient', 'glass'];
-const EFFECTS = ['none', 'sparkles', 'snow', 'hearts', 'stars', 'bubbles', 'embers', 'sakura', 'confetti', 'rain', 'fireflies'];
+const EFFECTS = ['none', 'sparkles', 'snow', 'hearts', 'stars', 'bubbles', 'embers', 'sakura', 'confetti', 'rain', 'fireflies', 'custom'];
+// Build-your-own effect: any characters or emoji, moving the way you pick.
+const FX_MOTIONS = ['fall', 'rise', 'float', 'drift', 'twinkle', 'spin', 'zoom', 'bounce'];
 const SHAPES = ['circle', 'rounded', 'square', 'hexagon'];
-const NAME_EFFECTS = ['none', 'glow', 'shimmer', 'rainbow'];
+const NAME_EFFECTS = ['none', 'glow', 'shimmer', 'rainbow', 'flow', 'pulse', 'wave', 'neon', 'glitch', 'outline', 'shadow'];
 
 const DEFAULTS = {
   displayName: '',
@@ -20,6 +22,15 @@ const DEFAULTS = {
   accentColor: '#f2a541',
   nameColor: '#ffffff',
   nameColor2: '',
+  nameColor3: '',
+  nameColor4: '',
+  nameGlow: '',
+  ringColor2: '',
+  ringColor3: '',
+  ringSpeed: 4,
+  customFx: { glyphs: '✦★', motion: 'fall', count: 16, speed: 5, size: 16, color: '', glow: false },
+  mood: { emoji: '', text: '' },
+  headline: '',
   nameFont: 'default',
   nameEffect: 'none',
   avatarRing: 'none',
@@ -36,6 +47,12 @@ const hex = (v, fallback) => (typeof v === 'string' && HEX.test(v) ? v.toLowerCa
 const pick = (v, list, fallback) => (list.includes(v) ? v : fallback);
 
 const num = (v, min, max, d) => (Number.isFinite(+v) ? Math.min(max, Math.max(min, +v)) : d);
+// Up to 6 characters/emoji ("graphemes"), so flags and skin-tone emoji count as one.
+const graphemes = (v) => {
+  const t = typeof v === 'string' ? v.replace(/[\u0000-\u001f<>]/g, '') : '';
+  const seg = typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter().segment(t)].map((x) => x.segment) : Array.from(t);
+  return seg.filter((g) => g.trim()).slice(0, 6).join('');
+};
 const crop = (c) => ({ x: num(c && c.x, -200, 200, 0), y: num(c && c.y, -200, 200, 0), z: num(c && c.z, 1, 5, 1) });
 
 function sanitizeProfile(input, current = {}) {
@@ -55,6 +72,26 @@ function sanitizeProfile(input, current = {}) {
     accentColor: hex(merged.accentColor, DEFAULTS.accentColor),
     nameColor: hex(merged.nameColor, DEFAULTS.nameColor),
     nameColor2: merged.nameColor2 ? hex(merged.nameColor2, '') : '',
+    nameColor3: merged.nameColor2 && merged.nameColor3 ? hex(merged.nameColor3, '') : '',
+    nameColor4: merged.nameColor2 && merged.nameColor3 && merged.nameColor4 ? hex(merged.nameColor4, '') : '',
+    nameGlow: merged.nameGlow ? hex(merged.nameGlow, '') : '',
+    ringColor2: merged.ringColor2 ? hex(merged.ringColor2, '') : '',
+    ringColor3: merged.ringColor3 ? hex(merged.ringColor3, '') : '',
+    ringSpeed: num(merged.ringSpeed, 1, 10, 4),
+    customFx: (() => {
+      const f = merged.customFx && typeof merged.customFx === 'object' ? merged.customFx : {};
+      return {
+        glyphs: graphemes(f.glyphs) || DEFAULTS.customFx.glyphs,
+        motion: pick(f.motion, FX_MOTIONS, 'fall'),
+        count: Math.round(num(f.count, 4, 40, 16)),
+        speed: num(f.speed, 1, 10, 5),
+        size: Math.round(num(f.size, 8, 48, 16)),
+        color: f.color ? hex(f.color, '') : '',
+        glow: !!f.glow,
+      };
+    })(),
+    mood: { emoji: str(merged.mood && merged.mood.emoji, 16), text: str(merged.mood && merged.mood.text, 40) },
+    headline: str(merged.headline, 80),
     nameFont: pick(merged.nameFont, FONTS, 'default'),
     nameEffect: pick(merged.nameEffect, NAME_EFFECTS, 'none'),
     avatarRing: pick(merged.avatarRing, RINGS, 'none'),
@@ -83,4 +120,4 @@ function parseProfile(row) {
   try { return sanitizeProfile(JSON.parse(row.profile || '{}')); } catch { return sanitizeProfile({}); }
 }
 
-module.exports = { sanitizeProfile, parseProfile, FONTS, DEFAULTS };
+module.exports = { sanitizeProfile, parseProfile, FONTS, DEFAULTS, graphemes };

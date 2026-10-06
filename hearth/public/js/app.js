@@ -12,7 +12,8 @@ import { prepareImage, makeQueue, whenVisible } from './media.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
 import { createSecure } from './secure.js';
-import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle } from './profile-ui.js';
+import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
+import { renderPage } from './page.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
 import { openSettings, applyAppearance } from './settings.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
@@ -81,6 +82,7 @@ export const app = {
   onMe(u) { setUser(u); renderUserPanel(); },
   logout,
   rerender: () => renderAll(),
+  openProfile: (id) => openProfileModal(id),
   install: () => installApp(),
   get canInstall() { return !!installPrompt; },
   get isInstalled() { return isStandalone(); },
@@ -287,6 +289,7 @@ function startApp() {
     playSound('mention');
     if (S.view.type === 'admin' && S.view.tab === 'reports') renderMain();
   });
+  socket.on('profile:comment', ({ from }) => toast(`${displayName(getUser(from))} commented on your profile.`));
   socket.on('config:update', (c) => {
     Object.assign(S.config, c);
     if ('announcement' in c) renderAnnouncement();
@@ -3143,17 +3146,22 @@ function topFriendsEl(u) {
   return h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'Top friends'),
     h('div', { class: 'pc-friends' }, ids.map((id) => { const f = getUser(id); return h('button', { class: 'pc-friend', onclick: () => openProfileModal(id) }, avatarEl(f, 44), h('span', null, displayName(f))); })));
 }
-function openProfileModal(userId) {
+// The full, MySpace-style profile page.
+async function openProfileModal(userId) {
   closePopover();
+  let data;
+  try { data = await api('GET', `/users/${userId}/page`); } catch (e) { return toast(e.message, 'error'); }
+  (data.topFriends || []).forEach(setUser);
+  data.comments.forEach((c) => c.author && setUser(c.author));
   const u = getUser(userId);
-  const friendsInCommon = Object.values(S.relationships).filter((r) => r.status === 'accepted').map((r) => r.userId)
-    .filter((id) => realServers().some((s) => s.memberIds.includes(id) && s.memberIds.includes(u.id)) && id !== u.id).slice(0, 8);
-  modal({
-    size: 'md', className: 'profile-modal',
-    body: h('div', { class: 'profile-full' },
-      profileCard(u, { meId: S.me.id, actions: relationshipActions(u), mutual: mutualServersEl(u), topFriends: topFriendsEl(u) }),
-      friendsInCommon.length ? h('div', { class: 'pf-common' }, h('h3', null, 'People you both know'), h('div', { class: 'friend-chips' }, friendsInCommon.map((id) => { const f = getUser(id); return h('span', { class: 'friend-chip' }, avatarEl(f, 24), displayName(f)); }))) : null),
+  let m = null;
+  const view = renderPage(data, u, {
+    me: S.me, isStaff: !!S.me.staffRole,
+    actions: u.id === S.me.id ? null : relationshipActions(u),
+    openUser: (id) => { m.close(); openProfileModal(id); },
+    onEdit: () => { m.close(); openSettings(app, 'page'); },
   });
+  m = modal({ size: 'full', className: 'mys-modal', title: `${displayName(u)}'s profile`, body: h('div', { class: 'mys-host' }, h('button', { class: 'icon-btn mys-close', 'aria-label': 'Close', onclick: () => m.close() }, icon('close')), view), onClose: stopSong });
 }
 async function openSafetyNumber(u) {
   try {

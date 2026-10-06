@@ -3,7 +3,8 @@ import { h, clear, icon, toast, playSound } from './util.js';
 import { api, upload } from './api.js';
 import { EVENTS as SOUND_EVENTS, LIBRARY as SOUND_LIBRARY, soundPrefs, setSoundPrefs, resetSoundPrefs, setCustomSound, customSoundName } from './sounds.js';
 import * as E2EE from './e2ee.js';
-import { profileCard, FONT_STACKS, cropStyle } from './profile-ui.js';
+import { profileCard, FONT_STACKS, cropStyle, customFxLayer } from './profile-ui.js';
+import { pageEditorTab } from './page.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import {
@@ -56,7 +57,7 @@ function section(title, ...kids) {
 // ------------------------------------------------------------------ the modal
 // Grouped like most chat apps so people can find things: [group label, [[key, label, icon], ...]]
 const TAB_GROUPS = [
-  ['Account', [['profile', 'Profile', 'user'], ['account', 'Security', 'lock'], ['sessions', 'Sessions', 'monitor']]],
+  ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor']]],
   ['App', [['appearance', 'Appearance', 'palette'], ['layout', 'Layout', 'sidebar'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['apps', 'Apps & devices', 'download']]],
   ['Privacy', [['privacy', 'Privacy & safety', 'shield']]],
   ['Servers', [['servers', 'Server settings', 'gear']]],
@@ -84,7 +85,7 @@ export function openSettings(app, tab = 'profile') {
   const m = modal({ size: 'full', className: 'settings-modal', body: shell, onClose: stopMicTest });
 
   async function tryClose() {
-    if (dirty && !(await confirmDialog({ title: 'Discard changes?', text: 'You have profile changes that are not saved yet.', confirm: 'Discard', danger: true }))) return;
+    if (dirty && !(await confirmDialog({ title: 'Discard changes?', text: 'You have changes that are not saved yet.', confirm: 'Discard', danger: true }))) return;
     dirty = false;
     m.close();
   }
@@ -115,7 +116,7 @@ export function openSettings(app, tab = 'profile') {
     stopMicTest();
     drawNav();
     clear(content);
-    const views = { instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
+    const views = { page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
     content.append(views[current](app, (d) => { dirty = d; }));
     content.scrollTop = 0;
   };
@@ -191,7 +192,7 @@ function profileTab(app, setDirty) {
       const f = fileIn.files[0];
       fileIn.value = '';
       if (!f) return;
-      if (f.size > 12 * 1024 * 1024) return toast('Images can be up to 12 MB.', 'error');
+      if (f.size > (app.S.config.imageMb || 12) * 1024 * 1024) return toast(`Images can be up to ${app.S.config.imageMb || 12} MB.`, 'error');
       const url = URL.createObjectURL(f);
       openCropper({
         src: url, kind, shape: shape(), saveLabel: 'Upload',
@@ -253,7 +254,22 @@ function profileTab(app, setDirty) {
 
   // --- name style
   const gradOn = !!draft.nameColor2;
-  const color2Wrap = h('div', { hidden: !gradOn }, colorInput(draft.nameColor2 || '#f2a541', (v) => { draft.nameColor2 = v; changed(); }, 'Second name color'));
+  // Up to four name colors: the 3rd and 4th are optional extras on top of a gradient.
+  const extraColors = h('div', { class: 'stack' });
+  const drawExtraColors = () => {
+    clear(extraColors);
+    if (!draft.nameColor2) return;
+    [['nameColor3', 'Third color'], ['nameColor4', 'Fourth color']].forEach(([k, label], i) => {
+      if (i === 1 && !draft.nameColor3) return;
+      extraColors.append(h('div', { class: 'row gap' }, draft[k]
+        ? colorInput(draft[k], (v) => { draft[k] = v; changed(); }, label)
+        : h('button', { class: 'btn ghost sm', onclick: () => { draft[k] = i ? '#38c6d9' : '#b07cff'; drawExtraColors(); changed(); } }, `+ ${label}`),
+      draft[k] ? h('button', { class: 'icon-btn sm', 'aria-label': `Remove ${label.toLowerCase()}`, onclick: () => { draft[k] = ''; if (k === 'nameColor3') draft.nameColor4 = ''; drawExtraColors(); changed(); } }, icon('close')) : null));
+    });
+  };
+  drawExtraColors();
+  const color2Wrap = h('div', { hidden: !gradOn }, colorInput(draft.nameColor2 || '#f2a541', (v) => { draft.nameColor2 = v; changed(); }, 'Second name color'), extraColors);
+  const glowWrap = h('div', { hidden: !draft.nameGlow }, colorInput(draft.nameGlow || '#ff4fa3', (v) => { draft.nameGlow = v; changed(); }, 'Glow color'));
   const fontSelect = h('select', { class: 'input', onchange: (e) => set('nameFont')(e.target.value) },
     Object.keys(FONT_STACKS).map((f) => h('option', { value: f, style: { fontFamily: FONT_STACKS[f] } }, f === 'default' ? 'Default' : f)));
   fontSelect.value = draft.nameFont || 'default';
@@ -269,6 +285,27 @@ function profileTab(app, setDirty) {
     if (draft.links.length < 6) linksHost.append(h('button', { class: 'btn ghost sm', onclick: () => { draft.links.push({ label: '', url: '' }); drawLinks(); changed(); } }, '+ Add link'));
   };
   drawLinks();
+
+  // ---- build-your-own effect
+  const FX_DEFAULT = { glyphs: '✦★', motion: 'fall', count: 16, speed: 5, size: 16, color: '', glow: false };
+  draft.customFx = { ...FX_DEFAULT, ...(draft.customFx || {}) };
+  const fxDemo = h('div', { class: 'fx-demo', style: { '--c1': draft.themePrimary, '--c2': draft.themeSecondary } });
+  const drawDemo = () => { const l = customFxLayer(draft.customFx); clear(fxDemo); if (l) fxDemo.append(l); };
+  const setFx = (k) => (v) => { draft.customFx = { ...draft.customFx, [k]: v }; drawDemo(); changed(); };
+  const fxColorWrap = h('div', { hidden: !draft.customFx.color }, colorInput(draft.customFx.color || '#ffe27a', setFx('color'), 'Effect color'));
+  const fxHost = h('div', { class: 'fx-builder', hidden: draft.profileEffect !== 'custom' },
+    h('strong', null, 'Your own effect'),
+    fxDemo,
+    field('Characters or emoji', h('input', { class: 'input', maxlength: '60', value: draft.customFx.glyphs, placeholder: '🍕👽✨', oninput: (e) => setFx('glyphs')(e.target.value) }), 'Up to 6. They take turns: type 🐸🌈 for frogs and rainbows.'),
+    h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'How they move'),
+      chips([['fall', 'Fall'], ['rise', 'Rise'], ['float', 'Float up'], ['drift', 'Drift sideways'], ['twinkle', 'Twinkle'], ['spin', 'Spin'], ['zoom', 'Zoom'], ['bounce', 'Bounce']], draft.customFx.motion, setFx('motion'))),
+    sliderRow('How many', 4, 40, 1, draft.customFx.count, (v) => `${v}`, setFx('count')),
+    sliderRow('Speed', 1, 10, 1, draft.customFx.speed, (v) => `${v}`, setFx('speed')),
+    sliderRow('Size', 8, 48, 1, draft.customFx.size, (v) => `${v}px`, setFx('size')),
+    toggle('Color them (for plain characters like ★ ♥ ✦)', !!draft.customFx.color, (on) => { fxColorWrap.hidden = !on; setFx('color')(on ? '#ffe27a' : ''); }, 'Emoji keep their own colors.'),
+    fxColorWrap,
+    toggle('Glow', !!draft.customFx.glow, setFx('glow')));
+  drawDemo();
 
   const presetRow = h('div', { class: 'presets' }, PRESETS.map((p) => h('button', {
     type: 'button',
@@ -305,24 +342,32 @@ function profileTab(app, setDirty) {
         h('div', { class: 'field' }, toggle('Gradient name', gradOn, (on) => {
           color2Wrap.hidden = !on;
           draft.nameColor2 = on ? (draft.nameColor2 || '#f2a541') : '';
+          if (!on) { draft.nameColor3 = ''; draft.nameColor4 = ''; }
+          drawExtraColors();
           changed();
         }), color2Wrap)),
       field('Name font', fontSelect),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Name effect'),
-        chips([['none', 'None'], ['glow', 'Glow'], ['shimmer', 'Shimmer'], ['rainbow', 'Rainbow']], draft.nameEffect || 'none', set('nameEffect')))),
+        chips([['none', 'None'], ['glow', 'Glow'], ['neon', 'Neon'], ['shimmer', 'Shimmer'], ['rainbow', 'Rainbow'], ['flow', 'Flowing colors'], ['pulse', 'Pulse'], ['wave', 'Wave'], ['glitch', 'Glitch'], ['outline', 'Outline'], ['shadow', 'Retro shadow']], draft.nameEffect || 'none', set('nameEffect'))),
+      h('div', { class: 'field' }, toggle('Pick the glow / outline / shadow color', !!draft.nameGlow, (on) => { draft.nameGlow = on ? (draft.nameGlow || '#ff4fa3') : ''; glowWrap.hidden = !on; changed(); }), glowWrap)),
     section('Avatar',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Shape'),
         chips([['circle', 'Circle'], ['rounded', 'Rounded'], ['square', 'Square'], ['hexagon', 'Hexagon']], draft.avatarShape || 'circle', set('avatarShape'))),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Ring'),
-        chips([['none', 'None'], ['solid', 'Solid'], ['gradient', 'Gradient'], ['rainbow', 'Rainbow'], ['glow', 'Glow'], ['pulse', 'Pulse']], draft.avatarRing || 'none', set('avatarRing'))),
-      field('Ring color', colorInput(draft.ringColor, set('ringColor'), 'Ring color'), 'Gradient and glow rings blend this with your accent.')),
+        chips([['none', 'None'], ['solid', 'Solid'], ['gradient', 'Gradient'], ['rainbow', 'Rainbow'], ['glow', 'Glow'], ['pulse', 'Pulse'], ['spin', 'Spinning colors'], ['double', 'Double'], ['dashed', 'Dashed spinner']], draft.avatarRing || 'none', set('avatarRing'))),
+      h('div', { class: 'grid-2' },
+        field('Ring color', colorInput(draft.ringColor, set('ringColor'), 'Ring color')),
+        field('Second color', colorInput(draft.ringColor2 || draft.accentColor || '#f2a541', set('ringColor2'), 'Second ring color'), 'Gradient, glow, double and spinning rings use it.')),
+      field('Third color (spinning ring)', colorInput(draft.ringColor3 || '#38c6d9', set('ringColor3'), 'Third ring color')),
+      sliderRow('Spin speed', 1, 10, 1, draft.ringSpeed || 4, (v) => `${v}`, (v) => { draft.ringSpeed = v; changed(); })),
     section('Card theme',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Presets'), presetRow),
       colorsHost,
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Card style'),
         chips([['solid', 'Solid'], ['gradient', 'Gradient'], ['glass', 'Glass']], draft.cardStyle || 'gradient', set('cardStyle'))),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Profile effect'),
-        chips([['none', 'None'], ['sparkles', '✦ Sparkles'], ['snow', '❄ Snow'], ['hearts', '♥ Hearts'], ['stars', '★ Stars'], ['bubbles', '◯ Bubbles'], ['embers', '🔥 Embers'], ['sakura', '✿ Cherry blossoms'], ['confetti', '🎉 Confetti'], ['rain', '🌧 Rain'], ['fireflies', '✨ Fireflies']], draft.profileEffect || 'none', set('profileEffect')))),
+        chips([['none', 'None'], ['sparkles', '✦ Sparkles'], ['snow', '❄ Snow'], ['hearts', '♥ Hearts'], ['stars', '★ Stars'], ['bubbles', '◯ Bubbles'], ['embers', '🔥 Embers'], ['sakura', '✿ Cherry blossoms'], ['confetti', '🎉 Confetti'], ['rain', '🌧 Rain'], ['fireflies', '✨ Fireflies'], ['custom', '🛠 Make your own']], draft.profileEffect || 'none', (v) => { set('profileEffect')(v); fxHost.hidden = v !== 'custom'; }),
+        fxHost)),
     section('Links', h('p', { class: 'field-hint' }, 'Up to 6. Must start with http:// or https://'), linksHost),
   );
 
@@ -367,11 +412,28 @@ function accountTab(app) {
     } finally { btn.disabled = false; btn.textContent = 'Change password'; }
   } }, 'Change password');
 
+  // Storage: what you've uploaded against the server's limits.
+  const storage = h('div', { class: 'stack' }, h('span', { class: 'field-hint' }, 'Loading\u2026'));
+  api('GET', '/me/storage').then((q) => {
+    const MB = 1024 * 1024;
+    const mb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
+    const pct = q.quotaMb ? Math.min(100, (q.used / (q.quotaMb * MB)) * 100) : 0;
+    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji' };
+    clear(storage).append(
+      q.blocked ? h('p', { class: 'key-bar bad' }, icon('ban'), 'An admin has turned off uploads for your account.') : null,
+      h('div', { class: 'kv' }, h('span', null, 'Used'), h('strong', null, q.quotaMb ? `${mb(q.used)} of ${q.quotaMb} MB` : `${mb(q.used)} (no limit)`)),
+      q.quotaMb ? h('div', { class: `storage-bar${pct > 90 ? ' warn' : ''}` }, h('i', { style: { width: `${pct}%` } })) : null,
+      h('div', { class: 'kv' }, h('span', null, 'Uploaded today'), h('strong', null, q.dailyMb ? `${mb(q.today)} of ${q.dailyMb} MB` : mb(q.today))),
+      h('div', { class: 'kv' }, h('span', null, 'Largest file'), h('strong', null, `${q.fileMb} MB (pictures ${q.imageMb} MB, songs ${q.songMb} MB)`)),
+      ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))));
+  }).catch((e) => clear(storage).append(h('p', { class: 'form-error' }, e.message)));
+
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Account & security'),
     section('Your account',
       h('div', { class: 'kv' }, h('span', null, 'Username'), h('strong', null, S.me.username)),
       h('div', { class: 'kv' }, h('span', null, 'Member since'), h('strong', null, new Date(S.me.createdAt).toLocaleDateString()))),
+    section('Storage', storage),
     section('Encryption',
       h('p', { class: 'muted-p' }, 'Everything you send \u2014 DMs, server channels and every file \u2014 is end-to-end encrypted on this device before it leaves. The server only stores scrambled data and can\u2019t read it.'),
       h('div', { class: 'kv' }, h('span', null, 'Messages'), h('strong', null, 'AES-256-GCM, new key per message')),
@@ -1203,7 +1265,7 @@ function profilePageSection(app, draft, set) {
     clear(songHost).append(h('div', { class: 'media-row' },
       h('span', { class: 'media-thumb song-thumb' }, '\u266B'),
       h('div', { class: 'media-text' }, h('strong', null, has ? (S.me.profile.songTitle || 'Profile song') : 'Profile song'),
-        h('span', { class: 'field-hint' }, has ? 'Plays when someone presses play on your profile (never automatically).' : 'MP3, M4A, OGG or WAV up to 10 MB.')),
+        h('span', { class: 'field-hint' }, has ? 'Plays when someone presses play on your profile (or by itself, if you turn on autoplay under Profile page).' : `MP3, M4A, OGG or WAV up to ${S.config.songMb || 10} MB.`)),
       h('div', { class: 'media-actions' },
         h('button', { class: 'btn primary sm', onclick: () => fileIn.click() }, has ? 'Change' : 'Upload'),
         has ? h('button', { class: 'btn ghost sm', onclick: async () => { app.onMe(await api('DELETE', '/me/song')); drawSong(); } }, 'Remove') : null),
