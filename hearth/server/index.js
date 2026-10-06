@@ -98,7 +98,8 @@ function selfUser(row) {
   u.kdf = row.kdf;
   u.kdfSalt = row.kdf_salt;
   u.privacy = privacyOf(row);
-  u.instanceAdmin = isInstanceAdmin(row.id);
+  u.staffRole = staffRole(row.id);
+  u.instanceAdmin = (STAFF_RANK[u.staffRole] || 0) >= 2;
   return u;
 }
 
@@ -503,16 +504,25 @@ function secEvent(type, ip, detail = '') {
   if (securityLog.length > 500) securityLog.length = 500;
 }
 const maintenance = () => getSetting('maintenance') || '';
-const suspendedMsg = (row) => `This account is suspended${row.suspend_reason ? `: ${row.suspend_reason}` : '.'}`;
+const suspendedMsg = (row) => `This account is suspended${row.suspended_until ? ` until ${new Date(row.suspended_until).toUTCString().replace(/:\d\d GMT$/, ' UTC')}` : ''}${row.suspend_reason ? `: ${row.suspend_reason}` : '.'}`;
+// True while the account is suspended. A timed suspension that has run out is lifted here, on first use.
+function stillSuspended(row) {
+  if (!row || !row.suspended_at) return false;
+  if (row.suspended_until && row.suspended_until <= Date.now()) {
+    db.prepare('UPDATE users SET suspended_at = NULL, suspend_reason = NULL, suspended_until = NULL WHERE id = ?').run(row.id);
+    return false;
+  }
+  return true;
+}
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
   const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
   if (!s) return res.status(401).json({ error: 'Not signed in.' });
-  const u = db.prepare('SELECT suspended_at, suspend_reason FROM users WHERE id = ?').get(s.user_id);
+  const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until FROM users WHERE id = ?').get(s.user_id);
   if (!u) return res.status(401).json({ error: 'Not signed in.' });
-  if (u.suspended_at) return res.status(403).json({ error: suspendedMsg(u), code: 'suspended' });
-  if (maintenance() && !isInstanceAdmin(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
+  if (stillSuspended(u)) return res.status(403).json({ error: suspendedMsg(u), code: 'suspended' });
+  if (maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
   req.userId = s.user_id;
   req.token = token;
   if (!s.last_seen || Date.now() - s.last_seen > 60000) db.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?').run(Date.now(), token);
@@ -663,8 +673,8 @@ api.post('/auth/login', wrap(async (req, res) => {
   verifyCaptcha((req.body || {}).captcha, 'login');
   const ok = row && typeof authKey === 'string' && await bcrypt.compare(authKey, row.auth_hash);
   if (!ok) { noteAuthFailure(req.ip); secEvent('failed_login', req.ip, String(username || '').slice(0, 40)); fail(401, 'Wrong username or password.'); }
-  if (maintenance() && !isInstanceAdmin(row.id)) fail(503, maintenance(), 'maintenance');
-  if (row.suspended_at) fail(403, suspendedMsg(row), 'suspended');
+  if (maintenance() && !isStaff(row.id)) fail(503, maintenance(), 'maintenance');
+  if (stillSuspended(row)) fail(403, suspendedMsg(row), 'suspended');
   const token = crypto.randomBytes(32).toString('hex');
   db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(token, row.id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
   recordIp(row.id, req.ip, token);
@@ -1783,21 +1793,47 @@ api.delete('/me/sessions/:id', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- instance settings + GIPHY
-// Instance admins: usernames in ADMIN_USERS (comma-separated), or else the first account created.
+// Instance staff, highest first:
+//   owner      one person: the first account (or the first ADMIN_USERS name that exists) until handed over.
+//              Only the owner can give or take away staff roles, and hand over ownership.
+//   admin      the whole admin dashboard and Settings → Instance. ADMIN_USERS names are always admins.
+//   moderator  reports, users (suspend, sign out, reset profile, notes), who's online and the audit log.
+// Staff can only act on people ranked below them.
 const getSetting = (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value;
 const setSetting = (k, v) => (v === null || v === undefined
   ? db.prepare('DELETE FROM instance_settings WHERE key = ?').run(k)
   : db.prepare('INSERT OR REPLACE INTO instance_settings (key, value) VALUES (?, ?)').run(k, String(v)));
 const firstAccount = () => (db.prepare('SELECT id FROM users ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
-const extraAdmins = () => { try { return JSON.parse(getSetting('admins') || '[]'); } catch { return []; } };
-function isInstanceAdmin(uid) {
-  const list = (process.env.ADMIN_USERS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
-  const row = getUserRow(uid);
-  if (!row) return false;
-  if (extraAdmins().includes(uid)) return true;
-  if (list.length) return list.includes(row.username.toLowerCase());
-  return firstAccount() === uid;
+const STAFF_RANK = { moderator: 1, admin: 2, owner: 3 };
+const envAdmins = () => (process.env.ADMIN_USERS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+// { userId: 'admin' | 'moderator' }. Older versions kept a plain list of extra admins under 'admins'.
+function staffRoles() {
+  let r = null;
+  try { r = JSON.parse(getSetting('staffRoles') || 'null'); } catch { /* rebuilt below */ }
+  if (!r || typeof r !== 'object' || Array.isArray(r)) {
+    r = {};
+    try { (JSON.parse(getSetting('admins') || '[]') || []).forEach((id) => { r[id] = 'admin'; }); } catch { /* none */ }
+  }
+  return r;
 }
+const saveStaffRoles = (r) => setSetting('staffRoles', JSON.stringify(r));
+function ownerId() {
+  const set = getSetting('owner');
+  if (set && getUserRow(set)) return set;
+  for (const n of envAdmins()) { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) return r.id; }
+  return firstAccount();
+}
+function staffRole(uid) {
+  const row = uid && getUserRow(uid);
+  if (!row) return null;
+  if (ownerId() === uid) return 'owner';
+  if (envAdmins().includes(row.username.toLowerCase())) return 'admin';
+  const r = staffRoles()[uid];
+  return STAFF_RANK[r] && r !== 'owner' ? r : null;
+}
+const staffRank = (uid) => STAFF_RANK[staffRole(uid)] || 0;
+const isStaff = (uid) => staffRank(uid) >= 1;
+function isInstanceAdmin(uid) { return staffRank(uid) >= 2; }
 const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'Only the server administrator can change this.'); };
 // The key saved in the app wins over .env, so the admin never has to edit files.
 const giphyKey = () => getSetting('giphyKey') || GIPHY_API_KEY;
@@ -2123,8 +2159,9 @@ function adminLog(req, action, target, detail = '') {
   db.prepare('INSERT INTO admin_log (admin_id, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(req.userId, action, target || null, String(detail).slice(0, 1000), cleanIp(req.ip), now());
 }
-function suspendUser(uid, reason) {
-  db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), uid);
+function suspendUser(uid, reason, hours = 0) {
+  const until = hours > 0 ? now() + hours * 3600000 : null;
+  db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ?, suspended_until = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), until, uid);
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
   io.in(`user:${uid}`).disconnectSockets(true);
 }
@@ -2181,8 +2218,19 @@ api.post('/reports', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin API (instance administrators only)
+// adminOnly: admins and the owner. staffOnly: moderators too. ownerOnly: just the owner.
 const adminOnly = (req, res, next) => { try { requireInstanceAdmin(req.userId); next(); } catch (e) { next(e); } };
-const brief = (uid) => { const r = uid && getUserRow(uid); return r ? { id: r.id, username: r.username, displayName: parseProfile(r).displayName || r.username, avatar: r.avatar, suspended: !!r.suspended_at } : null; };
+const staffOnly = (req, res, next) => (isStaff(req.userId) ? next() : next(new HttpError(403, 'Only staff can see this.')));
+const ownerOnly = (req, res, next) => (staffRole(req.userId) === 'owner' ? next() : next(new HttpError(403, 'Only the owner can change staff roles.')));
+// Staff can only act on people ranked below them (the owner on everyone else).
+function requireOutranks(req, targetId) {
+  const r = getUserRow(targetId);
+  if (!r) fail(404, 'User not found.');
+  if (targetId === req.userId) fail(400, 'You can\u2019t do that to your own account.');
+  if (staffRank(req.userId) <= staffRank(targetId)) fail(403, `You can\u2019t do that to ${staffRole(targetId) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
+  return r;
+}
+const brief = (uid) => { const r = uid && getUserRow(uid); return r ? { id: r.id, username: r.username, displayName: parseProfile(r).displayName || r.username, avatar: r.avatar, suspended: !!r.suspended_at, role: staffRole(r.id) } : null; };
 let diskCache = { at: 0, bytes: 0 };
 function uploadsBytes() {
   if (Date.now() - diskCache.at < 5 * 60 * 1000) return diskCache.bytes;
@@ -2191,7 +2239,7 @@ function uploadsBytes() {
   diskCache = { at: Date.now(), bytes };
   return bytes;
 }
-api.get('/admin/stats', auth, adminOnly, (req, res) => {
+api.get('/admin/stats', auth, staffOnly, (req, res) => {
   const day = 86400000; const t = now();
   const count = (sql, ...a) => db.prepare(sql).get(...a).n;
   const series = [];
@@ -2217,7 +2265,7 @@ api.get('/admin/stats', auth, adminOnly, (req, res) => {
     regMode: regMode(), series,
   });
 });
-api.get('/admin/online', auth, adminOnly, async (req, res) => {
+api.get('/admin/online', auth, staffOnly, async (req, res) => {
   const byUser = new Map();
   for (const sock of await io.fetchSockets()) {
     const e = byUser.get(sock.userId) || { user: brief(sock.userId), ips: new Set(), since: Infinity, devices: new Set(), connections: 0 };
@@ -2231,45 +2279,78 @@ api.get('/admin/online', auth, adminOnly, async (req, res) => {
     return { ...e, ips: [...e.ips].filter(Boolean), devices: [...e.devices].filter(Boolean), voice: vc ? (vc.kind === 'group' ? 'Group call' : `${vc.name} \u00b7 ${vc.sname}`) : null, status: (getUserRow(uid) || {}).status };
   }).sort((a, b) => a.since - b.since));
 });
-api.get('/admin/users', auth, adminOnly, (req, res) => {
+api.get('/admin/users', auth, staffOnly, (req, res) => {
   const q = `%${String(req.query.q || '').trim().toLowerCase()}%`;
   const only = req.query.filter === 'suspended' ? 'AND suspended_at IS NOT NULL' : '';
-  res.json(db.prepare(`SELECT id, username, created_at, last_seen_at, last_ip, suspended_at FROM users WHERE (lower(username) LIKE ? OR lower(profile) LIKE ? OR last_ip LIKE ?) ${only} ORDER BY created_at DESC LIMIT 100`).all(q, q, q)
+  let rows = db.prepare(`SELECT id, username, created_at, last_seen_at, last_ip, suspended_at FROM users WHERE (lower(username) LIKE ? OR lower(profile) LIKE ? OR last_ip LIKE ?) ${only} ORDER BY created_at DESC LIMIT ${req.query.filter === 'staff' || req.query.filter === 'online' ? 2000 : 100}`).all(q, q, q);
+  if (req.query.filter === 'staff') rows = rows.filter((r) => staffRole(r.id));
+  if (req.query.filter === 'online') rows = rows.filter((r) => onlineSockets.has(r.id));
+  res.json(rows.slice(0, 100)
     .map((r) => ({ ...brief(r.id), createdAt: r.created_at, lastSeen: r.last_seen_at, lastIp: r.last_ip, online: onlineSockets.has(r.id),
       reportsAgainst: db.prepare('SELECT COUNT(*) n FROM reports WHERE target_id = ?').get(r.id).n })));
 });
-api.get('/admin/users/:id', auth, adminOnly, (req, res) => {
+api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
   const r = getUserRow(req.params.id);
   if (!r) fail(404, 'User not found.');
   res.json({
     ...brief(r.id), createdAt: r.created_at, lastSeen: r.last_seen_at, lastIp: r.last_ip, suspendedAt: r.suspended_at, suspendReason: r.suspend_reason,
-    online: onlineSockets.has(r.id), isAdmin: isInstanceAdmin(r.id), ips: ipsOf(r.id),
+    online: onlineSockets.has(r.id), isAdmin: isInstanceAdmin(r.id), ips: ipsOf(r.id), suspendedUntil: r.suspended_until,
+    canAct: r.id !== req.userId && staffRank(req.userId) > staffRank(r.id), myRole: staffRole(req.userId),
+    notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
+      .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
     sessions: db.prepare('SELECT ua, ip, created_at AS createdAt, last_seen AS lastSeen FROM sessions WHERE user_id = ? ORDER BY last_seen DESC').all(r.id),
     servers: db.prepare("SELECT s.name, s.owner_id = ? AS owner FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ? AND s.kind = 'server'").all(r.id, r.id),
     reportsAgainst: db.prepare('SELECT id, category, status, created_at AS createdAt FROM reports WHERE target_id = ? ORDER BY created_at DESC LIMIT 20').all(r.id),
     reportsBy: db.prepare('SELECT COUNT(*) n FROM reports WHERE reporter_id = ?').get(r.id).n,
   });
 });
-api.post('/admin/users/:id/suspend', auth, adminOnly, (req, res) => {
-  const r = getUserRow(req.params.id);
-  if (!r) fail(404, 'User not found.');
-  if (isInstanceAdmin(r.id)) fail(400, 'Administrators can\u2019t be suspended from here.');
-  suspendUser(r.id, (req.body || {}).reason);
-  adminLog(req, 'suspend', r.id, (req.body || {}).reason || '');
+api.post('/admin/users/:id/suspend', auth, staffOnly, (req, res) => {
+  const r = requireOutranks(req, req.params.id);
+  const hours = Math.max(0, Math.min(24 * 365, Number((req.body || {}).hours) || 0)); // 0 = until unsuspended
+  suspendUser(r.id, (req.body || {}).reason, hours);
+  adminLog(req, 'suspend', r.id, `${hours ? `${hours} h` : 'until lifted'}${(req.body || {}).reason ? ` \u2014 ${req.body.reason}` : ''}`);
   res.json({ ok: true });
 });
-api.post('/admin/users/:id/unsuspend', auth, adminOnly, (req, res) => {
-  db.prepare('UPDATE users SET suspended_at = NULL, suspend_reason = NULL WHERE id = ?').run(req.params.id);
+api.post('/admin/users/:id/unsuspend', auth, staffOnly, (req, res) => {
+  requireOutranks(req, req.params.id);
+  db.prepare('UPDATE users SET suspended_at = NULL, suspend_reason = NULL, suspended_until = NULL WHERE id = ?').run(req.params.id);
   adminLog(req, 'unsuspend', req.params.id);
   res.json({ ok: true });
 });
-api.post('/admin/users/:id/logout', auth, adminOnly, (req, res) => {
+// Private notes about an account, shared between staff ("warned on 3 May about spam").
+api.post('/admin/users/:id/notes', auth, staffOnly, (req, res) => {
+  if (!getUserRow(req.params.id)) fail(404, 'User not found.');
+  const text = String((req.body || {}).text || '').trim().slice(0, 1000);
+  if (!text) fail(400, 'Write a note first.');
+  db.prepare('INSERT INTO staff_notes (id, user_id, author_id, text, created_at) VALUES (?, ?, ?, ?, ?)').run(newId(), req.params.id, req.userId, text, now());
+  adminLog(req, 'note_added', req.params.id);
+  res.json({ ok: true });
+});
+api.delete('/admin/notes/:id', auth, staffOnly, (req, res) => {
+  const n = db.prepare('SELECT * FROM staff_notes WHERE id = ?').get(req.params.id);
+  if (!n) fail(404, 'Note not found.');
+  if (n.author_id !== req.userId && !isInstanceAdmin(req.userId)) fail(403, 'Only the person who wrote it, or an admin, can delete a note.');
+  db.prepare('DELETE FROM staff_notes WHERE id = ?').run(n.id);
+  adminLog(req, 'note_deleted', n.user_id);
+  res.json({ ok: true });
+});
+// Clear an offensive profile: pictures, song, name, bio, status and links go back to the defaults.
+api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
+  const r = requireOutranks(req, req.params.id);
+  db.prepare("UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, profile = '{}' WHERE id = ?").run(r.id);
+  [r.avatar, r.banner, r.background, r.song].forEach((u) => removeUpload(u));
+  broadcastUser(r.id);
+  adminLog(req, 'profile_reset', r.id, r.username);
+  res.json({ ok: true });
+});
+api.post('/admin/users/:id/logout', auth, staffOnly, (req, res) => {
+  requireOutranks(req, req.params.id);
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
   io.in(`user:${req.params.id}`).disconnectSockets(true);
   adminLog(req, 'sign_out_everywhere', req.params.id);
   res.json({ ok: true });
 });
-api.get('/admin/reports', auth, adminOnly, (req, res) => {
+api.get('/admin/reports', auth, staffOnly, (req, res) => {
   const st = ['open', 'reviewing', 'resolved', 'dismissed', 'all'].includes(req.query.status) ? req.query.status : 'open';
   const rows = st === 'all' ? db.prepare('SELECT * FROM reports ORDER BY created_at DESC LIMIT 200').all()
     : st === 'open' ? db.prepare("SELECT * FROM reports WHERE status IN ('open','reviewing') ORDER BY created_at DESC LIMIT 200").all()
@@ -2282,7 +2363,7 @@ api.get('/admin/reports', auth, adminOnly, (req, res) => {
     priorReports: db.prepare('SELECT COUNT(*) n FROM reports WHERE target_id = ? AND id != ?').get(r.target_id, r.id).n,
   })));
 });
-api.patch('/admin/reports/:id', auth, adminOnly, (req, res) => {
+api.patch('/admin/reports/:id', auth, staffOnly, (req, res) => {
   const b = req.body || {};
   const r = db.prepare('SELECT * FROM reports WHERE id = ?').get(req.params.id);
   if (!r) fail(404, 'Report not found.');
@@ -2292,7 +2373,7 @@ api.patch('/admin/reports/:id', auth, adminOnly, (req, res) => {
   res.json({ ok: true });
 });
 // Remove a reported message (or any message) for everyone.
-api.delete('/admin/messages/:id', auth, adminOnly, (req, res) => {
+api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (m) {
     const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
@@ -2314,28 +2395,46 @@ api.delete('/admin/messages/:id', auth, adminOnly, (req, res) => {
   adminLog(req, 'delete_message', req.params.id);
   res.json({ ok: true });
 });
-// Admins
-api.get('/admin/admins', auth, adminOnly, (req, res) => {
-  const ids = new Set([firstAccount(), ...extraAdmins()]);
-  const envNames = (process.env.ADMIN_USERS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
-  envNames.forEach((n) => { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) ids.add(r.id); });
-  res.json([...ids].filter(Boolean).map((id) => ({ ...brief(id), owner: id === firstAccount(), fromEnv: envNames.includes((getUserRow(id) || {}).username?.toLowerCase()), removable: extraAdmins().includes(id) })));
-});
-api.post('/admin/admins', auth, adminOnly, (req, res) => {
-  const name = String((req.body || {}).username || '').trim().toLowerCase();
-  const row = db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(name);
+// Staff roles. Everyone on staff can see the team; only the owner can change it.
+function staffList() {
+  const ids = new Set([ownerId(), ...Object.keys(staffRoles())]);
+  envAdmins().forEach((n) => { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) ids.add(r.id); });
+  return [...ids].filter((id) => id && staffRole(id)).map((id) => ({ ...brief(id), role: staffRole(id), fromEnv: envAdmins().includes((getUserRow(id) || {}).username?.toLowerCase()) && staffRole(id) !== 'owner' }))
+    .sort((x, y) => STAFF_RANK[y.role] - STAFF_RANK[x.role] || x.username.localeCompare(y.username));
+}
+function staffChanged(uid) {
+  if (isStaff(uid)) io.in(`user:${uid}`).socketsJoin('admins'); else io.in(`user:${uid}`).socketsLeave('admins');
+  broadcastUser(uid); // their app shows or hides the dashboard right away
+}
+api.get('/admin/staff', auth, staffOnly, (req, res) => res.json({ staff: staffList(), me: staffRole(req.userId) }));
+// Give someone a role, change it, or take it away (role: 'admin' | 'moderator' | null).
+api.put('/admin/staff', auth, ownerOnly, (req, res) => {
+  const b = req.body || {};
+  const row = b.userId ? getUserRow(String(b.userId)) : db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(String(b.username || '').trim().replace(/^@/, '').toLowerCase());
   if (!row) fail(404, 'No account with that username.');
-  const list = extraAdmins();
-  if (!list.includes(row.id)) { list.push(row.id); setSetting('admins', JSON.stringify(list)); }
-  io.in(`user:${row.id}`).socketsJoin('admins');
-  adminLog(req, 'admin_added', row.id, row.username);
-  res.json({ ok: true });
+  if (row.id === ownerId()) fail(400, 'You\u2019re the owner. To step down, hand ownership to someone else first.');
+  const role = b.role === 'admin' || b.role === 'moderator' ? b.role : null;
+  if (!role && envAdmins().includes(row.username.toLowerCase())) fail(400, `${row.username} is an admin through ADMIN_USERS in the server's .env file. Remove the name there and restart to take it away.`);
+  const roles = staffRoles();
+  if (role) roles[row.id] = role; else delete roles[row.id];
+  saveStaffRoles(roles);
+  staffChanged(row.id);
+  adminLog(req, role ? `role_${role}` : 'role_removed', row.id, row.username);
+  res.json({ staff: staffList(), me: staffRole(req.userId) });
 });
-api.delete('/admin/admins/:id', auth, adminOnly, (req, res) => {
-  if (req.params.id === firstAccount()) fail(400, 'The first account (the owner) is always an admin.');
-  setSetting('admins', JSON.stringify(extraAdmins().filter((x) => x !== req.params.id)));
-  io.in(`user:${req.params.id}`).socketsLeave('admins');
-  adminLog(req, 'admin_removed', req.params.id);
+// Hand the whole instance to someone else. They become owner; the old owner stays on as an admin.
+api.post('/admin/owner', auth, ownerOnly, (req, res) => {
+  const row = getUserRow(String((req.body || {}).userId || ''));
+  if (!row) fail(404, 'User not found.');
+  if (row.id === req.userId) fail(400, 'You already own this server.');
+  if (row.suspended_at) fail(400, 'Unsuspend them first.');
+  const roles = staffRoles();
+  delete roles[row.id];
+  roles[req.userId] = 'admin';
+  saveStaffRoles(roles);
+  setSetting('owner', row.id);
+  staffChanged(row.id); staffChanged(req.userId);
+  adminLog(req, 'ownership_transferred', row.id, row.username);
   res.json({ ok: true });
 });
 // IP bans
@@ -2348,7 +2447,7 @@ api.post('/admin/ip-bans', auth, adminOnly, (req, res) => {
   list.unshift({ ip, reason: String((req.body || {}).reason || '').slice(0, 200), by: req.userId, at: now() });
   setSetting('ipBans', JSON.stringify(list.slice(0, 1000)));
   // Disconnect anyone currently connected from there (except admins).
-  io.fetchSockets().then((socks) => socks.forEach((x) => { if (ipBanned(x.data.ip) && !isInstanceAdmin(x.userId)) x.disconnect(true); })).catch(() => {});
+  io.fetchSockets().then((socks) => socks.forEach((x) => { if (ipBanned(x.data.ip) && !isStaff(x.userId)) x.disconnect(true); })).catch(() => {});
   adminLog(req, 'ip_banned', ip, (req.body || {}).reason || '');
   res.json({ ok: true });
 });
@@ -2379,6 +2478,28 @@ api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
   adminLog(req, 'server_deleted', srv.id, srv.name);
   res.json({ ok: true });
 });
+// Give a server to another of its members (e.g. its owner left or went quiet).
+api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
+  const srv = db.prepare("SELECT * FROM servers WHERE id = ? AND kind = 'server'").get(req.params.id);
+  if (!srv) fail(404, 'Server not found.');
+  const row = db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(String((req.body || {}).username || '').trim().replace(/^@/, '').toLowerCase());
+  if (!row) fail(404, 'No account with that username.');
+  if (!isMember(srv.id, row.id)) fail(400, `${row.username} isn\u2019t a member of ${srv.name}.`);
+  db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(row.id, srv.id);
+  emitServer(srv.id);
+  adminLog(req, 'server_transferred', srv.id, `${srv.name} \u2192 ${row.username}`);
+  res.json({ ok: true });
+});
+// Emergency: sign every account out of every device (for example after a leaked password list). Staff stay signed in.
+api.post('/admin/sign-out-all', auth, adminOnly, (req, res) => {
+  const keep = new Set(db.prepare('SELECT DISTINCT user_id FROM sessions').all().map((r) => r.user_id).filter((id) => isStaff(id)));
+  const victims = db.prepare('SELECT DISTINCT user_id FROM sessions').all().map((r) => r.user_id).filter((id) => !keep.has(id));
+  const del = db.prepare('DELETE FROM sessions WHERE user_id = ?');
+  db.transaction(() => victims.forEach((id) => del.run(id)))();
+  victims.forEach((id) => io.in(`user:${id}`).disconnectSockets(true));
+  adminLog(req, 'sign_out_all', null, `${victims.length} accounts`);
+  res.json({ ok: true, count: victims.length });
+});
 // Announcement banner for everyone
 api.put('/admin/announcement', auth, adminOnly, (req, res) => {
   const text = String((req.body || {}).text || '').trim().slice(0, 500);
@@ -2393,7 +2514,7 @@ api.put('/admin/announcement', auth, adminOnly, (req, res) => {
 api.put('/admin/maintenance', auth, adminOnly, (req, res) => {
   const text = String((req.body || {}).text || '').trim().slice(0, 300);
   setSetting('maintenance', text || null);
-  if (text) io.fetchSockets().then((socks) => socks.forEach((x) => { if (!isInstanceAdmin(x.userId)) { x.emit('server:maintenance', { text }); x.disconnect(true); } })).catch(() => {});
+  if (text) io.fetchSockets().then((socks) => socks.forEach((x) => { if (!isStaff(x.userId)) { x.emit('server:maintenance', { text }); x.disconnect(true); } })).catch(() => {});
   adminLog(req, text ? 'maintenance_on' : 'maintenance_off', null, text);
   res.json({ ok: true, maintenance: text || null });
 });
@@ -2403,7 +2524,7 @@ api.get('/admin/security', auth, adminOnly, (req, res) => {
   res.json({ events: securityLog.slice(0, 200), topFailedIps: Object.entries(byIp).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([ip, n]) => ({ ip, n })) });
 });
 
-api.get('/admin/log', auth, adminOnly, (req, res) => {
+api.get('/admin/log', auth, staffOnly, (req, res) => {
   res.json(db.prepare('SELECT * FROM admin_log ORDER BY id DESC LIMIT 200').all().map((r) => ({ ...r, admin: brief(r.admin_id) })));
 });
 api.get('/admin/registration', auth, adminOnly, (req, res) => res.json({ mode: regMode(), code: regCode(), captchaLogin: captchaMode('login'), captchaRegister: captchaMode('register') }));
@@ -2512,10 +2633,10 @@ function setupSockets(server) {
     const token = socket.handshake.auth && socket.handshake.auth.token;
     const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
     if (!s) return next(new Error('unauthorized'));
-    const u = db.prepare('SELECT suspended_at FROM users WHERE id = ?').get(s.user_id);
-    if (!u || u.suspended_at) return next(new Error('unauthorized'));
-    if (ipBanned(socketIp(socket)) && !isInstanceAdmin(s.user_id)) { secEvent('blocked_ip', socketIp(socket), 'connection'); return next(new Error('unauthorized')); }
-    if (maintenance() && !isInstanceAdmin(s.user_id)) return next(new Error('maintenance'));
+    const u = db.prepare('SELECT id, suspended_at, suspended_until FROM users WHERE id = ?').get(s.user_id);
+    if (!u || stillSuspended(u)) return next(new Error('unauthorized'));
+    if (ipBanned(socketIp(socket)) && !isStaff(s.user_id)) { secEvent('blocked_ip', socketIp(socket), 'connection'); return next(new Error('unauthorized')); }
+    if (maintenance() && !isStaff(s.user_id)) return next(new Error('maintenance'));
     socket.userId = s.user_id;
     socket.data.token = token;
     socket.data.ip = socketIp(socket);
@@ -2537,7 +2658,7 @@ function setupSockets(server) {
       return next(new Error('Slow down.'));
     });
     socket.join(`user:${uid}`);
-    if (isInstanceAdmin(uid)) socket.join('admins');
+    if (isStaff(uid)) socket.join('admins');
     db.prepare('SELECT server_id FROM members WHERE user_id = ?').all(uid).forEach((r) => socket.join(`server:${r.server_id}`));
 
     const wasOnline = isOnline(uid);

@@ -169,6 +169,8 @@ The first account created on the server (or anyone listed in `ADMIN_USERS`) sees
 - **Users:** search by name or IP; see IP history, signed-in devices and reports; suspend (signs them out everywhere at once, and they see your reason when they try to log in) or sign them out everywhere.
 - **Registration & Terms:** switch sign-ups between open, invite-code only and closed in one click (handy during a spam wave), and edit your Terms of Service (everyone is asked to accept changes).
 - **Audit log:** every admin action, who did it and from which IP.
+- **Team & roles:** three staff levels. The **owner** (you: the first account, or the first name in `ADMIN_USERS`) is the only one who can make people **admins** or **moderators**, change or take away those roles, and hand ownership to someone else (you stay on as an admin). **Admins** get the whole dashboard and Settings → Instance. **Moderators** get reports, users, who's online and the audit log. Staff can only act on people ranked below them, so a moderator can't suspend an admin and nobody can touch the owner. People see the dashboard appear or disappear the moment their role changes.
+- **Moderation tools:** timed suspensions (1 hour, 1 day, 3 days, 1 week, 30 days or until lifted; they end by themselves), private staff notes on any account, "reset profile" for offensive names, pictures and bios, user filters (online, suspended, staff), handing a server to another member when its owner has left, and an emergency "sign everyone out" (staff stay signed in).
 
 **About IP addresses:** the server records which IP addresses each account connects from, for security and abuse reports. The default Terms say so; keep that in your terms if you edit them, and check what your local privacy laws require.
 
@@ -358,7 +360,7 @@ Stop the server (or copy while idle) for a clean copy of the database.
 | `REGISTRATION_CODE` | — | Require this code to sign up |
 | `MAX_UPLOAD_MB` | `25` | Max size per file |
 | `GIPHY_API_KEY` | — | Turns on GIF search (or set it in Settings → Instance) |
-| `ADMIN_USERS` | first account | Usernames that can open the admin dashboard and Settings → Instance |
+| `ADMIN_USERS` | first account | Usernames that are always admins. If set, the first of them is the owner (unless ownership was handed over in the app). More admins and moderators can be added in Admin → Team & roles |
 | `ALLOW_DIRECT_HTTP` | `false` | Allow plain-HTTP access from the internet when `HTTPS=false` (not recommended) |
 | `GIF_PROXY` | `true` | Load GIPHY media through this server (also switchable in the app) |
 | `STUN_URLS` | Google STUN | Comma-separated STUN servers |

@@ -5,7 +5,17 @@ import { avatarEl } from './profile-ui.js';
 import { modal, confirmDialog, field, menu } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
 
-const TABS = [['overview', 'Overview', 'home'], ['online', 'Online', 'people'], ['reports', 'Reports', 'shield'], ['users', 'Users', 'user'], ['servers', 'Servers', 'compass'], ['security', 'Security', 'lock'], ['broadcast', 'Broadcast', 'megaphone'], ['admins', 'Admins', 'star'], ['registration', 'Registration & Terms', 'book'], ['log', 'Audit log', 'file']];
+// [key, label, icon, lowest role that sees it]. The server enforces the same rules.
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1]];
+export const RANK = { moderator: 1, admin: 2, owner: 3 };
+export const ROLE_LABEL = { owner: 'Owner', admin: 'Admin', moderator: 'Moderator' };
+const ROLE_HINT = {
+  owner: 'Everything, plus giving and taking away staff roles.',
+  admin: 'The whole dashboard and Settings \u2192 Instance.',
+  moderator: 'Reports, users (suspend, sign out, reset profile, notes), who\u2019s online and the audit log.',
+};
+const roleTag = (role) => (role ? h('span', { class: `badge-tag role-${role}` }, ROLE_LABEL[role]) : null);
+const DURATIONS = [[1, '1 hour'], [24, '1 day'], [72, '3 days'], [168, '1 week'], [720, '30 days'], [0, 'Until lifted']];
 export const CATEGORY_LABEL = {
   spam: 'Spam', harassment: 'Harassment or bullying', hate: 'Hate speech', threats: 'Threats or violence', sexual: 'Sexual content',
   child_safety: 'Child safety', self_harm: 'Self-harm', illegal: 'Illegal content', impersonation: 'Impersonation', scam: 'Scam or fraud', other: 'Something else',
@@ -36,17 +46,20 @@ const ipChip = (ip) => h('button', { class: 'ip-chip', 'data-tip': 'IP options',
 ]) }, ip);
 const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => b && onOpen && onOpen(b.id) }, avatarEl(asUser(b), 28),
   h('span', { class: 'adm-user-text' }, h('strong', null, b ? b.displayName : 'Deleted user'), h('span', null, b ? '@' + b.username : '')),
-  b && b.suspended ? h('span', { class: 'badge-tag bad' }, 'Suspended') : null);
+  b && b.suspended ? h('span', { class: 'badge-tag bad' }, 'Suspended') : null, b ? roleTag(b.role) : null);
 
-export function adminView({ tab = 'overview', setTab, openReports = 0, onCount } = {}) {
+export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin' } = {}) {
+  const myRank = RANK[role] || 0;
+  const tabs = TABS.filter((t) => myRank >= t[3]);
+  if (!tabs.some((t) => t[0] === tab)) tab = 'overview';
   const wrap = h('div', { class: 'admin' });
   const nav = h('nav', { class: 'admin-tabs', role: 'tablist' });
   const body = h('div', { class: 'admin-body' });
   let timer = null;
   const go = (t) => { clearInterval(timer); tab = t; setTab && setTab(t); draw(); };
-  const openUser = (id) => userModal(id, () => draw());
+  const openUser = (id) => userModal(id, () => draw(), myRank);
   const draw = () => {
-    clear(nav).append(...TABS.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
+    clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     ({ overview, online, reports, users, servers, security, broadcast, admins, registration, log })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
@@ -129,11 +142,15 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount }
           h('button', { class: 'btn ghost sm', onclick: () => noteDialog('Dismiss report', (note) => act(r, { status: 'dismissed', resolution: note }, 'Dismissed.')) }, 'Dismiss')))));
   }
 
-  async function users(q = '') {
+  async function users(q = '', filter = '') {
     const search = h('input', { class: 'input search-input', placeholder: 'Search by username, name or IP', value: q });
     const listEl = h('div', { class: 'adm-table' });
+    const seg = h('div', { class: 'seg' }, [['', 'Everyone'], ['online', 'Online'], ['suspended', 'Suspended'], ['staff', 'Staff']].map(([k, l]) => h('button', {
+      class: `seg-btn${filter === k ? ' active' : ''}`, onclick: () => users(search.value, k).catch((e) => toast(e.message, 'error')),
+    }, l)));
     const run = async () => {
-      const list = await api('GET', `/admin/users?q=${encodeURIComponent(search.value.trim())}`);
+      const list = await api('GET', `/admin/users?q=${encodeURIComponent(search.value.trim())}&filter=${filter}`);
+      if (!list.length) return clear(listEl).append(h('div', { class: 'adm-row three' }, h('span', { class: 'stat-sub' }, 'Nobody matches.')));
       clear(listEl).append(h('div', { class: 'adm-row head' }, h('span', null, 'Person'), h('span', null, 'Last IP'), h('span', null, 'Joined'), h('span', null, 'Last seen'), h('span', null, 'Reports')),
         ...list.map((u) => h('div', { class: 'adm-row' }, userCell(u, openUser), h('span', null, u.lastIp ? ipChip(u.lastIp) : '\u2014'),
           h('span', { class: 'stat-sub' }, fmtStamp(u.createdAt)), h('span', { class: 'stat-sub' }, u.online ? h('span', { class: 'online-dot' }, 'online') : ago(u.lastSeen)),
@@ -141,7 +158,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount }
     };
     let t;
     search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => run().catch((e) => toast(e.message, 'error')), 250); });
-    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Users')), h('div', { class: 'friends-search' }, icon('search'), search), listEl);
+    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Users'), seg), h('div', { class: 'friends-search' }, icon('search'), search), listEl);
     await run();
   }
 
@@ -185,9 +202,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount }
           userCell(x.owner, openUser),
           h('span', null, `${x.members} \u00b7 ${x.messages}`),
           h('span', { class: 'stat-sub' }, ago(x.lastActive)),
-          h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
+          h('span', { class: 'row gap tight' }, h('button', { class: 'btn ghost sm', onclick: () => transferServer(x, servers) }, 'Give to\u2026'), h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
             if (await confirmDialog({ title: `Delete ${x.name}?`, text: 'Every channel, message and file in it is deleted for everyone. This can\u2019t be undone.', confirm: 'Delete server', danger: true })) { await api('DELETE', `/admin/servers/${x.id}`); toast('Server deleted.'); servers(); }
-          } }, 'Delete')))));
+          } }, 'Delete'))))));
   }
 
   async function security() {
@@ -195,6 +212,12 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount }
     const ipIn = h('input', { class: 'input mono', placeholder: '203.0.113.7 or 203.0.113.0/24' });
     const label = { failed_login: 'Failed login', captcha_failed: 'Failed robot check', blocked_ip: 'Blocked IP' };
     clear(body).append(
+      h('div', { class: 'admin-head' }, h('h3', null, 'Emergency')),
+      h('p', { class: 'field-hint' }, 'Sign every account out of every device \u2014 for example if you think passwords leaked. Staff stay signed in. People just log in again; nothing is lost.'),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn danger', onclick: async () => {
+        if (!(await confirmDialog({ title: 'Sign everyone out?', text: 'Every account except staff is signed out of every device right now.', confirm: 'Sign everyone out', danger: true }))) return;
+        const r = await api('POST', '/admin/sign-out-all'); toast(`Signed out ${r.count} account${r.count === 1 ? '' : 's'}.`);
+      } }, 'Sign everyone out')),
       h('div', { class: 'admin-head' }, h('h3', null, 'Blocked IP addresses')),
       h('div', { class: 'row gap' }, ipIn, h('button', { class: 'btn danger', onclick: () => ipIn.value.trim() && banIp(ipIn.value.trim()) }, 'Block')),
       bans.length ? h('div', { class: 'adm-table' }, ...bans.map((b) => h('div', { class: 'adm-row three' }, h('span', { class: 'ip-chip static' }, b.ip), h('span', { class: 'stat-sub' }, `${b.reason || 'No note'} \u00b7 ${fmtStamp(b.at)}`),
@@ -236,17 +259,52 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount }
   }
 
   async function admins() {
-    const list = await api('GET', '/admin/admins');
+    const { staff, me } = await api('GET', '/admin/staff');
+    const owner = me === 'owner';
+    const setRole = async (who, newRole) => {
+      const r = await api('PUT', '/admin/staff', { ...who, role: newRole });
+      toast(newRole ? `Now ${ROLE_LABEL[newRole].toLowerCase()}.` : 'Removed from staff.');
+      admins();
+      return r;
+    };
+    const roleMenu = (a) => h('button', { class: 'btn ghost sm', 'data-pop-anchor': '', onclick: (e) => menu(e.currentTarget, [
+      a.role !== 'admin' ? { label: 'Make admin', icon: 'star', action: () => setRole({ userId: a.id }, 'admin').catch((x) => toast(x.message, 'error')) } : null,
+      a.role !== 'moderator' ? { label: 'Make moderator', icon: 'shield', action: () => setRole({ userId: a.id }, 'moderator').catch((x) => toast(x.message, 'error')) } : null,
+      { label: 'Make owner\u2026', icon: 'star', action: () => transferOwner(a) },
+      { label: 'Remove from staff', icon: 'close', danger: true, action: async () => {
+        if (await confirmDialog({ title: `Remove ${a.displayName} from staff?`, text: 'They lose access to the dashboard right away.', confirm: 'Remove', danger: true })) setRole({ userId: a.id }, null).catch((x) => toast(x.message, 'error'));
+      } },
+    ]) }, 'Change role');
+    const transferOwner = async (a) => {
+      const typed = h('input', { class: 'input', placeholder: a.username, autocomplete: 'off' });
+      modal({ title: `Make ${a.displayName} the owner?`, size: 'sm',
+        body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They get full control, including staff roles. You stay on as an admin, and only they can give ownership back.'), field(`Type ${a.username} to confirm`, typed)),
+        actions: [{ label: 'Cancel' }, { label: 'Make owner', kind: 'danger', action: async () => {
+          if (typed.value.trim().toLowerCase() !== a.username.toLowerCase()) { toast('The name doesn\u2019t match.', 'error'); return false; }
+          await api('POST', '/admin/owner', { userId: a.id }); toast(`${a.displayName} is now the owner.`); admins();
+        } }] });
+    };
     const name = h('input', { class: 'input', placeholder: 'username' });
-    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Administrators')),
-      h('p', { class: 'field-hint' }, 'Admins can see this dashboard: reports, IP addresses, users, and all the controls here. Only give it to people you trust.'),
-      h('div', { class: 'adm-table' }, ...list.map((a) => h('div', { class: 'adm-row three' }, userCell(a, openUser),
-        h('span', { class: 'stat-sub' }, a.owner ? 'Owner (first account)' : a.fromEnv ? 'Set in .env (ADMIN_USERS)' : 'Added here'),
-        a.removable ? h('button', { class: 'btn ghost sm danger-text', onclick: async () => { await api('DELETE', `/admin/admins/${a.id}`); toast('No longer an admin.'); admins(); } }, 'Remove') : h('span')))),
-      h('div', { class: 'row gap' }, name, h('button', { class: 'btn primary', onclick: async () => {
-        if (!(await confirmDialog({ title: `Make ${name.value} an admin?`, text: 'They\u2019ll be able to see reports, IP addresses and suspend people.', confirm: 'Make admin' }))) return;
-        await api('POST', '/admin/admins', { username: name.value }); toast('Added.'); admins();
-      } }, 'Add admin')));
+    let newRole = 'moderator';
+    const roleChips = h('div', { class: 'chips' });
+    const drawChips = () => clear(roleChips).append(...[['moderator', 'Moderator'], ['admin', 'Admin']].map(([k, l]) => h('button', { class: `chip${newRole === k ? ' active' : ''}`, onclick: () => { newRole = k; drawChips(); } }, l)));
+    drawChips();
+    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Team & roles')),
+      h('div', { class: 'role-guide' }, ...['owner', 'admin', 'moderator'].map((r) => h('div', null, roleTag(r), h('span', { class: 'stat-sub' }, ROLE_HINT[r])))),
+      h('div', { class: 'adm-table' }, ...staff.map((a) => h('div', { class: 'adm-row three' }, userCell(a, openUser),
+        h('span', { class: 'stat-sub' }, a.role === 'owner' ? 'Owner' : a.fromEnv ? 'Admin through ADMIN_USERS in .env' : ROLE_LABEL[a.role]),
+        owner && a.role !== 'owner' ? h('span', { style: { justifySelf: 'end' } }, a.fromEnv ? h('button', { class: 'btn ghost sm', onclick: () => transferOwner(a) }, 'Make owner\u2026') : roleMenu(a)) : h('span')))),
+      owner ? h('div', { class: 'stack' },
+        h('div', { class: 'admin-head' }, h('h3', null, 'Add someone to the team')),
+        h('p', { class: 'field-hint' }, 'Only give roles to people you trust: staff can see IP addresses and reports, and suspend people below them.'),
+        roleChips,
+        h('div', { class: 'row gap' }, name, h('button', { class: 'btn primary', onclick: async () => {
+          const u = name.value.trim().replace(/^@/, '');
+          if (!u) return toast('Type a username first.', 'error');
+          if (!(await confirmDialog({ title: `Make ${u} ${newRole === 'admin' ? 'an admin' : 'a moderator'}?`, text: ROLE_HINT[newRole], confirm: 'Add' }))) return;
+          await setRole({ username: u }, newRole).catch((x) => toast(x.message, 'error'));
+        } }, 'Add')))
+        : h('p', { class: 'field-hint' }, 'Only the owner can change roles.'));
   }
 
   async function log() {
@@ -263,19 +321,30 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount }
   return wrap;
 }
 
+function transferServer(x, after) {
+  const who = h('input', { class: 'input', placeholder: 'username of a member' });
+  modal({ title: `Give ${x.name} to someone else?`, size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `They become the owner of ${x.name}. They must already be a member. Useful when the owner has left or gone quiet.`), field('New owner', who)),
+    actions: [{ label: 'Cancel' }, { label: 'Give server', kind: 'primary', action: async () => { await api('POST', `/admin/servers/${x.id}/transfer`, { username: who.value }); toast('Server handed over.'); after(); } }] });
+}
 function noteDialog(title, onSave) {
   const note = h('input', { class: 'input', maxlength: '500', placeholder: 'Optional note for other admins' });
   modal({ title, size: 'sm', body: field('Note', note), actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: () => onSave(note.value) }] });
 }
 export function suspendDialog(user, after) {
   const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Shown to them when they try to log in' });
+  let hours = 24;
+  const chipsEl = h('div', { class: 'chips' });
+  const drawChips = () => clear(chipsEl).append(...DURATIONS.map(([v, l]) => h('button', { type: 'button', class: `chip${hours === v ? ' active' : ''}`, onclick: () => { hours = v; drawChips(); } }, l)));
+  drawChips();
   modal({
     title: `Suspend ${user.displayName}?`, size: 'sm',
-    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They\u2019re signed out everywhere immediately and can\u2019t log back in until you unsuspend them. Their messages stay.'), field('Reason', reason)),
-    actions: [{ label: 'Cancel' }, { label: 'Suspend', kind: 'danger', action: async () => { await api('POST', `/admin/users/${user.id}/suspend`, { reason: reason.value }); toast(`${user.displayName} is suspended.`); if (after) await after(); } }],
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They\u2019re signed out everywhere immediately and can\u2019t log back in until the time is up (or you unsuspend them). Their messages stay.'),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'For how long'), chipsEl), field('Reason', reason)),
+    actions: [{ label: 'Cancel' }, { label: 'Suspend', kind: 'danger', action: async () => { await api('POST', `/admin/users/${user.id}/suspend`, { reason: reason.value, hours }); toast(`${user.displayName} is suspended.`); if (after) await after(); } }],
   });
 }
-async function userModal(id, refresh) {
+async function userModal(id, refresh, myRank = 2) {
   const u = await api('GET', `/admin/users/${id}`).catch((e) => { toast(e.message, 'error'); return null; });
   if (!u) return;
   const m = modal({
@@ -283,20 +352,44 @@ async function userModal(id, refresh) {
     body: h('div', { class: 'stack' },
       h('div', { class: 'row gap wrap' },
         u.online ? h('span', { class: 'badge-tag ok' }, 'Online') : h('span', { class: 'badge-tag' }, `Last seen ${ago(u.lastSeen)}`),
-        u.isAdmin ? h('span', { class: 'badge-tag' }, 'Administrator') : null,
-        u.suspendedAt ? h('span', { class: 'badge-tag bad' }, `Suspended ${ago(u.suspendedAt)}${u.suspendReason ? `: ${u.suspendReason}` : ''}`) : null,
+        roleTag(u.role),
+        u.suspendedAt ? h('span', { class: 'badge-tag bad' }, `Suspended ${ago(u.suspendedAt)}${u.suspendedUntil ? ` until ${fmtStamp(u.suspendedUntil)}` : ''}${u.suspendReason ? `: ${u.suspendReason}` : ''}`) : null,
         h('span', { class: 'stat-sub' }, `Joined ${fmtStamp(u.createdAt)} \u00b7 ${u.servers.length} servers \u00b7 made ${u.reportsBy} reports`)),
       h('h4', null, 'IP addresses'),
       h('div', { class: 'adm-table' }, ...u.ips.map((x) => h('div', { class: 'adm-row three' }, ipChip(x.ip), h('span', { class: 'stat-sub' }, `first ${fmtStamp(x.firstSeen)}`), h('span', { class: 'stat-sub' }, `last ${ago(x.lastSeen)}`)))),
       h('h4', null, `Signed-in devices \u2014 ${u.sessions.length}`),
       h('div', { class: 'adm-table' }, ...u.sessions.map((x) => h('div', { class: 'adm-row three' }, h('span', null, device(x.ua)), x.ip ? ipChip(x.ip) : h('span'), h('span', { class: 'stat-sub' }, `active ${ago(x.lastSeen)}`)))),
       u.reportsAgainst.length ? h('h4', null, `Reports about them \u2014 ${u.reportsAgainst.length}`) : null,
-      u.reportsAgainst.length ? h('div', { class: 'adm-table' }, ...u.reportsAgainst.map((r) => h('div', { class: 'adm-row three' }, h('span', null, CATEGORY_LABEL[r.category] || r.category), h('span', { class: 'stat-sub' }, r.status), h('span', { class: 'stat-sub' }, fmtStamp(r.createdAt))))) : null),
-    actions: [
+      u.reportsAgainst.length ? h('div', { class: 'adm-table' }, ...u.reportsAgainst.map((r) => h('div', { class: 'adm-row three' }, h('span', null, CATEGORY_LABEL[r.category] || r.category), h('span', { class: 'stat-sub' }, r.status), h('span', { class: 'stat-sub' }, fmtStamp(r.createdAt))))) : null,
+      notesBox(u, () => { m.close(); userModal(id, refresh, myRank); }, myRank),
+      u.myRole === 'owner' && u.canAct ? h('div', { class: 'row gap wrap' }, h('span', { class: 'field-label' }, 'Staff role'),
+        ...[['moderator', 'Moderator'], ['admin', 'Admin'], [null, 'None']].map(([r, l]) => h('button', { class: `chip${(u.role || null) === r ? ' active' : ''}`, onclick: async () => {
+          await api('PUT', '/admin/staff', { userId: id, role: r }).then(() => { toast(r ? `Now ${l.toLowerCase()}.` : 'Removed from staff.'); m.close(); userModal(id, refresh, myRank); refresh(); }, (x) => toast(x.message, 'error'));
+        } }, l))) : null,
+      u.canAct ? null : h('p', { class: 'field-hint' }, 'You can look, but only someone ranked above this account can suspend, sign out or reset it.')),
+    actions: !u.canAct ? [] : [
+      { label: 'Reset profile', action: async () => {
+        if (!(await confirmDialog({ title: `Reset ${u.displayName}\u2019s profile?`, text: 'Their avatar, banner, background, song, display name, bio, status and links are cleared. Use it for offensive profiles. It can\u2019t be undone.', confirm: 'Reset profile', danger: true }))) return false;
+        await api('POST', `/admin/users/${id}/reset-profile`); toast('Profile reset.'); refresh();
+      } },
       { label: 'Sign out everywhere', action: async () => { await api('POST', `/admin/users/${id}/logout`); toast('Signed out of all devices.'); refresh(); } },
-      u.isAdmin ? null : u.suspendedAt
+      u.suspendedAt
         ? { label: 'Unsuspend', kind: 'primary', action: async () => { await api('POST', `/admin/users/${id}/unsuspend`); toast('Unsuspended.'); refresh(); } }
         : { label: 'Suspend\u2026', kind: 'danger', action: () => { m.close(); suspendDialog(u, refresh); return false; } },
     ].filter(Boolean),
   });
+}
+// Private staff notes on an account.
+function notesBox(u, reload, myRank) {
+  const ta = h('textarea', { class: 'input', rows: '2', maxlength: '1000', placeholder: 'Add a private note for staff (e.g. \u201cwarned about spam on 3 May\u201d)' });
+  return h('div', { class: 'stack' },
+    h('h4', null, `Staff notes${u.notes.length ? ` \u2014 ${u.notes.length}` : ''}`),
+    u.notes.length ? h('div', { class: 'adm-table' }, ...u.notes.map((n) => h('div', { class: 'adm-row note' },
+      h('div', { class: 'note-body' }, h('span', { class: 'note-text' }, n.text), h('span', { class: 'stat-sub' }, `${n.author ? n.author.displayName : 'Former staff'} \u00b7 ${fmtStamp(n.createdAt)}`)),
+      n.mine || myRank >= 2 ? h('button', { class: 'btn ghost sm danger-text', onclick: async () => { await api('DELETE', `/admin/notes/${n.id}`).catch((x) => toast(x.message, 'error')); reload(); } }, 'Delete') : h('span')))) : h('p', { class: 'field-hint' }, 'Only staff can see these. Nothing yet.'),
+    ta,
+    h('div', null, h('button', { class: 'btn ghost sm', onclick: async () => {
+      if (!ta.value.trim()) return;
+      await api('POST', `/admin/users/${u.id}/notes`, { text: ta.value }).then(reload, (x) => toast(x.message, 'error'));
+    } }, 'Add note')));
 }

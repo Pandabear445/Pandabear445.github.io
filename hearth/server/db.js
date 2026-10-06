@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -348,6 +348,14 @@ CREATE TABLE IF NOT EXISTS reports (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at);
+CREATE TABLE IF NOT EXISTS staff_notes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  author_id TEXT,
+  text TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_staff_notes_user ON staff_notes(user_id, created_at);
 CREATE TABLE IF NOT EXISTS admin_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   admin_id TEXT,
@@ -358,6 +366,9 @@ CREATE TABLE IF NOT EXISTS admin_log (
   created_at INTEGER NOT NULL
 );
 `);
+
+// v7: timed suspensions (staff roles live in instance_settings).
+addColumn('users', 'suspended_until', 'INTEGER');
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

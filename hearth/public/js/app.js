@@ -262,7 +262,16 @@ function startApp() {
   socket.on('server:restarting', () => showUpdating());
   socket.on('server:maintenance', ({ text }) => showUpdating('Down for maintenance', text || 'Back soon.'));
 
-  socket.on('user:update', (u) => { if (!S.me) return; setUser(u); sec.trust(u); refreshUserBits(u.id); });
+  socket.on('user:update', (u) => {
+    if (!S.me) return;
+    const roleBefore = S.me.staffRole;
+    setUser(u); sec.trust(u); refreshUserBits(u.id);
+    // Given or lost a staff role: show or hide the admin dashboard right away.
+    if (u.id === S.me.id && 'staffRole' in u && (u.staffRole || null) !== (roleBefore || null)) {
+      if (S.view.type === 'admin' && !u.staffRole) setView({ type: 'home' }); else app.rerender();
+      toast(u.staffRole ? `You\u2019re now ${({ owner: 'the owner', admin: 'an admin', moderator: 'a moderator' })[u.staffRole]} on this server.` : 'You\u2019re no longer on the staff team.');
+    }
+  });
   socket.on('keys:state', (st) => { if (S.me) sec.applyState(st); });
   socket.on('call:ring', (p) => onRing(p));
   socket.on('call:end', ({ room }) => stopRinging(room));
@@ -473,7 +482,7 @@ async function loadBootstrap() {
   if ((b.termsVersion || 0) > (b.tosAccepted || 0)) askToAcceptTerms();
   restoreResume();
   renderAnnouncement();
-  if (S.me.instanceAdmin) api('GET', '/admin/stats').then((st) => { S.adminReports = st.openReports; renderRail(); }).catch(() => {});
+  if (S.me.staffRole) api('GET', '/admin/stats').then((st) => { S.adminReports = st.openReports; renderRail(); }).catch(() => {});
   const open = new URLSearchParams(location.search).get('open');
   if (open) { history.replaceState(null, '', '/' + location.hash); if (open === 'messages') openMessages(); if (open === 'friends') goFriends(); }
   if (localStorage.getItem('hearth.push') === 'on') enablePush({ quiet: true }).catch(() => {});
@@ -857,7 +866,7 @@ function renderRail() {
       class: 'rail-btn nav', 'aria-label': 'Notifications', 'data-tip': 'Notifications', 'data-tip-side': railSide(), 'data-pop-anchor': '',
       onclick: (e) => openInbox(e.currentTarget),
     }, icon('bell'), h('span', { class: 'badge inbox-badge', hidden: true }))),
-    ...(S.me.instanceAdmin ? [tile({ label: 'Admin', cls: 'nav', active: S.view.type === 'admin', onclick: () => setView({ type: 'admin', tab: S.adminReports ? 'reports' : 'overview' }), content: icon('shield'), badge: S.adminReports })] : []),
+    ...(S.me.staffRole ? [tile({ label: 'Admin', cls: 'nav', active: S.view.type === 'admin', onclick: () => setView({ type: 'admin', tab: S.adminReports ? 'reports' : 'overview' }), content: icon('shield'), badge: S.adminReports })] : []),
     h('div', { class: 'rail-sep', role: 'separator' }),
   );
   const favs = P.favorites;
@@ -1262,7 +1271,7 @@ function renderMain() {
   if (v.type === 'home') main.append(homeView());
   else if (v.type === 'friends') main.append(friendsView());
   else if (v.type === 'saved') main.append(savedView());
-  else if (v.type === 'admin' && S.me.instanceAdmin) main.append(S.adminEl = adminView({ tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
+  else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
   else if (v.type === 'channel' || v.type === 'dm') main.append(chatView());
   else if (v.type === 'voice') main.append(voiceRoomView());
   else if (v.type === 'empty-server') {
@@ -1354,7 +1363,7 @@ function renderHeader() {
     head.append(h('div', { class: 'head-title' }, icon('home', 'ic head-ic'), h('h1', null, 'Home')),
       headTools(ibtn('search', 'Search (Ctrl+K)', () => openSearch())));
   } else if (v.type === 'admin') {
-    head.append(h('div', { class: 'head-title' }, icon('shield', 'ic head-ic'), h('h1', null, 'Admin'), h('span', { class: 'head-topic' }, 'Only server administrators can see this')));
+    head.append(h('div', { class: 'head-title' }, icon('shield', 'ic head-ic'), h('h1', null, 'Admin'), h('span', { class: 'head-topic' }, `Only staff can see this \u00b7 you\u2019re ${({ owner: 'the owner', admin: 'an admin', moderator: 'a moderator' })[S.me.staffRole] || 'staff'}`)));
   } else if (v.type === 'saved') {
     head.append(h('div', { class: 'head-title' }, icon('bookmark', 'ic head-ic'), h('h1', null, 'Saved messages')),
       headTools(h('span', { class: 'head-note' }, 'Saved on this device only')));

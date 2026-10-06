@@ -1760,6 +1760,17 @@ img.cemoji.big { width: 40px; height: 40px; }
 .badge-tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 6px; font-size: 11.5px; font-weight: 700; background: var(--active); color: var(--text-2); white-space: nowrap; }
 .badge-tag.bad { background: rgb(239 84 102 / .16); color: var(--danger); }
 .badge-tag.ok { background: rgb(63 207 131 / .16); color: var(--ok); }
+.badge-tag.role-owner { background: rgb(var(--accent-rgb) / .2); color: var(--accent-ink); }
+.badge-tag.role-admin { background: rgb(92 141 255 / .18); color: #8fb0ff; }
+.badge-tag.role-moderator { background: rgb(63 207 131 / .16); color: var(--ok); }
+[data-theme='light'] .badge-tag.role-admin { color: #3157c9; }
+.adm-user .badge-tag { margin-left: 6px; }
+.role-guide { display: grid; gap: 8px; margin: 4px 0 14px; }
+.role-guide > div { display: flex; align-items: center; gap: 10px; }
+.role-guide .badge-tag { min-width: 82px; justify-content: center; }
+.adm-row.note { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+.note-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.note-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .badge-tag.cat-child_safety, .badge-tag.cat-threats, .badge-tag.cat-self_harm { background: var(--danger); color: #fff; }
 .online-dot { color: var(--ok); font-weight: 700; }
 .report-card { padding: 14px 16px; border-radius: 14px; border: 1px solid var(--line-2); background: var(--hover); display: flex; flex-direction: column; gap: 10px; }
