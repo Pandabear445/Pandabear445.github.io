@@ -8,6 +8,7 @@ import { pageEditorTab } from './page.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import { androidApp } from './android.js';
+import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
 import {
   THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, UI_FONTS, CORNERS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
   gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage, exportAppearance, importAppearance,
@@ -58,7 +59,7 @@ function section(title, ...kids) {
 // ------------------------------------------------------------------ the modal
 // Grouped like most chat apps so people can find things: [group label, [[key, label, icon], ...]]
 const TAB_GROUPS = [
-  ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor']]],
+  ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['activity', 'Games & music', 'gamepad'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor']]],
   ['App', [['appearance', 'Appearance', 'palette'], ['layout', 'Layout', 'sidebar'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['apps', 'Apps & devices', 'download']]],
   ['Privacy', [['privacy', 'Privacy & safety', 'shield']]],
   ['Servers', [['servers', 'Server settings', 'gear']]],
@@ -117,7 +118,7 @@ export function openSettings(app, tab = 'profile') {
     stopMicTest();
     drawNav();
     clear(content);
-    const views = { page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
+    const views = { activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
     content.append(views[current](app, (d) => { dirty = d; }));
     content.scrollTop = 0;
   };
@@ -952,6 +953,61 @@ function privacyTab(app) {
       h('p', { class: 'set-sub' }, 'Blocked people can\u2019t DM you or send friend requests. Their messages in shared servers are hidden behind a click. They aren\u2019t notified.'),
       blockedHost),
   );
+}
+
+// ------------------------------------------------------------------ games & music tab
+function activityTab(app) {
+  const root = h('div', { class: 'set-form narrow' }, h('h2', { class: 'set-title' }, 'Games & music'), h('span', { class: 'spinner' }));
+  const draw = async () => {
+    let st;
+    try { st = await api('GET', '/me/activity-settings'); } catch (e) { clear(root).append(h('p', { class: 'form-error' }, e.message)); return; }
+    const save = async (patch, quiet) => {
+      try { await api('PATCH', '/me/activity-settings', patch); Object.assign(st, patch); if (!quiet) toast('Saved.'); startDesktopDetection(st); } catch (e) { toast(e.message, 'error'); throw e; }
+    };
+    // Favorite games (stored on the profile)
+    let games = [...((app.S.me.profile || {}).games || [])];
+    const favHost = h('div', { class: 'fav-edit' });
+    const saveGames = async () => {
+      try { const u = await api('PATCH', '/me/profile', { games }); app.onMe(u); } catch (e) { toast(e.message, 'error'); }
+    };
+    const drawFav = () => {
+      clear(favHost);
+      games.forEach((g, i) => favHost.append(h('div', { class: 'fav-edit-item' },
+        h('img', { src: gameImg(g.id), alt: '', loading: 'lazy' }), h('span', { class: 'fav-game-name' }, g.name),
+        h('div', { class: 'fav-edit-btns' },
+          i > 0 ? h('button', { class: 'icon-btn sm', 'aria-label': `Move ${g.name} earlier`, onclick: () => { [games[i - 1], games[i]] = [games[i], games[i - 1]]; drawFav(); saveGames(); } }, icon('chevronLeft')) : null,
+          h('button', { class: 'icon-btn sm', 'aria-label': `Remove ${g.name}`, onclick: () => { games.splice(i, 1); drawFav(); saveGames(); } }, icon('close'))))));
+      if (games.length < 12) favHost.append(h('button', { class: 'fav-edit-add', onclick: () => pickGame({ title: 'Add a favorite game', onPick: (g) => { if (!g.id || games.some((x) => x.id === g.id)) return; games.push({ id: g.id, name: g.name }); drawFav(); saveGames(); } }) }, icon('plus'), 'Add a game'));
+    };
+    drawFav();
+    const lastfm = h('input', { class: 'input', value: st.lastfm || '', placeholder: 'Your Last.fm username', autocomplete: 'off', spellcheck: 'false' });
+    const desktop = window.hearthDesktop;
+    clear(root).append(h('h2', { class: 'set-title' }, 'Games & music'),
+      section('Favorite games',
+        h('p', { class: 'set-sub' }, 'Up to 12, shown on your profile card and your page. Pictures come from Steam and Wikipedia.'),
+        favHost),
+      section('Show what I\u2019m doing',
+        toggle('Show the game I\u2019m playing', st.shareGames, (v) => save({ shareGames: v }), 'On your profile and in member lists, while you\u2019re online. Your profile also lists recently played games.'),
+        toggle('Show the music I\u2019m listening to', st.shareMusic, (v) => save({ shareMusic: v })),
+        h('p', { class: 'field-hint' }, 'Like your online status, this isn\u2019t end-to-end encrypted: the server sees it so it can show it. Turning these off hides it right away.'),
+        h('div', null, h('button', { class: 'btn', onclick: () => openActivityPicker(app.S.me.activity) }, icon('gamepad'), 'Set it by hand'))),
+      section('Detect it automatically',
+        desktop && desktop.detectActivity
+          ? h('p', { class: 'muted-p' }, '\u2705 The desktop app detects the game you\u2019re playing (Steam games and popular others like Fortnite, Valorant, League, Minecraft, Roblox) and your music (Spotify app, Apple Music app on Mac, any player on Linux).')
+          : h('p', { class: 'muted-p' }, 'The Hearth desktop app detects your game and music by itself. In a browser or on your phone, use Last.fm below for music, or set it by hand.'),
+        h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Last.fm (works with Spotify, Apple Music, YouTube Music, TIDAL, Deezer\u2026)'),
+          st.lastfmEnabled
+            ? h('div', { class: 'row gap' }, lastfm, h('button', { class: 'btn', onclick: async () => { try { await save({ lastfm: lastfm.value.trim() }, true); toast(lastfm.value.trim() ? 'Connected to Last.fm.' : 'Last.fm disconnected.'); } catch { /* shown */ } } }, 'Save'))
+            : h('p', { class: 'field-hint' }, 'Ask the server owner to add a free Last.fm API key (Admin \u2192 Owner \u2192 Games & music).'),
+          h('p', { class: 'field-hint' }, 'Connect Spotify to Last.fm once at last.fm \u2192 Settings \u2192 Applications. Apple Music and others need a scrobbler app. Hearth only reads what you\u2019re playing right now.')),
+        h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Where I listen'),
+          chips(st.platforms.map((x) => [x.id, x.name]), st.platform, (v) => save({ platform: v })),
+          h('span', { class: 'field-hint' }, 'Used for "Listening on \u2026" and the "Open in" button when Hearth can\u2019t tell.'))),
+      (st.recent || []).length ? section('Recently played', h('p', { class: 'set-sub' }, st.recent.map((r) => r.name).join(', ')),
+        h('div', null, h('button', { class: 'btn ghost sm', onclick: async () => { await save({ clearRecent: true }); draw(); } }, 'Clear the list'))) : '');
+  };
+  draw();
+  return root;
 }
 
 // ------------------------------------------------------------------ servers tab

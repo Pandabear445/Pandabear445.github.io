@@ -110,6 +110,11 @@ function sanitizeProfile(input, current = {}) {
     interests: (Array.isArray(merged.interests) ? merged.interests : []).map((x) => String(x).trim().slice(0, 24)).filter(Boolean).slice(0, 12),
     topFriends: (Array.isArray(merged.topFriends) ? merged.topFriends : []).map(String).filter((x) => /^[a-z0-9]{6,40}$/.test(x)).slice(0, 8),
     songTitle: String(merged.songTitle || '').slice(0, 80),
+    // Favorite games (pictures come from /media/game/<id>).
+    games: (Array.isArray(merged.games) ? merged.games : [])
+      .map((g) => ({ id: str(g && g.id, 24), name: str(g && g.name, 80).trim() }))
+      .filter((g) => /^(steam:\d{1,10}|wiki:\d{1,12}|rawg:\d{1,10})$/.test(g.id) && g.name)
+      .filter((g, i, a) => a.findIndex((x) => x.id === g.id) === i).slice(0, 12),
     links: links.slice(0, 6)
       .map((l) => ({ label: str(l && l.label, 32), url: str(l && l.url, 300) }))
       .filter((l) => /^https?:\/\/[^\s]+$/i.test(l.url)),

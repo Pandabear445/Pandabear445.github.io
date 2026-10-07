@@ -70,6 +70,8 @@ const voiceChannels = new Map(); // channelId -> Map(userId -> { socketId, muted
 const userVoice = new Map(); // userId -> channelId
 
 const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(userId).size > 0;
+// Games/music people are playing (server/activity.js fills these in once everything it needs exists).
+let ACT = { activityFor: () => null, recentFor: () => undefined };
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
@@ -91,6 +93,8 @@ function publicUser(row) {
     publicKey: row.public_key,
     signPublicKey: row.sign_public_key || null,
     supporter: !!row.supporter || undefined,
+    activity: ACT.activityFor(row) || undefined,
+    recentGames: ACT.recentFor(row),
     createdAt: row.created_at,
   };
 }
@@ -328,7 +332,8 @@ app.use((req, res, next) => {
   if (!directGuard(req.socket.remoteAddress)) return res.status(403).type('text').send('Please use the https:// address of this server.');
   next();
 });
-app.use(express.json({ limit: '2mb' }));
+// Stripe signs the exact bytes it sends, so keep them for that one route.
+app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
 // Strict browser security policy for the app's own pages. Scripts only from this server (plus WebAssembly
 // for password hashing); no plugins; can't be framed by other sites.
 const CSP = [
@@ -415,6 +420,9 @@ function quotaOf(uid) {
   let quotaMb = exempt ? 0 : (row && row.upload_quota_mb != null ? row.upload_quota_mb : lim.quotaMb);
   const sq = +(getSetting('supporterQuotaMb') || 0);
   if (!exempt && row && row.supporter && row.upload_quota_mb == null && sq && quotaMb && sq > quotaMb) quotaMb = sq;
+  // Supporters can also send bigger files, if the owner set that perk (Admin → Money).
+  const sf = row && row.supporter ? MONEY.supporterFileMb() : 0;
+  if (sf > lim.fileMb) lim.fileMb = sf;
   return { ...lim, quotaMb, dailyMb: exempt ? 0 : lim.dailyMb, used: usedBytes(uid), today: dayBytes(uid), blocked: !!(row && row.uploads_blocked), exempt };
 }
 const fmtMb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
@@ -735,6 +743,7 @@ api.get('/config', (req, res) => {
     tagline: brand().tagline,
     features: features(),
     funding: fundingPublic(),
+    support: MONEY.available(),
     registrationOpen: regMode() !== 'closed',
     registrationRequiresCode: regMode() === 'code',
     termsVersion: termsInfo().version || 0,
@@ -2297,6 +2306,9 @@ app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
   } catch { if (!res.headersSent) res.status(502).end(); } finally { clearTimeout(timer); }
 }));
 
+ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken,
+  requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
+
 // Admin: GIF settings (key, rating, privacy proxy) without editing .env.
 api.get('/admin/settings', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
@@ -2336,13 +2348,17 @@ api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
 // (valid 12 hours), so the relay can't be used by outsiders. Set up with scripts/setup-turn.sh.
 const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || '').split(',').map((x) => x.trim()).filter(Boolean);
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
+// Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
+// entry with a region name, so the app can measure which answer fastest and use those.
+const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..') });
 function iceServersFor(uid) {
   const list = [iceServers[0]];
   const urls = turnUrls();
-  if (urls.length && turnSecret()) {
+  const relays = [...(urls.length ? [{ region: 'Main server', urls }] : []), ...REG.liveRelays().map((r) => ({ region: r.name, urls: r.urls }))];
+  if (relays.length && turnSecret()) {
     const username = `${Math.floor(Date.now() / 1000) + 12 * 3600}:${uid}`;
     const credential = crypto.createHmac('sha1', turnSecret()).update(username).digest('base64');
-    list.push({ urls, username, credential });
+    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region });
   } else if (urls.length && process.env.TURN_USERNAME) {
     list.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL || '' });
   }
@@ -3107,7 +3123,7 @@ api.patch('/admin/users/:id/limits', auth, staffOnly, (req, res) => {
   if (b.uploadsBlocked !== undefined) { db.prepare('UPDATE users SET uploads_blocked = ? WHERE id = ?').run(b.uploadsBlocked ? 1 : 0, r.id); changes.push(b.uploadsBlocked ? 'uploads_blocked' : 'uploads_allowed'); }
   if (b.supporter !== undefined) {
     if (!isInstanceAdmin(req.userId)) fail(403, 'Only admins can mark supporters.');
-    db.prepare('UPDATE users SET supporter = ? WHERE id = ?').run(b.supporter ? 1 : 0, r.id);
+    db.prepare('UPDATE users SET supporter = ?, supporter_until = NULL WHERE id = ?').run(b.supporter ? 1 : 0, r.id); // marked by hand = no end date
     changes.push(b.supporter ? 'supporter_added' : 'supporter_removed'); broadcastUser(r.id);
   }
   if (b.profileLocked !== undefined) { db.prepare('UPDATE users SET profile_locked = ? WHERE id = ?').run(b.profileLocked ? 1 : 0, r.id); changes.push(b.profileLocked ? 'profile_locked' : 'profile_unlocked'); broadcastUser(r.id); }
@@ -3153,7 +3169,15 @@ function funding() {
   try { v = JSON.parse(getSetting('funding') || '{}') || {}; } catch { /* none */ }
   return { enabled: !!v.enabled, url: typeof v.url === 'string' ? v.url : '', monthly: +v.monthly || 0, raised: +v.raised || 0, currency: typeof v.currency === 'string' ? v.currency.slice(0, 3) : 'USD', note: typeof v.note === 'string' ? v.note : '' };
 }
-const fundingPublic = () => { const f = funding(); return f.enabled ? { ...f, supporters: db.prepare('SELECT COUNT(*) n FROM users WHERE supporter = 1').get().n } : null; };
+// Payments through Ko-fi / Stripe (server/money.js) count toward "raised this month" by themselves.
+const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, brief,
+  emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), onChange: () => io && io.emit('config:update', { funding: fundingPublic(), support: MONEY.available() }) });
+function fundingTotals() {
+  const f = funding();
+  const auto = MONEY.raisedThisMonth();
+  return auto === null ? f : { ...f, raised: Math.round((f.raised + auto) * 100) / 100 };
+}
+const fundingPublic = () => { const f = fundingTotals(); return f.enabled ? { ...f, supporters: db.prepare('SELECT COUNT(*) n FROM users WHERE supporter = 1').get().n } : null; };
 // How the machine is doing: CPU, memory, disk, connections and how responsive the server is.
 const { monitorEventLoopDelay } = require('perf_hooks');
 const loopDelay = monitorEventLoopDelay({ resolution: 20 });

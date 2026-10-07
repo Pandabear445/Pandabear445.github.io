@@ -216,6 +216,13 @@ ipcMain.on('version', (e) => { e.returnValue = app.getVersion(); });
 ipcMain.on('badge', (e, n) => { if (fromOurPage(e)) setBadge(n); });
 ipcMain.on('focus', (e) => { if (fromOurPage(e)) showWindow(); });
 ipcMain.on('change-server', (e) => { if (fromOurPage(e) && !CONFIG.lockServer) loadConnect(); });
+// Game / music detection (detect.js), only while the person shares it.
+const detect = require('./detect');
+ipcMain.on('detect', (e, o) => {
+  if (!fromOurPage(e)) return;
+  if (o && (o.games || o.songs)) detect.start((a) => { if (win && !win.isDestroyed()) win.webContents.send('activity', a); }, o);
+  else detect.stop();
+});
 // The connect screen checks that the address really is a Hearth server before saving it.
 ipcMain.handle('connect', async (e, raw) => {
   if (!e.senderFrame || !e.senderFrame.url.startsWith('file:')) return { ok: false, error: 'Not allowed.' };

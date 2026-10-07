@@ -1,6 +1,6 @@
 # Running Hearth: capacity, regions, costs and money
 
-Numbers here were measured with Hearth 1.16 under load (simulated app windows connected over WebSockets,
+Numbers here were measured with Hearth 1.16 (still true for 1.18) under load (simulated app windows connected over WebSockets,
 real message traffic through the real server), not guessed. Your server: 6 vCPU, 12 GB RAM,
 200 GB SSD (152.4 GB free), 300 Mbit/s.
 
@@ -57,47 +57,82 @@ than splitting Hearth across machines.
 If this is a ~$8/month VPS (check your bill): with 1,000 people using it in a month that's **under 1 cent per
 person per month**; with 5,000 it's 0.16 cents. That's the honest, headline number for "cost effective".
 
-## More regions, cheaply
+## More regions, linked together
 
-* **Text chat doesn't need regions.** A message crossing the world takes 100–300 ms, which nobody notices in
-  chat. Running copies of the server in several regions means syncing the database between them — a big
-  rebuild that isn't worth it at this size.
-* **Calls are where distance shows**, and only for the 10–20 % of people whose network needs the relay. Add
-  small relay servers near those people. A relay only forwards call traffic, so the cheapest VPS works:
-  * Oracle Cloud "Always Free" ARM VM — $0, generous traffic (sign-up needs a card).
-  * Hetzner, Vultr, DigitalOcean, Contabo small plans — roughly $4–6/month, many regions.
+**What goes in a region, and what doesn't.** Chat stays on your one main server: one database means everyone sees
+the same messages instantly and there's one thing to back up. A message crossing the world takes 0.1–0.3 s, which
+nobody notices in chat. Copying the database between regions would mean conflicts, lag between copies and several
+times the work, for no gain people can feel at this size.
 
-  Setup (5 minutes per region):
-  ```bash
-  # on your Hearth server: print the shared secret
-  node server/cli.js get-turn-secret
-  # on the new small VPS (as root), with setup-turn.sh copied over:
-  bash setup-turn.sh --relay-only --secret <that secret>
-  # back on the Hearth server: add the address it prints
-  node server/cli.js add-turn "turn:<ip>:3478?transport=udp,turn:<ip>:3478?transport=tcp"
-  ```
-  Calls try every relay and use whichever works best, automatically. Up to 6 relays (12 addresses).
-* **Optional: Cloudflare's free plan** in front of your domain gives global caching of the app's files,
-  DDoS protection and free HTTPS (WebSockets work on the free plan). Tell Caddy to trust Cloudflare's
-  addresses so Hearth still sees real visitor IPs.
+What distance *does* hurt is calls that can't connect person-to-person (about 1 in 5: phones on mobile data, strict
+school/office/home networks). Those go through a relay, and a relay on the other side of the world adds a noticeable
+delay. So a region is a small relay server near people.
+
+**How the regions link up (built in, Admin → Regions):**
+
+1. *Add a region* → name it (e.g. "Frankfurt") → you get a one-line install command.
+2. Rent the cheapest VPS there, log in as root, paste the line. It installs the relay with your server's secret,
+   plus a tiny check-in that reports to your server every minute (address, CPU, memory, traffic this month).
+3. Within a minute the region shows **Online** in Admin → Regions, and every call includes it.
+4. Each person's app measures which relays answer fastest from where they are and uses the two nearest. A region
+   that stops checking in is dropped from calls after 3 minutes and comes back by itself.
+5. *Measure from this device* shows the times from wherever you are.
+
+The install link expires after 24 hours (*Reinstall* makes a new one). When your server uses its own self-signed
+certificate, the command pins that exact certificate, so the new region only ever talks to your server.
+
+**Where to put them, cheaply** (prices checked October 2026; they change):
+
+| Provider | Cost | Notes |
+|---|---|---|
+| Oracle Cloud Always Free | $0 | Arm VM (2 CPU / 12 GB since mid-2026) with **10 TB traffic a month**. Many regions. Needs a card; free VMs can be hard to get in busy regions. |
+| Hetzner Cloud | ≈ €5.50/mo | Germany/Finland with 20 TB traffic: best value for Europe. US (1 TB) and Singapore (0.5 TB) include little traffic. Cheapest plans sometimes sold out. |
+| Contabo (your current host) | ≈ $5–7/mo | EU, US, UK, Asia, Australia; lots of traffic. Same account you have. |
+| Vultr / DigitalOcean / Linode | $4–6/mo | 30+ cities, 0.5–2 TB traffic. For South America, India, Japan, Australia. |
+
+Traffic is the number to watch, not CPU: a relayed video call is about 1–2 Mbit/s per person each way, so 1 TB
+is roughly 1,000 hours of relayed video. Admin → Regions shows each region's traffic this month.
+
+**A sensible plan:** start with nothing extra (your main server already relays if you ran setup-turn.sh). When
+people in one area have trouble with calls, add one region there. Europe + US East covers most friend groups; a
+third (Asia or US West) covers thousands of people. Oracle's free tier makes the first one $0.
+
+**Optional, for the web app itself:** Cloudflare's free plan in front of your domain serves the app's files from
+near everyone, hides your server's IP and blocks floods, also at $0. WebSockets work on the free plan. It needs
+a domain (next section).
 
 ## Making money without being invasive
 
-Hearth's chats are end-to-end encrypted, so there's no data to sell even if you wanted to — that's a selling
-point, not a limit. Ways that fit:
+Hearth's chats are end-to-end encrypted, so there's no data to sell even if you wanted to. That's a selling
+point, not a limit. Everything below is built in (Admin → Money and Admin → Owner).
 
-1. **Community funding (built in).** Admin → Owner → Funding: show the real monthly cost, how much is covered
-   and a Ko-fi / Patreon / Open Collective / Stripe link. It's a small card on Home that people can hide.
-   Mark people who chip in as **supporters**: a 💜 badge and, if you like, more storage.
-2. **Fair supporter perks.** Charge for things that cost you money to provide — more storage, bigger uploads,
-   bigger GIF library — never for privacy, basic chat or profile customization (keep those free; that's the
-   promise that makes people trust you).
-3. **Hosted Hearth for other communities.** Clubs, classes, gaming groups pay ~$3–10/month and you run their
-   own private Hearth (one per small VPS or several per server with Docker). Your updater and backup tools
-   already make this manageable.
-4. **One-off support.** Sponsor-a-month, stickers, merch for the community's in-jokes.
+**First: get a domain (about $10/year).** Ko-fi and Stripe only send payment notices to a real HTTPS address, and
+a domain also makes the Android app, installable app and push notifications work without certificate warnings.
+Point it at your server and put Caddy in front (README → "On a VPS with a domain").
 
-Avoid: ads, tracking pixels, selling data, paywalling safety features.
+1. **Automatic supporters (Admin → Money).** People pay, and their 💜 supporter badge and perks switch on by
+   themselves, for as long as they paid for (price per month is yours to set; paying twice as much lasts twice as
+   long; monthly subscriptions renew themselves).
+   * **Ko-fi:** 0% fee on one-off tips. People paste their personal support code (shown in their Support window)
+     into the Ko-fi message.
+   * **Stripe Payment Link:** cards, Apple Pay, Google Pay, monthly subscriptions (~2.9% + 30¢). The app adds each
+     person's code to the link, so nothing needs pasting.
+   * Payments without a code wait in Admin → Money: one click gives them to the right person.
+   * Payments also count toward the funding card's "raised this month" by themselves.
+2. **Perks that cost you money to provide, never basics.** More storage (Owner → Funding), bigger files (Money →
+   perks), the badge. Keep chat, privacy, calls, profiles, games & music free: that's the promise that makes
+   people trust you.
+3. **The funding card.** Shows the real monthly cost and how much is covered on everyone's Home screen (they can
+   hide it). Honest numbers are the best fundraiser: see "Cost per person" above.
+4. **Hosted Hearth for other communities.** Clubs, classes, gaming groups pay ~$3–10/month and you run their own
+   private Hearth (one per small VPS, or several per server with Docker). Your updater and backups already make
+   this manageable, and each one is another source of supporters.
+5. **One-off support.** Sponsor-a-month, stickers/merch of the community's in-jokes.
+
+What a realistic month looks like: at $3/month per supporter, about 5% of active people chipping in covers a
+$10–15 server for a community of 100. Bigger communities cover regions and hosting for smaller ones.
+
+Avoid: ads, tracking pixels, selling data, paywalling safety or privacy features.
 
 ## Telling people about it
 
@@ -120,3 +155,10 @@ Avoid: ads, tracking pixels, selling data, paywalling safety features.
   and set the age requirement in your Terms (13+ in most places).
 * Watch together embeds the official YouTube/Vimeo/Twitch players, which is allowed; each viewer loads the
   video from them directly.
+* Game pictures: Hearth shows Steam store art and Wikipedia images to identify games (and caches them on your
+  server so Steam/Wikipedia never see your members). That's how game launchers and chat apps commonly show games;
+  don't reuse the art for anything else.
+* Last.fm: their API is free for non-commercial use. If you start charging for Hearth itself (hosting it for
+  others), read their API terms first.
+* Payments: money from Ko-fi/Stripe is income. Keep the Admin → Money list (or your Ko-fi/Stripe exports) for
+  taxes, and make clear supporters are paying for the server, not buying a guaranteed service.

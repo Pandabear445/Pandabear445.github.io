@@ -1,6 +1,7 @@
 // Rendering for avatars, styled names and full profile cards.
 import { h, hashColor, initials, fmtDay } from './util.js';
 import { render as md, renderDoc } from './markdown.js';
+import { activityCards, favoriteGamesEl, recentGamesEl } from './activity.js';
 
 export const STATUS_LABEL = { online: 'Online', idle: 'Idle', dnd: 'Do not disturb', invisible: 'Invisible', offline: 'Offline' };
 
@@ -174,6 +175,8 @@ export function profileCard(u, { meId = '', actions = null, compact = false, mut
   inner.append(nameEl(u, { tag: 'div', cls: 'pc-name' }));
   inner.append(h('div', { class: 'pc-handle' }, u.username, p.pronouns ? h('span', { class: 'pc-pronouns' }, p.pronouns) : null,
     u.supporter ? h('span', { class: 'supporter-tag', title: 'Helps pay for this server' }, '\uD83D\uDC9C Supporter') : null));
+  const act = activityCards(u, { compact: true });
+  if (act) inner.append(h('div', { class: 'pc-section' }, act));
   if (p.bio) {
     inner.append(h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'About me'), h('div', { class: 'pc-bio', html: md(p.bio) })));
   }
@@ -183,6 +186,10 @@ export function profileCard(u, { meId = '', actions = null, compact = false, mut
   }
   if (u.song) inner.append(h('div', { class: 'pc-section' }, songPlayer(u, p)));
   if ((p.interests || []).length) inner.append(h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'Interests'), h('div', { class: 'pc-tags' }, p.interests.map((t) => h('span', { class: 'pc-tag' }, t)))));
+  const fav = favoriteGamesEl(p.games, { limit: compact ? 6 : 12 });
+  if (fav) inner.append(h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'Favorite games'), fav));
+  const recent = !compact && recentGamesEl((u.recentGames || []).slice(0, 4));
+  if (recent) inner.append(h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'Recently played'), recent));
   if (!compact && p.aboutMe) inner.append(h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'More about me'), h('div', { class: 'pc-about md', html: renderDoc(p.aboutMe) })));
   if (!compact && topFriends) inner.append(topFriends);
   if (mutual) inner.append(mutual);

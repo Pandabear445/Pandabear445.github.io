@@ -17,6 +17,8 @@ import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, c
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
+import { rankRelays, chooseIce } from './relays.js';
+import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
 import { openSettings, applyAppearance } from './settings.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
@@ -241,6 +243,10 @@ async function logout() {
 
 // ======================================================================= realtime
 function startApp() {
+  initActivity({
+    mediaToken: () => S.mediaToken || '',
+    changed: (a) => { if (!S.me) return; S.me.activity = a; if (S.users[S.me.id]) S.users[S.me.id].activity = a; renderUserPanel(); },
+  });
   initFeatures({
     S, getUser, displayName, avatarEl, playSound, addInbox,
     jump: (key, id) => jumpToMessage(key, id),
@@ -260,7 +266,7 @@ function startApp() {
     // Lets the speaking detector ignore people whose mic is off (their state comes from the server).
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
     socket,
-    getIceServers: () => S.iceServers || S.config.iceServers || [],
+    getIceServers: () => chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
@@ -320,6 +326,17 @@ function startApp() {
     if (S.panel === 'members' || S.view.type === 'dm') later(renderPanel);
     if (['friends', 'home'].includes(S.view.type) && S.view.tab !== 'add') later(renderMain);
   });
+  // Someone started or stopped a game or a song.
+  socket.on('user:activity', (list) => {
+    if (!S.me) return;
+    for (const { id, activity } of Array.isArray(list) ? list : []) {
+      if (!S.users[id]) continue;
+      S.users[id] = { ...S.users[id], activity: activity || null };
+      if (id === S.me.id) { S.me.activity = activity || null; renderUserPanel(); }
+    }
+    if (S.panel === 'members' || S.view.type === 'dm') later(renderPanel);
+    if (['friends', 'home', 'people'].includes(S.view.type) && S.view.tab !== 'add') later(renderMain);
+  });
   socket.on('user:update', (u) => {
     if (!S.me) return;
     const roleBefore = S.me.staffRole;
@@ -329,6 +346,10 @@ function startApp() {
       if (S.view.type === 'admin' && !u.staffRole) setView({ type: 'home' }); else app.rerender();
       toast(u.staffRole ? `You\u2019re now ${({ owner: 'the owner', admin: 'an admin', moderator: 'a moderator' })[u.staffRole]} on this server.` : 'You\u2019re no longer on the staff team.');
     }
+  });
+  socket.on('support:thanks', ({ until, forever }) => {
+    toast(forever ? '\uD83D\uDC9C Thank you for your support!' : `\uD83D\uDC9C Thank you! You\u2019re a supporter until ${new Date(until).toLocaleDateString()}.`);
+    playSound('mention');
   });
   socket.on('keys:state', (st) => { if (S.me) sec.applyState(st); });
   socket.on('call:ring', (p) => onRing(p));
@@ -533,6 +554,8 @@ async function loadBootstrap() {
   S.me = b.me;
   S.mediaToken = b.mediaToken;
   S.iceServers = b.iceServers;
+  // With relays in several regions, find the nearest ones in the background (cached for 6 hours).
+  if ((b.iceServers || []).filter((e) => [].concat(e.urls || []).some((u) => /^turns?:/.test(u))).length > 2) setTimeout(() => rankRelays(b.iceServers).then((r) => { S.relayRanks = r; }).catch(() => {}), 4000);
   S.encPrivateKey = b.encPrivateKey;
   S.users = b.users;
   S.servers = b.servers;
@@ -551,6 +574,7 @@ async function loadBootstrap() {
   renderAll();
   loadPreviews();
   if (!S.remindersOn) { S.remindersOn = true; startReminders(); }
+  if (window.hearthDesktop && window.hearthDesktop.detectActivity) api('GET', '/me/activity-settings').then(startDesktopDetection).catch(() => {});
   if ((b.termsVersion || 0) > (b.tosAccepted || 0)) askToAcceptTerms();
   restoreResume();
   renderAnnouncement();
@@ -1255,7 +1279,8 @@ function renderUserPanel() {
   const el = clear($('#user-panel'));
   if (!S.me) return;
   const p = S.me.profile || {};
-  const sub = p.customStatus && (p.customStatus.text || p.customStatus.emoji)
+  const act = S.me.activity || {};
+  const sub = act.game ? `Playing ${act.game.name}` : act.music ? `\u266B ${act.music.title}` : p.customStatus && (p.customStatus.text || p.customStatus.emoji)
     ? `${p.customStatus.emoji || ''} ${p.customStatus.text || ''}`.trim()
     : STATUS_LABEL[S.me.status] || 'Online';
   const av = avatarEl(S.me, 34, { status: true, meId: S.me.id });
@@ -1320,6 +1345,8 @@ function statusMenu(anchor) {
     }, h('span', { class: `status-dot inline st-${s}` }), h('span', { class: 'menu-col' }, s === 'idle' ? 'Away' : STATUS_LABEL[s], desc[s] ? h('span', { class: 'menu-desc' }, desc[s]) : null))),
     h('div', { class: 'menu-sep' }),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openCustomStatus(); } }, icon('smile', 'ic menu-ic'), 'Set a custom status'),
+    h('button', { class: 'menu-item', onclick: () => { closePopover(); openActivityPicker(S.me.activity); } }, icon('gamepad', 'ic menu-ic'), 'Set what I\u2019m playing or listening to'),
+    S.config.funding || S.config.support ? h('button', { class: 'menu-item', onclick: () => { closePopover(); openSupport(); } }, icon('coin', 'ic menu-ic'), `Support ${S.config.name}`) : null,
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openProfileModal(S.me.id); } }, icon('user', 'ic menu-ic'), 'View my profile'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'profile'); } }, icon('edit', 'ic menu-ic'), 'Edit profile'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'appearance'); } }, icon('palette', 'ic menu-ic'), 'Theme and appearance'),
@@ -1488,9 +1515,39 @@ function fundingCard() {
       f.monthly ? h('div', { class: 'fund-bar', role: 'progressbar', 'aria-valuenow': String(pct), 'aria-valuemin': '0', 'aria-valuemax': '100' }, h('i', { style: { width: pct + '%' } })) : null,
       h('span', { class: 'fund-meta' }, f.monthly ? `${money(f.raised)} of ${money(f.monthly)} this month` : '', f.supporters ? ` \u00b7 ${f.supporters} supporter${f.supporters === 1 ? '' : 's'} \uD83D\uDC9C` : '')),
     h('div', { class: 'fund-actions' },
-      h('a', { class: 'btn primary sm', href: f.url, target: '_blank', rel: 'noopener noreferrer' }, 'Chip in'),
+      h('button', { class: 'btn primary sm', onclick: () => openSupport() }, 'Chip in'),
       h('button', { class: 'btn ghost sm', onclick: () => { localStorage.setItem(hidKey, String(Date.now() + 30 * 86400000)); card.remove(); } }, 'Hide for a month')));
   return card;
+}
+// The Support window: perks, the person's own support code, and the ways to pay (Stripe / Ko-fi / the
+// owner's own link). Payments with the code turn on the supporter badge by themselves.
+async function openSupport() {
+  let d;
+  try { d = await api('GET', '/me/support'); } catch (e) { return toast(e.message, 'error'); }
+  const f = S.config.funding || {};
+  const money = (cents) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: d.currency }).format(cents / 100); } catch { return `${(cents / 100).toFixed(2)} ${d.currency}`; } };
+  const perks = [h('li', null, '\uD83D\uDC9C Supporter badge on your profile'),
+    d.perks.storageMb ? h('li', null, `${d.perks.storageMb >= 1024 ? `${(d.perks.storageMb / 1024).toFixed(d.perks.storageMb % 1024 ? 1 : 0)} GB` : `${d.perks.storageMb} MB`} of storage`) : null,
+    d.perks.fileMb ? h('li', null, `Send files up to ${d.perks.fileMb} MB`) : null,
+    h('li', null, 'The good feeling of keeping this place ad-free')];
+  const codeBox = h('div', { class: 'cmd-box' }, h('code', null, d.code), h('button', { class: 'btn sm', onclick: () => { copyText(d.code); toast('Code copied.'); } }, icon('copy'), 'Copy'));
+  const ways = [];
+  if (d.stripeUrl) ways.push(h('a', { class: 'btn primary', href: d.stripeUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Pay with card, Apple Pay or Google Pay'));
+  if (d.kofiUrl) ways.push(h('a', { class: 'btn', href: d.kofiUrl, target: '_blank', rel: 'noopener noreferrer', onclick: () => { copyText(d.code); toast('Your code is copied: paste it into the Ko-fi message.'); } }, 'Tip on Ko-fi'));
+  if (!ways.length && f.url) ways.push(h('a', { class: 'btn primary', href: f.url, target: '_blank', rel: 'noopener noreferrer' }, 'Chip in'));
+  modal({
+    title: `Support ${S.config.name}`, size: 'md',
+    body: h('div', { class: 'stack support-modal' },
+      d.supporter ? h('p', { class: 'support-now' }, d.until ? `\uD83D\uDC9C You\u2019re a supporter until ${new Date(d.until).toLocaleDateString()}. Thank you!` : '\uD83D\uDC9C You\u2019re a supporter. Thank you!') : null,
+      h('p', { class: 'muted-p' }, f.note || `No ads, no selling data. ${S.config.name} is paid for by the people who use it.`),
+      h('p', { class: 'muted-p' }, `${money(d.monthlyCents)} keeps you a supporter for a month (pay more, it lasts longer). You get:`),
+      h('ul', { class: 'perk-list' }, perks),
+      ways.length ? h('div', { class: 'row gap wrap' }, ways) : h('p', { class: 'field-hint' }, 'The owner hasn\u2019t set up a way to pay yet.'),
+      d.kofiUrl ? h('div', { class: 'stack tight' }, h('span', { class: 'field-label' }, 'Your support code'), codeBox,
+        h('p', { class: 'field-hint' }, 'On Ko-fi, put this code in your message so the payment finds you. Card payments find you by themselves.')) : null,
+      d.mine.length ? h('div', { class: 'stack tight' }, h('span', { class: 'field-label' }, 'Your payments'),
+        ...d.mine.map((p) => h('div', { class: 'kv' }, h('span', null, `${new Date(p.created_at).toLocaleDateString()} \u00b7 ${p.kind}`), h('b', null, money(p.amount_cents))))) : null),
+  });
 }
 function homeView() {
   const wrap = h('div', { class: 'home-view' });
@@ -1614,7 +1671,7 @@ function friendsView() {
       listEl.append(h('div', { class: 'friend-row' },
         h('button', { class: 'friend-who', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'right') },
           avatarEl(u, 38, { status: true, meId: S.me.id }),
-          h('span', { class: 'friend-text' }, h('span', { class: 'friend-name' }, nameEl(u), h('span', { class: 'friend-handle' }, u.username)), h('span', { class: 'friend-sub' }, sub))),
+          h('span', { class: 'friend-text' }, h('span', { class: 'friend-name' }, nameEl(u), h('span', { class: 'friend-handle' }, u.username)), h('span', { class: 'friend-sub' }, (r.status === 'accepted' && activityLine(u)) || sub))),
         h('div', { class: 'friend-actions' }, actions)));
     }
   };
@@ -2564,7 +2621,7 @@ function membersPanel(el) {
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
           sec.keyChanged(u) ? h('span', { class: 'key-warn', 'data-tip': 'Security key changed' }, icon('shield')) : null),
-        cs ? h('span', { class: 'member-status' }, cs) : null));
+        activityLine(u) ? h('span', { class: 'member-status' }, activityLine(u)) : cs ? h('span', { class: 'member-status' }, cs) : null));
     };
     for (const r of hoisted) {
       const list2 = sections.get(r.id).sort(byName);

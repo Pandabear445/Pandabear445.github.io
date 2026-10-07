@@ -4,6 +4,7 @@ import { api, upload } from './api.js';
 import { avatarEl, nameEl, displayName, effectLayer, splitGlyphs, FONT_STACKS, cropStyle, songPlayer, bannerEl } from './profile-ui.js';
 import { confirmDialog } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
+import { activityCards, favoriteGamesEl, recentGamesEl } from './activity.js';
 
 export const PAGE_FONTS = {
   default: 'inherit',
@@ -130,6 +131,8 @@ export function renderPage(d, u, opts = {}) {
         h('div', { class: 'mys-chips' }, chips)),
       heroActions.length ? h('div', { class: 'mys-hero-actions' }, heroActions) : null));
   const left = [];
+  const act = activityCards(u);
+  if (act) left.push(box(`What ${name} is up to`, 'mys-activity', act));
   if (u.song) left.push(box('Now playing', 'mys-song', songPlayer(u, prof)));
   if ((prof.links || []).length) left.push(box(`${name}'s links`, 'mys-links', h('ul', null, prof.links.map((l) => h('li', null, h('a', { href: l.url, target: '_blank', rel: 'noopener noreferrer nofollow' }, l.label || l.url))))));
   const rows = INTEREST_ROWS.filter(([k]) => p.interests[k]);
@@ -148,6 +151,10 @@ export function renderPage(d, u, opts = {}) {
       about ? h('div', null, h('h4', null, 'About me:'), h('div', { class: 'md', html: renderDoc(about) })) : null,
       p.meet ? h('div', null, h('h4', null, 'Who I’d like to meet:'), h('div', { class: 'md', html: renderDoc(p.meet) })) : null));
   }
+  const favGames = favoriteGamesEl(prof.games);
+  if (favGames) right.push(box(`${name}'s Favorite Games`, 'mys-games', favGames));
+  const recent = recentGamesEl(u.recentGames);
+  if (recent) right.push(box('Recently Played', 'mys-recent', recent));
   right.push(box(`${name}'s Friend Space`, 'mys-friends',
     h('p', null, h('b', null, name), ` has ${d.friendCount} friend${d.friendCount === 1 ? '' : 's'}.`),
     d.topFriends.length ? h('div', { class: 'mys-friend-grid' }, d.topFriends.map((f) => h('button', { class: 'mys-friend', onclick: () => opts.openUser && opts.openUser(f.id) }, avatarEl(f, 72), h('span', null, displayName(f)))))

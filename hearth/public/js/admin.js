@@ -4,9 +4,10 @@ import { api } from './api.js';
 import { avatarEl } from './profile-ui.js';
 import { modal, confirmDialog, field, menu } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
+import { rankRelays, relayTime } from './relays.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['storage', 'Storage & limits', 'download', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['owner', 'Owner', 'flame', 3]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['storage', 'Storage & limits', 'download', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
 export const ROLE_LABEL = { owner: 'Owner', admin: 'Admin', moderator: 'Moderator' };
 const ROLE_HINT = {
@@ -62,7 +63,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
-    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, owner })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, money, owner })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
 
   async function overview() {
@@ -378,8 +379,139 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         : h('p', { class: 'field-hint' }, 'Only the owner can change roles.'));
   }
 
+  // ---------------------------------------------------------------- regions (call relays near people)
+  async function regions() {
+    const d = await api('GET', '/admin/regions');
+    const showCommand = (title, command) => modal({
+      title, size: 'lg',
+      body: h('div', { class: 'stack' },
+        h('ol', { class: 'steps' },
+          h('li', null, 'Rent the cheapest VPS in that part of the world (1 CPU and 1 GB is plenty; Ubuntu or Debian). See the price guide below.'),
+          h('li', null, 'Log in to it as root (ssh root@its-ip) and paste this one line:'),
+        ),
+        h('div', { class: 'cmd-box' }, h('code', null, command), h('button', { class: 'btn sm', onclick: () => { copyText(command); toast('Copied.'); } }, icon('copy'), 'Copy')),
+        h('p', { class: 'field-hint' }, 'The link works for 24 hours. It installs the call relay with this server\u2019s secret and a tiny check-in that reports here every minute. Within a minute of finishing, the region shows as online and calls start using it.'),
+        h('p', { class: 'field-hint' }, 'If the VPS provider has a firewall in its control panel, open UDP + TCP 3478 and UDP 49160\u201349400 there.')),
+    });
+    const add = () => {
+      const name = h('input', { class: 'input', maxlength: '40', placeholder: 'e.g. Frankfurt, US West, Singapore' });
+      modal({ title: 'Add a region', size: 'sm', body: h('div', { class: 'stack' }, field('Name', name, 'Shown to you here and to people choosing a relay.')),
+        actions: [{ label: 'Cancel' }, { label: 'Get install command', kind: 'primary', action: async () => {
+          const r = await api('POST', '/admin/regions', { name: name.value.trim(), origin: location.origin });
+          regions(); setTimeout(() => showCommand(`Set up ${r.region.name}`, r.command), 150);
+        } }] });
+    };
+    const measured = h('div', { class: 'stack' });
+    const measure = async (btn) => {
+      btn.disabled = true; clear(measured).append(h('span', { class: 'spinner' }));
+      const ice = await api('GET', '/ice');
+      const ranks = await rankRelays(ice, { force: true });
+      clear(measured);
+      const relays = ice.filter((e) => [].concat(e.urls || []).some((u) => /^turns?:/.test(u)));
+      if (!relays.length) measured.append(h('p', { class: 'field-hint' }, 'No relays yet.'));
+      relays.map((e) => ({ e, ms: relayTime(ranks, e) })).sort((a, b) => (a.ms ?? 1e9) - (b.ms ?? 1e9)).forEach(({ e, ms }) => measured.append(h('div', { class: 'kv' }, h('span', null, e.region || [].concat(e.urls)[0]), h('b', null, typeof ms === 'number' ? `${ms} ms` : 'no answer'))));
+      btn.disabled = false;
+    };
+    const status = (r) => r.alive ? h('span', { class: 'rpill ok' }, 'Online') : r.waitingForInstall ? h('span', { class: 'rpill warn' }, r.installOpen ? 'Waiting for install' : 'Install link expired') : h('span', { class: 'rpill bad' }, `Offline since ${ago(r.lastSeen)}`);
+    clear(body).append(
+      h('div', { class: 'admin-head' }, h('h3', null, 'Regions'), h('button', { class: 'btn primary', onclick: add }, icon('plus'), 'Add a region')),
+      h('p', { class: 'field-hint' }, 'Chat lives on this one server: everyone sees the same messages instantly, and there\u2019s one database to back up. What distance slows down is calls that can\u2019t connect directly (about 1 in 5) and go through a relay. Regions put relays near people; each person\u2019s app measures which answer fastest and uses those two.'),
+      h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row region-row' }, h('b', null, 'This server'), h('span', { class: 'stat-sub' }, d.mainTurn.length ? d.mainTurn[0].replace(/^turn:|\?.*$/g, '') : 'No relay here (run scripts/setup-turn.sh to add one)'), h('span', { class: `rpill ${d.mainTurn.length ? 'ok' : 'warn'}` }, d.mainTurn.length ? 'Relay on' : 'Chat only'), h('span'), h('span')),
+        ...d.regions.map((r) => h('div', { class: 'adm-row region-row' },
+          h('b', null, r.name), h('span', { class: 'stat-sub' }, r.ip || '\u2014'), status(r),
+          h('span', { class: 'stat-sub' }, r.alive ? `load ${r.load ?? '?'} / ${r.cpus || 1} CPU \u00b7 ${r.mbps ?? 0} Mbit/s now \u00b7 ${r.monthGb ?? 0} GB this month${r.relayUp ? '' : ' \u00b7 relay stopped!'}` : ''),
+          h('span', { class: 'row gap tight' },
+            h('button', { class: 'btn ghost sm', onclick: async () => { const x = await api('POST', `/admin/regions/${r.id}/reinstall`, { origin: location.origin }); showCommand(`Reinstall ${r.name}`, x.command); } }, r.waitingForInstall ? 'Install command' : 'Reinstall'),
+            h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Remove ${r.name}?`, text: 'Calls stop using it right away. The VPS keeps running until you cancel it with your provider.', confirm: 'Remove', danger: true })) { await api('DELETE', `/admin/regions/${r.id}`); regions(); } } }, 'Remove'))))),
+      d.regions.length ? '' : h('p', { class: 'field-hint' }, 'No regions yet.'),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Which relay is nearest to me?')),
+      h('div', null, h('button', { class: 'btn', onclick: (e) => measure(e.currentTarget) }, 'Measure from this device')), measured,
+      h('div', { class: 'admin-head' }, h('h3', null, 'Cheap places to put a region')),
+      h('p', { class: 'field-hint' }, 'A relay only forwards call traffic, so the smallest plan is enough. Traffic matters more than CPU: one relayed video call is about 1\u20132 Mbit/s per person. Prices change; check before buying.'),
+      h('div', { class: 'adm-table price-table' },
+        ...[
+          ['Oracle Cloud Always Free', '$0', 'Arm VM (2 CPU / 12 GB since mid-2026) with 10 TB traffic a month. Many regions. Needs a card to sign up; free VMs can be hard to get in busy regions.'],
+          ['Hetzner Cloud', '\u2248 \u20ac5.50/mo', 'Germany and Finland with 20 TB traffic: best value for Europe. Their US (1 TB) and Singapore (0.5 TB) plans include little traffic. The cheapest plans sell out at times.'],
+          ['Contabo (your current host)', '\u2248 $5\u20137/mo', 'EU, US, UK, Asia, Australia. Lots of traffic included. Same account you already have.'],
+          ['Vultr / DigitalOcean / Linode', '$4\u20136/mo', '30+ cities worldwide, 0.5\u20132 TB traffic. Good for places the others don\u2019t cover (South America, India, Japan, Australia).'],
+        ].map(([n, p2, t]) => h('div', { class: 'adm-row three' }, h('b', null, n), h('span', null, p2), h('span', { class: 'stat-sub' }, t)))),
+      h('p', { class: 'field-hint' }, 'Start with the region where most people who can\u2019t connect live (Europe and US East cover most friend groups). Two or three regions is plenty for thousands of people.'));
+    timer = setInterval(() => { api('GET', '/admin/regions').then((x) => { if (JSON.stringify(x.regions.map((r) => [r.alive, r.mbps])) !== JSON.stringify(d.regions.map((r) => [r.alive, r.mbps]))) regions(); }).catch(() => {}); }, 20000);
+  }
+
+  // ---------------------------------------------------------------- money (Ko-fi / Stripe → automatic supporters)
+  async function money() {
+    const d = await api('GET', '/admin/money');
+    const c = d.config;
+    const cur = (cents, code = c.currency) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: code || 'USD' }).format(cents / 100); } catch { return `${(cents / 100).toFixed(2)} ${code}`; } };
+    const save = async (patch) => { try { await api('PUT', '/admin/money', patch); toast('Saved.'); money(); } catch (e) { toast(e.message, 'error'); } };
+    const hook = (p) => `${location.origin}/api/pay/${p}`;
+    const f = {
+      price: h('input', { class: 'input', type: 'number', min: '1', step: '0.5', value: String(c.monthlyCents / 100) }),
+      currency: h('input', { class: 'input', maxlength: '3', value: c.currency }),
+      fileMb: h('input', { class: 'input', type: 'number', min: '0', value: String(c.fileMb || ''), placeholder: '0 = same as everyone' }),
+      kofiUrl: h('input', { class: 'input', value: c.kofiUrl, placeholder: 'https://ko-fi.com/yourname' }),
+      kofiToken: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.kofiTokenSet ? 'Saved (paste to replace)' : 'Verification token from Ko-fi' }),
+      stripeLink: h('input', { class: 'input', value: c.stripeLink, placeholder: 'https://buy.stripe.com/\u2026' }),
+      stripeSecret: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.stripeSecretSet ? 'Saved (paste to replace)' : 'whsec_\u2026' }),
+    };
+    const copyRow = (label, text) => h('div', { class: 'kv' }, h('span', null, label), h('span', { class: 'row gap tight' }, h('code', { class: 'mono-sm' }, text), h('button', { class: 'btn ghost sm', onclick: () => { copyText(text); toast('Copied.'); } }, 'Copy')));
+    const assign = (p) => {
+      const who = h('input', { class: 'input', placeholder: 'username' });
+      modal({ title: 'Who is this payment from?', size: 'sm', body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `${cur(p.cents, p.currency)} \u00b7 ${p.kind}${p.note ? ` \u00b7 \u201c${p.note}\u201d` : ''}`), field('Their username', who)),
+        actions: [{ label: 'Cancel' }, { label: 'Give them supporter time', kind: 'primary', action: async () => { await api('POST', `/admin/money/payments/${p.id}/assign`, { username: who.value }); toast('Done.'); money(); } }] });
+    };
+    const local = /^https:\/\/(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(location.origin) || location.protocol !== 'https:';
+    clear(body).append(
+      h('div', { class: 'stats' },
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'This month'), h('strong', null, cur(d.totals.monthCents))),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'All time'), h('strong', null, cur(d.totals.allCents))),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Supporters now'), h('strong', null, String(d.totals.supporters))),
+        h('div', { class: `stat${d.totals.unmatched ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Need matching'), h('strong', null, String(d.totals.unmatched)))),
+      h('p', { class: 'field-hint' }, 'People pay through Ko-fi or Stripe and become supporters automatically: \uD83D\uDC9C badge, your supporter perks, and it shows in the funding card\u2019s \u201craised this month\u201d. Each person has a support code (in their Support window) that links the payment to them. Nothing is charged by Hearth; the money goes straight to you.'),
+      local ? h('p', { class: 'warn-box' }, 'Ko-fi and Stripe only deliver to a real HTTPS address. Put a domain in front of this server first (README \u2192 "On a VPS with a domain"); the webhook addresses below then use it.') : '',
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Perks and price')),
+      h('div', { class: 'grid-2' },
+        field('One month of supporter costs', f.price, 'Payments buy time at this rate: paying twice this gives two months. Monthly subscriptions always give at least a month.'),
+        field('Currency', f.currency),
+        field('Biggest file supporters can send (MB)', f.fileMb, 'Bigger than everyone else\u2019s limit, or 0. Extra storage for supporters is under Owner \u2192 Funding.')),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Count payments in the funding card'), h('span', { class: 'field-hint' }, 'Adds Ko-fi and Stripe payments this month to \u201craised this month\u201d (plus anything you enter by hand).')),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: c.autoRaised, onchange: (e) => save({ autoRaised: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ monthlyCents: Math.round(+f.price.value * 100), currency: f.currency.value, fileMb: f.fileMb.value }) }, 'Save')),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Ko-fi (free for one-off tips)')),
+      h('ol', { class: 'steps' },
+        h('li', null, 'Make a page at ko-fi.com and put its address below.'),
+        h('li', null, 'On Ko-fi: Settings \u2192 More \u2192 API \u2192 Webhook URL, paste the address below, then copy the Verification Token back here.'),
+        h('li', null, 'People paste their support code into the Ko-fi message. Payments without a code wait in the list below for you to match.')),
+      copyRow('Webhook URL', hook('kofi')),
+      h('div', { class: 'grid-2' }, field('Your Ko-fi page', f.kofiUrl), field('Verification token', f.kofiToken)),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ kofiUrl: f.kofiUrl.value, ...(f.kofiToken.value.trim() ? { kofiToken: f.kofiToken.value.trim() } : {}) }) }, 'Save Ko-fi')),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Stripe (cards, Apple Pay, Google Pay, monthly)')),
+      h('ol', { class: 'steps' },
+        h('li', null, 'In Stripe, create a Payment Link (a one-off amount, or a monthly price for automatic renewals) and paste it below.'),
+        h('li', null, 'Developers \u2192 Webhooks \u2192 Add endpoint with the address below and the events checkout.session.completed and invoice.paid. Copy its signing secret (whsec_\u2026) here.'),
+        h('li', null, 'Hearth adds each person\u2019s code to the link, so their payment matches them without typing anything.')),
+      copyRow('Webhook URL', hook('stripe')),
+      h('div', { class: 'grid-2' }, field('Payment Link', f.stripeLink), field('Webhook signing secret', f.stripeSecret)),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ stripeLink: f.stripeLink.value, ...(f.stripeSecret.value.trim() ? { stripeSecret: f.stripeSecret.value.trim() } : {}) }) }, 'Save Stripe')),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Payments')),
+      d.payments.length ? h('div', { class: 'adm-table' }, ...d.payments.map((p) => h('div', { class: 'adm-row pay-row' },
+        h('span', { class: 'stat-sub' }, ago(p.at)), h('b', null, cur(p.cents, p.currency)), h('span', null, p.kind),
+        p.user ? userCell(p.user, openUser) : h('button', { class: 'btn sm', onclick: () => assign(p) }, 'Match to someone'),
+        h('span', { class: 'stat-sub' }, p.note || '')))) : h('p', { class: 'field-hint' }, 'No payments yet.'));
+  }
+
   async function owner() {
     const o = await api('GET', '/admin/owner');
+    const act = await api('GET', '/admin/activity').catch(() => ({}));
+    const lastfmKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.lastfmKeySet ? 'Saved (paste to replace, or clear)' : 'Last.fm API key' });
+    const rawgKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.rawgKeySet ? 'Saved (paste to replace, or clear)' : 'RAWG API key (optional)' });
+    const saveKeys = async (patch) => { try { await api('PATCH', '/admin/activity', patch); toast('Saved.'); owner(); } catch (e) { toast(e.message, 'error'); } };
     const save = async (patch, msg = 'Saved.') => { try { await api('PUT', '/admin/owner', patch); toast(msg); owner(); } catch (e) { toast(e.message, 'error'); } };
     const name = h('input', { class: 'input', maxlength: '40', value: o.brand.name });
     const tagline = h('input', { class: 'input', maxlength: '140', value: o.brand.tagline, placeholder: 'e.g. Our little corner of the internet' });
@@ -418,9 +550,19 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Show the funding card')), h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: F.enabled, onchange: (e) => save({ funding: { enabled: e.target.checked } }) }), h('span', { class: 'switch-track' }))),
       h('div', { class: 'grid-2' }, field('Donation link', fund.url), field('Monthly cost', fund.monthly), field('Raised this month', fund.raised), field('Currency (USD, EUR\u2026)', fund.currency)),
       field('Message', fund.note),
-      field('Storage for supporters (MB)', supQuota, 'More room for people who help pay. Empty or 0 = same limit as everyone.'),
+      field('Storage for supporters (MB)', supQuota, 'More room for people who help pay. Empty or 0 = same limit as everyone. Automatic payments and other perks: the Money tab.'),
       h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value }) }, 'Save')),
       o.supporters.length ? h('div', { class: 'adm-table' }, ...o.supporters.map((u) => h('div', { class: 'adm-row three' }, userCell(u, openUser), h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter'), h('button', { class: 'btn ghost sm', onclick: () => openUser(u.id) }, 'Manage')))) : h('p', { class: 'field-hint' }, 'No supporters yet.'),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Games & music')),
+      h('p', { class: 'field-hint' }, `People show what they\u2019re playing and listening to, and their favorite games. Game pictures come from Steam and Wikipedia with no setup (${act.games || 0} games looked up so far). Two free keys make it better:`),
+      h('div', { class: 'grid-2' },
+        field('Last.fm API key', lastfmKey, 'Lets people link Last.fm so their song updates by itself from Spotify, Apple Music, YouTube Music\u2026 Free and instant: last.fm/api/account/create (any app name; callback can stay empty).'),
+        field('RAWG API key', rawgKey, 'Optional. More console and mobile games with pictures. Free at rawg.io/apidocs.')),
+      h('div', { class: 'row gap' },
+        h('button', { class: 'btn primary', onclick: () => saveKeys({ ...(lastfmKey.value.trim() ? { lastfmKey: lastfmKey.value.trim() } : {}), ...(rawgKey.value.trim() ? { rawgKey: rawgKey.value.trim() } : {}) }) }, 'Save keys'),
+        act.lastfmKeySet ? h('button', { class: 'btn ghost sm', onclick: () => saveKeys({ lastfmKey: '' }) }, 'Remove Last.fm key') : null,
+        act.rawgKeySet ? h('button', { class: 'btn ghost sm', onclick: () => saveKeys({ rawgKey: '' }) }, 'Remove RAWG key') : null),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Backups')),
       h('p', { class: 'field-hint' }, 'A copy of the database (accounts, servers, encrypted messages) while everything keeps running. Pictures and files live in data/uploads; your VPS snapshots cover those. Keep downloaded backups somewhere safe: they contain everyone\u2019s encrypted data.'),

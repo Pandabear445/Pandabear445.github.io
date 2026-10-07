@@ -25,7 +25,7 @@
   "build": {
     "appId": "app.hearth.desktop",
     "productName": "Hearth",
-    "files": ["main.js", "preload.js", "connect.html", "hearth.config.json", "build/icon.png", "build/tray*.png"],
+    "files": ["main.js", "preload.js", "detect.js", "connect.html", "hearth.config.json", "build/icon.png", "build/tray*.png"],
     "directories": { "buildResources": "build", "output": "dist" },
     "win": { "target": ["nsis"], "icon": "build/icon.png" },
     "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "artifactName": "${productName}-Setup-${version}.${ext}" },

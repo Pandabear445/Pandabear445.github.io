@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -450,6 +450,46 @@ CREATE TABLE IF NOT EXISTS event_rsvps (
   PRIMARY KEY (event_id, user_id)
 );
 `);
+
+// v11: games and music people play and like, linked regions (call relays), automatic supporter payments.
+db.exec(`
+CREATE TABLE IF NOT EXISTS game_catalog (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  cover_url TEXT,
+  wide_url TEXT,
+  link TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS regions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  ip TEXT,
+  turn_urls TEXT NOT NULL DEFAULT '[]',
+  setup_until INTEGER,
+  last_seen INTEGER,
+  stats TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payments (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  user_id TEXT,
+  amount_cents INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE (provider, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_payments_time ON payments(created_at);
+`);
+addColumn('users', 'activity_cfg', "TEXT NOT NULL DEFAULT '{}'");
+addColumn('users', 'supporter_until', 'INTEGER');
+addColumn('users', 'support_code', 'TEXT');
+addColumn('users', 'stripe_customer', 'TEXT');
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

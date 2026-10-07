@@ -36,6 +36,9 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Events:** plan game nights and hangouts in any server with a time, place and description; members RSVP (going / maybe / can't), the next event shows at the top of the channel list and on Home under "Coming up", everyone gets a heads-up 15 minutes before, and events can be added to your calendar (.ics).
 - **Reminders:** right-click any message → *Remind me* (in 20 minutes, in 1 hour, tonight, tomorrow morning).
 - **People:** a directory of everyone you share a server with (search, online first, friends badge), and every profile card opens a full MySpace-style page with a big header — banner, avatar, name, headline, mood, status and when they joined.
+- **Games & music:** show the game you're playing ("Playing ELDEN RING · for 1h 20m") and the song you're listening to (album art, artist, "on Spotify" with an *Open in Spotify* button), in member lists, friends, profile cards and pages. The desktop app detects both by itself (any Steam game plus 60+ popular others like Fortnite, Valorant, League, Minecraft, Roblox; the Spotify app; Apple Music on Mac; any player on Linux). Anywhere else, link Last.fm (works with Spotify, Apple Music, YouTube Music, TIDAL, Deezer) or set it by hand by pasting a song link. Plus **favorite games** (up to 12 covers) and **recently played** with hours. Pictures come from Steam and Wikipedia, cached on your server.
+- **Regions:** add call relays in other parts of the world from Admin → Regions with one install command each; they check in every minute, show their load and traffic, and everyone's app uses the nearest two automatically.
+- **Automatic supporters:** Ko-fi and Stripe payments turn on the 💜 supporter badge and perks (more storage, bigger files) by themselves for as long as someone paid, and count toward the funding card.
 - **Android app:** an APK built by GitHub Actions that opens your server with calls, voice messages, notifications and file saving; works with a self-signed certificate (asks once, like the desktop app).
 - **Fast:** messages send instantly (they show as "sending…" until delivered, and you can keep typing), long chats stay light, the app's files are sent compressed, and **Performance mode** (Settings → Appearance) turns off blur, moving backgrounds and decorative animations on slower computers — it switches on by itself on low-powered devices.
 
@@ -410,9 +413,18 @@ Stop the server (or copy while idle) for a clean copy of the database.
 
 App Store / Play Store listings, screen sharing in the Android app, push notifications for the Android app while it's swiped away, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
 
+## Games & music: setup
+
+Works out of the box (game search, pictures, setting things by hand, desktop detection). Two free keys in Admin → Owner → Games & music make it better:
+
+- **Last.fm API key** (free, instant at last.fm/api/account/create): people can link their Last.fm username in Settings → Games & music, and their song updates by itself. Spotify connects to Last.fm in Last.fm → Settings → Applications; Apple Music, YouTube Music and others through a scrobbler app.
+- **RAWG API key** (optional, free at rawg.io/apidocs): more console and mobile games in the search.
+
+Activity shows only while someone is online and not invisible, and each person can turn games and music off separately. It isn't end-to-end encrypted (like online status, the server has to see it to show it). Your Hearth server needs outgoing internet access to store.steampowered.com, en.wikipedia.org, itunes.apple.com and ws.audioscrobbler.com for this.
+
 ## Capacity, regions and costs
 
-See [docs/RUNNING-HEARTH.md](docs/RUNNING-HEARTH.md): measured capacity (how many people one VPS holds), cheap extra regions for calls, cost per person, non-invasive ways to fund it, and how to talk about it.
+See [docs/RUNNING-HEARTH.md](docs/RUNNING-HEARTH.md): measured capacity (how many people one VPS holds), linked regions (Admin → Regions) and what they cost, cost per person, automatic supporter payments with Ko-fi and Stripe (Admin → Money), and how to talk about it.
 
 ## Project layout
 
@@ -425,6 +437,10 @@ public/             The web app (plain JavaScript modules, no build)
 public/js/e2ee.js   Encryption primitives (WebCrypto + Argon2id)
 public/js/secure.js Key management: group keys, rotation, verification
 public/js/features.js Polls, voice messages, events, reminders
+public/js/activity.js Games & music: playing / listening, favorite games
+server/activity.js  Game search and pictures, Last.fm, live activity
+server/regions.js   Linked regions (call relays) and their install script
+server/money.js     Ko-fi / Stripe webhooks, supporter time and perks
 public/sw.js        Service worker: offline app shell, updates, push notifications
 scripts/            hearth-update.sh — safe server-side updater with automatic rollback
 tools/              One-click update tool for Windows / Mac / Linux

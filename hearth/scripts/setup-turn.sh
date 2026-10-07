@@ -14,12 +14,13 @@ step() { printf '%s▸%s %s\n' "$c_y" "$c_0" "$*"; }
 ok()   { printf '%s✓%s %s\n' "$c_g" "$c_0" "$*"; }
 die()  { printf '%s✗ %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Run this as root (or with sudo)."
-RELAY_ONLY=no; SECRET=""; NEW_SECRET=no
+RELAY_ONLY=no; SECRET=""; NEW_SECRET=no; MANAGED=no
 while [ $# -gt 0 ]; do
   case "$1" in
     --relay-only) RELAY_ONLY=yes ;;
     --secret) SECRET="${2:-}"; shift ;;
     --new-secret) NEW_SECRET=yes ;;
+    --managed) MANAGED=yes ;; # installed from Admin → Regions: that install links the relay by itself
     *) die "Unknown option: $1" ;;
   esac
   shift
@@ -105,6 +106,7 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: a
 fi
 
 URLS="turn:$PUBLIC_IP:3478?transport=udp,turn:$PUBLIC_IP:3478?transport=tcp"
+if [ "$RELAY_ONLY" = yes ] && [ "$MANAGED" = yes ]; then exit 0; fi
 if [ "$RELAY_ONLY" = yes ]; then
   printf '\n%s✓ Extra relay ready.%s Now add it to Hearth. On the Hearth server run:\n\n  node server/cli.js add-turn "%s"\n\n(or Settings → Instance → Calls → add these to the relay addresses).\n' "$c_g" "$c_0" "$URLS"
   printf '\nIf this VPS provider has its own firewall (in their control panel), open UDP+TCP 3478 and UDP 49160-49400 there too.\n'
