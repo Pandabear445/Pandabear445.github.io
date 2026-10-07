@@ -145,6 +145,14 @@ public class MainActivity extends BridgeActivity {
             if (!request.isForMainFrame()) return false;
             String url = request.getUrl().toString();
             if (isOurs(url)) return false;
+            // Leaving the connect screen: that's the server the person just chose (covers old web views
+            // without window.HearthAndroid, which can't tell us directly).
+            String from = view.getUrl() == null ? "" : originOf(view.getUrl());
+            if (from.equals(localOrigin()) && (url.startsWith("https://") || url.startsWith("http://"))) {
+                prefs.edit().putString("server", originOf(url)).apply();
+                listen();
+                return false;
+            }
             if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("about:")) return false;
             try {
                 startActivity(new Intent(Intent.ACTION_VIEW, request.getUrl()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));

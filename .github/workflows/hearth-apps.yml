@@ -52,9 +52,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Set version from tag
-        if: startsWith(github.ref, 'refs/tags/app-v')
-        run: npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#app-v}"
+      - name: Set the version (from the tag, or Hearth's own version)
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/app-v* ]]; then v="${GITHUB_REF_NAME#app-v}"; else v="$(node -p "require('../package.json').version")"; fi
+          npm version --no-git-tag-version --allow-same-version "$v"
       - name: Bake in the server address
         if: env.SERVER != ''
         run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"

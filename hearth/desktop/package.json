@@ -5,6 +5,7 @@
   "description": "Desktop app for Hearth, the self-hosted encrypted chat.",
   "main": "main.js",
   "author": { "name": "Hearth", "email": "admin@example.com" },
+  "homepage": "https://github.com/Pandabear445/Pandabear445.github.io",
   "license": "MIT",
   "private": true,
   "scripts": {

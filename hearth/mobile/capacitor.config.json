@@ -3,12 +3,12 @@
   "appName": "Hearth",
   "webDir": "www",
   "server": {
-    "androidScheme": "https",
-    "allowNavigation": ["*"]
+    "androidScheme": "https"
   },
   "android": {
     "allowMixedContent": false,
     "captureInput": true,
-    "webContentsDebuggingEnabled": false
+    "webContentsDebuggingEnabled": false,
+    "appendUserAgent": "HearthAndroid"
   }
 }
