@@ -30,6 +30,10 @@ function render() {
       installBtn()));
     if (os === 'mac') p.append(el('p', { class: 'dl-note' }, 'If macOS says the app can’t be opened, right-click it in Applications and choose Open the first time.'));
     if (os === 'windows') p.append(el('p', { class: 'dl-note' }, 'If Windows SmartScreen appears, choose “More info” → “Run anyway”.'));
+  } else if (os === 'android' && mine.length) {
+    p.append(el('div', { class: 'row-btns' },
+      el('a', { class: 'btn primary', href: mine[0].url }, `Download the Android app (${size(mine[0].size)})`), installBtn()));
+    p.append(el('p', { class: 'dl-note' }, 'Open the downloaded file and allow “Install unknown apps” for your browser when asked. Or skip the download: browser menu (⋮) → “Install app”.'));
   } else if (steps[os]) {
     p.append(installBtn() || '', el('ol', {}, steps[os].map((s) => el('li', {}, s))));
   } else {
@@ -42,7 +46,7 @@ function render() {
   all.append(
     card('Windows', [fileList('windows')]), card('macOS', [fileList('mac')]), card('Linux', [fileList('linux')]),
     card('iPhone & iPad', [el('ol', {}, steps.ios.map((s) => el('li', {}, s)))]),
-    card('Android', [el('ol', {}, steps.android.map((s) => el('li', {}, s)))]),
+    card('Android', [files.some((x) => x.platform === 'android') ? fileList('android') : el('ol', {}, steps.android.map((s) => el('li', {}, s)))]),
   );
   if (cfg.desktopUrl) all.append(card('All desktop downloads', [el('a', { class: 'btn ghost', href: cfg.desktopUrl }, 'View releases')]));
 }

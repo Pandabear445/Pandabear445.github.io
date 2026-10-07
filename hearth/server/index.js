@@ -2272,7 +2272,7 @@ function checkMediaToken(t) {
   const good = crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${exp}`).digest('base64url').slice(0, 22);
   return sig.length === good.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good)) && !!getUserRow(uid);
 }
-app.get('/media/gif', wrap(async (req, res) => {
+app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
   if (!gifProxyOn()) return res.status(404).end();
   if (!checkMediaToken(req.query.t)) return res.status(403).end();
   let u;
@@ -2923,6 +2923,147 @@ api.delete('/profile-comments/:id', auth, (req, res) => {
   if (!mine) adminLog(req, 'profile_comment_deleted', c.profile_id, c.text.slice(0, 200));
   res.json({ ok: true });
 });
+// ---------------------------------------------------------------- polls
+// The question and options travel inside the encrypted message; the server only stores which option
+// number each person picked, so it can count votes without knowing what they're about.
+function pollTarget(messageId, userId) {
+  const cm = db.prepare('SELECT id, channel_id FROM messages WHERE id = ?').get(messageId);
+  if (cm) { const c = requireChannel(cm.channel_id, userId); return { emit: (ev, data) => toChannel(c).emit(ev, data) }; }
+  const dm = db.prepare('SELECT id, dm_id FROM dm_messages WHERE id = ?').get(messageId);
+  if (dm) { const d = requireDm(dm.dm_id, userId); return { emit: (ev, data) => io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit(ev, data) }; }
+  fail(404, 'That poll no longer exists.');
+}
+function pollState(messageId) {
+  const votes = {};
+  db.prepare('SELECT user_id, choice FROM poll_votes WHERE message_id = ? ORDER BY created_at').all(messageId).forEach((v) => { (votes[v.choice] ||= []).push(v.user_id); });
+  return { messageId, votes, closed: !!db.prepare('SELECT 1 FROM poll_closed WHERE message_id = ?').get(messageId) };
+}
+api.get('/polls/:id', auth, (req, res) => { pollTarget(req.params.id, req.userId); res.json(pollState(req.params.id)); });
+api.post('/polls/:id/vote', auth, (req, res) => {
+  const t = pollTarget(req.params.id, req.userId);
+  rateLimit('vote:' + req.userId, 60, 60000);
+  if (db.prepare('SELECT 1 FROM poll_closed WHERE message_id = ?').get(req.params.id)) fail(400, 'This poll has ended.');
+  const choices = [...new Set((Array.isArray((req.body || {}).choices) ? req.body.choices : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < 10))].slice(0, 10);
+  db.transaction(() => {
+    db.prepare('DELETE FROM poll_votes WHERE message_id = ? AND user_id = ?').run(req.params.id, req.userId);
+    choices.forEach((c) => db.prepare('INSERT INTO poll_votes (message_id, user_id, choice, created_at) VALUES (?, ?, ?, ?)').run(req.params.id, req.userId, c, now()));
+  })();
+  const st = pollState(req.params.id);
+  t.emit('poll:update', st);
+  res.json(st);
+});
+api.post('/polls/:id/close', auth, (req, res) => {
+  const t = pollTarget(req.params.id, req.userId);
+  const row = db.prepare('SELECT author_id FROM messages WHERE id = ? UNION SELECT author_id FROM dm_messages WHERE id = ?').get(req.params.id, req.params.id);
+  if (!row || row.author_id !== req.userId) fail(403, 'Only the person who made the poll can end it.');
+  db.prepare('INSERT OR IGNORE INTO poll_closed (message_id, closed_at) VALUES (?, ?)').run(req.params.id, now());
+  const st = pollState(req.params.id);
+  t.emit('poll:update', st);
+  res.json(st);
+});
+
+// ---------------------------------------------------------------- server events (hangouts, game nights…)
+// Not end-to-end encrypted (the server needs the time to send reminders) — the app says so.
+const eventOut = (e, uid) => {
+  const rsvps = db.prepare('SELECT user_id, status FROM event_rsvps WHERE event_id = ?').all(e.id);
+  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId: e.channel_id, startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
+    going: rsvps.filter((r) => r.status === 'going').map((r) => r.user_id), maybe: rsvps.filter((r) => r.status === 'maybe').map((r) => r.user_id), no: rsvps.filter((r) => r.status === 'no').map((r) => r.user_id),
+    mine: (rsvps.find((r) => r.user_id === uid) || {}).status || null };
+};
+function cleanEvent(b, srv) {
+  const title = String(b.title || '').trim().slice(0, 100);
+  if (!title) fail(400, 'Give the event a name.');
+  const startsAt = Number(b.startsAt);
+  if (!Number.isFinite(startsAt) || startsAt < now() - 3600000 || startsAt > now() + 400 * 86400000) fail(400, 'Pick a time in the next year.');
+  const endsAt = b.endsAt ? Number(b.endsAt) : null;
+  if (endsAt && (!Number.isFinite(endsAt) || endsAt <= startsAt)) fail(400, 'The end has to be after the start.');
+  const channelId = b.channelId && db.prepare('SELECT id FROM channels WHERE id = ? AND server_id = ?').get(String(b.channelId), srv.id) ? String(b.channelId) : null;
+  const out = { title, description: String(b.description || '').slice(0, 2000), location: String(b.location || '').slice(0, 120), startsAt, endsAt, channelId };
+  checkWords(out.title, out.description, out.location);
+  return out;
+}
+const emitEvents = (serverId) => io.to(`server:${serverId}`).emit('events:update', { serverId });
+api.get('/servers/:id/events', auth, (req, res) => {
+  const srv = requireServer(req.params.id, req.userId);
+  res.json(db.prepare('SELECT * FROM server_events WHERE server_id = ? AND COALESCE(ends_at, starts_at + 3 * 3600000) > ? ORDER BY starts_at LIMIT 50').all(srv.id, now()).map((e) => eventOut(e, req.userId)));
+});
+// Everything coming up in all your servers (Home screen).
+api.get('/events', auth, (req, res) => {
+  res.json(db.prepare(`SELECT e.* FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE m.user_id = ? AND COALESCE(e.ends_at, e.starts_at + 3 * 3600000) > ? AND e.starts_at < ? ORDER BY e.starts_at LIMIT 20`)
+    .all(req.userId, now(), now() + 14 * 86400000).map((e) => eventOut(e, req.userId)));
+});
+api.post('/servers/:id/events', auth, (req, res) => {
+  const srv = requireServer(req.params.id, req.userId);
+  if (srv.kind === 'group') fail(400, 'Events are for servers.');
+  rateLimit('event:' + req.userId, 20, 3600000);
+  const e = cleanEvent(req.body || {}, srv);
+  const id = newId();
+  db.prepare('INSERT INTO server_events (id, server_id, title, description, location, channel_id, starts_at, ends_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(id, srv.id, e.title, e.description, e.location, e.channelId, e.startsAt, e.endsAt, req.userId, now());
+  db.prepare("INSERT INTO event_rsvps (event_id, user_id, status) VALUES (?, ?, 'going')").run(id, req.userId);
+  emitEvents(srv.id);
+  res.json(eventOut(db.prepare('SELECT * FROM server_events WHERE id = ?').get(id), req.userId));
+});
+function requireEventEditor(eventId, uid) {
+  const e = db.prepare('SELECT * FROM server_events WHERE id = ?').get(eventId);
+  if (!e) fail(404, 'That event no longer exists.');
+  const srv = requireServer(e.server_id, uid);
+  if (e.created_by !== uid && !can(srv, uid, PM.MANAGE_SERVER) && !can(srv, uid, PM.MANAGE_CHANNELS)) fail(403, 'Only the person who made it (or a server admin) can change this event.');
+  return { e, srv };
+}
+api.patch('/events/:id', auth, (req, res) => {
+  const { e, srv } = requireEventEditor(req.params.id, req.userId);
+  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id }, ...(req.body || {}) }, srv);
+  db.prepare('UPDATE server_events SET title = ?, description = ?, location = ?, channel_id = ?, starts_at = ?, ends_at = ?, reminded = CASE WHEN starts_at = ? THEN reminded ELSE 0 END WHERE id = ?')
+    .run(v.title, v.description, v.location, v.channelId, v.startsAt, v.endsAt, v.startsAt, e.id);
+  emitEvents(srv.id);
+  res.json(eventOut(db.prepare('SELECT * FROM server_events WHERE id = ?').get(e.id), req.userId));
+});
+api.delete('/events/:id', auth, (req, res) => {
+  const { e, srv } = requireEventEditor(req.params.id, req.userId);
+  db.prepare('DELETE FROM server_events WHERE id = ?').run(e.id);
+  emitEvents(srv.id);
+  res.json({ ok: true });
+});
+api.post('/events/:id/rsvp', auth, (req, res) => {
+  const e = db.prepare('SELECT * FROM server_events WHERE id = ?').get(req.params.id);
+  if (!e) fail(404, 'That event no longer exists.');
+  requireServer(e.server_id, req.userId);
+  const st = (req.body || {}).status;
+  if (['going', 'maybe', 'no'].includes(st)) db.prepare('INSERT OR REPLACE INTO event_rsvps (event_id, user_id, status) VALUES (?, ?, ?)').run(e.id, req.userId, st);
+  else db.prepare('DELETE FROM event_rsvps WHERE event_id = ? AND user_id = ?').run(e.id, req.userId);
+  emitEvents(e.server_id);
+  res.json(eventOut(e, req.userId));
+});
+// Reminders: 15 minutes before, everyone going (or maybe) gets a nudge — in the app and as a push notification.
+setInterval(() => {
+  const soon = db.prepare('SELECT * FROM server_events WHERE reminded = 0 AND starts_at <= ? AND starts_at > ?').all(now() + 15 * 60000, now() - 5 * 60000);
+  for (const e of soon) {
+    db.prepare('UPDATE server_events SET reminded = 1 WHERE id = ?').run(e.id);
+    const who = db.prepare("SELECT user_id FROM event_rsvps WHERE event_id = ? AND status IN ('going', 'maybe')").all(e.id).map((r) => r.user_id);
+    const srv = db.prepare('SELECT name FROM servers WHERE id = ?').get(e.server_id) || {};
+    who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: e.channel_id }));
+    pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/' });
+  }
+}, 60000).unref();
+
+// People directory: everyone you share a server with, plus your friends, with what their profile shows.
+api.get('/people', auth, (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase().slice(0, 40);
+  const sort = ['online', 'new', 'views', 'name'].includes(req.query.sort) ? req.query.sort : 'online';
+  const rows = db.prepare(`SELECT DISTINCT u.* FROM users u WHERE u.id != ? AND u.suspended_at IS NULL AND (
+      u.id IN (SELECT y.user_id FROM members x JOIN members y ON x.server_id = y.server_id WHERE x.user_id = ?)
+      OR u.id IN (SELECT CASE WHEN requester_id = ? THEN addressee_id ELSE requester_id END FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)))
+    LIMIT 2000`).all(req.userId, req.userId, req.userId, req.userId, req.userId);
+  let list = rows.map((r) => ({ ...publicUser(r), views: r.page_views || 0, lastSeen: r.last_seen_at || 0 }))
+    .filter((u) => !q || u.username.toLowerCase().includes(q) || (u.profile.displayName || '').toLowerCase().includes(q)
+      || (u.profile.interests || []).some((t) => t.toLowerCase().includes(q)) || (u.profile.headline || '').toLowerCase().includes(q));
+  const on = (u) => (u.presence && u.presence !== 'offline' ? 1 : 0);
+  const cmp = { online: (a, b) => on(b) - on(a) || b.lastSeen - a.lastSeen, new: (a, b) => b.createdAt - a.createdAt, views: (a, b) => b.views - a.views, name: (a, b) => (a.profile.displayName || a.username).localeCompare(b.profile.displayName || b.username) }[sort];
+  list.sort(cmp);
+  res.json({ total: list.length, people: list.slice(0, 120) });
+});
+
 // Your own storage use (Settings → Account).
 api.get('/me/storage', auth, (req, res) => {
   const q = quotaOf(req.userId);

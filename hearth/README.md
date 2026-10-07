@@ -31,6 +31,12 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Watch together:** in any call (voice channels, DMs, groups) share a YouTube, Vimeo, Twitch (live) or video-file link and everyone watches the same moment — play, pause, seek and speed stay in sync, people who join late jump right in, there's an "up next" queue, and the starter can keep control to themselves.
 - **GIFs without limits:** besides KLIPY/GIPHY, every Hearth has its own GIF library (upload GIFs, search them, no key, no limits). When a provider says "too many requests", the picker quietly switches to recent results and the library instead of failing.
 - **Owner tools:** server health (CPU, memory, disk, connections, responsiveness), one-click and automatic daily database backups with download, server name and tagline, feature switches (watch together, GIFs, comment walls, custom CSS, who can create servers), and a funding card with 💜 supporter badges and optional extra storage for supporters.
+- **Polls:** ask a question with 2–10 answers (single or multiple choice); votes update live for everyone and the poll creator can close it.
+- **Voice messages:** hold a conversation without typing — record from the mic button in any chat; they're end-to-end encrypted like every other file and play with a waveform and speed control.
+- **Events:** plan game nights and hangouts in any server with a time, place and description; members RSVP (going / maybe / can't), the next event shows at the top of the channel list and on Home under "Coming up", everyone gets a heads-up 15 minutes before, and events can be added to your calendar (.ics).
+- **Reminders:** right-click any message → *Remind me* (in 20 minutes, in 1 hour, tonight, tomorrow morning).
+- **People:** a directory of everyone you share a server with (search, online first, friends badge), and every profile card opens a full MySpace-style page with a big header — banner, avatar, name, headline, mood, status and when they joined.
+- **Android app:** an APK built by GitHub Actions that opens your server with calls, voice messages, notifications and file saving; works with a self-signed certificate (asks once, like the desktop app).
 - **Fast:** messages send instantly (they show as "sending…" until delivered, and you can keep typing), long chats stay light, the app's files are sent compressed, and **Performance mode** (Settings → Appearance) turns off blur, moving backgrounds and decorative animations on slower computers — it switches on by itself on low-powered devices.
 
 No build step, no external services required. One Node process and a SQLite file.
@@ -260,7 +266,7 @@ The `desktop/` folder is an Electron app: its own window, tray icon, unread badg
 | `closeToTray` | Keep running in the tray when the window is closed (Windows/Linux). |
 | `trustedSelfSignedHosts` | Hosts whose self-signed certificate is accepted without asking. Otherwise the app asks once and remembers that exact certificate. |
 
-**Build installers automatically (recommended):** push this project to a GitHub repository, then either push a tag (`git tag desktop-v1.0.0 && git push --tags`) or run the *Desktop app* workflow from the Actions tab (you can type your server address there). GitHub builds `.exe` (Windows), `.dmg` (macOS) and `.AppImage`/`.deb` (Linux) and attaches them to a release. To also copy them to your server automatically, add repository secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` and `VPS_DOWNLOADS_DIR` (the absolute path of your `data/downloads` folder).
+**Build installers automatically (recommended):** GitHub builds them whenever the apps change, on a tag (`git tag app-v1.17.0 && git push --tags`, attached to a release), or when you run the *Hearth apps* workflow from the Actions tab (you can type your server address there, or set the repository variable `HEARTH_SERVER`). The workflow is `.github/workflows/hearth-apps.yml` at the top of the repository; if Hearth lives in a repository of its own, `.github/workflows/desktop.yml` inside this folder does the desktop part. GitHub builds `.exe` (Windows), `.dmg` (macOS) and `.AppImage`/`.deb` (Linux) and attaches them to a release. To also copy them to your server automatically, add repository secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` and `VPS_DOWNLOADS_DIR` (the absolute path of your `data/downloads` folder).
 
 **Build on your own computer:** `cd desktop && npm install && npm run dist` (builds for the system you're on).
 
@@ -268,7 +274,13 @@ The `desktop/` folder is an Electron app: its own window, tray icon, unread badg
 
 **Code signing:** unsigned builds work, but Windows shows a SmartScreen warning ("More info → Run anyway") and macOS needs right-click → Open the first time. Removing those warnings needs a code-signing certificate (Windows) and an Apple Developer account ($99/year, macOS notarization); electron-builder picks them up from environment variables when you have them. Auto-update via GitHub releases works on Windows and Linux.
 
-**Phones:** use the installable web app above. Publishing to the App Store / Play Store means wrapping it (e.g. with Capacitor) and going through their review — not included.
+### Android app
+
+The `mobile/` folder is an Android app (Capacitor) that opens your server, like the desktop app: chats, calls, video, voice messages, watch together, notifications while it's open or in the background, and saving files to *Downloads/Hearth*. It works with a self-signed certificate (an IP address like `https://1.2.3.4:3000`): it shows the fingerprint and asks once. It updates whenever you update the server.
+
+**Get the APK:** GitHub builds it with the desktop installers — repository **Actions** tab → *Hearth apps* → latest run → *Artifacts* → `hearth-android` (or push a tag `app-v1.17.0` to get a release). Put the `.apk` in `data/downloads/` and the `/download` page offers it to Android visitors. Details, signing and limits: [mobile/README.md](mobile/README.md).
+
+**iPhone / iPad:** use the installable web app (Safari → Share → Add to Home Screen). A native iPhone app needs an Apple Developer account ($99/year) and App Store review.
 
 ---
 
@@ -396,7 +408,7 @@ Stop the server (or copy while idle) for a clean copy of the database.
 
 ## Not included (yet)
 
-Video and screen sharing, App Store / Play Store builds, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
+App Store / Play Store listings, screen sharing in the Android app, push notifications for the Android app while it's swiped away, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
 
 ## Capacity, regions and costs
 
@@ -412,11 +424,13 @@ server/perms.js     Roles and permission rules
 public/             The web app (plain JavaScript modules, no build)
 public/js/e2ee.js   Encryption primitives (WebCrypto + Argon2id)
 public/js/secure.js Key management: group keys, rotation, verification
+public/js/features.js Polls, voice messages, events, reminders
 public/sw.js        Service worker: offline app shell, updates, push notifications
 scripts/            hearth-update.sh — safe server-side updater with automatic rollback
 tools/              One-click update tool for Windows / Mac / Linux
 desktop/            Electron desktop app + build config
-.github/workflows/  Builds desktop installers on GitHub
+mobile/             Android app (Capacitor) + its native code
+.github/workflows/  Builds the desktop installers on GitHub (when Hearth is its own repository)
 deploy/             Caddy, coturn and systemd examples
 ```
 

@@ -6,7 +6,10 @@ const VERSION = '__VERSION__';
 const ASSETS = '__ASSETS__';
 const CACHE = `hearth-${VERSION}`;
 
+// A new version takes over right away (the page shows a "reload" bar for the app itself). Waiting for
+// someone to click it once left a broken old version in charge for days.
 self.addEventListener('install', (e) => {
+  self.skipWaiting();
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' })))).catch(() => {}));
 });
 

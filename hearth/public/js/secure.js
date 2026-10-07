@@ -6,6 +6,14 @@
 import * as E2EE from './e2ee.js';
 import { api } from './api.js';
 
+// A poll inside a message: question, 2–10 options, single or multiple choice. Anything else is dropped.
+function cleanPoll(p) {
+  if (!p || typeof p !== 'object' || !Array.isArray(p.o)) return undefined;
+  const o = p.o.map((x) => String(x || '').slice(0, 100)).filter(Boolean).slice(0, 10);
+  if (o.length < 2) return undefined;
+  return { q: String(p.q || '').slice(0, 300), o, m: !!p.m };
+}
+
 export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () => {} }) {
   const groupKeys = new Map(); // serverId -> Map(epoch -> Uint8Array)
   const states = new Map(); // serverId -> key state from the server
@@ -207,7 +215,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     try {
       const author = await userWithKeys(authorId);
       const { payload, verified } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: author.signPublicKey, text });
-      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], verified: verified && !keyChanged(author) };
+      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), verified: verified && !keyChanged(author) };
     } catch {
       return { error: true, t: '', f: [] };
     }
@@ -252,7 +260,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const peer = await dmPeer(dmId);
       trust(peer);
       const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub: peer.publicKey, dmId, authorId, text });
-      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], legacyFormat: !!legacy };
+      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), legacyFormat: !!legacy };
     } catch {
       return { error: true, t: '', f: [] };
     }

@@ -1,5 +1,6 @@
 // Hearth web client.
 // Layout: server rail | sidebar (home or server) | conversation | contextual right panel (members, pins, thread).
+import { androidApp } from './android.js';
 import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playSound, copyText, debounce } from './util.js';
 import { api, upload, getToken, setToken } from './api.js';
 import * as E2EE from './e2ee.js';
@@ -15,6 +16,7 @@ import { createSecure } from './secure.js';
 import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
+import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
 import { openSettings, applyAppearance } from './settings.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
@@ -44,6 +46,7 @@ const S = {
   speaking: new Set(),
 };
 let socket;
+let hadController = false; // was a service worker already in charge when the page loaded?
 let voice;
 const sec = createSecure({ S, onKeysChanged, onKeyWarning });
 const fetchingUsers = new Set();
@@ -238,6 +241,17 @@ async function logout() {
 
 // ======================================================================= realtime
 function startApp() {
+  initFeatures({
+    S, getUser, displayName, avatarEl, playSound, addInbox,
+    jump: (key, id) => jumpToMessage(key, id),
+    canManage: (server) => isAdmin(server) || can(server, PERMS.MANAGE_SERVER),
+    openChannelOrVoice: (c, server) => (c.type === 'voice' ? joinVoice(c, server) : openChannel(c.id, server.id)),
+    onEventsChanged: (serverId) => { if (S.view.serverId === serverId) later(renderSidebar); if (S.view.type === 'home') later(renderMain); },
+    notify: ({ title, body }) => {
+      if (!('Notification' in window) || Notification.permission !== 'granted' || (!document.hidden && document.hasFocus())) return;
+      try { new Notification(title, { body, icon: '/icons/icon-192.png' }); } catch { /* ignore */ }
+    },
+  });
   $('#auth').hidden = true;
   $('#app').hidden = false;
   $('#app').classList.add('loading');
@@ -470,6 +484,9 @@ function startApp() {
     t.set(p.userId, setTimeout(() => { t.delete(p.userId); if (currentKey() === key) renderTyping(); }, 6000));
     if (currentKey() === key) renderTyping();
   });
+  socket.on('poll:update', (st) => onPollUpdate(st));
+  socket.on('events:update', (p) => onEventsUpdate(p));
+  socket.on('event:starting', (e) => onEventStarting(e));
   socket.on('watch:state', ({ room, state }) => {
     if (!S.me) return;
     if (!voice || voice.channelId !== room) return;
@@ -530,9 +547,10 @@ async function loadBootstrap() {
   for (const st of Object.values(b.keyStates || {})) await sec.applyState(st);
   if (S.view.serverId && !S.servers.find((s) => s.id === S.view.serverId)) S.view = { type: 'home' };
   if (S.view.dmId && !S.dms.find((d) => d.id === S.view.dmId)) S.view = { type: 'home' };
-  if (!S.view.serverId && !S.view.dmId && S.view.type !== 'friends' && S.view.type !== 'saved') S.view = { type: 'home' };
+  if (!S.view.serverId && !S.view.dmId && !['friends', 'saved', 'people'].includes(S.view.type)) S.view = { type: 'home' };
   renderAll();
   loadPreviews();
+  if (!S.remindersOn) { S.remindersOn = true; startReminders(); }
   if ((b.termsVersion || 0) > (b.tosAccepted || 0)) askToAcceptTerms();
   restoreResume();
   renderAnnouncement();
@@ -966,6 +984,7 @@ function renderSidebar() {
   body.append(
     nav('Home', 'home', S.view.type === 'home', goHome),
     nav('Friends', 'people', S.view.type === 'friends', () => goFriends(pending ? 'pending' : 'online'), pending),
+    nav('People', 'user', S.view.type === 'people', () => setView({ type: 'people' })),
     nav('Saved messages', 'bookmark', S.view.type === 'saved', () => setView({ type: 'saved' })),
   );
   const convs = conversations();
@@ -1085,6 +1104,7 @@ function channelIcon(c) {
   return 'hash';
 }
 
+const eventsLoaded = new Set();
 function renderServerSidebar(server, head, body) {
   const th = server.theme || {};
   head.classList.toggle('has-banner', !!th.banner);
@@ -1092,6 +1112,13 @@ function renderServerSidebar(server, head, body) {
   head.append(h('button', { class: 'server-head', 'data-pop-anchor': '', 'aria-haspopup': 'menu', onclick: (e) => menu(e.currentTarget, serverMenuItems(server), { align: 'start' }) },
     h('span', { class: 'server-head-name' }, server.name), icon('chevron')));
   const admin = isAdmin(server);
+  // Events: what's planned in this server (loaded once, kept fresh by live updates).
+  const evs = eventsFor(server.id);
+  if (!eventsLoaded.has(server.id)) { eventsLoaded.add(server.id); loadEvents(server.id).then(() => later(renderSidebar)); }
+  const next = evs[0];
+  body.append(h('button', { class: `ev-row${next ? ' has' : ''}`, onclick: () => openEvents(server) }, icon('book'),
+    h('span', { class: 'ev-row-text' }, next ? h('span', null, h('strong', null, next.title), h('small', null, new Date(next.startsAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }))) : 'Events'),
+    evs.length ? h('span', { class: 'badge inline' }, evs.length) : null));
   const collapsed = P.collapsed[server.id] || [];
   const cats = orderedCategories(server);
   cats.forEach((cat, ci) => {
@@ -1331,6 +1358,7 @@ function renderMain() {
   if (v.type === 'home') main.append(homeView());
   else if (v.type === 'friends') main.append(friendsView());
   else if (v.type === 'saved') main.append(savedView());
+  else if (v.type === 'people') main.append(peopleView());
   else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
   else if (v.type === 'channel' || v.type === 'dm') main.append(chatView());
   else if (v.type === 'voice') main.append(voiceRoomView());
@@ -1424,6 +1452,9 @@ function renderHeader() {
       headTools(ibtn('search', 'Search (Ctrl+K)', () => openSearch())));
   } else if (v.type === 'admin') {
     head.append(h('div', { class: 'head-title' }, icon('shield', 'ic head-ic'), h('h1', null, 'Admin'), h('span', { class: 'head-topic' }, `Only staff can see this \u00b7 you\u2019re ${({ owner: 'the owner', admin: 'an admin', moderator: 'a moderator' })[S.me.staffRole] || 'staff'}`)));
+  } else if (v.type === 'people') {
+    head.append(h('div', { class: 'head-title' }, icon('user', 'ic head-ic'), h('h1', null, 'People'), h('span', { class: 'head-topic' }, 'Profiles of people you share a server with')),
+      headTools(h('button', { class: 'btn ghost sm', onclick: () => openProfileModal(S.me.id) }, icon('user'), 'My page')));
   } else if (v.type === 'saved') {
     head.append(h('div', { class: 'head-title' }, icon('bookmark', 'ic head-ic'), h('h1', null, 'Saved messages')),
       headTools(h('span', { class: 'head-note' }, 'Saved on this device only')));
@@ -1475,6 +1506,9 @@ function homeView() {
 
   const fundCard = fundingCard();
   if (fundCard) wrap.append(fundCard);
+  const upcomingSlot = h('div');
+  wrap.append(upcomingSlot);
+  upcomingSection().then((sec) => { if (sec) upcomingSlot.replaceWith(sec); });
   if (pinned.length) wrap.append(section('Pinned conversations', null, h('div', { class: 'conv-cards' }, pinned.map(convCard))));
   wrap.append(section('Recent conversations', h('button', { class: 'link-btn', onclick: () => openNewConversation() }, 'New message'),
     convs.length ? h('div', { class: 'conv-cards' }, convs.filter((c) => !favs.includes(c.fav)).slice(0, 6).map(convCard))
@@ -1938,6 +1972,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     if (embeds.length) body.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => h('div', { class: `embed-wrap${isGiphy(u) ? ' giphy' : ''}` },
       h('img', { class: 'embed-img', src: mediaUrl(u), alt: isGiphy(u) ? 'GIF' : 'Linked image', loading: 'lazy', referrerpolicy: 'no-referrer', onclick: (e) => openViewer(e.currentTarget) }),
       isGiphy(u) ? h('span', { class: 'giphy-tag' }, /klipy/i.test(u) ? 'KLIPY' : 'GIPHY') : null))));
+    if (m.dec && m.dec.p) body.append(pollEl(m));
     const files = filesOf(m);
     if (files.length) body.append(h('div', { class: 'msg-files' }, files.map((f) => attachmentEl(f, m))));
     if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only.' }, 'Older message \u2014 not end-to-end encrypted'));
@@ -1962,7 +1997,10 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
 }
 // GIPHY media goes through our server (if the admin left the privacy proxy on), so GIPHY never sees viewers' IPs.
 const isGiphy = (u) => /^https:\/\/(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)\//i.test(u);
-const mediaUrl = (u) => (isGiphy(u) && S.config.gifProxy && S.mediaToken ? `/media/gif?u=${encodeURIComponent(u)}&t=${encodeURIComponent(S.mediaToken)}` : u);
+// Each GIF gets its own path (/media/gif/<short hash>), not just its own "?u=…". Older app caches ignored
+// everything after "?" and showed the same GIF everywhere; a distinct path can't be mixed up.
+const urlKey = (u) => { let x = 5381; for (let i = 0; i < u.length; i++) x = ((x * 33) ^ u.charCodeAt(i)) >>> 0; return x.toString(36); };
+const mediaUrl = (u) => (isGiphy(u) && S.config.gifProxy && S.mediaToken ? `/media/gif/${urlKey(u)}?u=${encodeURIComponent(u)}&t=${encodeURIComponent(S.mediaToken)}` : u);
 const escapeText = (t) => t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])).replace(/\n/g, '<br>');
 
 // Hover toolbar: just the essentials. Everything else lives in the ⋯ menu / right-click.
@@ -2001,6 +2039,7 @@ function messageMenuItems(m, ctx) {
     canPin ? { label: m.pinnedAt ? 'Unpin message' : 'Pin message', icon: 'pin', action: () => togglePin(m) } : null,
     ok ? { label: saved ? 'Remove from saved' : 'Save message', icon: 'bookmark', action: () => toggleSaved(m) } : null,
     ctx === 'main' ? { label: 'Mark unread', icon: 'eye', action: () => markUnread(keyOfMessage(m), m.id) } : null,
+    ...(ok ? remindItems(m, keyOfMessage(m), textOf(m) || (m.dec && m.dec.p ? `Poll: ${m.dec.p.q}` : 'Attachment')) : []),
     '-',
     ok && textOf(m) ? { label: 'Copy text', icon: 'copy', action: () => { copyText(textOf(m)); toast('Copied.'); } } : null,
     { label: 'Copy message link', icon: 'link', action: () => { copyText(messageLink(m)); toast('Message link copied. It only works for people who can see this conversation.'); } },
@@ -2188,6 +2227,7 @@ async function downloadAttachment(m, f) {
 }
 const loadQueue = makeQueue(3);
 function attachmentEl(f, m) {
+  if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : Promise.resolve(f.url)));
   const enc = !!f.k || !!m.dmId;
   const type = f.type || '';
   const media = /^image\//.test(type) ? 'img' : /^video\//.test(type) ? 'video' : /^audio\//.test(type) ? 'audio' : null;
@@ -2652,10 +2692,14 @@ function createComposer({ id, key, threadId, placeholder }) {
   const autosize = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 260) + 'px'; };
   const update = () => { sendBtn.disabled = !ta.value.trim() && !state.pending.length; };
   const box = h('div', { class: 'composer' },
-    h('button', { class: 'icon-btn attach', 'aria-label': 'Attach files', 'data-tip': 'Attach files', onclick: () => fileIn.click() }, icon('plus')),
+    h('button', { class: 'icon-btn attach', 'aria-label': 'Attach a file or create a poll', 'data-tip': 'Attach or poll', 'data-pop-anchor': '', onclick: (e) => menu(e.currentTarget, [
+      { label: 'Upload a file', icon: 'file', action: () => fileIn.click() },
+      { label: 'Create a poll', icon: 'check', action: () => openPollCreator((poll) => send('', { poll })) },
+    ], { side: 'top' }) }, icon('plus')),
     ta,
     h('div', { class: 'composer-tools' },
       h('button', { class: 'icon-btn', 'aria-label': 'Emoji', 'data-tip': 'Emoji', 'data-pop-anchor': '', onclick: (e) => emojiPicker(e.currentTarget, (em) => insertAtCursor(ta, em), { keepOpen: true }) }, icon('smile')),
+      voiceButton(() => box, (file, dur) => send('', { files: [{ file, voice: true, dur }] })),
       (S.config.features || {}).gifs === false ? null : h('button', { class: 'icon-btn', 'aria-label': 'GIFs', 'data-tip': 'GIFs', 'data-pop-anchor': '', onclick: (e) => gifPicker(e.currentTarget, (url) => send(url)) }, icon('gif')),
       sendBtn),
     fileIn);
@@ -2814,10 +2858,12 @@ function createComposer({ id, key, threadId, placeholder }) {
   // Sending never blocks typing: the box clears at once, the message shows up right away as
   // "sending…", and messages go out one after another in the background (so they stay in order).
   let queue = Promise.resolve();
-  function send(overrideText) {
+  // extra: { poll } for a poll, { files } for a voice message; the typed text stays in the box for those.
+  function send(overrideText, extra = {}) {
     const text = overrideText != null ? overrideText : ta.value;
-    const files = overrideText != null ? [] : state.pending.slice();
-    if (!text.trim() && !files.length) return;
+    const files = extra.files || (overrideText != null ? [] : state.pending.slice());
+    const poll = extra.poll || null;
+    if (!text.trim() && !files.length && !poll) return;
     const kk = key();
     const tid = threadId();
     const replyTo = state.replyTo ? state.replyTo.id : null;
@@ -2831,16 +2877,16 @@ function createComposer({ id, key, threadId, placeholder }) {
     if (old) replaceMessageEl(old);
     renderExtras(); autosize(); update();
     const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)), (x) => x.toString(16).padStart(2, '0')).join('');
-    if (id === 'main' && !tid) showPendingSend(kk, nonce, text, files.length, replyTo);
-    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce }));
+    if (id === 'main' && !tid) showPendingSend(kk, nonce, poll ? `\uD83D\uDCCA ${poll.q}` : files.some((f) => f.voice) ? '\uD83C\uDFA4 Voice message' : text, files.some((f) => f.voice) ? 0 : files.length, replyTo);
+    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll }));
     return queue;
   }
-  async function deliver({ kk, tid, text, files, replyTo, nonce }) {
+  async function deliver({ kk, tid, text, files, replyTo, nonce, poll }) {
     const bar = extras.querySelector('.upload-progress');
     const setProgress = (f) => { if (!bar) return; bar.hidden = f >= 1; bar.firstChild.style.width = Math.round(f * 100) + '%'; };
     try {
       const f = await uploadEncryptedFiles(kk, files, setProgress);
-      const msg = await sendTo(kk, tid, { t: text, f }, replyTo, nonce);
+      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}) }, replyTo, nonce);
       files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
       playSound('sent');
       // Normally the live connection delivers it first; this covers a slow or dropped connection.
@@ -2854,7 +2900,7 @@ function createComposer({ id, key, threadId, placeholder }) {
       if (e.code === 'slowmode' && wait) startSlow(+wait[1]);
       toast(e.message, 'error');
       // Give the words back so nothing is lost (unless they've already typed something new).
-      if (!ta.value.trim() && key() === kk) { ta.value = text; if (!state.pending.length) state.pending = files; renderExtras(); autosize(); update(); }
+      if (!poll && !files.some((f) => f.voice) && !ta.value.trim() && key() === kk) { ta.value = text; if (!state.pending.length) state.pending = files; renderExtras(); autosize(); update(); }
     } finally { setProgress(1); }
   }
   setTimeout(() => { autosize(); update(); }, 0);
@@ -2909,7 +2955,7 @@ async function uploadEncryptedFiles(key, files, onProgress) {
   const compress = P.chat.compressImages !== false;
   // Optimize images first (resize big photos, make thumbnails), then encrypt and upload.
   const prepared = [];
-  for (const p of files) prepared.push({ ...(await prepareImage(p.file, { compress })), orig: p.file });
+  for (const p of files) prepared.push({ ...(p.voice ? { file: p.file } : await prepareImage(p.file, { compress })), orig: p.file, voice: p.voice, dur: p.dur });
   const total = prepared.reduce((a, p) => a + p.file.size + (p.thumb ? p.thumb.size : 0), 0) || 1;
   let done = 0;
   onProgress(0);
@@ -2925,7 +2971,8 @@ async function uploadEncryptedFiles(key, files, onProgress) {
   for (const p of prepared) {
     const th = p.thumb ? await send(p.thumb, p.thumb.size) : null;
     const main = await send(p.file, p.file.size);
-    out.push({ url: main.url, name: p.file.name, type: p.file.type, size: p.file.size, k: main.k, ...(p.w ? { w: p.w, h: p.h } : {}), ...(th ? { th: { url: th.url, k: th.k } } : {}) });
+    out.push({ url: main.url, name: p.file.name, type: p.file.type, size: p.file.size, k: main.k, ...(p.w ? { w: p.w, h: p.h } : {}), ...(th ? { th: { url: th.url, k: th.k } } : {}),
+      ...(p.voice ? { voice: true, dur: p.dur } : {}) });
   }
   return out;
 }
@@ -3356,6 +3403,10 @@ function mutualServersEl(u) {
 function openProfilePop(anchor, userId, side = 'right') {
   const u = getUser(userId);
   const card = profileCard(u, { meId: S.me.id, compact: true, actions: relationshipActions(u), mutual: mutualServersEl(u) });
+  // The full page is the best part of a profile: make it one obvious click away.
+  const open = () => openProfileModal(u.id);
+  card.querySelector('.pc-inner')?.prepend(h('button', { class: 'btn primary pc-open-page', onclick: open }, icon('user'), u.id === S.me.id ? 'View my page' : 'View full profile'));
+  card.querySelectorAll('.pc-av, .pc-name').forEach((el) => { el.style.cursor = 'pointer'; el.addEventListener('click', open); });
   if (S.blocked.has(u.id)) card.prepend(h('div', { class: 'pc-blocked' }, icon('ban'), 'Blocked'));
   popover(anchor, card, { side, className: 'pop-profile' });
 }
@@ -3364,6 +3415,49 @@ function topFriendsEl(u) {
   if (!ids.length) return null;
   return h('div', { class: 'pc-section' }, h('div', { class: 'pc-label' }, 'Top friends'),
     h('div', { class: 'pc-friends' }, ids.map((id) => { const f = getUser(id); return h('button', { class: 'pc-friend', onclick: () => openProfileModal(id) }, avatarEl(f, 44), h('span', null, displayName(f))); })));
+}
+// ---- People: browse everyone's profile (MySpace "browse"), sorted and searchable.
+function peopleView() {
+  const wrap = h('div', { class: 'people-view' });
+  const search = h('input', { class: 'input search-input', placeholder: 'Search names, headlines and interests' });
+  let sort = 'online';
+  const grid = h('div', { class: 'people-grid' });
+  const seg = h('div', { class: 'seg' });
+  const drawSeg = () => clear(seg).append(...[['online', 'Online first'], ['new', 'Newest'], ['views', 'Most viewed'], ['name', 'A\u2013Z']].map(([k, l]) => h('button', { class: `seg-btn${sort === k ? ' active' : ''}`, onclick: () => { sort = k; drawSeg(); load(); } }, l)));
+  let t = 0; let req = 0;
+  const load = async () => {
+    const id = ++req;
+    try {
+      const r = await api('GET', `/people?sort=${sort}&q=${encodeURIComponent(search.value.trim())}`);
+      if (id !== req) return;
+      r.people.forEach(setUser);
+      clear(grid);
+      if (!r.people.length) grid.append(h('div', { class: 'panel-empty' }, icon('user'), h('p', null, search.value ? 'Nobody matches that.' : 'Join a server or add friends to see people here.')));
+      r.people.forEach((u) => grid.append(personCard(u)));
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 250); });
+  drawSeg();
+  wrap.append(
+    h('div', { class: 'people-me' }, avatarEl(S.me, 48), h('div', { class: 'people-me-text' }, h('strong', null, 'Your profile page'), h('span', null, 'Make it yours: themes, a song, a comment wall, your own effects.')),
+      h('button', { class: 'btn ghost sm', onclick: () => openProfileModal(S.me.id) }, 'View'), h('button', { class: 'btn primary sm', onclick: () => openSettings(app, 'page') }, 'Edit')),
+    h('div', { class: 'people-tools' }, h('div', { class: 'friends-search' }, icon('search'), search), seg),
+    grid);
+  load();
+  return wrap;
+}
+function personCard(u) {
+  const p = u.profile || {};
+  const online = u.presence && u.presence !== 'offline';
+  return h('button', { class: 'person-card', onclick: () => openProfileModal(u.id), style: { '--c1': p.themePrimary, '--c2': p.themeSecondary } },
+    h('div', { class: 'person-banner', style: { background: p.bannerColor || 'var(--accent)' } }, u.banner ? h('img', { class: 'cropped', src: u.banner, alt: '', loading: 'lazy', style: cropStyle(p.bannerCrop) }) : null),
+    h('div', { class: 'person-av' }, avatarEl(u, 64, { status: true, meId: S.me.id })),
+    h('div', { class: 'person-body' },
+      nameEl(u, { tag: 'strong', cls: 'person-name' }),
+      h('span', { class: 'person-handle' }, '@' + u.username, u.supporter ? ' \uD83D\uDC9C' : ''),
+      p.headline ? h('span', { class: 'person-headline' }, `\u201C${p.headline}\u201D`) : p.mood && p.mood.text ? h('span', { class: 'person-headline' }, `${p.mood.emoji || ''} ${p.mood.text}`) : null,
+      (p.interests || []).length ? h('div', { class: 'pc-tags' }, p.interests.slice(0, 3).map((x) => h('span', { class: 'pc-tag' }, x))) : null,
+      h('span', { class: 'person-meta' }, online ? 'Online now' : `Joined ${fmtDay(u.createdAt)}`, u.views ? ` \u00b7 ${u.views} views` : '')));
 }
 // The full, MySpace-style profile page.
 async function openProfileModal(userId) {
@@ -3993,7 +4087,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) mark
 // ======================================================================= installable app (PWA), updates, push
 let installPrompt = null;
 let wantReload = false;
-const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true || !!window.hearthDesktop;
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true || !!window.hearthDesktop || androidApp.on;
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; });
 window.addEventListener('appinstalled', () => { installPrompt = null; toast('Installed. You can open it from your apps like any other program.'); });
 async function installApp() {
@@ -4005,6 +4099,7 @@ async function installApp() {
 }
 function setupServiceWorker() {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.register('/sw.js').then((reg) => {
     const offer = (w) => {
       // A new version finished installing in the background: offer to switch.
@@ -4023,7 +4118,14 @@ function setupServiceWorker() {
     setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
   }).catch(() => {});
   // Only reload when the person asked for the update — the very first install also fires this event.
-  navigator.serviceWorker.addEventListener('controllerchange', () => { if (wantReload) { wantReload = false; location.reload(); } });
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (wantReload) { wantReload = false; location.reload(); return; }
+    // A new version took over in the background: the next reload uses it. Let people do it when it suits them.
+    if (S.me && !document.querySelector('.update-bar') && hadController) {
+      document.body.append(h('div', { class: 'update-bar', role: 'status' }, icon('arrowUp'), h('span', null, 'Hearth was updated.'),
+        h('button', { class: 'btn primary sm', onclick: () => location.reload() }, 'Reload'), ibtn('close', 'Later', (e) => e.currentTarget.closest('.update-bar').remove(), { cls: 'sm' })));
+    }
+  });
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'open' && e.data.url) {
       const hash = e.data.url.split('#')[1];

@@ -1,0 +1,17 @@
+{
+  "name": "hearth-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hearth for Android: opens your Hearth server in an app, with microphone, camera and file access.",
+  "scripts": {
+    "android:add": "cap add android",
+    "android:sync": "cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/core": "^6.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0"
+  }
+}

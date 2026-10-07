@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Hearth</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { display: grid; place-items: center; padding: 20px; background: radial-gradient(70% 50% at 50% 0%, rgba(242,165,65,.18), transparent 70%), #100e16; color: #ede9f5; font: 16px/1.45 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+    .card { width: min(420px, 100%); padding: 28px 22px; border-radius: 22px; background: #1a1724; border: 1px solid rgba(255,255,255,.1); box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+    img { width: 60px; height: 60px; border-radius: 16px; }
+    h1 { font-size: 23px; margin: 14px 0 4px; }
+    p { margin: 0 0 18px; color: #b6afc6; font-size: 14.5px; }
+    label { display: block; font-size: 13px; font-weight: 600; color: #b6afc6; margin-bottom: 6px; }
+    input { width: 100%; height: 48px; padding: 0 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,.14); background: #110f18; color: inherit; font: inherit; outline: none; }
+    input:focus { border-color: #f2a541; box-shadow: 0 0 0 3px rgba(242,165,65,.18); }
+    button { margin-top: 14px; width: 100%; height: 48px; border: 0; border-radius: 12px; background: #f2a541; color: #1a1407; font: 700 16px system-ui, sans-serif; }
+    button:disabled { opacity: .6; }
+    .err { color: #ff7b8c; font-size: 14px; min-height: 20px; margin-top: 10px; }
+    .hint { font-size: 12.5px; color: #847c97; margin-top: 14px; }
+    .loading { display: none; text-align: center; color: #b6afc6; }
+    body.auto .card { display: none; } body.auto .loading { display: block; }
+  </style>
+</head>
+<body>
+  <div class="loading">Connecting…</div>
+  <form class="card" id="f">
+    <img src="icon.png" alt="">
+    <h1>Connect to your server</h1>
+    <p>Enter the address of the Hearth server you use in your browser.</p>
+    <label for="url">Server address</label>
+    <input id="url" placeholder="chat.example.com" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+    <button id="go" type="submit">Connect</button>
+    <div class="err" id="err" role="alert"></div>
+    <div class="hint">Your messages stay end-to-end encrypted. The app only talks to the server you enter. If your server uses a self-signed certificate (an IP address like 1.2.3.4:3000), the app asks you to confirm it once.</div>
+  </form>
+  <script>
+    // First launch: type the server address. After that the app goes straight there. Comes back here
+    // with ?error=… when the server can't be reached, or ?change=1 from Settings → Apps → Switch server.
+    const KEY = 'hearth.server';
+    const err = document.getElementById('err');
+    const input = document.getElementById('url');
+    const params = new URLSearchParams(location.search);
+    const norm = (v) => {
+      v = String(v || '').trim();
+      if (!v) return '';
+      if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+      try { const u = new URL(v); return u.protocol === 'https:' || u.protocol === 'http:' ? u.origin : ''; } catch { return ''; }
+    };
+    // Tells the app which site is "yours" (it alone loads inside the app and gets notifications/downloads).
+    const tellApp = (origin) => new Promise((resolve) => {
+      const A = window.HearthAndroid;
+      if (!A) return resolve();
+      const done = setTimeout(resolve, 1500);
+      A.onmessage = (e) => { try { if (JSON.parse(e.data).type === 'serverSet') { clearTimeout(done); resolve(); } } catch { /* ignore */ } };
+      A.postMessage(JSON.stringify({ type: 'setServer', origin }));
+    });
+    async function go(origin) {
+      const btn = document.getElementById('go');
+      btn.disabled = true; btn.textContent = 'Connecting…';
+      document.body.classList.add('auto');
+      localStorage.setItem(KEY, origin);
+      await tellApp(origin);
+      location.replace(origin + '/');
+    }
+    document.getElementById('f').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const o = norm(input.value);
+      if (!o) { err.textContent = 'Enter an address like chat.example.com'; return; }
+      if (o.startsWith('http://') && !/^http:\/\/(localhost|127\.|10\.|192\.168\.)/.test(o)) { err.textContent = 'Use the https:// address — Hearth\u2019s encryption needs a secure connection.'; return; }
+      go(o);
+    });
+    fetch('config.json').then((r) => r.json()).catch(() => ({})).then((cfg) => {
+      const fixed = cfg.lockServer ? norm(cfg.defaultServer) : '';
+      const saved = fixed || localStorage.getItem(KEY) || norm(cfg.defaultServer);
+      if (fixed) { input.value = fixed.replace(/^https:\/\//, ''); input.readOnly = true; }
+      if (params.get('error')) {
+        err.textContent = params.get('error');
+        if (saved) input.value = saved.replace(/^https:\/\//, '');
+        document.getElementById('go').textContent = 'Try again';
+      } else if (params.get('change')) {
+        if (saved) input.value = saved.replace(/^https:\/\//, '');
+        input.focus(); input.select();
+      } else if (saved) go(saved);
+      else input.focus();
+    });
+  </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 // MySpace-style profile pages: rendering, safe custom CSS, and the editor (Settings → Profile page).
 import { h, clear, icon, toast, fmtStamp, fmtDay } from './util.js';
 import { api, upload } from './api.js';
-import { avatarEl, nameEl, displayName, effectLayer, splitGlyphs, FONT_STACKS, cropStyle, songPlayer } from './profile-ui.js';
+import { avatarEl, nameEl, displayName, effectLayer, splitGlyphs, FONT_STACKS, cropStyle, songPlayer, bannerEl } from './profile-ui.js';
 import { confirmDialog } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
 
@@ -105,25 +105,31 @@ export function renderPage(d, u, opts = {}) {
   const name = displayName(u);
   const page = h('div', { class: `mys-page lay-${p.layout}${opts.preview ? ' preview' : ''}`, dataset: { page: u.id }, style: pageStyle(p, d.pageBg) });
 
-  // ---- left column
-  const title = nameEl(u, { tag: 'h1', cls: `mys-name${p.glitterTitle ? ' glitter' : ''}` });
+  // ---- the header: banner, big avatar, name, headline and the buttons that matter
   const online = u.presence && u.presence !== 'offline';
-  const identity = box(null, 'mys-id',
-    title,
-    h('div', { class: 'mys-id-row' },
-      h('div', { class: 'mys-photo' }, avatarEl(u, 150)),
-      h('div', { class: 'mys-id-text' },
-        prof.headline ? h('p', { class: 'mys-headline' }, `"${prof.headline}"`) : null,
-        prof.pronouns ? h('p', null, prof.pronouns) : null,
-        prof.mood && (prof.mood.text || prof.mood.emoji) ? h('p', { class: 'mys-mood' }, h('b', null, 'Mood: '), `${prof.mood.text || ''} ${prof.mood.emoji || ''}`.trim()) : null,
-        prof.customStatus && prof.customStatus.text ? h('p', null, `${prof.customStatus.emoji || ''} ${prof.customStatus.text}`.trim()) : null,
-        h('p', { class: `mys-online${online ? ' on' : ''}` }, online ? '● Online now!' : d.lastSeen ? `Last seen ${fmtDay(d.lastSeen)}` : 'Offline'),
-        h('p', { class: 'mys-since' }, `Member since ${fmtDay(u.createdAt)}`),
-        u.supporter ? h('p', null, h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter')) : null,
-        p.showViews ? h('p', { class: 'mys-views' }, h('b', null, 'Profile views: '), h('span', { class: 'mys-counter' }, String(d.views).padStart(6, '0'))) : null)));
-  const left = [identity];
-  if (!self && opts.actions) left.push(box(`Contacting ${name}`, 'mys-contact', h('div', { class: 'mys-contact-grid' }, opts.actions)));
-  if (self && !opts.preview && opts.onEdit) left.push(box('Your page', 'mys-contact', h('div', { class: 'mys-contact-grid' }, h('button', { class: 'btn primary sm', onclick: opts.onEdit }, icon('edit'), 'Edit my page'))));
+  const chips = [
+    h('span', { class: `mys-chip mys-online${online ? ' on' : ''}` }, online ? '\u25CF Online now' : d.lastSeen ? `Last seen ${fmtDay(d.lastSeen)}` : 'Offline'),
+    prof.mood && (prof.mood.text || prof.mood.emoji) ? h('span', { class: 'mys-chip mys-mood' }, `Mood: ${`${prof.mood.emoji || ''} ${prof.mood.text || ''}`.trim()}`) : null,
+    prof.customStatus && prof.customStatus.text ? h('span', { class: 'mys-chip' }, `${prof.customStatus.emoji || ''} ${prof.customStatus.text}`.trim()) : null,
+    h('span', { class: 'mys-chip mys-since' }, `Joined ${fmtDay(u.createdAt)}`),
+    p.showViews ? h('span', { class: 'mys-chip mys-views' }, 'Views ', h('span', { class: 'mys-counter' }, String(d.views).padStart(6, '0'))) : null,
+    d.isFriend && !self ? h('span', { class: 'mys-chip mys-friend-tag' }, '\u2714 Your friend') : null,
+  ].filter(Boolean);
+  const heroActions = self
+    ? (!opts.preview && opts.onEdit ? [h('button', { class: 'btn primary', onclick: opts.onEdit }, icon('edit'), 'Edit my page')] : [])
+    : (opts.actions || []);
+  const hero = h('header', { class: 'mys-hero mys-box' },
+    h('div', { class: 'mys-banner' }, bannerEl(u, 200)),
+    h('div', { class: 'mys-hero-row' },
+      h('div', { class: 'mys-photo' }, avatarEl(u, 132)),
+      h('div', { class: 'mys-hero-text' },
+        nameEl(u, { tag: 'h1', cls: `mys-name${p.glitterTitle ? ' glitter' : ''}` }),
+        h('div', { class: 'mys-handle' }, '@' + u.username, prof.pronouns ? h('span', null, ` \u00b7 ${prof.pronouns}`) : null,
+          u.supporter ? h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter') : null),
+        prof.headline ? h('p', { class: 'mys-headline' }, `\u201C${prof.headline}\u201D`) : null,
+        h('div', { class: 'mys-chips' }, chips)),
+      heroActions.length ? h('div', { class: 'mys-hero-actions' }, heroActions) : null));
+  const left = [];
   if (u.song) left.push(box('Now playing', 'mys-song', songPlayer(u, prof)));
   if ((prof.links || []).length) left.push(box(`${name}'s links`, 'mys-links', h('ul', null, prof.links.map((l) => h('li', null, h('a', { href: l.url, target: '_blank', rel: 'noopener noreferrer nofollow' }, l.label || l.url))))));
   const rows = INTEREST_ROWS.filter(([k]) => p.interests[k]);
@@ -136,8 +142,6 @@ export function renderPage(d, u, opts = {}) {
 
   // ---- right column
   const right = [];
-  right.push(box(null, 'mys-network', h('p', null, self ? 'This is your page. Everyone who opens your profile sees it like this.'
-    : d.isFriend ? h('span', null, h('b', null, name), ' is your friend.') : h('span', null, h('b', null, name), ' is in your extended network.'))));
   const about = prof.aboutMe || prof.bio;
   if (about || p.meet) {
     right.push(box(`${name}'s Blurbs`, 'mys-blurbs',
@@ -181,7 +185,9 @@ export function renderPage(d, u, opts = {}) {
   right.push(box(`${name}'s Friends' Comments`, 'mys-comments', h('p', { class: 'mys-muted' }, `Displaying ${comments.length} of ${d.commentCount} comments`), form, list));
 
   const head = prof.headline && p.marquee ? h('div', { class: 'mys-marquee', 'aria-label': prof.headline }, h('span', null, prof.headline), h('span', { 'aria-hidden': 'true' }, prof.headline)) : null;
-  const wrap = h('div', { class: 'mys-wrap' }, head, h('div', { class: 'mys-grid' }, h('div', { class: 'mys-left' }, left), h('div', { class: 'mys-right' }, right)));
+  if (self && !opts.preview) right.unshift(h('p', { class: 'mys-self-note' }, 'This is your page \u2014 everyone who opens your profile sees it like this.'));
+  if (!left.length) { page.classList.remove(`lay-${p.layout}`); page.classList.add('lay-single'); }
+  const wrap = h('div', { class: 'mys-wrap' }, head, hero, h('div', { class: 'mys-grid' }, h('div', { class: 'mys-left' }, left), h('div', { class: 'mys-right' }, right)));
   page.append(wrap);
   // The effect sits over the scrolling page (outside it, so it stays put while scrolling).
   const shell = h('div', { class: 'mys-shell' }, page);
@@ -227,7 +233,7 @@ export const PAGE_THEMES = [
   { name: 'Vaporwave', page: { bg: { kind: 'gradient', color: '#ff71ce', color2: '#01cdfe', angle: 160 }, text: '#2b1055', link: '#7d00ff', heading: '#b967ff', boxBg: '#fffbff', boxAlpha: 75, headerBg: '#b967ff', headerText: '#ffffff', border: 'solid', borderWidth: 2, borderColor: '#05ffa1', radius: 14, shadow: 'soft', font: 'Press Start 2P', fontSize: 13 } },
 ];
 
-const CSS_HELP = ['.mys-page', '.mys-box', '.mys-box-h', '.mys-box-b', '.mys-name', '.mys-photo', '.mys-headline', '.mys-mood', '.mys-contact', '.mys-song', '.mys-links', '.mys-interests', '.mys-details', '.mys-network', '.mys-blurbs', '.mys-friends', '.mys-friend', '.mys-comments', '.mys-comment', '.mys-counter', '.mys-marquee'];
+const CSS_HELP = ['.mys-page', '.mys-hero', '.mys-banner', '.mys-chip', '.mys-box', '.mys-box-h', '.mys-box-b', '.mys-name', '.mys-photo', '.mys-headline', '.mys-mood', '.mys-contact', '.mys-song', '.mys-links', '.mys-interests', '.mys-details', '.mys-network', '.mys-blurbs', '.mys-friends', '.mys-friend', '.mys-comments', '.mys-comment', '.mys-counter', '.mys-marquee'];
 const CSS_EXAMPLE = `/* Make every box tilt a tiny bit and wobble when you hover */
 .mys-box { transform: rotate(-0.6deg); transition: transform .2s; }
 .mys-box:hover { transform: rotate(0.6deg) scale(1.01); }

@@ -1,0 +1,208 @@
+# Builds the Hearth apps: Windows, macOS and Linux (hearth/desktop) and Android (hearth/mobile).
+#   Runs on every push that changes the apps, on tags like `app-v1.17.0` (attached to a GitHub release),
+#   and from the Actions tab ("Run workflow").
+#   Result: download them from the run's "Artifacts" section, or the release for tags.
+#   Optional repository variable HEARTH_SERVER (e.g. https://chat.example.com): bakes your server's address in
+#   so people don't have to type it.
+#   Optional secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD:
+#   sign Android builds with your own key (see hearth/mobile/README.md). Without them a key is generated once
+#   and kept in the Actions cache.
+#   Optional secrets VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR: copy the installers to your server's
+#   data/downloads folder, where they show up on https://your-server/download.
+name: Hearth apps
+
+on:
+  push:
+    branches: ['**']
+    tags: ['app-v*']
+    paths:
+      - 'hearth/desktop/**'
+      - 'hearth/mobile/**'
+      - '.github/workflows/hearth-apps.yml'
+  workflow_dispatch:
+    inputs:
+      server:
+        description: 'Server address baked into these builds (leave empty to ask on first launch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hearth-apps-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVER: ${{ github.event.inputs.server || vars.HEARTH_SERVER }}
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: hearth/desktop
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/app-v')
+        run: npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#app-v}"
+      - name: Bake in the server address
+        if: env.SERVER != ''
+        run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+      - run: npm install --no-audit --no-fund
+      - name: Build installers
+        run: npx electron-builder --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hearth-desktop-${{ runner.os }}
+          path: |
+            hearth/desktop/dist/*.exe
+            hearth/desktop/dist/*.dmg
+            hearth/desktop/dist/*.AppImage
+            hearth/desktop/dist/*.deb
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hearth/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/app-v* ]]; then v="${GITHUB_REF_NAME#app-v}"; else v="$(node -p "require('../package.json').version")"; fi
+          echo "name=$v" >> "$GITHUB_OUTPUT"
+      - name: Bake in the server address
+        if: env.SERVER != ''
+        run: node -e "const f='www/config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+      - run: npm install --no-audit --no-fund
+      - name: Create the Android project
+        run: |
+          npx cap add android
+          cp native/MainActivity.java android/app/src/main/java/app/hearth/mobile/MainActivity.java
+          # Microphone and camera for calls and voice messages, notifications for new messages.
+          sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />#' android/app/src/main/AndroidManifest.xml
+          grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+          cat >> android/app/build.gradle <<EOF
+
+          // ---- added by the Hearth build
+          dependencies { implementation "androidx.webkit:webkit:1.9.0" }
+          android {
+              defaultConfig {
+                  versionCode ${GITHUB_RUN_NUMBER}
+                  versionName "${{ steps.v.outputs.name }}"
+              }
+              signingConfigs {
+                  hearth {
+                      storeFile file(System.getenv("HEARTH_KEYSTORE"))
+                      storePassword System.getenv("HEARTH_KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("HEARTH_KEY_ALIAS")
+                      keyPassword System.getenv("HEARTH_KEY_PASSWORD")
+                  }
+              }
+              buildTypes { release { signingConfig signingConfigs.hearth } }
+          }
+          EOF
+      - name: App icon
+        continue-on-error: true
+        run: npx --yes @capacitor/assets@3 generate --android --assetPath resources --iconBackgroundColor '#100e16' --iconBackgroundColorDark '#100e16' --splashBackgroundColor '#100e16' --splashBackgroundColorDark '#100e16'
+      - run: npx cap sync android
+
+      - name: Signing key from secrets
+        id: secretkey
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > "$RUNNER_TEMP/hearth.jks"
+            echo "found=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Saved signing key
+        if: steps.secretkey.outputs.found != '1'
+        uses: actions/cache@v4
+        with:
+          path: ~/.hearth-android-key
+          key: hearth-android-key-v1
+      - name: Make a signing key (first build only)
+        if: steps.secretkey.outputs.found != '1'
+        run: |
+          mkdir -p ~/.hearth-android-key
+          if [ ! -f ~/.hearth-android-key/hearth.jks ]; then
+            keytool -genkeypair -v -keystore ~/.hearth-android-key/hearth.jks -storepass hearth-build -keypass hearth-build \
+              -alias hearth -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Hearth"
+          fi
+          cp ~/.hearth-android-key/hearth.jks "$RUNNER_TEMP/hearth.jks"
+      - name: Build the APK
+        working-directory: hearth/mobile/android
+        env:
+          HEARTH_KEYSTORE: ${{ runner.temp }}/hearth.jks
+          HEARTH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
+          HEARTH_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'hearth' }}
+          HEARTH_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          mkdir -p ../dist
+          cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-${{ steps.v.outputs.name }}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hearth-android
+          path: hearth/mobile/dist/*.apk
+          if-no-files-found: error
+
+  release:
+    needs: [desktop, android]
+    if: startsWith(github.ref, 'refs/tags/app-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  publish-to-vps:
+    needs: [desktop, android]
+    if: always() && (needs.desktop.result == 'success' || needs.android.result == 'success')
+    runs-on: ubuntu-latest
+    env:
+      HAS_VPS: ${{ secrets.VPS_HOST != '' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        if: env.HAS_VPS == 'true'
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Copy installers to the server
+        if: env.HAS_VPS == 'true'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb,dist/*.apk'
+          target: ${{ secrets.VPS_DOWNLOADS_DIR }}
+          strip_components: 1

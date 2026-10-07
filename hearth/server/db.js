@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -417,6 +417,38 @@ CREATE TABLE IF NOT EXISTS gif_library (
 );
 CREATE INDEX IF NOT EXISTS idx_gif_library_uses ON gif_library(uses DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gif_library_source ON gif_library(source, source_id);
+`);
+
+// v10: polls (votes only; the question and options are inside the encrypted message) and server events.
+db.exec(`
+CREATE TABLE IF NOT EXISTS poll_votes (
+  message_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  choice INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (message_id, user_id, choice)
+);
+CREATE TABLE IF NOT EXISTS poll_closed (message_id TEXT PRIMARY KEY, closed_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS server_events (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  location TEXT NOT NULL DEFAULT '',
+  channel_id TEXT,
+  starts_at INTEGER NOT NULL,
+  ends_at INTEGER,
+  created_by TEXT,
+  reminded INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_server ON server_events(server_id, starts_at);
+CREATE TABLE IF NOT EXISTS event_rsvps (
+  event_id TEXT NOT NULL REFERENCES server_events(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  PRIMARY KEY (event_id, user_id)
+);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);

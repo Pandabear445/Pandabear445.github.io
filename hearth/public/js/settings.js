@@ -7,6 +7,7 @@ import { profileCard, FONT_STACKS, cropStyle, customFxLayer } from './profile-ui
 import { pageEditorTab } from './page.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
+import { androidApp } from './android.js';
 import {
   THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, UI_FONTS, CORNERS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
   gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage, exportAppearance, importAppearance,
@@ -1078,6 +1079,21 @@ function pushToggleRow(app) {
   refresh();
   return row;
 }
+// In the Android app: notifications come from the app itself while it's open or in the background.
+function androidNotifyRow() {
+  const box = h('div', { class: 'stack' });
+  const draw = () => {
+    clear(box);
+    const st = window.Notification ? Notification.permission : 'default';
+    box.append(h('p', { class: 'muted-p' }, st === 'granted'
+      ? 'Notifications are on. The app notifies you about messages while it\u2019s open or in the background (not after you swipe it away).'
+      : st === 'denied' ? 'Notifications are blocked. Turn them on in Android Settings \u2192 Apps \u2192 Hearth \u2192 Notifications.'
+        : 'Allow the app to notify you about new messages.'));
+    if (st === 'default') box.append(h('div', null, h('button', { class: 'btn primary', onclick: async () => { await Notification.requestPermission(); draw(); } }, 'Allow notifications')));
+  };
+  draw();
+  return box;
+}
 function appsTab(app) {
   const ua = navigator.userAgent;
   const ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
@@ -1087,6 +1103,11 @@ function appsTab(app) {
   const drawInstall = () => {
     clear(installBox);
     if (window.hearthDesktop) { installBox.append(h('p', { class: 'muted-p' }, `You\u2019re using the Hearth desktop app (version ${window.hearthDesktop.version}).`)); return; }
+    if (androidApp.on) {
+      installBox.append(h('p', { class: 'muted-p' }, `You\u2019re using the Hearth Android app${androidApp.version ? ` (version ${androidApp.version})` : ''}. Files you save go to Downloads/Hearth.`),
+        h('div', null, h('button', { class: 'btn', onclick: () => androidApp.switchServer() }, 'Switch server')));
+      return;
+    }
     if (app.isInstalled) { installBox.append(h('p', { class: 'muted-p' }, 'Hearth is installed on this device. \uD83C\uDF89')); return; }
     if (app.canInstall) {
       installBox.append(h('p', { class: 'muted-p' }, 'Install Hearth as an app: it gets its own window and icon, opens instantly and can send notifications.'),
@@ -1109,8 +1130,9 @@ function appsTab(app) {
       dl.length || cfg.desktopUrl
         ? h('div', null, h('a', { class: 'btn ghost', href: '/download', target: '_blank', rel: 'noopener' }, icon('download'), 'Download page'))
         : h('p', { class: 'field-hint' }, 'The server owner hasn\u2019t published desktop installers yet.')),
-    section('Notifications', pushToggleRow(app),
-      h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
+    androidApp.on ? section('Notifications', androidNotifyRow())
+      : section('Notifications', pushToggleRow(app),
+        h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
     section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
       h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download` }),
         h('button', { class: 'btn ghost', onclick: () => { navigator.clipboard.writeText(`${location.origin}/download`).then(() => toast('Link copied.')); } }, 'Copy'))),
