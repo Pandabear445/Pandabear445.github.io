@@ -2290,3 +2290,50 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 @media (max-width: 700px) {
   .adm-row.region-row, .adm-row.pay-row, .price-table .adm-row.three { grid-template-columns: 1fr 1fr; }
 }
+
+/* ---------------------------------------------------------------- GIF picker, Discord-style */
+.gif-picker.xp { width: 440px; padding: 0; gap: 0; overflow: hidden; display: flex; flex-direction: column; }
+.xp-tabs { display: flex; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--line); flex: none; }
+.xp-tab { padding: 5px 12px; border-radius: 6px; font-weight: 600; font-size: 14px; color: var(--text-2); }
+.xp-tab:hover { background: var(--hover); color: var(--text); }
+.xp-tab.active { background: var(--active); color: var(--text); }
+.xp-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 10px 10px 8px; }
+.xp-bar { display: flex; align-items: center; gap: 4px; height: 38px; flex: none; padding: 0 8px 0 4px; border-radius: 8px; background: rgb(0 0 0 / .28); border: 1px solid var(--line); }
+.xp-bar:focus-within { border-color: rgb(var(--accent-rgb) / .6); }
+.xp-back, .xp-clear { width: 28px; height: 28px; flex: none; display: grid; place-items: center; border-radius: 6px; color: var(--text-2); }
+.xp-back:hover, .xp-clear:hover { background: var(--hover); color: var(--text); }
+.xp-back .ic, .xp-clear .ic { width: 18px; height: 18px; }
+.xp-title { flex: 1; padding-left: 4px; font-weight: 700; font-size: 15px; }
+.xp-input { flex: 1; min-width: 0; height: 100%; padding: 0 8px; background: none; border: 0; outline: none; color: var(--text); font: inherit; font-size: 14.5px; }
+.xp-input::placeholder { color: var(--muted); }
+.xp-search-ic { display: grid; place-items: center; color: var(--muted); padding-right: 2px; }
+.xp-search-ic .ic { width: 18px; height: 18px; }
+.xp-bar:has(.xp-clear:not([hidden])) .xp-search-ic, .xp-bar:has(.xp-title:not([hidden])) .xp-search-ic { display: none; }
+.xp-scroll { flex: 1; min-height: 0; overflow-y: auto; margin-right: -6px; padding-right: 6px; overscroll-behavior: contain; }
+.gif-home { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.gif-home .gif-cat { height: 104px; border-radius: 8px; background: var(--active); }
+.gif-home .gif-cat img { filter: none; }
+.gif-home .gif-cat::after { content: ''; position: absolute; inset: 0; background: rgb(0 0 0 / .48); transition: background .15s; }
+.gif-home .gif-cat:hover::after { background: rgb(0 0 0 / .28); }
+.gif-home .gif-cat:hover img { transform: scale(1.04); }
+.gif-home .gif-cat .gif-cat-label { z-index: 2; display: inline-flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 800; padding: 0 8px; text-align: center; }
+.gif-home .gif-cat .gif-cat-label b { font-weight: 800; }
+.gif-home .gif-cat .gif-cat-label .ic { position: static; display: inline-grid; place-items: center; width: 18px; height: 18px; padding: 0; text-shadow: none; }
+.gif-home .gif-cat .gif-cat-label .ic svg { width: 18px; height: 18px; }
+.gif-home .fav-tile { background: linear-gradient(135deg, #f2a541, #e0558b); }
+.gif-home .trend-tile { background: linear-gradient(135deg, #5865f2, #a855f7); }
+.gif-home .lib-tile { background: linear-gradient(135deg, #1f9d6b, #2b7bd6); }
+.gif-home .fav-tile .ic svg { fill: currentColor; }
+.gif-masonry { display: flex; gap: 8px; align-items: flex-start; }
+.gif-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.gif-masonry .gif-btn { margin: 0; border-radius: 8px; break-inside: auto; }
+.gif-masonry .gif-btn img { display: block; width: 100%; height: auto; }
+.gif-masonry.stickers .gif-btn { aspect-ratio: 1; background: rgb(255 255 255 / .03); }
+.gif-masonry.stickers .gif-btn img { height: 100%; object-fit: contain; padding: 6px; }
+.gif-picker.xp .gif-empty { padding: 40px 16px; }
+.gif-picker.xp .gif-credit { flex: none; }
+/* Emoji tab: the emoji picker fills the same window */
+.gif-picker.xp.emoji-mode .xp-body { padding: 0; }
+.gif-picker.xp .emoji-picker { width: 100%; flex: 1; min-height: 0; border: 0; border-radius: 0; box-shadow: none; background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+.gif-picker.xp .emoji-grid { flex: 1; min-height: 0; height: auto; max-height: none; }
+@media (max-width: 700px) { .gif-picker.xp { width: calc(100vw - 16px); } .gif-home .gif-cat { height: 88px; } }

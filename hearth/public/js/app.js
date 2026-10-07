@@ -2757,7 +2757,7 @@ function createComposer({ id, key, threadId, placeholder }) {
     h('div', { class: 'composer-tools' },
       h('button', { class: 'icon-btn', 'aria-label': 'Emoji', 'data-tip': 'Emoji', 'data-pop-anchor': '', onclick: (e) => emojiPicker(e.currentTarget, (em) => insertAtCursor(ta, em), { keepOpen: true }) }, icon('smile')),
       voiceButton(() => box, (file, dur) => send('', { files: [{ file, voice: true, dur }] })),
-      (S.config.features || {}).gifs === false ? null : h('button', { class: 'icon-btn', 'aria-label': 'GIFs', 'data-tip': 'GIFs', 'data-pop-anchor': '', onclick: (e) => gifPicker(e.currentTarget, (url) => send(url)) }, icon('gif')),
+      (S.config.features || {}).gifs === false ? null : h('button', { class: 'icon-btn', 'aria-label': 'GIFs', 'data-tip': 'GIFs', 'data-pop-anchor': '', onclick: (e) => gifPicker(e.currentTarget, (url) => send(url), { onEmoji: (em) => insertAtCursor(ta, em) }) }, icon('gif')),
       sendBtn),
     fileIn);
   const slowNote = h('div', { class: 'slow-note', hidden: true });
@@ -3090,6 +3090,10 @@ function redrawPendingSends(key) {
 
 // ======================================================================= emoji + GIF pickers
 function emojiPicker(anchor, onPick, { keepOpen = false } = {}) {
+  popover(anchor, emojiPanel(onPick, { keepOpen }), { side: 'top', align: 'end' });
+}
+// The emoji grid on its own, so it can also live in the GIF picker's "Emoji" tab.
+function emojiPanel(onPick, { keepOpen = false } = {}) {
   const search = h('input', { class: 'input emoji-search', placeholder: 'Search emoji', 'aria-label': 'Search emoji' });
   const grid = h('div', { class: 'emoji-grid', role: 'listbox' });
   const tabs = h('div', { class: 'emoji-tabs', role: 'tablist' });
@@ -3106,7 +3110,7 @@ function emojiPicker(anchor, onPick, { keepOpen = false } = {}) {
     const label = isCustom ? `:${e.name}:` : token.startsWith('<') ? token.replace(/^<a?(:[^:]+:).*$/, '$1') : (EMOJI_NAMES.get(e) || '').split(' ')[0];
     return h('button', {
       class: 'emoji-btn', role: 'option', 'aria-label': label, onclick: () => pick(token),
-      onmouseenter: () => { clear(preview).append(h('span', { class: 'ep-big' }, isCustom ? h('img', { class: 'cemoji', src: e.url, alt: '' }) : node.cloneNode ? node.cloneNode(true) : node), h('span', null, label), isCustom ? h('span', { class: 'ep-src' }, e.serverName) : null); },
+      onmouseenter: () => { clear(preview).append(h('span', { class: 'ep-big' }, isCustom ? h('img', { class: 'cemoji', src: e.url, alt: '' }) : node.cloneNode ? node.cloneNode(true) : node), h('span', null, label), isCustom ? h('span', { class: 'ep-src' }, e.serverName) : ''); },
     }, node);
   };
   const slug = (n) => 'ecat-' + n.replace(/[^A-Za-z0-9]/g, '');
@@ -3128,47 +3132,59 @@ function emojiPicker(anchor, onPick, { keepOpen = false } = {}) {
   });
   search.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const first = grid.querySelector('.emoji-btn'); if (first) first.click(); } });
   drawAll();
-  popover(anchor, h('div', { class: 'emoji-picker' }, h('div', { class: 'emoji-top' }, search), tabs, grid, preview), { side: 'top', align: 'end' });
   setTimeout(() => search.focus(), 20);
+  return h('div', { class: 'emoji-picker' }, h('div', { class: 'emoji-top' }, search), tabs, grid, preview);
 }
 
-// GIF picker: GIFs / Stickers / Favorites, categories + trending, infinite scroll. Reused for "emoji from GIPHY".
+// GIF picker, laid out like Discord's: GIFs / Stickers / Emoji tabs; a home screen of big tiles (Favorites,
+// Trending, this server's own GIFs, then categories); a back arrow out of any category or search; and results in a
+// masonry of two columns that stay put while more load in as you scroll. Also used for "emoji from GIPHY".
 const GIF_FAVS = 'hearth.gifFavs';
 const gifFavs = () => LS.get(GIF_FAVS, []);
-function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
+function gifPanel({ onPick, startTab = 'gifs', height = 440, onEmoji = null } = {}) {
   const libOnly = !!S.config.gifLibraryOnly;
-  let tab = libOnly && startTab !== 'favs' ? 'library' : startTab;
+  let tab = startTab === 'stickers' ? 'stickers' : startTab === 'emoji' && onEmoji ? 'emoji' : 'gifs';
+  let view = startTab === 'favs' ? 'favs' : 'home'; // home | search | trending | library | favs
   let q = '';
   let next = null;
   let loading = false;
   let reqId = 0;
   let lib = null; // { canAdd, count }
+  let cols = [];
   const provName = S.config.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY';
-  const input = h('input', { class: 'input', placeholder: libOnly ? 'Search this server’s GIFs' : `Search ${provName}`, 'aria-label': 'Search GIFs' });
-  const seg = h('div', { class: 'seg' });
-  const grid = h('div', { class: 'gif-grid', role: 'listbox' });
-  const status = h('div', { class: 'gif-status' });
+  const tabsEl = h('div', { class: 'xp-tabs', role: 'tablist' });
+  const back = h('button', { class: 'xp-back', 'aria-label': 'Back', 'data-tip': 'Back', onclick: () => goHome() }, icon('chevronLeft'));
+  const title = h('span', { class: 'xp-title' });
+  const input = h('input', { class: 'xp-input', 'aria-label': 'Search GIFs', autocomplete: 'off', spellcheck: 'false' });
+  const clearBtn = h('button', { class: 'xp-clear', 'aria-label': 'Clear search', onclick: () => { input.value = ''; q = ''; goHome(); input.focus(); } }, icon('close'));
+  const bar = h('div', { class: 'xp-bar' }, back, title, input, h('span', { class: 'xp-search-ic' }, icon('search')), clearBtn);
   const notice = h('div', { class: 'gif-notice', hidden: true });
+  const scroller = h('div', { class: 'xp-scroll', role: 'listbox' });
   const credit = h('div', { class: 'gif-credit' });
+  const body = h('div', { class: 'xp-body' }, bar, notice, scroller, credit);
+  const root = h('div', { class: 'gif-picker xp', style: { height: height + 'px' } }, tabsEl, body);
+
+  const sticker = () => tab === 'stickers';
+  const source = () => (view === 'library' || libOnly ? '&source=library' : '');
   // Picking a GIF: library GIFs are sent as a link to this server; the server also counts what's popular.
   const pick = (g) => {
     const out = g.library ? { ...g, url: location.origin + g.url } : g;
-    api('POST', '/gifs/used', { id: g.id, url: g.url, title: g.title, query: q, sticker: tab === 'stickers' }).catch(() => {});
+    api('POST', '/gifs/used', { id: g.id, url: g.url, title: g.title, query: q, sticker: sticker() }).catch(() => {});
     onPick(out);
   };
   const tile = (g) => {
     const fav = gifFavs().some((x) => x.id === g.id);
-    return h('div', { class: 'gif-btn', role: 'option', tabindex: '0', 'aria-label': g.title || 'GIF',
+    return h('div', { class: 'gif-btn', role: 'option', tabindex: '0', 'aria-label': g.title || 'GIF', title: g.title || '',
       onclick: () => pick(g), onkeydown: (e) => { if (e.key === 'Enter') pick(g); } },
-    h('img', { src: mediaUrl(g.preview), alt: '', loading: 'lazy', style: { aspectRatio: `${g.width} / ${g.height}` } }),
+    h('img', { src: mediaUrl(g.preview), alt: '', loading: 'lazy', style: sticker() ? null : { aspectRatio: `${g.width || 1} / ${g.height || 1}` } }),
     h('button', { class: `gif-fav${fav ? ' on' : ''}`, 'aria-label': fav ? 'Remove from favorites' : 'Add to favorites', 'data-tip': fav ? 'Unfavorite' : 'Favorite',
       onclick: (e) => {
         e.stopPropagation();
         const list = gifFavs();
         const has = list.some((x) => x.id === g.id);
-        LS.set(GIF_FAVS, has ? list.filter((x) => x.id !== g.id) : [g, ...list].slice(0, 100));
+        LS.set(GIF_FAVS, has ? list.filter((x) => x.id !== g.id) : [{ ...g, sticker: sticker() }, ...list].slice(0, 200));
         e.currentTarget.classList.toggle('on', !has);
-        if (tab === 'favs') draw();
+        if (view === 'favs' && has) e.currentTarget.closest('.gif-btn').remove();
       } }, icon('star')),
     g.library && S.me.staffRole ? h('button', { class: 'gif-del', 'aria-label': 'Remove from library', 'data-tip': 'Remove from library', onclick: async (e) => {
       e.stopPropagation();
@@ -3177,11 +3193,22 @@ function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
       e.target.closest('.gif-btn').remove();
     } }, icon('close')) : null);
   };
+  // Masonry: each GIF goes into the shortest column, so nothing jumps when more arrive.
+  const startMasonry = () => {
+    const n = sticker() ? 3 : 2;
+    cols = Array.from({ length: n }, () => ({ el: h('div', { class: 'gif-col' }), h: 0 }));
+    scroller.append(h('div', { class: `gif-masonry${sticker() ? ' stickers' : ''}` }, cols.map((c) => c.el)));
+  };
+  const place = (g) => {
+    const c = cols.reduce((a, b2) => (b2.h < a.h ? b2 : a));
+    c.el.append(tile(g));
+    c.h += sticker() ? 1 : (g.height || 1) / (g.width || 1) + 0.04;
+  };
+  const empty = (msg, ...extra) => scroller.append(h('div', { class: 'gif-empty' }, h('p', null, msg), ...extra));
+  const spinner = () => scroller.append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
   const showError = (msg) => {
-    clear(grid);
-    status.textContent = '';
-    grid.append(h('div', { class: 'gif-empty' }, h('p', null, msg),
-      S.me && S.me.instanceAdmin && /set up|key/i.test(msg) ? h('button', { class: 'btn primary sm', onclick: () => { closePopover(); openSettings(app, 'instance'); } }, 'Set up GIF search') : null));
+    clear(scroller);
+    empty(msg, S.me && S.me.instanceAdmin && /set up|key/i.test(msg) ? h('button', { class: 'btn primary sm', onclick: () => { closePopover(); openSettings(app, 'instance'); } }, 'Set up GIF search') : null);
   };
   // Add a GIF to this server's library (title + words people will search for).
   const addGif = () => {
@@ -3190,81 +3217,139 @@ function gifPanel({ onPick, startTab = 'gifs', height = 440 } = {}) {
       const f = fileIn.files[0];
       if (!f) return;
       if (f.size > 8 * 1024 * 1024) return toast('GIFs for the library can be up to 8 MB.', 'error');
-      const title = h('input', { class: 'input', maxlength: '120', placeholder: 'e.g. cat falling off couch', value: f.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ') });
+      const titleIn = h('input', { class: 'input', maxlength: '120', placeholder: 'e.g. cat falling off couch', value: f.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ') });
       const tags = h('input', { class: 'input', maxlength: '200', placeholder: 'funny, cat, fail' });
-      const sticker = h('input', { type: 'checkbox' });
+      const stk = h('input', { type: 'checkbox' });
       closePopover();
       modal({ title: 'Add to this server’s GIFs', size: 'sm',
-        body: h('div', { class: 'stack' }, field('Name', title), field('Search words', tags, 'Words people might type to find it.'), h('label', { class: 'row gap' }, sticker, 'It’s a sticker (transparent background)')),
+        body: h('div', { class: 'stack' }, field('Name', titleIn), field('Search words', tags, 'Words people might type to find it.'), h('label', { class: 'row gap' }, stk, 'It’s a sticker (transparent background)')),
         actions: [{ label: 'Cancel' }, { label: 'Add GIF', kind: 'primary', action: async () => {
-          const fd = new FormData(); fd.append('file', f, f.name); fd.append('title', title.value); fd.append('tags', tags.value); fd.append('sticker', String(sticker.checked));
+          const fd = new FormData(); fd.append('file', f, f.name); fd.append('title', titleIn.value); fd.append('tags', tags.value); fd.append('sticker', String(stk.checked));
           await upload('/gifs/library', fd); toast('Added. Everyone on this server can use it now.');
         } }] });
     });
     fileIn.click();
   };
+
+  // ---- results: search, trending, this server's library (infinite scroll)
   const load = async (more = false) => {
     if (loading || (more && next == null)) return;
     loading = true;
     const id = ++reqId;
-    if (!more) { clear(grid); status.textContent = ''; grid.append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' }))); }
+    if (!more) { clear(scroller); spinner(); }
     try {
-      const src = tab === 'library' ? '&source=library' : '';
-      const res = await api('GET', `/gifs?type=${tab === 'stickers' ? 'stickers' : 'gifs'}&q=${encodeURIComponent(q)}&offset=${more ? encodeURIComponent(next) : ''}${src}`);
+      const res = await api('GET', `/gifs?type=${sticker() ? 'stickers' : 'gifs'}&q=${encodeURIComponent(q)}&offset=${more ? encodeURIComponent(next) : ''}${source()}`);
       if (id !== reqId) return;
-      if (!more) clear(grid);
+      if (!more) { clear(scroller); startMasonry(); }
       notice.hidden = !res.limited && !res.stale;
       notice.textContent = res.limited ? `${provName}’s limit was reached for now, so these come from this server’s own GIFs.` : res.stale ? 'Showing saved results while GIF search catches its breath.' : '';
-      res.items.forEach((g) => grid.append(tile(g)));
+      res.items.forEach(place);
       next = res.nextOffset;
       if (!more && !res.items.length) {
-        grid.append(h('div', { class: 'gif-empty' }, h('p', null, res.library ? (q ? 'No GIFs here match that yet.' : 'This server has no GIFs of its own yet.') : 'No results. Try another word.'),
-          res.library && lib && lib.canAdd ? h('button', { class: 'btn primary sm', onclick: addGif }, '+ Add a GIF') : null));
+        clear(scroller);
+        empty(res.library ? (q ? 'No GIFs here match that yet.' : 'This server has no GIFs of its own yet.') : 'No results. Try another word.',
+          res.library && lib && lib.canAdd ? h('button', { class: 'btn primary sm', onclick: addGif }, '+ Add a GIF') : null);
       }
     } catch (e) { if (id === reqId) showError(e.message); } finally { loading = false; }
+    // Short first page on a tall picker: keep filling until it scrolls.
+    if (id === reqId && next != null && scroller.scrollHeight <= scroller.clientHeight + 50) load(true);
   };
-  const categories = async () => {
+
+  // ---- home: big tiles, like Discord
+  const bigTile = (label, onclick, { img = '', ic = null, cls = '' } = {}) => {
+    const t = h('button', { class: `gif-cat ${cls}`, onclick }, img ? h('img', { src: img, alt: '', loading: 'lazy' }) : null, h('span', { class: 'gif-cat-label' }, ic, h('b', null, label)));
+    return t;
+  };
+  const home = async () => {
     const id = ++reqId;
-    clear(grid).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
+    clear(scroller);
+    const grid = h('div', { class: 'gif-home' });
+    scroller.append(grid);
+    const favs = gifFavs();
+    grid.append(bigTile('Favorites', () => go('favs'), { img: favs[0] ? mediaUrl(favs[0].preview) : '', ic: icon('star'), cls: 'fav-tile' }));
+    const trend = bigTile(libOnly ? 'Most used' : 'Trending GIFs', () => go('trending'), { ic: icon('flame'), cls: 'trend-tile' });
+    grid.append(trend);
+    if (!libOnly && lib) grid.append(bigTile(`${S.config.name}’s GIFs`, () => go('library'), { ic: icon('home'), cls: 'lib-tile' }));
+    // A moving picture behind "Trending", from the first trending GIF (the server caches it).
+    api('GET', `/gifs?type=gifs&q=&offset=${libOnly ? '&source=library' : ''}`).then((r) => {
+      const g = r.items && r.items[0];
+      if (g && id === reqId) trend.prepend(h('img', { src: mediaUrl(g.preview), alt: '', loading: 'lazy' }));
+    }).catch(() => {});
     try {
-      const cats = await api('GET', `/gifs/categories${tab === 'library' ? '?source=library' : ''}`);
+      const cats = await api('GET', `/gifs/categories${libOnly ? '?source=library' : ''}`);
       if (id !== reqId) return;
-      clear(grid);
-      grid.append(h('button', { class: 'gif-cat trending', onclick: () => { q = ''; draw(true); } }, icon('arrowUp'), h('span', null, tab === 'library' ? 'Most used' : 'Trending')));
-      cats.forEach((c) => grid.append(h('button', { class: 'gif-cat', onclick: () => { input.value = c.name; q = c.name; draw(); } },
-        h('img', { src: mediaUrl(c.preview), alt: '', loading: 'lazy' }), h('span', null, c.name))));
-      if (tab === 'library' && !cats.length) draw(true);
-    } catch (e) { if (id === reqId) showError(e.message); }
+      cats.forEach((c) => grid.append(bigTile(c.name, () => { input.value = c.name; q = c.name; go('search'); }, { img: c.preview ? mediaUrl(c.preview) : '' })));
+    } catch (e) {
+      if (id !== reqId) return;
+      if (!/limit/i.test(e.message)) scroller.append(h('div', { class: 'gif-empty' }, h('p', null, e.message),
+        S.me && S.me.instanceAdmin && /set up|key/i.test(e.message) ? h('button', { class: 'btn primary sm', onclick: () => { closePopover(); openSettings(app, 'instance'); } }, 'Set up GIF search') : null));
+    }
   };
-  const draw = (trending = false) => {
-    clear(seg);
-    const tabs = libOnly ? [['library', 'GIFs'], ['stickers', 'Stickers'], ['favs', '★ Favorites']]
-      : [['gifs', 'GIFs'], ['stickers', 'Stickers'], ['library', 'This server'], ['favs', '★ Favorites']];
-    tabs.forEach(([k, l]) => seg.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
-    clear(credit).append(tab === 'library' || libOnly ? h('span', null, 'This server’s own GIFs — free, no limits') : h('span', null, `Powered by ${provName}`));
-    if ((tab === 'library' || libOnly) && lib && lib.canAdd) credit.append(h('button', { class: 'link-btn', onclick: addGif }, '+ Add a GIF'));
-    grid.classList.toggle('cats', (tab === 'gifs' || tab === 'library') && !q && !trending);
-    notice.hidden = true;
-    if (tab === 'favs') {
+  const favsView = () => {
+    reqId++;
+    clear(scroller);
+    const list = gifFavs();
+    if (!list.length) return empty('You haven’t favorited any GIFs yet. Hover over one and click the star.');
+    startMasonry();
+    list.forEach(place);
+  };
+
+  // ---- the top bar and tabs
+  const drawTabs = () => {
+    clear(tabsEl);
+    [['gifs', 'GIFs'], ['stickers', 'Stickers'], ...(onEmoji ? [['emoji', 'Emoji']] : [])].forEach(([k, l]) => tabsEl.append(h('button', {
+      class: `xp-tab${tab === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(tab === k),
+      onclick: () => { if (tab === k) return; tab = k; q = ''; input.value = ''; view = 'home'; render(); },
+    }, l)));
+  };
+  const drawBar = () => {
+    const titled = view === 'favs' || view === 'trending';
+    back.hidden = view === 'home' || (sticker() && view === 'search' && !q);
+    title.hidden = !titled;
+    title.textContent = view === 'favs' ? 'Favorites' : view === 'trending' ? (libOnly ? 'Most used' : 'Trending GIFs') : '';
+    input.hidden = titled;
+    clearBtn.hidden = titled || !input.value;
+    input.placeholder = sticker() ? `Search ${provName} stickers` : view === 'library' || libOnly ? `Search ${S.config.name}’s GIFs` : `Search ${provName}`;
+    clear(credit).append(view === 'library' || libOnly ? h('span', null, 'This server’s own GIFs: free, no limits') : h('span', null, `Powered by ${provName}`));
+    if ((view === 'library' || libOnly) && lib && lib.canAdd) credit.append(h('button', { class: 'link-btn', onclick: addGif }, '+ Add a GIF'));
+  };
+  const go = (v) => { view = v; render(); scroller.scrollTop = 0; };
+  const goHome = () => { q = ''; input.value = ''; view = sticker() ? 'search' : 'home'; render(); };
+  function render() {
+    drawTabs();
+    if (tab === 'emoji') {
       reqId++;
-      clear(grid);
-      const favs = gifFavs().filter((g) => !q || (g.title || '').toLowerCase().includes(q.toLowerCase()));
-      if (!favs.length) grid.append(h('div', { class: 'gif-empty' }, h('p', null, 'Star GIFs to keep them here. Favorites are saved on this device.')));
-      favs.forEach((g) => grid.append(tile(g)));
+      root.classList.add('emoji-mode');
+      clear(body).append(emojiPanel(onEmoji, { keepOpen: true }));
       return;
     }
-    if ((tab === 'gifs' || tab === 'library') && !q && !trending) return categories();
+    root.classList.remove('emoji-mode');
+    if (!body.contains(bar)) clear(body).append(bar, notice, scroller, credit);
+    if (sticker() && view === 'home') view = 'search'; // stickers open straight on trending stickers
+    notice.hidden = true;
+    drawBar();
+    if (view === 'favs') return favsView();
+    if (view === 'home') return home();
     load();
-  };
-  input.addEventListener('input', debounce(() => { q = input.value.trim(); if (tab === 'favs') return draw(); draw(); }, 300));
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const first = grid.querySelector('.gif-btn'); if (first) first.click(); } });
-  grid.addEventListener('scroll', () => { if (tab !== 'favs' && grid.scrollTop + grid.clientHeight > grid.scrollHeight - 300) load(true); });
-  api('GET', '/gifs/library').then((x) => { lib = x; draw(); }).catch(() => draw());
+  }
+  input.addEventListener('input', debounce(() => {
+    q = input.value.trim();
+    clearBtn.hidden = !input.value;
+    if (view === 'library') return render();
+    view = q || sticker() ? 'search' : 'home';
+    render();
+  }, 300));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { const first = scroller.querySelector('.gif-btn'); if (first) first.click(); }
+    if (e.key === 'Backspace' && !input.value && view !== 'home') goHome();
+  });
+  scroller.addEventListener('scroll', () => { if (view !== 'home' && view !== 'favs' && scroller.scrollTop + scroller.clientHeight > scroller.scrollHeight - 400) load(true); });
+  api('GET', '/gifs/library').then((x) => { lib = x; render(); }).catch(() => render());
   setTimeout(() => input.focus(), 30);
-  return h('div', { class: 'gif-picker', style: { height: height + 'px' } }, input, seg, notice, grid, status, credit);
+  return root;
 }
-function gifPicker(anchor, onPick) {
-  popover(anchor, gifPanel({ onPick: (g) => { closePopover(); onPick(g.url); } }), { side: 'top', align: 'end' });
+function gifPicker(anchor, onPick, { onEmoji = null } = {}) {
+  popover(anchor, gifPanel({ onPick: (g) => { closePopover(); onPick(g.url); }, onEmoji }), { side: 'top', align: 'end' });
 }
 
 // ======================================================================= global search (Ctrl+K)
