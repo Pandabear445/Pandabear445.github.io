@@ -43,8 +43,9 @@ const safeEq = (a, b) => { const x = Buffer.from(String(a)); const y = Buffer.fr
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
 
 module.exports = function setupAccounts(ctx) {
-  const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, newId, seal, unseal,
-    tokenId, requireInstanceAdmin, adminLog, secEvent, cleanIp, recordIp, emitKeyState, brandName, isB64ish, isSalt, DATA_DIR } = ctx;
+  const { api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
+    tokenId, requireInstanceAdmin, requireOutranks, auditLog, secEvent, cleanIp, emitKeyState, brandName, isB64ish, isSalt, atRestKey,
+    stepUp, createSession, revokeSessions } = ctx;
   const now = () => Date.now();
 
   // ------------------------------------------------------------------ sending email
@@ -77,6 +78,11 @@ module.exports = function setupAccounts(ctx) {
     }
     await transport.sendMail({ from: c.from, to, subject, text });
   }
+  // Security notices ("your password was changed") go to the account's confirmed email, if it has one.
+  function notify(row, what, text) {
+    if (!row || !row.email || !row.email_verified || !mailReady()) return;
+    sendMail({ to: row.email, subject: `${brandName()}: ${what}`, text: `${text}\n\nIf this wasn't you, reset your password right away and tell the server owner.` }).catch(() => {});
+  }
   const mask = (email) => { if (!email) return ''; const [u, d] = email.split('@'); return `${u.slice(0, 1)}${'•'.repeat(Math.max(1, Math.min(6, u.length - 1)))}@${d}`; };
 
   api.get('/admin/mail', auth, (req, res) => {
@@ -101,7 +107,7 @@ module.exports = function setupAccounts(ctx) {
     }
     setSetting('mail', JSON.stringify(v));
     transport = null;
-    adminLog(req, 'mail_settings', null, v.host || '');
+    auditLog(req, 'mail_settings', null, v.host || '');
     res.json({ ok: true, ready: mailReady() });
   });
   api.post('/admin/mail/test', auth, wrap(async (req, res) => {
@@ -127,17 +133,18 @@ module.exports = function setupAccounts(ctx) {
   };
   setInterval(() => db.prepare('DELETE FROM auth_tokens WHERE expires_at < ?').run(now()), 3600000).unref();
 
-  // Confirms it's really you (current password) before changing email, 2FA or the recovery key.
-  async function checkPassword(row, authKey) {
-    if (typeof authKey !== 'string' || !(await bcrypt.compare(authKey, row.auth_hash))) fail(401, 'Your password is not right.');
+  // Before setting up two-factor (it isn't on yet, so the password is all there is to check).
+  async function checkPassword(req, row, authKey) {
+    rateLimit('stepup:' + row.id, 10, 10 * 60000);
+    if (typeof authKey !== 'string' || !(await bcrypt.compare(authKey.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
   }
 
   // ------------------------------------------------------------------ email on your account
   api.post('/me/email', auth, wrap(async (req, res) => {
     rateLimit('email:' + req.userId, 6, 3600000);
-    const row = getUserRow(req.userId);
-    await checkPassword(row, (req.body || {}).authKey);
-    const email = String((req.body || {}).email || '').trim().toLowerCase();
+    limitNet(req, 'email', 20, 3600000);
+    const row = await stepUp(req, req.body);
+    const email = String((req.body || {}).email || '').trim().toLowerCase().slice(0, 254);
     if (!EMAIL_RE.test(email)) fail(400, 'That doesn’t look like an email address.');
     const other = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.userId);
     if (other) fail(409, 'That email is already used by another account.');
@@ -148,6 +155,8 @@ module.exports = function setupAccounts(ctx) {
     res.json({ ok: true, sentTo: email });
   }));
   api.post('/me/email/verify', auth, (req, res) => {
+    rateLimit('emailverify:' + req.userId, 20, 3600000);
+    limitNet(req, 'emailverify', 60, 3600000);
     const t = db.prepare("SELECT * FROM auth_tokens WHERE user_id = ? AND kind = 'email'").get(req.userId);
     if (!t || t.expires_at < now()) fail(400, 'That code expired. Send a new one.');
     const d = JSON.parse(t.data);
@@ -158,15 +167,21 @@ module.exports = function setupAccounts(ctx) {
       fail(400, 'That code isn’t right.');
     }
     if (db.prepare('SELECT 1 FROM users WHERE email = ? AND id != ?').get(d.email, req.userId)) fail(409, 'That email is already used by another account.');
+    const before = getUserRow(req.userId);
     db.prepare('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?').run(d.email, req.userId);
     db.prepare('DELETE FROM auth_tokens WHERE id = ?').run(t.id);
+    // The old address hears about it (someone with a stolen session and password could otherwise quietly
+    // move password resets to their own email).
+    if (before.email && before.email !== d.email) notify(before, 'your email was changed', `The email for ${before.username} was changed to ${mask(d.email)}. Password resets now go there.`);
+    auditLog(req, 'email_changed', req.userId, mask(d.email));
     broadcastUser(req.userId);
     res.json(selfUser(getUserRow(req.userId)));
   });
   api.delete('/me/email', auth, wrap(async (req, res) => {
-    const row = getUserRow(req.userId);
-    await checkPassword(row, (req.body || {}).authKey);
+    const row = await stepUp(req, req.body);
+    notify(row, 'your email was removed', `The email was removed from ${row.username}. Password resets by email won't work until a new one is added.`);
     db.prepare('UPDATE users SET email = NULL, email_verified = 0 WHERE id = ?').run(req.userId);
+    auditLog(req, 'email_removed', req.userId, row.username);
     broadcastUser(req.userId);
     res.json(selfUser(getUserRow(req.userId)));
   }));
@@ -175,17 +190,18 @@ module.exports = function setupAccounts(ctx) {
   // The browser makes a random recovery key, encrypts a second copy of your private key with it and sends
   // only that encrypted copy here. The recovery key itself never leaves your device.
   api.put('/me/recovery', auth, wrap(async (req, res) => {
-    const row = getUserRow(req.userId);
     const b = req.body || {};
-    await checkPassword(row, b.authKey);
+    const row = await stepUp(req, b);
     if (!isB64ish(b.encPrivateKeyRecovery, 4000) || !isSalt(b.recoverySalt)) fail(400, 'Bad key material.');
     db.prepare('UPDATE users SET enc_private_key_recovery = ?, recovery_salt = ? WHERE id = ?').run(b.encPrivateKeyRecovery, b.recoverySalt, req.userId);
+    auditLog(req, row.enc_private_key_recovery ? 'recovery_key_replaced' : 'recovery_key_created', req.userId, row.username);
+    notify(row, 'a recovery key was created', `A new recovery key was made for ${row.username}. Any older recovery key stopped working.`);
     res.json(selfUser(getUserRow(req.userId)));
   }));
   api.delete('/me/recovery', auth, wrap(async (req, res) => {
-    const row = getUserRow(req.userId);
-    await checkPassword(row, (req.body || {}).authKey);
+    const row = await stepUp(req, req.body);
     db.prepare('UPDATE users SET enc_private_key_recovery = NULL, recovery_salt = NULL WHERE id = ?').run(req.userId);
+    auditLog(req, 'recovery_key_removed', req.userId, row.username);
     res.json(selfUser(getUserRow(req.userId)));
   }));
 
@@ -203,12 +219,15 @@ module.exports = function setupAccounts(ctx) {
     }
     return false;
   }
+  // Backup codes are stored as HMACs keyed with the server's secret key (data/secret.key), so a copy of the
+  // database alone isn't enough to try all ~10^15 possible codes offline. (Codes from 1.20.0 were plain SHA-256.)
+  const backupHash = (uid, c) => crypto.createHmac('sha256', atRestKey).update(`backup-code|${uid}|${c}`).digest('hex');
   function backupOk(row, code) {
     const c = String(code || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     if (c.length !== 10) return false;
     const list = JSON.parse(row.backup_codes || '[]');
-    const h = sha(c);
-    const i = list.findIndex((x) => safeEq(x, h));
+    const keyed = backupHash(row.id, c); const plain = sha(c);
+    const i = list.findIndex((x) => safeEq(x, keyed) || safeEq(x, plain));
     if (i < 0) return false;
     list.splice(i, 1);
     db.prepare('UPDATE users SET backup_codes = ? WHERE id = ?').run(JSON.stringify(list), row.id);
@@ -216,24 +235,33 @@ module.exports = function setupAccounts(ctx) {
   }
   const newBackupCodes = (uid) => {
     const codes = Array.from({ length: 10 }, () => b32encode(crypto.randomBytes(7)).toLowerCase().slice(0, 10));
-    db.prepare('UPDATE users SET backup_codes = ? WHERE id = ?').run(JSON.stringify(codes.map(sha)), uid);
+    db.prepare('UPDATE users SET backup_codes = ? WHERE id = ?').run(JSON.stringify(codes.map((c) => backupHash(uid, c))), uid);
     return codes.map((c) => `${c.slice(0, 5)}-${c.slice(5)}`);
   };
   // For login and password reset: throws unless a right code (or an unused backup code) came with it.
-  function require2fa(row, body) {
+  // Guesses are limited per account (8 per 15 minutes, 30 per day — wherever they come from) and per network.
+  // After a few wrong codes the account's email gets a warning: whoever is trying already knows the password.
+  function require2fa(row, body, req) {
     if (!row.totp_enabled) return;
     const b = body || {};
     if (!b.totp && !b.backupCode) fail(401, 'Enter the 6-digit code from your authenticator app.', 'need_2fa');
+    if (typeof b.totp !== 'string' && typeof b.backupCode !== 'string') fail(400, 'Codes are text.', 'bad_2fa');
     rateLimit('totp:' + row.id, 8, 15 * 60000);
+    rateLimit('totpday:' + row.id, 30, 24 * 3600000);
+    if (req) limitNet(req, 'totp', 20, 15 * 60000);
     if (b.totp ? totpOk(row, b.totp) : backupOk(row, b.backupCode)) return;
-    secEvent('failed_2fa', '', row.username);
+    secEvent('failed_2fa', req ? req.ip : '', row.username);
+    if (countHit('totpwarn:' + row.id, 3600000) === 3) {
+      auditLog(req, '2fa_failures', row.id, `${row.username}: 3 wrong codes after the right password`, row.id);
+      notify(row, 'someone has your password', `Someone entered the right password for ${row.username} but the wrong two-factor code three times${req ? ` (from ${cleanIp(req.ip)})` : ''}. Two-factor stopped them. Change your password now.`);
+    }
     fail(401, b.totp ? 'That code isn’t right. Check your phone’s clock and try the newest code.' : 'That backup code isn’t right or was already used.', 'bad_2fa');
   }
 
   api.post('/me/2fa/setup', auth, wrap(async (req, res) => {
     const row = getUserRow(req.userId);
-    await checkPassword(row, (req.body || {}).authKey);
     if (row.totp_enabled) fail(400, 'Two-factor sign-in is already on.');
+    await checkPassword(req, row, (req.body || {}).authKey);
     const secret = b32encode(crypto.randomBytes(20));
     db.prepare('UPDATE users SET totp_secret = ?, totp_last_step = NULL WHERE id = ?').run(seal({ s: secret }), req.userId);
     const issuer = encodeURIComponent(brandName());
@@ -243,48 +271,61 @@ module.exports = function setupAccounts(ctx) {
     rateLimit('totpsetup:' + req.userId, 10, 15 * 60000);
     const row = getUserRow(req.userId);
     if (row.totp_enabled) fail(400, 'Two-factor sign-in is already on.');
+    if (!row.totp_secret) fail(400, 'Start the setup again.');
     if (!totpOk(row, (req.body || {}).code)) fail(400, 'That code isn’t right. Type the 6 digits your app shows now.');
     db.prepare('UPDATE users SET totp_enabled = 1 WHERE id = ?').run(req.userId);
     const backupCodes = newBackupCodes(req.userId);
     // Everyone else signed in on this account has to sign in again, now with a code.
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.userId, tokenId(req.token));
+    revokeSessions(req.userId, { except: req.session.id, reason: '2fa_enabled' });
+    db.prepare('UPDATE sessions SET mfa_at = ? WHERE id = ?').run(now(), req.session.id);
     secEvent('2fa_enabled', cleanIp(req.ip), row.username);
+    auditLog(req, '2fa_enabled', req.userId, row.username);
+    notify(row, 'two-factor sign-in is on', `Two-factor sign-in was turned on for ${row.username}. Every other device was signed out.`);
     res.json({ backupCodes, user: selfUser(getUserRow(req.userId)) });
   });
   api.post('/me/2fa/disable', auth, wrap(async (req, res) => {
-    const row = getUserRow(req.userId);
     const b = req.body || {};
-    await checkPassword(row, b.authKey);
-    require2fa(row, b);
+    // Always a fresh code here, even right after signing in.
+    const row = getUserRow(req.userId);
+    if (!row.totp_enabled) fail(400, 'Two-factor sign-in is already off.');
+    await checkPassword(req, row, b.authKey);
+    require2fa(row, b, req);
     db.prepare("UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_last_step = NULL, backup_codes = '[]' WHERE id = ?").run(req.userId);
     secEvent('2fa_disabled', cleanIp(req.ip), row.username);
+    auditLog(req, '2fa_disabled', req.userId, row.username);
+    notify(row, 'two-factor sign-in was turned off', `Two-factor sign-in was turned off for ${row.username}.`);
     res.json(selfUser(getUserRow(req.userId)));
   }));
   api.post('/me/2fa/backup-codes', auth, (req, res) => {
     const row = getUserRow(req.userId);
-    require2fa(row, { totp: (req.body || {}).code });
+    if (!row.totp_enabled) fail(400, 'Two-factor sign-in is off.');
+    require2fa(row, { totp: String((req.body || {}).code || '') }, req);
+    auditLog(req, '2fa_backup_codes_replaced', req.userId, row.username);
     res.json({ backupCodes: newBackupCodes(req.userId) });
   });
   api.post('/admin/users/:id/2fa/remove', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
-    const r = getUserRow(req.params.id);
-    if (!r) fail(404, 'No such user.');
+    const r = requireOutranks(req, String(req.params.id)); // never on yourself, the owner or staff at your level
+    if (!r.totp_enabled) fail(400, 'Two-factor sign-in is already off for them.');
     db.prepare("UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_last_step = NULL, backup_codes = '[]' WHERE id = ?").run(r.id);
-    adminLog(req, '2fa_removed', r.id, r.username);
+    auditLog(req, '2fa_removed', r.id, r.username);
+    notify(r, 'two-factor sign-in was removed', `A server admin turned off two-factor sign-in for ${r.username} (usually because the phone was lost).`);
     res.json({ ok: true });
   });
 
   // ------------------------------------------------------------------ forgot password
   // Always answers the same way, so it can't be used to find out which accounts or emails exist.
+  // Limits: per network, for everyone together, and per account — the last one quietly (refusing would
+  // tell the asker that the account exists), so an inbox can't be flooded with reset emails.
   api.post('/auth/forgot', wrap(async (req, res) => {
-    rateLimit('forgot:' + req.ip, 5, 15 * 60000);
+    limitNet(req, 'forgot', 5, 15 * 60000);
+    rateLimit('forgot:all', 300, 3600000);
     if (!mailReady()) fail(503, 'Password reset by email isn’t set up on this server. Ask the owner.');
     const login = String((req.body || {}).login || '').trim().slice(0, 200);
     const row = login.includes('@')
       ? db.prepare('SELECT * FROM users WHERE email = ? AND email_verified = 1').get(login.toLowerCase())
       : db.prepare('SELECT * FROM users WHERE username = ?').get(login);
-    if (row && row.email && row.email_verified && !row.is_bot) {
-      rateLimit('forgotuser:' + row.id, 3, 3600000);
+    if (row && row.email && row.email_verified && !row.is_bot && !row.deleted_at && countHit('forgotuser:' + row.id, 3600000) <= 3) {
       const raw = newToken(row.id, 'reset', {}, 30 * 60000);
       const link = `${mailCfg().publicUrl}/#reset=${raw}`;
       sendMail({ to: row.email, subject: `${brandName()}: reset your password`, text:
@@ -292,46 +333,70 @@ module.exports = function setupAccounts(ctx) {
         + (row.enc_private_key_recovery ? 'Have your recovery key ready: with it, all your old messages stay readable.\n\n' : 'Without a recovery key, your old direct messages won\'t be readable after the reset.\n\n')
         + 'If you didn\'t ask for this, ignore this email: your password stays the same.' }).catch(() => {});
       secEvent('reset_requested', cleanIp(req.ip), row.username);
+      auditLog(req, 'password_reset_requested', row.id, row.username, null);
     }
     res.json({ ok: true });
   }));
+  // Keeping your keys through a reset needs proof that you really have your private key back (from the
+  // recovery key): the server makes a one-off key pair, and the app answers with an HMAC keyed by the ECDH
+  // secret between that and your identity key. Someone who only got into your email can't answer it, so they
+  // can't quietly take over the account while your contacts keep trusting your old keys.
+  const proofKey = (shared, nonce, uid) => crypto.createHmac('sha256', shared).update(`hearth-reset-proof|${uid}|${nonce}`).digest('base64');
   api.post('/auth/reset/info', (req, res) => {
-    rateLimit('resetinfo:' + req.ip, 20, 15 * 60000);
+    limitNet(req, 'resetinfo', 20, 15 * 60000);
     const t = findToken((req.body || {}).token, 'reset');
     if (!t) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
     const row = getUserRow(t.user_id);
-    res.json({ username: row.username, hasRecovery: !!row.enc_private_key_recovery, recoverySalt: row.recovery_salt || null, encPrivateKeyRecovery: row.enc_private_key_recovery || null, need2fa: !!row.totp_enabled });
+    const eph = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const nonce = crypto.randomBytes(24).toString('base64url');
+    db.prepare('UPDATE auth_tokens SET data = ? WHERE id = ?').run(JSON.stringify({ ...JSON.parse(t.data || '{}'), proof: { priv: seal({ k: eph.privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64') }), nonce } }), t.id);
+    res.json({ username: row.username, userId: row.id, hasRecovery: !!row.enc_private_key_recovery, recoverySalt: row.recovery_salt || null, encPrivateKeyRecovery: row.enc_private_key_recovery || null, need2fa: !!row.totp_enabled,
+      keyChallenge: { serverPublicKey: eph.publicKey.export({ type: 'spki', format: 'der' }).toString('base64'), nonce } });
   });
+  function keyProofOk(t, row, proof) {
+    try {
+      const p = JSON.parse(t.data || '{}').proof;
+      if (!p || typeof proof !== 'string') return false;
+      const priv = crypto.createPrivateKey({ key: Buffer.from(unseal(p.priv).k, 'base64'), format: 'der', type: 'pkcs8' });
+      const pub = crypto.createPublicKey({ key: Buffer.from(row.public_key, 'base64'), format: 'der', type: 'spki' });
+      return safeEq(proofKey(crypto.diffieHellman({ privateKey: priv, publicKey: pub }), p.nonce, row.id), proof);
+    } catch { return false; }
+  }
   api.post('/auth/reset', wrap(async (req, res) => {
-    rateLimit('reset:' + req.ip, 10, 15 * 60000);
+    limitNet(req, 'reset', 10, 15 * 60000);
     const b = req.body || {};
     const t = findToken(b.token, 'reset');
     if (!t) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
+    rateLimit('resetuser:' + t.user_id, 10, 15 * 60000);
     const row = getUserRow(t.user_id);
-    require2fa(row, b);
-    if (!/^[0-9a-f]{64}$/.test(b.authKey || '') || !isB64ish(b.encPrivateKey, 4000) || !isSalt(b.kdfSalt)) fail(400, 'Bad key material.');
-    const keep = !!b.keepKeys && !!row.enc_private_key_recovery;
+    if (!row || row.deleted_at) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
+    if (typeof b.authKey !== 'string' || !/^[0-9a-f]{64}$/.test(b.authKey) || !isB64ish(b.encPrivateKey, 4000) || !isSalt(b.kdfSalt)) fail(400, 'Bad key material.');
+    const keep = b.keepKeys === true;
+    if (keep && !row.enc_private_key_recovery) fail(400, 'This account has no recovery key, so its keys can’t be kept.');
+    if (keep && !keyProofOk(t, row, b.keyProof)) { secEvent('reset_bad_proof', req.ip, row.username); fail(403, 'That didn’t prove the recovery key. Open the link again and re-enter it.', 'bad_key_proof'); }
     if (!keep && !isB64ish(b.publicKey, 2000)) fail(400, 'Bad key material.');
+    require2fa(row, b, req);
+    // Use up the link now, before the slow password hashing: two requests racing with the same link can't both win.
+    if (db.prepare('DELETE FROM auth_tokens WHERE id = ?').run(t.id).changes !== 1) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
     const hash = await bcrypt.hash(b.authKey, 11);
     const servers = db.prepare('SELECT server_id FROM members WHERE user_id = ?').all(row.id).map((m) => m.server_id);
     db.transaction(() => {
       db.prepare("UPDATE users SET auth_hash = ?, kdf = 'argon2id', kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(hash, b.kdfSalt, b.encPrivateKey, row.id);
       if (!keep) {
         // New keys: the old ones are gone for good. Friends' apps see the change (and say so), and re-share
-        // every server's current key with the new one.
+        // every server's current key with the new one once someone verifies it.
         db.prepare('UPDATE users SET public_key = ?, sign_public_key = NULL, enc_sign_private_key = NULL, enc_private_key_recovery = NULL, recovery_salt = NULL WHERE id = ?').run(b.publicKey, row.id);
         db.prepare('DELETE FROM server_keys WHERE user_id = ?').run(row.id);
       }
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
       db.prepare("DELETE FROM auth_tokens WHERE user_id = ? AND kind = 'reset'").run(row.id);
     })();
+    revokeSessions(row.id, { reason: 'password_reset' });
     // New public key first, then "please share": members must already know the new key when they re-share.
     broadcastUser(row.id);
     if (!keep) servers.forEach((sid) => emitKeyState(sid));
-    const token = crypto.randomBytes(32).toString('hex');
-    db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(tokenId(token), row.id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
-    recordIp(row.id, req.ip, token);
+    const token = createSession(req, row.id, { mfa: !!row.totp_enabled });
     secEvent('password_reset', cleanIp(req.ip), `${row.username}${keep ? ' (kept keys)' : ' (new keys)'}`);
+    auditLog(req, keep ? 'password_reset_kept_keys' : 'password_reset_new_keys', row.id, row.username, row.id);
     sendMail({ to: row.email, subject: `${brandName()}: your password was changed`, text: `The password for ${row.username} on ${brandName()} was just reset, and every device was signed out.\n\nIf this wasn't you, reset it again right away and tell the server owner.` }).catch(() => {});
     const fresh = getUserRow(row.id);
     res.json({ token, user: selfUser(fresh), encPrivateKey: fresh.enc_private_key });
@@ -339,5 +404,5 @@ module.exports = function setupAccounts(ctx) {
 
   // What selfUser() adds about these settings (only ever sent to the account itself).
   const selfExtras = (row) => ({ email: row.email || null, emailVerified: !!row.email_verified, emailMasked: mask(row.email), hasRecovery: !!row.enc_private_key_recovery, totpEnabled: !!row.totp_enabled, backupCodesLeft: row.totp_enabled ? JSON.parse(row.backup_codes || '[]').length : 0 });
-  return { require2fa, selfExtras, mailReady, sendMail, mask };
+  return { require2fa, selfExtras, mailReady, sendMail, mask, notify };
 };

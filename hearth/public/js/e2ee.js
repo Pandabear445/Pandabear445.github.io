@@ -165,6 +165,14 @@ export async function unwrapPrivateKey(wrapKey, encPrivateKey) {
   const pkcs8 = await openBytes(wrapKey, encPrivateKey);
   try { return await importEcdhPrivate(pkcs8); } finally { pkcs8.fill(0); }
 }
+// Proves to the server that this device holds the private key for the account's published public key, without
+// revealing it: ECDH with a one-off server key, then an HMAC over a fresh nonce. Used when a password reset
+// keeps the old keys (the server checks it so an email-only attacker can't).
+export async function resetKeyProof(myPriv, serverPublicKeyB64, nonce, userId) {
+  const bits = await subtle().deriveBits({ name: 'ECDH', public: await importEcdhPublic(serverPublicKeyB64) }, myPriv, 256);
+  const mac = await subtle().importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return b64(await subtle().sign('HMAC', mac, enc.encode(`hearth-reset-proof|${userId}|${nonce}`)));
+}
 export async function rewrapPrivateKey(oldWrapKey, newWrapKey, encPrivateKey) {
   const pkcs8 = await openBytes(oldWrapKey, encPrivateKey);
   try { return await sealBytes(newWrapKey, pkcs8); } finally { pkcs8.fill(0); }

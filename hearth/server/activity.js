@@ -285,7 +285,7 @@ module.exports = function setupActivity(ctx) {
     if (e.game && cfg.shareGames) out.game = { id: e.game.id, name: e.game.name, since: e.game.since };
     if (e.music && cfg.shareMusic) {
       const m = e.music;
-      const plat = PLATFORMS[m.platform] || PLATFORMS.other;
+      const plat = (Object.hasOwn(PLATFORMS, m.platform) && PLATFORMS[m.platform]) || PLATFORMS.other;
       out.music = { title: m.title, artist: m.artist, album: m.album, art: m.art, platform: m.platform, platformName: plat.name, url: m.url || (plat.search ? plat.search(`${m.title} ${m.artist}`.trim()) : null), since: m.since };
     }
     return out.game || out.music ? out : null;
@@ -422,7 +422,7 @@ module.exports = function setupActivity(ctx) {
       else if (m.title) {
         const title = clean(m.title, 120); const artist = clean(m.artist, 120);
         checkWords(title, artist);
-        const platform = PLATFORMS[m.platform] ? m.platform : cfgOf(getUserRow(uid)).platform;
+        const platform = Object.hasOwn(PLATFORMS, m.platform) ? m.platform : cfgOf(getUserRow(uid)).platform;
         setMusic(uid, { title, artist, album: clean(m.album, 120), platform, art: await findArt(title, artist), source });
       }
     }
@@ -439,7 +439,7 @@ module.exports = function setupActivity(ctx) {
     const c = cfgOf(row);
     if (b.shareGames !== undefined) c.shareGames = !!b.shareGames;
     if (b.shareMusic !== undefined) c.shareMusic = !!b.shareMusic;
-    if (b.platform !== undefined && PLATFORMS[b.platform]) c.platform = b.platform;
+    if (b.platform !== undefined && Object.hasOwn(PLATFORMS, b.platform)) c.platform = b.platform;
     if (b.clearRecent) c.recent = [];
     if (b.lastfm !== undefined) {
       const name = String(b.lastfm || '').trim().slice(0, 40);

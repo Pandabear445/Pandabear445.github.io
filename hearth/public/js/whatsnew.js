@@ -1,6 +1,12 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.21.0', items: [
+    'Settings → Sessions shows every device signed in to your account (device, IP address, last active). Sign one out, or all the others at once.',
+    'Changing your password, email or recovery key now asks for your two-factor code too (when it’s on), and you get an email whenever something important changes.',
+    'You can delete your account in Settings → Security & storage.',
+    'Behind the scenes: tougher limits against password guessing, a tamper-proof audit log for admins, encrypted backups that are test-restored every day, and an automated attacker that checks every part of the server on each update.',
+  ] },
   { version: '1.20.0', items: [
     'Forgot your password? Add an email in Settings → My Account and you can reset it from the sign-in screen. Save your recovery key there too, so a reset keeps all your old messages.',
     'Two-factor sign-in with an authenticator app, plus backup codes (Settings → My Account).',

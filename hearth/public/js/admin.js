@@ -49,7 +49,7 @@ const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => 
   h('span', { class: 'adm-user-text' }, h('strong', null, b ? b.displayName : 'Deleted user'), h('span', null, b ? '@' + b.username : '')),
   b && b.suspended ? h('span', { class: 'badge-tag bad' }, 'Suspended') : null, b ? roleTag(b.role) : null);
 
-export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin' } = {}) {
+export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin', confirm = null } = {}) {
   const myRank = RANK[role] || 0;
   const tabs = TABS.filter((t) => myRank >= t[3]);
   if (!tabs.some((t) => t[0] === tab)) tab = 'overview';
@@ -585,22 +585,48 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         act.rawgKeySet ? h('button', { class: 'btn ghost sm', onclick: () => saveKeys({ rawgKey: '' }) }, 'Remove RAWG key') : null),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Backups')),
-      h('p', { class: 'field-hint' }, 'A copy of the database (accounts, servers, encrypted messages) while everything keeps running. Pictures and files live in data/uploads; your VPS snapshots cover those. Keep downloaded backups somewhere safe: they contain everyone\u2019s encrypted data.'),
+      h('p', { class: 'field-hint' }, 'Encrypted backups hold everything needed to bring this server back on a new machine: the database, its keys and every uploaded file, locked with the backup key. Each one is test-restored right after it’s made. Plain database copies (for undoing an update) stay on the server and can’t be downloaded.'),
       h('div', { class: 'row gap wrap' },
-        h('button', { class: 'btn primary', onclick: async (e) => { e.currentTarget.disabled = true; try { await api('POST', '/admin/backups'); toast('Backup made.'); owner(); } catch (x) { toast(x.message, 'error'); e.currentTarget.disabled = false; } } }, 'Back up now'),
+        h('button', { class: 'btn primary', onclick: async (e) => {
+          const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Backing up…';
+          try { const r = await api('POST', '/admin/backups'); toast(r.verified && r.verified.ok ? 'Backup made and restore-tested.' : `Backup made, but its restore test FAILED: ${(r.verified || {}).error || ''}`, r.verified && r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); btn.disabled = false; btn.textContent = 'Back up now'; }
+        } }, 'Back up now'),
         h('label', { class: 'row gap tight' }, h('input', { type: 'checkbox', checked: o.autoBackup.enabled, onchange: (e) => save({ autoBackup: { enabled: e.target.checked, keep: keep.value } }) }), 'Automatic daily backup, keep'),
-        keep, h('button', { class: 'btn ghost sm', onclick: () => save({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save')),
-      o.backups.length ? h('div', { class: 'adm-table' }, ...o.backups.map((b) => h('div', { class: 'adm-row' }, h('span', { class: 'mono-sm' }, b.name), h('span', { class: 'stat-sub' }, fmtSize(b.size)), h('span', { class: 'stat-sub' }, ago(b.at)),
+        keep, h('button', { class: 'btn ghost sm', onclick: () => save({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save'),
+        o.keyFrom === 'file' && confirm ? h('button', { class: 'btn ghost sm', onclick: async () => {
+          try {
+            const r = await confirm((x) => api('POST', '/admin/backups/key', x), { title: 'Show the backup key', text: 'Save it in a password manager. Without it, no backup can be restored (for example if this server is lost).' });
+            if (!r) return;
+            modal({ title: 'Backup key', size: 'md', body: h('div', { class: 'stack' }, h('div', { class: 'cmd-box secret-box' }, h('code', null, r.key)),
+              h('button', { class: 'btn', onclick: () => copyText(r.key) }, icon('copy'), 'Copy'),
+              h('p', { class: 'field-hint' }, 'Restore on a new machine: node server/cli.js restore <backup.hbk> <new-data-folder> <this key>. Never keep this key in the same place as the backups.')) });
+          } catch (x) { if (!x.cancelled) toast(x.message, 'error'); }
+        } }, 'Show backup key') : null),
+      h('p', { class: 'field-hint' }, o.offsite ? `Off-site copies go to ${o.offsite} (rclone).` : 'Off-site copies are off. Set BACKUP_RCLONE_REMOTE in .env (for example b2:my-bucket/hearth) to copy every backup to another provider automatically.'),
+      o.encrypted.length ? h('div', { class: 'adm-table' }, ...o.encrypted.map((b) => h('div', { class: 'adm-row' }, h('span', { class: 'mono-sm' }, b.name), h('span', { class: 'stat-sub' }, fmtSize(b.size)), h('span', { class: 'stat-sub' }, ago(b.at)),
+        h('span', { class: b.verified && b.verified.ok ? 'rpill ok' : 'rpill' }, b.verified ? (b.verified.ok ? `restore test passed ${ago(b.verified.at)}` : `restore test FAILED: ${b.verified.error}`) : 'not tested'),
+        b.offsite ? h('span', { class: 'stat-sub' }, b.offsite.ok ? 'off-site ✓' : `off-site failed: ${b.offsite.error}`) : h('span'),
+        h('button', { class: 'btn ghost sm', onclick: async () => { try { const r = await api('POST', `/admin/backups/${encodeURIComponent(b.name)}/verify`); toast(r.verified.ok ? `Restore test passed: ${r.verified.users} accounts, ${r.verified.messages} messages, ${r.verified.files} files.` : `Restore test FAILED: ${r.verified.error}`, r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); } } }, 'Test restore'),
         h('button', { class: 'btn ghost sm', onclick: () => download(b) }, 'Download'),
-        h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: 'Delete this backup?', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`); owner(); } } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No backups yet.'));
+        h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: 'Delete this backup?', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`); owner(); } } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No encrypted backups yet.'),
+      o.backups.length ? h('p', { class: 'field-hint' }, `${o.backups.length} plain database cop${o.backups.length === 1 ? 'y' : 'ies'} on the server for undoing updates (newest ${ago(o.backups[0].at)}).`) : null);
   }
 
   async function log() {
-    const list = await api('GET', '/admin/log');
-    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Audit log'), h('span', { class: 'field-hint' }, 'Every admin action, newest first')),
-      h('div', { class: 'adm-table' }, ...list.map((l) => h('div', { class: 'adm-row log' },
-        h('span', { class: 'stat-sub' }, fmtStamp(l.created_at)), userCell(l.admin), h('strong', null, l.action.replace(/_/g, ' ')),
-        h('span', { class: 'stat-sub' }, [l.target, l.detail].filter(Boolean).join(' \u2014 ')), h('span', null, l.ip ? ipChip(l.ip) : '')))));
+    const [list, chain] = await Promise.all([api('GET', '/admin/log'), api('GET', '/admin/log/verify').catch(() => null)]);
+    const table = h('div', { class: 'adm-table' });
+    const addRows = (rows) => table.append(...rows.map((l) => h('div', { class: 'adm-row log' },
+      h('span', { class: 'stat-sub' }, fmtStamp(l.created_at)), l.admin ? userCell(l.admin) : h('span', { class: 'stat-sub' }, 'server'), h('strong', null, l.action.replace(/_/g, ' ')),
+      h('span', { class: 'stat-sub' }, [l.targetUser ? `@${l.targetUser.username}` : l.target, l.detail].filter(Boolean).join(' \u2014 ')), h('span', null, l.ip ? ipChip(l.ip) : ''))));
+    addRows(list);
+    let oldest = list.length ? list[list.length - 1].id : 0;
+    const more = h('button', { class: 'btn ghost sm', hidden: list.length < 200, onclick: async () => {
+      const next = await api('GET', `/admin/log?before=${oldest}`); addRows(next); if (next.length) oldest = next[next.length - 1].id; more.hidden = next.length < 200;
+    } }, 'Older entries');
+    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Audit log'), h('span', { class: 'field-hint' }, 'Staff actions and account security events, newest first. Entries can\u2019t be edited or deleted.')),
+      chain ? (chain.ok ? h('div', { class: 'chain-ok' }, icon('check'), `Tamper check passed: all ${chain.entries} entries are intact and in order.`)
+        : h('div', { class: 'chain-bad' }, icon('shield'), `Tamper check FAILED at entry #${chain.brokenAt}: the log was changed outside Hearth (someone edited the database file).`)) : '',
+      table, h('div', null, more));
   }
 
   wrap.append(nav, body);

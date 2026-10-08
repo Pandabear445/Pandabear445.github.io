@@ -22,7 +22,7 @@ import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
-import { openSettings, applyAppearance } from './settings.js';
+import { openSettings, applyAppearance, confirmedCall } from './settings.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 
 // ======================================================================= state
@@ -177,6 +177,9 @@ function showAuth() {
   if (!regForm.querySelector('.captcha')) regForm.querySelector('.form-error').before(regCap.el);
   loginForm.addEventListener('focusin', () => loginCap.start());
   regForm.addEventListener('focusin', () => regCap.start());
+  // Why this device was signed out, if it was done from somewhere else.
+  const why = sessionStorage.getItem('hearth.signedOutWhy');
+  if (why) { sessionStorage.removeItem('hearth.signedOutWhy'); loginForm.querySelector('.form-error').textContent = why; }
 
   $('#to-register').onclick = (e) => { e.preventDefault(); loginForm.hidden = true; regForm.hidden = false; };
   $('#to-login').onclick = (e) => { e.preventDefault(); regForm.hidden = true; loginForm.hidden = false; };
@@ -298,6 +301,7 @@ async function openReset(token) {
         try { body.encPrivateKey = await E2EE.rewrapPrivateKey(rk, next.wrapKey, info.encPrivateKeyRecovery); } catch { throw new Error('That recovery key isn\u2019t right.'); }
         privateKey = await E2EE.unwrapPrivateKey(next.wrapKey, body.encPrivateKey);
         body.keepKeys = true;
+        body.keyProof = await E2EE.resetKeyProof(privateKey, info.keyChallenge.serverPublicKey, info.keyChallenge.nonce, info.userId);
       } else {
         const id = await E2EE.createIdentity(next.wrapKey);
         Object.assign(body, { encPrivateKey: id.encPrivateKey, publicKey: id.publicKey });
@@ -403,6 +407,12 @@ function startApp() {
     if (S.restarting) return; // expected: the server is restarting for an update
     if (reason === 'io server disconnect') return logout(); // session was revoked
     $('#conn-banner').hidden = false;
+  });
+  // This device was signed out from somewhere else (Settings → Sessions, a password change or reset, staff).
+  socket.on('session:revoked', ({ reason } = {}) => {
+    const why = { password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on', expired: 'Your sign-in expired', account_deleted: 'This account was deleted' }[reason];
+    sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
+    logout();
   });
   socket.on('server:restarting', () => showUpdating());
   socket.on('server:maintenance', ({ text }) => showUpdating('Down for maintenance', text || 'Back soon.'));
@@ -1493,7 +1503,7 @@ function renderMain() {
   else if (v.type === 'friends') main.append(friendsView());
   else if (v.type === 'saved') main.append(savedView());
   else if (v.type === 'people') main.append(peopleView());
-  else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
+  else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, confirm: (fn, opts) => confirmedCall(app, fn, opts), tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
   else if (v.type === 'channel' || v.type === 'dm') main.append(chatView());
   else if (v.type === 'voice') main.append(voiceRoomView());
   else if (v.type === 'empty-server') {

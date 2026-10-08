@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -179,7 +179,8 @@ addColumn('messages', 'pinned_by', 'TEXT');
 addColumn('dm_messages', 'pinned_at', 'INTEGER');
 addColumn('dm_messages', 'pinned_by', 'TEXT');
 addColumn('sessions', 'ua', 'TEXT');
-addColumn('sessions', 'last_seen', 'INTEGER');
+// (renamed to last_used_at in v13; only added to databases that don't have that yet)
+if (!db.prepare('PRAGMA table_info(sessions)').all().some((c) => c.name === 'last_used_at')) addColumn('sessions', 'last_seen', 'INTEGER');
 addColumn('users', 'privacy', "TEXT NOT NULL DEFAULT '{}'");
 db.exec(`
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, id);
@@ -545,6 +546,55 @@ CREATE TABLE IF NOT EXISTS feed_seen (
 );
 `);
 
+// v13: sessions get a public id, an expiry and a revocation time, and the columns say what they hold.
+//   id            random, shown to the account (Settings → Sessions) to pick a device; not usable to sign in
+//   token_hash    SHA-256 of the sign-in token (the token itself is never stored)
+//   last_used_at  last request; a session unused for SESSION_IDLE_DAYS expires
+//   expires_at    when it stops working even if used (SESSION_MAX_DAYS after sign-in)
+//   revoked_at    signed out (by the person, a password change/reset, 2FA, staff); rows are purged later
+//   mfa_at        when this sign-in passed two-factor (recent → sensitive changes don't ask again)
+{
+  const cols = () => db.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name);
+  if (cols().includes('token')) db.exec('ALTER TABLE sessions RENAME COLUMN token TO token_hash');
+  if (cols().includes('last_seen')) db.exec('ALTER TABLE sessions RENAME COLUMN last_seen TO last_used_at');
+  addColumn('sessions', 'id', 'TEXT');
+  addColumn('sessions', 'expires_at', 'INTEGER');
+  addColumn('sessions', 'revoked_at', 'INTEGER');
+  addColumn('sessions', 'revoke_reason', 'TEXT');
+  addColumn('sessions', 'mfa_at', 'INTEGER');
+  const missing = db.prepare('SELECT rowid, created_at, last_used_at FROM sessions WHERE id IS NULL').all();
+  if (missing.length) {
+    // Existing sessions keep working: a fresh 60-day idle window from the upgrade, at most a year from sign-in.
+    const upd = db.prepare('UPDATE sessions SET id = ?, expires_at = ? WHERE rowid = ?');
+    const t = Date.now();
+    db.transaction(() => { for (const r of missing) upd.run(crypto.randomBytes(12).toString('base64url'), Math.max(t + 60 * 86400000, (r.created_at || t) + 365 * 86400000), r.rowid); })();
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)');
+}
+// v13: accounts can be deleted (the row stays as "Deleted user" so old messages keep an author).
+addColumn('users', 'deleted_at', 'INTEGER');
+
+// v13: the audit log is append-only. The database refuses to change or delete entries, and each entry carries
+// a hash of the one before it, so editing the file by hand to hide something breaks the chain (Admin → Audit
+// log shows whether it's intact).
+addColumn('admin_log', 'prev_hash', 'TEXT');
+addColumn('admin_log', 'hash', 'TEXT');
+const auditHash = (prev, r) => crypto.createHash('sha256').update(JSON.stringify([prev || '', r.id, r.admin_id || '', r.action, r.target || '', r.detail || '', r.ip || '', r.created_at])).digest('hex');
+{
+  const unchained = db.prepare('SELECT * FROM admin_log WHERE hash IS NULL ORDER BY id').all();
+  if (unchained.length) {
+    db.exec('DROP TRIGGER IF EXISTS admin_log_no_update');
+    let prev = (db.prepare('SELECT hash FROM admin_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1').get() || {}).hash || '';
+    const upd = db.prepare('UPDATE admin_log SET prev_hash = ?, hash = ? WHERE id = ?');
+    db.transaction(() => { for (const r of unchained) { const h = auditHash(prev, r); upd.run(prev, h, r.id); prev = h; } })();
+  }
+  db.exec(`
+CREATE TRIGGER IF NOT EXISTS admin_log_no_update BEFORE UPDATE ON admin_log BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS admin_log_no_delete BEFORE DELETE ON admin_log BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
+`);
+}
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
@@ -558,4 +608,4 @@ db.prepare = (sql) => {
   return st;
 };
 
-module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey };
+module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash };

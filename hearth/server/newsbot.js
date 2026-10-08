@@ -243,7 +243,7 @@ module.exports = function setupNewsbot(ctx) {
     const s = requireManager(req.params.id, req.userId);
     rateLimit('feedadd:' + req.userId, 20, 3600000);
     const b = req.body || {};
-    if (!KINDS[b.kind]) fail(400, 'Unknown kind of feed.');
+    if (typeof b.kind !== 'string' || !Object.hasOwn(KINDS, b.kind)) fail(400, 'Unknown kind of feed.');
     const c = db.prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?').get(String(b.channelId || ''), s.id);
     if (!c || c.type !== 'text') fail(400, 'Pick a text channel for the posts.');
     if (db.prepare('SELECT COUNT(*) n FROM feeds WHERE server_id = ?').get(s.id).n >= 25) fail(400, 'Up to 25 feeds per server.');

@@ -1,0 +1,17 @@
+# Secrets and server data, wherever they end up in this repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.db
+*.db-wal
+*.db-shm
+*.hbk
+hearth/data/
+node_modules/
+.DS_Store

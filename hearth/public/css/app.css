@@ -2379,3 +2379,16 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .feed-prev { display: flex; align-items: center; gap: 10px; }
 .feed-prev img, .feed-prev-ph { width: 64px; height: 44px; object-fit: cover; border-radius: 6px; flex: none; background: var(--hover); display: grid; place-items: center; }
 @media (max-width: 600px) { .news-img { display: none; } .adm-row.feed-row { grid-template-columns: 1fr; } }
+
+/* Settings → Active sessions */
+.session-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; background: var(--bg-2, rgb(0 0 0 / .15)); border: 1px solid var(--line); }
+.session-row.ended { opacity: .7; }
+.session-ico { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 50%; background: rgb(0 0 0 / .2); flex: none; }
+.session-row .session-text { flex: 1; min-width: 0; gap: 2px; }
+.session-row .session-text strong { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.session-row .session-text > span { overflow-wrap: anywhere; }
+.sub-title { margin: 6px 0 2px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+/* Admin → Audit log */
+.chain-ok, .chain-bad { padding: 8px 12px; border-radius: 8px; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.chain-ok { background: rgb(35 165 90 / .14); color: #3ba55d; }
+.chain-bad { background: rgb(237 66 69 / .16); color: #ed4245; font-weight: 600; }

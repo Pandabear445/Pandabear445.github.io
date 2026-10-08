@@ -405,13 +405,13 @@ function accountTab(app) {
       const newK = await E2EE.deriveKeys(S.me.username, newPw.value, { kdf: 'argon2id', salt });
       let enc;
       try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, S.encPrivateKey); } catch { throw new Error('Your current password is not right.'); }
-      await api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt });
+      await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }));
       S.encPrivateKey = enc;
       S.me = { ...S.me, kdf: 'argon2id', kdfSalt: salt };
       oldPw.value = ''; newPw.value = ''; confirmPw.value = '';
       toast('Password changed. Other devices were logged out.');
     } catch (e) {
-      msg.textContent = e.message;
+      if (!e.cancelled) msg.textContent = e.message;
     } finally { btn.disabled = false; btn.textContent = 'Change password'; }
   } }, 'Change password');
 
@@ -451,8 +451,26 @@ function accountTab(app) {
       field('Current password', oldPw), field('New password', newPw), field('Confirm new password', confirmPw), msg,
       h('div', null, btn)),
     section('Session',
-      h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device')),
+      h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device'),
+      h('p', { class: 'field-hint' }, 'To see or sign out your other devices, open Sessions.')),
+    section('Delete account',
+      h('p', { class: 'muted-p' }, 'Erases your keys, email, profile, pictures and friends, takes you out of every server, and signs out every device. Messages you sent stay where they are (still encrypted) and show “Deleted user”. This can’t be undone.'),
+      h('div', null, h('button', { class: 'btn danger', onclick: () => deleteAccount(app).catch(quiet) }, 'Delete my account'))),
   );
+}
+async function deleteAccount(app) {
+  const S = app.S;
+  const keys = await askPassword(app, { title: 'Delete your account?', text: 'This can’t be undone. Your old messages can never be read again by anyone, including you.', button: 'Continue' });
+  if (!keys) return;
+  const confirmName = h('input', { class: 'input', autocomplete: 'off', placeholder: S.me.username });
+  modal({ title: 'Type your username to confirm', size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'warn-box' }, `Deleting ${S.me.username} for good.`), field('Username', confirmName)),
+    actions: [{ label: 'Cancel' }, { label: 'Delete forever', kind: 'danger', action: async () => {
+      if (confirmName.value.trim() !== S.me.username) throw new Error('That isn’t your username.');
+      await withCode((x) => api('DELETE', '/me', { authKey: keys.authKey, confirm: S.me.username, ...x }));
+      sessionStorage.setItem('hearth.signedOutWhy', 'Your account was deleted.');
+      app.logout();
+    } }] });
 }
 
 // ------------------------------------------------------------------ account safety: email, recovery key, 2FA
@@ -470,6 +488,32 @@ function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'C
         resolve(keys);
       } }] });
   });
+}
+// Runs a sensitive request. If the server also wants a two-factor code (it does when two-factor is on, unless
+// this device passed it in the last few minutes), asks for one and sends the request again with it.
+function withCode(fn) {
+  return fn({}).catch((e) => {
+    if (e.code !== 'need_2fa') throw e;
+    return new Promise((resolve, reject) => {
+      const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
+      let done = false;
+      modal({ title: 'Enter your two-factor code', size: 'sm', onClose: () => { if (!done) reject(Object.assign(new Error('Cancelled.'), { cancelled: true })); },
+        body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'This change needs a code from your authenticator app (or one of your backup codes).'), field('Code', code)),
+        actions: [{ label: 'Cancel' }, { label: 'Continue', kind: 'primary', action: async () => {
+          const c = code.value.trim().replace(/\s/g, '');
+          const out = await fn(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c });
+          done = true; resolve(out);
+        } }] });
+    });
+  });
+}
+const quiet = (e) => { if (!e || !e.cancelled) toast(e.message, 'error'); };
+// Password (and a two-factor code if needed) for a sensitive request: fn gets { authKey, totp|backupCode }.
+// Resolves to null if the person cancels.
+export async function confirmedCall(app, fn, opts) {
+  const keys = await askPassword(app, opts);
+  if (!keys) return null;
+  return withCode((x) => fn({ authKey: keys.authKey, ...x }));
 }
 function showSecretOnce({ title, intro, secret, filename, note }) {
   return new Promise((resolve) => {
@@ -506,8 +550,7 @@ function securitySections(app) {
       actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        const r = await api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey });
-        setTimeout(() => verifyEmail(r.sentTo), 150);
+        setTimeout(() => withCode((x) => api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey, ...x })).then((r) => verifyEmail(r.sentTo)).catch(quiet), 150);
       } }] });
   };
   const drawEmail = () => {
@@ -515,7 +558,7 @@ function securitySections(app) {
     if (S.me.email) {
       emailBox.append(h('div', { class: 'kv' }, h('span', null, 'Email'), h('strong', null, S.me.email, ' ', h('span', { class: 'rpill ok' }, 'Confirmed'))),
         h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: addEmail }, 'Change'),
-          h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app, { text: 'Without an email you can’t reset a forgotten password.' }); if (!k) return; refresh(await api('DELETE', '/me/email', { authKey: k.authKey })); toast('Email removed.'); } }, 'Remove')));
+          h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app, { text: 'Without an email you can’t reset a forgotten password.' }); if (!k) return; withCode((x) => api('DELETE', '/me/email', { authKey: k.authKey, ...x })).then((u) => { refresh(u); toast('Email removed.'); }).catch(quiet); } }, 'Remove')));
     } else {
       emailBox.append(h('p', { class: 'muted-p' }, 'Add an email so you can reset your password if you ever forget it.'),
         S.config.emailEnabled ? h('div', null, h('button', { class: 'btn primary', onclick: addEmail }, 'Add an email'))
@@ -530,7 +573,7 @@ function securitySections(app) {
     const code = E2EE.newRecoveryCode();
     const salt = E2EE.newKdfSalt();
     const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), S.encPrivateKey);
-    const u = await api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt });
+    const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }));
     await showSecretOnce({ title: `${S.config.name} recovery key for ${S.me.username}`, intro: 'Save this key. If you forget your password, the email reset plus this key brings back everything, including your old messages. It’s shown only now.',
       secret: code, filename: `${S.config.name.replace(/\W+/g, '-')}-recovery-key-${S.me.username}.txt`, note: 'Anyone with this key AND access to your email could get into your account, so keep it private (a password manager is ideal).' });
     refresh(u);
@@ -540,8 +583,8 @@ function securitySections(app) {
     recBox.append(S.me.hasRecovery
       ? h('div', { class: 'kv' }, h('span', null, 'Recovery key'), h('span', { class: 'rpill ok' }, 'Saved'))
       : h('p', { class: 'warn-box' }, 'No recovery key yet. If you forget your password, an email reset gets you back in, but your old direct messages would be lost for good.'),
-    h('div', { class: 'row gap' }, h('button', { class: `btn ${S.me.hasRecovery ? 'sm' : 'primary'}`, onclick: () => makeRecovery().catch((e) => toast(e.message, 'error')) }, S.me.hasRecovery ? 'Make a new one' : 'Create a recovery key'),
-      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app); if (!k) return; refresh(await api('DELETE', '/me/recovery', { authKey: k.authKey })); toast('Recovery key removed.'); } }, 'Remove') : ''));
+    h('div', { class: 'row gap' }, h('button', { class: `btn ${S.me.hasRecovery ? 'sm' : 'primary'}`, onclick: () => makeRecovery().catch(quiet) }, S.me.hasRecovery ? 'Make a new one' : 'Create a recovery key'),
+      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app); if (!k) return; withCode((x) => api('DELETE', '/me/recovery', { authKey: k.authKey, ...x })).then((u) => { refresh(u); toast('Recovery key removed.'); }).catch(quiet); } }, 'Remove') : ''));
   };
   // ---- two-factor
   const tfaBox = h('div', { class: 'stack' });
@@ -1140,29 +1183,62 @@ function chatTab(app) {
 }
 
 // ------------------------------------------------------------------ sessions tab
+// Every device signed in to this account: what it is, its IP address, when it was last used. Any of them can be
+// signed out from here (it's disconnected right away), or all of them except this one.
+const deviceOf = (ua) => {
+  ua = String(ua || '');
+  const app = /Electron\//.test(ua) ? 'Hearth desktop app' : /HearthAndroid|; wv\)/.test(ua) ? 'Hearth Android app' : '';
+  const b = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : ua ? 'Browser' : 'Unknown device';
+  const o = /Windows/.test(ua) ? 'Windows' : /iPhone|iPad/.test(ua) ? 'iOS' : /Mac OS X/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : '';
+  return { name: app || b, os: o, icon: /Android|iPhone|iPad/.test(ua) ? 'phone' : 'monitor' };
+};
+const agoText = (t) => {
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 90) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)} minutes ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} hours ago`;
+  if (s < 86400 * 45) return `${Math.round(s / 86400)} days ago`;
+  return new Date(t).toLocaleDateString();
+};
+const ENDED = { logged_out: 'Logged out', revoked: 'Signed out from another device', password_changed: 'Signed out: password changed', password_reset: 'Signed out: password reset', '2fa_enabled': 'Signed out: two-factor turned on', staff: 'Signed out by a server admin', suspended: 'Signed out: account suspended', expired: 'Expired', signed_out: 'Signed out' };
 function sessionsTab(app) {
   const list = h('div', { class: 'stack' }, h('span', { class: 'spinner' }));
-  const describe = (ua) => {
-    const b = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
-    const o = /Windows/.test(ua) ? 'Windows' : /Mac OS X/.test(ua) && !/iPhone|iPad/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Linux/.test(ua) ? 'Linux' : '';
-    return o ? `${b} on ${o}` : b;
+  const ended = h('div', { class: 'stack' });
+  const othersBtn = h('button', { class: 'btn danger', hidden: true, onclick: () => {
+    modal({ title: 'Log out all other devices?', size: 'sm', body: h('p', { class: 'muted-p' }, 'Every other device is signed out right away and has to sign in again (with your password, and your two-factor code if it’s on). This device stays signed in.'),
+      actions: [{ label: 'Cancel' }, { label: 'Log out others', kind: 'danger', action: async () => { const r = await api('POST', '/me/sessions/revoke-others'); toast(r.count ? `Signed out ${r.count} device${r.count === 1 ? '' : 's'}.` : 'No other devices were signed in.'); load(); } }] });
+  } }, 'Log out all other devices');
+  const row = (x, live) => {
+    const d = deviceOf(x.ua);
+    const bits = [d.os, x.ip ? `IP ${x.ip}` : ''].filter(Boolean).join(' · ');
+    const when = live ? (x.current ? 'This device' : x.online ? 'Online now' : `Last active ${agoText(x.lastUsed)}`) : `${ENDED[x.revokeReason] || 'Ended'} · ${agoText(x.revokedAt || x.lastUsed)}`;
+    return h('div', { class: `session-row${live ? '' : ' ended'}` },
+      h('span', { class: 'session-ico' }, icon(d.icon)),
+      h('span', { class: 'session-text' },
+        h('strong', null, d.name, x.current ? h('span', { class: 'rpill ok' }, 'This device') : ''),
+        h('span', null, bits),
+        h('span', { class: 'field-hint' }, when, live ? ` · signed in ${new Date(x.createdAt).toLocaleDateString()}${x.twoFactor ? ' with two-factor' : ''}` : '')),
+      live && !x.current ? h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
+        try { await api('DELETE', `/me/sessions/${encodeURIComponent(x.id)}`); toast('Signed out of that device.'); load(); } catch (e) { toast(e.message, 'error'); }
+      } }, 'Revoke') : '');
   };
+  let info = h('p', { class: 'field-hint' });
   const load = async () => {
     try {
-      const sessions = await api('GET', '/me/sessions');
-      clear(list);
-      sessions.forEach((x) => list.append(h('div', { class: 'kv session' },
-        h('span', { class: 'session-text' }, h('strong', null, describe(x.ua)), h('span', null, x.current ? 'This device' : `Last active ${new Date(x.lastSeen).toLocaleString()}`)),
-        x.current ? h('span', { class: 'role-tag role-admin' }, 'Current') : h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
-          try { await api('DELETE', `/me/sessions/${x.id}`); toast('Signed out of that device.'); load(); } catch (e) { toast(e.message, 'error'); }
-        } }, 'Sign out'))));
+      const r = await api('GET', '/me/sessions');
+      clear(list).append(...r.active.map((x) => row(x, true)));
+      othersBtn.hidden = r.active.length < 2;
+      clear(ended);
+      if (r.ended.length) ended.append(h('h4', { class: 'sub-title' }, 'Recently signed out'), ...r.ended.map((x) => row(x, false)));
+      info.textContent = `A device that isn’t used for ${r.idleDays} days is signed out automatically, and every sign-in ends after ${r.maxDays} days.`;
     } catch (e) { clear(list).append(h('p', { class: 'form-error' }, e.message)); }
   };
   load();
   return h('div', { class: 'set-form narrow' },
-    h('h2', { class: 'set-title' }, 'Sessions'),
-    h('p', { class: 'muted-p' }, 'Devices signed in to your account. Signing a device out also removes your encryption keys from it.'),
-    section(null, list));
+    h('h2', { class: 'set-title' }, 'Active sessions'),
+    h('p', { class: 'muted-p' }, 'Devices signed in to your account. If you don’t recognise one, revoke it and change your password. Signing a device out also removes your encryption keys from it.'),
+    section(null, list, h('div', null, othersBtn), info),
+    section(null, ended));
 }
 
 // ------------------------------------------------------------------ privacy tab

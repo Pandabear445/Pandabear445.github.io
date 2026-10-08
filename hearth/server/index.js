@@ -9,7 +9,7 @@ const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
-const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey } = require('./db');
+const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash } = require('./db');
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
@@ -43,9 +43,10 @@ const randomCode = (len) => {
 };
 
 class HttpError extends Error {
-  constructor(status, message, code) { super(message); this.status = status; this.code = code; }
+  constructor(status, message, code, retryAfter) { super(message); this.status = status; this.code = code; this.retryAfter = retryAfter; }
 }
-const fail = (status, message, code) => { throw new HttpError(status, message, code); };
+const fail = (status, message, code, retryAfter) => { throw new HttpError(status, message, code, retryAfter); };
+const safeEqual = (a, b) => { const x = Buffer.from(String(a)); const y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 const wrap = (fn) => (req, res, next) => {
   try {
     const out = fn(req, res);
@@ -53,14 +54,44 @@ const wrap = (fn) => (req, res, next) => {
   } catch (e) { next(e); }
 };
 
-// Very small in-memory rate limiter.
+// Small in-memory rate limiter: at most `max` hits per key per window. Sensitive routes check several keys at
+// once (the network it comes from, the account it targets, the session using it, and everyone together), so
+// switching IP addresses doesn't get around the account's limit and one account can't use up another's.
 const buckets = new Map();
 function rateLimit(key, max, windowMs) {
   const t = now();
   let b = buckets.get(key);
   if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
   b.count += 1;
-  if (b.count > max) fail(429, 'Too many attempts. Wait a minute and try again.');
+  if (b.count > max) {
+    const wait = Math.ceil((b.reset - t) / 1000);
+    fail(429, `Too many attempts. Try again in ${wait < 90 ? `${wait} seconds` : `${Math.ceil(wait / 60)} minutes`}.`, 'rate_limited', wait);
+  }
+}
+// Counts a hit without ever refusing it (for limits where refusing would reveal something; check with overLimit).
+function countHit(key, windowMs) {
+  const t = now();
+  let b = buckets.get(key);
+  if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
+  return ++b.count;
+}
+// The "network" an address belongs to for rate limits: the address itself for IPv4, its /64 for IPv6 (a home
+// connection or a VPS usually gets a whole /64, so rotating addresses inside it changes nothing).
+function netOf(ip) {
+  const s = String(ip || '').replace(/^::ffff:/, '');
+  if (!s.includes(':')) return s;
+  const [head, tail = ''] = s.split('::');
+  const a = head ? head.split(':') : []; const b = tail ? tail.split(':') : [];
+  const full = s.includes('::') ? [...a, ...Array(Math.max(0, 8 - a.length - b.length)).fill('0'), ...b] : a;
+  return full.slice(0, 4).map((x) => (parseInt(x, 16) || 0).toString(16)).join(':') + '::/64';
+}
+const limitNet = (req, name, max, windowMs) => rateLimit(`${name}:net:${netOf(req.ip)}`, max, windowMs);
+// Sending messages: per account (bursts and per hour), per session, and per network (many accounts, one place).
+function limitMessages(req) {
+  rateLimit('msg:' + req.userId, 30, 10000);
+  rateLimit('msgh:' + req.userId, 1500, 3600000);
+  if (req.session) rateLimit('msgs:' + req.session.id, 25, 10000);
+  limitNet(req, 'msg', 120, 10000);
 }
 setInterval(() => { const t = now(); for (const [k, b] of buckets) if (b.reset < t) buckets.delete(k); }, 60000).unref();
 
@@ -95,7 +126,8 @@ function publicUser(row) {
     signPublicKey: row.sign_public_key || null,
     supporter: !!row.supporter || undefined,
     bot: !!row.is_bot || undefined,
-    activity: ACT.activityFor(row) || undefined,
+    deleted: !!row.deleted_at || undefined,
+    activity: row.deleted_at ? undefined : ACT.activityFor(row) || undefined,
     recentGames: ACT.recentFor(row),
     createdAt: row.created_at,
   };
@@ -337,22 +369,37 @@ app.use((req, res, next) => {
 });
 // Stripe signs the exact bytes it sends, so keep them for that one route.
 app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
-// Strict browser security policy for the app's own pages. Scripts only from this server (plus WebAssembly
-// for password hashing); no plugins; can't be framed by other sites.
-const CSP = [
-  "default-src 'self'", "script-src 'self' 'wasm-unsafe-eval'", "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+// Strict browser security policy for the app's own pages:
+//   scripts       only files from this server (+ WebAssembly for password hashing) — no inline or injected code
+//   connections   only back to this server (its API and live connection), so a bug can't send data elsewhere
+//   framing       nobody can put Hearth inside their page (clickjacking); no plugins; forms only post here
+//   styles        inline style attributes are allowed (the UI sets colours and sizes that way); CSS can't run code
+//   images/media  any https: source, for link previews and profile songs people choose (and blob: for decrypted files)
+const CSP_BASE = [
+  "default-src 'self'", "script-src 'self' 'wasm-unsafe-eval'", "script-src-attr 'none'", "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' data: https://fonts.gstatic.com", "img-src 'self' data: blob: https:", "media-src 'self' blob: data: https:",
-  "connect-src 'self' ws: wss:", "worker-src 'self' blob:", "frame-src 'self' blob: https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://player.twitch.tv", "object-src 'none'", "base-uri 'self'",
+  "worker-src 'self' blob:", "frame-src 'self' blob: https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://player.twitch.tv", "object-src 'none'", "base-uri 'none'",
   "form-action 'self'", "frame-ancestors 'none'", "manifest-src 'self'",
 ].join('; ');
+// 'self' covers the live connection (wss://) in current browsers; the host is named too for older Safari.
+const cspFor = (req) => {
+  const host = String(req.headers.host || '').toLowerCase();
+  const own = /^[a-z0-9.-]+(:\d{1,5})?$|^\[[0-9a-f:.]+\](:\d{1,5})?$/.test(host) ? ` wss://${host}${req.secure ? '' : ` ws://${host}`}` : '';
+  return `${CSP_BASE}; connect-src 'self'${own}${req.secure ? '; upgrade-insecure-requests' : ''}`;
+};
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Permissions-Policy', 'camera=(self), geolocation=(), payment=(), usb=(), microphone=(self), display-capture=(self), fullscreen=(self)');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Origin-Agent-Cluster', '?1');
+  res.setHeader('Permissions-Policy', 'camera=(self), geolocation=(), payment=(), usb=(), serial=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=(), microphone=(self), display-capture=(self), fullscreen=(self)');
   if (req.secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  if (!req.path.startsWith('/uploads/') && !req.path.startsWith('/media/')) res.setHeader('Content-Security-Policy', CSP);
+  if (!req.path.startsWith('/uploads/') && !req.path.startsWith('/media/')) res.setHeader('Content-Security-Policy', cspFor(req));
+  // API answers are personal: never cached by browsers or proxies, and other sites can't embed them.
+  if (req.path.startsWith('/api/')) { res.setHeader('Cache-Control', 'no-store'); res.setHeader('Cross-Origin-Resource-Policy', 'same-origin'); }
+  if (req.path.startsWith('/uploads/')) res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   next();
 });
 
@@ -435,6 +482,13 @@ const fmtMb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
 function limited(kind, base, field) {
   const perFile = { file: 'fileMb', image: 'imageMb', song: 'songMb' }[kind];
   return (req, res, next) => {
+    // Counted before the file is received, so a flood never reaches the disk.
+    try {
+      rateLimit(`up:user:${req.userId}`, 60, 60000);
+      rateLimit(`up:userh:${req.userId}`, 600, 3600000);
+      rateLimit(`up:session:${req.session.id}`, 40, 60000);
+      limitNet(req, 'up', 150, 60000);
+    } catch (e) { return next(e); }
     const q = quotaOf(req.userId);
     if (q.blocked) return next(new HttpError(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.'));
     const fileCap = q[perFile] * MB + (kind === 'file' ? MB : 0); // encrypted attachments carry a little overhead
@@ -624,7 +678,7 @@ function recordIp(userId, ip, token) {
   ipSeen.set(k, t);
   db.prepare('UPDATE users SET last_ip = ?, last_seen_at = ? WHERE id = ?').run(ip, t, userId);
   db.prepare('INSERT INTO user_ips (user_id, ip, first_seen, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen').run(userId, ip, t, t);
-  if (token) db.prepare('UPDATE sessions SET ip = ? WHERE token = ?').run(ip, tokenId(token));
+  if (token) db.prepare('UPDATE sessions SET ip = ? WHERE token_hash = ?').run(ip, tokenId(token));
 }
 // IP bans: single addresses or IPv4 ranges (CIDR), checked on sign-up, login and live connections.
 const ipBans = () => { try { return JSON.parse(getSetting('ipBans') || '[]'); } catch { return []; } };
@@ -659,18 +713,59 @@ function stillSuspended(row) {
 // Sessions are stored by a SHA-256 fingerprint of the token, never the token itself: someone with a copy of
 // the database (a stolen backup, say) can't use it to sign in as anyone.
 const tokenId = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+// A session ends when it's signed out (revoked), when it hasn't been used for SESSION_IDLE_DAYS (default 60), or
+// SESSION_MAX_DAYS (default 365) after sign-in, whichever comes first. Then the person signs in again.
+const SESSION_IDLE_MS = Math.max(1, +process.env.SESSION_IDLE_DAYS || 60) * 86400000;
+const SESSION_MAX_MS = Math.max(1, +process.env.SESSION_MAX_DAYS || 365) * 86400000;
+const sessionLive = (s, t = Date.now()) => !!s && !s.revoked_at && s.expires_at > t && (s.last_used_at || s.created_at) + SESSION_IDLE_MS > t;
+const tokenFrom = (req) => { const h = String(req.headers.authorization || ''); return h.startsWith('Bearer ') ? h.slice(7).trim() : ''; };
+// The session for a sign-in token, only if it still works. A token is 64 hex characters; anything else
+// (including a token_hash copied out of a stolen database) never matches.
+function sessionFor(token) {
+  if (typeof token !== 'string' || !/^[0-9a-f]{64}$/.test(token)) return null;
+  const s = db.prepare('SELECT * FROM sessions WHERE token_hash = ?').get(tokenId(token));
+  return sessionLive(s) ? s : null;
+}
+function createSession(req, userId, { mfa = false } = {}) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const t = now();
+  db.prepare(`INSERT INTO sessions (id, token_hash, user_id, created_at, last_used_at, expires_at, ua, ip, mfa_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(crypto.randomBytes(12).toString('base64url'), tokenId(token), userId, t, t, t + SESSION_MAX_MS, String(req.headers['user-agent'] || '').slice(0, 300), cleanIp(req.ip), mfa ? t : null);
+  recordIp(userId, req.ip, token);
+  return token;
+}
+// Signs sessions out: { id } one session, { except } every other one, or all of them. Open app windows using
+// them are disconnected right away (and a sweep every minute catches anything else, like expiry).
+function revokeSessions(userId, { id = null, except = null, reason = 'signed_out' } = {}) {
+  const t = now();
+  const where = id ? 'AND id = ?' : except ? 'AND id != ?' : '';
+  const args = id ? [id] : except ? [except] : [];
+  const ids = db.prepare(`SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL ${where}`).all(userId, ...args).map((r) => r.id);
+  if (!ids.length) return 0;
+  db.prepare(`UPDATE sessions SET revoked_at = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL ${where}`).run(t, reason, userId, ...args);
+  const gone = new Set(ids);
+  if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { if (gone.has(x.data.sid)) { x.emit('session:revoked', { reason }); x.disconnect(true); } })).catch(() => {});
+  return ids.length;
+}
+// Revoked and expired sessions are kept 30 days (so Settings → Sessions can say what happened), then deleted.
+setInterval(() => {
+  const t = now();
+  db.prepare('DELETE FROM sessions WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ? OR COALESCE(last_used_at, created_at) < ?')
+    .run(t - 30 * 86400000, t - 30 * 86400000, t - SESSION_IDLE_MS - 30 * 86400000);
+}, 3600000).unref();
 function auth(req, res, next) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
-  const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(tokenId(token));
-  if (!s) return res.status(401).json({ error: 'Not signed in.' });
-  const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until FROM users WHERE id = ?').get(s.user_id);
-  if (!u) return res.status(401).json({ error: 'Not signed in.' });
+  const token = tokenFrom(req);
+  const s = sessionFor(token);
+  if (!s) return res.status(401).json({ error: 'Not signed in.', code: 'signed_out' });
+  const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
+  if (!u || u.deleted_at) return res.status(401).json({ error: 'Not signed in.', code: 'signed_out' });
   if (stillSuspended(u)) return res.status(403).json({ error: suspendedMsg(u), code: 'suspended' });
   if (maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
   req.userId = s.user_id;
   req.token = token;
-  if (!s.last_seen || Date.now() - s.last_seen > 60000) db.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?').run(Date.now(), tokenId(token));
+  req.session = s;
+  if (!s.last_used_at || Date.now() - s.last_used_at > 60000) db.prepare('UPDATE sessions SET last_used_at = ? WHERE id = ?').run(Date.now(), s.id);
   recordIp(s.user_id, req.ip, token);
   next();
 }
@@ -804,69 +899,144 @@ api.use(['/auth/register', '/auth/login'], (req, res, next) => {
   next();
 });
 api.post('/auth/register', wrap(async (req, res) => {
-  rateLimit('reg:' + req.ip, 5, 60 * 60 * 1000);
+  limitNet(req, 'reg', 5, 60 * 60 * 1000);
+  rateLimit('reg:day:' + netOf(req.ip), 10, 24 * 60 * 60 * 1000);
   rateLimit('reg:all', 120, 60 * 60 * 1000); // slows bot floods across many IPs
   const mode = regMode();
   if (mode === 'closed') fail(403, 'Registration is closed on this server.');
   const { username, authKey, publicKey, encPrivateKey, code, kdfSalt, acceptTos } = req.body || {};
-  if (mode === 'code' && (!regCode() || code !== regCode())) fail(403, 'That registration code is not right.');
+  if (mode === 'code' && (!regCode() || typeof code !== 'string' || !safeEqual(code, regCode()))) fail(403, 'That registration code is not right.');
   const tos = termsInfo();
   if (tos.version && +acceptTos !== tos.version) fail(400, 'Please read and accept the Terms of Service to create an account.');
   verifyCaptcha((req.body || {}).captcha, 'register');
-  if (!USERNAME_RE.test(username || '')) fail(400, 'Usernames are 2–24 characters: letters, numbers, _ and . only.');
-  if (!/^[0-9a-f]{64}$/.test(authKey || '')) fail(400, 'Bad auth key.');
+  if (typeof username !== 'string' || !USERNAME_RE.test(username)) fail(400, 'Usernames are 2–24 characters: letters, numbers, _ and . only.');
+  if (typeof authKey !== 'string' || !/^[0-9a-f]{64}$/.test(authKey)) fail(400, 'Bad auth key.');
   if (!isB64ish(publicKey, 2000) || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
   if (!isSalt(kdfSalt)) fail(400, 'This page is out of date. Reload and try again.');
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) fail(409, 'That username is taken.');
   const id = newId();
   const hash = await bcrypt.hash(authKey, 11);
   const profile = sanitizeProfile({ displayName: username });
-  db.prepare(`INSERT INTO users (id, username, auth_hash, public_key, enc_private_key, profile, created_at, kdf, kdf_salt, tos_version)
-              VALUES (?, ?, ?, ?, ?, ?, ?, 'argon2id', ?, ?)`).run(id, username, hash, publicKey, encPrivateKey, JSON.stringify(profile), now(), kdfSalt, tos.version || null);
-  const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(tokenId(token), id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
-  recordIp(id, req.ip, token);
+  try {
+    db.prepare(`INSERT INTO users (id, username, auth_hash, public_key, enc_private_key, profile, created_at, kdf, kdf_salt, tos_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'argon2id', ?, ?)`).run(id, username, hash, publicKey, encPrivateKey, JSON.stringify(profile), now(), kdfSalt, tos.version || null);
+  } catch (e) {
+    // Two sign-ups for the same name at the same moment: the second one loses.
+    if (String(e.code).startsWith('SQLITE_CONSTRAINT')) fail(409, 'That username is taken.');
+    throw e;
+  }
+  const token = createSession(req, id);
   addSupportFriend(id);
   res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey });
 }));
 
+// Compared against when the username doesn't exist, so a wrong username takes as long as a wrong password
+// (otherwise the response time would tell which accounts exist).
+const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 11);
 api.post('/auth/login', wrap(async (req, res) => {
-  rateLimit('login:' + req.ip, 20, 10 * 60 * 1000);
+  limitNet(req, 'login', 20, 10 * 60 * 1000);
+  rateLimit('login:all', 3000, 10 * 60 * 1000); // password checks are slow on purpose; this keeps a flood from using all the CPU
   const { username, authKey } = req.body || {};
-  const row = typeof username === 'string' && db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  // Per-account limit too, so guessing one person's password from many IPs is slowed down. It doesn't
-  // apply from IPs this account has signed in from before, so nobody can lock a person out by spamming.
+  const name = typeof username === 'string' ? username.slice(0, 40) : '';
+  const row = name ? db.prepare('SELECT * FROM users WHERE username = ?').get(name) : null;
+  // Per-account limits too, so guessing one person's password from many IPs is slowed down. The short one
+  // doesn't apply from networks this account has signed in from before, so nobody can lock a person out of
+  // their usual devices by spamming; the daily one counts every network.
   const knownIp = row && db.prepare('SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?').get(row.id, cleanIp(req.ip));
-  if (!knownIp) rateLimit('loginuser:' + String(username || '').toLowerCase().slice(0, 40), 10, 15 * 60 * 1000);
+  if (!knownIp) rateLimit('loginuser:' + name.toLowerCase(), 10, 15 * 60 * 1000);
+  rateLimit('loginuser:day:' + name.toLowerCase(), 100, 24 * 60 * 60 * 1000);
   verifyCaptcha((req.body || {}).captcha, 'login');
-  const ok = row && typeof authKey === 'string' && await bcrypt.compare(authKey, row.auth_hash);
-  if (!ok) { noteAuthFailure(req.ip); secEvent('failed_login', req.ip, String(username || '').slice(0, 40)); fail(401, 'Wrong username or password.'); }
+  const key = typeof authKey === 'string' ? authKey.slice(0, 128) : '';
+  const ok = await bcrypt.compare(key, row ? row.auth_hash : DUMMY_HASH);
+  if (!ok || !row || row.is_bot || row.deleted_at) { noteAuthFailure(req.ip); secEvent('failed_login', req.ip, name); fail(401, 'Wrong username or password.'); }
   if (maintenance() && !isStaff(row.id)) fail(503, maintenance(), 'maintenance');
   if (stillSuspended(row)) fail(403, suspendedMsg(row), 'suspended');
-  if (row.is_bot) fail(401, 'Wrong username or password.');
   // Two-factor sign-in: the right password isn't enough on its own.
-  ACCT.require2fa(row, req.body);
-  const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(tokenId(token), row.id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
-  recordIp(row.id, req.ip, token);
+  ACCT.require2fa(row, req.body, req);
+  const token = createSession(req, row.id, { mfa: !!row.totp_enabled });
   res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key });
 }));
 
 api.post('/auth/logout', auth, (req, res) => {
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(tokenId(req.token));
+  revokeSessions(req.userId, { id: req.session.id, reason: 'logged_out' });
   res.json({ ok: true });
 });
 
+// "Is it really you?" before sensitive changes: the current password, plus a two-factor code when it's on
+// (unless this session passed two-factor in the last 10 minutes, e.g. you just signed in).
+async function stepUp(req, body, authKeyField = 'authKey') {
+  const row = getUserRow(req.userId);
+  const b = body || {};
+  rateLimit('stepup:' + req.userId, 10, 10 * 60 * 1000);
+  const key = b[authKeyField];
+  if (typeof key !== 'string' || !(await bcrypt.compare(key.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
+  if (row.totp_enabled && !(req.session.mfa_at && now() - req.session.mfa_at < 10 * 60000)) {
+    ACCT.require2fa(row, b, req);
+    db.prepare('UPDATE sessions SET mfa_at = ? WHERE id = ?').run(now(), req.session.id);
+  }
+  return row;
+}
+
 api.post('/me/password', auth, wrap(async (req, res) => {
   rateLimit('pw:' + req.userId, 10, 10 * 60 * 1000);
-  const { oldAuthKey, newAuthKey, encPrivateKey, salt, keepSessions } = req.body || {};
-  const row = getUserRow(req.userId);
-  if (!(await bcrypt.compare(oldAuthKey || '', row.auth_hash))) fail(401, 'Your current password is not right.');
-  if (!/^[0-9a-f]{64}$/.test(newAuthKey || '') || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
+  const { newAuthKey, encPrivateKey, salt, keepSessions } = req.body || {};
+  const row = await stepUp(req, req.body, 'oldAuthKey');
+  if (typeof newAuthKey !== 'string' || !/^[0-9a-f]{64}$/.test(newAuthKey) || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
   if (!isSalt(salt)) fail(400, 'This page is out of date. Reload and try again.');
   db.prepare(`UPDATE users SET auth_hash = ?, enc_private_key = ?, kdf = 'argon2id', kdf_salt = ? WHERE id = ?`)
     .run(await bcrypt.hash(newAuthKey, 11), encPrivateKey, salt, req.userId);
-  if (!keepSessions) db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.userId, tokenId(req.token));
+  // Every other device is signed out — except for the automatic hashing upgrade at sign-in (same password).
+  const kept = keepSessions === true && row.kdf !== 'argon2id';
+  if (!kept) revokeSessions(req.userId, { except: req.session.id, reason: 'password_changed' });
+  if (!kept) {
+    auditLog(req, 'password_changed', req.userId, row.username);
+    ACCT.notify(row, 'your password was changed', `The password for ${row.username} was just changed, and every other device was signed out.`);
+  }
+  res.json({ ok: true });
+}));
+
+// Deleting your account. Needs your password (and a two-factor code when it's on). What happens:
+//   - you're signed out everywhere, and the account can never sign in again; the username is freed
+//   - your keys, email, two-factor, recovery key, profile, pictures, friends, blocks and push devices are erased
+//   - you leave every server and group (the others switch to a new server key, as when anyone leaves)
+//   - messages you sent stay where they are (still end-to-end encrypted) and show "Deleted user"
+// Owners first hand over or delete their servers; the instance owner first hands over ownership.
+api.delete('/me', auth, wrap(async (req, res) => {
+  rateLimit('deleteme:' + req.userId, 5, 60 * 60 * 1000);
+  const row = await stepUp(req, req.body);
+  if ((req.body || {}).confirm !== row.username) fail(400, 'Type your username to confirm.', 'confirm');
+  if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
+  const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
+  if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
+  revokeSessions(row.id, { reason: 'account_deleted' });
+  for (const m of db.prepare('SELECT s.id, s.kind, s.owner_id FROM members m JOIN servers s ON s.id = m.server_id WHERE m.user_id = ?').all(row.id)) {
+    if (m.kind === 'group' && m.owner_id === row.id) {
+      const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(m.id, row.id);
+      if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, m.id);
+    }
+    removeMember(m.id, row.id);
+    if (m.kind === 'group' && !db.prepare('SELECT 1 FROM members WHERE server_id = ?').get(m.id)) db.prepare('DELETE FROM servers WHERE id = ?').run(m.id);
+    else emitServer(m.id);
+  }
+  const files = [row.avatar, row.banner, row.background, row.song, row.page_bg];
+  const friends = db.prepare('SELECT requester_id, addressee_id FROM friendships WHERE requester_id = ? OR addressee_id = ?').all(row.id, row.id);
+  db.transaction(() => {
+    db.prepare(`UPDATE users SET username = ?, auth_hash = '!', public_key = '', enc_private_key = '', sign_public_key = NULL, enc_sign_private_key = NULL,
+      enc_private_key_recovery = NULL, recovery_salt = NULL, email = NULL, email_verified = 0, totp_enabled = 0, totp_secret = NULL, backup_codes = '[]',
+      avatar = NULL, banner = NULL, background = NULL, song = NULL, page = NULL, page_bg = NULL, profile = ?, status = 'offline', activity_cfg = '{}',
+      last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
+      .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
+    for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    const roles = staffRoles();
+    if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
+  })();
+  files.forEach((f) => removeUpload(f));
+  friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
+  broadcastUser(row.id);
+  io.in(`user:${row.id}`).disconnectSockets(true);
+  auditLog(req, 'account_deleted', row.id, row.username);
+  ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
   res.json({ ok: true });
 }));
 
@@ -985,7 +1155,7 @@ api.delete('/me/song', auth, (req, res) => {
   res.json(selfUser(getUserRow(req.userId)));
 });
 api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(req.userId); next(); } catch (e) { next(e); } }, limited('image', uploadImage, 'file'), (req, res) => {
-  const col = MEDIA_KINDS[req.params.kind];
+  const col = Object.hasOwn(MEDIA_KINDS, req.params.kind) ? MEDIA_KINDS[req.params.kind] : null;
   if (!col) fail(404, 'Unknown media type.');
   if (!req.file) fail(400, 'Choose an image.');
   const old = getUserRow(req.userId)[col];
@@ -998,7 +1168,7 @@ api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(re
   res.json(selfUser(getUserRow(req.userId)));
 });
 api.delete('/me/media/:kind', auth, (req, res) => {
-  const col = MEDIA_KINDS[req.params.kind];
+  const col = Object.hasOwn(MEDIA_KINDS, req.params.kind) ? MEDIA_KINDS[req.params.kind] : null;
   if (!col) fail(404, 'Unknown media type.');
   const old = getUserRow(req.userId)[col];
   db.prepare(`UPDATE users SET ${col} = NULL WHERE id = ?`).run(req.userId);
@@ -1171,6 +1341,7 @@ api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   const uid = req.params.uid;
   if (!isMember(s.id, uid)) fail(404, 'That person is not in this server.');
   const myTop = perms.top(s, req.userId);
+  if (uid === s.owner_id && req.userId !== s.owner_id) fail(403, 'Only the owner can change the owner\u2019s roles.');
   if (uid !== req.userId && uid !== s.owner_id && perms.top(s, uid) >= myTop) fail(403, 'You can only change roles for people below you.');
   const wanted = new Set((Array.isArray((req.body || {}).roleIds) ? req.body.roleIds : []).map(String));
   const all = db.prepare('SELECT * FROM roles WHERE server_id = ? AND id != ?').all(s.id, s.id);
@@ -1456,7 +1627,7 @@ function withNonce(msg, body) {
 api.post('/channels/:id/messages', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
   if (c.type !== 'text') fail(400, 'You can only send messages in text channels.');
-  rateLimit('msg:' + req.userId, 30, 10000);
+  limitMessages(req);
   const { ciphertext, epoch, files } = req.body || {};
   validCipher(ciphertext);
   const srvRow = serverOf(c);
@@ -1640,7 +1811,7 @@ api.get('/dms/:id/messages', auth, (req, res) => {
 
 api.post('/dms/:id/messages', auth, (req, res) => {
   const d = requireDm(req.params.id, req.userId);
-  rateLimit('msg:' + req.userId, 30, 10000);
+  limitMessages(req);
   if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t message this person.');
   const { ciphertext, files } = req.body || {};
   validCipher(ciphertext);
@@ -1999,19 +2170,44 @@ api.patch('/me/privacy', auth, (req, res) => {
   db.prepare('UPDATE users SET privacy = ? WHERE id = ?').run(JSON.stringify(p), req.userId);
   res.json(p);
 });
-const sessionId = (token) => crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
+// Settings → Sessions: every device signed in (and recently signed out), with where and when it was last used.
+const sessionOut = (r, current) => ({
+  id: r.id, current: r.id === current, createdAt: r.created_at, lastUsed: r.last_used_at || r.created_at, expiresAt: r.expires_at,
+  revokedAt: r.revoked_at || null, revokeReason: r.revoke_reason || null, ua: r.ua || '', ip: r.ip || '', twoFactor: !!r.mfa_at,
+  online: !!r.id && sessionSockets(r.user_id).has(r.id),
+});
+function sessionSockets(uid) {
+  const out = new Set();
+  if (!io) return out;
+  for (const sid of onlineSockets.get(uid) || []) { const sock = io.sockets.sockets.get(sid); if (sock && sock.data.sid) out.add(sock.data.sid); }
+  return out;
+}
 api.get('/me/sessions', auth, (req, res) => {
-  res.json(db.prepare('SELECT token, created_at, last_seen, ua FROM sessions WHERE user_id = ? ORDER BY last_seen DESC').all(req.userId)
-    .map((r) => ({ id: sessionId(r.token), current: r.token === tokenId(req.token), createdAt: r.created_at, lastSeen: r.last_seen || r.created_at, ua: r.ua || '' })));
+  const t = now();
+  const rows = db.prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY COALESCE(revoked_at, 0) ASC, last_used_at DESC LIMIT 100').all(req.userId);
+  res.json({
+    active: rows.filter((r) => sessionLive(r, t)).map((r) => sessionOut(r, req.session.id)),
+    ended: rows.filter((r) => !sessionLive(r, t) && Math.max(r.revoked_at || 0, r.expires_at < t ? r.expires_at : 0, r.last_used_at || 0) > t - 30 * 86400000).slice(0, 20)
+      .map((r) => ({ ...sessionOut(r, req.session.id), revokeReason: r.revoke_reason || 'expired' })),
+    idleDays: Math.round(SESSION_IDLE_MS / 86400000), maxDays: Math.round(SESSION_MAX_MS / 86400000),
+  });
 });
 api.delete('/me/sessions/:id', auth, (req, res) => {
-  const rows = db.prepare('SELECT token FROM sessions WHERE user_id = ?').all(req.userId);
-  const hit = rows.find((r) => sessionId(r.token) === req.params.id);
-  if (!hit) fail(404, 'Session not found.');
-  if (hit.token === tokenId(req.token)) fail(400, 'Use Log out to end this session.');
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(hit.token);
-  io.in(`user:${req.userId}`).fetchSockets().then((socks) => socks.filter((x) => tokenId(x.data.token) === hit.token).forEach((x) => x.disconnect(true))).catch(() => {});
+  rateLimit('sessrevoke:' + req.userId, 60, 60 * 60 * 1000);
+  const id = String(req.params.id);
+  const hit = db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(id, req.userId);
+  if (!hit || !sessionLive(hit)) fail(404, 'Session not found.');
+  if (hit.id === req.session.id) fail(400, 'Use Log out to end this session.');
+  revokeSessions(req.userId, { id: hit.id, reason: 'revoked' });
+  auditLog(req, 'session_revoked', req.userId, (hit.ua || '').slice(0, 120));
   res.json({ ok: true });
+});
+// "Log out all other devices".
+api.post('/me/sessions/revoke-others', auth, (req, res) => {
+  rateLimit('sessrevoke:' + req.userId, 60, 60 * 60 * 1000);
+  const n = revokeSessions(req.userId, { except: req.session.id, reason: 'revoked' });
+  if (n) auditLog(req, 'sessions_revoked_others', req.userId, `${n} device${n === 1 ? '' : 's'}`);
+  res.json({ ok: true, count: n });
 });
 
 // ---------------------------------------------------------------- instance settings + GIPHY
@@ -2058,9 +2254,9 @@ const isStaff = (uid) => staffRank(uid) >= 1;
 function isInstanceAdmin(uid) { return staffRank(uid) >= 2; }
 const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'Only the server administrator can change this.'); };
 // Email, recovery key and two-factor sign-in (server/accounts.js).
-ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, newId, seal, unseal,
-  tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), adminLog: (...a) => adminLog(...a), secEvent: (...a) => secEvent(...a), cleanIp, recordIp,
-  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, DATA_DIR });
+ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
+  tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), requireOutranks: (req, id) => requireOutranks(req, id), auditLog, secEvent: (...a) => secEvent(...a), cleanIp,
+  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions });
 // The key saved in the app wins over .env, so the admin never has to edit files.
 const giphyKey = () => getSetting('giphyKey') || GIPHY_API_KEY;
 const giphyRating = () => (['g', 'pg', 'pg-13', 'r'].includes(getSetting('giphyRating')) ? getSetting('giphyRating') : 'pg-13');
@@ -2530,14 +2726,33 @@ function socketIp(socket) {
   }
   return cleanIp(remote);
 }
-function adminLog(req, action, target, detail = '') {
-  db.prepare('INSERT INTO admin_log (admin_id, action, target, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(req.userId, action, target || null, String(detail).slice(0, 1000), cleanIp(req.ip), now());
+// The audit log: staff actions and security events on accounts (password changes and resets, two-factor,
+// sessions, deletions). Append-only — the database refuses to edit or delete entries (see db.js), and each
+// entry's hash covers the previous one, so a hand-edited database shows up as a broken chain.
+// `req` may be null for things the server does by itself; actorId then says whose account it was.
+function auditLog(req, action, target, detail = '', actorId = undefined) {
+  db.transaction(() => {
+    const last = db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
+    const r = { id: last.id + 1, admin_id: actorId !== undefined ? actorId : (req && req.userId) || null, action, target: target || null, detail: String(detail).slice(0, 1000), ip: req ? cleanIp(req.ip) : null, created_at: now() };
+    db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.id, r.admin_id, r.action, r.target, r.detail, r.ip, r.created_at, last.hash || '', auditHash(last.hash || '', r));
+  })();
+}
+const adminLog = auditLog;
+// Walks the whole chain. Returns { ok, entries, brokenAt }.
+function verifyAuditChain() {
+  let prev = ''; let n = 0;
+  for (const r of db.prepare('SELECT * FROM admin_log ORDER BY id').iterate()) {
+    n++;
+    if ((r.prev_hash || '') !== prev || r.hash !== auditHash(prev, r)) return { ok: false, entries: n, brokenAt: r.id };
+    prev = r.hash;
+  }
+  return { ok: true, entries: n, brokenAt: null };
 }
 function suspendUser(uid, reason, hours = 0) {
   const until = hours > 0 ? now() + hours * 3600000 : null;
   db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ?, suspended_until = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), until, uid);
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
+  revokeSessions(uid, { reason: 'suspended' });
   io.in(`user:${uid}`).disconnectSockets(true);
 }
 const ipsOf = (uid) => db.prepare('SELECT ip, first_seen AS firstSeen, last_seen AS lastSeen FROM user_ips WHERE user_id = ? ORDER BY last_seen DESC LIMIT 20').all(uid);
@@ -2676,7 +2891,7 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     commentsWritten: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE author_id = ?').get(r.id).n,
     notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
       .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
-    sessions: db.prepare('SELECT ua, ip, created_at AS createdAt, last_seen AS lastSeen FROM sessions WHERE user_id = ? ORDER BY last_seen DESC').all(r.id),
+    sessions: db.prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY last_used_at DESC').all(r.id).filter((x) => sessionLive(x)).map((x) => ({ ua: x.ua, ip: x.ip, createdAt: x.created_at, lastSeen: x.last_used_at })),
     servers: db.prepare("SELECT s.name, s.owner_id = ? AS owner FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ? AND s.kind = 'server'").all(r.id, r.id),
     reportsAgainst: db.prepare('SELECT id, category, status, created_at AS createdAt FROM reports WHERE target_id = ? ORDER BY created_at DESC LIMIT 20').all(r.id),
     reportsBy: db.prepare('SELECT COUNT(*) n FROM reports WHERE reporter_id = ?').get(r.id).n,
@@ -2723,7 +2938,7 @@ api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
 });
 api.post('/admin/users/:id/logout', auth, staffOnly, (req, res) => {
   requireOutranks(req, req.params.id);
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
+  revokeSessions(req.params.id, { reason: 'staff' });
   io.in(`user:${req.params.id}`).disconnectSockets(true);
   adminLog(req, 'sign_out_everywhere', req.params.id);
   res.json({ ok: true });
@@ -2870,10 +3085,8 @@ api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
 });
 // Emergency: sign every account out of every device (for example after a leaked password list). Staff stay signed in.
 api.post('/admin/sign-out-all', auth, adminOnly, (req, res) => {
-  const keep = new Set(db.prepare('SELECT DISTINCT user_id FROM sessions').all().map((r) => r.user_id).filter((id) => isStaff(id)));
-  const victims = db.prepare('SELECT DISTINCT user_id FROM sessions').all().map((r) => r.user_id).filter((id) => !keep.has(id));
-  const del = db.prepare('DELETE FROM sessions WHERE user_id = ?');
-  db.transaction(() => victims.forEach((id) => del.run(id)))();
+  const victims = db.prepare('SELECT DISTINCT user_id FROM sessions WHERE revoked_at IS NULL').all().map((r) => r.user_id).filter((id) => !isStaff(id));
+  db.transaction(() => victims.forEach((id) => revokeSessions(id, { reason: 'staff' })))();
   victims.forEach((id) => io.in(`user:${id}`).disconnectSockets(true));
   adminLog(req, 'sign_out_all', null, `${victims.length} accounts`);
   res.json({ ok: true, count: victims.length });
@@ -2903,8 +3116,11 @@ api.get('/admin/security', auth, adminOnly, (req, res) => {
 });
 
 api.get('/admin/log', auth, staffOnly, (req, res) => {
-  res.json(db.prepare('SELECT * FROM admin_log ORDER BY id DESC LIMIT 200').all().map((r) => ({ ...r, admin: brief(r.admin_id) })));
+  const before = Math.floor(+req.query.before) || Number.MAX_SAFE_INTEGER;
+  res.json(db.prepare('SELECT * FROM admin_log WHERE id < ? ORDER BY id DESC LIMIT 200').all(before)
+    .map((r) => ({ ...r, admin: brief(r.admin_id), targetUser: r.target && getUserRow(r.target) ? brief(r.target) : null })));
 });
+api.get('/admin/log/verify', auth, staffOnly, (req, res) => res.json(verifyAuditChain()));
 api.get('/admin/registration', auth, adminOnly, (req, res) => res.json({ mode: regMode(), code: regCode(), captchaLogin: captchaMode('login'), captchaRegister: captchaMode('register') }));
 api.put('/admin/registration', auth, adminOnly, (req, res) => {
   const b = req.body || {};
@@ -3246,7 +3462,7 @@ function health() {
 }
 api.get('/admin/owner', auth, ownerOnly, (req, res) => {
   res.json({ brand: brand(), features: features(), funding: funding(), supporterQuotaMb: +(getSetting('supporterQuotaMb') || 0),
-    supporters: db.prepare('SELECT id FROM users WHERE supporter = 1').all().map((r) => brief(r.id)), backups: listBackups(), autoBackup: autoBackup() });
+    supporters: db.prepare('SELECT id FROM users WHERE supporter = 1').all().map((r) => brief(r.id)), ...backupInfo(), autoBackup: autoBackup() });
 });
 api.put('/admin/owner', auth, ownerOnly, (req, res) => {
   const b = req.body || {};
@@ -3273,50 +3489,116 @@ api.put('/admin/owner', auth, ownerOnly, (req, res) => {
   io.emit('config:update', { name: brand().name, tagline: brand().tagline, features: features(), funding: fundingPublic() });
   res.json({ ok: true });
 });
-// Database backups (copies of hearth.db made while the server runs). Uploaded files live in
-// data/uploads and are best backed up with the VPS's own snapshots.
+// Backups, two kinds:
+//   - database copies in data/backups/*.db (daily, and before every upgrade): for quickly undoing a bad update on
+//     this machine. They never leave the server (not even as a download): they're as sensitive as the database.
+//   - encrypted full backups in data/backups/encrypted/*.hbk (server/backup.js): database + keys + uploads, sealed
+//     with the backup key, restore-tested right after they're made, and copied off-site if BACKUP_RCLONE_REMOTE is set.
+//     These are what you download or keep elsewhere.
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const ENC_DIR = path.join(BACKUP_DIR, 'encrypted');
+const BK = require('./backup');
 const autoBackup = () => { try { return { enabled: true, keep: 7, ...JSON.parse(getSetting('autoBackup') || '{}') }; } catch { return { enabled: true, keep: 7 }; } };
 function listBackups() {
   try {
     return fs.readdirSync(BACKUP_DIR).filter((f) => /^hearth-[\w.-]+\.db$/.test(f)).map((f) => { const st = fs.statSync(path.join(BACKUP_DIR, f)); return { name: f, size: st.size, at: st.mtimeMs }; }).sort((a, b) => b.at - a.at);
   } catch { return []; }
 }
+function listEncBackups() {
+  const status = backupStatus();
+  try {
+    return fs.readdirSync(ENC_DIR).filter((f) => /^hearth-[\w.-]+\.hbk$/.test(f)).map((f) => { const st = fs.statSync(path.join(ENC_DIR, f)); return { name: f, size: st.size, at: st.mtimeMs, ...(status.files[f] || {}) }; }).sort((a, b) => b.at - a.at);
+  } catch { return []; }
+}
+const backupStatus = () => { try { return { files: {}, ...JSON.parse(getSetting('backupStatus') || '{}') }; } catch { return { files: {} }; } };
+const saveBackupStatus = (name, patch) => {
+  const st = backupStatus();
+  st.files[name] = { ...(st.files[name] || {}), ...patch };
+  const keep = new Set(fs.existsSync(ENC_DIR) ? fs.readdirSync(ENC_DIR) : []);
+  for (const k of Object.keys(st.files)) if (!keep.has(k)) delete st.files[k];
+  setSetting('backupStatus', JSON.stringify(st));
+};
 async function makeBackup(kind) {
   fs.mkdirSync(BACKUP_DIR, { recursive: true });
   const name = `hearth-${kind}-${new Date().toISOString().replace(/[:.]/g, '-')}.db`;
   await db.backup(path.join(BACKUP_DIR, name));
   return name;
 }
+let encBusy = null;
+// Make → restore-test → copy off-site. One at a time.
+function makeEncryptedBackup() {
+  if (encBusy) return encBusy;
+  encBusy = (async () => {
+    const b = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: ENC_DIR });
+    let verified;
+    try { verified = { ...(await BK.verifyBackup(b.file, BK.loadKey(DATA_DIR), BACKUP_DIR)), at: now() }; } catch (e) { verified = { ok: false, error: e.message, at: now() }; }
+    saveBackupStatus(b.name, { verified });
+    if (!verified.ok) { console.error(`Encrypted backup ${b.name} FAILED its restore test: ${verified.error}`); auditLog(null, 'backup_restore_test_failed', null, `${b.name}: ${verified.error}`); return { ...b, verified }; }
+    const offsite = await BK.uploadOffsite(b.file);
+    if (!offsite.skipped) {
+      saveBackupStatus(b.name, { offsite: { ...offsite, at: now() } });
+      if (!offsite.ok) { console.error(`Copying ${b.name} off-site failed: ${offsite.error}`); auditLog(null, 'backup_offsite_failed', null, `${b.name}: ${offsite.error}`); }
+    }
+    const a = autoBackup();
+    listEncBackups().slice(Math.max(2, a.keep)).forEach((x) => fs.promises.unlink(path.join(ENC_DIR, x.name)).catch(() => {}));
+    return { ...b, verified, offsite };
+  })().finally(() => { encBusy = null; });
+  return encBusy;
+}
+const backupInfo = () => ({ backups: listBackups(), encrypted: listEncBackups(), offsite: (process.env.BACKUP_RCLONE_REMOTE || '').trim() || null, keyFrom: process.env.BACKUP_KEY ? 'env' : 'file' });
 api.post('/admin/backups', auth, ownerOnly, wrap(async (req, res) => {
   rateLimit('backup:' + req.userId, 6, 3600000);
-  const name = await makeBackup('manual');
-  adminLog(req, 'backup_made', null, name);
-  res.json({ name, backups: listBackups() });
+  const b = await makeEncryptedBackup();
+  auditLog(req, 'backup_made', null, `${b.name}${b.verified && b.verified.ok ? ', restore test passed' : ', RESTORE TEST FAILED'}`);
+  res.json({ name: b.name, verified: b.verified, offsite: b.offsite, ...backupInfo() });
 }));
-api.get('/admin/backups/:name', auth, ownerOnly, (req, res) => {
-  const hit = listBackups().find((b) => b.name === req.params.name);
+api.post('/admin/backups/:name/verify', auth, ownerOnly, wrap(async (req, res) => {
+  rateLimit('backupverify:' + req.userId, 20, 3600000);
+  const hit = listEncBackups().find((b) => b.name === req.params.name);
   if (!hit) fail(404, 'Backup not found.');
-  adminLog(req, 'backup_downloaded', null, hit.name);
-  res.download(path.join(BACKUP_DIR, hit.name), hit.name);
+  let verified;
+  try { verified = { ...(await BK.verifyBackup(path.join(ENC_DIR, hit.name), BK.loadKey(DATA_DIR), BACKUP_DIR)), at: now() }; } catch (e) { verified = { ok: false, error: e.message, at: now() }; }
+  saveBackupStatus(hit.name, { verified });
+  auditLog(req, 'backup_restore_test', null, `${hit.name}: ${verified.ok ? 'passed' : verified.error}`);
+  res.json({ verified, ...backupInfo() });
+}));
+// Only encrypted backups can be downloaded.
+api.get('/admin/backups/:name', auth, ownerOnly, (req, res) => {
+  const hit = listEncBackups().find((b) => b.name === req.params.name);
+  if (!hit) fail(404, 'Backup not found.');
+  auditLog(req, 'backup_downloaded', null, hit.name);
+  res.download(path.join(ENC_DIR, hit.name), hit.name);
 });
 api.delete('/admin/backups/:name', auth, ownerOnly, (req, res) => {
-  const hit = listBackups().find((b) => b.name === req.params.name);
+  const hit = listEncBackups().find((b) => b.name === req.params.name) || listBackups().find((b) => b.name === req.params.name);
   if (!hit) fail(404, 'Backup not found.');
-  fs.unlinkSync(path.join(BACKUP_DIR, hit.name));
-  adminLog(req, 'backup_deleted', null, hit.name);
-  res.json({ backups: listBackups() });
+  fs.unlinkSync(path.join(hit.name.endsWith('.hbk') ? ENC_DIR : BACKUP_DIR, hit.name));
+  auditLog(req, 'backup_deleted', null, hit.name);
+  res.json(backupInfo());
 });
-// A copy of the database every day, keeping the newest few.
+// The backup key, to keep in a password manager. Needs the password (and two-factor) again; always logged.
+api.post('/admin/backups/key', auth, ownerOnly, wrap(async (req, res) => {
+  await stepUp(req, req.body);
+  if (process.env.BACKUP_KEY) fail(400, 'This server’s backup key is BACKUP_KEY in its .env file.');
+  const key = BK.loadKey(DATA_DIR).toString('hex');
+  auditLog(req, 'backup_key_viewed', null, '');
+  res.json({ key });
+}));
+// Every day: a database copy (for quick rollback here) and an encrypted, restore-tested, off-site backup.
 setInterval(async () => {
   const a = autoBackup();
   if (!a.enabled) return;
   const autos = listBackups().filter((b) => b.name.startsWith('hearth-auto-'));
-  if (autos.length && Date.now() - autos[0].at < 23.5 * 3600000) return;
-  try {
-    await makeBackup('auto');
-    listBackups().filter((b) => b.name.startsWith('hearth-auto-')).slice(a.keep).forEach((b) => fs.promises.unlink(path.join(BACKUP_DIR, b.name)).catch(() => {}));
-  } catch (e) { console.error('Automatic backup failed:', e.message); }
+  if (!autos.length || Date.now() - autos[0].at > 23.5 * 3600000) {
+    try {
+      await makeBackup('auto');
+      listBackups().filter((b) => b.name.startsWith('hearth-auto-')).slice(a.keep).forEach((b) => fs.promises.unlink(path.join(BACKUP_DIR, b.name)).catch(() => {}));
+    } catch (e) { console.error('Automatic backup failed:', e.message); }
+  }
+  const enc = listEncBackups();
+  if (!enc.length || Date.now() - enc[0].at > 23.5 * 3600000) {
+    try { await makeEncryptedBackup(); } catch (e) { console.error('Encrypted backup failed:', e.message); auditLog(null, 'backup_failed', null, e.message); }
+  }
 }, 3600000).unref();
 
 // One-time: list files uploaded before storage tracking existed, so quotas count them too.
@@ -3342,9 +3624,14 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
     const msg = err.code === 'LIMIT_FILE_SIZE' ? `Files can be up to ${MAX_UPLOAD_MB} MB.` : err.message;
     return res.status(400).json({ error: msg });
   }
+  // Broken or oversized request bodies (from express.json) are the sender's mistake, not a server error.
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'The request wasn’t valid JSON.', code: 'bad_json' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'That request is too big.', code: 'too_large' });
+  if (err.type && /^(encoding|charset)\./.test(err.type)) return res.status(415).json({ error: 'Unsupported request encoding.' });
   const status = err.status || 500;
   const expected = err instanceof HttpError; // our own, user-facing errors keep their message
   if (!expected) console.error(err);
+  if (expected && err.retryAfter) res.setHeader('Retry-After', String(err.retryAfter));
   res.status(status).json({ error: expected ? err.message : 'Something broke on the server.', code: err.code });
 });
 app.get(/^\/(?!api|uploads|socket\.io).*/, (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
@@ -3462,17 +3749,33 @@ function leaveVoice(userId, notifyUser = false) {
 
 function setupSockets(server) {
   io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 1e6, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
+  // Every minute: an open connection whose session has ended (signed out, expired, account suspended or
+  // deleted) is closed; one that's still fine counts as use, so an app left open never idles out.
+  setInterval(() => {
+    const t = now();
+    const touch = db.prepare('UPDATE sessions SET last_used_at = ? WHERE id = ?');
+    const seen = new Set();
+    for (const sock of io.sockets.sockets.values()) {
+      const s = sock.data.sid && db.prepare('SELECT * FROM sessions WHERE id = ?').get(sock.data.sid);
+      const u = s && db.prepare('SELECT suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
+      if (!sessionLive(s, t) || !u || u.deleted_at || (u.suspended_at && (!u.suspended_until || u.suspended_until > t))) {
+        sock.emit('session:revoked', { reason: s && s.revoke_reason ? s.revoke_reason : 'expired' });
+        sock.disconnect(true);
+      } else if (!seen.has(s.id) && t - (s.last_used_at || 0) > 5 * 60000) { seen.add(s.id); touch.run(t, s.id); }
+    }
+  }, 60000).unref();
 
   io.use((socket, next) => {
     const token = socket.handshake.auth && socket.handshake.auth.token;
-    const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(tokenId(token));
+    const s = sessionFor(token);
     if (!s) return next(new Error('unauthorized'));
-    const u = db.prepare('SELECT id, suspended_at, suspended_until FROM users WHERE id = ?').get(s.user_id);
-    if (!u || stillSuspended(u)) return next(new Error('unauthorized'));
+    const u = db.prepare('SELECT id, suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
+    if (!u || u.deleted_at || stillSuspended(u)) return next(new Error('unauthorized'));
     if (ipBanned(socketIp(socket)) && !isStaff(s.user_id)) { secEvent('blocked_ip', socketIp(socket), 'connection'); return next(new Error('unauthorized')); }
     if (maintenance() && !isStaff(s.user_id)) return next(new Error('maintenance'));
     socket.userId = s.user_id;
     socket.data.token = token;
+    socket.data.sid = s.id;
     socket.data.ip = socketIp(socket);
     socket.data.since = Date.now();
     socket.data.ua = String(socket.handshake.headers['user-agent'] || '').slice(0, 200);

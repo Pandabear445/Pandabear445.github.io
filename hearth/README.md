@@ -105,16 +105,30 @@ Any small Linux VPS works (1 GB RAM is plenty for a friend group).
    ```
    HTTPS=false
    TRUST_PROXY=1
+   HEARTH_BIND=127.0.0.1
    ```
+   (`HEARTH_BIND` keeps port 3000 off the internet: Docker-published ports go around the server's firewall.)
 5. Start it:
    ```bash
    docker compose --profile domain up -d
    ```
 6. Open `https://chat.example.com`. Caddy gets a real certificate automatically, so there's no warning.
 
-Open ports 80 and 443 in the VPS firewall. Port 3000 doesn't need to be public in this setup; you can remove the `ports` line from the `hearth` service.
+Open ports 80 and 443 in the VPS firewall. Then lock the server down with `sudo bash scripts/harden-vps.sh` (see [Locking down the VPS](#locking-down-the-vps)).
 
-**Without Docker:** install Node 20+, run `npm ci --omit=dev`, use `deploy/hearth.service` for systemd, and install [Caddy](https://caddyserver.com/docs/install) with a Caddyfile that says `reverse_proxy localhost:3000`.
+**Without Docker:** install Node 20+, run `npm ci --omit=dev`, use `deploy/hearth.service` for systemd (it runs Hearth as its own `hearth` user in a sandbox), and install [Caddy](https://caddyserver.com/docs/install) with a Caddyfile that says `reverse_proxy localhost:3000`.
+
+### Locking down the VPS
+
+First run `sudo bash scripts/harden-vps.sh --dry-run` to see what it would do, then `sudo bash scripts/harden-vps.sh`. Add `--yes` for no questions, or `--auto-reboot` to allow restarts at 04:00 after security updates. It:
+
+- switches on the firewall (SSH, 80, 443, and the call relay's ports if installed);
+- turns off SSH password logins, but only if you already log in with a key, so it never locks you out (keep your session open and test a new login);
+- sets up fail2ban for SSH and automatic security updates;
+- moves a root-run systemd Hearth to the sandboxed `hearth` user, putting the old service back automatically if Hearth doesn't answer;
+- lists anything else reachable from the internet.
+
+It's safe to run again any time. If your VPS provider has its own firewall, open the same ports there. The full threat model and what each protection guarantees are in [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -173,6 +187,19 @@ docker compose up -d --build   # rebuild after updating the files
 
 Everything is stored in `./data`. Requires Docker Compose 2.24 or newer.
 
+**Hardened by default.**
+
+- **Runs unprivileged**: Hearth's container runs as an unprivileged user (uid 1000) on a read-only filesystem, with no Linux capabilities and no way to gain any. Only `./data` and a small `/tmp` are writable, and logs are rotated.
+- **Fixes old file ownership**: on start, a tiny one-shot helper (`hearth-perms`) hands `./data` to uid 1000, because older versions wrote it as root.
+- **No direct internet exposure with a domain**: set `HEARTH_BIND=127.0.0.1` in `.env`; Caddy reaches Hearth over an internal network.
+
+**Upgrading an existing Docker install:** the update tool never replaces your `docker-compose.yml`.
+
+- Updates keep working with the old file: the new image fixes `./data` and drops root by itself.
+- To get all the protections, first save your file: `cp docker-compose.yml docker-compose.yml.old`.
+- Copy in the new `docker-compose.yml` and re-add your own changes.
+- Then run `docker compose up -d --build` (with a domain: `docker compose --profile domain up -d --build`).
+
 ---
 
 ## Admin dashboard, reports and safety
@@ -184,7 +211,7 @@ The first account created on the server (or anyone listed in `ADMIN_USERS`) sees
 - **Reports:** what was reported, the messages the reporter shared, the reported account's IP addresses, and buttons to suspend the account, delete the message, resolve or dismiss. You get a live notification when a report comes in.
 - **Users:** search by name or IP; see IP history, signed-in devices and reports; suspend (signs them out everywhere at once, and they see your reason when they try to log in) or sign them out everywhere.
 - **Registration & Terms:** switch sign-ups between open, invite-code only and closed in one click (handy during a spam wave), and edit your Terms of Service (everyone is asked to accept changes).
-- **Audit log:** every admin action, who did it and from which IP.
+- **Audit log:** every staff action and account security event (password changes and resets, two-factor on/off, sessions signed out, deleted accounts, backups), who did it and from which IP. It's append-only: nobody can edit or delete entries, and the page checks a hash chain, so it shows if someone edited the database file by hand.
 - **Storage & limits:** set the largest file, picture and profile song, a storage limit per person and a daily upload limit (all optional). See total use, today's uploads, free disk space and who uses the most; give one person a bigger (or smaller) limit, turn off someone's uploads, lock someone's profile, delete everything someone uploaded or all their profile comments. People see their own usage under Settings → Security & storage. Admins and the owner aren't held to quotas.
 - **Word filter:** words and phrases that can't be used in names, bios, profile pages and profile comments (chats are end-to-end encrypted, so they can't be filtered).
 - **Team & roles:** three staff levels. The **owner** (you: the first account, or the first name in `ADMIN_USERS`) is the only one who can make people **admins** or **moderators**, change or take away those roles, and hand ownership to someone else (you stay on as an admin). **Admins** get the whole dashboard and Settings → Instance. **Moderators** get reports, users, who's online and the audit log. Staff can only act on people ranked below them, so a moderator can't suspend an admin and nobody can touch the owner. People see the dashboard appear or disappear the moment their role changes.
@@ -195,7 +222,10 @@ The first account created on the server (or anyone listed in `ADMIN_USERS`) sees
 ### Security built in
 - **Captcha on sign-up and login:** a private, self-hosted "I'm not a robot" check (proof of work, like ALTCHA). People's browsers solve a small puzzle — about a fifth of a second on a computer, usually finished before they've typed their password — which makes mass sign-ups and password guessing expensive for bots. Puzzles are signed, single-use and expire after 5 minutes; IPs that keep failing get harder puzzles automatically. No Google/hCaptcha scripts and no tracking. Turn it on or off for login and sign-up in Admin → Registration & Terms.
 - Strict browser security policy (only this server's own scripts can run), clickjacking protection, HSTS on HTTPS, locked-down browser permissions.
-- Login throttling per IP *and* per account (an account's usual IPs are exempt, so nobody can lock someone out by spamming wrong passwords). Sign-ups are limited per IP and overall.
+- Rate limits by network (IPv6 per /64), per account (from any number of IPs) and per session on sign-in, sign-up, password reset, two-factor codes, email codes, messages and uploads. An account's usual IPs are exempt from the short sign-in limit, so nobody can lock someone out by spamming wrong passwords.
+- **Sessions:** every device is listed in Settings → Sessions (device, IP, last active) and can be signed out on its own, or all at once with "Log out all other devices". Sessions also end after 60 days unused or 365 days in total. Signing out, changing the password, a reset and turning on two-factor all cut off the other devices immediately, including open app windows.
+- **Re-confirm before sensitive changes:** changing your password, email or recovery key, turning off two-factor or deleting your account needs your password again, plus a two-factor code if it's on.
+- **Automated attacker:** the test suite (`npm test`, run by GitHub Actions on every push) tries every API route without signing in, with other people's ids, and with hostile input, and checks the rules in [SECURITY.md](SECURITY.md).
 - Live connections are rate-limited; floods are disconnected.
 - Behind Caddy/nginx, real client IPs are detected automatically. Plain-HTTP requests that bypass your proxy from the internet are refused (`ALLOW_DIRECT_HTTP=true` turns that off).
 - Suspended accounts are cut off instantly, including open connections.
@@ -360,6 +390,12 @@ Your browser remembers everyone's keys the first time it sees them. If the serve
   - **With your recovery key** (Settings → My Account → Recovery key, shown once — write it down): you keep everything, including all old messages.
   - **Without it:** you get your account, name, friends and servers back, but with new keys. Old encrypted messages can't be read any more (by anyone), and friends see "Security key changed" on you; once one of them verifies you (click the shield next to your name), you get the server keys again and can read new messages.
 - **Two-factor sign-in** (Settings → My Account → Two-factor sign-in): after your password, sign-in asks for a 6-digit code from an authenticator app (Google Authenticator, Authy, 1Password, Microsoft Authenticator…). You get 10 one-time backup codes. Password resets also need the code. If someone loses their phone and their backup codes, an admin can turn it off for them in Admin → Users.
+- **Deleting your account** (Settings → Security & storage → Delete account, password and two-factor code needed):
+  - erases your keys, email, two-factor, profile, pictures and friends;
+  - takes you out of every server and signs out every device; the username becomes free again;
+  - leaves the messages you sent in place, still encrypted, under "Deleted user".
+
+  Owners hand over or delete their servers first.
 - **Check my encryption** (Settings → My Account) runs every lock on your device — including that tampered, misaddressed and outsider messages are refused — and checks your own keys and every server key, without sending anything.
 - **Logging out removes your keys from that browser.** Log back in to read everything again — your history works on every device you log in from.
 - **New members need someone online.** A member who already has the server's key must be online (any open tab, even in the background) to hand it to a new member. Until then they see "Waiting for the encryption key".
@@ -373,17 +409,23 @@ Your browser remembers everyone's keys the first time it sees them. If the serve
 
 ## Backups
 
-Back up the whole `data/` folder:
+Hearth makes two kinds of backup by itself every day (Admin → Owner → Backups).
 
-- `hearth.db` — accounts, servers, messages
-- `secret.key` — only needed for messages sent before end-to-end encryption was turned on (and keeps the login screen from revealing which usernames exist)
-- `uploads/` — images and files
-- `backups/` — automatic copies made before each database upgrade (safe to delete old ones)
-- `vapid.json` — push notification keys (if lost, everyone has to turn push back on)
-- `downloads/` — installers you publish
-- `cert.pem`, `key.pem` — the self-signed certificate (safe to delete; it's regenerated)
+**Encrypted full backups** (`data/backups/encrypted/*.hbk`)
+- **Contents**: the database, `secret.key`, `vapid.json` and every uploaded file, in one file.
+- **Encrypted** with the backup key, so the file is safe to keep on another provider.
+- **Restore-tested** right after it's made: the backup is decrypted into a scratch folder and the database is checked. "Test restore" repeats this.
+- **Off-site copies**: set `BACKUP_RCLONE_REMOTE` (for example `b2:my-bucket/hearth`; any [rclone](https://rclone.org) remote works) and each backup is copied there. With Docker, run rclone from the host on `data/backups/encrypted/` instead.
+- **Keep the backup key somewhere safe and separate**, such as a password manager: Admin → Owner → **Show backup key** (it asks for your password again). Without the key, no backup can be restored.
+- **Restore on a new machine**:
+  ```bash
+  node server/cli.js restore hearth-2026-….hbk /opt/hearth/data <backup key>
+  ```
+  Then start Hearth (for a different folder, set `DATA_DIR`). `node server/cli.js verify-backup <file> <key>` checks a backup without restoring it, and `node server/cli.js backup` makes one from the command line.
 
-Stop the server (or copy while idle) for a clean copy of the database.
+**Database copies** (`data/backups/*.db`) are for undoing an update on this machine. They're as sensitive as the database itself, so they never leave the server and can't be downloaded.
+
+Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are regenerated if missing.
 
 ---
 
@@ -414,6 +456,10 @@ Stop the server (or copy while idle) for a clean copy of the database.
 | `AT_REST_KEY` | — | 64-hex-char key instead of `data/secret.key` (for pre-upgrade messages) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `MAIL_FROM` | — | Email for password resets (or set it in Admin → Owner → Email) |
 | `PUBLIC_URL` | — | This server's public address, used in reset links |
+| `SESSION_IDLE_DAYS` / `SESSION_MAX_DAYS` | `60` / `365` | A device is signed out after this many days unused / after this many days in total |
+| `BACKUP_KEY` | `data/backup.key` | 64 hex characters: the key encrypted backups use (made automatically if not set) |
+| `BACKUP_RCLONE_REMOTE` | — | Copy every encrypted backup off-site with rclone, e.g. `b2:my-bucket/hearth` |
+| `HEARTH_BIND` | all interfaces | Docker only: the address port 3000 listens on. Set `127.0.0.1` behind Caddy |
 
 ---
 

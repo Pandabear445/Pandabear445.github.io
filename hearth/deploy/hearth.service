@@ -1,19 +1,71 @@
 # systemd unit to run Hearth on a Linux VPS without Docker.
-# Copy to /etc/systemd/system/hearth.service, fix the paths/user, then:
+#
+# The easy way: sudo bash scripts/harden-vps.sh  (creates the "hearth" user and installs this file with your paths).
+# By hand:
+#   sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin hearth
+#   sudo install -d -o hearth -g hearth -m 700 /opt/hearth/data     # the only folder Hearth may write to
+#   sudo chown -R hearth:hearth /opt/hearth/data                     # if it already has data in it
+#   sudo chgrp hearth /opt/hearth/.env && sudo chmod 640 /opt/hearth/.env   # if you have a .env
+#   Copy this file to /etc/systemd/system/hearth.service, change /opt/hearth (3 places) if Hearth lives elsewhere,
+#   and the node path (command -v node), then:
 #   sudo systemctl daemon-reload && sudo systemctl enable --now hearth
+#
+# The program files stay owned by root, so Hearth can read but never change its own code.
+# Run Hearth's command-line tool as the same user: sudo -u hearth node server/cli.js ...
+# Check how locked down it is: systemd-analyze security hearth
 [Unit]
 Description=Hearth chat server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=hearth
+Group=hearth
 WorkingDirectory=/opt/hearth
 ExecStart=/usr/bin/node server/index.js
 Restart=on-failure
+RestartSec=2
+Environment=NODE_ENV=production
 # Each open app window is one connection; the usual default (1024) would cap you at about 1000 people online.
 LimitNOFILE=65535
-Environment=NODE_ENV=production
+
+# ---- Sandbox ----
+# The whole filesystem is read-only for Hearth except its data folder (database, uploads, keys, certificate).
+# If you set DATA_DIR or DOWNLOADS_DIR in .env to another folder, add it here too (space-separated).
+ProtectSystem=strict
+ReadWritePaths=/opt/hearth/data
+# Hearth can't see /home, /root or /run/user. If Hearth itself lives under /home, use ProtectHome=read-only.
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# No root powers of any kind, and no way to gain them (setuid programs, file capabilities).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+# Network: IPv4/IPv6, local sockets, and netlink (used to list network interfaces).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Only the system calls normal services need. Anything else fails with "permission denied" instead of
+# killing Hearth, so Node falls back gracefully (e.g. if it tries io_uring).
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# New files are private to Hearth (owner-only).
+UMask=0077
+# Not set on purpose: MemoryDenyWriteExecute=yes. Node's JavaScript engine compiles code at runtime (JIT),
+# which needs memory that is writable and then executable; with that setting Hearth would crash at start.
 
 [Install]
 WantedBy=multi-user.target

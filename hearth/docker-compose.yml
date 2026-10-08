@@ -1,10 +1,51 @@
 # Quick start:   docker compose up -d            -> https://<this-machine>:3000 (self-signed)
-# With a domain: edit deploy/Caddyfile, set HTTPS=false + TRUST_PROXY=1 below,
+# With a domain: edit deploy/Caddyfile, and in .env set
+#                  HTTPS=false
+#                  TRUST_PROXY=1
+#                  HEARTH_BIND=127.0.0.1     <- port 3000 then only answers on this machine itself
 #                then: docker compose --profile domain up -d
+#
+# How it's locked down:
+#  - Hearth runs as uid 1000 (not root), on a read-only filesystem: it can only write ./data and a small /tmp.
+#    It has no Linux capabilities, can't gain any (no-new-privileges), and its process count is capped.
+#  - No Docker socket is mounted anywhere (that would equal root on the host).
+#  - Port 3000: Docker publishes ports straight past the server's firewall (ufw can't block them), so with a
+#    domain set HEARTH_BIND=127.0.0.1. Caddy reaches Hearth over a private network ("proxy") that has no
+#    route to the internet; only Caddy's ports 80/443 face the internet.
+#  - hearth-perms runs once at start-up: older images wrote ./data as root, so it hands the folder to uid 1000
+#    (only what isn't already) and exits. It can change file owners and nothing else.
+#  - Logs are rotated (3 x 10 MB per container), so a flood of requests can't fill the disk.
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
 services:
+  hearth-perms:
+    build: .
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'find /data -xdev \( ! -user 1000 -o ! -group 1000 \) -exec chown -h 1000:1000 {} +'
+    volumes:
+      - ./data:/data
+    network_mode: none
+    read_only: true
+    # CHOWN to change owners; DAC_READ_SEARCH so it can look inside folders that already belong to uid 1000.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    logging: *logging
+
   hearth:
     build: .
     restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      hearth-perms:
+        condition: service_completed_successfully
     env_file:
       - path: .env
         required: false
@@ -13,15 +54,27 @@ services:
       # HTTPS: "false"
       # TRUST_PROXY: "1"
     ports:
-      - "3000:3000"
+      # Quick start: reachable on every interface (LAN, or the internet if you forward the port).
+      # Behind Caddy: put HEARTH_BIND=127.0.0.1 in .env so only this machine can reach it directly.
+      - "${HEARTH_BIND:+${HEARTH_BIND}:}3000:3000"
     volumes:
       - ./data:/data
+    networks: [hearth_net, proxy]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    # Optional memory cap. ~300-500 MB is typical for a friend group; uncomment and adjust if the VPS is shared.
+    # mem_limit: 1g
     # Each open app window is one connection; keep the limit high so it never caps how many can be online.
     ulimits:
       nofile: { soft: 65535, hard: 65535 }
+    logging: *logging
 
   caddy:
-    image: caddy:2
+    image: caddy:2.11
     profiles: ["domain"]
     restart: unless-stopped
     depends_on: [hearth]
@@ -33,6 +86,27 @@ services:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    networks: [edge, proxy]
+    # Caddy only needs to listen on ports 80/443; everything else is dropped. Certificates live in the
+    # caddy_data volume and its saved config in caddy_config; the rest of its filesystem is read-only.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    # mem_limit: 256m
+    logging: *logging
+
+networks:
+  # Hearth's own network: outgoing connections (web push, GIFs, email, relays) and the published port 3000.
+  hearth_net: {}
+  # Caddy's own network: getting certificates and the published ports 80/443.
+  edge: {}
+  # Private link between Caddy and Hearth. internal = no route in or out of the server.
+  proxy:
+    internal: true
 
 volumes:
   caddy_data:

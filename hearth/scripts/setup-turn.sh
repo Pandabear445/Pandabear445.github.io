@@ -35,8 +35,13 @@ find_hearth() {
   fi
   echo "$d"
 }
-hearth_cli() { # run server/cli.js inside Hearth (Docker or plain)
-  ( cd "$DIR" && if docker compose ps -q hearth 2>/dev/null | grep -q .; then docker compose exec -T hearth node server/cli.js "$@"; else node server/cli.js "$@"; fi )
+hearth_cli() { # run server/cli.js inside Hearth (Docker or plain), as the user that owns Hearth's data (e.g. "hearth")
+  ( cd "$DIR" && if docker compose ps -q hearth 2>/dev/null | grep -q .; then docker compose exec -T hearth node server/cli.js "$@"
+    else
+      owner="$(stat -c %U data 2>/dev/null || echo root)"
+      if [ "$owner" != root ] && [ "$owner" != UNKNOWN ] && command -v runuser >/dev/null 2>&1; then runuser -u "$owner" -- "$(command -v node)" server/cli.js "$@"
+      else node server/cli.js "$@"; fi
+    fi )
 }
 DIR=""
 if [ "$RELAY_ONLY" = no ]; then
