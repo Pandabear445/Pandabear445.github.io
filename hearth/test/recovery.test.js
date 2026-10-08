@@ -219,11 +219,17 @@ test('2FA backup codes work once each', async () => {
   for (const c of backupCodes) assert.ok(!stored.includes(c.replace('-', '')), 'codes are stored hashed');
 });
 
-test('2FA backup code racing: 10 simultaneous logins with one code → one session', async () => {
+test('2FA racing: 8 simultaneous logins with one backup code, or one authenticator code → one session', async () => {
   const u = await srv.register();
-  const { backupCodes } = await enable2fa(srv, u);
-  const rs = await Promise.all(Array.from({ length: 10 }, () => srv.login(u, { backupCode: backupCodes[3] })));
-  assert.equal(rs.filter((r) => r.status === 200).length, 1);
+  const { secret, backupCodes, used } = await enable2fa(srv, u);
+  const rs = await Promise.all(Array.from({ length: 8 }, () => srv.login(u, { backupCode: backupCodes[3] })));
+  assert.equal(rs.filter((r) => r.status === 200).length, 1, 'backup code');
+  const v = await srv.register();
+  const t = await enable2fa(srv, v);
+  const code = await freshCode(t.secret, t.used);
+  const rv = await Promise.all(Array.from({ length: 8 }, () => srv.login(v, { totp: code })));
+  assert.equal(rv.filter((r) => r.status === 200).length, 1, 'authenticator code');
+  void secret; void used;
 });
 
 test('2FA is needed for a password reset too (a stolen inbox is not enough)', async () => {

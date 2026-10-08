@@ -242,7 +242,11 @@ module.exports = function setupAccounts(ctx) {
   // Guesses are limited per account (8 per 15 minutes, 30 per day — wherever they come from) and per network.
   // After a few wrong codes the account's email gets a warning: whoever is trying already knows the password.
   function require2fa(row, body, req) {
-    if (!row.totp_enabled) return;
+    // Read the account again right here: callers fetched it before a slow password check, and concurrent
+    // requests must see a code that another request just used up. From here to the write below nothing
+    // awaits, so checking and using up a code can't interleave with another request.
+    row = getUserRow(row.id);
+    if (!row || !row.totp_enabled) return;
     const b = body || {};
     if (!b.totp && !b.backupCode) fail(401, 'Enter the 6-digit code from your authenticator app.', 'need_2fa');
     if (typeof b.totp !== 'string' && typeof b.backupCode !== 'string') fail(400, 'Codes are text.', 'bad_2fa');
