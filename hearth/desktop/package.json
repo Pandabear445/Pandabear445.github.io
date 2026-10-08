@@ -87,6 +87,7 @@
     },
     "asarUnpack": [
       "node_modules/uiohook-napi/**"
-    ]
+    ],
+    "npmRebuild": false
   }
 }
