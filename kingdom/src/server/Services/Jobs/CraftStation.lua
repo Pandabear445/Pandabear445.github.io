@@ -113,7 +113,14 @@ function CraftStation.Craft(ctx, player: Player, station, recipeId: string, held
 	end
 	if next(fromStorage) then
 		if not ctx.Resources:Has(fromStorage) then
-			ctx:Feedback(player, false, "Missing ingredients: " .. describe(fromStorage) .. ".")
+			local missing = {}
+			for resourceId, amount in pairs(fromStorage) do
+				local short = amount - ctx.Resources:GetStock(resourceId)
+				if short > 0 then
+					missing[resourceId] = short
+				end
+			end
+			ctx:Feedback(player, false, "Missing ingredients (not in your pack or storage): " .. describe(missing) .. ".")
 			return
 		end
 		if not ctx.Permission:Has(player, "Storage.Withdraw") then

@@ -204,6 +204,9 @@ end
 
 function DataService:Start()
 	self.Registry:Every(self.Name, "autosave", GameConfig.Data.AutosaveSeconds, function()
+		if self._shuttingDown then
+			return
+		end
 		local players = Players:GetPlayers()
 		local spacing = math.min(1, GameConfig.Data.AutosaveSeconds / math.max(#players, 1) / 2)
 		for _, player in ipairs(players) do
@@ -404,6 +407,11 @@ function DataService:SaveNow(player: Player, reason: string?, release: boolean?)
 	if not session or not session.loaded or session.safeMode or not session.profile or session.lostLock then
 		return false
 	end
+	-- Once shutdown begins every save releases the lock, so a late autosave
+	-- can never re-lock a profile this server is about to abandon.
+	if self._shuttingDown then
+		release = true
+	end
 	if session.saving then
 		session.resaveQueued = true
 		session.resaveRelease = session.resaveRelease or release
@@ -471,6 +479,7 @@ function DataService:_updateLeaderboard(userId: number, profile)
 end
 
 function DataService:_saveAllOnShutdown()
+	self._shuttingDown = true
 	local pending = 0
 	for player, session in pairs(self._sessions) do
 		if session.loaded and not session.safeMode and session.profile then

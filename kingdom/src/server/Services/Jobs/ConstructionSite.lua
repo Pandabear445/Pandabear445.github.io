@@ -91,6 +91,8 @@ end
 
 function ConstructionSite.Attach(ctx, instance: Instance, job)
 	local station: any = {
+		Instance = instance,
+		Job = job,
 		State = instance:GetAttribute("AutoApproved") == true and "Active" or "Proposed",
 		Delivered = {},
 		Work = 0,

@@ -24,6 +24,10 @@ EconomyConfig.Treasury = {
 	-- Crown revenue per in-game hour = (Base + PerPlayer * players) * stabilityFactor
 	CrownRevenueBase = 30,
 	CrownRevenuePerPlayer = 10,
+	-- The crown earns this share of the base value of goods delivered to
+	-- storage each hour (the kingdom's economy putting them to use). Working
+	-- kingdoms fund themselves; idle ones go broke and can't pay wages.
+	ProductionLevy = 0.6,
 	-- Below this the government is "poor": warnings + morale penalty.
 	LowThreshold = 300,
 }

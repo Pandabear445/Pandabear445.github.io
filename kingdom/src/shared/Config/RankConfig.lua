@@ -217,6 +217,7 @@ RankConfig.Ranks = {
 			"Rank.Demote",
 			"Rank.Appoint",
 			"Projects.Approve",
+			"Government.Vote",
 			"Government.Propose",
 			"Kingdom.ViewFull",
 		}),

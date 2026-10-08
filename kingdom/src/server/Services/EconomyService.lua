@@ -62,6 +62,7 @@ function EconomyService:Init()
 	self._unpaidThisPeriod = 0
 	self._xpSincePayday = {}
 	self._revenueModifier = nil
+	self._deliveredValue = 0
 
 	self._global = GameConfig.KingdomScope == "Global" and GameConfig.Global.PersistTreasury
 	if self._global then
@@ -79,6 +80,12 @@ function EconomyService:Init()
 	end)
 	self._data.Loaded:Connect(function(player)
 		self:PublishPlayer(player)
+	end)
+	self._resources.Deposited:Connect(function(resourceId, amount, source)
+		if source == "Delivery" then
+			local def = ResourceConfig.Resources[resourceId]
+			self._deliveredValue += (def and def.BaseValue or 0) * amount
+		end
 	end)
 
 	self._time.MinuteChanged:Connect(function(_, hour)
@@ -242,6 +249,11 @@ function EconomyService:_crownRevenue()
 		end
 	end
 	self:TreasuryDeposit(base * modifier, "CrownRevenue")
+	local levy = self._deliveredValue * (EconomyConfig.Treasury.ProductionLevy or 0)
+	self._deliveredValue = 0
+	if levy > 0 then
+		self:TreasuryDeposit(levy, "ProductionLevy")
+	end
 end
 
 function EconomyService:_payday()

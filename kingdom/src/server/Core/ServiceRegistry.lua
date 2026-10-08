@@ -53,7 +53,11 @@ function ServiceRegistry:Register(service)
 	assert(type(service) == "table" and type(service.Name) == "string", "service must have a Name")
 	assert(not self.Services[service.Name], "duplicate service " .. service.Name)
 	service.Dependencies = service.Dependencies or {}
-	service.Log = Logger.new(service.Name)
+	-- Services get a tagged logger as self.Log (AuditService keeps its own
+	-- Log method and logs through the Logger module directly).
+	if service.Log == nil then
+		service.Log = Logger.new(service.Name)
+	end
 	self.Services[service.Name] = service
 	self:_setStatus(service.Name, "Pending")
 end
