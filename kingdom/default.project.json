@@ -1,0 +1,21 @@
+{
+  "name": "MedievalKingdom",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Kingdom": {
+        "$className": "Folder",
+        "Config": { "$path": "src/shared/Config" },
+        "Shared": { "$path": "src/shared/Shared" }
+      }
+    },
+    "ServerScriptService": {
+      "Kingdom": { "$path": "src/server" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Kingdom": { "$path": "src/client" }
+      }
+    }
+  }
+}
