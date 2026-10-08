@@ -576,6 +576,7 @@ function InventoryService:ApplyDeathRules(player: Player, position: Vector3?)
 				dropped[itemId] = amount
 				local remaining = count - amount
 				profile.Inventory.Items[itemId] = remaining > 0 and remaining or nil
+				self:_clampTaint(profile, itemId)
 			end
 		end
 	end

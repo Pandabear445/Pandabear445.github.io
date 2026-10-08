@@ -1066,8 +1066,98 @@ end
 function Methods.JSONEncode(self, value)
 	return encode(value)
 end
-function Methods.JSONDecode()
-	error("JSONDecode not supported in mock")
+local function decode(text)
+	local pos = 1
+	local function skip()
+		pos = string.find(text, "[^%s]", pos) or (#text + 1)
+	end
+	local parseValue
+	local function parseString()
+		pos += 1
+		local parts = {}
+		while true do
+			local c = string.sub(text, pos, pos)
+			if c == '"' then
+				pos += 1
+				break
+			elseif c == "\\" then
+				local nextChar = string.sub(text, pos + 1, pos + 1)
+				if nextChar == "u" then
+					table.insert(parts, utf8.char(tonumber(string.sub(text, pos + 2, pos + 5), 16)))
+					pos += 6
+				else
+					local map = { n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" }
+					table.insert(parts, map[nextChar] or nextChar)
+					pos += 2
+				end
+			else
+				table.insert(parts, c)
+				pos += 1
+			end
+		end
+		return table.concat(parts)
+	end
+	function parseValue()
+		skip()
+		local c = string.sub(text, pos, pos)
+		if c == "{" then
+			pos += 1
+			local result = {}
+			skip()
+			if string.sub(text, pos, pos) == "}" then
+				pos += 1
+				return result
+			end
+			while true do
+				skip()
+				local key = parseString()
+				skip()
+				pos += 1 -- :
+				result[key] = parseValue()
+				skip()
+				local sep = string.sub(text, pos, pos)
+				pos += 1
+				if sep == "}" then
+					return result
+				end
+			end
+		elseif c == "[" then
+			pos += 1
+			local result = {}
+			skip()
+			if string.sub(text, pos, pos) == "]" then
+				pos += 1
+				return result
+			end
+			while true do
+				table.insert(result, parseValue())
+				skip()
+				local sep = string.sub(text, pos, pos)
+				pos += 1
+				if sep == "]" then
+					return result
+				end
+			end
+		elseif c == '"' then
+			return parseString()
+		elseif string.sub(text, pos, pos + 3) == "true" then
+			pos += 4
+			return true
+		elseif string.sub(text, pos, pos + 4) == "false" then
+			pos += 5
+			return false
+		elseif string.sub(text, pos, pos + 3) == "null" then
+			pos += 4
+			return nil
+		end
+		local numberText = string.match(text, "^-?[%d%.eE+-]+", pos)
+		pos += #numberText
+		return tonumber(numberText)
+	end
+	return parseValue()
+end
+function Methods.JSONDecode(self, text)
+	return decode(text)
 end
 
 -- Marketplace / badges / chat / tweens

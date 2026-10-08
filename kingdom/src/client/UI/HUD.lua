@@ -96,8 +96,16 @@ function HUD.Init()
 	line(panel, "Alerts", 19, { TextSize = 12, Color = Kit.Colors.Bad })
 
 	HUD.Panel = panel
+	-- Many keys can change in one replication batch: refresh once per frame.
+	local pending = false
 	ClientState.Changed:Connect(function()
-		HUD.Update()
+		if not pending then
+			pending = true
+			task.defer(function()
+				pending = false
+				HUD.Update()
+			end)
+		end
 	end)
 	HUD.Update()
 end

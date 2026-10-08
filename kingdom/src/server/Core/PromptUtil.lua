@@ -12,7 +12,6 @@
 ]]
 
 local CollectionService = game:GetService("CollectionService")
-local Players = game:GetService("Players")
 
 local PromptUtil = {}
 
@@ -57,7 +56,9 @@ end
 
 -- handler(player, heldSeconds) runs in its own thread with errors isolated.
 function PromptUtil.onTriggered(prompt: ProximityPrompt, handler: (Player, number) -> ())
-	local holdStarted: { [Player]: number } = {}
+	-- Weak keys: departed players are collected without a PlayerRemoving
+	-- connection per prompt (maps can have thousands of prompts).
+	local holdStarted: { [Player]: number } = setmetatable({}, { __mode = "k" }) :: any
 	prompt.PromptButtonHoldBegan:Connect(function(player)
 		holdStarted[player] = os.clock()
 	end)
@@ -81,9 +82,6 @@ function PromptUtil.onTriggered(prompt: ProximityPrompt, handler: (Player, numbe
 		if not ok then
 			warn("[PromptUtil] handler error: " .. tostring(err))
 		end
-	end)
-	Players.PlayerRemoving:Connect(function(player)
-		holdStarted[player] = nil
 	end)
 end
 

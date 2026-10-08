@@ -14,6 +14,10 @@ part("CouncilChamber", Vector3.new(-100, 2, -100), Vector3.new(30, 10, 30), { "K
 part("Seat1", Vector3.new(-100, 2, -95), nil, { "KingdomMeetingSpawn" }, { MeetingID = "RoyalCouncil" })
 local pier = part("Pier", Vector3.new(0, 0, -80), Vector3.new(6, 1, 6), { "KingdomFishing" })
 local market = part("MarketSquare", Vector3.new(30, 2, -30), Vector3.new(10, 2, 10), { "KingdomMarket" })
+local messHall = part("MessHall", Vector3.new(-30, 2, 30), Vector3.new(8, 4, 8), { "KingdomMessHall" })
+local hospital = part("Hospital", Vector3.new(-40, 2, -40), nil, { "KingdomHospital" })
+local forge = part("Forge", Vector3.new(40, 2, 40), Vector3.new(6, 4, 6), { "KingdomBlacksmith" })
+local house = part("Cottage", Vector3.new(-60, 2, 60), Vector3.new(10, 6, 10), { "KingdomHouse" }, { HouseId = "Cottage1", RentPrice = 5 })
 
 section("Boot")
 Mock.boot()
@@ -273,6 +277,70 @@ if sack then
 	Mock.firePrompt(Mock.findPrompt(sack, "Pick up"), cara, 1)
 	check("another player recovered the goods", Inventory:Count(cara, "Wood") >= 3)
 end
+
+---------------------------------------------------------------------------
+section("Mess hall, hospital, housing")
+local Food = svc("FoodService")
+Data:Get(cara).Hunger = 20
+Mock.moveTo(cara, messHall.Position + Vector3.new(0, 3, 0))
+Sched.run(2)
+Mock.firePrompt(Mock.findPrompt(messHall, "Eat"), cara, 1.6)
+check("ate at the mess hall", Data:Get(cara).Hunger > 20, Data:Get(cara).Hunger)
+Food:MakeSick(cara, "Test")
+check("sick", Food:IsSick(cara))
+admin("spawn Medicine 2")
+Mock.moveTo(cara, hospital.Position + Vector3.new(0, 3, 0))
+Sched.run(2)
+Mock.firePrompt(Mock.findPrompt(hospital, "treatment"), cara, 3.2)
+check("cured at the hospital", not Food:IsSick(cara))
+Mock.moveTo(cara, house.Position + Vector3.new(0, 3, 0))
+Sched.run(2)
+local caraCoins = Data:Get(cara).Coins
+Mock.firePrompt(Mock.findPrompt(house, "Rent"), cara, 1.2)
+check("rented a house", Data:Get(cara).Home == "Cottage1" and Data:Get(cara).Coins < caraCoins, Data:Get(cara).Home)
+Sched.run(3)
+check("at home grants storage access", cara:GetAttribute("KingdomAtHome") == true)
+
+---------------------------------------------------------------------------
+section("Blacksmith repair queue")
+local Inv = svc("InventoryService")
+local uid, tool = Inv:GetBestTool(cara, "Bucket")
+if tool then
+	tool.Durability = 3
+end
+Mock.moveTo(cara, forge.Position + Vector3.new(0, 3, 0))
+Sched.run(2)
+local caraBefore = Data:Get(cara).Coins
+Mock.firePrompt(Mock.findPrompt(forge, "Leave tool"), cara, 1.1)
+check("tool left in the repair queue (fee in escrow)", Inv:GetTool(cara, uid) == nil and Data:Get(cara).Coins < caraBefore and next(Data:Get(cara).Escrow) ~= nil)
+admin("give Alice Iron 2")
+admin("tool Alice Hammer")
+Mock.moveTo(alice, forge.Position + Vector3.new(2, 3, 0))
+Sched.run(6)
+Mock.firePrompt(Mock.findPrompt(forge, "Work repair queue"), alice, 5.2)
+local repairedOk = false
+for _, owned in pairs(Data:Get(cara).Inventory.Tools) do
+	if owned.Id == "Bucket" and owned.Durability >= owned.Max then
+		repairedOk = true
+	end
+end
+check("smith repaired and returned the tool", repairedOk)
+check("escrow settled", next(Data:Get(cara).Escrow) == nil)
+
+---------------------------------------------------------------------------
+section("Developer product receipts are idempotent")
+local GamepassConfig = require(game:GetService("ReplicatedStorage").Kingdom.Config.GamepassConfig)
+GamepassConfig.Products.DonationSmall.Id = 555
+local market = game:GetService("MarketplaceService")
+local receipt = { PlayerId = cara.UserId, PurchaseId = "purchase-1", ProductId = 555 }
+local first, second
+task.spawn(function()
+	first = market.ProcessReceipt(receipt)
+	second = market.ProcessReceipt(receipt)
+end)
+Sched.run(1)
+check("receipt granted", first == Enum.ProductPurchaseDecision.PurchaseGranted)
+check("replayed receipt granted without re-applying", second == Enum.ProductPurchaseDecision.PurchaseGranted and #Data:Get(cara).Titles == 1, #Data:Get(cara).Titles)
 
 ---------------------------------------------------------------------------
 section("Safe mode when the archive is down")
