@@ -134,6 +134,8 @@ init();
 async function init() {
   applyAppearance();
   setupServiceWorker();
+  const resetToken = (location.hash.match(/^#reset=([A-Za-z0-9_-]{20,100})$/) || [])[1];
+  if (resetToken) { history.replaceState(null, '', '/'); sessionStorage.setItem('hearth.resetToken', resetToken); } // keep it out of the address bar
   const m = location.pathname.match(/^\/invite\/([A-Za-z0-9]+)/);
   if (m) { sessionStorage.setItem('hearth.pendingInvite', m[1]); history.replaceState(null, '', '/'); }
   try { S.config = await api('GET', '/config'); } catch { S.config = { name: 'Hearth', iceServers: [] }; }
@@ -141,6 +143,14 @@ async function init() {
   $$('[data-instance-name]').forEach((el) => { el.textContent = S.config.name; });
   $$('[data-instance-tagline]').forEach((el) => { el.textContent = S.config.tagline || ''; el.hidden = !S.config.tagline; });
 
+  // A reset link opened in a tab that already shows Hearth only changes the #part: catch that too.
+  window.addEventListener('hashchange', () => {
+    const t = (location.hash.match(/^#reset=([A-Za-z0-9_-]{20,100})$/) || [])[1];
+    if (t) { history.replaceState(null, '', '/'); if (S.me) { sessionStorage.setItem('hearth.resetToken', t); location.reload(); } else openReset(t); }
+  });
+  // A password-reset link: show the sign-in screen with the reset window on top.
+  const pendingReset = sessionStorage.getItem('hearth.resetToken');
+  if (pendingReset) { sessionStorage.removeItem('hearth.resetToken'); showAuth(); openReset(pendingReset); return; }
   const uid = localStorage.getItem('hearth.userId');
   if (getToken() && uid) {
     const key = await E2EE.loadKey(uid).catch(() => null);
@@ -171,6 +181,17 @@ function showAuth() {
   $('#to-register').onclick = (e) => { e.preventDefault(); loginForm.hidden = true; regForm.hidden = false; };
   $('#to-login').onclick = (e) => { e.preventDefault(); regForm.hidden = true; loginForm.hidden = false; };
 
+  // Two-factor step: after a right password, the server asks for the app's code (or a backup code).
+  const totpField = $('#totp-field');
+  let useBackup = false;
+  let derived = null; // { who, params, keys } so the slow password step isn't repeated for the 2FA code
+  $('#totp-switch').onclick = (e) => {
+    e.preventDefault(); useBackup = !useBackup;
+    $('#totp-label').textContent = useBackup ? 'Backup code' : 'Two-factor code';
+    e.currentTarget.textContent = useBackup ? 'Use the code from my app' : 'Use a backup code instead';
+    loginForm.totp.value = ''; loginForm.totp.inputMode = useBackup ? 'text' : 'numeric'; loginForm.totp.focus();
+  };
+  $('#to-forgot').onclick = (e) => { e.preventDefault(); openForgot(loginForm.username.value.trim()); };
   loginForm.onsubmit = async (e) => {
     e.preventDefault();
     const btn = loginForm.querySelector('button[type=submit]');
@@ -180,9 +201,21 @@ function showAuth() {
     try {
       const username = loginForm.username.value.trim();
       const password = loginForm.password.value;
-      const params = await api('GET', '/auth/params?username=' + encodeURIComponent(username));
-      const [{ authKey, wrapKey }, captcha] = await Promise.all([E2EE.deriveKeys(username, password, params), loginCap.token()]);
-      const res = await api('POST', '/auth/login', { username, authKey, captcha }).finally(() => loginCap.reset());
+      const who = `${username}\n${password}`;
+      if (!derived || derived.who !== who) {
+        const params = await api('GET', '/auth/params?username=' + encodeURIComponent(username));
+        derived = { who, params, keys: await E2EE.deriveKeys(username, password, params) };
+      }
+      const { params } = derived;
+      const { authKey, wrapKey } = derived.keys;
+      const captcha = await loginCap.token();
+      const second = !totpField.hidden && loginForm.totp.value.trim() ? (useBackup ? { backupCode: loginForm.totp.value.trim() } : { totp: loginForm.totp.value.trim() }) : {};
+      const res = await api('POST', '/auth/login', { username, authKey, captcha, ...second }).finally(() => loginCap.reset())
+        .catch((ex) => {
+          if (ex.code === 'need_2fa' || ex.code === 'bad_2fa') { totpField.hidden = false; setTimeout(() => loginForm.totp.focus(), 30); }
+          throw ex;
+        });
+      totpField.hidden = true; loginForm.totp.value = ''; derived = null;
       const priv = await E2EE.unwrapPrivateKey(wrapKey, res.encPrivateKey);
       if (params.kdf !== 'argon2id') {
         // Older account: upgrade password hashing from PBKDF2 to Argon2id. Same password, same keys.
@@ -223,6 +256,58 @@ function showAuth() {
       err.textContent = ex.message;
     } finally { btn.disabled = false; btn.textContent = 'Create account'; }
   };
+}
+
+// "Forgot your password?": a reset link goes to the account's verified email.
+function openForgot(prefill) {
+  const input = h('input', { class: 'input', value: prefill || '', placeholder: 'Username or email', autocomplete: 'username', autocapitalize: 'off', spellcheck: 'false' });
+  modal({ title: 'Reset your password', size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'We\u2019ll email a reset link to the address on your account (if it has a confirmed one).'), field('Username or email', input)),
+    actions: [{ label: 'Cancel' }, { label: 'Send reset link', kind: 'primary', action: async () => {
+      if (!input.value.trim()) throw new Error('Enter your username or email.');
+      await api('POST', '/auth/forgot', { login: input.value.trim() });
+      toast('If that account has a confirmed email, a reset link is on its way. Check your inbox (and spam).');
+    } }] });
+}
+// The link from that email: #reset=<token>. Recovery key → everything stays readable; without → new keys.
+async function openReset(token) {
+  let info;
+  try { info = await api('POST', '/auth/reset/info', { token }); } catch (e) { toast(e.message, 'error'); return; }
+  const pw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
+  const pw2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
+  const rec = h('input', { class: 'input mono', placeholder: 'XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX', autocomplete: 'off', spellcheck: 'false', autocapitalize: 'characters' });
+  const noRec = h('input', { type: 'checkbox' });
+  const code = h('input', { class: 'input', inputmode: 'numeric', autocomplete: 'one-time-code', placeholder: '123456 (or a backup code)' });
+  const recBox = info.hasRecovery ? h('div', { class: 'stack' }, field('Recovery key', rec, 'With it, all your messages stay readable.'),
+    h('label', { class: 'row gap tight' }, noRec, h('span', { class: 'field-hint' }, 'I don\u2019t have it: start over with new keys (old direct messages can\u2019t be read any more)')))
+    : h('p', { class: 'warn-box' }, 'You don\u2019t have a recovery key, so this reset makes you new encryption keys: you\u2019ll get back into all your servers and friends, but your old direct messages can\u2019t be read any more. (That\u2019s the price of nobody, not even this server, being able to read them.)');
+  modal({ title: `Choose a new password for ${info.username}`, size: 'md', dismissable: true,
+    body: h('div', { class: 'stack' }, field('New password', pw), field('Confirm new password', pw2), recBox, info.need2fa ? field('Two-factor code', code, 'From your authenticator app, or one of your backup codes.') : ''),
+    actions: [{ label: 'Cancel' }, { label: 'Reset password', kind: 'primary', action: async () => {
+      if (pw.value.length < 8) throw new Error('Use at least 8 characters.');
+      if (pw.value !== pw2.value) throw new Error('The passwords do not match.');
+      const kdfSalt = E2EE.newKdfSalt();
+      const next = await E2EE.deriveKeys(info.username, pw.value, { kdf: 'argon2id', salt: kdfSalt });
+      const body = { token, authKey: next.authKey, kdfSalt };
+      const c = code.value.trim();
+      if (info.need2fa) { if (!c) throw new Error('Enter your two-factor code.'); Object.assign(body, /^\d{6}$/.test(c.replace(/\s/g, '')) ? { totp: c } : { backupCode: c }); }
+      let privateKey;
+      if (info.hasRecovery && !noRec.checked) {
+        // Unlock the old key with the recovery key and lock it again with the new password.
+        const rk = await E2EE.recoveryWrapKey(rec.value, info.recoverySalt);
+        try { body.encPrivateKey = await E2EE.rewrapPrivateKey(rk, next.wrapKey, info.encPrivateKeyRecovery); } catch { throw new Error('That recovery key isn\u2019t right.'); }
+        privateKey = await E2EE.unwrapPrivateKey(next.wrapKey, body.encPrivateKey);
+        body.keepKeys = true;
+      } else {
+        const id = await E2EE.createIdentity(next.wrapKey);
+        Object.assign(body, { encPrivateKey: id.encPrivateKey, publicKey: id.publicKey });
+        privateKey = id.privateKey;
+      }
+      const res = await api('POST', '/auth/reset', body);
+      history.replaceState(null, '', '/');
+      toast(body.keepKeys ? 'Password reset. All your messages are still here.' : 'Password reset with new keys. Add a recovery key in Settings so this can\u2019t happen again.');
+      await finishLogin(res, privateKey);
+    } }] });
 }
 
 async function finishLogin(res, privateKey) {
@@ -2029,6 +2114,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const rs = roleStyle(server, author.id);
     body.append(h('div', { class: 'msg-head' },
       h('button', { class: 'msg-name', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, nameEl(author, { roleColor: rs.color })),
+      (author.bot || m.bot || (m.dec && m.dec.bot)) ? h('span', { class: 'bot-tag' }, 'BOT') : null,
       rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
       rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
       h('time', { class: 'msg-time', datetime: new Date(m.createdAt).toISOString(), title: new Date(m.createdAt).toLocaleString() }, fmtStamp(m.createdAt)),
@@ -2043,7 +2129,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
   } else {
     const chat = P.chat;
     const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length;
-    if (text && !hideText) {
+    const embed = m.dec && m.dec.embed;
+    if (text && !hideText && !(embed && text === embed.title)) {
       const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: authorMayPingEveryone(m) }) : escapeText(text);
       body.append(h('div', { class: `msg-text${chat.jumbo && isJumbo(text) ? ' jumbo' : ''}`, html: html + (m.editedAt ? '<span class="edited" title="Edited">(edited)</span>' : '') }));
     }
@@ -2054,7 +2141,9 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     if (m.dec && m.dec.p) body.append(pollEl(m));
     const files = filesOf(m);
     if (files.length) body.append(h('div', { class: 'msg-files' }, files.map((f) => attachmentEl(f, m))));
-    if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only.' }, 'Older message \u2014 not end-to-end encrypted'));
+    if (embed) body.append(newsCard(embed));
+    if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
+    else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only.' }, 'Older message \u2014 not end-to-end encrypted'));
     else if (m.dec && m.dec.verified === false && !m.dmId) body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'The signature on this message does not match the sender\u2019s key.' }, '\u26a0 Sender could not be verified'));
   }
   if (m.reactions && m.reactions.length) {
@@ -2642,7 +2731,7 @@ function membersPanel(el) {
         h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color }),
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
-          sec.keyChanged(u) ? h('span', { class: 'key-warn', 'data-tip': 'Security key changed' }, icon('shield')) : null),
+          sec.keyChanged(u) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
         activityLine(u) ? h('span', { class: 'member-status' }, activityLine(u)) : cs ? h('span', { class: 'member-status' }, cs) : null));
     };
     for (const r of hoisted) {
@@ -3817,6 +3906,90 @@ function nextServerUpdate(id, ms = 1500) {
 }
 
 // Server settings: overview, appearance, roles, members, emoji, bans, danger zone.
+// Server settings → News bot: follow topics, YouTube channels, subreddits, Steam games, GitHub projects or any
+// RSS feed; the bot posts only new items into the chosen channel.
+const FEED_KINDS = [
+  ['topic', 'Topic', 'Anything: a game, a team, a band, a company\u2026', 'e.g. Elden Ring DLC'],
+  ['youtube', 'YouTube', 'A channel\u2019s new videos.', 'youtube.com/@channel or @handle'],
+  ['reddit', 'Reddit', 'New posts in a subreddit.', 'e.g. pcgaming'],
+  ['steam', 'Steam game', 'Patch notes and announcements for a game.', 'Game name or Steam store link'],
+  ['github', 'GitHub', 'New releases of a project.', 'owner/project'],
+  ['rss', 'RSS', 'Any site\u2019s RSS or Atom feed.', 'https://example.com/feed.xml'],
+];
+async function newsBotTab(s, body) {
+  clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
+  let feeds = [];
+  try { feeds = await api('GET', `/servers/${s.id}/feeds`); } catch (e) { clear(body).append(h('p', { class: 'form-error' }, e.message)); return; }
+  const textChannels = (s.channels || []).filter((c) => c.type === 'text');
+  const chName = (id) => (textChannels.find((c) => c.id === id) || {}).name || 'deleted channel';
+  const ago = (t) => { if (!t) return 'never'; const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+  let kind = 'topic';
+  const query = h('input', { class: 'input', placeholder: FEED_KINDS[0][3] });
+  const hint = h('span', { class: 'field-hint' }, FEED_KINDS[0][2]);
+  const channel = h('select', { class: 'input' }, textChannels.map((c) => h('option', { value: c.id }, `#${c.name}`)));
+  const keywords = h('input', { class: 'input', placeholder: 'optional: patch, update, release' });
+  const postNow = h('input', { type: 'checkbox' });
+  const preview = h('div', { class: 'stack' });
+  const kindChips = h('div', { class: 'chips' });
+  const drawKinds = () => {
+    clear(kindChips).append(...FEED_KINDS.map(([k, l, d, ph]) => h('button', { type: 'button', class: `chip${kind === k ? ' active' : ''}`, onclick: () => { kind = k; query.placeholder = ph; hint.textContent = d; clear(preview); drawKinds(); } }, l)));
+  };
+  drawKinds();
+  const doPreview = async (btn) => {
+    btn.disabled = true; clear(preview).append(h('span', { class: 'spinner' }));
+    try {
+      const r = await api('POST', `/servers/${s.id}/feeds/preview`, { kind, query: query.value });
+      clear(preview).append(h('p', { class: 'muted-p' }, h('b', null, r.title || 'Feed'), ` \u2014 the newest items right now (these count as already seen; only newer ones get posted):`),
+        ...r.items.map((i) => h('div', { class: 'feed-prev' }, i.image ? h('img', { src: mediaNewsUrl(i.image), alt: '', loading: 'lazy' }) : h('span', { class: 'feed-prev-ph' }, icon('megaphone')),
+          h('div', { class: 'act-text' }, h('a', { class: 'act-title', href: i.link, target: '_blank', rel: 'noopener noreferrer' }, i.title), h('span', { class: 'act-sub' }, i.date ? new Date(i.date).toLocaleString() : '')))));
+      if (!r.items.length) preview.append(h('p', { class: 'field-hint' }, 'Nothing in it right now, which is fine: new items will still get posted.'));
+    } catch (e) { clear(preview).append(h('p', { class: 'form-error' }, e.message)); }
+    btn.disabled = false;
+  };
+  const list = h('div', { class: 'adm-table' }, ...feeds.map((f) => h('div', { class: 'adm-row feed-row' },
+    h('div', { class: 'act-text' }, h('b', null, f.title), h('span', { class: 'act-sub' }, `${f.kindName} \u00b7 into #${chName(f.channelId)}${f.keywords ? ` \u00b7 only \u201c${f.keywords}\u201d` : ''}`)),
+    h('span', { class: 'stat-sub' }, `${f.posted} posted \u00b7 checked ${ago(f.lastCheck)}`),
+    f.paused ? h('span', { class: 'rpill warn' }, 'Paused') : f.lastError ? h('span', { class: 'rpill bad', 'data-tip': f.lastError }, 'Problem') : h('span', { class: 'rpill ok' }, 'Working'),
+    h('span', { class: 'row gap tight' },
+      h('button', { class: 'btn ghost sm', onclick: async (e) => { e.currentTarget.disabled = true; try { const r = await api('POST', `/feeds/${f.id}/check`); toast(r.posted ? `Posted ${r.posted} new item${r.posted === 1 ? '' : 's'}.` : r.feed.lastError ? `Problem: ${r.feed.lastError}` : 'Nothing new yet.'); } catch (x) { toast(x.message, 'error'); } newsBotTab(s, body); } }, 'Check now'),
+      h('button', { class: 'btn ghost sm', onclick: async () => { await api('PATCH', `/feeds/${f.id}`, { paused: !f.paused }); newsBotTab(s, body); } }, f.paused ? 'Resume' : 'Pause'),
+      h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Stop following ${f.title}?`, confirm: 'Remove', danger: true })) { await api('DELETE', `/feeds/${f.id}`); newsBotTab(s, body); } } }, 'Remove')))));
+  clear(body).append(
+    h('h3', null, 'News bot'),
+    h('p', { class: 'muted-p' }, 'Follow things your server cares about. The bot checks every 15 minutes and posts only new items, never old news. Its posts are public news, so they aren\u2019t end-to-end encrypted (and say so); everything people write still is.'),
+    feeds.length ? list : h('p', { class: 'field-hint' }, 'Not following anything yet.'),
+    h('h4', null, 'Follow something new'),
+    kindChips,
+    h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'What to follow'), query, hint),
+    h('div', { class: 'grid-2' }, field('Post into', channel), field('Only posts mentioning (optional)', keywords, 'Comma-separated words. Leave empty for everything.')),
+    h('label', { class: 'row gap tight' }, postNow, h('span', null, 'Also post the newest item right now (to see what it looks like)')),
+    h('div', { class: 'row gap' },
+      h('button', { class: 'btn', onclick: (e) => doPreview(e.currentTarget) }, 'Preview'),
+      h('button', { class: 'btn primary', onclick: async (e) => {
+        const b = e.currentTarget; b.disabled = true;
+        try {
+          if (!textChannels.length) throw new Error('Make a text channel first.');
+          const f = await api('POST', `/servers/${s.id}/feeds`, { kind, query: query.value, channelId: channel.value, keywords: keywords.value, postLatest: postNow.checked });
+          toast(`Following ${f.title}. New items will show up in #${chName(f.channelId)}.`);
+          newsBotTab(s, body);
+        } catch (x) { toast(x.message, 'error'); b.disabled = false; }
+      } }, 'Follow')),
+    preview);
+}
+const newsKey = (u) => { let x = 5381; for (let i = 0; i < u.length; i++) x = ((x * 33) ^ u.charCodeAt(i)) >>> 0; return x.toString(36); };
+const mediaNewsUrl = (u) => (u ? `/media/news/${newsKey(u)}?u=${encodeURIComponent(u)}&t=${encodeURIComponent(S.mediaToken || '')}` : '');
+function newsCard(e) {
+  let host = '';
+  try { host = new URL(e.url).hostname.replace(/^www\./, ''); } catch { /* bad link */ }
+  return h('a', { class: `news-card kind-${e.kind || 'rss'}`, href: e.url, target: '_blank', rel: 'noopener noreferrer nofollow' },
+    h('div', { class: 'news-text' },
+      h('span', { class: 'news-source' }, e.source || host),
+      h('span', { class: 'news-title' }, e.title),
+      e.summary ? h('span', { class: 'news-summary' }, e.summary.length > 220 ? `${e.summary.slice(0, 220)}\u2026` : e.summary) : null,
+      h('span', { class: 'news-meta' }, [host, e.date ? fmtStamp(e.date) : ''].filter(Boolean).join(' \u00b7 '))),
+    e.image ? h('img', { class: 'news-img', src: mediaNewsUrl(e.image), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (ev) => ev.currentTarget.remove() }) : null);
+}
+
 function openServerSettings(server, startTab = 'overview') {
   if (!server) return;
   const live = () => S.servers.find((s) => s.id === server.id) || server;
@@ -3826,6 +3999,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['roles', 'Roles', 'shield', (s) => can(s, PERMS.MANAGE_ROLES)],
     ['members', 'Members', 'people', (s) => can(s, PERMS.MANAGE_ROLES) || can(s, PERMS.KICK_MEMBERS) || can(s, PERMS.BAN_MEMBERS)],
     ['emoji', 'Emoji', 'smile', (s) => can(s, PERMS.MANAGE_EMOJIS)],
+    ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bans', 'Bans', 'ban', (s) => can(s, PERMS.BAN_MEMBERS)],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
   ];
@@ -3843,7 +4017,7 @@ function openServerSettings(server, startTab = 'overview') {
     if (!allowed.some(([k]) => k === tab)) tab = allowed[0] ? allowed[0][0] : 'overview';
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
-    ({ overview, appearance, roles, members, emoji, bans, danger })[tab](s);
+    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bans, danger })[tab](s);
   };
 
   function overview(s) {

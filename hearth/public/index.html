@@ -42,14 +42,18 @@
           <input class="input" name="username" autocomplete="username" required maxlength="24" autocapitalize="off" spellcheck="false"></label>
         <label class="field"><span class="field-label">Password</span>
           <input class="input" name="password" type="password" autocomplete="current-password" required></label>
+        <label class="field" id="totp-field" hidden><span class="field-label" id="totp-label">Two-factor code</span>
+          <input class="input" name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="12" autocapitalize="off" spellcheck="false">
+          <span class="field-hint"><a href="#" id="totp-switch">Use a backup code instead</a></span></label>
         <p class="form-error" role="alert"></p>
         <button class="btn primary block" type="submit">Log in</button>
+        <p class="auth-switch"><a href="#" id="to-forgot">Forgot your password?</a></p>
         <p class="auth-switch">New here? <a href="#" id="to-register">Create an account</a></p>
       </form>
 
       <form id="register-form" autocomplete="on" hidden>
         <h2>Create your account</h2>
-        <p class="auth-sub">Your password also locks your encryption key. It can't be reset, so keep it somewhere safe.</p>
+        <p class="auth-sub">Your password also locks your encryption key. After signing up, add an email and a recovery key in Settings so you can get back in if you forget it.</p>
         <label class="field"><span class="field-label">Username</span>
           <input class="input" name="username" autocomplete="username" required minlength="2" maxlength="24" pattern="[A-Za-z0-9_.]{2,24}" autocapitalize="off" spellcheck="false">
           <span class="field-hint">Letters, numbers, _ and . — you can set a fancy display name later.</span></label>

@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -490,6 +490,60 @@ addColumn('users', 'activity_cfg', "TEXT NOT NULL DEFAULT '{}'");
 addColumn('users', 'supporter_until', 'INTEGER');
 addColumn('users', 'support_code', 'TEXT');
 addColumn('users', 'stripe_customer', 'TEXT');
+
+// v12: sessions are stored as SHA-256 fingerprints of their tokens (see auth() in index.js). Existing raw tokens
+// are converted once, so nobody gets signed out by the upgrade.
+if (hasData && fromVersion < 12) {
+  const rows = db.prepare('SELECT rowid, token FROM sessions').all();
+  const upd = db.prepare('UPDATE sessions SET token = ? WHERE rowid = ?');
+  db.transaction(() => { for (const r of rows) upd.run(require('crypto').createHash('sha256').update(String(r.token)).digest('hex'), r.rowid); })();
+}
+// v12: account recovery (email, recovery key) and two-factor sign-in; news feeds posted by the server's bot.
+addColumn('users', 'email', 'TEXT');
+addColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'enc_private_key_recovery', 'TEXT');
+addColumn('users', 'recovery_salt', 'TEXT');
+addColumn('users', 'totp_secret', 'TEXT');
+addColumn('users', 'totp_enabled', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('users', 'totp_last_step', 'INTEGER');
+addColumn('users', 'backup_codes', "TEXT NOT NULL DEFAULT '[]'");
+addColumn('users', 'is_bot', 'INTEGER NOT NULL DEFAULT 0');
+db.exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;
+CREATE TABLE IF NOT EXISTS auth_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id, kind);
+CREATE TABLE IF NOT EXISTS feeds (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  channel_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  query TEXT NOT NULL,
+  url TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  keywords TEXT NOT NULL DEFAULT '',
+  created_by TEXT,
+  created_at INTEGER NOT NULL,
+  last_check INTEGER,
+  last_ok INTEGER,
+  last_error TEXT,
+  posted INTEGER NOT NULL DEFAULT 0,
+  paused INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_feeds_server ON feeds(server_id);
+CREATE TABLE IF NOT EXISTS feed_seen (
+  feed_id TEXT NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+  item_key TEXT NOT NULL,
+  seen_at INTEGER NOT NULL,
+  PRIMARY KEY (feed_id, item_key)
+);
+`);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

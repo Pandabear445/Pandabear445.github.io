@@ -509,6 +509,16 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   async function owner() {
     const o = await api('GET', '/admin/owner');
     const act = await api('GET', '/admin/activity').catch(() => ({}));
+    const mail = await api('GET', '/admin/mail').catch(() => ({}));
+    const mf = {
+      publicUrl: h('input', { class: 'input', value: mail.publicUrl || location.origin, placeholder: 'https://chat.example.com' }),
+      host: h('input', { class: 'input', value: mail.host || '', placeholder: 'smtp-relay.brevo.com' }),
+      port: h('input', { class: 'input', type: 'number', value: String(mail.port || 587) }),
+      user: h('input', { class: 'input', value: mail.user || '', autocomplete: 'off' }),
+      pass: h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: mail.passSet ? 'Saved (paste to replace)' : 'SMTP password / API key' }),
+      from: h('input', { class: 'input', value: mail.from || '', placeholder: 'Hearth <no-reply@yourdomain.com>' }),
+      test: h('input', { class: 'input', type: 'email', placeholder: 'you@example.com' }),
+    };
     const lastfmKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.lastfmKeySet ? 'Saved (paste to replace, or clear)' : 'Last.fm API key' });
     const rawgKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.rawgKeySet ? 'Saved (paste to replace, or clear)' : 'RAWG API key (optional)' });
     const saveKeys = async (patch) => { try { await api('PATCH', '/admin/activity', patch); toast('Saved.'); owner(); } catch (e) { toast(e.message, 'error'); } };
@@ -553,6 +563,16 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       field('Storage for supporters (MB)', supQuota, 'More room for people who help pay. Empty or 0 = same limit as everyone. Automatic payments and other perks: the Money tab.'),
       h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value }) }, 'Save')),
       o.supporters.length ? h('div', { class: 'adm-table' }, ...o.supporters.map((u) => h('div', { class: 'adm-row three' }, userCell(u, openUser), h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter'), h('button', { class: 'btn ghost sm', onclick: () => openUser(u.id) }, 'Manage')))) : h('p', { class: 'field-hint' }, 'No supporters yet.'),
+
+      h('div', { class: 'admin-head' }, h('h3', null, 'Email (password resets)'), h('span', { class: `rpill ${mail.ready ? 'ok' : 'warn'}` }, mail.ready ? 'Working' : 'Not set up')),
+      h('p', { class: 'field-hint' }, 'Lets people confirm an email and reset a forgotten password. Any SMTP service works. Free options: Brevo (300 emails/day), Resend (100/day) or a Gmail account with an app password (Google Account \u2192 Security \u2192 App passwords; host smtp.gmail.com, port 465).'),
+      h('div', { class: 'grid-2' },
+        field('Your server\u2019s address', mf.publicUrl, 'Used in reset links. Must be https://.'), field('From', mf.from, 'The sender people see.'),
+        field('SMTP host', mf.host), field('Port', mf.port, '587 (STARTTLS) or 465 (SSL).'),
+        field('Username', mf.user), field('Password', mf.pass)),
+      h('div', { class: 'row gap wrap' },
+        h('button', { class: 'btn primary', onclick: async () => { try { await api('PUT', '/admin/mail', { publicUrl: mf.publicUrl.value.trim(), host: mf.host.value.trim(), port: mf.port.value, user: mf.user.value.trim(), from: mf.from.value.trim(), ...(mf.pass.value ? { pass: mf.pass.value } : {}) }); toast('Saved.'); owner(); } catch (e) { toast(e.message, 'error'); } } }, 'Save email settings'),
+        mf.test, h('button', { class: 'btn', onclick: async (e) => { const b = e.currentTarget; b.disabled = true; try { await api('POST', '/admin/mail/test', { to: mf.test.value.trim() }); toast('Test email sent. Check that inbox (and spam).'); } catch (x) { toast(x.message, 'error'); } b.disabled = false; } }, 'Send a test email')),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Games & music')),
       h('p', { class: 'field-hint' }, `People show what they\u2019re playing and listening to, and their favorite games. Game pictures come from Steam and Wikipedia with no setup (${act.games || 0} games looked up so far). Two free keys make it better:`),
@@ -628,6 +648,7 @@ async function userModal(id, refresh, myRank = 2) {
         h('span', { class: 'stat-sub' }, `Joined ${fmtStamp(u.createdAt)} \u00b7 ${u.servers.length} servers \u00b7 made ${u.reportsBy} reports`)),
       h('h4', null, 'IP addresses'),
       h('div', { class: 'adm-table' }, ...u.ips.map((x) => h('div', { class: 'adm-row three' }, ipChip(x.ip), h('span', { class: 'stat-sub' }, `first ${fmtStamp(x.firstSeen)}`), h('span', { class: 'stat-sub' }, `last ${ago(x.lastSeen)}`)))),
+      h('p', { class: 'field-hint' }, `Email: ${u.emailMasked || 'none'} \u00b7 Two-factor: ${u.totpEnabled ? 'on' : 'off'} \u00b7 Recovery key: ${u.hasRecovery ? 'saved' : 'none'}`),
       h('h4', null, `Signed-in devices \u2014 ${u.sessions.length}`),
       h('div', { class: 'adm-table' }, ...u.sessions.map((x) => h('div', { class: 'adm-row three' }, h('span', null, device(x.ua)), x.ip ? ipChip(x.ip) : h('span'), h('span', { class: 'stat-sub' }, `active ${ago(x.lastSeen)}`)))),
       u.reportsAgainst.length ? h('h4', null, `Reports about them \u2014 ${u.reportsAgainst.length}`) : null,
@@ -638,6 +659,7 @@ async function userModal(id, refresh, myRank = 2) {
         h('div', { class: 'kv' }, h('span', null, 'Profile comments written'), h('strong', null, String(u.commentsWritten))),
         u.canAct ? h('div', { class: 'row gap wrap' },
           h('button', { class: `chip${u.storage.blocked ? ' active' : ''}`, onclick: () => setLimits({ uploadsBlocked: !u.storage.blocked }, u.storage.blocked ? 'Uploads turned back on.' : 'Uploads turned off.') }, u.storage.blocked ? 'Uploads are off \u2014 turn on' : 'Turn off uploads'),
+          myRank >= 2 && u.totpEnabled ? h('button', { class: 'chip', onclick: async () => { if (!(await confirmDialog({ title: `Remove two-factor sign-in for ${u.username}?`, text: 'Only do this if you\u2019re sure it\u2019s really them (they lost their phone and backup codes). They can set it up again in Settings.', confirm: 'Remove 2FA', danger: true }))) return; await api('POST', `/admin/users/${u.id}/2fa/remove`); toast('Two-factor sign-in removed.'); refresh(); } }, '\uD83D\uDD10 2FA on \u2014 remove') : null,
           myRank >= 2 ? h('button', { class: `chip${u.supporter ? ' active' : ''}`, onclick: () => setLimits({ supporter: !u.supporter }, u.supporter ? 'No longer a supporter.' : 'Marked as a supporter. Thank you, them!') }, u.supporter ? '\uD83D\uDC9C Supporter \u2014 remove' : 'Mark as supporter') : null,
           h('button', { class: `chip${u.profileLocked ? ' active' : ''}`, onclick: () => setLimits({ profileLocked: !u.profileLocked }, u.profileLocked ? 'Profile unlocked.' : 'Profile locked.') }, u.profileLocked ? 'Profile is locked \u2014 unlock' : 'Lock profile'),
           myRank >= 2 ? h('button', { class: 'chip', onclick: () => {

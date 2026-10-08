@@ -72,6 +72,7 @@ const userVoice = new Map(); // userId -> channelId
 const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(userId).size > 0;
 // Games/music people are playing (server/activity.js fills these in once everything it needs exists).
 let ACT = { activityFor: () => null, recentFor: () => undefined };
+let ACCT = null; // server/accounts.js: email, recovery key, two-factor
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
@@ -93,6 +94,7 @@ function publicUser(row) {
     publicKey: row.public_key,
     signPublicKey: row.sign_public_key || null,
     supporter: !!row.supporter || undefined,
+    bot: !!row.is_bot || undefined,
     activity: ACT.activityFor(row) || undefined,
     recentGames: ACT.recentFor(row),
     createdAt: row.created_at,
@@ -108,6 +110,7 @@ function selfUser(row) {
   u.profileLocked = !!row.profile_locked;
   u.staffRole = staffRole(row.id);
   u.instanceAdmin = (STAFF_RANK[u.staffRole] || 0) >= 2;
+  if (ACCT) Object.assign(u, ACCT.selfExtras(row));
   return u;
 }
 
@@ -206,7 +209,7 @@ function serializeMessage(row, channel, reactions) {
     channelId: row.channel_id,
     serverId: channel.server_id,
     authorId: row.author_id,
-    ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [] }),
+    ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [], ...(data.embed ? { embed: data.embed } : {}), ...(data.bot ? { bot: true } : {}) }),
     replyTo: row.reply_to,
     reply,
     threadId: row.thread_id || null,
@@ -621,7 +624,7 @@ function recordIp(userId, ip, token) {
   ipSeen.set(k, t);
   db.prepare('UPDATE users SET last_ip = ?, last_seen_at = ? WHERE id = ?').run(ip, t, userId);
   db.prepare('INSERT INTO user_ips (user_id, ip, first_seen, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen').run(userId, ip, t, t);
-  if (token) db.prepare('UPDATE sessions SET ip = ? WHERE token = ?').run(ip, token);
+  if (token) db.prepare('UPDATE sessions SET ip = ? WHERE token = ?').run(ip, tokenId(token));
 }
 // IP bans: single addresses or IPv4 ranges (CIDR), checked on sign-up, login and live connections.
 const ipBans = () => { try { return JSON.parse(getSetting('ipBans') || '[]'); } catch { return []; } };
@@ -653,10 +656,13 @@ function stillSuspended(row) {
   }
   return true;
 }
+// Sessions are stored by a SHA-256 fingerprint of the token, never the token itself: someone with a copy of
+// the database (a stolen backup, say) can't use it to sign in as anyone.
+const tokenId = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
-  const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(tokenId(token));
   if (!s) return res.status(401).json({ error: 'Not signed in.' });
   const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until FROM users WHERE id = ?').get(s.user_id);
   if (!u) return res.status(401).json({ error: 'Not signed in.' });
@@ -664,7 +670,7 @@ function auth(req, res, next) {
   if (maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
   req.userId = s.user_id;
   req.token = token;
-  if (!s.last_seen || Date.now() - s.last_seen > 60000) db.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?').run(Date.now(), token);
+  if (!s.last_seen || Date.now() - s.last_seen > 60000) db.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?').run(Date.now(), tokenId(token));
   recordIp(s.user_id, req.ip, token);
   next();
 }
@@ -756,6 +762,7 @@ api.get('/config', (req, res) => {
     features: features(),
     funding: fundingPublic(),
     support: MONEY.available(),
+    emailEnabled: !!(ACCT && ACCT.mailReady()),
     registrationOpen: regMode() !== 'closed',
     registrationRequiresCode: regMode() === 'code',
     termsVersion: termsInfo().version || 0,
@@ -817,7 +824,7 @@ api.post('/auth/register', wrap(async (req, res) => {
   db.prepare(`INSERT INTO users (id, username, auth_hash, public_key, enc_private_key, profile, created_at, kdf, kdf_salt, tos_version)
               VALUES (?, ?, ?, ?, ?, ?, ?, 'argon2id', ?, ?)`).run(id, username, hash, publicKey, encPrivateKey, JSON.stringify(profile), now(), kdfSalt, tos.version || null);
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(token, id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
+  db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(tokenId(token), id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
   recordIp(id, req.ip, token);
   addSupportFriend(id);
   res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey });
@@ -836,14 +843,17 @@ api.post('/auth/login', wrap(async (req, res) => {
   if (!ok) { noteAuthFailure(req.ip); secEvent('failed_login', req.ip, String(username || '').slice(0, 40)); fail(401, 'Wrong username or password.'); }
   if (maintenance() && !isStaff(row.id)) fail(503, maintenance(), 'maintenance');
   if (stillSuspended(row)) fail(403, suspendedMsg(row), 'suspended');
+  if (row.is_bot) fail(401, 'Wrong username or password.');
+  // Two-factor sign-in: the right password isn't enough on its own.
+  ACCT.require2fa(row, req.body);
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(token, row.id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
+  db.prepare('INSERT INTO sessions (token, user_id, created_at, ua, last_seen, ip) VALUES (?, ?, ?, ?, ?, ?)').run(tokenId(token), row.id, now(), String(req.headers['user-agent'] || '').slice(0, 300), now(), cleanIp(req.ip));
   recordIp(row.id, req.ip, token);
   res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key });
 }));
 
 api.post('/auth/logout', auth, (req, res) => {
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(req.token);
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(tokenId(req.token));
   res.json({ ok: true });
 });
 
@@ -856,7 +866,7 @@ api.post('/me/password', auth, wrap(async (req, res) => {
   if (!isSalt(salt)) fail(400, 'This page is out of date. Reload and try again.');
   db.prepare(`UPDATE users SET auth_hash = ?, enc_private_key = ?, kdf = 'argon2id', kdf_salt = ? WHERE id = ?`)
     .run(await bcrypt.hash(newAuthKey, 11), encPrivateKey, salt, req.userId);
-  if (!keepSessions) db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.userId, req.token);
+  if (!keepSessions) db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.userId, tokenId(req.token));
   res.json({ ok: true });
 }));
 
@@ -1238,6 +1248,13 @@ api.post('/invites/:code/join', auth, (req, res) => {
 
 // ---------------------------------------------------------------- server encryption keys
 const isWrapped = (s) => typeof s === 'string' && s.length > 40 && s.length < 2000;
+// Which wrapped keys were made for a public key the person no longer has (the sharer's app had stale info).
+// Apps send the public key they wrapped for; older apps that don't are trusted as before.
+function staleWraps(pubs, ids) {
+  if (!pubs || typeof pubs !== 'object') return [];
+  const get = db.prepare('SELECT public_key FROM users WHERE id = ?');
+  return ids.filter((uid) => typeof pubs[uid] === 'string' && (get.get(uid) || {}).public_key !== pubs[uid]);
+}
 
 api.get('/servers/:id/keys', auth, (req, res) => {
   requireServer(req.params.id, req.userId);
@@ -1248,7 +1265,7 @@ api.get('/servers/:id/keys', auth, (req, res) => {
 api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('rotate:' + req.userId, 30, 60 * 1000);
-  const { epoch, check, wraps } = req.body || {};
+  const { epoch, check, wraps, pubs } = req.body || {};
   if (typeof check !== 'string' || !/^[A-Za-z0-9+/=]{16,64}$/.test(check)) fail(400, 'Bad key check.');
   if (!wraps || typeof wraps !== 'object') fail(400, 'Missing wrapped keys.');
   const tx = db.transaction(() => {
@@ -1257,6 +1274,8 @@ api.post('/servers/:id/keys/rotate', auth, (req, res) => {
     const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(s.id).map((r) => r.user_id);
     const ids = Object.keys(wraps);
     if (ids.length !== members.length || !members.every((m) => isWrapped(wraps[m]))) fail(409, 'The member list changed. Try again.', 'members');
+    const stale = staleWraps(pubs, members);
+    if (stale.length) fail(409, 'A member\u2019s keys just changed. Try again.', 'stale_keys');
     const t = now();
     db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur + 1, check, req.userId, t);
     const ins = db.prepare('INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
@@ -1272,17 +1291,29 @@ api.post('/servers/:id/keys/rotate', auth, (req, res) => {
 api.post('/servers/:id/keys/share', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('share:' + req.userId, 60, 60 * 1000);
-  const { epoch, wraps } = req.body || {};
+  const { epoch, wraps, pubs } = req.body || {};
   const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
   if (!cur || Number(epoch) !== cur) fail(409, 'That key is out of date.', 'epoch');
   if (!db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND epoch = ? AND user_id = ?').get(s.id, cur, req.userId)) fail(403, 'You do not have this key.');
   const ins = db.prepare('INSERT OR IGNORE INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
   let n = 0;
+  const stale = staleWraps(pubs, Object.keys(wraps || {}));
   for (const [uid, w] of Object.entries(wraps || {}).slice(0, 200)) {
+    if (stale.includes(uid)) continue;
     if (isMember(s.id, uid) && isWrapped(w)) n += ins.run(s.id, cur, uid, w, req.userId, now()).changes;
   }
   if (n) emitKeyState(s.id);
-  res.json({ shared: n });
+  res.json({ shared: n, stale });
+});
+// A member's app couldn't unlock the key it was given (wrapped for keys it no longer has, e.g. right after
+// a password reset): drop it so the others share it again.
+api.post('/servers/:id/keys/bad', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  rateLimit('badkey:' + req.userId, 20, 60 * 60 * 1000);
+  const epoch = Number((req.body || {}).epoch);
+  const n = db.prepare('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').run(s.id, req.userId, epoch).changes;
+  if (n) emitKeyState(s.id);
+  res.json({ removed: n });
 });
 
 // ---------------------------------------------------------------- channels
@@ -1971,15 +2002,15 @@ api.patch('/me/privacy', auth, (req, res) => {
 const sessionId = (token) => crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
 api.get('/me/sessions', auth, (req, res) => {
   res.json(db.prepare('SELECT token, created_at, last_seen, ua FROM sessions WHERE user_id = ? ORDER BY last_seen DESC').all(req.userId)
-    .map((r) => ({ id: sessionId(r.token), current: r.token === req.token, createdAt: r.created_at, lastSeen: r.last_seen || r.created_at, ua: r.ua || '' })));
+    .map((r) => ({ id: sessionId(r.token), current: r.token === tokenId(req.token), createdAt: r.created_at, lastSeen: r.last_seen || r.created_at, ua: r.ua || '' })));
 });
 api.delete('/me/sessions/:id', auth, (req, res) => {
   const rows = db.prepare('SELECT token FROM sessions WHERE user_id = ?').all(req.userId);
   const hit = rows.find((r) => sessionId(r.token) === req.params.id);
   if (!hit) fail(404, 'Session not found.');
-  if (hit.token === req.token) fail(400, 'Use Log out to end this session.');
+  if (hit.token === tokenId(req.token)) fail(400, 'Use Log out to end this session.');
   db.prepare('DELETE FROM sessions WHERE token = ?').run(hit.token);
-  io.in(`user:${req.userId}`).fetchSockets().then((socks) => socks.filter((x) => x.data.token === hit.token).forEach((x) => x.disconnect(true))).catch(() => {});
+  io.in(`user:${req.userId}`).fetchSockets().then((socks) => socks.filter((x) => tokenId(x.data.token) === hit.token).forEach((x) => x.disconnect(true))).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -1994,7 +2025,7 @@ const getSetting = (k) => (db.prepare('SELECT value FROM instance_settings WHERE
 const setSetting = (k, v) => (v === null || v === undefined
   ? db.prepare('DELETE FROM instance_settings WHERE key = ?').run(k)
   : db.prepare('INSERT OR REPLACE INTO instance_settings (key, value) VALUES (?, ?)').run(k, String(v)));
-const firstAccount = () => (db.prepare('SELECT id FROM users ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
+const firstAccount = () => (db.prepare('SELECT id FROM users WHERE is_bot = 0 ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
 const STAFF_RANK = { moderator: 1, admin: 2, owner: 3 };
 const envAdmins = () => (process.env.ADMIN_USERS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
 // { userId: 'admin' | 'moderator' }. Older versions kept a plain list of extra admins under 'admins'.
@@ -2026,6 +2057,10 @@ const staffRank = (uid) => STAFF_RANK[staffRole(uid)] || 0;
 const isStaff = (uid) => staffRank(uid) >= 1;
 function isInstanceAdmin(uid) { return staffRank(uid) >= 2; }
 const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'Only the server administrator can change this.'); };
+// Email, recovery key and two-factor sign-in (server/accounts.js).
+ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, newId, seal, unseal,
+  tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), adminLog: (...a) => adminLog(...a), secEvent: (...a) => secEvent(...a), cleanIp, recordIp,
+  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, DATA_DIR });
 // The key saved in the app wins over .env, so the admin never has to edit files.
 const giphyKey = () => getSetting('giphyKey') || GIPHY_API_KEY;
 const giphyRating = () => (['g', 'pg', 'pg-13', 'r'].includes(getSetting('giphyRating')) ? getSetting('giphyRating') : 'pg-13');
@@ -2318,6 +2353,10 @@ app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
   } catch { if (!res.headersSent) res.status(502).end(); } finally { clearTimeout(timer); }
 }));
 
+// The news bot (server/newsbot.js): follows feeds and posts new items into channels.
+const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer,
+  canManageServer: (s, uid) => can(s, uid, PM.MANAGE_SERVER), serializeMessage, toChannel, checkMediaToken, emitServerFeeds: () => {},
+  searchSteam: (q) => ACT.searchGames(q) });
 ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken,
   requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
 
@@ -2633,6 +2672,7 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     online: onlineSockets.has(r.id), isAdmin: isInstanceAdmin(r.id), ips: ipsOf(r.id), suspendedUntil: r.suspended_until,
     canAct: r.id !== req.userId && staffRank(req.userId) > staffRank(r.id), myRole: staffRole(req.userId),
     storage: quotaOf(r.id), quotaOverride: r.upload_quota_mb, profileLocked: !!r.profile_locked, supporter: !!r.supporter,
+    emailMasked: ACCT ? ACCT.mask(r.email) : '', totpEnabled: !!r.totp_enabled, hasRecovery: !!r.enc_private_key_recovery,
     commentsWritten: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE author_id = ?').get(r.id).n,
     notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
       .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
@@ -3425,7 +3465,7 @@ function setupSockets(server) {
 
   io.use((socket, next) => {
     const token = socket.handshake.auth && socket.handshake.auth.token;
-    const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+    const s = token && db.prepare('SELECT * FROM sessions WHERE token = ?').get(tokenId(token));
     if (!s) return next(new Error('unauthorized'));
     const u = db.prepare('SELECT id, suspended_at, suspended_until FROM users WHERE id = ?').get(s.user_id);
     if (!u || stillSuspended(u)) return next(new Error('unauthorized'));

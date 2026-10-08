@@ -22,6 +22,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   const warned = new Set();
   const fetching = new Map();
   const generation = new Map(); // serverId -> bumps whenever new keys arrive
+  const reported = new Set(); // keys we couldn't unlock and asked to be re-shared
 
   // ---------------------------------------------------------------- people + trust
   async function userWithKeys(id) {
@@ -91,6 +92,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
         generation.set(st.serverId, (generation.get(st.serverId) || 0) + 1);
       } catch (e) {
         console.warn('Could not unlock a server key', st.serverId, k.epoch, e.message);
+        // Locked for keys this account no longer has (or damaged): ask for it to be shared again. Once per
+        // key per session. Not for "untrusted sharer": that one waits for you to verify them.
+        const tag = `${st.serverId}|${k.epoch}`;
+        if (e.message !== 'untrusted sharer' && !reported.has(tag)) { reported.add(tag); api('POST', `/servers/${st.serverId}/keys/bad`, { epoch: k.epoch }).catch(() => {}); }
       }
     }
     (waiters.get(st.serverId) || []).forEach((r) => r());
@@ -132,6 +137,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   async function wrapFor(serverId, epoch, raw, userIds) {
     const wraps = {};
+    const pubs = {}; // the public key each one is wrapped for, so the server can refuse stale ones
     for (const uid of userIds) {
       const u = uid === S.me.id ? S.me : await userWithKeys(uid);
       if (!u || !u.publicKey) throw new Error(`Missing encryption key for a member.`);
@@ -141,8 +147,13 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
         throw err;
       }
       wraps[uid] = await E2EE.wrapGroupKey({ raw, serverId, epoch, recipientId: uid, recipientPub: u.publicKey, wrapperId: S.me.id, signKey: S.signKey });
+      pubs[uid] = u.publicKey;
     }
-    return wraps;
+    return { wraps, pubs };
+  }
+  // Someone's keys changed under us: fetch them fresh before trying again.
+  async function refreshUsers(ids) {
+    await Promise.all(ids.map((id) => api('GET', '/users/' + id).then((x) => { S.users[id] = { ...(S.users[id] || {}), ...x }; }).catch(() => {})));
   }
 
   async function rotate(serverId) {
@@ -151,9 +162,12 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!server || !st) return;
     const epoch = st.keyEpoch + 1;
     const raw = E2EE.newGroupKey();
-    const wraps = await wrapFor(serverId, epoch, raw, server.memberIds);
+    const { wraps, pubs } = await wrapFor(serverId, epoch, raw, server.memberIds);
     const check = await E2EE.keyCheck(raw, serverId, epoch);
-    const next = await api('POST', `/servers/${serverId}/keys/rotate`, { epoch, check, wraps });
+    const next = await api('POST', `/servers/${serverId}/keys/rotate`, { epoch, check, wraps, pubs }).catch(async (e) => {
+      if (e.code === 'stale_keys') { await refreshUsers(server.memberIds.filter((id) => id !== S.me.id)); setTimeout(() => maintain(serverId), 500); }
+      throw e;
+    });
     keysFor(serverId).set(epoch, raw);
     await applyState(next);
   }
@@ -164,8 +178,9 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!ck || !server || !userIds.length) return;
     const ids = userIds.filter((id) => server.memberIds.includes(id));
     if (!ids.length) return;
-    const wraps = await wrapFor(serverId, ck.epoch, ck.raw, ids);
-    await api('POST', `/servers/${serverId}/keys/share`, { epoch: ck.epoch, wraps });
+    const { wraps, pubs } = await wrapFor(serverId, ck.epoch, ck.raw, ids);
+    const r = await api('POST', `/servers/${serverId}/keys/share`, { epoch: ck.epoch, wraps, pubs });
+    if (r && r.stale && r.stale.length) { await refreshUsers(r.stale); setTimeout(() => maintain(serverId), 500); }
   }
 
   // Wait until we can send in this server (rotating ourselves if the key needs refreshing).
@@ -223,7 +238,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   async function decryptChannelMessage(m) {
     if (m.dec && !m.dec.pending) return;
-    if (m.legacy) m.dec = { t: m.content || '', f: m.attachments || [], legacy: true, verified: true };
+    if (m.legacy) m.dec = { t: m.content || '', f: m.attachments || [], legacy: true, verified: true, embed: m.embed || null, bot: !!m.bot };
     else {
       // If a key arrives while we're decrypting, try again so we never keep a stale "waiting" result.
       for (let i = 0; i < 3; i++) {

@@ -342,6 +342,10 @@ All chats are end-to-end encrypted: your browser encrypts each message and file 
 | Your signing key | **ECDSA P-256**. Signs channel messages, key handoffs and voice handshakes so nobody can impersonate you. |
 | Each message | **AES-256-GCM** with its own key, derived by **HKDF-SHA256** from the conversation key and a random 256-bit salt. The channel or DM, the author and the key version are bound in, so the server can't move a message or change who sent it. |
 | Each attachment | Its own random AES-256-GCM key, carried inside the encrypted message. |
+| Message length | Padded before encrypting (to 256-byte steps, 1 KiB steps above 4 KiB), so the server can't tell "ok" from a sentence. |
+| Sign-in sessions | The database stores only a SHA-256 hash of each session token, so a copy of the database can't be used to sign in as anyone. |
+| Recovery key | 160 random bits, shown once. Locks a second copy of your private key (HKDF-SHA256 + AES-256-GCM, its own salt). The server never sees it. |
+| Two-factor | Standard authenticator codes (RFC 6238). A code can't be used twice, guesses are rate-limited, backup codes are stored hashed. |
 | DMs | Conversation key from ECDH between the two of you. DMs aren't signed, so they stay deniable (like Signal). |
 | Server channels | A random 256-bit **group key** per server, sent to each member encrypted to their identity key (ECIES) and signed by whoever shared it. When anyone leaves or is removed, a new key is created automatically and given only to the remaining members, so former members can't read anything new. New members can read from the key that was current when they joined; older messages stay locked to the people who were there. |
 
@@ -352,7 +356,11 @@ Your browser remembers everyone's keys the first time it sees them. If the serve
 ### Things to know
 
 - **Saved messages, the notification center and per-device preferences** (layout, favorites, collapsed categories, notification levels) live in your browser, not on the server.
-- **There is no password reset.** Your password is what unlocks your keys. If you forget it, your messages can't be decrypted by anyone, including the host. You can make a new account.
+- **Forgot your password?** Add an email (Settings → My Account → Email) and the sign-in screen's **Forgot your password?** link emails you a reset link (good for 30 minutes, one use). Your password is what unlocks your keys, so what you keep depends on the **recovery key**:
+  - **With your recovery key** (Settings → My Account → Recovery key, shown once — write it down): you keep everything, including all old messages.
+  - **Without it:** you get your account, name, friends and servers back, but with new keys. Old encrypted messages can't be read any more (by anyone), and friends see "Security key changed" on you; once one of them verifies you (click the shield next to your name), you get the server keys again and can read new messages.
+- **Two-factor sign-in** (Settings → My Account → Two-factor sign-in): after your password, sign-in asks for a 6-digit code from an authenticator app (Google Authenticator, Authy, 1Password, Microsoft Authenticator…). You get 10 one-time backup codes. Password resets also need the code. If someone loses their phone and their backup codes, an admin can turn it off for them in Admin → Users.
+- **Check my encryption** (Settings → My Account) runs every lock on your device — including that tampered, misaddressed and outsider messages are refused — and checks your own keys and every server key, without sending anything.
 - **Logging out removes your keys from that browser.** Log back in to read everything again — your history works on every device you log in from.
 - **New members need someone online.** A member who already has the server's key must be online (any open tab, even in the background) to hand it to a new member. Until then they see "Waiting for the encryption key".
 - **Trust on first use.** The key-change warning protects you from the moment your browser first sees someone. On a brand-new device you're trusting the server's first answer — that's what safety numbers are for.
@@ -404,6 +412,8 @@ Stop the server (or copy while idle) for a clean copy of the database.
 | `DOWNLOADS_DIR` | `data/downloads` | Installers offered on `/download` |
 | `DESKTOP_DOWNLOAD_URL` | — | Link `/download` to your GitHub releases page instead |
 | `AT_REST_KEY` | — | 64-hex-char key instead of `data/secret.key` (for pre-upgrade messages) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `MAIL_FROM` | — | Email for password resets (or set it in Admin → Owner → Email) |
+| `PUBLIC_URL` | — | This server's public address, used in reset links |
 
 ---
 
@@ -421,6 +431,22 @@ Stop the server (or copy while idle) for a clean copy of the database.
 ## Not included (yet)
 
 App Store / Play Store listings, screen sharing in the Android app, push notifications for the Android app while it's swiped away, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
+
+## Email (password resets)
+
+Password resets need the server to send email. In **Admin → Owner → Email**, fill in an SMTP server and press **Send a test email**. Free options:
+
+- **Brevo** (300 emails/day free): SMTP host `smtp-relay.brevo.com`, port `587`, your Brevo login and SMTP key.
+- **Resend** (3,000/month free): host `smtp.resend.com`, port `465`, user `resend`, password = your API key. Needs your own domain.
+- **Gmail**: host `smtp.gmail.com`, port `465`, your address and an *app password* (Google Account → Security → 2-Step Verification → App passwords).
+
+Set **Your server’s address** to the public URL people use (for example `https://kappachat.duckdns.org`) — reset links point there. Or use `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`, `PUBLIC_URL`. The SMTP password is stored encrypted.
+
+## News bot
+
+In a server's **Server Settings → News bot** (needs Manage Server), follow a topic (Google News), a YouTube channel, a subreddit, a Steam game's news, a GitHub project's releases, or any RSS/Atom feed, and pick the channel to post in. Press **Preview** to see what it would find. The bot posts only things published **after** you add the feed — never a backlog of old news — at most 3 at a time, checking every 15 minutes. Add keywords to post only matching items (for example `patch, update`). Bot posts show a **BOT** tag and a card with the picture, which loads through your server so readers' IPs aren't shared.
+
+Bot posts come from public feeds, so they aren't end-to-end encrypted (the server writes them). The bot can't sign in and can't read your encrypted messages. The server needs outgoing internet access to the sites you follow.
 
 ## Games & music: setup
 

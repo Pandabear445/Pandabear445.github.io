@@ -436,6 +436,7 @@ function accountTab(app) {
     section('Your account',
       h('div', { class: 'kv' }, h('span', null, 'Username'), h('strong', null, S.me.username)),
       h('div', { class: 'kv' }, h('span', null, 'Member since'), h('strong', null, new Date(S.me.createdAt).toLocaleDateString()))),
+    ...securitySections(app),
     section('Storage', storage),
     section('Encryption',
       h('p', { class: 'muted-p' }, 'Everything you send \u2014 DMs, server channels and every file \u2014 is end-to-end encrypted on this device before it leaves. The server only stores scrambled data and can\u2019t read it.'),
@@ -446,12 +447,187 @@ function accountTab(app) {
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Your key fingerprint'), fp,
         h('span', { class: 'field-hint' }, 'Open a DM and click \u201cEnd-to-end encrypted\u201d to compare safety numbers with a friend.'))),
     section('Change password',
-      h('p', { class: 'muted-p warn' }, 'There is no password reset. If you forget it, your encrypted DMs cannot be recovered — not even by the server owner.'),
+      h('p', { class: 'muted-p' }, 'Your password locks your encryption key, so changing it re-locks the key on this device. Forgot it? Use \u201cForgot your password?\u201d on the sign-in screen (needs a confirmed email; keep a recovery key to keep your old messages).'),
       field('Current password', oldPw), field('New password', newPw), field('Confirm new password', confirmPw), msg,
       h('div', null, btn)),
     section('Session',
       h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device')),
   );
+}
+
+// ------------------------------------------------------------------ account safety: email, recovery key, 2FA
+// Asks for the password again (sensitive changes). Checked on this device first: it must unlock your key.
+function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'Continue' } = {}) {
+  const S = app.S;
+  return new Promise((resolve) => {
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    modal({ title, size: 'sm', onClose: () => resolve(null),
+      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw)),
+      actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
+        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
+        const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
+        try { await E2EE.unwrapPrivateKey(keys.wrapKey, S.encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
+        resolve(keys);
+      } }] });
+  });
+}
+function showSecretOnce({ title, intro, secret, filename, note }) {
+  return new Promise((resolve) => {
+    const ok = h('input', { type: 'checkbox' });
+    let m;
+    const done = h('button', { class: 'btn primary', disabled: true, onclick: () => { m.close(); resolve(); } }, 'Done');
+    ok.addEventListener('change', () => { done.disabled = !ok.checked; });
+    m = modal({ title, size: 'md', dismissable: false,
+      body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, intro),
+        h('div', { class: 'cmd-box secret-box' }, h('code', null, secret)),
+        h('div', { class: 'row gap' },
+          h('button', { class: 'btn', onclick: () => { navigator.clipboard.writeText(secret).then(() => toast('Copied.')); } }, icon('copy'), 'Copy'),
+          h('button', { class: 'btn', onclick: () => { const url = URL.createObjectURL(new Blob([`${title}\n\n${secret}\n\n${note || ''}\n`], { type: 'text/plain' })); h('a', { href: url, download: filename }).click(); setTimeout(() => URL.revokeObjectURL(url), 5000); } }, icon('download'), 'Download')),
+        note ? h('p', { class: 'field-hint' }, note) : '',
+        h('label', { class: 'row gap tight' }, ok, h('span', null, 'I saved it somewhere safe')),
+        h('div', null, done)) });
+  });
+}
+function securitySections(app) {
+  const S = app.S;
+  const refresh = (u) => { if (u && u.id) app.onMe(u); drawAll(); };
+  // ---- email
+  const emailBox = h('div', { class: 'stack' });
+  const verifyEmail = (sentTo) => {
+    const code = h('input', { class: 'input', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', placeholder: '123456' });
+    modal({ title: 'Check your email', size: 'sm', body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `We sent a 6-digit code to ${sentTo}. It works for 30 minutes.`), field('Code', code)),
+      actions: [{ label: 'Cancel' }, { label: 'Confirm email', kind: 'primary', action: async () => { refresh(await api('POST', '/me/email/verify', { code: code.value })); toast('Email confirmed. You can now reset your password with it.'); } }] });
+  };
+  const addEmail = async () => {
+    const email = h('input', { class: 'input', type: 'email', autocomplete: 'email', placeholder: 'you@example.com' });
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    modal({ title: S.me.email ? 'Change your email' : 'Add an email', size: 'sm',
+      body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw)),
+      actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
+        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
+        const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
+        const r = await api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey });
+        setTimeout(() => verifyEmail(r.sentTo), 150);
+      } }] });
+  };
+  const drawEmail = () => {
+    clear(emailBox);
+    if (S.me.email) {
+      emailBox.append(h('div', { class: 'kv' }, h('span', null, 'Email'), h('strong', null, S.me.email, ' ', h('span', { class: 'rpill ok' }, 'Confirmed'))),
+        h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: addEmail }, 'Change'),
+          h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app, { text: 'Without an email you can’t reset a forgotten password.' }); if (!k) return; refresh(await api('DELETE', '/me/email', { authKey: k.authKey })); toast('Email removed.'); } }, 'Remove')));
+    } else {
+      emailBox.append(h('p', { class: 'muted-p' }, 'Add an email so you can reset your password if you ever forget it.'),
+        S.config.emailEnabled ? h('div', null, h('button', { class: 'btn primary', onclick: addEmail }, 'Add an email'))
+          : h('p', { class: 'field-hint' }, 'The server owner hasn’t set up email yet (Admin → Owner → Email).'));
+    }
+  };
+  // ---- recovery key
+  const recBox = h('div', { class: 'stack' });
+  const makeRecovery = async () => {
+    const keys = await askPassword(app, { title: 'Create a recovery key', text: S.me.hasRecovery ? 'Your old recovery key will stop working.' : '' });
+    if (!keys) return;
+    const code = E2EE.newRecoveryCode();
+    const salt = E2EE.newKdfSalt();
+    const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), S.encPrivateKey);
+    const u = await api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt });
+    await showSecretOnce({ title: `${S.config.name} recovery key for ${S.me.username}`, intro: 'Save this key. If you forget your password, the email reset plus this key brings back everything, including your old messages. It’s shown only now.',
+      secret: code, filename: `${S.config.name.replace(/\W+/g, '-')}-recovery-key-${S.me.username}.txt`, note: 'Anyone with this key AND access to your email could get into your account, so keep it private (a password manager is ideal).' });
+    refresh(u);
+  };
+  const drawRec = () => {
+    clear(recBox);
+    recBox.append(S.me.hasRecovery
+      ? h('div', { class: 'kv' }, h('span', null, 'Recovery key'), h('span', { class: 'rpill ok' }, 'Saved'))
+      : h('p', { class: 'warn-box' }, 'No recovery key yet. If you forget your password, an email reset gets you back in, but your old direct messages would be lost for good.'),
+    h('div', { class: 'row gap' }, h('button', { class: `btn ${S.me.hasRecovery ? 'sm' : 'primary'}`, onclick: () => makeRecovery().catch((e) => toast(e.message, 'error')) }, S.me.hasRecovery ? 'Make a new one' : 'Create a recovery key'),
+      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app); if (!k) return; refresh(await api('DELETE', '/me/recovery', { authKey: k.authKey })); toast('Recovery key removed.'); } }, 'Remove') : ''));
+  };
+  // ---- two-factor
+  const tfaBox = h('div', { class: 'stack' });
+  const qrSvg = async (text) => {
+    if (!window.qrcode) await new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = '/vendor/qrcode.js'; sc.onload = res; sc.onerror = () => rej(new Error('Couldn’t load the QR code.')); document.head.append(sc); });
+    const q = window.qrcode(0, 'M'); q.addData(text); q.make();
+    return q.createSvgTag({ cellSize: 5, margin: 4, scalable: true });
+  };
+  const setup2fa = async () => {
+    const keys = await askPassword(app, { title: 'Turn on two-factor sign-in' });
+    if (!keys) return;
+    const r = await api('POST', '/me/2fa/setup', { authKey: keys.authKey });
+    const qr = h('div', { class: 'qr-box', html: await qrSvg(r.uri) });
+    const code = h('input', { class: 'input', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', placeholder: '123456' });
+    modal({ title: 'Scan this with your authenticator app', size: 'md',
+      body: h('div', { class: 'stack' },
+        h('p', { class: 'muted-p' }, 'Use Google Authenticator, Microsoft Authenticator, Authy, 1Password, Bitwarden or any app that does 6-digit codes.'),
+        h('div', { class: 'tfa-setup' }, qr, h('div', { class: 'stack' }, h('span', { class: 'field-label' }, 'Can’t scan? Type this key:'), h('code', { class: 'mono-sm' }, r.secret), field('Then enter the code it shows', code)))),
+      actions: [{ label: 'Cancel' }, { label: 'Turn on', kind: 'primary', action: async () => {
+        const res = await api('POST', '/me/2fa/enable', { code: code.value });
+        setTimeout(async () => {
+          await showSecretOnce({ title: `${S.config.name} backup codes for ${S.me.username}`, intro: 'If you lose your phone, each of these codes signs you in once. Keep them somewhere safe.', secret: res.backupCodes.join('\n'), filename: `${S.config.name.replace(/\W+/g, '-')}-backup-codes-${S.me.username}.txt` });
+          refresh(res.user); toast('Two-factor sign-in is on. Other devices were signed out.');
+        }, 150);
+      } }] });
+  };
+  const disable2fa = async () => {
+    const keys = await askPassword(app, { title: 'Turn off two-factor sign-in' });
+    if (!keys) return;
+    const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
+    modal({ title: 'Enter a code to turn it off', size: 'sm', body: h('div', { class: 'stack' }, field('Code from your app (or a backup code)', code)),
+      actions: [{ label: 'Cancel' }, { label: 'Turn off', kind: 'danger', action: async () => {
+        const c = code.value.trim();
+        refresh(await api('POST', '/me/2fa/disable', { authKey: keys.authKey, ...(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c }) }));
+        toast('Two-factor sign-in is off.');
+      } }] });
+  };
+  const newCodes = () => {
+    const code = h('input', { class: 'input', inputmode: 'numeric', maxlength: '6', placeholder: '123456' });
+    modal({ title: 'New backup codes', size: 'sm', body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Your old backup codes stop working.'), field('Code from your app', code)),
+      actions: [{ label: 'Cancel' }, { label: 'Make new codes', kind: 'primary', action: async () => {
+        const r = await api('POST', '/me/2fa/backup-codes', { code: code.value });
+        setTimeout(() => showSecretOnce({ title: `${S.config.name} backup codes for ${S.me.username}`, intro: 'Each code signs you in once.', secret: r.backupCodes.join('\n'), filename: `${S.config.name.replace(/\W+/g, '-')}-backup-codes-${S.me.username}.txt` }).then(() => { S.me.backupCodesLeft = 10; drawAll(); }), 150);
+      } }] });
+  };
+  const draw2fa = () => {
+    clear(tfaBox);
+    if (S.me.totpEnabled) {
+      tfaBox.append(h('div', { class: 'kv' }, h('span', null, 'Two-factor sign-in'), h('span', { class: 'rpill ok' }, 'On')),
+        h('p', { class: 'field-hint' }, `${S.me.backupCodesLeft} backup code${S.me.backupCodesLeft === 1 ? '' : 's'} left.`),
+        h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: newCodes }, 'New backup codes'), h('button', { class: 'btn ghost sm', onclick: () => disable2fa().catch((e) => toast(e.message, 'error')) }, 'Turn off')));
+    } else {
+      tfaBox.append(h('p', { class: 'muted-p' }, 'After your password, sign-in asks for a 6-digit code from an app on your phone, so a stolen password alone isn’t enough. It’s also needed to reset your password by email.'),
+        h('div', null, h('button', { class: 'btn primary', onclick: () => setup2fa().catch((e) => toast(e.message, 'error')) }, 'Set up two-factor sign-in')));
+    }
+  };
+  // ---- encryption check
+  const checkBox = h('div', { class: 'stack' });
+  const runCheck = async (btn) => {
+    btn.disabled = true; clear(checkBox).append(h('span', { class: 'spinner' }), h('span', { class: 'field-hint' }, 'Testing every lock (about 5 seconds)…'));
+    try {
+      const { runCryptoChecks, runAccountChecks } = await import('./selftest.js');
+      const generic = await runCryptoChecks();
+      const serverKeys = S.servers.map((sv) => {
+        const st = app.sec.stateOf(sv.id);
+        const held = app.sec.heldEpochs(sv.id);
+        const ok = !st || !st.keyEpoch || held.includes(st.keyEpoch);
+        return { name: sv.name || 'group chat', ok, why: ok ? '' : 'waiting for another member to share it (happens automatically when one is online)' };
+      });
+      const mine = await runAccountChecks({ me: S.me, privateKey: S.privateKey, signKey: S.signKey, serverKeys });
+      const all = [...generic, ...mine];
+      const bad = all.filter((x) => !x.ok);
+      clear(checkBox).append(h('p', { class: bad.length ? 'warn-box' : 'support-now' }, bad.length ? `${bad.length} of ${all.length} checks need attention.` : `All ${all.length} checks passed. Your encryption is working as it should.`),
+        h('ul', { class: 'check-list' }, all.map((x) => h('li', { class: x.ok ? 'ok' : 'bad' }, x.ok ? '✓ ' : '✗ ', x.name, x.detail && !x.ok ? h('span', { class: 'field-hint' }, ` — ${x.detail}`) : ''))));
+    } catch (e) { clear(checkBox).append(h('p', { class: 'form-error' }, e.message)); }
+    btn.disabled = false;
+  };
+  const drawAll = () => { drawEmail(); drawRec(); draw2fa(); };
+  drawAll();
+  return [
+    section('Email', emailBox),
+    section('Recovery key', recBox),
+    section('Two-factor sign-in', tfaBox),
+    section('Check my encryption', h('p', { class: 'muted-p' }, 'Runs every lock Hearth uses on this device — including that changed or forged messages are refused — and checks your own keys.'),
+      h('div', null, h('button', { class: 'btn', onclick: (e) => runCheck(e.currentTarget) }, icon('shield'), 'Run the check')), checkBox),
+  ];
 }
 
 // ------------------------------------------------------------------ voice tab

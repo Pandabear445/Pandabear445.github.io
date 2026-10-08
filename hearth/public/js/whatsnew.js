@@ -1,6 +1,12 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.20.0', items: [
+    'Forgot your password? Add an email in Settings → My Account and you can reset it from the sign-in screen. Save your recovery key there too, so a reset keeps all your old messages.',
+    'Two-factor sign-in with an authenticator app, plus backup codes (Settings → My Account).',
+    'Check my encryption: one button that tests every lock on your device and your keys. Message lengths are now hidden too.',
+    'News bot: Server Settings → News bot posts new articles, videos, patch notes and releases on any topic as they come out — never old news.',
+  ] },
   { version: '1.19.0', items: [
     'Push to talk: Settings → Voice & video → Input mode. In the desktop app your keys work even while a game is focused.',
     'Keybinds: pick your own keys (or mouse side buttons) for push to talk, mute and deafen in Settings → Keybinds.',

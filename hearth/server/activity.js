@@ -505,5 +505,5 @@ module.exports = function setupActivity(ctx) {
   const recentFor = (row) => { const c = cfgFor(row); return c.shareGames && (c.recent || []).length ? c.recent.slice(0, 8).map((r) => ({ id: r.id, name: r.name, at: r.at, minutes: r.minutes })) : undefined; };
   const settingsFor = (row) => { const c = cfgFor(row); return { shareGames: c.shareGames, shareMusic: c.shareMusic }; };
 
-  return { activityFor, recentFor, settingsFor, GAME_ID };
+  return { activityFor, recentFor, settingsFor, GAME_ID, searchGames };
 };

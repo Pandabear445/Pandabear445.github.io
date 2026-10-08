@@ -8,7 +8,8 @@
 //   Signing key         ECDSA P-256. Signs channel messages, group-key handoffs and voice handshakes.
 //   Message encryption  AES-256-GCM with a fresh key per message (HKDF-SHA256 from the conversation key
 //                        and a random 256-bit salt), plus a random 96-bit nonce. Channel, author and key
-//                        epoch are bound in as additional authenticated data.
+//                        epoch are bound in as additional authenticated data. Padded to size steps so
+//                        lengths don't give messages away.
 //   Attachments         Each file gets its own random AES-256-GCM key, carried inside the encrypted message.
 //   Direct messages     Conversation key = HKDF(ECDH(you, them)). Not signed, so DMs stay deniable.
 //   Server channels     A random 256-bit group key per server "epoch", sent to each member wrapped with
@@ -56,6 +57,18 @@ function hkdfAes(base, salt, info, usages = ['encrypt', 'decrypt']) {
 const gcm = (iv, aad) => (aad ? { name: 'AES-GCM', iv, additionalData: enc.encode(aad), tagLength: 128 } : { name: 'AES-GCM', iv, tagLength: 128 });
 async function aesEncrypt(key, iv, data, aad) { return new Uint8Array(await subtle().encrypt(gcm(iv, aad), key, data)); }
 async function aesDecrypt(key, iv, data, aad) { return new Uint8Array(await subtle().decrypt(gcm(iv, aad), key, data)); }
+
+// Message lengths: before encryption every message is padded with spaces up to a size step (256 bytes,
+// then 1 KiB steps above 4 KiB), so the server can't tell "ok" from a paragraph by the ciphertext's length.
+// JSON ignores trailing spaces, so padded messages read fine everywhere (including older versions).
+export function padded(payload) {
+  const bytes = enc.encode(JSON.stringify(payload));
+  const n = bytes.length;
+  const step = n < 4096 ? 256 : 1024;
+  const out = new Uint8Array(Math.ceil((n + 1) / step) * step).fill(0x20);
+  out.set(bytes);
+  return out;
+}
 
 // ---------------------------------------------------------------- password → keys
 let argon2Promise = null;
@@ -112,6 +125,23 @@ async function sealBytes(key, bytes, aad) {
 async function openBytes(key, sealed, aad) {
   const [iv, ct] = sealed.split(':');
   return aesDecrypt(key, unb64(iv), unb64(ct), aad);
+}
+
+// ---------------------------------------------------------------- recovery key
+// 32 random letters/numbers (160 bits). It encrypts a second copy of your private key, so a password reset
+// by email can keep all your messages. High entropy, so a fast key derivation (HKDF) is enough.
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+export function newRecoveryCode() {
+  const bytes = rand(20);
+  let bits = 0; let value = 0; let out = '';
+  for (const b of bytes) { value = (value << 8) | b; bits += 8; while (bits >= 5) { out += B32[(value >>> (bits - 5)) & 31]; bits -= 5; } }
+  return out.match(/.{4}/g).join('-');
+}
+const normRecovery = (c) => String(c || '').toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I').replace(/[^A-Z2-7]/g, '');
+export async function recoveryWrapKey(code, saltB64) {
+  const n = normRecovery(code);
+  if (n.length !== 32) throw new Error('A recovery key has 32 letters and numbers (dashes optional).');
+  return hkdfAes(await hkdfKey(enc.encode(`hearth-recovery|${n}`)), unb64(saltB64), 'hearth-recovery-v1');
 }
 
 // ---------------------------------------------------------------- identity (ECDH) key
@@ -175,22 +205,25 @@ export async function verify(signPubB64, text, sigB64) {
 }
 
 // ---------------------------------------------------------------- direct messages
-const dmBases = new Map();
+// Derived keys are cached per (your private key, their public key), so a cache can never hand one person's
+// key to another, even with two accounts or a key change in the same tab.
+let dmBases = new WeakMap(); // myPriv -> Map(theirPub -> Promise<HKDF base>)
+let dmLegacyKeys = new WeakMap();
+const cacheFor = (wm, k) => { let m = wm.get(k); if (!m) { m = new Map(); wm.set(k, m); } return m; };
 function dmBase(myPriv, theirPubB64) {
-  if (!dmBases.has(theirPubB64)) {
-    dmBases.set(theirPubB64, (async () => {
+  const m = cacheFor(dmBases, myPriv);
+  if (!m.has(theirPubB64)) {
+    m.set(theirPubB64, (async () => {
       const bits = await subtle().deriveBits({ name: 'ECDH', public: await importEcdhPublic(theirPubB64) }, myPriv, 256);
       return hkdfKey(bits);
     })());
   }
-  return dmBases.get(theirPubB64);
+  return m.get(theirPubB64);
 }
-const dmLegacyKeys = new Map();
 function dmLegacyKey(myPriv, theirPubB64) {
-  if (!dmLegacyKeys.has(theirPubB64)) {
-    dmLegacyKeys.set(theirPubB64, dmBase(myPriv, theirPubB64).then((base) => hkdfAes(base, enc.encode('hearth-dm-salt'), 'hearth-dm-v1')));
-  }
-  return dmLegacyKeys.get(theirPubB64);
+  const m = cacheFor(dmLegacyKeys, myPriv);
+  if (!m.has(theirPubB64)) m.set(theirPubB64, dmBase(myPriv, theirPubB64).then((base) => hkdfAes(base, enc.encode('hearth-dm-salt'), 'hearth-dm-v1')));
+  return m.get(theirPubB64);
 }
 
 // Format: d2:<salt>:<iv>:<ciphertext>   (fresh HKDF key per message; DM id + author bound as AAD)
@@ -198,7 +231,7 @@ export async function encryptDm({ myPriv, theirPub, dmId, authorId, payload }) {
   const salt = rand(32);
   const iv = rand(12);
   const key = await hkdfAes(await dmBase(myPriv, theirPub), salt, `hearth-dm-v2|${dmId}`, ['encrypt']);
-  const ct = await aesEncrypt(key, iv, enc.encode(JSON.stringify(payload)), `hearth-d2|${dmId}|${authorId}`);
+  const ct = await aesEncrypt(key, iv, padded(payload), `hearth-d2|${dmId}|${authorId}`);
   return `d2:${b64(salt)}:${b64(iv)}:${b64(ct)}`;
 }
 export async function decryptDm({ myPriv, theirPub, dmId, authorId, text }) {
@@ -249,10 +282,13 @@ export async function unwrapGroupKey({ wrapped, serverId, epoch, myId, myPriv, w
   return aesDecrypt(key, unb64(iv), unb64(ct), ctx);
 }
 
-const groupBases = new Map();
+// Cached per key (the raw bytes object) as well as server+epoch, so a different key for the same epoch
+// is never answered from the cache.
+let groupBases = new WeakMap(); // raw -> Map(id -> Promise<HKDF base>)
 function groupBase(raw, id) {
-  if (!groupBases.has(id)) groupBases.set(id, hkdfKey(raw));
-  return groupBases.get(id);
+  const m = cacheFor(groupBases, raw);
+  if (!m.has(id)) m.set(id, hkdfKey(raw));
+  return m.get(id);
 }
 
 // Format: c2:<epoch>:<salt>:<iv>:<ciphertext>:<signature>
@@ -261,7 +297,7 @@ export async function encryptGroup({ raw, serverId, channelId, epoch, authorId, 
   const iv = rand(12);
   const aad = `hearth-c2|${channelId}|${epoch}|${authorId}`;
   const key = await hkdfAes(await groupBase(raw, `${serverId}|${epoch}`), salt, `hearth-msg-v2|${channelId}`, ['encrypt']);
-  const ct = await aesEncrypt(key, iv, enc.encode(JSON.stringify(payload)), aad);
+  const ct = await aesEncrypt(key, iv, padded(payload), aad);
   const body = `${epoch}:${b64(salt)}:${b64(iv)}:${b64(ct)}`;
   const sig = await sign(signKey, `${aad}|${body}`);
   return `c2:${body}:${sig}`;
@@ -355,4 +391,4 @@ async function tx(mode, fn) {
 export const storeKey = (userId, key) => tx('readwrite', (s) => s.put(key, userId));
 export const loadKey = (userId) => tx('readonly', (s) => s.get(userId)).catch(() => null);
 export const clearKeys = () => tx('readwrite', (s) => s.clear()).catch(() => {});
-export function clearCaches() { dmBases.clear(); dmLegacyKeys.clear(); groupBases.clear(); }
+export function clearCaches() { dmBases = new WeakMap(); dmLegacyKeys = new WeakMap(); groupBases = new WeakMap(); }
