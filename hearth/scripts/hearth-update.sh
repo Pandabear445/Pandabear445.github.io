@@ -136,6 +136,7 @@ plain_pid() {
     [ "$(cat "/proc/$p/comm" 2>/dev/null)" = node ] || continue
     [ "$(readlink -f "/proc/$p/cwd" 2>/dev/null)" = "$(readlink -f "$DIR")" ] && echo "$p"
   done
+  return 0
 }
 stop_app() {
   case $MODE in
