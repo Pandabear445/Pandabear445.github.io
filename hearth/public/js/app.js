@@ -23,6 +23,9 @@ import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, instal
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
 import { openSettings, applyAppearance, confirmedCall } from './settings.js';
+import { createFolders } from './folders.js';
+import { createUpdates } from './updates.js';
+import { createStudy } from './study.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 
 // ======================================================================= state
@@ -126,6 +129,7 @@ export const app = {
   openServerSettings: (id) => openServerSettings(S.servers.find((s) => s.id === id)),
   unblock: (id) => toggleBlock(id, false),
   openAdmin: () => setView({ type: 'admin', tab: 'overview' }),
+  study: () => study,
 };
 
 // ======================================================================= boot
@@ -334,6 +338,12 @@ async function logout() {
 
 // ======================================================================= realtime
 function startApp() {
+  if (!document.getElementById('study-pill')) document.body.append(study.pill());
+  // Desktop app: Ctrl+, (and the tray's "Settings…") open Settings.
+  if (window.hearthDesktop && typeof window.hearthDesktop.onOpenSettings === 'function' && !window.__hearthSettingsHook) {
+    window.__hearthSettingsHook = true;
+    window.hearthDesktop.onOpenSettings(() => { if (!document.querySelector('.settings-modal, .set-nav')) openSettings(app); });
+  }
   initActivity({
     mediaToken: () => S.mediaToken || '',
     changed: (a) => { if (!S.me) return; S.me.activity = a; if (S.users[S.me.id]) S.users[S.me.id].activity = a; renderUserPanel(); },
@@ -515,6 +525,12 @@ function startApp() {
     renderRail();
     if (!S.view.serverId) renderSidebar();
   });
+  socket.on('rail:update', ({ rail }) => folders.applyRemote(rail));
+  socket.on('study:state', (p) => study.onRoomState(p));
+  socket.on('study:reminder', (p) => study.onReminder(p));
+  socket.on('study:changed', () => { if (S.me.studyEnabled) study.onRemoteChange().catch(() => {}); });
+  socket.on('study:enabled', ({ enabled }) => { S.me.studyEnabled = enabled; if (!S.view.serverId) renderSidebar(); });
+  socket.on('updates:new', (p) => { updates.onNew(p); if (S.view.type === 'updates') renderMain(); });
   socket.on('server:update', (server) => {
     const i = S.servers.findIndex((s) => s.id === server.id);
     if (i >= 0) S.servers[i] = server;
@@ -667,6 +683,7 @@ async function loadBootstrap() {
   S.encPrivateKey = b.encPrivateKey;
   S.users = b.users;
   S.servers = b.servers;
+  S.serversLoaded = true;
   S.dms = b.dms;
   S.relationships = Object.fromEntries(b.relationships.map((r) => [r.userId, r]));
   S.blocked = new Set(b.blocked || []);
@@ -1062,6 +1079,27 @@ function resizeHandle(which) {
 }
 
 // ---- server rail: rounded tiles, favorites first
+const serverIconEl = (s) => (s.icon ? h('img', { src: s.icon, alt: '' }) : h('span', { class: 'rail-initials', style: s.theme && s.theme.accent ? { color: s.theme.accent } : null }, s.name.split(/\s+/).map((w) => w[0]).join('').slice(0, 3)));
+const updates = createUpdates({
+  S, mediaNewsUrl: (u) => mediaNewsUrl(u),
+  onUnread: () => { if (!S.view.serverId) renderSidebar(); renderRail(); },
+});
+const study = createStudy({
+  S, voice: () => voice, socket: () => socket, playSound: (...a) => playSound(...a),
+  desktopNotify: (title, body) => { try { if ('Notification' in window && Notification.permission === 'granted' && (document.hidden || !document.hasFocus())) new Notification(title, { body, icon: '/icons/icon-192.png' }); } catch { /* */ } },
+  getStatus: () => S.me.status || 'online',
+  setStatus: (st) => api('PATCH', '/me/status', { status: st }).then(() => { S.me.status = st; if (S.users[S.me.id]) S.users[S.me.id].status = st; renderUserPanel(); }).catch(() => {}),
+  setMuted: (v) => { if (voice && voice.channelId && voice.muted !== v) toggleMute(); },
+  onChange: () => { if (S.view.type === 'study') renderMain(); renderVoicePanel(); },
+  onEnabled: () => { if (!S.view.serverId) renderSidebar(); },
+  openStudy: (tab) => setView({ type: 'study', tab }),
+});
+const folders = createFolders({
+  S, servers: () => realServers(), favorites: () => new Set(P.favorites.filter((f) => f.startsWith('s:')).map((f) => f.slice(2))),
+  rerender: () => renderRail(), serverUnread: (s) => serverUnread(s), setNotify: (k, v) => setNotify(k, v), railSide: () => railSide(),
+  markServerRead: (server) => { server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); }); renderAll(); },
+  serverIcon: (s) => serverIconEl(s),
+});
 function renderRail() {
   const rail = clear($('#rail'));
   if (!S.me) return;
@@ -1077,7 +1115,7 @@ function renderRail() {
     }, opts.content, opts.badge ? h('span', { class: 'badge', 'aria-label': `${opts.badge} unread` }, opts.badge > 99 ? '99+' : opts.badge) : null));
 
   rail.append(
-    tile({ label: 'Home', cls: 'home', active: homeActive && S.view.type !== 'dm' && !isGroup(currentServer()), onclick: goHome, content: icon('flame'), badge: pending }),
+    tile({ label: 'Home', cls: 'home', active: homeActive && S.view.type !== 'dm' && !isGroup(currentServer()), onclick: goHome, content: icon('flame'), badge: pending + (S.me.updatesUnread || 0) }),
     tile({ label: 'Direct messages', cls: 'nav', active: S.view.type === 'dm' || isGroup(currentServer()), onclick: openMessages, content: icon('message'), badge: dmUnread }),
     h('div', { class: 'rail-item' }, h('button', {
       class: 'rail-btn nav', 'aria-label': 'Notifications', 'data-tip': 'Notifications', 'data-tip-side': railSide(), 'data-pop-anchor': '',
@@ -1086,24 +1124,26 @@ function renderRail() {
     ...(S.me.staffRole ? [tile({ label: 'Admin', cls: 'nav', active: S.view.type === 'admin', onclick: () => setView({ type: 'admin', tab: S.adminReports ? 'reports' : 'overview' }), content: icon('shield'), badge: S.adminReports })] : []),
     h('div', { class: 'rail-sep', role: 'separator' }),
   );
+  // Favorites first, then your folders and the rest in your own order (see folders.js).
   const favs = P.favorites;
-  const servers = realServers();
-  const ordered = [...servers.filter((s) => favs.includes('s:' + s.id)), ...servers.filter((s) => !favs.includes('s:' + s.id))];
-  ordered.forEach((s, i) => {
-    if (i > 0 && favs.includes('s:' + ordered[i - 1].id) && !favs.includes('s:' + s.id)) rail.append(h('div', { class: 'rail-sep thin', role: 'separator' }));
+  const serverTile = (s, inFolder) => {
     const { unread, mentions } = serverUnread(s);
-    rail.append(tile({
+    return tile({
       label: s.name + (favs.includes('s:' + s.id) ? ' (favorite)' : ''),
       active: S.view.serverId === s.id, unread,
       onclick: () => openServer(s.id),
       oncontext: (e) => contextMenu(e, serverMenuItems(s)),
       cls: `shape-${(s.theme && s.theme.iconShape) || 'rounded'}`,
-      content: s.icon ? h('img', { src: s.icon, alt: '' }) : h('span', { class: 'rail-initials', style: s.theme && s.theme.accent ? { color: s.theme.accent } : null }, s.name.split(/\s+/).map((w) => w[0]).join('').slice(0, 3)),
+      content: serverIconEl(s),
       badge: mentions,
-    }));
-  });
+    });
+  };
+  const favServers = realServers().filter((s) => favs.includes('s:' + s.id));
+  favServers.forEach((s) => rail.append(serverTile(s)));
+  if (favServers.length) rail.append(h('div', { class: 'rail-sep thin', role: 'separator' }));
+  folders.render(rail, serverTile);
   rail.append(
-    tile({ label: 'Add a server', cls: 'add', onclick: openAddServer, content: icon('plus') }),
+    tile({ label: 'Add a server', cls: 'add', onclick: openAddServer, oncontext: (e) => contextMenu(e, [{ label: 'Organize servers\u2026', icon: 'folder', action: () => folders.openOrganize() }]), content: icon('plus') }),
   );
   updateTitle();
 }
@@ -1125,6 +1165,8 @@ function renderSidebar() {
     nav('Friends', 'people', S.view.type === 'friends', () => goFriends(pending ? 'pending' : 'online'), pending),
     nav('People', 'user', S.view.type === 'people', () => setView({ type: 'people' })),
     nav('Saved messages', 'bookmark', S.view.type === 'saved', () => setView({ type: 'saved' })),
+    nav('Updates', 'rss', S.view.type === 'updates', () => setView({ type: 'updates' }), S.me.updatesUnread || 0),
+    S.me.studyEnabled ? nav('Study', 'graduation', S.view.type === 'study', () => setView({ type: 'study', tab: 'focus' })) : null,
   );
   const convs = conversations();
   const favs = P.favorites;
@@ -1134,7 +1176,8 @@ function renderSidebar() {
     pinned.forEach((c) => body.append(convRow(c)));
   }
   body.append(h('div', { class: 'group-label' }, h('span', null, 'Direct messages'),
-    ibtn('plus', 'New message or group', () => openNewConversation(), { cls: 'sm' })));
+    ibtn('plus', 'New message', () => openNewConversation(), { cls: 'sm' })),
+  h('button', { class: 'nav-row new-group', 'data-nav': '', onclick: () => openNewConversation(null, { group: true }) }, icon('people'), h('span', null, 'New group chat')));
   const rest = convs.filter((c) => !favs.includes(c.fav));
   if (!rest.length && !pinned.length) body.append(h('p', { class: 'sidebar-empty' }, 'No conversations yet. Start one with a friend or someone from a server.'));
   rest.forEach((c) => body.append(convRow(c)));
@@ -1166,6 +1209,7 @@ function groupName(g) {
   return others.length ? others.slice(0, 3).join(', ') + (others.length > 3 ? ` +${others.length - 3}` : '') : 'Just you';
 }
 function groupAvatar(g, size) {
+  if (g.icon) return h('span', { class: 'group-av icon', style: { '--size': size + 'px' } }, h('img', { src: g.icon, alt: '' }));
   const others = g.memberIds.filter((id) => id !== S.me.id).slice(0, 2);
   return h('span', { class: 'group-av', style: { '--size': size + 'px' } }, others.map((id) => avatarEl(getUser(id), Math.round(size * 0.68))));
 }
@@ -1211,7 +1255,9 @@ function groupMenuItems(g) {
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('g:' + g.id) },
     c ? notifyItem('c:' + c.id) : null,
     { label: 'Rename group', icon: 'edit', action: () => renameGroup(g) },
+    { label: 'Change group picture', icon: 'image', action: () => changeGroupIcon(g) },
     { label: 'Add people', icon: 'userPlus', action: () => openNewConversation(g) },
+    { label: 'Members', icon: 'people', action: () => manageGroup(g) },
     '-',
     { label: 'Leave group', icon: 'logout', danger: true, action: () => leaveServer(g) },
   ];
@@ -1434,6 +1480,7 @@ function renderVoicePanel() {
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),
       ibtn('monitor', voice.screenStream ? 'Stop sharing' : 'Share your screen', toggleScreen, { cls: voice.screenStream ? 'on' : '' }),
       ibtn('phoneOff', 'Leave call', () => { voice.leave(); playSound('selfLeave'); }, { cls: 'hang' })),
+    study.callControls(),
     voice.pttMode() ? h('div', { class: `ptt-hint${voice.pttHeld && !voice.muted ? ' on' : ''}` }, icon('mic'),
       getKeybinds().ptt ? (voice.pttHeld && !voice.muted ? 'Talking' : `Push to talk: hold ${comboLabel(getKeybinds().ptt)}`) : h('button', { class: 'link-btn', onclick: () => openSettings(app, 'keybinds') }, 'Push to talk is on, but no key is set')) : '',
   );
@@ -1503,6 +1550,8 @@ function renderMain() {
   else if (v.type === 'friends') main.append(friendsView());
   else if (v.type === 'saved') main.append(savedView());
   else if (v.type === 'people') main.append(peopleView());
+  else if (v.type === 'updates') main.append(updates.view());
+  else if (v.type === 'study') main.append(study.view(v.tab || 'focus', (t) => setView({ type: 'study', tab: t })));
   else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, confirm: (fn, opts) => confirmedCall(app, fn, opts), tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
   else if (v.type === 'channel' || v.type === 'dm') main.append(chatView());
   else if (v.type === 'voice') main.append(voiceRoomView());
@@ -1599,6 +1648,11 @@ function renderHeader() {
   } else if (v.type === 'people') {
     head.append(h('div', { class: 'head-title' }, icon('user', 'ic head-ic'), h('h1', null, 'People'), h('span', { class: 'head-topic' }, 'Profiles of people you share a server with')),
       headTools(h('button', { class: 'btn ghost sm', onclick: () => openProfileModal(S.me.id) }, icon('user'), 'My page')));
+  } else if (v.type === 'study') {
+    head.append(h('div', { class: 'head-title' }, icon('graduation', 'ic head-ic'), h('h1', null, 'Study'), h('span', { class: 'head-topic' }, 'Focus timer, flashcards and assignments — end-to-end encrypted')));
+  } else if (v.type === 'updates') {
+    head.append(h('div', { class: 'head-title' }, icon('rss', 'ic head-ic'), h('h1', null, 'Updates'), h('span', { class: 'head-topic' }, 'Topics, channels and projects you track')),
+      headTools(h('button', { class: 'btn ghost sm', onclick: () => updates.trackDialog(() => renderMain()) }, icon('plus'), 'Track something')));
   } else if (v.type === 'saved') {
     head.append(h('div', { class: 'head-title' }, icon('bookmark', 'ic head-ic'), h('h1', null, 'Saved messages')),
       headTools(h('span', { class: 'head-note' }, 'Saved on this device only')));
@@ -1775,6 +1829,8 @@ function friendsView() {
         actions.push(ibtn('message', 'Message', () => openDmWith(u.id)));
         actions.push(ibtn('more', 'More', (e) => menu(e.currentTarget, [
           { label: 'View profile', icon: 'user', action: () => openProfileModal(u.id) },
+          { label: 'Start a group chat with them', icon: 'people', action: () => openNewConversation(null, { group: true, preselect: [u.id] }) },
+          ...groups().filter((g) => !g.memberIds.includes(u.id) && g.memberIds.length < GROUP_MAX).slice(0, 8).map((g) => ({ label: `Add to ${groupName(g)}`, icon: 'userPlus', action: () => api('POST', `/groups/${g.id}/members`, { userId: u.id }).then(() => toast('Added.')).catch((x) => toast(x.message, 'error')) })),
           { label: 'Remove friend', icon: 'trash', danger: true, action: async () => {
             if (await confirmDialog({ title: `Remove ${displayName(u)}?`, text: 'You can add them again later.', confirm: 'Remove friend', danger: true })) api('DELETE', '/friends/' + u.id).catch((e2) => toast(e2.message, 'error'));
           } },
@@ -1794,7 +1850,8 @@ function friendsView() {
   };
   search.addEventListener('input', draw);
   draw();
-  wrap.append(h('div', { class: 'friends-search' }, icon('search'), search), listEl);
+  wrap.append(h('div', { class: 'friends-top' }, h('div', { class: 'friends-search' }, icon('search'), search),
+    h('button', { class: 'btn', onclick: () => openNewConversation(null, { group: true }) }, icon('people'), 'New group chat')), listEl);
   return wrap;
 }
 
@@ -2278,6 +2335,8 @@ function openLinkFromHash() {
   history.replaceState(null, '', location.pathname);
   let m = hsh.match(/^#m\/([a-z0-9]+)$/i);
   if (m) return jumpToMessageId(m[1]);
+  if (hsh === '#updates') return setView({ type: 'updates' });
+  if (hsh === '#study') return setView({ type: 'study', tab: 'tasks' });
   m = hsh.match(/^#c\/([a-z0-9]+)$/i);
   if (m) { const s = serverOfChannel(m[1]); if (s) openChannel(m[1], s.id); else toast('You don\u2019t have access to that channel.'); }
 }
@@ -3797,6 +3856,7 @@ function serverMenuItems(server) {
     canManageServer(server) && can(server, PERMS.MANAGE_ROLES) ? { label: 'Roles', icon: 'shield', action: () => openServerSettings(server, 'roles') } : null,
     { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; P.showMembers = true; renderAll(); } },
     { label: fav ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => toggleFavorite('s:' + server.id) },
+    ...folders.serverMenuExtras(server),
     '-',
     { header: 'Notifications' },
     ...[['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify('s:' + server.id, v === 'all' ? 'default' : v) })),
@@ -4388,44 +4448,94 @@ async function deleteChannel(c) {
   if (await confirmDialog({ title: `Delete ${c.name}?`, text: 'All of its messages will be deleted too.', confirm: 'Delete channel', danger: true })) await api('DELETE', `/channels/${c.id}`).catch((e) => toast(e.message, 'error'));
 }
 
-// New DM or group (or add people to an existing group).
-function openNewConversation(existingGroup = null) {
-  const known = Object.values(S.users).filter((u) => u.id !== S.me.id && !S.blocked.has(u.id) && (!existingGroup || !existingGroup.memberIds.includes(u.id)));
-  const picked = new Set();
-  const input = h('input', { class: 'input', placeholder: 'Search people you know', 'aria-label': 'Search people' });
+// New DM, new group chat, or adding people to a group. Friends are listed first, then people you share a server
+// with (those are the only people a group can include).
+const GROUP_MAX = 25;
+function openNewConversation(existingGroup = null, { group = false, preselect = [] } = {}) {
+  const isFriend = (id) => (S.relationships[id] || {}).status === 'accepted';
+  const known = Object.values(S.users).filter((u) => u.id !== S.me.id && !u.bot && !u.deleted && !S.blocked.has(u.id) && (!existingGroup || !existingGroup.memberIds.includes(u.id)));
+  const room = existingGroup ? GROUP_MAX - existingGroup.memberIds.length : GROUP_MAX - 1;
+  const picked = new Set(preselect.filter((id) => known.some((u) => u.id === id)));
+  const groupMode = () => !!existingGroup || group || picked.size > 1;
+  const input = h('input', { class: 'input', placeholder: 'Search friends and people you know', 'aria-label': 'Search people' });
+  const nameIn = h('input', { class: 'input', maxlength: '64', placeholder: 'Optional, e.g. "Study group" or "Squad"' });
+  const nameField = field('Group name', nameIn);
   const chips = h('div', { class: 'pick-chips' });
   const results = h('div', { class: 'quick-list' });
   const hint = h('p', { class: 'field-hint' });
+  const row = (u) => h('button', { class: `quick-row${picked.has(u.id) ? ' picked' : ''}`, 'aria-pressed': String(picked.has(u.id)), onclick: () => {
+    if (picked.has(u.id)) picked.delete(u.id); else if (picked.size < room) picked.add(u.id); else toast(`A group chat can have up to ${GROUP_MAX} people.`);
+    draw();
+  } },
+  avatarEl(u, 30, { status: true, meId: S.me.id }), h('span', { class: 'quick-text' }, h('strong', null, displayName(u)), h('span', null, u.username)),
+  h('span', { class: 'pick-box' }, picked.has(u.id) ? icon('check') : null));
   const draw = () => {
     clear(chips);
     picked.forEach((id) => { const u = getUser(id); chips.append(h('button', { class: 'chip active', onclick: () => { picked.delete(id); draw(); } }, displayName(u), icon('close'))); });
     clear(results);
     const q = input.value.trim().toLowerCase();
-    const list = known.filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q)).slice(0, 40);
-    if (!list.length) results.append(h('p', { class: 'muted-p' }, 'No one matches. You can message friends and anyone who shares a server with you.'));
-    list.forEach((u) => results.append(h('button', { class: `quick-row${picked.has(u.id) ? ' picked' : ''}`, 'aria-pressed': String(picked.has(u.id)), onclick: () => { if (picked.has(u.id)) picked.delete(u.id); else if (picked.size < 9) picked.add(u.id); draw(); } },
-      avatarEl(u, 30, { status: true, meId: S.me.id }), h('span', { class: 'quick-text' }, h('strong', null, displayName(u)), h('span', null, u.username)),
-      h('span', { class: 'pick-box' }, picked.has(u.id) ? icon('check') : null))));
-    hint.textContent = existingGroup ? 'Pick people to add.' : picked.size > 1 ? `Creates a group with ${picked.size} people. Up to 10 total.` : 'Pick one person for a DM, or several for a group.';
+    const match = (u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q);
+    const byName = (a, b) => displayName(a).localeCompare(displayName(b));
+    const friends = known.filter((u) => isFriend(u.id) && match(u)).sort(byName);
+    const others = known.filter((u) => !isFriend(u.id) && match(u)).sort(byName).slice(0, 40);
+    if (friends.length) results.append(h('div', { class: 'list-label' }, `Friends — ${friends.length}`), ...friends.map(row));
+    if (others.length) results.append(h('div', { class: 'list-label' }, 'From your servers'), ...others.map(row));
+    if (!friends.length && !others.length) results.append(h('p', { class: 'muted-p' }, q ? 'No one matches.' : 'Add some friends first (Friends → Add friend). You can also include anyone who shares a server with you.'));
+    nameField.hidden = !!existingGroup || !groupMode();
+    hint.textContent = existingGroup ? `Pick people to add (room for ${room - picked.size} more).`
+      : groupMode() ? `${picked.size ? `${picked.size + 1} people including you` : 'Pick the people to include'} — up to ${GROUP_MAX}. Everyone in the group can add more people later.`
+        : 'Pick one person for a direct message, or several for a group chat.';
+    startBtn.textContent = existingGroup ? 'Add' : groupMode() ? 'Create group chat' : 'Start';
   };
   input.addEventListener('input', draw);
+  let startBtn;
   const mdl = modal({
-    title: existingGroup ? 'Add people' : 'New message', size: 'sm',
-    body: h('div', { class: 'stack' }, input, chips, results, hint),
+    title: existingGroup ? `Add people to ${groupName(existingGroup)}` : group ? 'New group chat' : 'New message', size: 'sm',
+    body: h('div', { class: 'stack' }, nameField, input, chips, results, hint),
     actions: [{ label: 'Cancel' }, { label: existingGroup ? 'Add' : 'Start', kind: 'primary', action: async () => {
       const ids = [...picked];
       if (!ids.length) throw new Error('Pick at least one person.');
-      if (existingGroup) { for (const id of ids) await api('POST', `/groups/${existingGroup.id}/members`, { userId: id }); return; }
-      if (ids.length === 1) return openDmWith(ids[0]);
-      const g = await api('POST', '/groups', { userIds: ids });
+      if (existingGroup) { for (const id of ids) await api('POST', `/groups/${existingGroup.id}/members`, { userId: id }); toast(ids.length === 1 ? 'Added.' : `Added ${ids.length} people.`); return; }
+      if (ids.length === 1 && !group) return openDmWith(ids[0]);
+      const g = await api('POST', '/groups', { userIds: ids, name: nameIn.value.trim() });
       if (!S.servers.find((x) => x.id === g.id)) S.servers.push(g);
       if (g.keyState) await sec.applyState(g.keyState);
       openGroup(g.id);
     } }],
   });
+  startBtn = mdl.box.querySelector('.modal-foot .btn.primary');
   draw();
   setTimeout(() => input.focus(), 30);
   return mdl;
+}
+// Members of a group chat: who's in it, who owns it; the owner can remove people or hand the group over.
+function manageGroup(g) {
+  const list = h('div', { class: 'quick-list' });
+  const draw = () => {
+    const cur = S.servers.find((x) => x.id === g.id) || g;
+    clear(list);
+    const mine = cur.ownerId === S.me.id;
+    cur.memberIds.map(getUser).sort((a, b) => (a.id === cur.ownerId ? -1 : b.id === cur.ownerId ? 1 : displayName(a).localeCompare(displayName(b)))).forEach((u) => list.append(h('div', { class: 'quick-row static' },
+      avatarEl(u, 30, { status: true, meId: S.me.id }),
+      h('span', { class: 'quick-text' }, h('strong', null, displayName(u), u.id === S.me.id ? ' (you)' : ''), h('span', null, u.id === cur.ownerId ? 'Owner' : u.username)),
+      mine && u.id !== S.me.id ? h('span', { class: 'row gap tight' },
+        h('button', { class: 'btn ghost sm', onclick: async () => { if (await confirmDialog({ title: `Make ${displayName(u)} the owner?`, text: 'They’ll be able to remove people. You stay in the group.', confirm: 'Make owner' })) { await api('POST', `/groups/${cur.id}/owner`, { userId: u.id }).catch((e) => toast(e.message, 'error')); setTimeout(draw, 300); } } }, 'Make owner'),
+        h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Remove ${displayName(u)}?`, text: 'They won’t see new messages. The group switches to a new encryption key.', confirm: 'Remove', danger: true })) { await api('DELETE', `/groups/${cur.id}/members/${u.id}`).catch((e) => toast(e.message, 'error')); setTimeout(draw, 300); } } }, 'Remove')) : null)));
+  };
+  draw();
+  modal({ title: `${groupName(g)} — members`, size: 'sm', body: h('div', { class: 'stack' }, list,
+    h('button', { class: 'btn', onclick: () => openNewConversation(S.servers.find((x) => x.id === g.id) || g) }, icon('userPlus'), 'Add people')) });
+}
+// Group picture: any member can set one (like the name).
+function changeGroupIcon(g) {
+  const fileIn = h('input', { type: 'file', accept: 'image/*', hidden: true });
+  fileIn.onchange = async () => {
+    const f = fileIn.files[0];
+    if (!f) return;
+    const fd = new FormData(); fd.append('icon', f);
+    try { await upload(`/servers/${g.id}/icon`, fd); toast('Group picture updated.'); } catch (e) { toast(e.message, 'error'); }
+  };
+  document.body.append(fileIn); fileIn.click(); setTimeout(() => fileIn.remove(), 60000);
 }
 function renameGroup(g) {
   const input = h('input', { class: 'input', maxlength: '64', value: g.name || '', placeholder: groupName(g) });

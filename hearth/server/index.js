@@ -140,6 +140,9 @@ function selfUser(row) {
   u.privacy = privacyOf(row);
   u.pageBg = row.page_bg || null;
   u.profileLocked = !!row.profile_locked;
+  u.rail = railOf(row);
+  u.studyEnabled = !!row.study_enabled;
+  u.updatesUnread = NEWS ? NEWS.unreadUpdates(row.id) : 0;
   u.staffRole = staffRole(row.id);
   u.instanceAdmin = (STAFF_RANK[u.staffRole] || 0) >= 2;
   if (ACCT) Object.assign(u, ACCT.selfExtras(row));
@@ -1027,7 +1030,8 @@ api.delete('/me', auth, wrap(async (req, res) => {
       last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
-    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'study_reminders']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0 WHERE id = ?").run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
   })();
@@ -2105,10 +2109,15 @@ api.delete('/emojis/:id', auth, (req, res) => {
 // A group DM is a small private "server" (one text channel + one call channel) so it gets the same
 // end-to-end encrypted group keys, key rotation and voice. It never shows up in the server rail.
 const canAddToGroup = (adder, uid) => uid !== adder && getUserRow(uid) && !isBlocked(adder, uid) && (areFriends(adder, uid) || sharesServer(adder, uid));
+// Group chats: up to GROUP_MAX people, end-to-end encrypted like servers (they are small servers with one chat
+// and one call). Anyone in the group can add friends or people they share a server with; the person who made
+// it (the owner, passed on if they leave) can also remove people.
+const GROUP_MAX = 25;
 api.post('/groups', auth, (req, res) => {
+  rateLimit('groupnew:' + req.userId, 30, 3600000);
   const ids = [...new Set(((req.body || {}).userIds || []).map(String))].filter((u) => u !== req.userId);
   if (!ids.length) fail(400, 'Pick at least one person.');
-  if (ids.length > 9) fail(400, 'Group DMs can have up to 10 people.');
+  if (ids.length > GROUP_MAX - 1) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
   ids.forEach((u) => { if (!canAddToGroup(req.userId, u)) fail(403, 'You can add friends and people who share a server with you.'); });
   const id = newId();
   const t = now();
@@ -2134,7 +2143,7 @@ api.post('/groups/:id/members', auth, (req, res) => {
   if (s.kind !== 'group') fail(400, 'Use an invite to add people to a server.');
   const uid = String((req.body || {}).userId || '');
   if (isMember(s.id, uid)) fail(409, 'They\u2019re already in this group.');
-  if (db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n >= 10) fail(400, 'Group DMs can have up to 10 people.');
+  if (db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n >= GROUP_MAX) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
   if (!canAddToGroup(req.userId, uid)) fail(403, 'You can add friends and people who share a server with you.');
   db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(s.id, uid, now());
   io.to(`server:${s.id}`).emit('member:add', { serverId: s.id, user: publicUser(getUserRow(uid)) });
@@ -2144,6 +2153,29 @@ api.post('/groups/:id/members', auth, (req, res) => {
   server.memberIds.forEach((u) => { users[u] = publicUser(getUserRow(u)); });
   io.to(`user:${uid}`).emit('server:add', { server, users, voice: {}, keyState: keyState(s.id, uid) });
   emitKeyState(s.id);
+  emitServer(s.id);
+  res.json({ ok: true });
+});
+
+api.delete('/groups/:id/members/:uid', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  if (s.kind !== 'group') fail(400, 'This isn\u2019t a group chat.');
+  const uid = String(req.params.uid);
+  if (uid === req.userId) fail(400, 'Use Leave group to leave.');
+  if (s.owner_id !== req.userId) fail(403, 'Only the group\u2019s owner can remove people.');
+  if (!isMember(s.id, uid)) fail(404, 'They\u2019re not in this group.');
+  removeMember(s.id, uid); // the others switch to a new key, so they can't read what's said next
+  emitServer(s.id);
+  res.json({ ok: true });
+});
+// Hand the group to someone else in it.
+api.post('/groups/:id/owner', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  if (s.kind !== 'group') fail(400, 'This isn\u2019t a group chat.');
+  if (s.owner_id !== req.userId) fail(403, 'Only the group\u2019s owner can do that.');
+  const uid = String((req.body || {}).userId || '');
+  if (!isMember(s.id, uid) || uid === req.userId) fail(404, 'Pick someone in the group.');
+  db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(uid, s.id);
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -2160,6 +2192,32 @@ api.post('/blocks/:id', auth, (req, res) => {
 api.delete('/blocks/:id', auth, (req, res) => {
   db.prepare('DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?').run(req.userId, req.params.id);
   res.json({ ok: true });
+});
+// Server folders: how you've arranged the servers in your left bar (folders with a name, colour and emoji, their
+// order, which are open, and an optional "focus" folder). Kept on the server so every device shows the same.
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+function cleanRail(input) {
+  const b = input && typeof input === 'object' ? input : {};
+  const str = (v, n) => (typeof v === 'string' ? v.trim().slice(0, n) : '');
+  const id = (v) => (typeof v === 'string' && /^[\w-]{1,40}$/.test(v) ? v : null);
+  const folders = (Array.isArray(b.folders) ? b.folders : []).slice(0, 50).map((f) => (f && id(f.id) ? {
+    id: f.id, name: str(f.name, 32) || 'Folder', color: HEX_COLOR.test(f.color) ? f.color : '#5865f2', emoji: str(f.emoji, 8),
+    open: !!f.open, muted: !!f.muted, servers: [...new Set((Array.isArray(f.servers) ? f.servers : []).map(id).filter(Boolean))].slice(0, 200),
+  } : null)).filter(Boolean);
+  const order = [...new Set((Array.isArray(b.order) ? b.order : []).filter((x) => typeof x === 'string' && /^[fs]:[\w-]{1,40}$/.test(x)))].slice(0, 500);
+  const focus = id(b.focus) && folders.some((f) => f.id === b.focus) ? b.focus : null;
+  return { folders, order, focus };
+}
+function railOf(row) { try { return row.rail_layout ? cleanRail(JSON.parse(row.rail_layout)) : { folders: [], order: [], focus: null }; } catch { return { folders: [], order: [], focus: null }; } }
+api.put('/me/rail', auth, (req, res) => {
+  rateLimit('rail:' + req.userId, 120, 60000);
+  const rail = cleanRail(req.body);
+  const text = JSON.stringify(rail);
+  if (text.length > 64000) fail(400, 'That\u2019s too many folders.');
+  db.prepare('UPDATE users SET rail_layout = ? WHERE id = ?').run(text, req.userId);
+  // Other devices of yours pick it up right away.
+  io.to(`user:${req.userId}`).emit('rail:update', { rail, from: req.session.id });
+  res.json(rail);
 });
 api.patch('/me/privacy', auth, (req, res) => {
   const row = getUserRow(req.userId);
@@ -2552,7 +2610,14 @@ app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
 // The news bot (server/newsbot.js): follows feeds and posts new items into channels.
 const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer,
   canManageServer: (s, uid) => can(s, uid, PM.MANAGE_SERVER), serializeMessage, toChannel, checkMediaToken, emitServerFeeds: () => {},
-  searchSteam: (q) => ACT.searchGames(q) });
+  searchSteam: (q) => ACT.searchGames(q),
+  // Personal trackers found something: tell the person's open apps, and push a notification if they want one.
+  notifyUser: (uid, p) => {
+    io.to(`user:${uid}`).emit('updates:new', p);
+    if (p.notify) pushTo([uid], { title: `${p.count} new \u2014 ${p.title}`, body: p.first.title, tag: `updates-${p.feedId}`, url: '/#updates' });
+  } });
+// Study tools (server/study.js): encrypted decks/assignments sync and reminder pings.
+require('./study')({ api, auth, db, fail, rateLimit, pushTo: (...a) => pushTo(...a), emitToUser: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
 ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken,
   requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
 
@@ -3729,12 +3794,16 @@ const emitWatch = (room) => io.to(`voice:${room}`).emit('watch:state', { room, s
 // Where the video is right now, according to the shared state.
 const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 1000) * w.rate : 0);
 
+// Study together: a shared focus timer in a voice channel or call. Everyone in the room sees the same countdown
+// (worked out from when it started), so only the settings and start time live here; it ends when the room empties.
+const studyRooms = new Map(); // room -> { focus, short, long, every, startedAt, by }
+const studyOut = (room) => { const st = studyRooms.get(room); return st ? { ...st, now: Date.now() } : null; };
 function leaveVoice(userId, notifyUser = false) {
   const channelId = userVoice.get(userId);
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
   const state = m && m.get(userId);
-  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); } }
+  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); studyRooms.delete(channelId); } }
   userVoice.delete(userId);
   if (state) {
     const sock = io.sockets.sockets.get(state.socketId);
@@ -3846,6 +3915,7 @@ function setupSockets(server) {
       socket.join(`voice:${c.id}`);
       emitVoiceState(c.id);
       if (watchRooms.has(c.id)) socket.emit('watch:state', { room: c.id, state: watchOut(c.id) });
+      if (studyRooms.has(c.id)) socket.emit('study:state', { room: c.id, state: studyOut(c.id) });
       // First one in a DM or group call: ring everyone else (and push-notify them if their app is closed).
       if (!peers.length) {
         const ring = callees(c.id, uid);
@@ -3959,6 +4029,19 @@ function setupSockets(server) {
       return { ok: true };
     }));
 
+    socket.on('study:start', guard((p = {}) => {
+      const room = userVoice.get(uid);
+      if (!room) fail(400, 'Join a voice channel or call first.');
+      const n = (v, min, max, d) => { const x = Math.round(+v); return Number.isFinite(x) ? Math.min(max, Math.max(min, x)) : d; };
+      studyRooms.set(room, { focus: n(p.focus, 5, 180, 25), short: n(p.short, 1, 60, 5), long: n(p.long, 1, 90, 15), every: n(p.every, 2, 8, 4), startedAt: Date.now(), by: uid });
+      io.to(`voice:${room}`).emit('study:state', { room, state: studyOut(room) });
+    }));
+    socket.on('study:stop', guard(() => {
+      const room = userVoice.get(uid);
+      if (!room || !studyRooms.has(room)) return;
+      studyRooms.delete(room);
+      io.to(`voice:${room}`).emit('study:state', { room, state: null, by: uid });
+    }));
     socket.on('voice:leave', guard(() => {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);

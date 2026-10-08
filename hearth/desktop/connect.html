@@ -9,40 +9,154 @@
     html, body { height: 100%; margin: 0; }
     body { display: grid; place-items: center; background: radial-gradient(60% 50% at 50% 0%, rgba(242,165,65,.16), transparent 70%), #100e16; color: #ede9f5; font: 15px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; -webkit-app-region: drag; }
     .card { width: min(420px, 92vw); padding: 32px; border-radius: 22px; background: #1a1724; border: 1px solid rgba(255,255,255,.1); -webkit-app-region: no-drag; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+    [hidden] { display: none !important; }
     img { width: 56px; height: 56px; border-radius: 14px; }
-    h1 { font-size: 22px; margin: 16px 0 4px; }
+    h1 { font-size: 22px; margin: 16px 0 4px; overflow-wrap: anywhere; }
     p { margin: 0 0 18px; color: #b6afc6; font-size: 14px; }
     label { display: block; font-size: 13px; font-weight: 600; color: #b6afc6; margin-bottom: 6px; }
     input { width: 100%; height: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,.14); background: #110f18; color: inherit; font: inherit; outline: none; }
     input:focus { border-color: #f2a541; box-shadow: 0 0 0 3px rgba(242,165,65,.18); }
     button { margin-top: 14px; width: 100%; height: 44px; border: 0; border-radius: 10px; background: #f2a541; color: #1a1407; font: 600 15px system-ui, sans-serif; cursor: pointer; }
+    button.ghost { background: rgba(255,255,255,.08); color: #ede9f5; }
+    button.link { background: none; color: #b6afc6; height: auto; margin-top: 12px; padding: 4px; font-weight: 500; font-size: 13.5px; }
     button:disabled { opacity: .6; cursor: default; }
+    button:focus-visible { outline: 2px solid #f2a541; outline-offset: 2px; }
     .err { color: #ff7b8c; font-size: 13.5px; min-height: 20px; margin-top: 10px; }
     .hint { font-size: 12.5px; color: #847c97; margin-top: 14px; }
+    .status { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 12px; background: #110f18; border: 1px solid rgba(255,255,255,.08); font-size: 14px; color: #d8d2e4; }
+    .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: #f2a541; box-shadow: 0 0 0 0 rgba(242,165,65,.6); }
+    .trying .dot { animation: pulse 1s ease-out infinite; }
+    @keyframes pulse { to { box-shadow: 0 0 0 10px rgba(242,165,65,0); } }
+    .why { font-size: 12.5px; color: #847c97; margin-top: 10px; overflow-wrap: anywhere; }
+    @media (prefers-reduced-motion: reduce) { .trying .dot { animation: none; } }
   </style>
 </head>
 <body>
-  <form class="card" id="f">
+  <!-- Can't reach the server: keeps trying by itself (2s, 4s, 8s… up to 30s) and loads it when it answers. -->
+  <div class="card" id="offline" hidden>
+    <img src="build/icon.png" alt="">
+    <h1 id="off-title">Can’t reach your server</h1>
+    <p id="off-text">Hearth will connect again by itself as soon as the server answers. Check your internet connection if this takes a while.</p>
+    <div class="status" id="status" role="status" aria-live="polite"><span class="dot"></span><span id="status-text">Trying again…</span></div>
+    <div class="why" id="why"></div>
+    <button id="retry" type="button">Retry now</button>
+    <button id="change" type="button" class="ghost">Change server</button>
+  </div>
+
+  <form class="card" id="f" hidden>
     <img src="build/icon.png" alt="">
     <h1 id="title">Connect to your server</h1>
     <p>Enter the address of the Hearth server you use in your browser.</p>
     <label for="url">Server address</label>
-    <input id="url" placeholder="chat.example.com" autocomplete="url" autofocus required>
+    <input id="url" placeholder="chat.example.com" autocomplete="url" spellcheck="false" required>
     <button id="go" type="submit">Connect</button>
     <div class="err" id="err" role="alert"></div>
+    <button id="back" type="button" class="link" hidden>Back</button>
     <div class="hint">Your messages stay end-to-end encrypted. The app only talks to the server you enter here.</div>
   </form>
   <script>
+    const $ = (id) => document.getElementById(id);
     const q = new URLSearchParams(location.search);
-    if (q.get('name')) document.getElementById('title').textContent = `Connect to ${q.get('name')}`;
-    document.getElementById('err').textContent = q.get('error') || '';
-    document.getElementById('f').addEventListener('submit', async (e) => {
+    const D = window.hearthDesktop;
+    const locked = q.get('locked') === '1';
+    const server = q.get('server') || '';
+    const host = (() => { try { return new URL(server).host; } catch { return server; } })();
+    if (q.get('name')) $('title').textContent = `Connect to ${q.get('name')}`;
+
+    // ------------------------------------------------ the server address form (first run, Change server)
+    function showForm(error) {
+      stopRetrying();
+      $('offline').hidden = true;
+      $('f').hidden = false;
+      $('err').textContent = error || '';
+      if (server && !$('url').value) $('url').value = server.replace(/^https:\/\//, '');
+      $('url').readOnly = locked;
+      $('back').hidden = !q.get('offline');
+      $('url').focus();
+      $('url').select();
+    }
+    $('f').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const btn = document.getElementById('go');
+      const btn = $('go');
       btn.disabled = true; btn.textContent = 'Connecting…';
-      const r = await window.hearthDesktop.connect(document.getElementById('url').value);
-      if (!r.ok) { document.getElementById('err').textContent = r.error; btn.disabled = false; btn.textContent = 'Connect'; }
+      // A build locked to one server can only try that server again.
+      const r = locked ? await D.retryServer() : await D.connect($('url').value);
+      if (!r.ok) { $('err').textContent = locked ? `Couldn’t reach ${host}. ${explain(r.error)}` : r.error; btn.disabled = false; btn.textContent = 'Connect'; }
     });
+    $('back').addEventListener('click', showOffline);
+
+    // ------------------------------------------------ can't reach the server: retry with backoff
+    const reasons = {
+      ERR_INTERNET_DISCONNECTED: 'You’re offline.',
+      ERR_NAME_NOT_RESOLVED: 'The address couldn’t be found (DNS).',
+      ERR_NAME_RESOLUTION_FAILED: 'The address couldn’t be found (DNS).',
+      ERR_CONNECTION_REFUSED: 'The server isn’t accepting connections, it may be restarting.',
+      ERR_CONNECTION_TIMED_OUT: 'The server took too long to answer.',
+      ERR_TIMED_OUT: 'The server took too long to answer.',
+      ERR_NETWORK_CHANGED: 'Your network changed.',
+      ERR_ADDRESS_UNREACHABLE: 'The server can’t be reached from this network.',
+      ERR_CONNECTION_RESET: 'The connection was interrupted.',
+      ERR_CONNECTION_CLOSED: 'The connection was interrupted.',
+      ERR_PROXY_CONNECTION_FAILED: 'Couldn\u2019t connect through your proxy.',
+      ERR_TUNNEL_CONNECTION_FAILED: 'Couldn\u2019t connect through your proxy or network filter.',
+    };
+    const explain = (r) => {
+      r = String(r || '').replace(/^net::/, '');
+      const http = /^HTTP_(\d{3})$/.exec(r);
+      if (http) return +http[1] >= 500 ? `The server answered with error ${http[1]}, it\u2019s probably restarting.` : `The server answered with error ${http[1]}.`;
+      if (r === 'NOT_HEARTH') return 'Something answers at this address, but it isn\u2019t a Hearth server.';
+      return reasons[r] || (r ? `Details: ${r}` : '');
+    };
+    let delay = 2;      // seconds until the next try; doubles up to 30
+    let timer = null;
+    let tick = null;
+    let busy = false;
+    function stopRetrying() { clearTimeout(timer); clearInterval(tick); timer = tick = null; }
+    function schedule() {
+      stopRetrying();
+      let left = delay;
+      const draw = () => { $('status').classList.remove('trying'); $('status-text').textContent = `Retrying in ${left}s`; };
+      draw();
+      tick = setInterval(() => { left = Math.max(0, left - 1); draw(); }, 1000);
+      timer = setTimeout(attempt, delay * 1000);
+      delay = Math.min(30, delay * 2);
+    }
+    async function attempt() {
+      if (busy) return;
+      busy = true;
+      stopRetrying();
+      $('status').classList.add('trying');
+      $('status-text').textContent = 'Trying again…';
+      $('retry').disabled = true;
+      let r = { ok: false };
+      try { r = await D.retryServer(); } catch { /* keep trying */ }
+      busy = false;
+      $('retry').disabled = false;
+      if (r.ok) { $('status-text').textContent = 'Connected, loading…'; return; } // the app loads the server now
+      if (r.error) $('why').textContent = explain(r.error);
+      if (!$('offline').hidden) schedule();
+    }
+    function showOffline() {
+      $('f').hidden = true;
+      $('offline').hidden = false;
+      delay = 2;
+      schedule();
+      $('retry').focus();
+    }
+    $('retry').addEventListener('click', () => { delay = 2; attempt(); });
+    $('change').addEventListener('click', () => showForm(''));
+    // Back online, or the computer woke up: try straight away.
+    window.addEventListener('online', () => { if (!$('offline').hidden) { delay = 2; attempt(); } });
+    if (D && D.onResume) D.onResume(() => { if (!$('offline').hidden) { delay = 2; attempt(); } });
+
+    if (q.get('offline') && server) {
+      $('off-title').textContent = `Can’t reach ${host}`;
+      $('why').textContent = explain(q.get('reason'));
+      $('change').hidden = locked;
+      showOffline();
+    } else {
+      showForm(q.get('error'));
+    }
   </script>
 </body>
 </html>

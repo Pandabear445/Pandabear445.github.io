@@ -19,12 +19,12 @@
     "dist:linux": "electron-builder --linux --publish never"
   },
   "dependencies": {
-    "electron-updater": "^6.3.9",
-    "uiohook-napi": "^1.5.4"
+    "electron-updater": "^6.8.9",
+    "uiohook-napi": "^1.5.5"
   },
   "devDependencies": {
-    "electron": "^33.2.1",
-    "electron-builder": "^25.1.8"
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
   },
   "build": {
     "appId": "app.hearth.desktop",
@@ -53,6 +53,12 @@
       "buildResources": "build",
       "output": "dist"
     },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://hearth.invalid/updates/"
+      }
+    ],
     "win": {
       "target": [
         "nsis"

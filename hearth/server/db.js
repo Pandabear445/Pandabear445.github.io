@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -594,6 +594,54 @@ CREATE TRIGGER IF NOT EXISTS admin_log_no_update BEFORE UPDATE ON admin_log BEGI
 CREATE TRIGGER IF NOT EXISTS admin_log_no_delete BEFORE DELETE ON admin_log BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
 `);
 }
+
+// v14: server folders (synced across your devices), personal update tracking, and study tools.
+addColumn('users', 'rail_layout', "TEXT NOT NULL DEFAULT ''");
+addColumn('users', 'study_enabled', 'INTEGER NOT NULL DEFAULT 0');
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_feeds (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  query TEXT NOT NULL,
+  url TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  keywords TEXT NOT NULL DEFAULT '',
+  notify INTEGER NOT NULL DEFAULT 1,
+  paused INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  last_check INTEGER,
+  last_ok INTEGER,
+  last_error TEXT,
+  found INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_user_feeds_user ON user_feeds(user_id);
+CREATE TABLE IF NOT EXISTS user_feed_items (
+  id TEXT PRIMARY KEY,
+  feed_id TEXT NOT NULL REFERENCES user_feeds(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  item_key TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '{}',
+  new INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  read_at INTEGER,
+  UNIQUE (feed_id, item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_user_feed_items_user ON user_feed_items(user_id, created_at);
+-- Study tools: each deck, task or day of focus stats is one row, end-to-end encrypted by the app (the
+-- server only stores ciphertext), synced across the person's devices.
+CREATE TABLE IF NOT EXISTS study_items (
+  id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '',
+  size INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_study_items_sync ON study_items(user_id, updated_at);
+`);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

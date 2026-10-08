@@ -15,6 +15,8 @@ What the app adds on top of the web page (in `native/MainActivity.java`):
 * **Back button** goes back; on the first screen it sends the app to the background (so messages keep
   arriving) instead of closing it.
 * **Switch server:** Settings → Apps & devices → *Switch server*.
+* **Status bar and keyboard:** the page sits between Android's status bar and navigation bar and above the
+  keyboard on every Android version (Android 15+ would otherwise draw it underneath them).
 
 ## Get the APK
 
@@ -23,6 +25,8 @@ repository's **Actions** tab → *Hearth apps* → the latest run → *Artifacts
 `.apk` inside). Push a tag like `app-v1.17.0` to get it attached to a GitHub release instead.
 
 Install it: open the `.apk` on the phone and allow "Install unknown apps" for your browser or file manager.
+Those warnings (and Play Protect's "unrecognised app") come with installing outside Google Play; to avoid them,
+offer the app through Google Play's internal testing track, see [`../docs/SIGNING.md`](../docs/SIGNING.md).
 To offer it to everyone, put the `.apk` in your server's `data/downloads/` folder — the `/download` page shows
 it to Android visitors.
 
@@ -48,15 +52,22 @@ base64 -w0 hearth.jks > hearth.jks.txt      # macOS: base64 -i hearth.jks -o hea
 `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`hearth`) and `ANDROID_KEY_PASSWORD`. Keep `hearth.jks` safe:
 lose it and you can never update the app again without everyone reinstalling.
 
+With these secrets the workflow also builds a Google Play bundle (`.aab`, artifact
+`hearth-android-play-bundle`), and with a `PLAY_SERVICE_ACCOUNT_JSON` secret it uploads it to Google Play's
+internal testing track. Step by step: [`../docs/SIGNING.md`](../docs/SIGNING.md).
+
+The app's *versionCode* (which must go up with every update) is `(major × 100 + minor) × 100000 + the
+workflow's run number`.
+
 ## Not in the Android app (yet)
 
 * **Screen sharing** — Android's web view can't capture the screen. Camera, mic and watch together work.
 * **Notifications after the app is swiped away** — that needs Google's Firebase push service.
-* **Google Play** — needs a Play developer account ($25 once) and their review. The APK above is what you'd
-  upload.
 
 ## Building it yourself
 
-Needs Node 20, JDK 17 and the Android SDK (Android Studio). The workflow's *Create the Android project* step
-shows exactly what it does: `npm install`, `npx cap add android`, copy `native/MainActivity.java` in, add the
-microphone/camera/notification permissions and the `androidx.webkit` dependency, then `./gradlew assembleRelease`.
+Needs Node 22, JDK 21 and the Android SDK (Android Studio Otter 2025.2.1 or newer): the app uses Capacitor 8
+and targets Android 16 (API 36), which Google Play requires for new apps and updates. The workflow's *Create
+the Android project* step shows exactly what it does: `npm install`, `npx cap add android`, copy
+`native/MainActivity.java` in, add the microphone/camera/notification permissions and the `androidx.webkit`
+dependency, then `./gradlew assembleRelease` (and `bundleRelease` for Google Play).

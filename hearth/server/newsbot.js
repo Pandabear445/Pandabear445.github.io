@@ -115,7 +115,7 @@ function parseFeed(xml) {
 }
 
 module.exports = function setupNewsbot(ctx) {
-  const { api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer, canManageServer, serializeMessage, toChannel, checkMediaToken, emitServerFeeds, searchSteam } = ctx;
+  const { api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer, canManageServer, serializeMessage, toChannel, checkMediaToken, emitServerFeeds, searchSteam, notifyUser } = ctx;
   const now = () => Date.now();
 
   // The bot's account: can't sign in (no password), shows a BOT tag.
@@ -157,7 +157,9 @@ module.exports = function setupNewsbot(ctx) {
       }
       return { url: `https://www.youtube.com/feeds/videos.xml?channel_id=${id}`, title: '' };
     }
-    if (kind === 'rss') return { url: (await assertPublic(q)).href, title: '' };
+    if (kind === 'rss') {
+      try { return { url: (await assertPublic(q)).href, title: '' }; } catch (e) { fail(400, e.message); }
+    }
     fail(400, 'Unknown kind of feed.');
   }
   const itemKey = (i) => crypto.createHash('sha1').update(i.id || i.link).digest('hex');
@@ -219,8 +221,130 @@ module.exports = function setupNewsbot(ctx) {
       for (const f of due) await check(f);
     } finally { running = false; }
   }
-  setInterval(() => { tick().catch(() => {}); }, 60000).unref();
-  setTimeout(() => { tick().catch(() => {}); }, 20000).unref();
+  setInterval(() => { tick().catch(() => {}); userTick().catch(() => {}); }, 60000).unref();
+  setTimeout(() => { tick().catch(() => {}); userTick().catch(() => {}); }, 20000).unref();
+
+  // ------------------------------------------------------------------ personal trackers ("Updates")
+  // The same feeds, followed by one person for themselves instead of posted to a server. Found items go to their
+  // Updates page (and a notification if they want one). Like server feeds, only things published after you
+  // start tracking show up — never a backlog of old news.
+  const USER_EVERY_MS = 30 * 60000;
+  const USER_MAX_TRACKERS = 20;
+  const USER_MAX_PER_CHECK = 10;
+  const trackerOut = (f, unread = 0) => ({ id: f.id, kind: f.kind, kindName: (KINDS[f.kind] || {}).name || f.kind, query: f.query, title: f.title, keywords: f.keywords,
+    notify: !!f.notify, paused: !!f.paused, found: f.found, unread, lastCheck: f.last_check, lastOk: f.last_ok, lastError: f.last_error, createdAt: f.created_at });
+  const itemOut = (r) => { let d = {}; try { d = JSON.parse(r.data); } catch { /* */ } return { id: r.id, feedId: r.feed_id, ...d, foundAt: r.created_at, read: !!r.read_at }; };
+  const unreadCount = (uid) => db.prepare('SELECT COUNT(*) n FROM user_feed_items WHERE user_id = ? AND new = 1 AND read_at IS NULL').get(uid).n;
+  async function checkUserFeed(feed) {
+    db.prepare('UPDATE user_feeds SET last_check = ? WHERE id = ?').run(now(), feed.id);
+    try {
+      const { items } = await fetchFeed(feed.url);
+      const seen = db.prepare('SELECT 1 FROM user_feed_items WHERE feed_id = ? AND item_key = ?');
+      // "new" = shown on the Updates page; the rest are only remembered so they never show up later.
+      const add = db.prepare('INSERT OR IGNORE INTO user_feed_items (id, feed_id, user_id, item_key, data, new, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      const fresh = items.filter((i) => !seen.get(feed.id, itemKey(i))).sort((a, b) => (a.date || 0) - (b.date || 0));
+      const found = [];
+      db.transaction(() => {
+        for (const i of fresh) {
+          const show = !(i.date && i.date < feed.created_at - 3600000) && matches(feed, i) && found.length < USER_MAX_PER_CHECK;
+          const data = show ? JSON.stringify({ title: i.title, url: i.link, summary: i.summary, image: i.image, source: i.source || feed.title, date: i.date }) : '{}';
+          add.run(newId(), feed.id, feed.user_id, itemKey(i), data, show ? 1 : 0, now());
+          if (show) found.push(i);
+        }
+        db.prepare('UPDATE user_feeds SET last_ok = ?, last_error = NULL, found = found + ? WHERE id = ?').run(now(), found.length, feed.id);
+        // Remember at most the newest 600 items per tracker.
+        db.prepare('DELETE FROM user_feed_items WHERE feed_id = ? AND id NOT IN (SELECT id FROM user_feed_items WHERE feed_id = ? ORDER BY created_at DESC LIMIT 600)').run(feed.id, feed.id);
+      })();
+      if (found.length && notifyUser) {
+        notifyUser(feed.user_id, {
+          feedId: feed.id, title: feed.title, count: found.length, unread: unreadCount(feed.user_id), notify: !!feed.notify,
+          first: { title: found[found.length - 1].title, url: found[found.length - 1].link },
+        });
+      }
+      return found.length;
+    } catch (e) {
+      db.prepare('UPDATE user_feeds SET last_error = ? WHERE id = ?').run(String(e.message || e).slice(0, 200), feed.id);
+      return 0;
+    }
+  }
+  let userRunning = false;
+  async function userTick() {
+    if (userRunning) return;
+    userRunning = true;
+    try {
+      const due = db.prepare('SELECT * FROM user_feeds WHERE paused = 0 AND (last_check IS NULL OR last_check < ?) ORDER BY last_check LIMIT 30').all(now() - USER_EVERY_MS);
+      for (const f of due) await checkUserFeed(f);
+    } finally { userRunning = false; }
+  }
+  const myFeed = (id, uid) => { const f = db.prepare('SELECT * FROM user_feeds WHERE id = ? AND user_id = ?').get(String(id), uid); if (!f) fail(404, 'No such tracker.'); return f; };
+  const unreadByFeed = (uid) => Object.fromEntries(db.prepare('SELECT feed_id, COUNT(*) n FROM user_feed_items WHERE user_id = ? AND new = 1 AND read_at IS NULL GROUP BY feed_id').all(uid).map((r) => [r.feed_id, r.n]));
+  api.get('/me/trackers', auth, (req, res) => {
+    const unread = unreadByFeed(req.userId);
+    const before = Math.floor(+req.query.before) || Number.MAX_SAFE_INTEGER;
+    const feed = typeof req.query.feed === 'string' && req.query.feed ? req.query.feed : null;
+    const items = db.prepare(`SELECT * FROM user_feed_items WHERE user_id = ? AND new = 1 AND created_at < ? ${feed ? 'AND feed_id = ?' : ''} ORDER BY created_at DESC, id DESC LIMIT 60`).all(...[req.userId, before, ...(feed ? [feed] : [])]);
+    res.json({ trackers: db.prepare('SELECT * FROM user_feeds WHERE user_id = ? ORDER BY created_at').all(req.userId).map((f) => trackerOut(f, unread[f.id] || 0)),
+      items: items.map(itemOut), unread: unreadCount(req.userId), kinds: Object.fromEntries(Object.entries(KINDS).map(([k, v]) => [k, v.name])) });
+  });
+  api.post('/me/trackers/preview', auth, wrap(async (req, res) => {
+    rateLimit('trackpreview:' + req.userId, 20, 10 * 60000);
+    const b = req.body || {};
+    if (typeof b.kind !== 'string' || !Object.hasOwn(KINDS, b.kind)) fail(400, 'Unknown kind of tracker.');
+    const { url, title } = await feedUrl(b.kind, b.query);
+    let parsed;
+    try { parsed = await fetchFeed(url); } catch (e) { fail(400, `Couldn’t read it: ${e.message}`); }
+    res.json({ title: title || parsed.title, items: parsed.items.slice(0, 5).map((i) => ({ title: i.title, url: i.link, date: i.date, image: i.image, source: i.source })) });
+  }));
+  api.post('/me/trackers', auth, wrap(async (req, res) => {
+    rateLimit('trackadd:' + req.userId, 20, 3600000);
+    const b = req.body || {};
+    if (typeof b.kind !== 'string' || !Object.hasOwn(KINDS, b.kind)) fail(400, 'Unknown kind of tracker.');
+    if (db.prepare('SELECT COUNT(*) n FROM user_feeds WHERE user_id = ?').get(req.userId).n >= USER_MAX_TRACKERS) fail(400, `You can track up to ${USER_MAX_TRACKERS} things.`);
+    const { url, title } = await feedUrl(b.kind, b.query);
+    if (db.prepare('SELECT 1 FROM user_feeds WHERE user_id = ? AND url = ?').get(req.userId, url)) fail(409, 'You’re already tracking that.');
+    let parsed;
+    try { parsed = await fetchFeed(url); } catch (e) { fail(400, `Couldn’t read it: ${e.message}`); }
+    const id = newId(); const t = now();
+    db.transaction(() => {
+      db.prepare('INSERT INTO user_feeds (id, user_id, kind, query, url, title, keywords, notify, created_at, last_check, last_ok) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, req.userId, b.kind, String(b.query).trim().slice(0, 300), url, String(b.title || title || parsed.title || KINDS[b.kind].name).trim().slice(0, 100), String(b.keywords || '').slice(0, 300), b.notify === false ? 0 : 1, t, t, t);
+      // What's already out there counts as seen: only news from now on shows up.
+      const add = db.prepare("INSERT OR IGNORE INTO user_feed_items (id, feed_id, user_id, item_key, data, new, created_at) VALUES (?, ?, ?, ?, '{}', 0, ?)");
+      parsed.items.forEach((i) => add.run(newId(), id, req.userId, itemKey(i), t));
+    })();
+    res.json(trackerOut(db.prepare('SELECT * FROM user_feeds WHERE id = ?').get(id)));
+  }));
+  api.patch('/me/trackers/:id', auth, (req, res) => {
+    const f = myFeed(req.params.id, req.userId);
+    const b = req.body || {};
+    if (b.paused !== undefined) db.prepare('UPDATE user_feeds SET paused = ? WHERE id = ?').run(b.paused ? 1 : 0, f.id);
+    if (b.notify !== undefined) db.prepare('UPDATE user_feeds SET notify = ? WHERE id = ?').run(b.notify ? 1 : 0, f.id);
+    if (b.keywords !== undefined) db.prepare('UPDATE user_feeds SET keywords = ? WHERE id = ?').run(String(b.keywords || '').slice(0, 300), f.id);
+    if (b.title !== undefined) db.prepare('UPDATE user_feeds SET title = ? WHERE id = ?').run(String(b.title || '').trim().slice(0, 100) || f.title, f.id);
+    res.json(trackerOut(db.prepare('SELECT * FROM user_feeds WHERE id = ?').get(f.id), unreadByFeed(req.userId)[f.id] || 0));
+  });
+  api.post('/me/trackers/:id/check', auth, wrap(async (req, res) => {
+    const f = myFeed(req.params.id, req.userId);
+    rateLimit('trackcheck:' + req.userId, 10, 10 * 60000);
+    const found = await checkUserFeed(f);
+    res.json({ found, tracker: trackerOut(db.prepare('SELECT * FROM user_feeds WHERE id = ?').get(f.id), unreadByFeed(req.userId)[f.id] || 0) });
+  }));
+  api.delete('/me/trackers/:id', auth, (req, res) => {
+    const f = myFeed(req.params.id, req.userId);
+    db.prepare('DELETE FROM user_feeds WHERE id = ?').run(f.id);
+    res.json({ ok: true, unread: unreadCount(req.userId) });
+  });
+  // Mark items read: some ids, one tracker, or everything.
+  api.post('/me/tracker-items/read', auth, (req, res) => {
+    const b = req.body || {};
+    const t = now();
+    if (Array.isArray(b.ids)) {
+      const st = db.prepare('UPDATE user_feed_items SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL');
+      db.transaction(() => b.ids.slice(0, 500).forEach((id) => st.run(t, String(id), req.userId)))();
+    } else if (typeof b.feedId === 'string') db.prepare('UPDATE user_feed_items SET read_at = ? WHERE feed_id = ? AND user_id = ? AND read_at IS NULL').run(t, b.feedId, req.userId);
+    else if (b.all === true) db.prepare('UPDATE user_feed_items SET read_at = ? WHERE user_id = ? AND read_at IS NULL').run(t, req.userId);
+    res.json({ unread: unreadCount(req.userId) });
+  });
 
   // ------------------------------------------------------------------ API (server admins)
   const feedOut = (f) => ({ id: f.id, channelId: f.channel_id, kind: f.kind, kindName: (KINDS[f.kind] || {}).name || f.kind, query: f.query, title: f.title, keywords: f.keywords, posted: f.posted, paused: !!f.paused, lastCheck: f.last_check, lastOk: f.last_ok, lastError: f.last_error, createdAt: f.created_at });
@@ -312,7 +436,7 @@ module.exports = function setupNewsbot(ctx) {
     } catch { res.status(404).end(); }
   }));
 
-  return { BOT_ID, parseFeed, KINDS: Object.fromEntries(Object.entries(KINDS).map(([k, v]) => [k, v.name])) };
+  return { BOT_ID, parseFeed, KINDS: Object.fromEntries(Object.entries(KINDS).map(([k, v]) => [k, v.name])), unreadUpdates: unreadCount };
 };
 module.exports.parseFeed = parseFeed;
 module.exports.privateIp = privateIp;

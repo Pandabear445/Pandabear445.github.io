@@ -23,6 +23,8 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | **Reset links and email codes** | Server database | Stored hashed, single-use, short-lived (30 minutes). |
 | **Group membership, who talks to whom, when** | Server database | **Not hidden** (metadata). The server needs it to route messages. |
 | **SMTP password, API keys** | Server database or `.env` | Encrypted with `data/secret.key` (database), or kept in `.env`. Never in git. |
+| **Study tools data** (decks, assignments, timer settings, stats) | Server database, as ciphertext only | Encrypted on your device with a key derived from your identity key (ECDH with itself → HKDF → AES-256-GCM). Each item is bound to its id and kind, so the server can't swap them. For reminders, the server stores only a time. |
+| **Server folders, tracked feeds** | Server database | Not encrypted: they're personal settings the server needs (folders) or acts on (it fetches the feeds). They're only shown to the account itself. |
 | **Backups** | `data/backups/encrypted/*.hbk`, plus off-site copies | Encrypted with a separate backup key, made tamper-evident in chunks, and restore-tested when made. |
 | **The audit log** | Server database | Append-only (the database refuses edits and deletes), with a hash chain so hand edits to the file are detected. |
 
@@ -71,6 +73,9 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 27 | Admin hides their tracks | Audit entries can't be edited or deleted; hand edits to the database file break the hash chain, and Admin → Audit log says so | `platform.test.js` › audit log |
 | 28 | Backup stolen | Useless without the backup key; tampering or truncation is detected; restores really work | `backup.test.js` |
 | 29 | VPS filesystem compromised | No plaintext messages, passwords or private keys are stored (see rows 1–4) | `platform.test.js`, `crypto.test.js` |
+| 30 | Someone reads another person's study data, trackers or folders | Every route only returns the caller's own items; study data is ciphertext anyway | `features.test.js` |
+| 31 | A tracker is pointed at an internal address (SSRF) | Private, loopback, link-local and cloud-metadata addresses are refused, including after redirects | `features.test.js` › trackers: private and internal addresses |
+| 32 | A group member removes others or takes over the group | Only the owner can remove people or hand the group over | `features.test.js` › group chats |
 
 ## 4. What each adversary can still do (honest limits)
 

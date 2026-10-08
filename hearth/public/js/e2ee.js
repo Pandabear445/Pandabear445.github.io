@@ -173,6 +173,21 @@ export async function resetKeyProof(myPriv, serverPublicKeyB64, nonce, userId) {
   const mac = await subtle().importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return b64(await subtle().sign('HMAC', mac, enc.encode(`hearth-reset-proof|${userId}|${nonce}`)));
 }
+// ---------------------------------------------------------------- personal vault (study tools)
+// A key only you can derive: ECDH between your identity key and its own public half, through HKDF. Your study
+// decks, assignments and stats are encrypted with it before they're saved, so the server stores only ciphertext.
+// Each item is bound to its kind and id (as additional data), so the server can't swap or relabel items.
+export async function vaultKey(myPriv, myPubB64) {
+  const bits = await subtle().deriveBits({ name: 'ECDH', public: await importEcdhPublic(myPubB64) }, myPriv, 256);
+  return hkdfAes(await hkdfKey(bits), enc.encode('hearth-vault-salt'), 'hearth-vault-v1');
+}
+export async function sealVault(key, kind, id, obj) {
+  return 'x1:' + await sealBytes(key, padded(obj), `hearth-vault|${kind}|${id}`);
+}
+export async function openVault(key, kind, id, text) {
+  if (!String(text).startsWith('x1:')) throw new Error('Unknown format');
+  return JSON.parse(dec.decode(await openBytes(key, text.slice(3), `hearth-vault|${kind}|${id}`)));
+}
 export async function rewrapPrivateKey(oldWrapKey, newWrapKey, encPrivateKey) {
   const pkcs8 = await openBytes(oldWrapKey, encPrivateKey);
   try { return await sealBytes(newWrapKey, pkcs8); } finally { pkcs8.fill(0); }

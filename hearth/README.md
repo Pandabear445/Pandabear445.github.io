@@ -494,6 +494,54 @@ In a server's **Server Settings → News bot** (needs Manage Server), follow a t
 
 Bot posts come from public feeds, so they aren't end-to-end encrypted (the server writes them). The bot can't sign in and can't read your encrypted messages. The server needs outgoing internet access to the sites you follow.
 
+## Server folders
+
+Organise the servers in your left bar into folders:
+
+- **Right-click a server → Move to folder**, or open **Organize servers** (right-click the + at the bottom of the bar), a plain list with a folder picker and up/down buttons for each server. You can also drag servers in the bar: drop one onto another to make a folder, or between two to reorder.
+- **Folders have a name, a colour and an emoji.** When closed they show a combined unread dot and @mention count.
+- **Focus on a folder** (right-click it) to show only its servers, for example "School" during the week. Click the focus tile at the top of the bar to switch back.
+- **Mute a folder or mark it all as read** in one click.
+- **They follow you:** your folders are saved to your account, so every device shows the same arrangement.
+
+## Group chats
+
+**New group chat** is on Home (under Direct messages) and on the Friends page. A friend's ⋯ menu can also start a group chat or add them to one.
+
+- **Up to 25 people.** Everyone in the group can add friends or people they share a server with, rename it and change its picture.
+- **The owner can remove people** and hand the group to someone else (group menu → Members).
+- **End-to-end encrypted** like servers. When someone is removed or leaves, the group switches to a new key.
+
+## Updates (track anything)
+
+Home → **Updates** → **Track something**: a topic in the news, a YouTube channel, a subreddit, a game's patch notes (Steam), a GitHub project's releases, or any RSS feed.
+
+- **Only new posts:** you see posts published after you started tracking, never old news.
+- **Checked about every 30 minutes,** with an optional notification (even when the app is closed, if push is on) and an optional keyword filter.
+- **Not end-to-end encrypted:** your server fetches the feeds, so it knows what you track (it can't read your chats). Pictures load through the server, so the sites don't see your IP.
+
+## Study tools
+
+Off until someone turns them on: **Settings → Study tools**. Then Home → **Study** has:
+
+- **Focus timer:** focus, short break, long break (lengths are yours). It turns on Do Not Disturb while you focus.
+  - **Study together:** in a voice channel or call, press **Study together** in the call bar, and everyone there gets the same countdown and chime.
+- **Flashcards:** decks with spaced repetition (cards you know come back less often) and quick multiple-choice quizzes.
+  - Paste a list to make many cards at once (`term - meaning` per line; Quizlet exports work), or import a file.
+- **Assignments:** due dates, subjects and reminders. The reminder arrives even when Hearth is closed.
+- **Stats:** focus minutes per day, cards reviewed, streak.
+
+Decks, assignments, settings and stats are **end-to-end encrypted** with a key only your account can derive, and synced between your devices. For reminders, the server only knows a time, not what the reminder is for.
+
+## Desktop app: signing (no more "Windows protected your PC")
+
+See [docs/SIGNING.md](docs/SIGNING.md):
+
+- **Windows:** sign the installer with Azure Artifact Signing (about $10 a month) or a code-signing certificate.
+- **Android:** publish through Google Play's internal testing track ($25 once), so friends install from Play without warnings.
+
+The GitHub workflow signs automatically once the secrets are added.
+
 ## Games & music: setup
 
 Works out of the box (game search, pictures, setting things by hand, desktop detection). Two free keys in Admin → Owner → Games & music make it better:

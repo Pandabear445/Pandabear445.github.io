@@ -1,6 +1,13 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.22.0', items: [
+    'Server folders: right-click a server \u2192 Move to folder, or drag one onto another. Folders get a name, colour and emoji, can be focused (show only that folder), muted or marked read, and follow you to every device.',
+    'Group chats are easier: \u201cNew group chat\u201d on Home and on the Friends page, up to 25 people, a group picture, and the owner can remove people.',
+    'Updates: track a topic, a YouTube channel, a subreddit, a game\u2019s patch notes or a GitHub project, and new posts show up on your Updates page (never old news).',
+    'Study tools (turn them on in Settings \u2192 Study tools): a focus timer you can share with your call, flashcards with spaced repetition and quizzes, assignments with reminders, and stats \u2014 all end-to-end encrypted.',
+    'Desktop app: fixed blank preview tiles in Appearance, a right-click menu (copy, paste, spelling), zoom, Ctrl+, for Settings, its own settings in Apps & devices, and it keeps retrying when the server is unreachable.',
+  ] },
   { version: '1.21.0', items: [
     'Settings → Sessions shows every device signed in to your account (device, IP address, last active). Sign one out, or all the others at once.',
     'Changing your password, email or recovery key now asks for your two-factor code too (when it’s on), and you get an email whenever something important changes.',

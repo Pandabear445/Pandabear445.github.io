@@ -10,6 +10,7 @@ import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.net.Uri;
 import android.net.http.SslCertificate;
 import android.net.http.SslError;
@@ -18,18 +19,24 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Base64;
+import android.view.View;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 import android.widget.Toast;
 
+import androidx.activity.EdgeToEdge;
 import androidx.activity.OnBackPressedCallback;
+import androidx.activity.SystemBarStyle;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 import androidx.webkit.JavaScriptReplyProxy;
 import androidx.webkit.WebMessageCompat;
 import androidx.webkit.WebViewCompat;
@@ -78,6 +85,7 @@ public class MainActivity extends BridgeActivity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         Bridge bridge = getBridge();
         WebView web = bridge.getWebView();
+        fitBetweenSystemBars(web);
         web.getSettings().setMediaPlaybackRequiresUserGesture(false);
         bridge.setWebViewClient(new HearthClient(bridge));
         listen();
@@ -103,6 +111,24 @@ public class MainActivity extends BridgeActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         handleNotificationTap(intent);
+    }
+
+    // ------------------------------------------------------------------ status bar, navigation bar, keyboard
+    // Android 15+ draws every app edge to edge (behind the status and navigation bars) and no longer shrinks
+    // the window for the keyboard. Hearth's pages expect a normal window, so the web view's container is padded
+    // by the bars, the camera cutout and the keyboard, on every Android version alike, with light bar icons
+    // over Hearth's dark background. (Capacitor's own SystemBars handling is off in capacitor.config.json.)
+    private void fitBetweenSystemBars(WebView web) {
+        EdgeToEdge.enable(this, SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT));
+        View box = (View) web.getParent();
+        box.setBackgroundColor(0xFF100E16);
+        ViewCompat.setOnApplyWindowInsetsListener(box, (v, insets) -> {
+            Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+            v.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, ime.bottom));
+            return WindowInsetsCompat.CONSUMED;
+        });
+        ViewCompat.requestApplyInsets(box);
     }
 
     // ------------------------------------------------------------------ which pages may load in the app

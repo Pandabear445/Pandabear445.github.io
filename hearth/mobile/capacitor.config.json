@@ -10,5 +10,11 @@
     "captureInput": true,
     "webContentsDebuggingEnabled": false,
     "appendUserAgent": "HearthAndroid"
+  },
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "disable",
+      "style": "DARK"
+    }
   }
 }

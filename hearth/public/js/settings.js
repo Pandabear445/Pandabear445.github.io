@@ -8,6 +8,7 @@ import { pageEditorTab } from './page.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import { androidApp } from './android.js';
+import { desktopSettingsSection } from './desktop-settings.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
 import { getKeybinds, saveKeybinds, comboLabel, recordCombo, DEFAULT_KEYBINDS } from './keybinds.js';
 import {
@@ -60,7 +61,7 @@ function section(title, ...kids) {
 // ------------------------------------------------------------------ the modal
 // Grouped like most chat apps so people can find things: [group label, [[key, label, icon], ...]]
 const TAB_GROUPS = [
-  ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['activity', 'Games & music', 'gamepad'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor']]],
+  ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['activity', 'Games & music', 'gamepad'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor'], ['study', 'Study tools', 'graduation']]],
   ['App', [['appearance', 'Appearance', 'palette'], ['layout', 'Layout', 'sidebar'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['keybinds', 'Keybinds', 'monitor'], ['apps', 'Apps & devices', 'download']]],
   ['Privacy', [['privacy', 'Privacy & safety', 'shield']]],
   ['Servers', [['servers', 'Server settings', 'gear']]],
@@ -119,7 +120,7 @@ export function openSettings(app, tab = 'profile') {
     stopMicTest();
     drawNav();
     clear(content);
-    const views = { keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
+    const views = { study: studyTab, keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
     content.append(views[current](app, (d) => { dirty = d; }));
     content.scrollTop = 0;
   };
@@ -1182,6 +1183,12 @@ function chatTab(app) {
   );
 }
 
+// ------------------------------------------------------------------ study tools tab
+function studyTab(app) {
+  return h('div', { class: 'set-form narrow' }, h('h2', { class: 'set-title' }, 'Study tools'),
+    app.study().settingsSection({ section, toggle }));
+}
+
 // ------------------------------------------------------------------ sessions tab
 // Every device signed in to this account: what it is, its IP address, when it was last used. Any of them can be
 // signed out from here (it's disconnected right away), or all of them except this one.
@@ -1476,7 +1483,7 @@ function appsTab(app) {
   const installBox = h('div', { class: 'stack' });
   const drawInstall = () => {
     clear(installBox);
-    if (window.hearthDesktop) { installBox.append(h('p', { class: 'muted-p' }, `You\u2019re using the Hearth desktop app (version ${window.hearthDesktop.version}).`)); return; }
+    if (window.hearthDesktop) { installBox.append(h('p', { class: 'muted-p' }, 'You\u2019re using the Hearth desktop app. Its settings are below.')); return; }
     if (androidApp.on) {
       installBox.append(h('p', { class: 'muted-p' }, `You\u2019re using the Hearth Android app${androidApp.version ? ` (version ${androidApp.version})` : ''}. Files you save go to Downloads/Hearth.`),
         h('div', null, h('button', { class: 'btn', onclick: () => androidApp.switchServer() }, 'Switch server')));
@@ -1499,7 +1506,8 @@ function appsTab(app) {
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Apps & devices'),
     section('Install on this device', installBox),
-    section('Desktop app',
+    window.hearthDesktop ? desktopSettingsSection({ h, section, toggle, field, toast }) : null,
+    window.hearthDesktop ? null : section('Desktop app',
       h('p', { class: 'muted-p' }, 'A Windows, Mac and Linux app with a tray icon, unread badge and launch-at-login.'),
       dl.length || cfg.desktopUrl
         ? h('div', null, h('a', { class: 'btn ghost', href: '/download', target: '_blank', rel: 'noopener' }, icon('download'), 'Download page'))

@@ -6,9 +6,17 @@
 #   so people don't have to type it.
 #   Optional secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD:
 #   sign Android builds with your own key (see hearth/mobile/README.md). Without them a key is generated once
-#   and kept in the Actions cache.
+#   and kept in the Actions cache. With them, a Google Play bundle (.aab) is built too.
 #   Optional secrets VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR: copy the installers to your server's
 #   data/downloads folder, where they show up on https://your-server/download.
+#
+#   Code signing (all optional; builds stay unsigned without them; step-by-step guide: hearth/docs/SIGNING.md):
+#     Windows, Azure Artifact Signing: secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET and
+#       variables AZURE_SIGNING_ENDPOINT / AZURE_SIGNING_ACCOUNT / AZURE_SIGNING_PROFILE / AZURE_SIGNING_PUBLISHER.
+#     Windows, a .pfx certificate: secrets WIN_CSC_LINK (the .pfx, base64) / WIN_CSC_KEY_PASSWORD.
+#     Windows: variable WINDOWS_REQUIRE_SIGNING=true fails the build instead of making an unsigned installer.
+#     Google Play: secret PLAY_SERVICE_ACCOUNT_JSON uploads the bundle to the internal testing track
+#       (needs the ANDROID_KEYSTORE_* secrets; variable PLAY_RELEASE_STATUS=draft while the app is still a draft).
 name: Hearth apps
 
 on:
@@ -51,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Set the version (from the tag, or Hearth's own version)
         run: |
           if [[ "$GITHUB_REF" == refs/tags/app-v* ]]; then v="${GITHUB_REF_NAME#app-v}"; else v="$(node -p "require('../package.json').version")"; fi
@@ -59,11 +67,46 @@ jobs:
       - name: Bake in the server address
         if: env.SERVER != ''
         run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
+      # Windows: sign with Azure Artifact Signing or a .pfx certificate when those secrets exist; otherwise an
+      # unsigned installer and a warning (see hearth/docs/SIGNING.md).
+      - name: Choose how to sign the Windows installer
+        id: signing
+        if: runner.os == 'Windows'
+        run: node build/configure-signing.js
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          AZURE_SIGNING_PUBLISHER: ${{ vars.AZURE_SIGNING_PUBLISHER }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_PUBLISHER_NAME: ${{ vars.WIN_PUBLISHER_NAME }}
+          WIN_TIMESTAMP_SERVER: ${{ vars.WIN_TIMESTAMP_SERVER }}
+          WINDOWS_REQUIRE_SIGNING: ${{ vars.WINDOWS_REQUIRE_SIGNING }}
       - name: Build installers
         run: npx electron-builder --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          # Only the Windows build sees the signing secrets, and only the ones for the method chosen above.
+          AZURE_TENANT_ID: ${{ steps.signing.outputs.method == 'azure' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_CLIENT_ID: ${{ steps.signing.outputs.method == 'azure' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ steps.signing.outputs.method == 'azure' && secrets.AZURE_CLIENT_SECRET || '' }}
+          WIN_CSC_LINK: ${{ steps.signing.outputs.method == 'pfx' && secrets.WIN_CSC_LINK || '' }}
+          WIN_CSC_KEY_PASSWORD: ${{ steps.signing.outputs.method == 'pfx' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
+      - name: Check the signature
+        if: runner.os == 'Windows' && steps.signing.outputs.method != 'none'
+        shell: pwsh
+        run: |
+          $bad = $false
+          foreach ($f in Get-ChildItem dist/*.exe, dist/win-unpacked/Hearth.exe) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            Write-Host "$($f.Name): $($s.Status) - $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid') { $bad = $true }
+          }
+          if ($bad) { Write-Host "::error::An .exe is not validly signed."; exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: hearth-desktop-${{ runner.os }}
@@ -81,20 +124,29 @@ jobs:
     defaults:
       run:
         working-directory: hearth/mobile
+    env:
+      HAS_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+      # Capacitor 8 (Android 16 / API 36, which Google Play requires) builds with Java 21.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
       - name: Version
         id: v
         run: |
           if [[ "$GITHUB_REF" == refs/tags/app-v* ]]; then v="${GITHUB_REF_NAME#app-v}"; else v="$(node -p "require('../package.json').version")"; fi
           echo "name=$v" >> "$GITHUB_OUTPUT"
+          # Android (and Google Play) only accept an update whose versionCode is higher than the installed one:
+          # (major*100 + minor) * 100000 + this workflow's run number. 1.21.x → 121xxxxx, always going up.
+          IFS=. read -r major minor _ <<< "${v%%-*}"
+          code=$(( (10#${major:-0} * 100 + 10#${minor:-0}) * 100000 + GITHUB_RUN_NUMBER % 100000 ))
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Hearth $v, Android versionCode $code"
       - name: Bake in the server address
         if: env.SERVER != ''
         run: node -e "const f='www/config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
@@ -109,10 +161,10 @@ jobs:
           cat >> android/app/build.gradle <<EOF
 
           // ---- added by the Hearth build
-          dependencies { implementation "androidx.webkit:webkit:1.9.0" }
+          dependencies { implementation "androidx.webkit:webkit:\$androidxWebkitVersion" }
           android {
               defaultConfig {
-                  versionCode ${GITHUB_RUN_NUMBER}
+                  versionCode ${{ steps.v.outputs.code }}
                   versionName "${{ steps.v.outputs.name }}"
               }
               signingConfigs {
@@ -139,6 +191,8 @@ jobs:
           if [ -n "$KS" ]; then
             echo "$KS" | base64 -d > "$RUNNER_TEMP/hearth.jks"
             echo "found=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Android signing::No ANDROID_KEYSTORE_BASE64 secret: using the key kept in the Actions cache, and no Google Play bundle. See hearth/docs/SIGNING.md."
           fi
       - name: Saved signing key
         if: steps.secretkey.outputs.found != '1'
@@ -155,23 +209,47 @@ jobs:
               -alias hearth -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Hearth"
           fi
           cp ~/.hearth-android-key/hearth.jks "$RUNNER_TEMP/hearth.jks"
-      - name: Build the APK
+      # The APK is for installing directly (your server's /download page). The .aab bundle is what Google Play
+      # takes; it's only built with your own permanent key, since Play remembers the key of the first upload.
+      - name: Build the APK (and the Play bundle)
         working-directory: hearth/mobile/android
         env:
           HEARTH_KEYSTORE: ${{ runner.temp }}/hearth.jks
           HEARTH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
           HEARTH_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'hearth' }}
           HEARTH_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
+          BUNDLE: ${{ steps.secretkey.outputs.found == '1' && 'bundleRelease' || '' }}
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease
-          mkdir -p ../dist
+          ./gradlew --no-daemon assembleRelease ${BUNDLE:+"$BUNDLE"}
+          mkdir -p ../dist ../play
           cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-${{ steps.v.outputs.name }}.apk"
+          if [ -n "$BUNDLE" ]; then cp app/build/outputs/bundle/release/app-release.aab "../play/Hearth-${{ steps.v.outputs.name }}-${{ steps.v.outputs.code }}.aab"; fi
       - uses: actions/upload-artifact@v4
         with:
           name: hearth-android
           path: hearth/mobile/dist/*.apk
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: steps.secretkey.outputs.found == '1'
+        with:
+          name: hearth-android-play-bundle
+          path: hearth/mobile/play/*.aab
+          if-no-files-found: error
+      # Google Play internal testing: friends you add as testers install and update Hearth from the Play Store,
+      # without the "unknown apps" and Play Protect warnings. Tags, the default branch and manual runs only.
+      - name: Upload to Google Play (internal testing)
+        if: >-
+          env.HAS_PLAY == 'true' && steps.secretkey.outputs.found == '1' &&
+          (startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch')
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: app.hearth.mobile
+          releaseFiles: hearth/mobile/play/*.aab
+          releaseName: ${{ steps.v.outputs.name }} (${{ steps.v.outputs.code }})
+          track: internal
+          status: ${{ vars.PLAY_RELEASE_STATUS || 'completed' }}
 
   release:
     needs: [desktop, android]
@@ -182,6 +260,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Leave out the Google Play bundle (it isn't installable by itself)
+        run: rm -f dist/*.aab
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
