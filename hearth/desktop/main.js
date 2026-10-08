@@ -1,6 +1,6 @@
 // Hearth desktop: a secure window onto your Hearth server, with tray, badge, notifications and auto-start.
 // All chat code (including end-to-end encryption) runs from your server exactly as in the browser.
-const { app, BrowserWindow, Menu, Tray, shell, session, ipcMain, nativeImage, dialog, net, desktopCapturer } = require('electron');
+const { app, BrowserWindow, Menu, Tray, shell, session, ipcMain, nativeImage, dialog, net, desktopCapturer, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const CONFIG = require('./hearth.config.json');
@@ -27,7 +27,27 @@ const closeToTray = () => (settings.closeToTray ?? CONFIG.closeToTray ?? true) &
 
 // ---------------------------------------------------------------- single instance
 if (!app.requestSingleInstanceLock()) app.quit();
-app.on('second-instance', () => showWindow());
+// hearth:// links (e.g. hearth://invite/abcd2345 from the browser) open here. Windows and Linux pass them on
+// the command line; macOS sends open-url.
+const PROTOCOL = 'hearth';
+if (process.defaultApp && process.argv.length >= 2) app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
+else app.setAsDefaultProtocolClient(PROTOCOL);
+let pendingLink = (process.argv.find((a) => a.startsWith(`${PROTOCOL}://`)) || '');
+function openLink(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return; }
+  if (u.protocol !== `${PROTOCOL}:`) return;
+  const origin = serverOrigin();
+  const parts = `${u.hostname}${u.pathname}`.split('/').filter(Boolean);
+  showWindow();
+  if (!origin || !win) { pendingLink = raw; return; }
+  if (parts[0] === 'invite' && /^[A-Za-z0-9_-]{2,64}$/.test(parts[1] || '')) win.loadURL(`${origin}/invite/${parts[1]}`);
+}
+app.on('second-instance', (e, argv) => {
+  const link = (argv || []).find((a) => a.startsWith(`${PROTOCOL}://`));
+  if (link) openLink(link); else showWindow();
+});
+app.on('open-url', (e, url) => { e.preventDefault(); if (app.isReady()) openLink(url); else pendingLink = url; });
 app.setAppUserModelId(CONFIG.appId || 'app.hearth.desktop');
 
 // ---------------------------------------------------------------- window
@@ -64,6 +84,8 @@ function createWindow() {
     if (!quitting && (closeToTray() || process.platform === 'darwin')) { e.preventDefault(); win.hide(); }
   });
   win.on('closed', () => { win = null; });
+  // A reload or a new page starts outside any call until the page says otherwise.
+  win.webContents.on('did-navigate', () => { call = { inCall: false, muted: false, deafened: false }; drawThumbar(); });
 
   // Links to other sites open in the normal browser, never inside the app.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -154,17 +176,53 @@ app.on('certificate-error', async (event, wc, url, error, cert, callback) => {
 });
 
 // ---------------------------------------------------------------- unread badge
-function redDot(count) {
-  const n = count > 9 ? '9+' : String(count);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="15" fill="#ef5466"/><text x="16" y="21.5" text-anchor="middle" font-family="Segoe UI, Arial" font-weight="700" font-size="${n.length > 1 ? 14 : 17}" fill="#fff">${n}</text></svg>`;
-  return nativeImage.createFromDataURL('data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64'));
-}
+const buildImage = (name) => nativeImage.createFromPath(path.join(__dirname, 'build', `${name}.png`));
+function redDot(count) { return buildImage(`badge-${count > 9 ? '9plus' : count}`); }
 function setBadge(n) {
   unread = Math.max(0, Math.floor(n) || 0);
   if (process.platform === 'win32' && win) win.setOverlayIcon(unread ? redDot(unread) : null, unread ? `${unread} unread` : '');
   else app.setBadgeCount(unread);
   if (tray) tray.setToolTip(unread ? `${APP_NAME} — ${unread} unread` : APP_NAME);
   if (unread && win && !win.isFocused()) win.flashFrame(true);
+}
+
+// ---------------------------------------------------------------- calls: taskbar buttons + global keys
+// While you're in a call, the taskbar preview (hover Hearth's taskbar button) gets Mute and Deafen buttons.
+let call = { inCall: false, muted: false, deafened: false };
+function drawThumbar() {
+  if (process.platform !== 'win32' || !win) return;
+  if (!call.inCall) { win.setThumbarButtons([]); return; }
+  win.setThumbarButtons([
+    { tooltip: call.muted ? 'Unmute' : 'Mute', icon: buildImage(call.muted ? 'thumb-mic-off' : 'thumb-mic'), click: () => sendToPage('hotkey', { action: 'mute' }) },
+    { tooltip: call.deafened ? 'Undeafen' : 'Deafen', icon: buildImage(call.deafened ? 'thumb-deafen-off' : 'thumb-deafen'), click: () => sendToPage('hotkey', { action: 'deafen' }) },
+  ]);
+}
+const sendToPage = (ch, data) => { if (win && !win.isDestroyed()) win.webContents.send(ch, data); };
+const hotkeys = require('./hotkeys');
+
+// ---------------------------------------------------------------- updates
+// The app updates itself from your own Hearth server (data/downloads, filled by GitHub Actions or by hand):
+// it downloads in the background and asks to restart. Mac builds need code signing for this, so Mac skips it.
+let updateReady = null;
+function setupUpdates() {
+  if (!app.isPackaged || CONFIG.autoUpdate === false || process.platform === 'darwin') return;
+  const origin = serverOrigin();
+  if (!origin) return;
+  let au;
+  try { au = require('electron-updater').autoUpdater; } catch { return; }
+  au.setFeedURL({ provider: 'generic', url: `${origin}/updates/` });
+  au.autoDownload = true;
+  au.autoInstallOnAppQuit = true;
+  au.on('update-downloaded', (info) => { updateReady = info.version; sendToPage('update-ready', { version: info.version }); refreshTrayMenu(); });
+  au.on('error', () => { /* no update published yet, or offline: try again later */ });
+  const check = () => au.checkForUpdates().catch(() => {});
+  setTimeout(check, 15000);
+  setInterval(check, 4 * 3600000);
+}
+function installUpdate() {
+  if (!updateReady) return;
+  quitting = true;
+  try { require('electron-updater').autoUpdater.quitAndInstall(false, true); } catch { app.quit(); }
 }
 
 // ---------------------------------------------------------------- tray + menus
@@ -180,8 +238,10 @@ function refreshTrayMenu() {
   const login = app.getLoginItemSettings().openAtLogin;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: `Open ${APP_NAME}`, click: showWindow },
+    updateReady ? { label: `Restart to update (${updateReady})`, click: installUpdate } : null,
     { type: 'separator' },
-    { label: 'Start when I log in', type: 'checkbox', checked: login, click: (i) => { app.setLoginItemSettings({ openAtLogin: i.checked, args: ['--hidden'] }); refreshTrayMenu(); } },
+    { label: 'Start when I log in', type: 'checkbox', checked: login, click: (i) => { app.setLoginItemSettings({ openAtLogin: i.checked, args: settings.startVisible ? [] : ['--hidden'] }); refreshTrayMenu(); } },
+    login ? { label: 'Open the window when it starts', type: 'checkbox', checked: !!settings.startVisible, click: (i) => { settings.startVisible = i.checked; saveSettings(); app.setLoginItemSettings({ openAtLogin: true, args: i.checked ? [] : ['--hidden'] }); } } : null,
     process.platform !== 'darwin' ? { label: 'Keep running in the tray when closed', type: 'checkbox', checked: closeToTray(), click: (i) => { settings.closeToTray = i.checked; saveSettings(); } } : null,
     CONFIG.lockServer ? null : { label: 'Change server…', click: () => { showWindow(); loadConnect(); } },
     { type: 'separator' },
@@ -216,6 +276,17 @@ ipcMain.on('version', (e) => { e.returnValue = app.getVersion(); });
 ipcMain.on('badge', (e, n) => { if (fromOurPage(e)) setBadge(n); });
 ipcMain.on('focus', (e) => { if (fromOurPage(e)) showWindow(); });
 ipcMain.on('change-server', (e) => { if (fromOurPage(e) && !CONFIG.lockServer) loadConnect(); });
+// Keybinds from Settings → Keybinds: push-to-talk / mute / deafen, even while a game has focus.
+ipcMain.handle('keybinds', (e, b) => (fromOurPage(e) ? hotkeys.set(b, (ev) => sendToPage('hotkey', ev)) : { ok: false }));
+// A @mention while Hearth isn't focused: flash the taskbar button until it is.
+ipcMain.on('flash', (e) => { if (fromOurPage(e) && win && !win.isFocused()) win.flashFrame(true); });
+ipcMain.on('call-state', (e, s) => {
+  if (!fromOurPage(e)) return;
+  call = { inCall: !!(s && s.inCall), muted: !!(s && s.muted), deafened: !!(s && s.deafened) };
+  drawThumbar();
+});
+ipcMain.on('install-update', (e) => { if (fromOurPage(e)) installUpdate(); });
+ipcMain.on('update-status', (e) => { e.returnValue = updateReady; });
 // Game / music detection (detect.js), only while the person shares it.
 const detect = require('./detect');
 ipcMain.on('detect', (e, o) => {
@@ -250,10 +321,13 @@ app.whenReady().then(() => {
   buildAppMenu();
   createWindow();
   buildTray();
-  if (app.isPackaged && CONFIG.autoUpdate !== false && process.platform !== 'darwin') {
-    try { require('electron-updater').autoUpdater.checkForUpdatesAndNotify().catch(() => {}); } catch { /* updates not configured */ }
-  }
+  setupUpdates();
+  if (pendingLink) win.webContents.once('did-finish-load', () => { const l = pendingLink; pendingLink = ''; openLink(l); });
+  // Back from sleep or the lock screen: tell the page to reconnect right away instead of waiting.
+  powerMonitor.on('resume', () => sendToPage('resume'));
+  powerMonitor.on('unlock-screen', () => sendToPage('resume'));
 });
+app.on('will-quit', () => hotkeys.stop());
 app.on('activate', () => showWindow());
 app.on('before-quit', () => { quitting = true; });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin' && !closeToTray()) app.quit(); });

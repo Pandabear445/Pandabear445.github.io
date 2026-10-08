@@ -257,13 +257,22 @@ Installed apps open in their own window, start instantly from cache, update them
 
 ### Desktop app (Windows, macOS, Linux)
 
-The `desktop/` folder is an Electron app: its own window, tray icon, unread badge, native notifications, start-at-login, and microphone/notification permissions limited to your server. It loads the interface from your server, so web updates reach desktop users without reinstalling.
+The `desktop/` folder is an Electron app for Windows (and Mac/Linux). It loads the interface from your server, so most updates reach people without reinstalling, and adds what a browser can't:
+
+- **Push to talk, mute and deafen keys that work while a game is focused** (Settings → Keybinds; keyboard keys, combos or mouse side buttons). The key still reaches the game.
+- **Updates itself** from your server: downloads in the background, then "Restart now" (or it installs when you quit).
+- **Taskbar:** unread count on the icon, the button flashes when someone @mentions you, and Mute/Deafen buttons in the taskbar preview while you're in a call.
+- **Invite links open in the app** (`hearth://invite/…`; the browser's join window offers "Open this invite in the app").
+- **Detects the game you're playing and your music** (Settings → Games & music).
+- Tray icon, start with Windows (minimized or not), remembers its size and position, reconnects right after your PC wakes up, screen sharing with sound, and a "What's new" note after updates.
+
+**Make updates automatic (once):** in your GitHub repository → Settings → Secrets and variables → Actions, add the secrets `VPS_HOST` (your server's IP), `VPS_USER` (e.g. `root`), `VPS_SSH_KEY` (a private key made just for this; its public half goes in that user's `~/.ssh/authorized_keys`) and `VPS_DOWNLOADS_DIR` (the full path of Hearth's `data/downloads` folder; `hearth-update --status` shows where Hearth is). Every build then copies the installers and update files there, keeps the two newest, and every desktop app updates itself within a few hours. Without these, download the installer from the Actions run and put it (with `latest.yml` and the `.blockmap`) in `data/downloads` yourself.
 
 **Point it at your server:** edit `desktop/hearth.config.json`:
 
 | Key | What it does |
 |---|---|
-| `defaultServer` | Your address, e.g. `https://chat.example.com`. Empty = ask on first launch. |
+| `defaultServer` | Your address, e.g. `https://chat.example.com` (set to `https://kappachat.duckdns.org`). Empty = ask on first launch. The repository variable `HEARTH_SERVER` overrides it at build time. |
 | `lockServer` | `true` to hide "Change server" (a branded app for your community). |
 | `appName`, `appId` | Window title, and the ID Windows/macOS use for notifications. Also change `productName`/`appId` in `desktop/package.json` if you rebrand. |
 | `closeToTray` | Keep running in the tray when the window is closed (Windows/Linux). |

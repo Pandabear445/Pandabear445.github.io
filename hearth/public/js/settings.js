@@ -9,6 +9,7 @@ import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import { androidApp } from './android.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
+import { getKeybinds, saveKeybinds, comboLabel, recordCombo, DEFAULT_KEYBINDS } from './keybinds.js';
 import {
   THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, UI_FONTS, CORNERS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
   gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage, exportAppearance, importAppearance,
@@ -60,7 +61,7 @@ function section(title, ...kids) {
 // Grouped like most chat apps so people can find things: [group label, [[key, label, icon], ...]]
 const TAB_GROUPS = [
   ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['activity', 'Games & music', 'gamepad'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor']]],
-  ['App', [['appearance', 'Appearance', 'palette'], ['layout', 'Layout', 'sidebar'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['apps', 'Apps & devices', 'download']]],
+  ['App', [['appearance', 'Appearance', 'palette'], ['layout', 'Layout', 'sidebar'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['keybinds', 'Keybinds', 'monitor'], ['apps', 'Apps & devices', 'download']]],
   ['Privacy', [['privacy', 'Privacy & safety', 'shield']]],
   ['Servers', [['servers', 'Server settings', 'gear']]],
   ['Instance', [['instance', 'Instance', 'monitor']], 'admin'],
@@ -118,7 +119,7 @@ export function openSettings(app, tab = 'profile') {
     stopMicTest();
     drawNav();
     clear(content);
-    const views = { activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
+    const views = { keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
     content.append(views[current](app, (d) => { dirty = d; }));
     content.scrollTop = 0;
   };
@@ -567,17 +568,82 @@ function voiceTab(app) {
       h('div', { class: 'row gap' }, testBtn, h('label', { class: 'inline-check' }, hear, 'Hear myself')),
       meter,
       h('p', { class: 'field-hint' }, 'Talk normally — the bar should turn your accent color when you speak. Use headphones if you turn on "Hear myself".')),
-    section('Input sensitivity',
-      toggle('Only send audio when I’m talking', !!prefs.gate, (v) => { setAudioPref('gate', v); sens.hidden = !v; }, 'Cuts background noise between sentences. Applies the next time you join voice.'),
-      sens),
+    inputModeSection(app, prefs, sens),
     section('Processing',
       toggle('Echo cancellation', prefs.echoCancellation !== false, (v) => setAudioPref('echoCancellation', v), 'Stops others hearing themselves through your speakers.'),
       toggle('Noise suppression', prefs.noiseSuppression !== false, (v) => setAudioPref('noiseSuppression', v), 'Filters out fans, keyboards and background hum.'),
       toggle('Automatic gain control', prefs.autoGainControl !== false, (v) => setAudioPref('autoGainControl', v), 'Keeps your volume steady.')),
-    section('Shortcuts',
-      h('div', { class: 'kv' }, h('span', null, 'Toggle mute'), h('kbd', null, 'Ctrl / ⌘ + Shift + M')),
-      h('div', { class: 'kv' }, h('span', null, 'Toggle deafen'), h('kbd', null, 'Ctrl / ⌘ + Shift + D'))),
+    section('Keybinds', keybindsEditor()),
   );
+}
+
+// Voice activity (talk any time, optional sensitivity gate) or push-to-talk (hold a key), like Discord.
+function inputModeSection(app, prefs, sens) {
+  const ptt = prefs.mode === 'ptt';
+  const vaBox = h('div', { class: 'stack', hidden: ptt },
+    toggle('Only send audio when I’m talking', !!prefs.gate, (v) => { setAudioPref('gate', v); sens.hidden = !v; }, 'Cuts background noise between sentences. Applies the next time you join voice.'),
+    sens);
+  const delay = +(prefs.pttDelay ?? 200);
+  const pttBox = h('div', { class: 'stack', hidden: !ptt },
+    keyRow('ptt', 'Push-to-talk key', 'Hold it to talk. Works while a game has focus in the desktop app.'),
+    sliderRow('Release delay', 0, 1000, 20, delay, (v) => `${v} ms`, (v) => setAudioPref('pttDelay', v)),
+    h('p', { class: 'field-hint' }, 'How long your mic stays on after you let go, so the end of a word isn\u2019t cut off.'));
+  const apply = () => { const v = app.voice; if (v && v.applyLocalTrackState) { v.pttHeld = false; v.applyLocalTrackState(); v.onChange(); } };
+  return section('Input mode',
+    chips([['va', 'Voice activity'], ['ptt', 'Push to talk']], ptt ? 'ptt' : 'va', (v) => {
+      setAudioPref('mode', v);
+      vaBox.hidden = v === 'ptt'; pttBox.hidden = v !== 'ptt';
+      if (v === 'ptt' && !getKeybinds().ptt) toast('Now pick a push-to-talk key.');
+      apply();
+    }),
+    vaBox, pttBox);
+}
+
+// ------------------------------------------------------------------ keybinds
+// One row: what it does, the current key, "Change" (press the new key / mouse button / combo) and "Clear".
+function keyRow(name, label, hint) {
+  const keyEl = h('kbd', { class: 'kb-key' }, comboLabel(getKeybinds()[name]));
+  const btn = h('button', { class: 'btn sm', type: 'button' }, 'Change');
+  const status = h('span', { class: 'field-hint' }, hint || '');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true; keyEl.textContent = 'Press a key\u2026'; keyEl.classList.add('recording');
+    status.textContent = name === 'ptt' ? 'Press a key or a mouse side button. Esc cancels.' : 'Press the keys together (e.g. Ctrl + Shift + M). Esc cancels.';
+    const combo = await recordCombo({ allowMods: name !== 'ptt' });
+    keyEl.classList.remove('recording'); btn.disabled = false; status.textContent = hint || '';
+    if (combo) {
+      const all = getKeybinds();
+      if (name !== 'ptt' && !combo.ctrl && !combo.alt && !combo.meta && !/^F\d+$|^Mouse/.test(combo.code)) {
+        toast('Use a combination with Ctrl or Alt (or an F-key), so it doesn\u2019t fire while you type.', 'error');
+      } else {
+        all[name] = combo;
+        const r = await saveKeybinds(all);
+        if (r && r.ok === false && r.error) toast(r.error, 'error');
+      }
+    }
+    keyEl.textContent = comboLabel(getKeybinds()[name]);
+  });
+  const clearBtn = h('button', { class: 'btn ghost sm', type: 'button', onclick: async () => { const all = getKeybinds(); all[name] = null; await saveKeybinds(all); keyEl.textContent = comboLabel(null); } }, 'Clear');
+  return h('div', { class: 'kb-row' }, h('div', { class: 'kb-text' }, h('span', { class: 'toggle-label' }, label), status), keyEl, h('div', { class: 'row gap tight' }, btn, clearBtn));
+}
+function keybindsEditor() {
+  const d = window.hearthDesktop;
+  const root = h('div', { class: 'stack' },
+    keyRow('ptt', 'Push to talk', 'Only used when Input mode is Push to talk.'),
+    keyRow('mute', 'Mute / unmute'),
+    keyRow('deafen', 'Deafen / undeafen'),
+    h('p', { class: 'field-hint' }, d && d.setKeybinds
+      ? 'These work everywhere, even while a game is focused. On a Mac, allow Hearth under System Settings \u2192 Privacy & Security \u2192 Accessibility.'
+      : 'In the browser these work while Hearth is the focused window. The desktop app makes them work everywhere, even in games.'),
+    h('div', null, h('button', { class: 'btn ghost sm', type: 'button', onclick: async () => { await saveKeybinds({ ...DEFAULT_KEYBINDS }); root.replaceWith(keybindsEditor()); toast('Keybinds reset.'); } }, 'Reset to defaults')));
+  return root;
+}
+function keybindsTab() {
+  return h('div', { class: 'set-form narrow' },
+    h('h2', { class: 'set-title' }, 'Keybinds'),
+    section('Voice', keybindsEditor()),
+    section('Everywhere in Hearth',
+      ...[['Search everything', 'Ctrl + K'], ['Previous / next channel', 'Alt + \u2191 / \u2193'], ['Close menus, cancel a reply or an edit', 'Esc'], ['New line in a message', 'Shift + Enter'], ['Edit your last message', '\u2191 in an empty box']]
+        .map(([a, k]) => h('div', { class: 'kv' }, h('span', null, a), h('kbd', null, k)))));
 }
 
 // ------------------------------------------------------------------ appearance tab

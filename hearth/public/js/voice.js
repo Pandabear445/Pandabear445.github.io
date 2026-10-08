@@ -25,6 +25,9 @@ export class Voice {
     this.peers = new Map(); // socketId -> { pc, userId, audio, pending: [] }
     this.localStream = null;
     this.muted = localStorage.getItem('hearth.muted') === '1';
+    // Push-to-talk (Settings → Voice & video → Input mode): the mic only sends while the key is held.
+    this.pttHeld = false;
+    this.pttTimer = null;
     this.deafened = localStorage.getItem('hearth.deafened') === '1';
     this.volumes = JSON.parse(localStorage.getItem('hearth.volumes') || '{}');
     this.speaking = new Map();
@@ -269,9 +272,19 @@ export class Voice {
     this.onChange();
   }
 
+  pttMode() { try { return JSON.parse(localStorage.getItem('hearth.audio') || '{}').mode === 'ptt'; } catch { return false; } }
+  // Key pressed / released. Releasing waits a moment (Settings: release delay) so word endings aren't cut off.
+  setPtt(down) {
+    clearTimeout(this.pttTimer);
+    if (down) { if (!this.pttHeld) { this.pttHeld = true; this.applyLocalTrackState(); this.onChange(); } return; }
+    let delay = 200;
+    try { delay = Math.max(0, Math.min(2000, +(JSON.parse(localStorage.getItem('hearth.audio') || '{}').pttDelay ?? 200))); } catch { /* default */ }
+    this.pttTimer = setTimeout(() => { this.pttHeld = false; this.applyLocalTrackState(); this.onChange(); }, delay);
+  }
+  talking() { return !this.muted && !this.deafened && (!this.pttMode() || this.pttHeld); }
   applyLocalTrackState() {
     if (!this.localStream) return;
-    this.localStream.getAudioTracks().forEach((t) => { t.enabled = !this.muted && !this.deafened && this.gateOpen !== false; });
+    this.localStream.getAudioTracks().forEach((t) => { t.enabled = this.talking() && this.gateOpen !== false; });
   }
 
   setMuted(v) {
@@ -404,7 +417,7 @@ export class Voice {
         // Track the room's noise floor: drop to quiet moments quickly, rise slowly, so steady hum
         // (fans, mic hiss) never counts as talking.
         floor = rms < floor ? floor * 0.7 + rms * 0.3 : floor * 0.995 + rms * 0.005;
-        const silent = (id === 'me' && (this.muted || this.deafened)) || (this.isPeerMuted && this.isPeerMuted(id));
+        const silent = (id === 'me' && !this.talking()) || (this.isPeerMuted && this.isPeerMuted(id));
         const above = !silent && rms > Math.max(threshold, floor * 2.5 + 0.006);
         loudFor = above ? loudFor + 1 : 0;
         quietFor = above ? 0 : quietFor + 1;

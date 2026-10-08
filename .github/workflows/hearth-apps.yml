@@ -72,6 +72,8 @@ jobs:
             hearth/desktop/dist/*.dmg
             hearth/desktop/dist/*.AppImage
             hearth/desktop/dist/*.deb
+            hearth/desktop/dist/*.blockmap
+            hearth/desktop/dist/latest*.yml
           if-no-files-found: error
 
   android:
@@ -204,6 +206,21 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb,dist/*.apk'
+          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb,dist/*.apk,dist/*.blockmap,dist/latest*.yml'
           target: ${{ secrets.VPS_DOWNLOADS_DIR }}
           strip_components: 1
+      - name: Keep only the two newest of each installer on the server
+        if: env.HAS_VPS == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DIR: ${{ secrets.VPS_DOWNLOADS_DIR }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: DIR
+          script: |
+            cd "$DIR" || exit 0
+            for pat in 'Hearth-Setup-*.exe' 'Hearth-*.AppImage' 'Hearth-*.deb' 'Hearth-*.dmg' 'Hearth-*.apk' '*.exe.blockmap'; do
+              ls -t $pat 2>/dev/null | tail -n +3 | while read -r f; do rm -f -- "$f"; done
+            done

@@ -17,4 +17,16 @@ contextBridge.exposeInMainWorld('hearthDesktop', {
   // { game, music } back every 20 seconds while it's on. See detect.js.
   detectActivity: (o) => ipcRenderer.send('detect', { games: !!(o && o.games), songs: !!(o && o.songs) }),
   onActivity: (cb) => ipcRenderer.on('activity', (e, a) => cb(a)),
+  // Keybinds that work everywhere (push-to-talk, mute, deafen). Resolves to { ok, global }.
+  setKeybinds: (b) => ipcRenderer.invoke('keybinds', b || {}),
+  onHotkey: (cb) => ipcRenderer.on('hotkey', (e, ev) => cb(ev)),
+  // Taskbar: flash on @mention; Mute/Deafen buttons in the taskbar preview while in a call.
+  flash: () => ipcRenderer.send('flash'),
+  setCallState: (s) => ipcRenderer.send('call-state', { inCall: !!(s && s.inCall), muted: !!(s && s.muted), deafened: !!(s && s.deafened) }),
+  // Updates from your server: told when one is downloaded; installUpdate() restarts into it.
+  onUpdateReady: (cb) => ipcRenderer.on('update-ready', (e, u) => cb(u)),
+  updateReady: () => ipcRenderer.sendSync('update-status'),
+  installUpdate: () => ipcRenderer.send('install-update'),
+  // Back from sleep / lock screen.
+  onResume: (cb) => ipcRenderer.on('resume', () => cb()),
 });

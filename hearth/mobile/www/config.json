@@ -1,1 +1,4 @@
-{ "defaultServer": "", "lockServer": false }
+{
+ "defaultServer": "https://kappachat.duckdns.org",
+ "lockServer": false
+}

@@ -550,6 +550,17 @@ app.get('/sw.js', (req, res) => {
 });
 app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
+// The desktop app's self-updater reads latest.yml (latest-linux.yml…) here, then downloads the installer it
+// names. electron-builder writes these next to the installers; GitHub Actions copies them to data/downloads.
+const UPDATE_FILE = /^(latest(-mac|-linux)?\.yml|[\w.-]+\.(exe|blockmap|AppImage|zip|dmg))$/;
+app.get('/updates/:file', (req, res) => {
+  const name = String(req.params.file);
+  if (!UPDATE_FILE.test(name) || name.includes('..')) return res.status(404).send('Not found');
+  const file = path.join(DOWNLOADS_DIR, name);
+  if (!fs.existsSync(file)) return res.status(404).send('Not found');
+  if (name.endsWith('.yml')) res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(file);
+});
 app.get('/downloads/:file', (req, res) => {
   const hit = listDownloads().find((d) => d.name === req.params.file);
   if (!hit) return res.status(404).send('Not found');
@@ -726,8 +737,9 @@ function listDownloads() {
     return fs.readdirSync(DOWNLOADS_DIR).map((name) => {
       const hit = PLATFORM_OF.find(([re]) => re.test(name));
       if (!hit || name.startsWith('.')) return null;
-      return { name, platform: hit[1], size: fs.statSync(path.join(DOWNLOADS_DIR, name)).size, url: '/downloads/' + encodeURIComponent(name) };
-    }).filter(Boolean);
+      const st = fs.statSync(path.join(DOWNLOADS_DIR, name));
+      return { name, platform: hit[1], size: st.size, at: st.mtimeMs, url: '/downloads/' + encodeURIComponent(name) };
+    }).filter(Boolean).sort((a, b) => b.at - a.at); // newest first
   } catch { return []; }
 }
 

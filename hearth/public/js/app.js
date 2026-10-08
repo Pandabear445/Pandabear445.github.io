@@ -18,6 +18,8 @@ import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
 import { rankRelays, chooseIce } from './relays.js';
+import { unseenChanges } from './whatsnew.js';
+import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
 import { openSettings, applyAppearance } from './settings.js';
@@ -262,6 +264,17 @@ function startApp() {
   $('#app').hidden = false;
   $('#app').classList.add('loading');
   socket = io({ auth: { token: getToken() }, transports: ['websocket', 'polling'] });
+  // Keybinds (push-to-talk, mute, deafen) and the desktop app's extras. Global keys in the desktop app.
+  if (!S.keybindsOn) {
+    S.keybindsOn = true;
+    initKeybinds({
+      onPtt: (isDown) => { if (voice && voice.channelId) voice.setPtt(isDown); else if (voice) voice.pttHeld = false; },
+      onMute: () => toggleMute(),
+      onDeafen: () => toggleDeafen(),
+      reconnect: () => { if (socket && !socket.connected) socket.connect(); },
+      showUpdate: (version) => showAppUpdate(version),
+    }).catch(() => {});
+  }
   voice = new Voice({
     // Lets the speaking detector ignore people whose mic is off (their state comes from the server).
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
@@ -270,7 +283,7 @@ function startApp() {
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
-    onChange: () => { renderVoicePanel(); renderUserPanel(); renderCallStages(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); },
+    onChange: () => { renderVoicePanel(); renderUserPanel(); renderCallStages(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
     onSpeaking: (id, on) => {
       const uid = id === 'me' ? S.me.id : id;
       // Never show someone as speaking while they're muted or deafened, whatever audio arrives.
@@ -584,6 +597,15 @@ async function loadBootstrap() {
   if (localStorage.getItem('hearth.push') === 'on') enablePush({ quiet: true }).catch(() => {});
   const invite = sessionStorage.getItem('hearth.pendingInvite');
   if (invite) { sessionStorage.removeItem('hearth.pendingInvite'); openJoinModal(invite); }
+  else if (!S.whatsNewShown) {
+    S.whatsNewShown = true;
+    const news = unseenChanges(S.config.version);
+    if (news.length) {
+      modal({ title: 'What\u2019s new', size: 'md', className: 'whatsnew',
+        body: h('div', { class: 'stack' }, ...news.map((c) => h('section', null, h('h3', { class: 'set-h' }, `Version ${c.version}`), h('ul', { class: 'perk-list' }, c.items.map((t) => h('li', null, t)))))),
+        actions: [{ label: 'Nice', kind: 'primary' }] });
+    }
+  }
   else if (location.hash) openLinkFromHash();
 }
 
@@ -866,8 +888,6 @@ function relTime(ts) {
 function globalKeys(e) {
   const k = e.key.toLowerCase();
   if ((e.ctrlKey || e.metaKey) && k === 'k') { e.preventDefault(); openSearch(); return; }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'm') { e.preventDefault(); toggleMute(); }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'd') { e.preventDefault(); toggleDeafen(); }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); stepChannel(e.key === 'ArrowUp' ? -1 : 1); }
   if (e.key === 'Escape' && !document.querySelector('.modal-backdrop, .popover')) {
     if (S.editing) { S.editing = null; renderMessages(false); }
@@ -1290,8 +1310,8 @@ function renderUserPanel() {
     h('button', { class: 'me-btn', 'data-pop-anchor': '', 'aria-label': 'Your status and profile', onclick: (e) => statusMenu(e.currentTarget) },
       av, h('span', { class: 'me-text' }, nameEl(S.me), h('span', { class: 'me-sub' }, sub))),
     h('div', { class: 'me-actions' },
-      inCall ? ibtn(voice.muted ? 'micOff' : 'mic', voice.muted ? 'Unmute (Ctrl+Shift+M)' : 'Mute (Ctrl+Shift+M)', toggleMute, { cls: voice.muted ? 'off' : '', active: voice.muted }) : null,
-      inCall ? ibtn(voice.deafened ? 'headphonesOff' : 'headphones', voice.deafened ? 'Undeafen' : 'Deafen (Ctrl+Shift+D)', toggleDeafen, { cls: voice.deafened ? 'off' : '', active: voice.deafened }) : null,
+      inCall ? ibtn(voice.muted ? 'micOff' : 'mic', `${voice.muted ? 'Unmute' : 'Mute'}${getKeybinds().mute ? ` (${comboLabel(getKeybinds().mute)})` : ''}`, toggleMute, { cls: voice.muted ? 'off' : '', active: voice.muted }) : null,
+      inCall ? ibtn(voice.deafened ? 'headphonesOff' : 'headphones', `${voice.deafened ? 'Undeafen' : 'Deafen'}${getKeybinds().deafen ? ` (${comboLabel(getKeybinds().deafen)})` : ''}`, toggleDeafen, { cls: voice.deafened ? 'off' : '', active: voice.deafened }) : null,
       ibtn('gear', 'Settings', () => openSettings(app))),
   );
 }
@@ -1319,6 +1339,8 @@ function renderVoicePanel() {
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),
       ibtn('monitor', voice.screenStream ? 'Stop sharing' : 'Share your screen', toggleScreen, { cls: voice.screenStream ? 'on' : '' }),
       ibtn('phoneOff', 'Leave call', () => { voice.leave(); playSound('selfLeave'); }, { cls: 'hang' })),
+    voice.pttMode() ? h('div', { class: `ptt-hint${voice.pttHeld && !voice.muted ? ' on' : ''}` }, icon('mic'),
+      getKeybinds().ptt ? (voice.pttHeld && !voice.muted ? 'Talking' : `Push to talk: hold ${comboLabel(getKeybinds().ptt)}`) : h('button', { class: 'link-btn', onclick: () => openSettings(app, 'keybinds') }, 'Push to talk is on, but no key is set')) : '',
   );
 }
 
@@ -2440,7 +2462,7 @@ async function onNewMessage(key, m) {
     S.unread.add(key);
     if ((isDm || mentioned || repliedToMe) && level !== 'muted' && !S.blocked.has(m.authorId)) {
       S.mentions.set(key, (S.mentions.get(key) || 0) + 1);
-      if (S.me.status !== 'dnd') { playSound(mentionKind(m) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); }
+      if (S.me.status !== 'dnd') { playSound(mentionKind(m) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); if (!document.hasFocus()) flashTaskbar(); }
     } else if (level === 'all' && !S.blocked.has(m.authorId) && S.me.status !== 'dnd') playSound('message');
   }
   if ((mentioned || repliedToMe) && !S.blocked.has(m.authorId)) {
@@ -3748,7 +3770,10 @@ function openJoinModal(code) {
   input.addEventListener('input', debounce(look, 300));
   modal({
     title: 'Join a server', size: 'sm',
-    body: h('div', { class: 'stack' }, field('Invite link or code', input), preview),
+    body: h('div', { class: 'stack' }, field('Invite link or code', input), preview,
+      // In a browser on a computer: hand the invite to the installed desktop app instead.
+      code && !window.hearthDesktop && !/Android|iPhone|iPad/.test(navigator.userAgent)
+        ? h('p', { class: 'field-hint' }, 'Have the desktop app? ', h('a', { href: `hearth://invite/${encodeURIComponent(code)}` }, 'Open this invite in the app')) : null),
     actions: [
       { label: 'Cancel' },
       { label: 'Join server', kind: 'primary', action: async () => {
@@ -4238,6 +4263,15 @@ async function installApp() {
   const { outcome } = await installPrompt.userChoice;
   installPrompt = null;
   return outcome === 'accepted';
+}
+// The desktop app downloaded an update from this server: offer to restart into it (never mid-call by itself).
+function showAppUpdate(version) {
+  if (document.querySelector('.update-bar.app-update')) return;
+  const bar = h('div', { class: 'update-bar app-update', role: 'status' }, icon('download'),
+    h('span', null, `The ${S.config.name || 'Hearth'} app ${version ? `${version} ` : ''}is ready to install.`),
+    h('button', { class: 'btn primary sm', onclick: async () => { if (voice && voice.channelId && !(await confirmDialog({ title: 'Restart now?', text: 'Restarting leaves your call. It takes a few seconds.', confirm: 'Restart' }))) return; installUpdate(); } }, 'Restart now'),
+    ibtn('close', 'Later (it installs when you quit)', () => bar.remove(), { cls: 'sm' }));
+  document.body.append(bar);
 }
 function setupServiceWorker() {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
