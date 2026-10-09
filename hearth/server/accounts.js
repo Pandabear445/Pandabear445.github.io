@@ -101,7 +101,8 @@ module.exports = function setupAccounts(ctx) {
     if (b.pass !== undefined) v.pass = b.pass ? seal({ p: String(b.pass).slice(0, 300) }) : '';
     if (b.from !== undefined) v.from = String(b.from || '').trim().slice(0, 200);
     if (b.publicUrl !== undefined) {
-      const u = String(b.publicUrl || '').trim().replace(/\/+$/, '');
+      let u = String(b.publicUrl || '').trim().slice(0, 300);
+      while (u.endsWith('/')) u = u.slice(0, -1);
       if (u && !/^https:\/\/[^\s/]+$/.test(u)) fail(400, 'Your server’s address must look like https://chat.example.com');
       v.publicUrl = u;
     }

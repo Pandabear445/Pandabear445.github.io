@@ -315,7 +315,7 @@ const RKEY = () => `hearth.reminders.${X.S.me.id}`;
 const getR = () => { try { return JSON.parse(localStorage.getItem(RKEY()) || '[]'); } catch { return []; } };
 const setR = (v) => { try { localStorage.setItem(RKEY(), JSON.stringify(v.slice(0, 200))); } catch { /* full */ } };
 export function remindItems(m, key, preview) {
-  const at = (ms) => () => { setR([...getR(), { at: Date.now() + ms, key, msgId: m.id, text: preview.slice(0, 140), authorId: m.authorId }]); toast(`Okay — I’ll remind you ${relative(Date.now() + ms).replace('in ', 'in ')}.`); };
+  const at = (ms) => () => { setR([...getR(), { at: Date.now() + ms, key, msgId: m.id, text: preview.slice(0, 140), authorId: m.authorId }]); toast(`Okay — I’ll remind you ${relative(Date.now() + ms)}.`); };
   const tomorrow9 = () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); };
   const tonight = () => { const d = new Date(); d.setHours(20, 0, 0, 0); return d.getTime() - Date.now(); };
   return [

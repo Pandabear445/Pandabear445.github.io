@@ -53,14 +53,19 @@ const PAGE_DEFAULTS = {
 // that could load something from elsewhere); this is the first line of defence and keeps it small.
 function sanitizeCss(css) {
   let s = String(css || '').slice(0, 12000);
-  s = s.replace(/\/\*[\s\S]*?\*\//g, '') // comments
-    .replace(/\\/g, '') // escapes could hide the words below
-    .replace(/<\/?\s*style/gi, '')
-    .replace(/@(import|charset|namespace|font-face|property|layer|container|supports|page|document)\b[^;{]*(;|\{[^}]*\})?/gi, '')
-    .replace(/\b(url|image-set|image|src|expression|element|cross-fade)\s*\(/gi, 'blocked(')
-    .replace(/javascript\s*:/gi, '')
-    .replace(/(-moz-binding|behavior)\s*:/gi, 'blocked:');
-  return s.slice(0, 10000);
+  // Repeat until nothing changes, so removing one word can't join the pieces around it into another
+  // ("<sty<stylele" → "<style").
+  for (let prev = null, i = 0; s !== prev && i < 20; i++) {
+    prev = s;
+    s = s.replace(/\/\*[\s\S]*?\*\//g, '') // comments
+      .replace(/\\/g, '') // escapes could hide the words below
+      .replace(/<\/?\s*style/gi, '')
+      .replace(/@(import|charset|namespace|font-face|property|layer|container|supports|page|document)\b[^;{]*(;|\{[^}]*\})?/gi, '')
+      .replace(/\b(url|image-set|image|src|expression|element|cross-fade)\s*\(/gi, 'blocked(')
+      .replace(/javascript\s*:/gi, '')
+      .replace(/(-moz-binding|behavior)\s*:/gi, 'blocked:');
+  }
+  return s.replace(/</g, '').slice(0, 10000);
 }
 
 function sanitizePage(input, current = {}) {

@@ -79,7 +79,7 @@ export function render(text, { mentionName = '', inline = false, everyone = true
 
 export function mentionsUser(text, username) {
   if (!username) return false;
-  const re = new RegExp(`(^|\\s)@(${username.replace(/[.]/g, '\\.')}|everyone|here)(?![a-zA-Z0-9_.])`, 'i');
+  const re = new RegExp(`(^|\\s)@(${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}|everyone|here)(?![a-zA-Z0-9_.])`, 'i');
   return re.test(String(text || ''));
 }
 

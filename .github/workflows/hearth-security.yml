@@ -108,8 +108,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Docker Hub rate-limits shared CI runners (429 Too Many Requests). Fetch the base image first,
+      # retrying with backoff and falling back to Google's Docker Hub mirror, then build from that copy.
+      - name: Fetch the base image
+        run: |
+          base=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' hearth/Dockerfile | head -n1)
+          for wait in 0 10 30 60; do
+            sleep "$wait"
+            docker pull "$base" && exit 0
+            docker pull "mirror.gcr.io/library/$base" && docker tag "mirror.gcr.io/library/$base" "$base" && exit 0
+          done
+          exit 1
       - name: Build the Docker image
-        run: docker build --pull -t hearth:ci hearth
+        run: docker build -t hearth:ci hearth
       - name: Scan the image (fails on fixable high/critical)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

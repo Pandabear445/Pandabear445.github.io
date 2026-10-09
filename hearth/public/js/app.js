@@ -2114,7 +2114,7 @@ const keyOfMessage = (m) => (m.dmId ? 'd:' + m.dmId : 'c:' + m.channelId);
 function mentionKind(m) {
   const t = textOf(m);
   if (!t) return null;
-  const me = S.me.username.replace(/[.]/g, '\\.');
+  const me = S.me.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (new RegExp(`(^|\\s)@${me}(?![\\w.])`, 'i').test(t)) return 'mention';
   if (m.dmId) return null;
   const server = S.servers.find((x) => x.id === m.serverId);
