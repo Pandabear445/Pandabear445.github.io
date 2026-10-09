@@ -1163,11 +1163,29 @@ function renderSidebar() {
   body.append(
     nav('Home', 'home', S.view.type === 'home', goHome),
     nav('Friends', 'people', S.view.type === 'friends', () => goFriends(pending ? 'pending' : 'online'), pending),
-    nav('People', 'user', S.view.type === 'people', () => setView({ type: 'people' })),
-    nav('Saved messages', 'bookmark', S.view.type === 'saved', () => setView({ type: 'saved' })),
+  );
+  // The less-used pages sit behind one "More" row so the sidebar stays about your conversations.
+  const extras = [
     nav('Updates', 'rss', S.view.type === 'updates', () => setView({ type: 'updates' }), S.me.updatesUnread || 0),
     S.me.studyEnabled ? nav('Study', 'graduation', S.view.type === 'study', () => setView({ type: 'study', tab: 'focus' })) : null,
-  );
+    nav('People', 'user', S.view.type === 'people', () => setView({ type: 'people' })),
+    nav('Saved messages', 'bookmark', S.view.type === 'saved', () => setView({ type: 'saved' })),
+  ].filter(Boolean);
+  const extraActive = ['updates', 'study', 'people', 'saved'].includes(S.view.type);
+  let moreOpen = extraActive;
+  try { moreOpen = moreOpen || localStorage.getItem('hearth.navMore') === '1'; } catch { /* storage blocked */ }
+  const moreBox = h('div', { class: 'nav-more', id: 'nav-more', hidden: !moreOpen }, extras);
+  body.append(h('button', {
+    class: `nav-row nav-more-btn${moreOpen ? ' open' : ''}`, 'aria-expanded': String(moreOpen), 'aria-controls': 'nav-more',
+    onclick: (e) => {
+      const open = moreBox.hidden;
+      moreBox.hidden = !open;
+      e.currentTarget.classList.toggle('open', open);
+      e.currentTarget.setAttribute('aria-expanded', String(open));
+      try { localStorage.setItem('hearth.navMore', open ? '1' : '0'); } catch { /* storage blocked */ }
+    },
+  }, icon('chevronRight'), h('span', null, 'More'),
+  !moreOpen && S.me.updatesUnread ? h('span', { class: 'badge inline' }, S.me.updatesUnread) : null), moreBox);
   const convs = conversations();
   const favs = P.favorites;
   const pinned = convs.filter((c) => favs.includes(c.fav));
@@ -1176,8 +1194,10 @@ function renderSidebar() {
     pinned.forEach((c) => body.append(convRow(c)));
   }
   body.append(h('div', { class: 'group-label' }, h('span', null, 'Direct messages'),
-    ibtn('plus', 'New message', () => openNewConversation(), { cls: 'sm' })),
-  h('button', { class: 'nav-row new-group', 'data-nav': '', onclick: () => openNewConversation(null, { group: true }) }, icon('people'), h('span', null, 'New group chat')));
+    ibtn('plus', 'New message or group chat', (e) => menu(e.currentTarget, [
+      { label: 'New message', icon: 'message', action: () => openNewConversation() },
+      { label: 'New group chat', icon: 'people', action: () => openNewConversation(null, { group: true }) },
+    ], { align: 'end' }), { cls: 'sm', attrs: { 'data-pop-anchor': '' } })));
   const rest = convs.filter((c) => !favs.includes(c.fav));
   if (!rest.length && !pinned.length) body.append(h('p', { class: 'sidebar-empty' }, 'No conversations yet. Start one with a friend or someone from a server.'));
   rest.forEach((c) => body.append(convRow(c)));
@@ -1578,6 +1598,7 @@ function renderHeader() {
   const v = S.view;
   const key = currentKey();
   const server = currentServer();
+  const PIN_ITEM = { label: S.panel === 'pins' ? 'Hide pinned messages' : 'Pinned messages', icon: 'pin', action: () => togglePanel('pins') };
   if (v.type === 'channel' && server && !isGroup(server)) {
     const c = server.channels.find((x) => x.id === v.channelId);
     if (!c) return;
@@ -1587,10 +1608,10 @@ function renderHeader() {
       headTools(
         encBadge(() => openServerSecurity(server)),
         ibtn('search', 'Search this channel (Ctrl+K)', () => openSearch({ scope: key })),
-        ibtn('pin', 'Pinned messages', () => togglePanel('pins'), { active: S.panel === 'pins' }),
-        ibtn(isMuted(key) ? 'bellOff' : 'bell', 'Notification settings', (e) => menu(e.currentTarget, notifyMenu(key), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }),
+        // Notification options live in the ⋯ menu; the bell only shows up as a reminder when it's muted.
+        isMuted(key) ? ibtn('bellOff', 'Muted. Click to change.', (e) => menu(e.currentTarget, notifyMenu(key), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }) : null,
         ibtn('people', S.panel === 'members' ? 'Hide members' : 'Show members', () => togglePanel('members'), { active: S.panel === 'members' }),
-        ibtn('more', 'More', (e) => menu(e.currentTarget, channelMenuItems(c, server), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } })));
+        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'channel' && isGroup(server)) {
     const call = server.channels.find((c) => c.type === 'voice');
     const inCall = voice && call && voice.channelId === call.id;
@@ -1604,9 +1625,8 @@ function renderHeader() {
         call ? h('button', { class: `btn sm ${inCall ? 'danger' : callers ? 'primary' : 'ghost'}`, onclick: () => (inCall ? voice.leave() : joinRoom(call.id)) },
           icon(inCall ? 'phoneOff' : 'phone'), inCall ? 'Leave call' : callers ? `Join call (${callers})` : 'Call') : null,
         ibtn('search', 'Search (Ctrl+K)', () => openSearch({ scope: key })),
-        ibtn('pin', 'Pinned messages', () => togglePanel('pins'), { active: S.panel === 'pins' }),
         ibtn('people', 'Members', () => togglePanel('members'), { active: S.panel === 'members' }),
-        ibtn('more', 'More', (e) => menu(e.currentTarget, groupMenuItems(server), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } })));
+        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...groupMenuItems(server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'dm') {
     const d = S.dms.find((x) => x.id === v.dmId);
     if (!d) return;
@@ -1628,9 +1648,8 @@ function renderHeader() {
           return [ibtn('phone', live ? 'Join the call' : 'Start a voice call', () => startDmCall(d.id)), ibtn('video', live ? 'Join with video' : 'Start a video call', () => startDmCall(d.id, true))];
         })(),
         ibtn('search', 'Search (Ctrl+K)', () => openSearch({ scope: key })),
-        ibtn('pin', 'Pinned messages', () => togglePanel('pins'), { active: S.panel === 'pins' }),
         ibtn('user', S.panel === 'members' ? 'Hide profile' : 'Show profile', () => togglePanel('members'), { active: S.panel === 'members' }),
-        ibtn('more', 'More', (e) => menu(e.currentTarget, [...dmMenuItems(d), '-', blockItem(u)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' } })));
+        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...dmMenuItems(d), '-', blockItem(u)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'voice' && server) {
     const c = server.channels.find((x) => x.id === v.channelId);
     head.append(h('div', { class: 'head-title' }, icon('speaker', 'ic head-ic'), h('h1', null, c ? c.name : 'Voice')),
@@ -1724,8 +1743,7 @@ function homeView() {
   const wrap = h('div', { class: 'home-view' });
   const hour = new Date().getHours();
   const greet = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
-  wrap.append(h('div', { class: 'home-hero' }, h('h2', null, `${greet}, ${displayName(S.me)}`),
-    h('button', { class: 'home-search', onclick: () => openSearch() }, icon('search'), h('span', null, 'Search messages, people, channels and servers'), h('kbd', null, 'Ctrl K'))));
+  wrap.append(h('div', { class: 'home-hero' }, h('h2', null, `${greet}, ${displayName(S.me)}`)));
 
   const convs = conversations();
   const favs = P.favorites;
@@ -1734,7 +1752,7 @@ function homeView() {
 
   const fundCard = fundingCard();
   if (fundCard) wrap.append(fundCard);
-  const upcomingSlot = h('div');
+  const upcomingSlot = h('div', { hidden: true }); // no empty gap while it loads (or when there's nothing coming up)
   wrap.append(upcomingSlot);
   upcomingSection().then((sec) => { if (sec) upcomingSlot.replaceWith(sec); });
   if (pinned.length) wrap.append(section('Pinned conversations', null, h('div', { class: 'conv-cards' }, pinned.map(convCard))));

@@ -507,7 +507,7 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
   font-size: 12px; font-weight: 600; color: var(--muted); border-radius: 8px; border: 1px solid var(--line);
 }
 .head-badge .ic { width: 15px; height: 15px; }
-.head-badge.e2ee { color: color-mix(in oklab, var(--ok) 85%, var(--text)); }
+.head-badge.e2ee { color: color-mix(in oklab, var(--ok) 85%, var(--text)); border-color: transparent; }
 .head-badge.e2ee:hover { background: rgb(63 207 131 / .1); }
 .head-badge.warn { color: var(--danger); background: rgb(239 84 102 / .1); border-color: rgb(239 84 102 / .35); }
 .tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; }
@@ -537,12 +537,6 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .home-view { flex: 1; overflow-y: auto; padding: 28px clamp(16px, 4vw, 48px) 40px; display: flex; flex-direction: column; gap: 26px; }
 .home-hero { display: flex; flex-direction: column; gap: 14px; max-width: 920px; }
 .home-hero h2 { font-size: 26px; font-weight: 800; }
-.home-search {
-  display: flex; align-items: center; gap: 10px; height: 46px; padding: 0 14px; border-radius: 12px; max-width: 620px;
-  background: rgb(var(--field)); border: 1px solid var(--line-2); color: var(--muted); text-align: left; transition: border-color .15s;
-}
-.home-search > span:not(.ic) { flex: 1; }
-.home-search:hover { border-color: rgb(var(--accent-rgb) / .6); color: var(--text-2); }
 .home-sec { display: flex; flex-direction: column; gap: 10px; max-width: 920px; }
 .home-sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .home-sec-head h3 { font-size: 14px; font-weight: 700; color: var(--text-2); font-family: var(--font); }
@@ -1328,10 +1322,22 @@ html.has-bg .set-nav, html.has-bg .set-main { backdrop-filter: blur(18px) satura
 .set-content { flex: 1; overflow-y: auto; padding: 44px 48px 140px; }
 .set-close { position: absolute; top: 20px; right: 22px; z-index: 3; width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line-2); background: var(--hover); }
 .set-title { font-size: 26px; font-weight: 800; letter-spacing: -.02em; }
+.set-subtabs { display: flex; gap: 4px; flex-wrap: wrap; margin: 0 56px 22px 0; padding: 4px; width: fit-content; max-width: 100%; border-radius: 12px; background: var(--hover); }
+.set-subtab { padding: 7px 14px; border-radius: 9px; font-size: 13.5px; font-weight: 600; color: var(--muted); }
+.set-subtab:hover { color: var(--text); }
+.set-subtab.active { background: var(--active); color: var(--text); }
 .set-form { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
 .set-form.narrow { max-width: 680px; }
 .set-section { display: flex; flex-direction: column; gap: 14px; padding-top: 22px; border-top: 1px solid var(--line); }
 .set-h { font-size: 16px; font-weight: 700; }
+.set-fold { gap: 0; }
+.set-fold > summary { display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none; padding: 2px 0; }
+.set-fold > summary::-webkit-details-marker { display: none; }
+.set-fold > summary .set-fold-hint { flex: 1; color: var(--muted); font-size: 13px; }
+.set-fold > summary .ic { width: 18px; height: 18px; margin-left: auto; color: var(--muted); transition: transform .15s; }
+.set-fold[open] > summary .ic { transform: rotate(90deg); }
+.set-fold > summary:hover .set-h { color: var(--accent); }
+.set-fold-body { display: flex; flex-direction: column; gap: 14px; padding-top: 14px; }
 .set-sub { font-size: 13px; color: var(--muted); margin: -8px 0 0; }
 .set-profile { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 40px; max-width: 1120px; align-items: start; }
 .set-preview { position: sticky; top: 0; }
@@ -2400,7 +2406,11 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .group-av.icon img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
 .friends-top { display: flex; align-items: center; gap: 10px; }
 .friends-top .friends-search { flex: 1; }
-.nav-row.new-group { color: var(--text-2); }
+.nav-more-btn { color: var(--muted); }
+.nav-more-btn .ic { transition: transform .15s; }
+.nav-more-btn.open .ic { transform: rotate(90deg); }
+.nav-more { display: flex; flex-direction: column; padding-left: 12px; }
+.nav-more[hidden] { display: none; }
 .quick-row.static { cursor: default; }
 .quick-row.static:hover { background: none; }
 

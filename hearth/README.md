@@ -223,7 +223,7 @@ The first account created on the server (or anyone listed in `ADMIN_USERS`) sees
 - **Captcha on sign-up and login:** a private, self-hosted "I'm not a robot" check (proof of work, like ALTCHA). People's browsers solve a small puzzle — about a fifth of a second on a computer, usually finished before they've typed their password — which makes mass sign-ups and password guessing expensive for bots. Puzzles are signed, single-use and expire after 5 minutes; IPs that keep failing get harder puzzles automatically. No Google/hCaptcha scripts and no tracking. Turn it on or off for login and sign-up in Admin → Registration & Terms.
 - Strict browser security policy (only this server's own scripts can run), clickjacking protection, HSTS on HTTPS, locked-down browser permissions.
 - Rate limits by network (IPv6 per /64), per account (from any number of IPs) and per session on sign-in, sign-up, password reset, two-factor codes, email codes, messages and uploads. An account's usual IPs are exempt from the short sign-in limit, so nobody can lock someone out by spamming wrong passwords.
-- **Sessions:** every device is listed in Settings → Sessions (device, IP, last active) and can be signed out on its own, or all at once with "Log out all other devices". Sessions also end after 60 days unused or 365 days in total. Signing out, changing the password, a reset and turning on two-factor all cut off the other devices immediately, including open app windows.
+- **Sessions:** every device is listed in Settings → Security → Signed-in devices (device, IP, last active) and can be signed out on its own, or all at once with "Log out all other devices". Sessions also end after 60 days unused or 365 days in total. Signing out, changing the password, a reset and turning on two-factor all cut off the other devices immediately, including open app windows.
 - **Re-confirm before sensitive changes:** changing your password, email or recovery key, turning off two-factor or deleting your account needs your password again, plus a two-factor code if it's on.
 - **Automated attacker:** the test suite (`npm test`, run by GitHub Actions on every push) tries every API route without signing in, with other people's ids, and with hostile input, and checks the rules in [SECURITY.md](SECURITY.md).
 - Live connections are rate-limited; floods are disconnected.
@@ -506,7 +506,7 @@ Organise the servers in your left bar into folders:
 
 ## Group chats
 
-**New group chat** is on Home (under Direct messages) and on the Friends page. A friend's ⋯ menu can also start a group chat or add them to one.
+**New group chat** is under the + next to Direct messages on Home, and on the Friends page. A friend's ⋯ menu can also start a group chat or add them to one.
 
 - **Up to 25 people.** Everyone in the group can add friends or people they share a server with, rename it and change its picture.
 - **The owner can remove people** and hand the group to someone else (group menu → Members).

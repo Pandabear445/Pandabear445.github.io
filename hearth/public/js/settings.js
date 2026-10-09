@@ -57,16 +57,27 @@ function toggle(label, checked, onChange, hint) {
 function section(title, ...kids) {
   return h('section', { class: 'set-section' }, title ? h('h3', { class: 'set-h' }, title) : null, kids);
 }
+// A section that starts closed: for the extras most people set once (or never), so a page isn't a wall of options.
+function fold(title, hint, ...kids) {
+  return h('details', { class: 'set-section set-fold' },
+    h('summary', null, h('span', { class: 'set-h' }, title), hint ? h('span', { class: 'set-fold-hint' }, hint) : null, icon('chevronRight')),
+    h('div', { class: 'set-fold-body' }, kids));
+}
 
 // ------------------------------------------------------------------ the modal
 // Grouped like most chat apps so people can find things: [group label, [[key, label, icon], ...]]
+// Closely related pages share one entry and switch with tabs at the top (SUBTABS), which keeps the list short.
 const TAB_GROUPS = [
-  ['Account', [['profile', 'Profile', 'user'], ['page', 'Profile page', 'star'], ['activity', 'Games & music', 'gamepad'], ['account', 'Security & storage', 'lock'], ['sessions', 'Sessions', 'monitor'], ['study', 'Study tools', 'graduation']]],
-  ['App', [['appearance', 'Appearance', 'palette'], ['layout', 'Layout', 'sidebar'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['keybinds', 'Keybinds', 'monitor'], ['apps', 'Apps & devices', 'download']]],
-  ['Privacy', [['privacy', 'Privacy & safety', 'shield']]],
-  ['Servers', [['servers', 'Server settings', 'gear']]],
-  ['Instance', [['instance', 'Instance', 'monitor']], 'admin'],
+  ['Account', [['profile', 'Profile', 'user'], ['account', 'Security', 'lock'], ['privacy', 'Privacy & safety', 'shield'], ['study', 'Study tools', 'graduation']]],
+  ['App', [['appearance', 'Appearance', 'palette'], ['chat', 'Chat', 'message'], ['notifications', 'Notifications', 'bell'], ['voice', 'Voice & video', 'mic'], ['keybinds', 'Keybinds', 'monitor'], ['apps', 'Apps & devices', 'download']]],
+  ['Servers', [['servers', 'Server settings', 'gear'], ['instance', 'Instance', 'monitor', 'admin']]],
 ];
+const SUBTABS = {
+  profile: [['profile', 'Profile card'], ['page', 'Profile page'], ['activity', 'Games & music']],
+  account: [['account', 'Security & storage'], ['sessions', 'Signed-in devices']],
+  appearance: [['appearance', 'Theme'], ['layout', 'Layout']],
+};
+const parentTab = (k) => Object.keys(SUBTABS).find((p) => SUBTABS[p].some(([s]) => s === k)) || k;
 
 let micTest = null;
 function stopMicTest() {
@@ -96,18 +107,12 @@ export function openSettings(app, tab = 'profile') {
 
   const drawNav = () => {
     clear(nav);
-    TAB_GROUPS.filter(([, , who]) => who !== 'admin' || app.S.me.instanceAdmin).forEach(([group, tabs]) => {
+    TAB_GROUPS.forEach(([group, tabs]) => {
       nav.append(h('div', { class: 'set-nav-label' }, group));
-      tabs.forEach(([k, label, ic]) => nav.append(h('button', {
-        class: `set-nav-btn${k === current ? ' active' : ''}`,
-        'aria-current': k === current ? 'page' : null,
-        onclick: async () => {
-          if (k === current) return;
-          if (dirty && !(await confirmDialog({ title: 'Discard changes?', text: 'You have profile changes that are not saved yet.', confirm: 'Discard', danger: true }))) return;
-          dirty = false;
-          current = k;
-          draw();
-        },
+      tabs.filter(([, , , who]) => who !== 'admin' || app.S.me.instanceAdmin).forEach(([k, label, ic]) => nav.append(h('button', {
+        class: `set-nav-btn${k === parentTab(current) ? ' active' : ''}`,
+        'aria-current': k === parentTab(current) ? 'page' : null,
+        onclick: () => go(k),
       }, icon(ic), label)));
     });
     nav.append(h('div', { class: 'set-nav-sep' }));
@@ -116,10 +121,24 @@ export function openSettings(app, tab = 'profile') {
     } }, 'Log out'));
   };
 
+  const go = async (k) => {
+    if (k === current) return;
+    if (dirty && !(await confirmDialog({ title: 'Discard changes?', text: 'You have profile changes that are not saved yet.', confirm: 'Discard', danger: true }))) return;
+    dirty = false;
+    current = k;
+    draw();
+  };
+
   const draw = () => {
     stopMicTest();
     drawNav();
     clear(content);
+    const subs = SUBTABS[parentTab(current)];
+    if (subs) {
+      content.append(h('div', { class: 'set-subtabs', role: 'tablist' }, subs.map(([k, label]) => h('button', {
+        class: `set-subtab${k === current ? ' active' : ''}`, role: 'tab', 'aria-selected': String(k === current), onclick: () => go(k),
+      }, label))));
+    }
     const views = { study: studyTab, keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
     content.append(views[current](app, (d) => { dirty = d; }));
     content.scrollTop = 0;
@@ -239,10 +258,10 @@ function profileTab(app, setDirty) {
   const mediaHost = h('div', { class: 'media-list' });
   const refreshMedia = () => {
     clear(mediaHost).append(
-      mediaRow('avatar', 'Avatar', 'PNG, JPG, WebP or animated GIF. You can move and zoom it after choosing.'),
-      mediaRow('banner', 'Banner', 'Shown across the top of your profile. GIFs animate.'),
-      mediaRow('background', 'Profile background', 'Fills your whole profile card behind everything.'),
-      toggle('Show banner', draft.showBanner !== false, (v) => { set('showBanner')(v); }, 'Turn this off to let your profile background fill the whole card, top to bottom.'),
+      mediaRow('avatar', 'Avatar', 'PNG, JPG, WebP or GIF'),
+      mediaRow('banner', 'Banner', 'Across the top of your profile'),
+      mediaRow('background', 'Profile background', 'Behind your whole profile card'),
+      toggle('Show banner', draft.showBanner !== false, (v) => { set('showBanner')(v); }, 'Off: the background fills the whole card.'),
     );
     redrawPreview();
   };
@@ -332,15 +351,13 @@ function profileTab(app, setDirty) {
 
   const form = h('div', { class: 'set-form' },
     h('h2', { class: 'set-title' }, 'My profile'),
-    h('p', { class: 'muted-p' }, 'Everything here is free, forever. Changes show up live on the right.'),
-    section('Pictures', mediaHost),
-    profilePageSection(app, draft, set),
     section('About you',
-      field('Display name', displayName, 'Shown instead of your username. Your username stays the same.'),
+      field('Display name', displayName, 'Shown instead of your username.'),
       field('Pronouns', pronouns),
       h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'About me', bioCount), bio),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Custom status'), h('div', { class: 'row gap' }, csEmoji, csText))),
-    section('Name style',
+    section('Pictures', mediaHost),
+    fold('Name style', 'Color, gradient, font and effects',
       h('div', { class: 'grid-2' },
         field('Name color', colorInput(draft.nameColor, set('nameColor'), 'Name color')),
         h('div', { class: 'field' }, toggle('Gradient name', gradOn, (on) => {
@@ -354,7 +371,7 @@ function profileTab(app, setDirty) {
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Name effect'),
         chips([['none', 'None'], ['glow', 'Glow'], ['neon', 'Neon'], ['shimmer', 'Shimmer'], ['rainbow', 'Rainbow'], ['flow', 'Flowing colors'], ['pulse', 'Pulse'], ['wave', 'Wave'], ['glitch', 'Glitch'], ['outline', 'Outline'], ['shadow', 'Retro shadow']], draft.nameEffect || 'none', set('nameEffect'))),
       h('div', { class: 'field' }, toggle('Pick the glow / outline / shadow color', !!draft.nameGlow, (on) => { draft.nameGlow = on ? (draft.nameGlow || '#ff4fa3') : ''; glowWrap.hidden = !on; changed(); }), glowWrap)),
-    section('Avatar',
+    fold('Avatar shape & ring', null,
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Shape'),
         chips([['circle', 'Circle'], ['rounded', 'Rounded'], ['square', 'Square'], ['hexagon', 'Hexagon']], draft.avatarShape || 'circle', set('avatarShape'))),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Ring'),
@@ -364,7 +381,7 @@ function profileTab(app, setDirty) {
         field('Second color', colorInput(draft.ringColor2 || draft.accentColor || '#f2a541', set('ringColor2'), 'Second ring color'), 'Gradient, glow, double and spinning rings use it.')),
       field('Third color (spinning ring)', colorInput(draft.ringColor3 || '#38c6d9', set('ringColor3'), 'Third ring color')),
       sliderRow('Spin speed', 1, 10, 1, draft.ringSpeed || 4, (v) => `${v}`, (v) => { draft.ringSpeed = v; changed(); })),
-    section('Card theme',
+    fold('Card theme', 'Presets, colors and effects',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Presets'), presetRow),
       colorsHost,
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Card style'),
@@ -372,7 +389,8 @@ function profileTab(app, setDirty) {
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Profile effect'),
         chips([['none', 'None'], ['sparkles', '✦ Sparkles'], ['snow', '❄ Snow'], ['hearts', '♥ Hearts'], ['stars', '★ Stars'], ['bubbles', '◯ Bubbles'], ['embers', '🔥 Embers'], ['sakura', '✿ Cherry blossoms'], ['confetti', '🎉 Confetti'], ['rain', '🌧 Rain'], ['fireflies', '✨ Fireflies'], ['custom', '🛠 Make your own']], draft.profileEffect || 'none', (v) => { set('profileEffect')(v); fxHost.hidden = v !== 'custom'; }),
         fxHost)),
-    section('Links', h('p', { class: 'field-hint' }, 'Up to 6. Must start with http:// or https://'), linksHost),
+    profilePageSection(app, draft, set),
+    fold('Links', 'Up to 6', linksHost),
   );
 
   body = h('div', { class: 'set-profile' },
@@ -1694,8 +1712,7 @@ function profilePageSection(app, draft, set) {
     onclick: () => { if (picked.has(u.id)) picked.delete(u.id); else if (picked.size < 8) picked.add(u.id); else return toast('You can pick up to 8.', 'error'); set('topFriends')([...picked]); drawTf(); },
   }, (u.profile && u.profile.displayName) || u.username)) : [h('span', { class: 'field-hint' }, 'Add some friends first.')]));
   drawTf();
-  return section('Profile page',
-    h('p', { class: 'set-sub' }, 'Extra things people see when they open your full profile.'),
+  return fold('Profile page extras', 'Song, interests and top friends',
     songHost,
     field('More about me', about, 'Shown on your full profile. Markdown works: # headings, - lists, **bold**.'),
     field('Interests', interests, 'Up to 12, separated by commas.'),

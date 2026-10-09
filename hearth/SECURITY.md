@@ -48,7 +48,7 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 2 | DB stolen | Passwords can't be recovered: only bcrypt hashes of an Argon2id-derived key | `auth.test.js` › bcrypt hashes |
 | 3 | DB stolen | Sessions can't be used: only token hashes, and a hash isn't a token | `sessions.test.js` › stolen database |
 | 4 | DB stolen | Reset links, email codes, backup codes and the 2FA secret aren't usable from the file alone | `recovery.test.js` › reset link stored as hash, `platform.test.js` › no usable secrets |
-| 5 | Session stolen | The owner sees it in **Settings → Sessions** and revokes it (or "Log out all other devices"); it dies at once, live connection included | `sessions.test.js` › Sessions lists devices… |
+| 5 | Session stolen | The owner sees it in **Settings → Security → Signed-in devices** and revokes it (or "Log out all other devices"); it dies at once, live connection included | `sessions.test.js` › Sessions lists devices… |
 | 6 | Session stolen + password | With 2FA on: can't change the password, email or recovery key, turn off 2FA, or delete the account without a fresh code | `recovery.test.js` › step-up |
 | 7 | Session left behind | Logout, password change, password reset and turning on 2FA end the other sessions immediately | `sessions.test.js`, `recovery.test.js` |
 | 8 | Old session | Expires after 60 idle days or 365 days in total | `sessions.test.js` › expired session |
