@@ -79,44 +79,135 @@ async function safeGet(urlStr, { accept = 'application/rss+xml, application/atom
 }
 
 // ------------------------------------------------------------------ reading RSS / Atom
+// Feeds are other people's text, often full of HTML (patch notes, news summaries) and sometimes broken, so
+// every step here takes time in proportion to the feed's size: nothing scans "to the end" again for each tag,
+// and big items are trimmed first. (Before 1.24.1 some feeds took up to a minute to read, freezing the
+// server.) On top of that, feeds are read in a worker thread with a time limit (see parseInWorker below).
+const MAX_ITEM_CHARS = 200000; // one item; longer ones are cut (the summary keeps only 400 characters anyway)
+const MAX_SUMMARY_CHARS = 30000;
 const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'', nbsp: ' ', hellip: '…', mdash: '—', ndash: '–', rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“' };
-const decode = (s) => String(s || '')
-  .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-  .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => (e[0] === '#' ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)) : ENT[e.toLowerCase()] ?? m));
-const stripTags = (s) => decode(s).replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m) => decode(m)).replace(/\s+/g, ' ').trim();
+const codePoint = (n) => (Number.isInteger(n) && n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : '');
+const entities = (s) => s.replace(/&(#x[0-9a-f]{1,8}|#\d{1,9}|[a-z]{1,12});/gi, (m, e) => (e[0] === '#' ? codePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)) : ENT[e.toLowerCase()] ?? m));
+// <![CDATA[ ... ]]> → its contents (an unclosed one runs to the end).
+function cdata(s) {
+  let out = ''; let i = 0;
+  for (;;) {
+    const a = s.indexOf('<![CDATA[', i);
+    if (a === -1) return out + s.slice(i);
+    const b = s.indexOf(']]>', a + 9);
+    out += s.slice(i, a) + s.slice(a + 9, b === -1 ? s.length : b);
+    if (b === -1) return out;
+    i = b + 3;
+  }
+}
+const decode = (s) => entities(cdata(String(s || '')));
+// Drops <script>…</script> and <style>…</style> (an unclosed one drops the rest).
+function dropBlocks(s, name) {
+  const open = new RegExp(`<${name}\\b`, 'gi'); const close = new RegExp(`</${name}\\s*>`, 'gi');
+  let out = ''; let i = 0; let m;
+  open.lastIndex = 0;
+  while ((m = open.exec(s))) {
+    close.lastIndex = m.index;
+    const c = close.exec(s);
+    out += s.slice(i, m.index) + ' ';
+    if (!c) return out;
+    i = close.lastIndex; open.lastIndex = i;
+  }
+  return out + s.slice(i);
+}
+const stripTags = (s) => entities(dropBlocks(dropBlocks(decode(s), 'script'), 'style').replace(/<[^<>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
 const esc = (n) => n.replace(/[.*+?^${}()|[\]\\:]/g, '\\$&');
+// The text inside the first <name …>…</name> (or up to the end if it's never closed).
 function tag(block, name) {
-  const m = block.match(new RegExp(`<${esc(name)}(?:\\s[^>]*)?>([\\s\\S]*?)</${esc(name)}>`, 'i'));
-  return m ? m[1] : '';
+  const m = new RegExp(`<${esc(name)}(?:\\s[^<>]*)?>`, 'i').exec(block);
+  if (!m) return '';
+  const from = m.index + m[0].length;
+  const close = new RegExp(`</${esc(name)}\\s*>`, 'gi');
+  close.lastIndex = from;
+  const c = close.exec(block);
+  return block.slice(from, c ? c.index : block.length);
 }
 function attr(block, name, a, where = null) {
-  const re = new RegExp(`<${esc(name)}\\b([^>]*)/?>`, 'gi');
+  const re = new RegExp(`<${esc(name)}\\b([^<>]*)>`, 'gi');
+  const want = new RegExp(`(?:^|\\s)${esc(a)}\\s*=\\s*["']([^"'<>]*)["']`, 'i');
   let m;
   while ((m = re.exec(block))) {
     const attrs = m[1];
     if (where && !where(attrs)) continue;
-    const v = attrs.match(new RegExp(`\\b${esc(a)}\\s*=\\s*["']([^"']*)["']`, 'i'));
+    const v = want.exec(attrs);
     if (v) return decode(v[1]);
   }
   return '';
 }
+// The <item>s (or Atom <entry>s): each runs to its closing tag, or to the next item if it's never closed.
+function blocksOf(text, name, max = 60) {
+  const openRe = new RegExp(`<${name}[\\s>/]`, 'gi');
+  const opens = []; let m;
+  while (opens.length <= max && (m = openRe.exec(text))) opens.push(m.index);
+  const closeRe = new RegExp(`</${name}\\s*>`, 'i');
+  return opens.slice(0, max).map((start, k) => {
+    const seg = text.slice(start, Math.min(k + 1 < opens.length ? opens[k + 1] : text.length, start + MAX_ITEM_CHARS));
+    const c = closeRe.exec(seg);
+    return c ? seg.slice(0, c.index + c[0].length) : seg;
+  });
+}
 function parseFeed(xml) {
   const text = String(xml);
   const isAtom = /<feed[\s>]/i.test(text) && !/<rss[\s>]/i.test(text);
-  const blocks = text.match(isAtom ? /<entry[\s>][\s\S]*?<\/entry>/gi : /<item[\s>][\s\S]*?<\/item>/gi) || [];
-  const head = text.slice(0, text.search(isAtom ? /<entry[\s>]/i : /<item[\s>]/i) >>> 0 || 4000);
+  const blocks = blocksOf(text, isAtom ? 'entry' : 'item');
+  const first = text.search(isAtom ? /<entry[\s>]/i : /<item[\s>]/i);
+  const head = text.slice(0, first > 0 ? Math.min(first, 20000) : 4000);
   const title = stripTags(tag(head, 'title')).slice(0, 120);
-  const items = blocks.slice(0, 60).map((b) => {
+  const items = blocks.map((b) => {
     const link = isAtom ? (attr(b, 'link', 'href', (a) => !/rel=["'](?!alternate)/i.test(a)) || attr(b, 'link', 'href')) : stripTags(tag(b, 'link')) || attr(b, 'link', 'href');
     const id = stripTags(tag(b, 'guid') || tag(b, 'id')) || link;
     const date = Date.parse(stripTags(tag(b, 'pubDate') || tag(b, 'published') || tag(b, 'updated') || tag(b, 'dc:date'))) || null;
-    const rawSummary = tag(b, 'description') || tag(b, 'summary') || tag(b, 'media:description') || tag(b, 'content:encoded') || tag(b, 'content');
+    const rawSummary = (tag(b, 'description') || tag(b, 'summary') || tag(b, 'media:description') || tag(b, 'content:encoded') || tag(b, 'content')).slice(0, MAX_SUMMARY_CHARS);
     const image = attr(b, 'media:thumbnail', 'url') || attr(b, 'media:content', 'url', (a) => /image|\.(jpe?g|png|webp|gif)/i.test(a)) || attr(b, 'enclosure', 'url', (a) => /image\//i.test(a))
-      || (decode(rawSummary).match(/<img[^>]+src=["']([^"']+)["']/i) || [])[1] || '';
+      || (/<img\b[^<>]*?\ssrc=["']([^"'<>]+)["']/i.exec(decode(rawSummary)) || [])[1] || '';
     const source = stripTags(tag(b, 'source')) || '';
     return { id: String(id).slice(0, 500), title: stripTags(tag(b, 'title')).slice(0, 300), link: String(link).trim().slice(0, 1000), date, summary: stripTags(rawSummary).slice(0, 400), image: /^https?:\/\//.test(image) ? image.slice(0, 1000) : '', source: source.slice(0, 80) };
   }).filter((i) => i.title && /^https?:\/\//.test(i.link));
   return { title, items };
+}
+
+// Feeds are read in a worker thread, so even a feed that's slow to read can't hold up chat, calls or anything
+// else; one that takes longer than PARSE_LIMIT_MS is given up on (the worker is replaced).
+const PARSE_LIMIT_MS = +process.env.FEED_PARSE_LIMIT_MS || 5000;
+let parser = null; let parseSeq = 0;
+const parsing = new Map(); // id -> { resolve, reject }
+function parserWorker() {
+  if (parser) return parser;
+  const { Worker } = require('worker_threads');
+  parser = new Worker(__filename, { workerData: { feedParser: true } });
+  parser.on('message', ({ id, ok, err }) => { const p = parsing.get(id); if (!p) return; parsing.delete(id); if (err) p.reject(new Error(err)); else p.resolve(ok); });
+  const fail = (e) => { parser = null; for (const [, p] of parsing) p.reject(e); parsing.clear(); };
+  parser.on('error', fail);
+  parser.on('exit', () => fail(new Error('The feed reader stopped.')));
+  parser.unref(); // after the listeners (adding one re-arms it): never keeps the process alive by itself
+  return parser;
+}
+function parseInWorker(xml) {
+  return new Promise((resolve, reject) => {
+    const id = ++parseSeq;
+    const w = parserWorker();
+    const timer = setTimeout(() => {
+      if (!parsing.has(id)) return;
+      parsing.delete(id);
+      reject(new Error('That feed takes too long to read.'));
+      if (parser === w) { parser = null; w.terminate().catch(() => {}); }
+    }, PARSE_LIMIT_MS);
+    parsing.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+    w.postMessage({ id, xml: String(xml) });
+  });
+}
+{
+  const { isMainThread, parentPort, workerData } = require('worker_threads');
+  if (!isMainThread && workerData && workerData.feedParser) {
+    parentPort.on('message', ({ id, xml }) => {
+      try { parentPort.postMessage({ id, ok: parseFeed(xml) }); } catch (e) { parentPort.postMessage({ id, err: String(e.message || e) }); }
+    });
+  }
 }
 
 module.exports = function setupNewsbot(ctx) {
@@ -176,7 +267,7 @@ module.exports = function setupNewsbot(ctx) {
   };
   async function fetchFeed(url) {
     const r = await safeGet(url);
-    const parsed = parseFeed(r.body.toString('utf8'));
+    const parsed = await parseInWorker(r.body.toString('utf8'));
     if (!parsed.items.length && !/<(rss|feed|rdf)[\s>]/i.test(r.body.toString('utf8', 0, 2000))) throw new Error('That address isn’t a news feed.');
     return parsed;
   }
@@ -446,4 +537,5 @@ module.exports = function setupNewsbot(ctx) {
 };
 module.exports.parseFeed = parseFeed;
 module.exports.BOT_ID = BOT_ID;
+module.exports.parseInWorker = parseInWorker;
 module.exports.privateIp = privateIp;

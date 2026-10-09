@@ -363,7 +363,7 @@ module.exports = function setupActivity(ctx) {
     };
     const og = async (platform) => {
       const html = await getText(u.href, (host) => host === 'music.apple.com' || /(^|\.)bandcamp\.com$/.test(host));
-      const meta = (p) => { const m = html.match(new RegExp(`<meta[^>]+property=["']og:${p}["'][^>]+content=["']([^"']+)["']`, 'i')) || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:${p}["']`, 'i')); return m ? m[1].replace(/&amp;/g, '&').replace(/&#39;|&apos;/g, '’').replace(/&quot;/g, '"') : ''; };
+      const meta = (p) => { const m = html.match(new RegExp(`<meta[^<>]+property=["']og:${p}["'][^<>]+content=["']([^"'<>]+)["']`, 'i')) || html.match(new RegExp(`<meta[^<>]+content=["']([^"'<>]+)["'][^<>]+property=["']og:${p}["']`, 'i')); return m ? m[1].replace(/&amp;/g, '&').replace(/&#39;|&apos;/g, '’').replace(/&quot;/g, '"') : ''; };
       const title = meta('title');
       if (!title) fail(400, 'Couldn’t read that link. Is the song public?');
       const img = meta('image');

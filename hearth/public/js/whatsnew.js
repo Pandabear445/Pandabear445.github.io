@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.24.1', items: [
+    'Fixed: some news feeds (long patch notes, news summaries full of HTML) could freeze the server for up to a minute while the news bot read them, so everyone saw \u201cReconnecting\u2026\u201d and \u201cFailed to fetch\u201d. Feeds are now read in the background with a time limit, and much faster.',
+  ] },
   { version: '1.24.0', items: [
     'Call regions, like Discord: press \ud83c\udf10 in the call bar (or right-click a voice channel) to move a call to another region, and everyone in it switches together without hanging up.',
     'The news bot shows as online, appears under Bots in the member list, posts the newest item as soon as you follow something, and no longer skips articles that sites list a few hours late.',

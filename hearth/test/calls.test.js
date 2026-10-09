@@ -10,7 +10,13 @@ const rss = () => `<?xml version="1.0"?><rss version="2.0"><channel><title>Test 
 
 before(async () => {
   // A local feed (the test server is allowed to fetch private addresses for this file only).
-  feedSrv = http.createServer((req, res) => { res.setHeader('Content-Type', 'application/rss+xml'); res.end(rss()); });
+  feedSrv = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/rss+xml');
+    // A broken, HTML-heavy feed: items never closed, descriptions full of stray "<". It used to take the
+    // parser about a minute, freezing the whole server ("Reconnecting…" and "Failed to fetch" for everyone).
+    if (req.url.startsWith('/heavy')) return res.end(`<rss><channel><title>Heavy</title>${'<item><title>x</title><link>https://a.test/x</link><description>a &lt; b &lt;img alt="y" '.repeat(24000)}`);
+    res.end(rss());
+  });
   await new Promise((r) => feedSrv.listen(0, '127.0.0.1', r));
   feedUrl = `http://127.0.0.1:${feedSrv.address().port}/feed.xml`;
   srv = await startServer({ FEED_ALLOW_PRIVATE: '1' });
@@ -98,4 +104,17 @@ test('news bot: articles listed late are still posted; really old ones are not',
   // Pausing or removing the feed takes the bot out of the member list.
   await as(owner, 'DELETE', `/feeds/${f.id}`);
   assert.deepEqual((await as(owner, 'GET', '/bootstrap')).json.servers.find((x) => x.id === server.id).bots, []);
+});
+
+test('a broken, heavy feed never freezes the server', async () => {
+  const u = await srv.register();
+  const t0 = Date.now();
+  const adding = as(u, 'POST', '/me/trackers', { kind: 'rss', query: feedUrl.replace('/feed.xml', '/heavy.xml') });
+  // While it's being read, the server keeps answering right away.
+  const pings = [];
+  for (let i = 0; i < 5; i++) { const t = Date.now(); await srv.api('GET', '/config'); pings.push(Date.now() - t); await new Promise((r) => setTimeout(r, 100)); }
+  const r = await adding;
+  assert.ok(Math.max(...pings) < 1000, `server answered in ${pings.join(', ')} ms`);
+  assert.ok(Date.now() - t0 < 15000, 'the feed was read (or given up on) quickly');
+  assert.ok([200, 400].includes(r.status), r.text);
 });
