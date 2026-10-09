@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -647,6 +647,47 @@ CREATE INDEX IF NOT EXISTS idx_study_items_sync ON study_items(user_id, updated_
 // goes through. NULL = automatic (direct when possible, otherwise the nearest relays).
 addColumn('channels', 'rtc_region', 'TEXT');
 addColumn('dm_channels', 'rtc_region', 'TEXT');
+
+// v16: creator memberships. A server's owner connects a Stripe account and sells monthly tiers; each tier
+// gives a role (which can open private channels). Payments go to the creator through Stripe; this Hearth
+// keeps the fee its owner set. Only Stripe ids and statuses are stored here, never card details.
+db.exec(`
+CREATE TABLE IF NOT EXISTS creator_accounts (
+  server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+  stripe_account TEXT NOT NULL,
+  ready INTEGER NOT NULL DEFAULT 0,
+  checked_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS membership_tiers (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  price_cents INTEGER NOT NULL,
+  currency TEXT NOT NULL,
+  role_id TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_membership_tiers_server ON membership_tiers(server_id);
+CREATE TABLE IF NOT EXISTS memberships (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  tier_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  stripe_sub TEXT NOT NULL UNIQUE,
+  stripe_customer TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  cancel_at_end INTEGER NOT NULL DEFAULT 0,
+  period_end INTEGER,
+  amount_cents INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memberships_server_user ON memberships(server_id, user_id);
+`);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

@@ -2517,3 +2517,27 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .share-cover-card h2 { font-size: 19px; font-weight: 800; }
 .share-cover-card p { margin: 0; color: var(--text-2); }
 .share-cover-ic { width: 34px; height: 34px; color: var(--accent); }
+
+/* ---- creator memberships ---- */
+.mb-tier { border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; background: rgb(var(--s3) / .45); display: grid; gap: 8px; }
+.mb-tier.mine { border-color: rgb(var(--accent-rgb) / .55); background: rgb(var(--accent-rgb) / .07); }
+.mb-tier-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.mb-tier-head h3 { font-size: 17px; margin: 0 0 4px; }
+.mb-price { text-align: right; white-space: nowrap; }
+.mb-price strong { font-size: 20px; font-family: var(--font-display); }
+.mb-price span { color: var(--muted); font-size: 13px; margin-left: 2px; }
+.mb-desc { margin: 0; color: var(--text-2); font-size: 14px; white-space: pre-line; }
+.mb-role { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; color: var(--rc, var(--accent)); background: color-mix(in srgb, var(--rc, var(--accent)) 16%, transparent); }
+.mb-mine { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.mb-status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+.mb-status.active .ic { color: var(--good, #4fd18b); }
+.mb-status.past_due { color: var(--danger, #f0596b); }
+.mb-status .ic { width: 15px; height: 15px; }
+.mb-fine { display: flex; align-items: center; gap: 6px; }
+.mb-fine .ic { width: 14px; height: 14px; }
+.mb-note { display: flex; gap: 8px; align-items: flex-start; padding: 12px 14px; border-radius: 12px; background: rgb(var(--s3) / .55); color: var(--text-2); }
+.mb-step { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px; padding: 16px 0; border-top: 1px solid var(--line); }
+.mb-step-n { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: rgb(var(--accent-rgb) / .16); color: var(--accent-ink, var(--accent)); font-weight: 800; font-size: 14px; }
+.mb-step-body { display: grid; gap: 10px; min-width: 0; }
+.mb-step-body h4 { margin: 2px 0 0; font-size: 15px; }
+.mb-row .ic { color: var(--accent); }

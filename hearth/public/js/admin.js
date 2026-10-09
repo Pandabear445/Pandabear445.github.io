@@ -508,7 +508,43 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       d.payments.length ? h('div', { class: 'adm-table' }, ...d.payments.map((p) => h('div', { class: 'adm-row pay-row' },
         h('span', { class: 'stat-sub' }, ago(p.at)), h('b', null, cur(p.cents, p.currency)), h('span', null, p.kind),
         p.user ? userCell(p.user, openUser) : h('button', { class: 'btn sm', onclick: () => assign(p) }, 'Match to someone'),
-        h('span', { class: 'stat-sub' }, p.note || '')))) : h('p', { class: 'field-hint' }, 'No payments yet.'));
+        h('span', { class: 'stat-sub' }, p.note || '')))) : h('p', { class: 'field-hint' }, 'No payments yet.'),
+      await membershipsAdmin(cur, hook, copyRow));
+  }
+
+  // Creator memberships: server owners sell monthly tiers through their own Stripe accounts (Stripe Connect);
+  // this Hearth keeps a small fee. Set up once here.
+  async function membershipsAdmin(cur, hook, copyRow) {
+    const m = await api('GET', '/admin/memberships').catch(() => null);
+    if (!m) return '';
+    const c = m.config;
+    const save = async (patch) => { try { await api('PUT', '/admin/memberships', patch); toast('Saved.'); money(); } catch (e) { toast(e.message, 'error'); } };
+    const f = {
+      key: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.keySet ? `Saved (${c.keyMode} mode, paste to replace)` : 'sk_live_\u2026 or rk_live_\u2026' }),
+      secret: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.webhookSet ? 'Saved (paste to replace)' : 'whsec_\u2026' }),
+      fee: h('input', { class: 'input', type: 'number', min: '0', max: '30', step: '0.5', value: String(c.feePercent) }),
+      currency: h('input', { class: 'input', maxlength: '3', value: c.currency }),
+    };
+    const ready = c.keySet && c.webhookSet;
+    return h('div', { class: 'stack' },
+      h('div', { class: 'admin-head' }, h('h3', null, 'Creator memberships')),
+      h('p', { class: 'field-hint' }, 'Let server owners sell monthly memberships (a role, private channels, perks they choose), like Patreon inside their server. Members pay on Stripe\u2019s page; the money goes to the creator\u2019s own Stripe account, and this Hearth keeps the fee you set below. It\u2019s purely extra: nothing that\u2019s free today changes.'),
+      h('div', { class: 'stats' },
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Creators getting paid'), h('strong', null, String(m.stats.creators))),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Paying members'), h('strong', null, String(m.stats.members))),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Memberships a month'), h('strong', null, cur(m.stats.monthlyCents, c.currency))),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, `Your ${c.feePercent}% a month`), h('strong', null, cur(m.stats.feeCents, c.currency)))),
+      h('ol', { class: 'steps' },
+        h('li', null, 'In Stripe, turn on Connect (Connect \u2192 Get started, choose \u201cExpress\u201d accounts). Stripe handles the creators\u2019 identity checks, payouts and tax forms.'),
+        h('li', null, 'Developers \u2192 API keys: paste your secret key below (or a restricted key with write access to Accounts, Account Links, Checkout Sessions and Subscriptions).'),
+        h('li', null, 'Developers \u2192 Webhooks \u2192 Add endpoint with the address below and the events checkout.session.completed, customer.subscription.updated, customer.subscription.deleted and invoice.paid. Copy its signing secret (whsec_\u2026) here.'),
+        h('li', null, 'Turn memberships on. Server owners then find them in Server settings \u2192 Memberships.')),
+      copyRow('Webhook URL', hook('memberships')),
+      h('div', { class: 'grid-2' }, field('Stripe secret key', f.key, 'Stored encrypted. Never shown again.'), field('Webhook signing secret', f.secret),
+        field('Your fee (%)', f.fee, 'Taken from each payment automatically (0\u201330). Stripe\u2019s own card fee is separate. Most platforms take 5\u201310%.'), field('Currency', f.currency)),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ feePercent: +f.fee.value, currency: f.currency.value, ...(f.key.value.trim() ? { key: f.key.value.trim() } : {}), ...(f.secret.value.trim() ? { webhookSecret: f.secret.value.trim() } : {}) }) }, 'Save')),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Let server owners sell memberships'), h('span', { class: 'field-hint' }, ready ? 'Turning this off stops new memberships; existing ones keep running until people cancel.' : 'Save the key and webhook secret first.')),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: c.enabled, disabled: !ready && !c.enabled, onchange: (e) => save({ enabled: e.target.checked }) }), h('span', { class: 'switch-track' }))));
   }
 
   async function owner() {

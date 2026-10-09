@@ -17,7 +17,7 @@ const SERVER_DIR = path.join(__dirname, '..', 'server');
 // Routes anyone may call without signing in (and what they're for).
 const PUBLIC = new Set([
   'GET /config', 'GET /auth/params', 'POST /auth/register', 'POST /auth/login', 'POST /auth/forgot', 'POST /auth/reset/info', 'POST /auth/reset',
-  'GET /captcha', 'GET /terms', 'GET /push/key', 'POST /pay/kofi', 'POST /pay/stripe', 'POST /regions/:id/heartbeat',
+  'GET /captcha', 'GET /terms', 'GET /push/key', 'POST /pay/kofi', 'POST /pay/stripe', 'POST /pay/memberships', 'POST /regions/:id/heartbeat',
 ]);
 function routes() {
   const out = [];

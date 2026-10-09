@@ -1,6 +1,10 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.26.0', items: [
+    'Creator memberships: server owners can sell monthly memberships, like Patreon inside your server. Each one gives a role, and roles can open private channels. Members join from the server\u2019s Memberships row and pay on Stripe\u2019s page; the money goes to the creator. Everything that\u2019s free stays free.',
+    'Fixed: on phones and tablets the member list no longer covers the chat every time you open a channel (tap the people button when you want it).',
+  ] },
   { version: '1.25.1', items: [
     'Fixed: if a file failed to download once (a brief connection drop or a server restart), it kept failing until you reloaded the app. Now pressing Download again simply tries again, and the error says what went wrong.',
     'Photos, videos and audio files have a Download button (top-right corner), and you can click anywhere on a file card to download it.',

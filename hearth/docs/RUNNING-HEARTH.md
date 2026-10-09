@@ -144,6 +144,19 @@ Point it at your server and put Caddy in front (README → "On a VPS with a doma
    private Hearth (one per small VPS, or several per server with Docker). Your updater and backups already make
    this manageable, and each one is another source of supporters.
 5. **One-off support.** Sponsor-a-month, stickers/merch of the community's in-jokes.
+6. **Creator memberships (Admin → Money → Creator memberships).** Server owners sell monthly memberships to
+   their own fans, like Patreon built into their server: each membership gives a role, and roles can open
+   private channels (#behind-the-scenes, early videos, study notes). Members pay on Stripe's own page; the money
+   goes straight to the creator's Stripe account (Stripe Connect Express handles their identity checks, payouts
+   and tax forms), and your Hearth keeps the fee you set (5% by default, 0–30%) automatically. Nobody who doesn't
+   join pays anything, and nothing that's free today moves behind it: you earn when creators earn.
+   * Set up once: Stripe → Connect (Express accounts), paste a secret key and add a webhook to
+     `https://your-server/api/pay/memberships` (events `checkout.session.completed`,
+     `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`), then turn it on.
+   * Roles with moderator powers can't be sold. Leaving or being removed from a server stops renewals at the end
+     of the paid month; deleting a server ends its memberships.
+   * With Express accounts the platform (you) is responsible for refunds and disputes Stripe can't recover
+     from the creator, so only enable it for creators you trust, and read Stripe's Connect terms.
 
 What a realistic month looks like: at $3/month per supporter, about 5% of active people chipping in covers a
 $10–15 server for a community of 100. Bigger communities cover regions and hosting for smaller ones.
@@ -178,3 +191,5 @@ Avoid: ads, tracking pixels, selling data, paywalling safety or privacy features
   others), read their API terms first.
 * Payments: money from Ko-fi/Stripe is income. Keep the Admin → Money list (or your Ko-fi/Stripe exports) for
   taxes, and make clear supporters are paying for the server, not buying a guaranteed service.
+* Memberships: your fee is income too (Stripe lists it as application fees). Creators are responsible for
+  delivering what they promise; your Terms should say memberships are between the member and the creator.

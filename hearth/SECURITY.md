@@ -79,6 +79,7 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 33 | A booby-trapped deck file (study tools) runs code | Recall runs in a sandboxed frame with its own origin: no access to Hearth's sign-in or storage, no network, only Hearth may embed it. Imported decks are cleaned (ids, pictures, colours) before they're shown | `features.test.js` › Recall runs sandboxed |
 | 34 | Someone moves a call to a region to listen in | A region's relay only forwards end-to-end encrypted packets it can't read. Changing a server voice channel's region needs Manage Channels; outsiders can't change DM calls | `calls.test.js` |
 | 35 | A region server is broken into | It holds only encrypted backups (useless without the backup key, which never leaves the main server) and relays encrypted call packets. The main server pushes copies to an upload-only, chrooted SFTP account and never accepts commands from the region; uploads go only to the SSH host key the region reports with its secret token | `calls.test.js` › regions with backup space |
+| 36 | Someone gets a paid role without paying, or charges a member twice | Roles come only from Stripe webhooks with a valid signature less than 5 minutes old; each Stripe subscription is stored once; checkout amounts, fees and destinations are set by the server, never the app; roles with moderator powers can't be sold; the Stripe key is encrypted at rest and never sent back | `memberships.test.js` |
 
 ## 4. What each adversary can still do (honest limits)
 

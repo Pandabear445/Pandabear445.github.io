@@ -200,6 +200,9 @@ function serializeServer(s, uid) {
     roleDefs, memberRoles, myPerms: myBase, emojis, theme: themeOf(s), description: s.description || '', categoryOrder,
     // Bots working for this server (shown in the member list like on Discord): the news bot while it follows something.
     bots: db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : [],
+    // This server sells memberships (the app shows "Memberships" in its menu); owners see the tab either way.
+    memberships: s.kind !== 'group' && MEMB.offers(s.id),
+    membershipsOn: s.kind !== 'group' && MEMB.usable(),
   };
   if (out.kind === 'group') {
     const last = db.prepare(`SELECT m.* FROM messages m JOIN channels c ON c.id = m.channel_id
@@ -1312,6 +1315,7 @@ api.delete('/servers/:id', auth, (req, res) => {
   });
   removeMessageFiles(db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(s.id).map((r) => r.id));
   db.prepare('DELETE FROM reactions WHERE message_id IN (SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?)').run(s.id);
+  MEMB.onServerDeleted(s.id);
   db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
   removeUpload(s.icon);
   io.to(`server:${s.id}`).emit('server:remove', { serverId: s.id });
@@ -1333,6 +1337,7 @@ api.post('/servers/:id/leave', auth, (req, res) => {
 });
 
 function removeMember(serverId, userId) {
+  MEMB.onLeave(serverId, userId);
   kickFromVoiceInServer(serverId, userId);
   db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
   // They still hold old keys, so the remaining members must switch to a fresh key.
@@ -1424,6 +1429,7 @@ api.post('/invites/:code/join', auth, (req, res) => {
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(inv.code);
     io.to(`server:${sid}`).emit('member:add', { serverId: sid, user: publicUser(getUserRow(req.userId)) });
     io.in(`user:${req.userId}`).socketsJoin(`server:${sid}`);
+    MEMB.syncRoles(sid, req.userId); // back with a membership they still pay for: their role comes back too
   }
   const server = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(sid), req.userId);
   const users = {};
@@ -3179,6 +3185,7 @@ api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
   const ids = db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(srv.id).map((r) => r.id);
   if (ids.length) removeMessageFiles(ids);
   removeUpload(srv.icon);
+  MEMB.onServerDeleted(srv.id);
   db.prepare('DELETE FROM servers WHERE id = ?').run(srv.id);
   memberIds.forEach((u) => io.to(`user:${u}`).emit('server:remove', { serverId: srv.id }));
   io.in(`server:${srv.id}`).socketsLeave(`server:${srv.id}`);
@@ -3554,6 +3561,10 @@ function funding() {
 // Payments through Ko-fi / Stripe (server/money.js) count toward "raised this month" by themselves.
 const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, brief,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), onChange: () => io && io.emit('config:update', { funding: fundingPublic(), support: MONEY.available() }) });
+// Creator memberships (server/memberships.js): server owners sell monthly tiers that give a role.
+const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
+  isMember, emitServer, seal, unseal, newId, brief, PM, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
+  mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();

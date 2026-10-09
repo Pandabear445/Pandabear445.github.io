@@ -26,6 +26,7 @@ import { openSettings, applyAppearance, confirmedCall } from './settings.js';
 import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
 import { createRecall } from './recall-host.js';
+import { openMemberships, membershipsTab } from './memberships.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 
 // ======================================================================= state
@@ -87,6 +88,8 @@ function later(fn) {
   drawFrame = document.hidden ? setTimeout(run, 250) : requestAnimationFrame(run);
 }
 const mine = (k) => `hearth.${k}.${S.me.id}`;
+// Below this width the member list floats over the chat, so it only opens when asked (not on every channel).
+const wideEnoughForPanel = () => matchMedia('(min-width: 1241px)').matches;
 const P = {
   get favorites() { return LS.get(mine('favs'), []); },
   set favorites(v) { LS.set(mine('favs'), v); },
@@ -464,6 +467,13 @@ function startApp() {
       toast(u.staffRole ? `You\u2019re now ${({ owner: 'the owner', admin: 'an admin', moderator: 'a moderator' })[u.staffRole]} on this server.` : 'You\u2019re no longer on the staff team.');
     }
   });
+  socket.on('membership:update', ({ serverId, membership: m }) => {
+    const sv = S.servers.find((x) => x.id === serverId);
+    const where = sv ? sv.name : 'the server';
+    if (m.status === 'active' && !m.cancelAtEnd && Date.now() - m.since < 10 * 60000) { toast(`\u2B50 You\u2019re a member of ${where}. Thank you!`); playSound('mention'); }
+    else if (m.status === 'past_due') toast(`Your membership payment for ${where} didn\u2019t go through. Stripe will try again; check your card.`, 'error');
+    else if (m.status === 'ended') toast(`Your membership of ${where} has ended.`);
+  });
   socket.on('support:thanks', ({ until, forever }) => {
     toast(forever ? '\uD83D\uDC9C Thank you for your support!' : `\uD83D\uDC9C Thank you! You\u2019re a supporter until ${new Date(until).toLocaleDateString()}.`);
     playSound('mention');
@@ -702,6 +712,7 @@ async function loadBootstrap() {
   restoreResume();
   renderAnnouncement();
   if (S.me.staffRole) api('GET', '/admin/stats').then((st) => { S.adminReports = st.openReports; renderRail(); }).catch(() => {});
+  backFromStripe();
   const open = new URLSearchParams(location.search).get('open');
   if (open) { history.replaceState(null, '', '/' + location.hash); if (open === 'messages') openMessages(); if (open === 'friends') goFriends(); }
   if (localStorage.getItem('hearth.push') === 'on') enablePush({ quiet: true }).catch(() => {});
@@ -911,7 +922,7 @@ function setView(v) {
   S.editing = null;
   if (S.panel === 'thread' && (!S.thread || S.thread.channelId !== v.channelId)) { S.panel = null; S.thread = null; }
   if (S.panel === 'pins') S.panel = null;
-  if (S.panel === null && P.showMembers && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
+  if (S.panel === null && P.showMembers && wideEnoughForPanel() && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
   document.body.classList.remove('nav-open');
   if (v.type === 'channel') { const lc = P.lastChannel; lc[v.serverId] = v.channelId; P.lastChannel = lc; }
   S.unreadMarker = S.unread.has(currentKey()) ? currentKey() : null;
@@ -1395,6 +1406,8 @@ function renderServerSidebar(server, head, body) {
   body.append(h('button', { class: `ev-row${next ? ' has' : ''}`, onclick: () => openEvents(server) }, icon('book'),
     h('span', { class: 'ev-row-text' }, next ? h('span', null, h('strong', null, next.title), h('small', null, new Date(next.startsAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }))) : 'Events'),
     evs.length ? h('span', { class: 'badge inline' }, evs.length) : null));
+  // Memberships this server sells (support the creator, get a role / private channels).
+  if (server.memberships) body.append(h('button', { class: 'ev-row mb-row', onclick: () => (isOwner(server) ? openServerSettings(server, 'memberships') : openMemberships(server)) }, icon('star'), h('span', { class: 'ev-row-text' }, 'Memberships')));
   const collapsed = P.collapsed[server.id] || [];
   const cats = orderedCategories(server);
   cats.forEach((cat, ci) => {
@@ -2825,7 +2838,7 @@ async function openThread(root, focusId) {
 }
 function closeThread() {
   S.thread = null;
-  S.panel = P.showMembers && ['channel', 'dm'].includes(S.view.type) ? 'members' : null;
+  S.panel = P.showMembers && wideEnoughForPanel() && ['channel', 'dm'].includes(S.view.type) ? 'members' : null;
   document.body.classList.toggle('panel-open', !!panelMode());
   delete composers.thread;
   renderPanel(); renderHeader();
@@ -3970,6 +3983,21 @@ function openServerSecurity(server) {
   });
 }
 
+// Coming back from Stripe (memberships): say what happened and open the right place.
+function backFromStripe() {
+  const q = new URLSearchParams(location.search);
+  const what = q.get('membership');
+  if (!what) return;
+  history.replaceState(null, '', '/' + location.hash);
+  const sv = S.servers.find((x) => x.id === q.get('server'));
+  if (what === 'thanks') toast('\u2B50 Thanks! Your membership starts as soon as Stripe confirms the payment (a few seconds).');
+  else if (what === 'cancelled') toast('No payment was made.');
+  else if ((what === 'connected' || what === 'connect') && sv) {
+    openServerSettings(sv, 'memberships');
+    if (what === 'connected') api('POST', `/servers/${sv.id}/memberships/refresh`).then((r) => toast(r.ready ? 'Stripe is connected: you can be paid.' : 'Stripe still needs a few details from you.')).catch(() => {});
+  }
+}
+
 // ======================================================================= servers, groups, channels, invites
 function serverMenuItems(server) {
   const admin = isAdmin(server);
@@ -3980,6 +4008,7 @@ function serverMenuItems(server) {
     canManageServer(server) ? { label: 'Server settings', icon: 'gear', action: () => openServerSettings(server) } : null,
     canManageServer(server) && can(server, PERMS.MANAGE_ROLES) ? { label: 'Roles', icon: 'shield', action: () => openServerSettings(server, 'roles') } : null,
     { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; P.showMembers = true; renderAll(); } },
+    server.memberships && !isOwner(server) ? { label: 'Memberships', icon: 'star', action: () => openMemberships(server) } : null,
     { label: fav ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => toggleFavorite('s:' + server.id) },
     ...folders.serverMenuExtras(server),
     '-',
@@ -4196,6 +4225,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['emoji', 'Emoji', 'smile', (s) => can(s, PERMS.MANAGE_EMOJIS)],
     ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bans', 'Bans', 'ban', (s) => can(s, PERMS.BAN_MEMBERS)],
+    ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
   ];
   const add = (el, ...kids) => el.append(...kids.filter((k) => k != null && k !== false));
@@ -4212,7 +4242,7 @@ function openServerSettings(server, startTab = 'overview') {
     if (!allowed.some(([k]) => k === tab)) tab = allowed[0] ? allowed[0][0] : 'overview';
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
-    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bans, danger })[tab](s);
+    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, danger })[tab](s);
   };
 
   function overview(s) {

@@ -489,6 +489,23 @@ Password resets need the server to send email. In **Admin → Owner → Email**,
 
 Set **Your server’s address** to the public URL people use (for example `https://kappachat.duckdns.org`) — reset links point there. Or use `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`, `PUBLIC_URL`. The SMTP password is stored encrypted.
 
+## Creator memberships
+
+Server owners can sell monthly memberships to their community, like Patreon inside the server. Each membership
+gives a role, and roles can open private channels, so "supporters get #behind-the-scenes" works with the
+permissions you already have. Members join from the server's **Memberships** row (or its menu), pay on
+Stripe's page, and get the role within seconds; they can cancel any time and keep it until the end of the month
+they paid for.
+
+- **Hearth's owner** turns it on once in **Admin → Money → Creator memberships**: Stripe Connect (Express
+  accounts), a secret key (stored encrypted), a webhook to `/api/pay/memberships`, and the fee this Hearth keeps
+  (default 5%).
+- **Server owners** set it up in **Server settings → Memberships**: connect Stripe (Stripe checks who they are and
+  pays them out), then make up to 5 memberships with a name, a monthly price, what members get and the role.
+- Money goes to the creator's own Stripe account; Hearth only stores Stripe ids and statuses, never card details.
+  Roles with moderator powers can't be sold. Nothing that's free changes: memberships only add what a creator
+  chooses to offer.
+
 ## News bot
 
 In a server's **Server Settings → News bot** (needs Manage Server), follow a topic (Google News), a YouTube channel, a subreddit, a Steam game's news, a GitHub project's releases, or any RSS/Atom feed, and pick the channel to post in. Press **Preview** to see what it would find. When you follow something, the bot posts the newest item right away so you can see it working; after that it posts only new things — never a backlog of old news — at most 3 at a time, checking every 10 minutes. The bot shows as online in the member list of servers it posts in. Add keywords to post only matching items (for example `patch, update`). Bot posts show a **BOT** tag and a card with the picture, which loads through your server so readers' IPs aren't shared.
