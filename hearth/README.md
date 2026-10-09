@@ -520,18 +520,22 @@ Home → **Updates** → **Track something**: a topic in the news, a YouTube cha
 - **Checked about every 30 minutes,** with an optional notification (even when the app is closed, if push is on) and an optional keyword filter.
 - **Not end-to-end encrypted:** your server fetches the feeds, so it knows what you track (it can't read your chats). Pictures load through the server, so the sites don't see your IP.
 
-## Study tools
+## Study tools (Recall)
 
-Off until someone turns them on: **Settings → Study tools**. Then Home → **Study** has:
+Off until someone turns them on: **Settings → Study tools**. Then **More → Study** in the sidebar opens **Recall**:
 
-- **Focus timer:** focus, short break, long break (lengths are yours). It turns on Do Not Disturb while you focus.
-  - **Study together:** in a voice channel or call, press **Study together** in the call bar, and everyone there gets the same countdown and chime.
-- **Flashcards:** decks with spaced repetition (cards you know come back less often) and quick multiple-choice quizzes.
-  - Paste a list to make many cards at once (`term - meaning` per line; Quizlet exports work), or import a file.
-- **Assignments:** due dates, subjects and reminders. The reminder arrives even when Hearth is closed.
-- **Stats:** focus minutes per day, cards reviewed, streak.
+- **Decks** of cards with pictures, formatting for science and maths (`H_2O`, `x^2`, `\alpha`), and fill-in-the-blank cards (`{{word}}`).
+  - Paste a list, import CSV, text or a Recall file, or drag a file onto the page. Export to CSV (Anki, Quizlet) or a Recall file.
+- **Study modes:** Flashcards, Learn, Smart Review (spaced repetition), Write, Match, Practice test, Blitz, Fill the gap, Explain it, Brain dump, Listen & spell and Quick Fire.
+- **Courses and exam dates** with a countdown, a daily goal, a streak, and studying several decks together.
+- **Focus timer** (Pomodoro). It keeps running while you chat elsewhere in Hearth.
+- **Print** a study sheet or cut-out cards.
 
-Decks, assignments, settings and stats are **end-to-end encrypted** with a key only your account can derive, and synced between your devices. For reminders, the server only knows a time, not what the reminder is for.
+Your decks, pictures and progress are **end-to-end encrypted** with a key only your account can derive, and synced between your devices.
+
+Recall runs in a **sandboxed frame** with its own origin. It can't read your Hearth sign-in or storage and can't connect anywhere, so even a booby-trapped deck file someone shares can't reach your account. Hearth hands Recall your decrypted decks and encrypts everything it sends back.
+
+Decks made with the earlier Hearth study tools are moved into Recall the first time you open it.
 
 ## Desktop app: signing (no more "Windows protected your PC")
 

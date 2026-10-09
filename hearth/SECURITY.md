@@ -76,6 +76,7 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 30 | Someone reads another person's study data, trackers or folders | Every route only returns the caller's own items; study data is ciphertext anyway | `features.test.js` |
 | 31 | A tracker is pointed at an internal address (SSRF) | Private, loopback, link-local and cloud-metadata addresses are refused, including after redirects | `features.test.js` › trackers: private and internal addresses |
 | 32 | A group member removes others or takes over the group | Only the owner can remove people or hand the group over | `features.test.js` › group chats |
+| 33 | A booby-trapped deck file (study tools) runs code | Recall runs in a sandboxed frame with its own origin: no access to Hearth's sign-in or storage, no network, only Hearth may embed it. Imported decks are cleaned (ids, pictures, colours) before they're shown | `features.test.js` › Recall runs sandboxed |
 
 ## 4. What each adversary can still do (honest limits)
 

@@ -25,7 +25,7 @@ import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, 
 import { openSettings, applyAppearance, confirmedCall } from './settings.js';
 import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
-import { createStudy } from './study.js';
+import { createRecall } from './recall-host.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 
 // ======================================================================= state
@@ -338,7 +338,6 @@ async function logout() {
 
 // ======================================================================= realtime
 function startApp() {
-  if (!document.getElementById('study-pill')) document.body.append(study.pill());
   // Desktop app: Ctrl+, (and the tray's "Settings…") open Settings.
   if (window.hearthDesktop && typeof window.hearthDesktop.onOpenSettings === 'function' && !window.__hearthSettingsHook) {
     window.__hearthSettingsHook = true;
@@ -526,9 +525,7 @@ function startApp() {
     if (!S.view.serverId) renderSidebar();
   });
   socket.on('rail:update', ({ rail }) => folders.applyRemote(rail));
-  socket.on('study:state', (p) => study.onRoomState(p));
-  socket.on('study:reminder', (p) => study.onReminder(p));
-  socket.on('study:changed', () => { if (S.me.studyEnabled) study.onRemoteChange().catch(() => {}); });
+  socket.on('study:changed', () => { if (S.me.studyEnabled) study.onRemoteChange(); });
   socket.on('study:enabled', ({ enabled }) => { S.me.studyEnabled = enabled; if (!S.view.serverId) renderSidebar(); });
   socket.on('updates:new', (p) => { updates.onNew(p); if (S.view.type === 'updates') renderMain(); });
   socket.on('server:update', (server) => {
@@ -1084,16 +1081,8 @@ const updates = createUpdates({
   S, mediaNewsUrl: (u) => mediaNewsUrl(u),
   onUnread: () => { if (!S.view.serverId) renderSidebar(); renderRail(); },
 });
-const study = createStudy({
-  S, voice: () => voice, socket: () => socket, playSound: (...a) => playSound(...a),
-  desktopNotify: (title, body) => { try { if ('Notification' in window && Notification.permission === 'granted' && (document.hidden || !document.hasFocus())) new Notification(title, { body, icon: '/icons/icon-192.png' }); } catch { /* */ } },
-  getStatus: () => S.me.status || 'online',
-  setStatus: (st) => api('PATCH', '/me/status', { status: st }).then(() => { S.me.status = st; if (S.users[S.me.id]) S.users[S.me.id].status = st; renderUserPanel(); }).catch(() => {}),
-  setMuted: (v) => { if (voice && voice.channelId && voice.muted !== v) toggleMute(); },
-  onChange: () => { if (S.view.type === 'study') renderMain(); renderVoicePanel(); },
-  onEnabled: () => { if (!S.view.serverId) renderSidebar(); },
-  openStudy: (tab) => setView({ type: 'study', tab }),
-});
+// Study tools: Recall in a sandboxed frame, with its decks end-to-end encrypted and synced (recall-host.js).
+const study = createRecall({ S, onEnabled: () => { if (!S.view.serverId) renderSidebar(); } });
 const folders = createFolders({
   S, servers: () => realServers(), favorites: () => new Set(P.favorites.filter((f) => f.startsWith('s:')).map((f) => f.slice(2))),
   rerender: () => renderRail(), serverUnread: (s) => serverUnread(s), setNotify: (k, v) => setNotify(k, v), railSide: () => railSide(),
@@ -1167,7 +1156,7 @@ function renderSidebar() {
   // The less-used pages sit behind one "More" row so the sidebar stays about your conversations.
   const extras = [
     nav('Updates', 'rss', S.view.type === 'updates', () => setView({ type: 'updates' }), S.me.updatesUnread || 0),
-    S.me.studyEnabled ? nav('Study', 'graduation', S.view.type === 'study', () => setView({ type: 'study', tab: 'focus' })) : null,
+    S.me.studyEnabled ? nav('Study', 'graduation', S.view.type === 'study', () => setView({ type: 'study' })) : null,
     nav('People', 'user', S.view.type === 'people', () => setView({ type: 'people' })),
     nav('Saved messages', 'bookmark', S.view.type === 'saved', () => setView({ type: 'saved' })),
   ].filter(Boolean);
@@ -1500,7 +1489,6 @@ function renderVoicePanel() {
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),
       ibtn('monitor', voice.screenStream ? 'Stop sharing' : 'Share your screen', toggleScreen, { cls: voice.screenStream ? 'on' : '' }),
       ibtn('phoneOff', 'Leave call', () => { voice.leave(); playSound('selfLeave'); }, { cls: 'hang' })),
-    study.callControls(),
     voice.pttMode() ? h('div', { class: `ptt-hint${voice.pttHeld && !voice.muted ? ' on' : ''}` }, icon('mic'),
       getKeybinds().ptt ? (voice.pttHeld && !voice.muted ? 'Talking' : `Push to talk: hold ${comboLabel(getKeybinds().ptt)}`) : h('button', { class: 'link-btn', onclick: () => openSettings(app, 'keybinds') }, 'Push to talk is on, but no key is set')) : '',
   );
@@ -1571,7 +1559,7 @@ function renderMain() {
   else if (v.type === 'saved') main.append(savedView());
   else if (v.type === 'people') main.append(peopleView());
   else if (v.type === 'updates') main.append(updates.view());
-  else if (v.type === 'study') main.append(study.view(v.tab || 'focus', (t) => setView({ type: 'study', tab: t })));
+  else if (v.type === 'study') main.append(study.view());
   else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, confirm: (fn, opts) => confirmedCall(app, fn, opts), tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
   else if (v.type === 'channel' || v.type === 'dm') main.append(chatView());
   else if (v.type === 'voice') main.append(voiceRoomView());
@@ -1668,7 +1656,7 @@ function renderHeader() {
     head.append(h('div', { class: 'head-title' }, icon('user', 'ic head-ic'), h('h1', null, 'People'), h('span', { class: 'head-topic' }, 'Profiles of people you share a server with')),
       headTools(h('button', { class: 'btn ghost sm', onclick: () => openProfileModal(S.me.id) }, icon('user'), 'My page')));
   } else if (v.type === 'study') {
-    head.append(h('div', { class: 'head-title' }, icon('graduation', 'ic head-ic'), h('h1', null, 'Study'), h('span', { class: 'head-topic' }, 'Focus timer, flashcards and assignments — end-to-end encrypted')));
+    head.append(h('div', { class: 'head-title' }, icon('graduation', 'ic head-ic'), h('h1', null, 'Study'), h('span', { class: 'head-topic' }, 'Recall flashcards \u00b7 end-to-end encrypted, on all your devices')));
   } else if (v.type === 'updates') {
     head.append(h('div', { class: 'head-title' }, icon('rss', 'ic head-ic'), h('h1', null, 'Updates'), h('span', { class: 'head-topic' }, 'Topics, channels and projects you track')),
       headTools(h('button', { class: 'btn ghost sm', onclick: () => updates.trackDialog(() => renderMain()) }, icon('plus'), 'Track something')));
@@ -2354,7 +2342,7 @@ function openLinkFromHash() {
   let m = hsh.match(/^#m\/([a-z0-9]+)$/i);
   if (m) return jumpToMessageId(m[1]);
   if (hsh === '#updates') return setView({ type: 'updates' });
-  if (hsh === '#study') return setView({ type: 'study', tab: 'tasks' });
+  if (hsh === '#study') return setView({ type: 'study' });
   m = hsh.match(/^#c\/([a-z0-9]+)$/i);
   if (m) { const s = serverOfChannel(m[1]); if (s) openChannel(m[1], s.id); else toast('You don\u2019t have access to that channel.'); }
 }

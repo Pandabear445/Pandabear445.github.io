@@ -626,6 +626,16 @@ app.get('/downloads/:file', (req, res) => {
   if (!hit) return res.status(404).send('Not found');
   res.download(path.join(DOWNLOADS_DIR, hit.name), hit.name);
 });
+// Recall (the study tools, public/recall/) runs inside Hearth in a sandboxed frame: it gets an origin of its own,
+// so it can't read Hearth's sign-in or storage, can't connect anywhere, and only Hearth itself may embed it.
+// Hearth hands it your decrypted decks and encrypts whatever it sends back (see public/js/recall-host.js).
+const RECALL_CSP = ["default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "font-src 'self' data:", "img-src data: blob:",
+  "media-src data: blob:", "connect-src 'none'", "form-action 'none'", "base-uri 'none'", "frame-ancestors 'self'", 'sandbox allow-scripts allow-modals allow-downloads'].join('; ');
+app.use('/recall', (req, res, next) => {
+  res.setHeader('Content-Security-Policy', RECALL_CSP);
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  next();
+});
 // The app's text files (JavaScript, styles, pages) are sent compressed, about 4-5x smaller, and kept
 // compressed in memory. Behind Caddy this changes nothing; without it, first loads get much faster.
 const zlib = require('zlib');
@@ -1030,7 +1040,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
       last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
-    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'study_reminders']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
     db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0 WHERE id = ?").run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
@@ -2616,7 +2626,7 @@ const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, s
     io.to(`user:${uid}`).emit('updates:new', p);
     if (p.notify) pushTo([uid], { title: `${p.count} new \u2014 ${p.title}`, body: p.first.title, tag: `updates-${p.feedId}`, url: '/#updates' });
   } });
-// Study tools (server/study.js): encrypted decks/assignments sync and reminder pings.
+// Study tools (server/study.js): encrypted sync for Recall's decks, pictures and profile.
 require('./study')({ api, auth, db, fail, rateLimit, pushTo: (...a) => pushTo(...a), emitToUser: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
 ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken,
   requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
@@ -3796,14 +3806,12 @@ const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 
 
 // Study together: a shared focus timer in a voice channel or call. Everyone in the room sees the same countdown
 // (worked out from when it started), so only the settings and start time live here; it ends when the room empties.
-const studyRooms = new Map(); // room -> { focus, short, long, every, startedAt, by }
-const studyOut = (room) => { const st = studyRooms.get(room); return st ? { ...st, now: Date.now() } : null; };
 function leaveVoice(userId, notifyUser = false) {
   const channelId = userVoice.get(userId);
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
   const state = m && m.get(userId);
-  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); studyRooms.delete(channelId); } }
+  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); } }
   userVoice.delete(userId);
   if (state) {
     const sock = io.sockets.sockets.get(state.socketId);
@@ -3915,7 +3923,6 @@ function setupSockets(server) {
       socket.join(`voice:${c.id}`);
       emitVoiceState(c.id);
       if (watchRooms.has(c.id)) socket.emit('watch:state', { room: c.id, state: watchOut(c.id) });
-      if (studyRooms.has(c.id)) socket.emit('study:state', { room: c.id, state: studyOut(c.id) });
       // First one in a DM or group call: ring everyone else (and push-notify them if their app is closed).
       if (!peers.length) {
         const ring = callees(c.id, uid);
@@ -4029,19 +4036,6 @@ function setupSockets(server) {
       return { ok: true };
     }));
 
-    socket.on('study:start', guard((p = {}) => {
-      const room = userVoice.get(uid);
-      if (!room) fail(400, 'Join a voice channel or call first.');
-      const n = (v, min, max, d) => { const x = Math.round(+v); return Number.isFinite(x) ? Math.min(max, Math.max(min, x)) : d; };
-      studyRooms.set(room, { focus: n(p.focus, 5, 180, 25), short: n(p.short, 1, 60, 5), long: n(p.long, 1, 90, 15), every: n(p.every, 2, 8, 4), startedAt: Date.now(), by: uid });
-      io.to(`voice:${room}`).emit('study:state', { room, state: studyOut(room) });
-    }));
-    socket.on('study:stop', guard(() => {
-      const room = userVoice.get(uid);
-      if (!room || !studyRooms.has(room)) return;
-      studyRooms.delete(room);
-      io.to(`voice:${room}`).emit('study:state', { room, state: null, by: uid });
-    }));
     socket.on('voice:leave', guard(() => {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);

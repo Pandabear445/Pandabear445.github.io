@@ -1,6 +1,10 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.23.0', items: [
+    'Study tools are now Recall: flashcards with pictures, Learn, Smart Review, Write, Match, practice tests, Blitz and more, plus courses with exam dates and a focus timer. Turn it on in Settings \u2192 Study tools, then open More \u2192 Study.',
+    'Your decks stay end-to-end encrypted and sync between your devices. Decks you made with the old study tools move over by themselves.',
+  ] },
   { version: '1.22.1', items: [
     'A tidier app, with every feature still there: Updates, Study, People and Saved messages sit under \u201cMore\u201d in the sidebar, the + next to Direct messages starts a message or a group chat, and pinned messages and notification options are in each chat\u2019s \u22ef menu.',
     'Settings is shorter: Profile, Security and Appearance each have tabs at the top (Sessions is now Security \u2192 Signed-in devices), and profile styling opens when you want it.',

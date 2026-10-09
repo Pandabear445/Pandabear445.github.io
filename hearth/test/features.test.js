@@ -73,7 +73,7 @@ test("trackers: nobody can see, change or delete someone else's", async () => {
 test('study: only ciphertext is accepted, and each account sees only its own items', async () => {
   for (const data of ['plain text', '{"name":"deck"}', '', null, 123, ['x1:']]) assert.equal((await as(a, 'PUT', '/me/study/deck-1', { kind: 'deck', data })).status, 400);
   for (const kind of ['note', '__proto__', '', null]) assert.equal((await as(a, 'PUT', '/me/study/deck-1', { kind, data: x1() })).status, 400);
-  for (const id of ['../x', 'a'.repeat(41), 'a b', '%00']) assert.notEqual((await as(a, 'PUT', `/me/study/${encodeURIComponent(id)}`, { kind: 'deck', data: x1() })).status, 200);
+  for (const id of ['../x', 'a'.repeat(65), 'a b', '%00']) assert.notEqual((await as(a, 'PUT', `/me/study/${encodeURIComponent(id)}`, { kind: 'deck', data: x1() })).status, 200);
   const secret = x1();
   assert.equal((await as(a, 'PUT', '/me/study/deck-1', { kind: 'deck', data: secret })).status, 200);
   assert.equal((await as(b, 'PUT', '/me/study/deck-1', { kind: 'deck', data: x1() })).status, 200, 'same id, different account: separate items');
@@ -87,19 +87,36 @@ test('study: only ciphertext is accepted, and each account sees only its own ite
 });
 
 test('study: size limits', async () => {
-  const big = 'x1:' + 'A'.repeat(512 * 1024 + 10);
+  const big = 'x1:' + 'A'.repeat(1024 * 1024 + 10);
   const r = await as(a, 'PUT', '/me/study/deck-big', { kind: 'deck', data: big });
   assert.ok([400, 413].includes(r.status));
 });
 
-test('study: reminders hold only a time and are per account', async () => {
-  assert.equal((await as(a, 'PUT', '/me/study-reminders/task-1', { at: Date.now() + 3600000 })).status, 200);
-  assert.equal((await as(a, 'PUT', '/me/study-reminders/task-2', { at: Date.now() + 1000 * 86400000 })).status, 400, 'more than a year away');
-  assert.equal((await as(a, 'PUT', '/me/study-reminders/task-3', { at: 'soon' })).status, 400);
-  const row = srv.sql('SELECT * FROM study_reminders WHERE user_id = ?', a.id)[0];
-  assert.deepEqual(Object.keys(row).sort(), ['at', 'id', 'user_id']);
-  await as(b, 'PUT', '/me/study-reminders/task-1', { at: null });
-  assert.equal(srv.sql('SELECT COUNT(*) n FROM study_reminders WHERE user_id = ?', a.id)[0].n, 1, "B can't cancel A's reminder");
+test('study: pictures are their own (encrypted) items and stay per account', async () => {
+  const pic = x1(300 * 1024);
+  assert.equal((await as(a, 'PUT', '/me/study/img-abc123', { kind: 'img', data: pic })).status, 200);
+  assert.equal((await as(a, 'PUT', '/me/study/img-plain', { kind: 'img', data: 'data:image/png;base64,AAAA' })).status, 400, 'only ciphertext');
+  assert.ok(!JSON.stringify((await as(b, 'GET', '/me/study')).json).includes(pic.slice(0, 200)));
+  assert.equal((await as(a, 'PUT', '/me/study/img-abc123', { kind: 'deck', data: x1() })).status, 409, 'no type confusion');
+});
+
+test('Recall runs sandboxed: own origin, no network, only Hearth may embed it', async () => {
+  for (const p of ['/recall/', '/recall/recall.js']) {
+    const r = await fetch(srv.base + p);
+    assert.equal(r.status, 200, p);
+    const csp = r.headers.get('content-security-policy');
+    assert.match(csp, /sandbox allow-scripts allow-modals allow-downloads(;|$)/);
+    assert.ok(!/allow-same-origin|allow-top-navigation|allow-popups|allow-forms/.test(csp), csp);
+    assert.match(csp, /connect-src 'none'/);
+    assert.match(csp, /frame-ancestors 'self'/);
+    assert.ok(!/img-src[^;]*https/.test(csp), 'pictures can\'t be used to send data out');
+    assert.equal(r.headers.get('x-frame-options'), 'SAMEORIGIN');
+  }
+  const home = await fetch(srv.base + '/');
+  assert.equal(home.headers.get('x-frame-options'), 'DENY', 'the rest of Hearth still refuses to be framed');
+  assert.match(home.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  const html = await (await fetch(srv.base + '/recall/')).text();
+  assert.ok(!/<script>|<script [^>]*>[^<]|\son\w+=/i.test(html.replace(/<script src="recall.js"><\/script>/, '')), 'no inline code');
 });
 
 // ------------------------------------------------------------------ group chats
@@ -119,11 +136,10 @@ test('group chats: only the owner removes people; outsiders can do nothing', asy
   assert.equal((await as(a, 'POST', `/groups/${g.id}/owner`, { userId: d.id })).status, 404, 'only to someone in the group');
 });
 
-test('deleting an account removes its trackers, study items and reminders', async () => {
+test('deleting an account removes its trackers and study items', async () => {
   const u = await srv.register();
   await as(u, 'PUT', '/me/study/deck-x', { kind: 'deck', data: x1() });
-  await as(u, 'PUT', '/me/study-reminders/t1', { at: Date.now() + 3600000 });
   srv.sql('INSERT INTO user_feeds (id, user_id, kind, query, url, title, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', 'trk' + hex(4), u.id, 'rss', 'q', 'https://example.test/f', 't', Date.now());
   assert.equal((await as(u, 'DELETE', '/me', { authKey: u.authKey, confirm: u.username })).status, 200);
-  for (const t of ['study_items', 'study_reminders', 'user_feeds']) assert.equal(srv.sql(`SELECT COUNT(*) n FROM ${t} WHERE user_id = ?`, u.id)[0].n, 0, t);
+  for (const t of ['study_items', 'user_feeds']) assert.equal(srv.sql(`SELECT COUNT(*) n FROM ${t} WHERE user_id = ?`, u.id)[0].n, 0, t);
 });
