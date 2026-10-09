@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hearth: free, private chat for your people</title>
+<meta name="description" content="Hearth is a free chat app for friend groups and communities: servers, voice and video, screen sharing, watch together and profiles you can make your own. End-to-end encrypted, no ads, and you can host it yourself.">
+<meta property="og:title" content="Hearth: free, private chat for your people">
+<meta property="og:description" content="Servers, voice, video, screen sharing, watch together and MySpace-style profiles. End-to-end encrypted. No ads. Free, and open source.">
+<meta property="og:image" content="https://arc32.me/site/og.png">
+<meta property="og:url" content="https://arc32.me/">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#100e16">
+<link rel="icon" href="site/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="site/icon-192.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #100e16; --s1: #18151f; --s2: #201c29; --line: #2e2939;
+    --text: #f3eff8; --text-2: #b9b1c7; --muted: #8a8299;
+    --accent: #f2a541; --accent-2: #ff7a59; --ink: #1a1206;
+    --good: #4fd18b;
+    --r: 18px;
+    --font: 'Figtree', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --display: 'Bricolage Grotesque', 'Figtree', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.6 var(--font); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+  a { color: inherit; }
+  img { max-width: 100%; height: auto; display: block; }
+  .wrap { width: min(1160px, 100% - 32px); margin-inline: auto; }
+  h1, h2, h3 { font-family: var(--display); letter-spacing: -.02em; line-height: 1.08; margin: 0; }
+  p { margin: 0; }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 10; background: rgb(16 14 22 / .78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid rgb(255 255 255 / .05); }
+  nav .wrap { display: flex; align-items: center; gap: 24px; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font: 800 21px var(--display); text-decoration: none; }
+  .brand img { width: 30px; height: 30px; border-radius: 9px; }
+  .nav-links { display: flex; gap: 22px; margin-left: auto; font-size: 15px; color: var(--text-2); }
+  .nav-links a { text-decoration: none; }
+  .nav-links a:hover { color: var(--text); }
+  @media (max-width: 720px) { .nav-links { display: none; } nav .btn { margin-left: auto; } }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font: 700 16px var(--font); text-decoration: none; border: 1px solid transparent; transition: transform .15s, background .15s, border-color .15s; white-space: nowrap; }
+  .btn:hover { transform: translateY(-1px); }
+  .btn.primary { background: var(--accent); color: var(--ink); }
+  .btn.primary:hover { background: #f7b65c; }
+  .btn.ghost { border-color: var(--line); background: rgb(255 255 255 / .03); }
+  .btn.ghost:hover { border-color: #4a4359; }
+  .btn.sm { padding: 8px 14px; font-size: 14px; border-radius: 10px; }
+  .btn svg { width: 18px; height: 18px; }
+
+  /* hero */
+  .hero { position: relative; padding: 84px 0 40px; text-align: center; }
+  .hero::before { content: ''; position: absolute; inset: -120px 0 auto; height: 620px; z-index: -1; pointer-events: none;
+    background: radial-gradient(600px 300px at 50% 30%, rgb(242 165 65 / .22), transparent 70%), radial-gradient(500px 260px at 75% 10%, rgb(255 122 89 / .14), transparent 70%); }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; background: rgb(255 255 255 / .05); border: 1px solid var(--line); font-size: 14px; color: var(--text-2); margin-bottom: 22px; }
+  .pill b { color: var(--good); font-weight: 700; }
+  .hero h1 { font-size: clamp(40px, 7vw, 76px); font-weight: 800; max-width: 14ch; margin-inline: auto; }
+  .hero h1 em { font-style: normal; background: linear-gradient(100deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero .lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--text-2); max-width: 640px; margin: 22px auto 0; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 32px; }
+  .platforms { margin-top: 18px; font-size: 14px; color: var(--muted); }
+  .shot { margin: 56px auto 0; border-radius: 16px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 30px 80px -20px rgb(0 0 0 / .7), 0 0 0 6px rgb(255 255 255 / .02); background: var(--s1); }
+  .hero .shot { max-width: 1100px; }
+  @media (max-width: 600px) { .hero .shot { max-width: 300px; border-radius: 30px; border: 7px solid #2a2533; margin-top: 40px; } }
+
+  /* sections */
+  section { padding: 88px 0; }
+  .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 12px; }
+  .sec-head { max-width: 700px; margin-bottom: 44px; }
+  .sec-head h2 { font-size: clamp(30px, 4.4vw, 46px); font-weight: 800; }
+  .sec-head p { color: var(--text-2); margin-top: 14px; font-size: 18px; }
+  .center { text-align: center; margin-inline: auto; }
+
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--s1); border: 1px solid var(--line); border-radius: var(--r); padding: 24px; min-width: 0; }
+  .card .ic { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; background: rgb(242 165 65 / .13); color: var(--accent); margin-bottom: 16px; }
+  .card .ic svg { width: 22px; height: 22px; }
+  .card h3 { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
+  .card p { color: var(--text-2); font-size: 15.5px; }
+
+  .split { display: grid; grid-template-columns: 1fr 1.25fr; gap: 56px; align-items: center; }
+  .split.flip { grid-template-columns: 1.25fr 1fr; }
+  .split.flip .copy { order: 2; }
+  @media (max-width: 900px) { .split, .split.flip { grid-template-columns: 1fr; gap: 32px; } .split.flip .copy { order: 0; } }
+  .copy h2 { font-size: clamp(28px, 4vw, 40px); font-weight: 800; }
+  .copy p { color: var(--text-2); margin-top: 16px; }
+  .ticks { list-style: none; padding: 0; margin: 22px 0 0; display: grid; gap: 10px; }
+  .ticks li { display: flex; gap: 10px; color: var(--text-2); font-size: 16px; }
+  .ticks li::before { content: ''; flex: none; width: 20px; height: 20px; margin-top: 3px; border-radius: 50%; background: rgb(79 209 139 / .15) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234fd18b' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12l5 5L20 7'/%3E%3C/svg%3E") center / 12px no-repeat; }
+  .phone { max-width: 300px; margin-inline: auto; border-radius: 36px; border: 8px solid #2a2533; overflow: hidden; box-shadow: 0 30px 70px -20px rgb(0 0 0 / .8); }
+
+  /* free */
+  .free { background: linear-gradient(180deg, transparent, rgb(242 165 65 / .05) 30%, transparent); }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .compare { grid-template-columns: 1fr; } }
+  .compare .card h3 { display: flex; align-items: center; gap: 10px; }
+  .compare ul { margin: 12px 0 0; padding-left: 20px; color: var(--text-2); font-size: 15.5px; display: grid; gap: 6px; }
+
+  /* host */
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; counter-reset: s; }
+  @media (max-width: 900px) { .steps { grid-template-columns: minmax(0, 1fr); } }
+  .steps .card { counter-increment: s; }
+  .steps .card::before { content: counter(s); display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: var(--ink); font: 800 16px var(--display); margin-bottom: 14px; }
+  pre { margin: 14px 0 0; padding: 14px 16px; background: #0b0a10; border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; font: 13.5px/1.6 ui-monospace, 'SF Mono', Menlo, Consolas, monospace; color: #e8e2f0; }
+  .note { margin-top: 20px; color: var(--muted); font-size: 15px; }
+
+  /* faq */
+  details { border-bottom: 1px solid var(--line); padding: 18px 0; }
+  details summary { cursor: pointer; list-style: none; font-weight: 700; font-size: 18px; display: flex; justify-content: space-between; gap: 16px; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::after { content: '+'; color: var(--accent); font-size: 24px; line-height: 1; transition: transform .2s; }
+  details[open] summary::after { transform: rotate(45deg); }
+  details p { color: var(--text-2); margin-top: 10px; max-width: 760px; }
+  .faq { max-width: 860px; }
+
+  .final { text-align: center; padding: 96px 0; }
+  .final .card { padding: 56px 24px; background: radial-gradient(500px 220px at 50% 0%, rgb(242 165 65 / .16), transparent 70%), var(--s1); }
+  .final h2 { font-size: clamp(30px, 4.6vw, 48px); font-weight: 800; }
+  .final p { color: var(--text-2); margin-top: 12px; }
+
+  footer { border-top: 1px solid var(--line); padding: 32px 0 48px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; }
+  footer a { text-decoration: none; color: var(--text-2); }
+  footer a:hover { color: var(--text); }
+  footer nav { all: unset; display: flex; gap: 20px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<nav aria-label="Main">
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="site/icon-192.png" alt="" width="30" height="30">Hearth</a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#free">Free, really</a>
+      <a href="#host">Host your own</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/Pandabear445/Pandabear445.github.io/tree/main/hearth">GitHub</a>
+    </div>
+    <a class="btn primary sm" href="https://kappachat.duckdns.org">Open Hearth</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="pill"><b>●</b> Free, open source, and end-to-end encrypted</div>
+    <h1>A place for your people. <em>Nobody else.</em></h1>
+    <p class="lede">Hearth is a chat app for friend groups and communities: servers, voice and video, screen sharing, watch parties and profiles you can actually make your own. Every message is encrypted on your device. No ads, no data selling, no paywall.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://kappachat.duckdns.org">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        Join the community
+      </a>
+      <a class="btn ghost" href="#host">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg>
+        Host your own, free
+      </a>
+    </div>
+    <p class="platforms">In your browser, or as an app for Windows, Mac, Linux, Android and iPhone.</p>
+    <div class="shot hero-shot"><picture><source media="(max-width: 600px)" srcset="site/phone.webp" width="600" height="1298"><img src="site/chat.webp" alt="Hearth on a computer: a server called Friday Night with text and voice channels, a group chat planning game night with a shared sunset photo, and the member list." width="1800" height="1125" fetchpriority="high"></picture></div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Everything you'd expect</div>
+      <h2>All the good parts of Discord. None of the creepy ones.</h2>
+      <p>Hearth does what your group chat already needs, and every feature is free for everyone.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+        <h3>Encrypted by default</h3>
+        <p>Messages, DMs and files are locked on your device before they're sent. Even whoever runs the server can't read them.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></div>
+        <h3>Voice, video and screen share</h3>
+        <p>Drop into a voice channel, turn on your camera or share your screen with sound. Calls go straight between you and your friends.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M10 9l5 2.5-5 2.5z"/><path d="M8 21h8"/></svg></div>
+        <h3>Watch together</h3>
+        <p>YouTube, Twitch, Vimeo or any video file, in sync for everyone in the call, with a shared queue and controls.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/><path d="M19 3l.7 1.6L21.3 5l-1.6.7L19 7.3l-.7-1.6L16.7 5l1.6-.4z"/></svg></div>
+        <h3>Profiles like it's 2006</h3>
+        <p>A full MySpace-style page: themes, glitter names, a profile song, top 8, a comment wall, custom effects and your own CSS.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
+        <h3>Real community tools</h3>
+        <p>Roles and permissions, private channels, threads, polls, events with RSVPs, custom emoji, GIFs and server folders.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4h7a3 3 0 0 1 3 3v14a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v14a2 2 0 0 1 2-2h8z"/></svg></div>
+        <h3>Study tools built in</h3>
+        <p>Flashcards, practice tests and a focus timer you can use in a study call. Your decks are encrypted and sync across devices.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap split flip">
+    <div class="copy">
+      <div class="eyebrow">Movie night, sorted</div>
+      <h2>Press play once. Everyone's on the same frame.</h2>
+      <p>Share a link in any call and Hearth keeps everyone in sync: pause, skip ahead, jump back ten seconds. People who join late land at the right moment.</p>
+      <ul class="ticks">
+        <li>YouTube, Twitch, Vimeo and video files</li>
+        <li>A shared "up next" queue</li>
+        <li>Keep control yourself, or hand it to everyone</li>
+      </ul>
+    </div>
+    <div class="shot" style="margin:0"><img src="site/watch.webp" alt="A voice call in Hearth with three friends watching a trailer together, with shared playback controls." width="1600" height="1000" loading="lazy"></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap split">
+    <div class="copy">
+      <div class="eyebrow">Your corner of the internet</div>
+      <h2>Make your profile weird again.</h2>
+      <p>Everyone gets a full profile page, styled however you like, with backgrounds, borders, fonts, falling emoji, a song and a wall for your friends to sign. All of it is free.</p>
+      <ul class="ticks">
+        <li>Animated avatars, banners and name effects</li>
+        <li>Top 8 friends and a comment wall</li>
+        <li>Custom CSS, kept safe to your own page</li>
+      </ul>
+    </div>
+    <div class="shot" style="margin:0"><img src="site/profile.webp" alt="A Hearth profile page in a retro MySpace style, with a pink and starry theme, interests, a blurb and a friend space." width="1440" height="950" loading="lazy"></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap split flip">
+    <div class="copy">
+      <div class="eyebrow">Wherever you are</div>
+      <h2>On your phone, your PC and your browser.</h2>
+      <p>Use Hearth in any browser, install it from there in one tap, or get the desktop and Android apps. The desktop app has push-to-talk that works while a game is focused, and it shows what you're playing and listening to.</p>
+      <ul class="ticks">
+        <li>Windows, Mac, Linux, Android and iPhone</li>
+        <li>Push notifications, even when the app is closed</li>
+        <li>Updates itself, nothing to reinstall</li>
+      </ul>
+    </div>
+    <div class="phone"><img src="site/phone.webp" alt="Hearth on a phone, showing the same group chat." width="600" height="1298" loading="lazy"></div>
+  </div>
+</section>
+
+<section class="free" id="free">
+  <div class="wrap">
+    <div class="sec-head center" style="text-align:center">
+      <div class="eyebrow">Free, really</div>
+      <h2>No ads. No upsells. Nothing held back.</h2>
+      <p>Every feature on this page is free for everyone, with no "premium" tier to unlock it. Hearth is open source (MIT), so you can always run it yourself.</p>
+    </div>
+    <div class="compare">
+      <div class="card">
+        <h3>💜 How it pays for itself</h3>
+        <ul>
+          <li>People who want to can chip in, and get a supporter badge as a thank-you</li>
+          <li>A server costs a few dollars a month, and the numbers are shown to everyone</li>
+          <li>No ads, no tracking and no selling your data, ever</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔒 What the server can't see</h3>
+        <ul>
+          <li>Your messages, DMs and files (they're encrypted on your device)</li>
+          <li>Your calls (they go directly between people in the call)</li>
+          <li>Your study decks (encrypted and synced like everything else)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="host">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Host your own</div>
+      <h2>Your own Hearth in about ten minutes.</h2>
+      <p>Run a server for your friends, your class or your community on a $5-a-month VPS or a spare computer. One server comfortably holds a busy community, and you can add call regions around the world later.</p>
+    </div>
+    <div class="steps">
+      <div class="card">
+        <h3>Get a small server</h3>
+        <p>Any Linux VPS with Docker works (1 CPU and 1 GB is plenty to start), or your own PC.</p>
+      </div>
+      <div class="card">
+        <h3>Start Hearth</h3>
+        <p>Download it and start it with Docker:</p>
+<pre>git clone https://github.com/Pandabear445/Pandabear445.github.io
+cd Pandabear445.github.io/hearth
+docker compose up -d</pre>
+      </div>
+      <div class="card">
+        <h3>Invite your people</h3>
+        <p>Point a domain at it for automatic HTTPS, create a server and share the invite link. Your friends get the apps from your own /download page.</p>
+      </div>
+    </div>
+    <p class="note">Step-by-step guides for a VPS, a domain, call relays, backups and the apps are in the <a href="https://github.com/Pandabear445/Pandabear445.github.io/tree/main/hearth#readme">README</a>.</p>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap faq">
+    <div class="sec-head"><div class="eyebrow">Questions</div><h2>Good questions.</h2></div>
+    <details>
+      <summary>Is it really free?</summary>
+      <p>Yes. There are no paid features. Running a server costs a few dollars a month, and supporters who want to help cover that get a 💜 badge. Nobody has to pay for anything.</p>
+    </details>
+    <details>
+      <summary>Can the people running the server read my messages?</summary>
+      <p>No. Messages, DMs and files are encrypted in your app before they're sent, and only the people in that chat have the keys. The server stores scrambled data. Calls go directly between the people in them.</p>
+    </details>
+    <details>
+      <summary>How is this different from Discord?</summary>
+      <p>The everyday features are similar: servers, channels, voice, video, screen sharing, roles and GIFs. The differences: your chats are end-to-end encrypted, there are no ads or paid tiers, you can host it yourself, and profiles are a lot more fun.</p>
+    </details>
+    <details>
+      <summary>Do I need to host it myself?</summary>
+      <p>No. You can join the community server and start chatting right away. Hosting your own is for groups who want their own space and their own rules.</p>
+    </details>
+    <details>
+      <summary>Is it open source?</summary>
+      <p>Yes, it's MIT licensed. The code, the security notes and the setup guides are all <a href="https://github.com/Pandabear445/Pandabear445.github.io/tree/main/hearth">on GitHub</a>.</p>
+    </details>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap">
+    <div class="card">
+      <h2>Bring your friends over.</h2>
+      <p>It takes a minute to sign up, and it's free forever.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://kappachat.duckdns.org">Join the community</a>
+        <a class="btn ghost" href="https://kappachat.duckdns.org/download">Get the apps</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Hearth · MIT licensed · made for friend groups</span>
+    <nav aria-label="Footer">
+      <a href="https://kappachat.duckdns.org">Open Hearth</a>
+      <a href="https://kappachat.duckdns.org/download">Download</a>
+      <a href="https://kappachat.duckdns.org/terms">Terms</a>
+      <a href="https://github.com/Pandabear445/Pandabear445.github.io/tree/main/hearth">GitHub</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>
