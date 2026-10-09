@@ -22,6 +22,7 @@ export const CATEGORY_LABEL = {
   child_safety: 'Child safety', self_harm: 'Self-harm', illegal: 'Illegal content', impersonation: 'Impersonation', scam: 'Scam or fraud', other: 'Something else',
 };
 const asUser = (b) => (b ? { id: b.id, username: b.username, avatar: b.avatar, profile: { displayName: b.displayName } } : { id: '', username: 'deleted', profile: { displayName: 'Deleted user' } });
+const fmtMb = (mb) => (mb >= 1024 ? `${(mb / 1024).toFixed(mb >= 10240 ? 0 : 1)} GB` : `${mb || 0} MB`);
 const ago = (ts) => {
   if (!ts) return 'never';
   const s = Math.round((Date.now() - ts) / 1000);
@@ -421,6 +422,10 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         ...d.regions.map((r) => h('div', { class: 'adm-row region-row' },
           h('b', null, r.name), h('span', { class: 'stat-sub' }, r.ip || '\u2014'), status(r),
           h('span', { class: 'stat-sub' }, r.alive ? `load ${r.load ?? '?'} / ${r.cpus || 1} CPU \u00b7 ${r.mbps ?? 0} Mbit/s now \u00b7 ${r.monthGb ?? 0} GB this month${r.relayUp ? '' : ' \u00b7 relay stopped!'}` : ''),
+          // Backup space on the region (Hearth 1.25+): keeps copies of this server's encrypted backups.
+          h('span', { class: 'stat-sub', 'data-tip': r.backup && r.backup.last && !r.backup.last.ok ? r.backup.last.error : null },
+            !r.backup ? 'Backups: reinstall to add backup space' : !r.backup.ready ? 'Backups: no backup space (needs SSH)'
+              : `Backups: ${r.backup.files} cop${r.backup.files === 1 ? 'y' : 'ies'}, ${fmtMb(r.backup.usedMb)} (${fmtMb(r.backup.freeMb)} free)${r.backup.last ? (r.backup.last.ok ? ` \u00b7 last copy ${ago(r.backup.last.at)} \u2713` : ' \u00b7 last copy FAILED') : ' \u00b7 waiting for the next backup'}`),
           h('span', { class: 'row gap tight' },
             h('button', { class: 'btn ghost sm', onclick: async () => { const x = await api('POST', `/admin/regions/${r.id}/reinstall`, { origin: location.origin }); showCommand(`Reinstall ${r.name}`, x.command); } }, r.waitingForInstall ? 'Install command' : 'Reinstall'),
             h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Remove ${r.name}?`, text: 'Calls stop using it right away. The VPS keeps running until you cancel it with your provider.', confirm: 'Remove', danger: true })) { await api('DELETE', `/admin/regions/${r.id}`); regions(); } } }, 'Remove'))))),
@@ -602,10 +607,12 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
               h('p', { class: 'field-hint' }, 'Restore on a new machine: node server/cli.js restore <backup.hbk> <new-data-folder> <this key>. Never keep this key in the same place as the backups.')) });
           } catch (x) { if (!x.cancelled) toast(x.message, 'error'); }
         } }, 'Show backup key') : null),
-      h('p', { class: 'field-hint' }, o.offsite ? `Off-site copies go to ${o.offsite} (rclone).` : 'Off-site copies are off. Set BACKUP_RCLONE_REMOTE in .env (for example b2:my-bucket/hearth) to copy every backup to another provider automatically.'),
+      h('p', { class: 'field-hint' }, o.regionCopies && o.regionCopies.length ? `Every backup is also copied to your region${o.regionCopies.length === 1 ? '' : 's'} ${o.regionCopies.join(', ')} (still locked with the backup key).` : 'Tip: a linked region (Admin \u2192 Regions) keeps copies of every backup on another machine automatically.'),
+      h('p', { class: 'field-hint' }, o.offsite ? `Off-site copies go to ${o.offsite} (rclone).` : 'Off-site copies to a storage provider are off. Set BACKUP_RCLONE_REMOTE in .env (for example b2:my-bucket/hearth) to add one.'),
       o.encrypted.length ? h('div', { class: 'adm-table' }, ...o.encrypted.map((b) => h('div', { class: 'adm-row' }, h('span', { class: 'mono-sm' }, b.name), h('span', { class: 'stat-sub' }, fmtSize(b.size)), h('span', { class: 'stat-sub' }, ago(b.at)),
         h('span', { class: b.verified && b.verified.ok ? 'rpill ok' : 'rpill' }, b.verified ? (b.verified.ok ? `restore test passed ${ago(b.verified.at)}` : `restore test FAILED: ${b.verified.error}`) : 'not tested'),
         b.offsite ? h('span', { class: 'stat-sub' }, b.offsite.ok ? 'off-site ✓' : `off-site failed: ${b.offsite.error}`) : h('span'),
+        b.regions ? h('span', { class: 'stat-sub' }, Object.values(b.regions).map((x) => (x.ok ? `${x.name} \u2713` : `${x.name}: failed`)).join(' \u00b7 ')) : null,
         h('button', { class: 'btn ghost sm', onclick: async () => { try { const r = await api('POST', `/admin/backups/${encodeURIComponent(b.name)}/verify`); toast(r.verified.ok ? `Restore test passed: ${r.verified.users} accounts, ${r.verified.messages} messages, ${r.verified.files} files.` : `Restore test FAILED: ${r.verified.error}`, r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); } } }, 'Test restore'),
         h('button', { class: 'btn ghost sm', onclick: () => download(b) }, 'Download'),
         h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: 'Delete this backup?', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`); owner(); } } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No encrypted backups yet.'),

@@ -1,6 +1,11 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.25.0', items: [
+    'Watch together: skipping ahead works (dragging YouTube\u2019s progress bar used to snap back). New shared buttons to jump back 10 s or ahead 10/30 s, play/pause for everyone, a clock, and a note when someone else jumps or pauses. Video links in chat get a \u201cWatch together\u201d button.',
+    'Screen sharing keeps your DMs private: while you share, direct messages and group chats are covered (and their previews and notifications hidden) unless you press \u201cShow while sharing\u201d. Settings \u2192 Chat can turn it off.',
+    'Your regions now keep copies of the server\u2019s encrypted daily backups, so losing the main server isn\u2019t losing everything (reinstall a region once to add this).',
+  ] },
   { version: '1.24.1', items: [
     'Fixed: some news feeds (long patch notes, news summaries full of HTML) could freeze the server for up to a minute while the news bot read them, so everyone saw \u201cReconnecting\u2026\u201d and \u201cFailed to fetch\u201d. Feeds are now read in the background with a time limit, and much faster.',
   ] },

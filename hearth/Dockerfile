@@ -18,10 +18,12 @@ RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 FROM node:22.23-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production DATA_DIR=/data
-# OS security fixes released after the base image was built. And no package managers (npm, npx, corepack,
+# OS security fixes released after the base image was built, and the SSH client (sftp) that copies
+# encrypted backups to linked regions. And no package managers (npm, npx, corepack,
 # yarn): Hearth doesn't use them at runtime, and they bring their own dependencies with known vulnerabilities.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
+ && apt-get install -y --no-install-recommends openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-v* \
            /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg

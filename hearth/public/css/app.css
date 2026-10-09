@@ -2116,7 +2116,7 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 /* ------------------------------------------------------------------ watch together */
 .cs-watch-host { min-height: 0; }
 .wt { display: flex; flex-direction: column; gap: 8px; }
-.wt-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; max-height: 62vh; background: #000; border-radius: 12px; overflow: hidden; }
+.wt-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; max-height: min(62vh, calc(100vh - 380px)); min-height: 200px; background: #000; border-radius: 12px; overflow: hidden; }
 .wt-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
 .wt-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .wt-title { display: flex; flex-direction: column; min-width: 0; flex: 1; }
@@ -2125,6 +2125,18 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .wt-sub { font-size: 12px; color: var(--muted); }
 .wt-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .wt-actions .btn.active { background: rgb(var(--accent-rgb) / .18); }
+.wt-controls { display: flex; align-items: center; gap: 4px; width: 100%; padding: 4px 6px; border-radius: 12px; background: rgb(var(--s3) / .5); }
+.wt-controls .wt-ctl { width: 34px; height: 34px; }
+.wt-controls .wt-ctl[disabled] { opacity: .4; cursor: not-allowed; }
+.wt-skip { font-size: 11.5px; font-weight: 800; letter-spacing: -.02em; }
+.wt-time { margin: 0 auto 0 8px; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.wt-recent { display: flex; flex-wrap: wrap; gap: 6px; }
+.field-hint.ok { color: var(--ok); }
+.watch-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.watch-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 999px; font-size: 12.5px; font-weight: 600;
+  background: rgb(var(--accent-rgb) / .12); color: var(--text); border: 1px solid rgb(var(--accent-rgb) / .3); }
+.watch-chip:hover { background: rgb(var(--accent-rgb) / .22); }
+.watch-chip .ic { width: 14px; height: 14px; }
 .wt-queue:empty { display: none; }
 .wt-queue { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 10px; background: var(--hover); }
 .wt-qh { font-size: 12px; font-weight: 700; color: var(--text-2); }
@@ -2132,8 +2144,12 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .wt-qn { color: var(--muted); text-align: right; }
 .wt-qt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .call-stage.watching .cs-grid, .call-stage.watching .cs-spot { max-height: 180px; }
-.call-stage.watching .cs-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+.call-stage.watching .cs-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); flex: none; grid-auto-rows: 100px; }
+.call-stage.watching .cs-spot { flex: none; height: 180px; }
+.call-stage.watching .cs-controls { position: sticky; bottom: -10px; z-index: 2; margin: 0 -10px -10px; padding: 8px 10px 10px; background: linear-gradient(transparent, rgb(var(--bg) / .92) 35%); }
 .call-stage.watching { overflow-y: auto; }
+/* nothing squeezes while watching (tiles used to slide under the call buttons); the area scrolls instead */
+.call-stage.watching > * { flex-shrink: 0; }
 
 /* Funding + supporters */
 .auth-tagline { margin: -6px 0 10px; color: var(--text-2); text-align: center; }
@@ -2487,3 +2503,10 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .bar-col { display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
 .bar { width: 100%; max-width: 46px; min-height: 3px; border-radius: 6px 6px 2px 2px; background: var(--accent); }
 .bar-label { font-size: 11.5px; color: var(--muted); }
+
+/* screen sharing: private conversations covered */
+.share-cover { flex: 1; display: grid; place-items: center; padding: 24px; background: repeating-linear-gradient(135deg, transparent 0 14px, rgb(var(--s3) / .25) 14px 28px); }
+.share-cover-card { max-width: 440px; display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; padding: 28px 24px; border-radius: 18px; background: rgb(var(--s2)); border: 1px solid var(--line-2); box-shadow: var(--pop-shadow); }
+.share-cover-card h2 { font-size: 19px; font-weight: 800; }
+.share-cover-card p { margin: 0; color: var(--text-2); }
+.share-cover-ic { width: 34px; height: 34px; color: var(--accent); }

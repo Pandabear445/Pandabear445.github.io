@@ -3653,13 +3653,20 @@ function makeEncryptedBackup() {
       saveBackupStatus(b.name, { offsite: { ...offsite, at: now() } });
       if (!offsite.ok) { console.error(`Copying ${b.name} off-site failed: ${offsite.error}`); auditLog(null, 'backup_offsite_failed', null, `${b.name}: ${offsite.error}`); }
     }
+    // A copy on each linked region with backup space (server/regions.js), so losing this machine isn't losing it all.
+    const regions = await REG.copyBackup(b.file).catch((e) => ({ error: { ok: false, error: e.message, at: now() } }));
+    if (Object.keys(regions).length) {
+      saveBackupStatus(b.name, { regions });
+      for (const r of Object.values(regions)) if (!r.ok) { console.error(`Copying ${b.name} to region ${r.name || ''} failed: ${r.error}`); auditLog(null, 'backup_region_failed', null, `${b.name} → ${r.name || '?'}: ${r.error}`); }
+    }
     const a = autoBackup();
     listEncBackups().slice(Math.max(2, a.keep)).forEach((x) => fs.promises.unlink(path.join(ENC_DIR, x.name)).catch(() => {}));
-    return { ...b, verified, offsite };
+    return { ...b, verified, offsite, regions };
   })().finally(() => { encBusy = null; });
   return encBusy;
 }
-const backupInfo = () => ({ backups: listBackups(), encrypted: listEncBackups(), offsite: (process.env.BACKUP_RCLONE_REMOTE || '').trim() || null, keyFrom: process.env.BACKUP_KEY ? 'env' : 'file' });
+const backupInfo = () => ({ backups: listBackups(), encrypted: listEncBackups(), offsite: (process.env.BACKUP_RCLONE_REMOTE || '').trim() || null, keyFrom: process.env.BACKUP_KEY ? 'env' : 'file',
+  regionCopies: db.prepare('SELECT name, stats FROM regions').all().map((r) => { try { const b = JSON.parse(r.stats || '{}').backup; return b && b.ready ? r.name : null; } catch { return null; } }).filter(Boolean) });
 api.post('/admin/backups', auth, ownerOnly, wrap(async (req, res) => {
   rateLimit('backup:' + req.userId, 6, 3600000);
   const b = await makeEncryptedBackup();
@@ -4022,7 +4029,7 @@ function setupSockets(server) {
         cur.queue.push(item);
       } else {
         if (cur && !mayControl(room, cur)) fail(403, 'Only the host can change the video.');
-        watchRooms.set(room, { item, queue: cur ? cur.queue : [], playing: true, position: item.start || 0, rate: 1, updatedAt: Date.now(), by: cur && cur.hostOnly ? cur.by : uid, hostOnly: cur ? cur.hostOnly : !!p.hostOnly });
+        watchRooms.set(room, { item, queue: cur ? cur.queue : [], playing: true, position: item.start || 0, rate: 1, updatedAt: Date.now(), by: cur && cur.hostOnly ? cur.by : uid, hostOnly: cur ? cur.hostOnly : !!p.hostOnly, seq: ((cur && cur.seq) || 0) + 1, lastBy: uid, lastAction: 'start' });
       }
       emitWatch(room);
       watchTitle(item).then((t) => { if (t) { item.title = t; emitWatch(room); } });
@@ -4042,6 +4049,8 @@ function setupSockets(server) {
       else if (p.action === 'hostOnly' && (w.by === uid || isStaff(uid))) { w.hostOnly = !!p.value; }
       else return { ok: true };
       w.updatedAt = Date.now();
+      // Who did what, so everyone else's app can say "ana jumped to 12:30".
+      w.seq = (w.seq || 0) + 1; w.lastBy = uid; w.lastAction = p.action;
       emitWatch(room);
       return { ok: true };
     }));

@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFile, execFileSync } = require('child_process');
 
 module.exports = function setupRegions(ctx) {
   const { api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT } = ctx;
@@ -52,6 +53,7 @@ module.exports = function setupRegions(ctx) {
       id: r.id, name: r.name, ip: r.ip || null, urls: parse(r.turn_urls, []), alive: !!isAlive(r), lastSeen: r.last_seen || null, createdAt: r.created_at,
       waitingForInstall: !r.last_seen, installOpen: (r.setup_until || 0) > now(),
       load: st.load ?? null, cpus: st.cpus ?? null, mem: st.mem ?? null, mbps: st.mbps ?? null, monthGb: st.monthGb ?? null, month: st.month || null, relayUp: st.relay !== false, version: st.version || null,
+      backup: st.backup ? { ready: !!st.backup.ready, files: st.backup.files, usedMb: st.backup.usedMb, freeMb: st.backup.freeMb, last: st.backup.last || null } : null,
     };
   }
 
@@ -127,6 +129,43 @@ HEARTH_TURN_EOF
 bash /tmp/hearth-setup-turn.sh --relay-only --managed --secret ${q(ensureSecret())}
 rm -f /tmp/hearth-setup-turn.sh
 
+# Off-site backups: an upload-only SFTP account that can write into one folder and nothing else. The main
+# server copies its encrypted backups here (useless without the backup key, which never leaves it).
+echo "▸ Making a safe place for your main server's encrypted backups…"
+if command -v sshd >/dev/null 2>&1 && [ -f /etc/ssh/sshd_config ] && [ -f /etc/ssh/ssh_host_ed25519_key.pub ]; then
+  id hearth-backup >/dev/null 2>&1 || useradd --system --home-dir /var/lib/hearth-backup --no-create-home --shell /usr/sbin/nologin hearth-backup
+  install -d -m 755 -o root -g root /var/lib/hearth-backup
+  install -d -m 700 -o hearth-backup -g hearth-backup /var/lib/hearth-backup/backups
+  install -d -m 700 /etc/hearth-region
+  touch /etc/ssh/hearth-backup.keys && chmod 644 /etc/ssh/hearth-backup.keys
+  cp /etc/ssh/sshd_config /etc/ssh/sshd_config.hearth-bak
+  sed -i '/^# BEGIN hearth-backup/,/^# END hearth-backup/d' /etc/ssh/sshd_config
+  cat >> /etc/ssh/sshd_config <<'SSHD_EOF'
+# BEGIN hearth-backup (added by Hearth: an upload-only account for your main server's encrypted backups)
+Match User hearth-backup
+  AuthorizedKeysFile /etc/ssh/hearth-backup.keys
+  ForceCommand internal-sftp -d /backups
+  ChrootDirectory /var/lib/hearth-backup
+  PasswordAuthentication no
+  AllowTcpForwarding no
+  AllowAgentForwarding no
+  X11Forwarding no
+  PermitTTY no
+# END hearth-backup
+SSHD_EOF
+  install -d -m 755 /run/sshd 2>/dev/null || true # sshd's own folder; its config check fails without it
+  if sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    touch /etc/hearth-region/backup-ready
+  else
+    cp /etc/ssh/sshd_config.hearth-bak /etc/ssh/sshd_config
+    rm -f /etc/hearth-region/backup-ready
+    echo "  Skipped: the SSH settings didn't pass their check, so they were left exactly as they were."
+  fi
+else
+  echo "  Skipped: no SSH server here."
+fi
+
 echo "▸ Linking this region to Hearth…"
 install -d -m 700 /etc/hearth-region
 printf 'MAIN=%s\\nREGION=%s\\nTOKEN=%s\\nPIN=%s\\n' "$MAIN" "$REGION" "$TOKEN" "$PIN" > /etc/hearth-region/env
@@ -152,9 +191,27 @@ CPUS="$(nproc 2>/dev/null || echo 1)"
 MEM="$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {if (t) printf "%d", (t-a)*100/t; else print 0}' /proc/meminfo)"
 RELAY=true; systemctl is-active --quiet coturn || RELAY=false
 UP="$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
+# Backup space: where the main server can reach SSH, this server's own SSH key (so the main server only ever
+# talks to this exact machine), and how full it is.
+[ -d /run/sshd ] || install -d -m 755 /run/sshd 2>/dev/null || true
+SSH_PORT="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"; [ -n "$SSH_PORT" ] || SSH_PORT=22
+HOSTKEY="$(awk '{print $1" "$2}' /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null || true)"
+BREADY=false; [ -f /etc/hearth-region/backup-ready ] && BREADY=true
+BDIR=/var/lib/hearth-backup/backups
+BUSED="$(du -sm $BDIR 2>/dev/null | cut -f1)"; BFREE="$(df -Pm /var/lib 2>/dev/null | awk 'NR == 2 {print $4}')"; BFILES="$(ls $BDIR/*.hbk 2>/dev/null | wc -l)"
 curl -fsS \${PIN:+-k --pinnedpubkey "$PIN"} --max-time 15 -X POST -H 'Content-Type: application/json' -H "X-Region-Token: $TOKEN" \\
-  -d "{\\"ip\\":\\"$IP\\",\\"tx\\":$TX,\\"rx\\":$RX,\\"load\\":$LOAD,\\"cpus\\":$CPUS,\\"mem\\":$MEM,\\"relay\\":$RELAY,\\"uptime\\":$UP,\\"version\\":1}" \\
+  -d "{\\"ip\\":\\"$IP\\",\\"tx\\":$TX,\\"rx\\":$RX,\\"load\\":$LOAD,\\"cpus\\":$CPUS,\\"mem\\":$MEM,\\"relay\\":$RELAY,\\"uptime\\":$UP,\\"ssh\\":{\\"port\\":$SSH_PORT,\\"hostKey\\":\\"$HOSTKEY\\",\\"ready\\":$BREADY,\\"usedMb\\":\${BUSED:-0},\\"freeMb\\":\${BFREE:-0},\\"files\\":\${BFILES:-0}},\\"version\\":2}" \\
   "$MAIN/api/regions/$REGION/heartbeat" -o "$STATE" || true
+# The main server's key may upload backups (and nothing else: the account is upload-only, see sshd_config).
+KEY="$(sed -n 's/.*"backupKey":"\\(ssh-ed25519 [A-Za-z0-9+/=]*\\).*/\\1/p' "$STATE" 2>/dev/null | head -1)"
+if [ "$BREADY" = true ] && [ -n "$KEY" ]; then
+  LINE="restrict $KEY hearth-main"
+  [ "$(cat /etc/ssh/hearth-backup.keys 2>/dev/null)" = "$LINE" ] || printf '%s\\n' "$LINE" > /etc/ssh/hearth-backup.keys
+fi
+# Keep the newest copies (the main server says how many); unfinished uploads go after a day.
+KEEP="$(sed -n 's/.*"keep":\\([0-9][0-9]*\\).*/\\1/p' "$STATE" 2>/dev/null | head -1)"; [ -n "$KEEP" ] || KEEP=14
+ls -1t $BDIR/*.hbk 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+find $BDIR -name '*.part' -mmin +1440 -delete 2>/dev/null || true
 AGENT_EOF
 chmod 755 /usr/local/bin/hearth-region-agent
 cat > /etc/systemd/system/hearth-region.service <<'UNIT_EOF'
@@ -219,9 +276,77 @@ echo "If this VPS provider has its own firewall (in their control panel), open U
     }
     Object.assign(st, { lastTx: tx, lastRx: rx, lastAt: t, load: Math.round((+b.load || 0) * 100) / 100, cpus: Math.max(1, +b.cpus || 1), mem: Math.min(100, Math.max(0, +b.mem || 0)), relay: b.relay !== false, uptime: +b.uptime || 0, version: +b.version || 1 });
     st.monthGb = Math.round(((st.monthBytes || 0) / 1e9) * 100) / 100;
+    // Backup space (agent version 2+): the SSH port and this region's own host key, so copies only ever go to
+    // this exact machine.
+    const sh = b.ssh && typeof b.ssh === 'object' ? b.ssh : null;
+    if (sh) {
+      const port = Math.floor(+sh.port);
+      const hostKey = String(sh.hostKey || '').trim();
+      st.backup = {
+        ...(st.backup || {}), ready: sh.ready === true && /^ssh-ed25519 [A-Za-z0-9+/]+={0,3}$/.test(hostKey) && port > 0 && port < 65536,
+        port, hostKey, files: Math.max(0, Math.floor(+sh.files || 0)), usedMb: Math.max(0, Math.floor(+sh.usedMb || 0)), freeMb: Math.max(0, Math.floor(+sh.freeMb || 0)),
+      };
+    }
     db.prepare('UPDATE regions SET ip = ?, turn_urls = ?, last_seen = ?, stats = ?, setup_until = NULL WHERE id = ?').run(ip, JSON.stringify(st.relay ? urls : []), t, JSON.stringify(st), r.id);
-    res.json({ ok: true, name: r.name });
+    const key = backupPublicKey();
+    res.json({ ok: true, name: r.name, ...(key ? { backupKey: key, keep: KEEP_COPIES } : {}) });
   }));
 
-  return { liveRelays };
+  // ------------------------------------------------------------------ off-site backups on the regions
+  // Each region that has backup space (installed or reinstalled with Hearth 1.25+) keeps copies of this server's
+  // encrypted backups, so losing this machine doesn't lose everything. Copies go over SFTP with this server's
+  // own key, to an account that can only upload into one folder, and only to the host key the region reported
+  // (checked strictly, so nobody can pretend to be the region). The region keeps the newest KEEP_COPIES.
+  const KEEP_COPIES = Math.max(2, Math.min(60, +process.env.REGION_BACKUP_KEEP || 14));
+  const KEY_DIR = path.join(DATA_DIR, 'region-backup');
+  const KEY_FILE = path.join(KEY_DIR, 'id_ed25519');
+  let pubCache = null;
+  function backupPublicKey() {
+    if (process.env.REGION_BACKUPS === 'off') return null;
+    if (pubCache) return pubCache;
+    try {
+      if (!fs.existsSync(KEY_FILE)) {
+        fs.mkdirSync(KEY_DIR, { recursive: true, mode: 0o700 });
+        execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'hearth-main', '-f', KEY_FILE], { stdio: 'ignore', timeout: 20000 });
+      }
+      const pub = fs.readFileSync(KEY_FILE + '.pub', 'utf8').trim().split(/\s+/).slice(0, 2).join(' ');
+      if (/^ssh-ed25519 [A-Za-z0-9+/]+={0,3}$/.test(pub)) pubCache = pub;
+    } catch { /* no ssh-keygen here (install openssh-client): region backups stay off */ }
+    return pubCache;
+  }
+  const backupTargets = () => rows().filter((r) => isAlive(r) && r.ip).map((r) => ({ r, b: parse(r.stats, {}).backup })).filter(({ b }) => b && b.ready);
+  function sftpPut(r, b, file) {
+    return new Promise((resolve) => {
+      const name = path.basename(file);
+      const host = r.ip.includes(':') ? `[${r.ip}]` : r.ip;
+      const known = path.join(KEY_DIR, `known_hosts_${r.id}`);
+      const batch = path.join(KEY_DIR, `batch_${r.id}`);
+      fs.writeFileSync(known, `${b.port === 22 && !r.ip.includes(':') ? r.ip : `[${r.ip}]:${b.port}`} ${b.hostKey}\n`, { mode: 0o600 });
+      fs.writeFileSync(batch, `put "${file.replace(/"/g, '')}" "${name}.part"\nrename "${name}.part" "${name}"\n`, { mode: 0o600 });
+      execFile('sftp', ['-b', batch, '-o', 'LogLevel=ERROR', '-i', KEY_FILE, '-P', String(b.port), '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+        '-o', `UserKnownHostsFile=${known}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=30', `hearth-backup@${host}`],
+      { timeout: 4 * 3600000, env: { ...process.env, HOME: KEY_DIR } }, (err, stdout, stderr) => {
+        const ok = !err;
+        const lines = String(stderr || (err && err.message) || '').trim().split('\n').filter((l) => !/^(Warning|Connection closed)/.test(l));
+        const why = lines.find((l) => /verification failed|REMOTE HOST IDENTIFICATION/.test(l)) ? 'The region\u2019s identity changed (host key mismatch), so nothing was sent. Reinstall the region if you rebuilt it.'
+          : lines.find((l) => /Permission denied/.test(l)) ? 'The region refused this server\u2019s key (it updates within a minute of the region checking in).'
+            : lines.pop() || (err && err.killed ? 'Took too long.' : 'The copy failed.');
+        resolve({ id: r.id, name: r.name, ok, error: ok ? undefined : why.slice(0, 200) });
+      });
+    });
+  }
+  // Copies one encrypted backup (.hbk) to every region with backup space. Returns { <region id>: { name, ok, error, at } }.
+  async function copyBackup(file) {
+    if (!/\.hbk$/.test(file) || !backupPublicKey()) return {};
+    const out = {};
+    for (const { r, b } of backupTargets()) {
+      const res = await sftpPut(r, b, file);
+      out[r.id] = { name: res.name, ok: res.ok, error: res.error, at: now() };
+      const st = parse(db.prepare('SELECT stats FROM regions WHERE id = ?').get(r.id)?.stats, {});
+      if (st.backup) { st.backup.last = { ok: res.ok, error: res.error, at: now(), file: path.basename(file) }; db.prepare('UPDATE regions SET stats = ? WHERE id = ?').run(JSON.stringify(st), r.id); }
+    }
+    return out;
+  }
+
+  return { liveRelays, copyBackup, backupPublicKey };
 };

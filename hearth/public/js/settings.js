@@ -1198,6 +1198,8 @@ function chatTab(app) {
       toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'Pasted image URLs are loaded from the other site, which can see your IP address.'),
       toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers|| and > quotes.'),
       toggle('Large emoji when a message is only emoji', c.jumbo, (v) => set('jumbo', v))),
+    section('Screen sharing',
+      toggle('Hide DMs while I share my screen', c.hideDmsWhileSharing !== false, (v) => set('hideDmsWhileSharing', v), 'Direct messages and group chats are covered, and their previews and notifications hidden, while you share your screen. You can still open one with \u201cShow while sharing\u201d.')),
   );
 }
 

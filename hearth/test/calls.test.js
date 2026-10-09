@@ -118,3 +118,34 @@ test('a broken, heavy feed never freezes the server', async () => {
   assert.ok(Date.now() - t0 < 15000, 'the feed was read (or given up on) quickly');
   assert.ok([200, 400].includes(r.status), r.text);
 });
+
+// ------------------------------------------------------------------ backups kept on linked regions
+test('regions with backup space get this server\'s key; their identity is checked', async () => {
+  const owner = srv.owner; // the instance owner (Admin → Regions)
+  const add = await as(owner, 'POST', '/admin/regions', { name: 'US Central', origin: 'https://chat.example.test' });
+  assert.equal(add.status, 200, add.text);
+  const { id } = add.json.region;
+  const token = add.json.command.match(/k=([0-9a-f]+)/)[1];
+  const text = await (await fetch(`${srv.base}/regions/install/${id}?k=${token}`)).text();
+  for (const must of ['ForceCommand internal-sftp -d /backups', 'ChrootDirectory /var/lib/hearth-backup', 'AuthorizedKeysFile /etc/ssh/hearth-backup.keys', 'restrict $KEY', 'sshd -t']) assert.ok(text.includes(must), must);
+  const beat = (ssh) => fetch(`${srv.base}/api/regions/${id}/heartbeat`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-region-token': token },
+    body: JSON.stringify({ ip: '203.0.113.9', tx: 1, rx: 1, load: 0.1, cpus: 1, mem: 10, relay: true, uptime: 5, ssh, version: 2 }) }).then((r) => r.json());
+  const good = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG6vHZd6yfCzVFOySflZG/g7JEVNvf8rvov34t9xjmjr';
+  const r = await beat({ port: 22, hostKey: good, ready: true, files: 3, usedMb: 10, freeMb: 500 });
+  assert.equal(r.ok, true);
+  if (r.backupKey) { assert.match(r.backupKey, /^ssh-ed25519 [A-Za-z0-9+/]+={0,3}$/); assert.equal(r.keep, 14); }
+  let reg = (await as(owner, 'GET', '/admin/regions')).json.regions.find((x) => x.id === id);
+  assert.equal(reg.backup.ready, true);
+  assert.equal(reg.backup.files, 3);
+  // Anything that isn't a plain ed25519 key (or a sneaky multi-line one) turns backups off for that region.
+  for (const hostKey of ['ssh-rsa AAAAB3NzaC1yc2E', `${good}\nevil.example ssh-ed25519 AAAA`, '', 'ssh-ed25519 not base64!']) {
+    await beat({ port: 22, hostKey, ready: true, files: 0, usedMb: 0, freeMb: 0 });
+    reg = (await as(owner, 'GET', '/admin/regions')).json.regions.find((x) => x.id === id);
+    assert.equal(reg.backup.ready, false, JSON.stringify(hostKey));
+  }
+  await beat({ port: 99999, hostKey: good, ready: true });
+  assert.equal((await as(owner, 'GET', '/admin/regions')).json.regions.find((x) => x.id === id).backup.ready, false, 'bad port');
+  // Without the region's token, nobody can change what it reports.
+  const forged = await fetch(`${srv.base}/api/regions/${id}/heartbeat`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-region-token': 'f'.repeat(48) }, body: JSON.stringify({ ip: '198.51.100.7', ssh: { port: 22, hostKey: good, ready: true } }) });
+  assert.equal(forged.status, 403);
+});

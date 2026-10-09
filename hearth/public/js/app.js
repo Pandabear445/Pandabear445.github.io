@@ -115,7 +115,7 @@ export const app = {
   get voice() { return voice; },
   onMe(u) { setUser(u); renderUserPanel(); },
   logout,
-  rerender: () => renderAll(),
+  rerender: () => { lsCache.clear(); renderAll(); }, // settings.js writes some preferences straight to localStorage
   openProfile: (id) => openProfileModal(id),
   install: () => installApp(),
   get canInstall() { return !!installPrompt; },
@@ -381,7 +381,7 @@ function startApp() {
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
-    onChange: () => { renderVoicePanel(); renderUserPanel(); renderCallStages(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
+    onChange: () => { shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
     onSpeaking: (id, on) => {
       const uid = id === 'me' ? S.me.id : id;
       // Never show someone as speaking while they're muted or deafened, whatever audio arrives.
@@ -823,6 +823,41 @@ const realServers = () => S.servers.filter((s) => s.kind !== 'group');
 const groups = () => S.servers.filter((s) => s.kind === 'group');
 const serverOfChannel = (channelId) => S.servers.find((s) => s.channels.some((c) => c.id === channelId));
 const channelById = (id) => { for (const s of S.servers) { const c = s.channels.find((x) => x.id === id); if (c) return c; } return null; };
+
+// ---- screen sharing: keep DMs private
+// While you share your screen, direct messages and group chats are covered (and their previews and pop-up
+// notifications hidden), so you can't show a private conversation by accident. "Show while sharing" opens one
+// conversation for the rest of this share. Settings → Chat can turn this off.
+const shareAllowed = new Set(); // conversation keys shown anyway during the current share
+let wasSharing = false;
+const isSharing = () => !!(voice && voice.screenStream) && P.chat.hideDmsWhileSharing !== false;
+// The conversation key ('d:<dm>' or 'c:<group text channel>') if this view is a private conversation.
+function privateKey(v = S.view) {
+  if (v.type === 'dm') return 'd:' + v.dmId;
+  if (v.type === 'channel') { const s = currentServer(); if (s && isGroup(s)) return 'c:' + v.channelId; }
+  return null;
+}
+const hiddenWhileSharing = (key) => !!key && isSharing() && !shareAllowed.has(key);
+function shareChanged() {
+  const now = isSharing();
+  if (now === wasSharing) return;
+  wasSharing = now;
+  if (!now) shareAllowed.clear();
+  renderMain(); renderSidebar(); renderPanel();
+  if (now && privateKey()) toast('You\u2019re sharing your screen, so this conversation is hidden from view.');
+}
+function shareCover(key) {
+  const v = S.view;
+  const who = v.type === 'dm' ? displayName(getUser((S.dms.find((d) => d.id === v.dmId) || {}).userId)) : groupName(currentServer());
+  return h('div', { class: 'share-cover' },
+    h('div', { class: 'share-cover-card' }, icon('monitor', 'ic share-cover-ic'),
+      h('h2', null, 'Hidden while you share your screen'),
+      h('p', null, `Your conversation with ${who} stays private: anyone watching your screen sees this instead.`),
+      h('div', { class: 'row gap center' },
+        h('button', { class: 'btn primary', onclick: () => { shareAllowed.add(key); renderMain(); renderSidebar(); renderPanel(); } }, 'Show while sharing'),
+        h('button', { class: 'btn ghost', onclick: () => toggleScreen() }, 'Stop sharing')),
+      h('p', { class: 'field-hint' }, 'Only for this conversation, until you stop sharing. You can turn this off in Settings \u2192 Chat.')));
+}
 
 // ---- call regions (like Discord's region override)
 // A voice channel or DM call can be pinned to one region's relay; everyone in it switches together.
@@ -1278,7 +1313,7 @@ function convRow(c) {
   }, c.avatar,
   h('span', { class: 'dm-row-text' },
     h('span', { class: 'dm-row-top' }, h('span', { class: 'dm-row-name' }, c.title), c.at ? h('span', { class: 'dm-row-time' }, shortTime(c.at)) : null),
-    h('span', { class: 'dm-row-status' }, c.preview || '\u00a0')),
+    h('span', { class: 'dm-row-status' }, isSharing() && !shareAllowed.has(c.unreadKey) ? 'Hidden while sharing' : c.preview || '\u00a0')),
   mentions ? h('span', { class: 'badge', 'aria-label': `${mentions} unread` }, mentions) : unread ? h('span', { class: 'unread-dot', 'aria-label': 'Unread' }) : null);
 }
 function shortTime(ts) {
@@ -1613,6 +1648,7 @@ function renderMain() {
   else if (v.type === 'updates') main.append(updates.view());
   else if (v.type === 'study') main.append(study.view());
   else if (v.type === 'admin' && S.me.staffRole) main.append(S.adminEl = adminView({ role: S.me.staffRole, confirm: (fn, opts) => confirmedCall(app, fn, opts), tab: v.tab, setTab: (t) => { S.view.tab = t; }, openReports: S.adminReports, onCount: (n) => { if (S.adminReports !== n) { S.adminReports = n; renderRail(); } } }));
+  else if ((v.type === 'channel' || v.type === 'dm') && hiddenWhileSharing(privateKey(v))) main.append(shareCover(privateKey(v)));
   else if (v.type === 'channel' || v.type === 'dm') main.append(chatView());
   else if (v.type === 'voice') main.append(voiceRoomView());
   else if (v.type === 'empty-server') {
@@ -1829,7 +1865,7 @@ function homeView() {
 function convCard(c) {
   const unread = c.unreadKey && S.unread.has(c.unreadKey) && !isMuted(c.unreadKey);
   return h('button', { class: `conv-card${unread ? ' unread' : ''}`, onclick: c.open, oncontextmenu: (e) => contextMenu(e, c.menu) },
-    c.avatar, h('span', { class: 'conv-card-text' }, h('strong', null, c.title), h('span', null, c.preview || 'No messages yet')),
+    c.avatar, h('span', { class: 'conv-card-text' }, h('strong', null, c.title), h('span', null, isSharing() && !shareAllowed.has(c.unreadKey) ? 'Hidden while sharing' : c.preview || 'No messages yet')),
     c.at ? h('span', { class: 'conv-card-time' }, shortTime(c.at)) : null);
 }
 
@@ -2266,6 +2302,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     if (m.dec && m.dec.p) body.append(pollEl(m));
     const files = filesOf(m);
     if (files.length) body.append(h('div', { class: 'msg-files' }, files.map((f) => attachmentEl(f, m))));
+    const wc = watchChips(text);
+    if (wc) body.append(wc);
     if (embed) body.append(newsCard(embed));
     if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
     else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only.' }, 'Older message \u2014 not end-to-end encrypted'));
@@ -2699,7 +2737,9 @@ function notify(author, body, key) {
   if (!('Notification' in window) || Notification.permission !== 'granted' || (!document.hidden && document.hasFocus())) return;
   if (localStorage.getItem('hearth.notify') === 'off') return;
   try {
-    const n = new Notification(displayName(author), { body: body.slice(0, 140), icon: author.avatar || undefined, tag: key });
+    const priv = key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)));
+    const shown = priv && isSharing() && !shareAllowed.has(key) ? 'New message (hidden while you share your screen)' : body.slice(0, 140);
+    const n = new Notification(displayName(author), { body: shown, icon: author.avatar || undefined, tag: key });
     n.onclick = () => { window.focus(); if (window.hearthDesktop) window.hearthDesktop.focus(); if (key.startsWith('d:')) openDm(key.slice(2)); else { const s = serverOfChannel(key.slice(2)); if (s) openChannel(key.slice(2), s.id); } n.close(); };
   } catch { /* ignore */ }
 }
@@ -2815,6 +2855,7 @@ function renderPanel() {
   if (!mode || !S.me) return;
   el.dataset.mode = mode;
   queueMicrotask(() => { if (!el.querySelector(':scope > .resize-handle')) el.append(resizeHandle('panel')); });
+  if ((mode === 'thread' || mode === 'pins') && hiddenWhileSharing(privateKey())) return el.append(h('p', { class: 'sidebar-empty' }, 'Hidden while you share your screen.'));
   if (mode === 'thread') return threadPanel(el);
   if (mode === 'pins') return pinsPanel(el);
   if (S.view.type === 'dm') return dmProfilePanel(el);
@@ -3678,7 +3719,9 @@ function openSearch({ scope = null } = {}) {
     }
     if (['all', 'messages', 'files', 'links'].includes(tab) && (q || tab === 'files' || tab === 'links')) {
       const kind = tab === 'files' ? 'files' : tab === 'links' ? 'links' : 'text';
-      const pool = scopeKey ? convoMessages(scopeKey).map((m) => ({ m, key: scopeKey })) : allLoaded();
+      // While you share your screen, messages from DMs and group chats stay out of the results (see shareCover).
+      const privateHidden = (key) => (key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)))) && hiddenWhileSharing(key);
+      const pool = (scopeKey ? convoMessages(scopeKey).map((m) => ({ m, key: scopeKey })) : allLoaded()).filter(({ key }) => !privateHidden(key));
       const hits = pool.filter(({ m }) => matchMsg(m, q, kind)).sort((a, b) => b.m.createdAt - a.m.createdAt).slice(0, tab === 'all' ? 8 : 60);
       add(tab === 'files' ? 'Files' : tab === 'links' ? 'Links' : 'Messages', hits.map(({ m, key }) => {
         const u = getUser(m.authorId);
@@ -4890,20 +4933,68 @@ const watchCtx = (room) => ({
   openStart: (queue) => openWatchStart(room, queue),
 });
 // Start (or queue) a video for everyone in the call.
+// What kind of link this is (the server checks again): YouTube, Vimeo, Twitch or a video file.
+function watchKind(raw) {
+  let u; try { u = new URL(String(raw || '').trim()); } catch { return null; }
+  const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, '');
+  if (/^(youtube\.com|youtube-nocookie\.com|youtu\.be)$/.test(host)) return 'YouTube video';
+  if (/^(player\.)?vimeo\.com$/.test(host)) return 'Vimeo video';
+  if (host === 'twitch.tv') return 'Twitch live stream';
+  if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(u.pathname)) return 'Video file';
+  return null;
+}
+const watchRecent = () => { try { return JSON.parse(localStorage.getItem('hearth.watchRecent') || '[]').slice(0, 6); } catch { return []; } };
+function rememberWatch(link) { try { localStorage.setItem('hearth.watchRecent', JSON.stringify([link, ...watchRecent().filter((x) => x !== link)].slice(0, 6))); } catch { /* private mode */ } }
+function startWatching(room, link, queue) {
+  return new Promise((resolve, reject) => {
+    socket.emit('watch:start', { url: link, queue }, (r) => {
+      if (r && r.error) return reject(new Error(r.error));
+      rememberWatch(String(link).trim());
+      resolve();
+    });
+  });
+}
 function openWatchStart(room, queue = false) {
-  const url = h('input', { class: 'input', placeholder: 'https://www.youtube.com/watch?v=\u2026', autocomplete: 'off', spellcheck: 'false' });
+  const url = h('input', { class: 'input', placeholder: 'Paste a YouTube, Vimeo or Twitch link', autocomplete: 'off', spellcheck: 'false' });
+  const kind = h('span', { class: 'field-hint' }, 'YouTube, Vimeo, Twitch (live) and video files (.mp4, .webm). For anything else (like Netflix), share your screen.');
   const hostOnly = h('input', { type: 'checkbox' });
-  modal({
+  const check = () => { const k = watchKind(url.value); kind.textContent = url.value.trim() ? (k ? `✓ ${k}` : 'That link isn’t a video this can play. Try a YouTube, Vimeo or Twitch link.') : kind.textContent; kind.classList.toggle('ok', !!k); };
+  url.addEventListener('input', check);
+  let m;
+  const submit = () => startWatching(room, url.value, queue).then(() => m && m.close());
+  url.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit().catch((x) => toast(x.message, 'error')); } });
+  const paste = h('button', { class: 'btn ghost sm', type: 'button', onclick: async () => { try { url.value = (await navigator.clipboard.readText()).trim(); check(); url.focus(); } catch { url.focus(); toast('Press Ctrl+V to paste the link.'); } } }, 'Paste');
+  const recent = watchRecent();
+  m = modal({
     title: queue ? 'Add to the queue' : 'Watch together', size: 'sm',
     body: h('div', { class: 'stack' },
-      h('p', { class: 'muted-p' }, 'Everyone in this call sees the same video at the same moment. YouTube, Vimeo, Twitch (live) and video files (.mp4, .webm) work. For anything else (like Netflix), share your screen instead.'),
-      field('Link', url),
+      h('p', { class: 'muted-p' }, queue ? 'It plays for everyone when the current video ends.' : 'Everyone in this call sees the same video at the same moment, and anyone can pause or skip ahead (unless you keep the controls).'),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Link'), h('div', { class: 'row gap' }, url, paste), kind),
+      recent.length ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Watched recently'),
+        h('div', { class: 'wt-recent' }, recent.map((link) => h('button', { class: 'chip', type: 'button', title: link, onclick: () => { url.value = link; check(); submit().catch((x) => toast(x.message, 'error')); } }, link.replace(/^https?:\/\/(www\.)?/, '').slice(0, 40))))) : null,
       queue ? null : h('label', { class: 'row gap' }, hostOnly, 'Only I can play, pause and skip'),
-      h('p', { class: 'field-hint' }, 'The video loads straight from YouTube/Vimeo/Twitch, so they can see each viewer\u2019s IP address, like when you watch there.')),
+      h('p', { class: 'field-hint' }, 'The video loads straight from YouTube/Vimeo/Twitch, so they can see each viewer’s IP address, like when you watch there.')),
     actions: [{ label: 'Cancel' }, { label: queue ? 'Add to queue' : 'Start watching', kind: 'primary', action: () => new Promise((resolve, reject) => {
-      socket.emit('watch:start', { url: url.value, queue, hostOnly: hostOnly.checked }, (r) => (r && r.error ? reject(new Error(r.error)) : resolve()));
+      socket.emit('watch:start', { url: url.value, queue, hostOnly: hostOnly.checked }, (r) => { if (r && r.error) return reject(new Error(r.error)); rememberWatch(url.value.trim()); resolve(); });
     }) }],
   });
+  setTimeout(() => url.focus(), 50);
+}
+// Video links in chat get a "Watch together" button: one click plays it for everyone in your call.
+const WATCH_LINK = /https?:\/\/(?:www\.|m\.|music\.)?(?:youtube\.com\/(?:watch\?[^\s<>"']*v=|shorts\/|live\/)[\w-]{11}[^\s<>"']*|youtu\.be\/[\w-]{11}[^\s<>"']*|vimeo\.com\/\d{5,12}[^\s<>"']*|twitch\.tv\/[a-z0-9_]{3,25}(?=[\s/?#]|$)|[^\s<>"']+\.(?:mp4|webm|m4v)(?=[\s?#]|$))/gi;
+function watchChips(text) {
+  if ((S.config.features || {}).watch === false || !text) return null;
+  const links = [...new Set(String(text).match(WATCH_LINK) || [])].slice(0, 2);
+  if (!links.length) return null;
+  return h('div', { class: 'watch-chips' }, links.map((link) => h('button', {
+    class: 'watch-chip', 'data-tip': 'Play it for everyone in your call',
+    onclick: () => {
+      const room = voice && voice.channelId;
+      if (!room) return toast('Join a voice channel or call first, then press this to watch it together.');
+      const queued = !!S.watch[room];
+      startWatching(room, link, queued).then(() => toast(queued ? 'Added to the watch queue.' : 'Playing for everyone in the call.')).catch((e) => toast(e.message, 'error'));
+    },
+  }, icon('play'), `Watch together${links.length > 1 ? ` · ${watchKind(link) || 'video'}` : ''}`)));
 }
 function renderCallStages() { $$('.call-stage').forEach(fillStage); }
 

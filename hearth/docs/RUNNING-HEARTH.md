@@ -78,6 +78,14 @@ delay. So a region is a small relay server near people.
    that stops checking in is dropped from calls after 3 minutes and comes back by itself.
 5. *Measure from this device* shows the times from wherever you are.
 
+**What the second server does for you.** Chat can't be split across machines without two databases disagreeing,
+so the main server keeps running chat, and each region takes the jobs that make sense on another machine:
+
+- **Calls**: relays near people (and a whole call can be moved to a region, below).
+- **Backups**: a copy of every encrypted daily backup, so your community survives losing the main VPS. Copies go
+  to an upload-only account on the region, checked against the region's own key; the region can't open them.
+  *Already have a region? Press Reinstall in Admin → Regions and run the new command on it once to add backup space.*
+
 **Switching a call's region (like Discord).** Press the 🌐 region button in the call bar (or right-click a voice
 channel) and pick a region, or *Automatic*. Everyone in the call moves over together within a second, without
 hanging up; people who join later land in the same region. With a region picked, all of the call's audio and video
