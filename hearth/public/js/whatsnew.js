@@ -1,6 +1,10 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.25.1', items: [
+    'Fixed: if a file failed to download once (a brief connection drop or a server restart), it kept failing until you reloaded the app. Now pressing Download again simply tries again, and the error says what went wrong.',
+    'Photos, videos and audio files have a Download button (top-right corner), and you can click anywhere on a file card to download it.',
+  ] },
   { version: '1.25.0', items: [
     'Watch together: skipping ahead works (dragging YouTube\u2019s progress bar used to snap back). New shared buttons to jump back 10 s or ahead 10/30 s, play/pause for everyone, a clock, and a note when someone else jumps or pauses. Video links in chat get a \u201cWatch together\u201d button.',
     'Screen sharing keeps your DMs private: while you share, direct messages and group chats are covered (and their previews and notifications hidden) unless you press \u201cShow while sharing\u201d. Settings \u2192 Chat can turn it off.',

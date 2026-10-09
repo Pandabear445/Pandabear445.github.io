@@ -1,6 +1,6 @@
 {
   "name": "hearth",
-  "version": "1.25.0",
+  "version": "1.25.1",
   "description": "Self-hostable chat with voice, end-to-end encrypted DMs and free profile customization",
   "main": "server/index.js",
   "scripts": {

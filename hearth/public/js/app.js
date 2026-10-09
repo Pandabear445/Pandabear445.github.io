@@ -2536,12 +2536,16 @@ function openForward(m) {
 const blobCache = new Map();
 function decryptedUrl(m, f) {
   if (!blobCache.has(f.url)) {
-    blobCache.set(f.url, (async () => {
-      const res = await fetch(f.url);
-      if (!res.ok) throw new Error('File is gone');
+    const job = (async () => {
+      const res = await fetch(f.url).catch(() => { throw new Error('Couldn\u2019t reach the server. Check your connection and try again.'); });
+      if (res.status === 404) throw new Error('This file was deleted.');
+      if (!res.ok) throw new Error(`The server couldn\u2019t send this file (${res.status}). Try again in a moment.`);
       const plain = await sec.decryptAttachment(m, f, await res.arrayBuffer());
       return URL.createObjectURL(new Blob([plain], { type: f.type || 'application/octet-stream' }));
-    })());
+    })();
+    blobCache.set(f.url, job);
+    // A failed try isn't remembered: the next click fetches again instead of failing straight away.
+    job.catch(() => { if (blobCache.get(f.url) === job) blobCache.delete(f.url); });
   }
   return blobCache.get(f.url);
 }
@@ -2550,13 +2554,23 @@ function fileIcon(type, name) {
   if (/pdf|text|document|msword|sheet|presentation/.test(type) || /\.(pdf|txt|md|docx?|xlsx?|pptx?|csv)$/i.test(name)) return 'file';
   return 'file';
 }
-async function downloadAttachment(m, f) {
+async function downloadAttachment(m, f, btn) {
+  if (btn && btn.disabled) return;
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
   try {
     const enc = !!f.k || !!m.dmId;
     const href = enc ? await decryptedUrl(m, f) : f.url;
     const a = h('a', { href, download: f.name || 'file' });
     document.body.append(a); a.click(); a.remove();
-  } catch (e) { toast(e.message, 'error'); }
+  } catch (e) {
+    toast(`Couldn\u2019t download ${f.name || 'the file'}: ${e.message}`, 'error');
+  } finally { if (btn) { btn.disabled = false; btn.classList.remove('busy'); } }
+}
+// A small "Download" button on photos, videos and audio, which otherwise have no way to save them.
+function mediaDownloadBtn(m, f) {
+  const b = h('button', { class: 'att-dl', type: 'button', title: `Download ${f.name || 'file'}`, 'aria-label': `Download ${f.name || 'file'}`,
+    onclick: (e) => { e.stopPropagation(); downloadAttachment(m, f, b); } }, icon('download'));
+  return b;
 }
 const loadQueue = makeQueue(3);
 function attachmentEl(f, m) {
@@ -2583,6 +2597,7 @@ function attachmentEl(f, m) {
       el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.click(); });
     }
     if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
+    holder.append(mediaDownloadBtn(m, f));
     // Load only when it scrolls near the screen, a few at a time; images show the small thumbnail first.
     const load = () => {
       holder.classList.add('loading');
@@ -2597,10 +2612,12 @@ function attachmentEl(f, m) {
     if (enc || f.th) whenVisible(holder, load); else el.src = f.url;
     return holder;
   }
-  return h('div', { class: 'att-file' },
+  // The whole card downloads the file, not just the button.
+  const btn = h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => { e.stopPropagation(); downloadAttachment(m, f, btn); } }, icon('download'), 'Download');
+  return h('div', { class: 'att-file', title: `Download ${f.name || 'file'}`, onclick: () => downloadAttachment(m, f, btn) },
     h('span', { class: 'att-file-badge' }, icon(fileIcon(type, f.name || ''), 'ic'), h('span', null, ((f.name || '').split('.').pop() || 'file').slice(0, 4).toUpperCase())),
     h('div', { class: 'att-file-text' }, h('span', { class: 'att-name', title: f.name }, f.name || 'file'), h('span', { class: 'att-size' }, fmtSize(f.size || 0), enc ? h('span', { class: 'att-enc' }, icon('lock', 'ic'), 'Encrypted') : null)),
-    h('button', { class: 'btn ghost sm', onclick: () => downloadAttachment(m, f) }, icon('download'), 'Download'));
+    btn);
 }
 
 function openViewer(fromImg, { name, download } = {}) {

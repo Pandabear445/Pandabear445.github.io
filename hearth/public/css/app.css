@@ -752,6 +752,13 @@ mark { background: rgb(var(--accent-rgb) / .35); color: inherit; border-radius: 
   background: rgb(var(--s3) / .55); border: 1px solid var(--line); width: min(420px, 100%); min-width: 0;
 }
 .att-file.bad { color: var(--muted); font-style: italic; }
+.att-file:not(.bad) { cursor: pointer; }
+.att-file:not(.bad):hover { border-color: rgb(var(--accent-rgb) / .45); }
+.att-file .btn.busy, .att-dl.busy { opacity: .6; cursor: progress; }
+.att-dl { position: absolute; top: 8px; right: 8px; z-index: 2; width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; background: rgb(0 0 0 / .55); color: #fff; opacity: 0; transition: opacity .15s; }
+.att-dl .ic, .att-dl svg { width: 17px; height: 17px; }
+.att-media:hover .att-dl, .att-media:focus-within .att-dl, .att-dl.busy { opacity: 1; }
+@media (hover: none) { .att-dl { opacity: .9; } }
 .att-file-badge { position: relative; width: 38px; height: 44px; border-radius: 8px; background: rgb(var(--accent-rgb) / .14); color: var(--accent-ink); display: flex; flex-direction: column; align-items: center; justify-content: center; flex: none; }
 .att-file-badge .ic { width: 18px; height: 18px; }
 .att-file-badge span { font-size: 8.5px; font-weight: 800; letter-spacing: .03em; }
