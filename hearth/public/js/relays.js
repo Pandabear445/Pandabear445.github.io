@@ -40,10 +40,16 @@ export const relayTime = (ranks, e) => (ranks && sig(e) in ranks ? ranks[sig(e)]
 
 // What a call uses: every STUN server, plus the two relays that answered fastest (all of them until measured).
 // Fewer relays = the connection is found sooner.
-export function chooseIce(list, ranks) {
-  const strip = (e) => { const { region, ...rest } = e; return rest; };
+// With a region picked for the call (like Discord's region override), everything goes through that region's
+// relay: { iceServers, iceTransportPolicy: 'relay' }. If that region is down, the call falls back to automatic.
+export function chooseIce(list, ranks, regionId = null) {
+  const strip = (e) => { const { region, regionId: _r, ...rest } = e; return rest; };
   const stun = (list || []).filter((e) => !isRelay(e));
   const relays = (list || []).filter(isRelay);
+  if (regionId) {
+    const picked = relays.filter((e) => e.regionId === regionId);
+    if (picked.length) return { iceServers: picked.map(strip), iceTransportPolicy: 'relay' };
+  }
   if (relays.length <= 2 || !ranks) return [...stun, ...relays].map(strip);
   const scored = relays.map((e) => ({ e, ms: relayTime(ranks, e) }));
   const answered = scored.filter((x) => typeof x.ms === 'number').sort((a, b) => a.ms - b.ms);

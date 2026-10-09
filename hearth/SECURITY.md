@@ -77,6 +77,7 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 31 | A tracker is pointed at an internal address (SSRF) | Private, loopback, link-local and cloud-metadata addresses are refused, including after redirects | `features.test.js` › trackers: private and internal addresses |
 | 32 | A group member removes others or takes over the group | Only the owner can remove people or hand the group over | `features.test.js` › group chats |
 | 33 | A booby-trapped deck file (study tools) runs code | Recall runs in a sandboxed frame with its own origin: no access to Hearth's sign-in or storage, no network, only Hearth may embed it. Imported decks are cleaned (ids, pictures, colours) before they're shown | `features.test.js` › Recall runs sandboxed |
+| 34 | Someone moves a call to a region to listen in | A region's relay only forwards end-to-end encrypted packets it can't read. Changing a server voice channel's region needs Manage Channels; outsiders can't change DM calls | `calls.test.js` |
 
 ## 4. What each adversary can still do (honest limits)
 

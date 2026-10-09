@@ -1,9 +1,10 @@
 // The news bot: follows things people care about and posts new items into a server channel.
 //
 // Sources (no API keys needed): a topic search (Google News), a YouTube channel, a subreddit, a Steam game's
-// news, a GitHub project's releases, or any RSS/Atom feed. Each feed checks every 15 minutes.
-// Only NEW things get posted: when a feed is added, everything already in it is marked as seen, and
-// anything dated before the feed was added is skipped even if the source shuffles it back to the top.
+// news, a GitHub project's releases, or any RSS/Atom feed. Each feed checks every 10 minutes.
+// Only NEW things get posted: when a feed is added, everything already in it is marked as seen (the newest one
+// can be posted right away to show it works), and items more than 3 days old are skipped even if the source
+// shuffles them back to the top.
 //
 // Bot posts are public news, so they're stored like older messages (protected by the server's at-rest
 // encryption, not end-to-end) and the app labels them that way. Everything people write stays end-to-end.
@@ -20,7 +21,11 @@ const KINDS = {
   github: { name: 'GitHub releases', url: (repo) => `https://github.com/${repo}/releases.atom` },
   rss: { name: 'RSS / Atom feed', url: (u) => u },
 };
-const EVERY_MS = 15 * 60000;
+const EVERY_MS = 10 * 60000;
+// News older than this when it first shows up in a feed is skipped (sources sometimes shuffle old items back
+// to the top). Measured from now, not from when the feed was added: sites like Google News often list an
+// article hours after its publish time, and those are still news.
+const STALE_MS = 3 * 86400000;
 const MAX_POSTS_PER_CHECK = 3;
 
 // ------------------------------------------------------------------ fetching safely
@@ -199,7 +204,7 @@ module.exports = function setupNewsbot(ctx) {
       let posted = 0;
       for (const i of fresh) {
         mark.run(feed.id, itemKey(i), now());
-        if (i.date && i.date < feed.created_at - 3600000) continue;
+        if (i.date && i.date < now() - STALE_MS) continue;
         if (!matches(feed, i) || posted >= MAX_POSTS_PER_CHECK) continue;
         if (post(feed, i)) posted++;
       }
@@ -246,7 +251,7 @@ module.exports = function setupNewsbot(ctx) {
       const found = [];
       db.transaction(() => {
         for (const i of fresh) {
-          const show = !(i.date && i.date < feed.created_at - 3600000) && matches(feed, i) && found.length < USER_MAX_PER_CHECK;
+          const show = !(i.date && i.date < now() - STALE_MS) && matches(feed, i) && found.length < USER_MAX_PER_CHECK;
           const data = show ? JSON.stringify({ title: i.title, url: i.link, summary: i.summary, image: i.image, source: i.source || feed.title, date: i.date }) : '{}';
           add.run(newId(), feed.id, feed.user_id, itemKey(i), data, show ? 1 : 0, now());
           if (show) found.push(i);
@@ -395,7 +400,7 @@ module.exports = function setupNewsbot(ctx) {
     if (!f) fail(404, 'No such feed.');
     requireManager(f.server_id, req.userId);
     const b = req.body || {};
-    if (b.paused !== undefined) db.prepare('UPDATE feeds SET paused = ? WHERE id = ?').run(b.paused ? 1 : 0, f.id);
+    if (b.paused !== undefined) { db.prepare('UPDATE feeds SET paused = ? WHERE id = ?').run(b.paused ? 1 : 0, f.id); emitServerFeeds(f.server_id); }
     if (b.keywords !== undefined) db.prepare('UPDATE feeds SET keywords = ? WHERE id = ?').run(String(b.keywords || '').slice(0, 300), f.id);
     if (b.title !== undefined) db.prepare('UPDATE feeds SET title = ? WHERE id = ?').run(String(b.title || '').trim().slice(0, 100) || f.title, f.id);
     if (b.channelId !== undefined) {
@@ -418,6 +423,7 @@ module.exports = function setupNewsbot(ctx) {
     if (!f) fail(404, 'No such feed.');
     requireManager(f.server_id, req.userId);
     db.prepare('DELETE FROM feeds WHERE id = ?').run(f.id);
+    emitServerFeeds(f.server_id);
     res.json({ ok: true });
   });
 
@@ -439,4 +445,5 @@ module.exports = function setupNewsbot(ctx) {
   return { BOT_ID, parseFeed, KINDS: Object.fromEntries(Object.entries(KINDS).map(([k, v]) => [k, v.name])), unreadUpdates: unreadCount };
 };
 module.exports.parseFeed = parseFeed;
+module.exports.BOT_ID = BOT_ID;
 module.exports.privateIp = privateIp;

@@ -1,6 +1,10 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.24.0', items: [
+    'Call regions, like Discord: press \ud83c\udf10 in the call bar (or right-click a voice channel) to move a call to another region, and everyone in it switches together without hanging up.',
+    'The news bot shows as online, appears under Bots in the member list, posts the newest item as soon as you follow something, and no longer skips articles that sites list a few hours late.',
+  ] },
   { version: '1.23.0', items: [
     'Study tools are now Recall: flashcards with pictures, Learn, Smart Review, Write, Match, practice tests, Blitz and more, plus courses with exam dates and a focus timer. Turn it on in Settings \u2192 Study tools, then open More \u2192 Study.',
     'Your decks stay end-to-end encrypted and sync between your devices. Decks you made with the old study tools move over by themselves.',

@@ -17,7 +17,7 @@ import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, c
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
-import { rankRelays, chooseIce } from './relays.js';
+import { rankRelays, chooseIce, relayTime } from './relays.js';
 import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
@@ -377,7 +377,7 @@ function startApp() {
     // Lets the speaking detector ignore people whose mic is off (their state comes from the server).
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
     socket,
-    getIceServers: () => chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks),
+    getIceServers: () => chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks, voice && voice.channelId ? callRegion(voice.channelId) : null),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
@@ -567,6 +567,7 @@ function startApp() {
     if (s && !s.channels.find((c) => c.id === ch.id)) s.channels.push(ch);
     if (S.view.serverId === ch.serverId) renderSidebar();
   });
+  socket.on('call:region', (p) => onCallRegion(p));
   socket.on('channel:update', (ch) => {
     const s = S.servers.find((x) => x.id === ch.serverId);
     if (!s) return;
@@ -822,6 +823,52 @@ const realServers = () => S.servers.filter((s) => s.kind !== 'group');
 const groups = () => S.servers.filter((s) => s.kind === 'group');
 const serverOfChannel = (channelId) => S.servers.find((s) => s.channels.some((c) => c.id === channelId));
 const channelById = (id) => { for (const s of S.servers) { const c = s.channels.find((x) => x.id === id); if (c) return c; } return null; };
+
+// ---- call regions (like Discord's region override)
+// A voice channel or DM call can be pinned to one region's relay; everyone in it switches together.
+// null = automatic: direct when possible, otherwise the nearest relays.
+function callRegion(room) {
+  if (!room) return null;
+  if (room.startsWith('dm:')) return (S.dms.find((d) => d.id === room.slice(3)) || {}).region || null;
+  return (channelById(room) || {}).region || null;
+}
+// Regions this server can relay calls through right now: [{ id, name, ms }]
+function callRegions() {
+  const seen = new Map();
+  for (const e of S.iceServers || []) if (e.regionId && !seen.has(e.regionId)) seen.set(e.regionId, { id: e.regionId, name: e.region || 'Relay', ms: relayTime(S.relayRanks, e) });
+  return [...seen.values()];
+}
+const regionName = (id) => (id ? (callRegions().find((r) => r.id === id) || {}).name || 'an offline region' : 'Automatic');
+function canSetRegion(room) {
+  if (room.startsWith('dm:')) return true;
+  const c = channelById(room); const s = c && serverOfChannel(c.id);
+  return !!s && (isGroup(s) || can(s, PERMS.MANAGE_CHANNELS));
+}
+function regionMenuItems(room) {
+  const cur = callRegion(room);
+  const regions = callRegions();
+  const set = (region) => api('POST', '/calls/region', { room, region }).catch((e) => toast(e.message, 'error'));
+  const items = [{ header: 'Call region' }];
+  if (!canSetRegion(room)) {
+    items.push({ label: regionName(cur), icon: 'globe', checked: true, action: () => toast('Only people who can manage this channel can change its region.') });
+    return items;
+  }
+  items.push({ label: 'Automatic', hint: 'fastest for each person', checked: !cur, action: () => set(null) });
+  for (const r of regions) items.push({ label: r.name, hint: typeof r.ms === 'number' ? `${r.ms} ms` : '', checked: cur === r.id, action: () => set(r.id) });
+  if (cur && !regions.some((r) => r.id === cur)) items.push({ label: 'Pinned region is offline \u2014 using Automatic', icon: 'globe', checked: true, action: () => set(null) });
+  return items;
+}
+function onCallRegion(p) {
+  if (!p || typeof p.room !== 'string') return;
+  if (p.room.startsWith('dm:')) { const d = S.dms.find((x) => x.id === p.room.slice(3)); if (d) d.region = p.region; }
+  else { const c = channelById(p.room); if (c) c.region = p.region; }
+  if (voice && voice.channelId === p.room) {
+    voice.switchNetwork();
+    const who = p.by === S.me.id ? 'You' : displayName(getUser(p.by));
+    toast(`${who} moved the call to ${p.region ? regionName(p.region) : 'automatic region'}. Everyone is switching over.`);
+  }
+  renderVoicePanel();
+}
 const textChannel = (server) => server.channels.find((c) => c.type === 'text');
 
 function setView(v) {
@@ -1370,6 +1417,7 @@ function channelMenuItems(c, server) {
   const lvl = P.notify[k] || 'default';
   return [
     c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => { S.unread.delete(k); S.mentions.delete(k); renderSidebar(); renderRail(); updateTitle(); } } : null,
+    ...(c.type === 'voice' && callRegions().length ? [...regionMenuItems(c.id), '-'] : []),
     c.type === 'text' ? { header: 'Notifications' } : null,
     ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
     '-',
@@ -1483,7 +1531,11 @@ function renderVoicePanel() {
   const go = () => { if (room.startsWith('dm:')) openDm(room.slice(3)); else if (isGroup(srv)) openGroup(srv.id); else if (ch) openVoiceRoom(ch.id, srv.id); };
   el.append(
     h('div', { class: 'vp-top' },
-      h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}` }, label), h('button', { class: 'vp-where', onclick: go }, where))),
+      h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}` }, label), h('button', { class: 'vp-where', onclick: go }, where)),
+      callRegions().length ? h('button', {
+        class: `vp-region${callRegion(room) ? ' pinned' : ''}`, 'data-pop-anchor': '', 'data-tip': 'Call region: everyone in the call switches together',
+        onclick: (e) => menu(e.currentTarget, regionMenuItems(room), { align: 'end' }),
+      }, icon('globe'), h('span', null, callRegion(room) ? regionName(callRegion(room)) : 'Auto')) : null),
     h('div', { class: 'vp-controls' },
       ibtn(voice.muted ? 'micOff' : 'mic', voice.muted ? 'Unmute' : 'Mute', toggleMute, { cls: voice.muted ? 'off' : '' }),
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),
@@ -1641,7 +1693,7 @@ function renderHeader() {
   } else if (v.type === 'voice' && server) {
     const c = server.channels.find((x) => x.id === v.channelId);
     head.append(h('div', { class: 'head-title' }, icon('speaker', 'ic head-ic'), h('h1', null, c ? c.name : 'Voice')),
-      headTools(h('span', { class: 'head-note' }, icon('lock', 'ic'), 'Audio goes directly between members, encrypted')));
+      headTools(h('span', { class: 'head-note' }, icon('lock', 'ic'), c && c.region && callRegions().some((r) => r.id === c.region) ? `Audio goes through ${regionName(c.region)}, encrypted end to end` : 'Audio goes directly between members, encrypted')));
   } else if (v.type === 'friends') {
     const pending = Object.values(S.relationships).filter((r) => r.direction === 'incoming').length;
     const tab = (k, label, extra) => h('button', { class: `tab${v.tab === k ? ' active' : ''}${k === 'add' ? ' tab-add' : ''}`, role: 'tab', 'aria-selected': String(v.tab === k), onclick: () => goFriends(k) }, label, extra);
@@ -2814,8 +2866,15 @@ function membersPanel(el) {
       if (list2.length) list.append(h('div', { class: 'group-label' }, h('span', { style: r.color ? { color: r.color } : null }, `${r.icon ? r.icon + ' ' : ''}${r.name} \u2014 ${list2.length}`)), ...list2.map(row));
     }
     if (online.length) list.append(h('div', { class: 'group-label' }, h('span', null, `Online \u2014 ${online.length}`)), ...online.sort(byName).map(row));
+    // Bots working for this server (the news bot while it follows something), like Discord shows them.
+    const bots = (server.bots || []).map(getUser).filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q));
+    if (bots.length) list.append(h('div', { class: 'group-label' }, h('span', null, `Bots \u2014 ${bots.length}`)), ...bots.map((u) => h('button', {
+      class: 'member', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'left'),
+    }, avatarEl(u, 34, { status: true, meId: S.me.id }),
+    h('span', { class: 'member-text' }, h('span', { class: 'member-name' }, nameEl(u), h('span', { class: 'bot-tag' }, 'BOT')),
+      h('span', { class: 'member-status' }, 'Posting news from the feeds this server follows')))));
     if (offline.length) list.append(h('div', { class: 'group-label' }, h('span', null, `Offline \u2014 ${offline.length}`)), ...offline.sort(byName).map(row));
-    if (!users.length) list.append(h('p', { class: 'sidebar-empty' }, 'No one matches.'));
+    if (!users.length && !bots.length) list.append(h('p', { class: 'sidebar-empty' }, 'No one matches.'));
   };
   search.addEventListener('input', draw);
   draw();
@@ -4004,7 +4063,7 @@ async function newsBotTab(s, body) {
   const hint = h('span', { class: 'field-hint' }, FEED_KINDS[0][2]);
   const channel = h('select', { class: 'input' }, textChannels.map((c) => h('option', { value: c.id }, `#${c.name}`)));
   const keywords = h('input', { class: 'input', placeholder: 'optional: patch, update, release' });
-  const postNow = h('input', { type: 'checkbox' });
+  const postNow = h('input', { type: 'checkbox', checked: true });
   const preview = h('div', { class: 'stack' });
   const kindChips = h('div', { class: 'chips' });
   const drawKinds = () => {
@@ -4027,18 +4086,18 @@ async function newsBotTab(s, body) {
     h('span', { class: 'stat-sub' }, `${f.posted} posted \u00b7 checked ${ago(f.lastCheck)}`),
     f.paused ? h('span', { class: 'rpill warn' }, 'Paused') : f.lastError ? h('span', { class: 'rpill bad', 'data-tip': f.lastError }, 'Problem') : h('span', { class: 'rpill ok' }, 'Working'),
     h('span', { class: 'row gap tight' },
-      h('button', { class: 'btn ghost sm', onclick: async (e) => { e.currentTarget.disabled = true; try { const r = await api('POST', `/feeds/${f.id}/check`); toast(r.posted ? `Posted ${r.posted} new item${r.posted === 1 ? '' : 's'}.` : r.feed.lastError ? `Problem: ${r.feed.lastError}` : 'Nothing new yet.'); } catch (x) { toast(x.message, 'error'); } newsBotTab(s, body); } }, 'Check now'),
+      h('button', { class: 'btn ghost sm', onclick: async (e) => { e.currentTarget.disabled = true; try { const r = await api('POST', `/feeds/${f.id}/check`); toast(r.posted ? `Posted ${r.posted} new item${r.posted === 1 ? '' : 's'}.` : r.feed.lastError ? `Problem: ${r.feed.lastError}` : 'Working \u2014 nothing new since the last check. New items are posted as soon as they come out.'); } catch (x) { toast(x.message, 'error'); } newsBotTab(s, body); } }, 'Check now'),
       h('button', { class: 'btn ghost sm', onclick: async () => { await api('PATCH', `/feeds/${f.id}`, { paused: !f.paused }); newsBotTab(s, body); } }, f.paused ? 'Resume' : 'Pause'),
       h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Stop following ${f.title}?`, confirm: 'Remove', danger: true })) { await api('DELETE', `/feeds/${f.id}`); newsBotTab(s, body); } } }, 'Remove')))));
   clear(body).append(
     h('h3', null, 'News bot'),
-    h('p', { class: 'muted-p' }, 'Follow things your server cares about. The bot checks every 15 minutes and posts only new items, never old news. Its posts are public news, so they aren\u2019t end-to-end encrypted (and say so); everything people write still is.'),
+    h('p', { class: 'muted-p' }, 'Follow things your server cares about. The bot checks every 10 minutes and posts only new items, never old news. Its posts are public news, so they aren\u2019t end-to-end encrypted (and say so); everything people write still is.'),
     feeds.length ? list : h('p', { class: 'field-hint' }, 'Not following anything yet.'),
     h('h4', null, 'Follow something new'),
     kindChips,
     h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'What to follow'), query, hint),
     h('div', { class: 'grid-2' }, field('Post into', channel), field('Only posts mentioning (optional)', keywords, 'Comma-separated words. Leave empty for everything.')),
-    h('label', { class: 'row gap tight' }, postNow, h('span', null, 'Also post the newest item right now (to see what it looks like)')),
+    h('label', { class: 'row gap tight' }, postNow, h('span', null, 'Post the newest item right now, so you can see it working')),
     h('div', { class: 'row gap' },
       h('button', { class: 'btn', onclick: (e) => doPreview(e.currentTarget) }, 'Preview'),
       h('button', { class: 'btn primary', onclick: async (e) => {

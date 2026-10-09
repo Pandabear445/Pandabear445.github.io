@@ -15,7 +15,7 @@ db.pragma('journal_mode = WAL');
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 const fromVersion = db.pragma('user_version', { simple: true });
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
@@ -642,6 +642,11 @@ CREATE TABLE IF NOT EXISTS study_items (
 );
 CREATE INDEX IF NOT EXISTS idx_study_items_sync ON study_items(user_id, updated_at);
 `);
+
+// v15: a call's region (like Discord's region override): which relay everyone in a voice channel or DM call
+// goes through. NULL = automatic (direct when possible, otherwise the nearest relays).
+addColumn('channels', 'rtc_region', 'TEXT');
+addColumn('dm_channels', 'rtc_region', 'TEXT');
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 

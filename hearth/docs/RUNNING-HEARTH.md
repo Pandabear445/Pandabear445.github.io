@@ -78,6 +78,14 @@ delay. So a region is a small relay server near people.
    that stops checking in is dropped from calls after 3 minutes and comes back by itself.
 5. *Measure from this device* shows the times from wherever you are.
 
+**Switching a call's region (like Discord).** Press the 🌐 region button in the call bar (or right-click a voice
+channel) and pick a region, or *Automatic*. Everyone in the call moves over together within a second, without
+hanging up; people who join later land in the same region. With a region picked, all of the call's audio and video
+goes through that region's relay (still end-to-end encrypted: the relay only forwards scrambled packets). On
+*Automatic*, people connect directly when they can and otherwise use the relays nearest to each of them.
+In a server, changing a voice channel's region needs **Manage Channels**; in DM and group calls anyone in the call
+can change it. If a picked region goes offline, the call falls back to Automatic by itself.
+
 The install link expires after 24 hours (*Reinstall* makes a new one). When your server uses its own self-signed
 certificate, the command pins that exact certificate, so the new region only ever talks to your server.
 

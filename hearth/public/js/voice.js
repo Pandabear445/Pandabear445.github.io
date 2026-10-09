@@ -124,8 +124,29 @@ export class Voice {
     this.onChange();
   }
 
+  // getIceServers() gives a list (automatic), or { iceServers, iceTransportPolicy } when the call has a region.
+  rtcConfig() { const r = this.getIceServers(); return Array.isArray(r) ? { iceServers: r } : r; }
+  // The call's region changed: reconnect every connection through the new relays (like Discord moving a call to
+  // another voice server: a short blip, nobody has to rejoin). Everyone gets the change at about the same time;
+  // whoever started each connection rebuilds it, a moment later so both sides have the new region by then.
+  // (Restarting the old connection in place isn't enough: browsers keep using the direct path they had.)
+  switchNetwork() {
+    for (const [socketId, peer] of this.peers) {
+      if (!peer.initiator) continue;
+      setTimeout(() => { if (this.peers.get(socketId) === peer) this.reconnectPeer(socketId).catch(() => {}); }, 800);
+    }
+    this.onChange();
+  }
+  async reconnectPeer(socketId) {
+    const old = this.peers.get(socketId);
+    if (!old || !this.channelId) return;
+    this.signal(socketId, { reset: true });
+    this.closePeer(socketId);
+    await this.createPeer(socketId, old.userId, true);
+  }
+
   async createPeer(socketId, userId, initiator) {
-    const pc = new RTCPeerConnection({ iceServers: this.getIceServers() });
+    const pc = new RTCPeerConnection(this.rtcConfig());
     const peer = { pc, userId, audio: null, screenAudio: null, cam: null, screen: null, pending: [], initiator };
     this.peers.set(socketId, peer);
     if (initiator) {
@@ -204,12 +225,22 @@ export class Voice {
   }
 
   signal(to, data) { this.socket.emit('voice:signal', { to, data }, () => {}); }
+  // One restart at a time per connection: a second one asked for meanwhile runs after the answer arrives.
   async restartIce(socketId, peer) {
+    if (peer.restarting) { peer.restartAgain = true; return; }
+    peer.restarting = true;
+    clearTimeout(peer.restartTimer);
+    peer.restartTimer = setTimeout(() => this.restartDone(socketId, peer), 8000); // no answer: let the next try go
     try {
       const offer = await peer.pc.createOffer({ iceRestart: true });
       await peer.pc.setLocalDescription(offer);
       await this.sendSdp(socketId, peer.userId, peer.pc.localDescription);
-    } catch { /* try again on the next round */ }
+    } catch { this.restartDone(socketId, peer); /* try again on the next round */ }
+  }
+  restartDone(socketId, peer) {
+    clearTimeout(peer.restartTimer);
+    peer.restarting = false;
+    if (peer.restartAgain && this.peers.get(socketId) === peer) { peer.restartAgain = false; this.restartIce(socketId, peer); }
   }
   // How each person's connection is doing: 'connected' | 'connecting' | 'failed'
   peerState(userId) {
@@ -230,6 +261,7 @@ export class Voice {
     if (!this.channelId || !data) return;
     let peer = this.peers.get(from);
     if (data.restart && peer && peer.initiator) { this.restartIce(from, peer); return; }
+    if (data.reset) { if (peer && !peer.initiator) this.closePeer(from); return; } // a fresh connection follows
     if (data.sdp) {
       const ok = data.sdp && typeof data.sdp.sdp === 'string' && await this.verifySdp(userId, data.sdp, data.sig);
       if (!ok) {
@@ -246,8 +278,9 @@ export class Voice {
         await peer.pc.setLocalDescription(answer);
         await this.sendSdp(from, userId, peer.pc.localDescription);
       } else if (data.sdp.type === 'answer' && peer) {
-        await peer.pc.setRemoteDescription(data.sdp);
+        if (peer.pc.signalingState === 'have-local-offer') await peer.pc.setRemoteDescription(data.sdp);
         await this.flush(peer);
+        this.restartDone(from, peer);
       }
     } else if (data.candidate && peer) {
       if (!peer.pc.remoteDescription) peer.pending.push(data.candidate);

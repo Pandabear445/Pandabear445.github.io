@@ -113,6 +113,7 @@ function publicUser(row) {
   const profile = parseProfile(row);
   let presence = 'offline';
   if (isOnline(row.id) && row.status !== 'invisible') presence = row.status;
+  if (row.is_bot) presence = 'online'; // bots run inside this server: they're up whenever it is
   return {
     id: row.id,
     username: row.username,
@@ -171,10 +172,11 @@ function emitKeyState(serverId) {
     .forEach((m) => io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id)));
 }
 
-const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0 });
+const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined });
 const THEME_DEFAULT = { accent: '', banner: '', bannerCrop: null, background: { kind: 'none' }, welcome: '', roleColors: true, iconShape: 'rounded' };
 const themeOf = (s) => { try { return { ...THEME_DEFAULT, ...JSON.parse(s.theme || '{}') }; } catch { return { ...THEME_DEFAULT }; } };
 // What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
+const NEWS_BOT_ID = require('./newsbot').BOT_ID;
 function serializeServer(s, uid) {
   const myBase = perms.base(s, uid);
   const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
@@ -196,6 +198,8 @@ function serializeServer(s, uid) {
   const out = {
     id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: mrows.map((r) => r.user_id),
     roleDefs, memberRoles, myPerms: myBase, emojis, theme: themeOf(s), description: s.description || '', categoryOrder,
+    // Bots working for this server (shown in the member list like on Discord): the news bot while it follows something.
+    bots: db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : [],
   };
   if (out.kind === 'group') {
     const last = db.prepare(`SELECT m.* FROM messages m JOIN channels c ON c.id = m.channel_id
@@ -284,7 +288,7 @@ function serializeDmMessage(row, reactions) {
 function serializeDm(row, userId) {
   const last = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE dm_id = ? ORDER BY id DESC LIMIT 1').get(row.id);
   return {
-    id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at,
+    id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at, region: row.rtc_region || null,
     last: last ? { id: last.id, authorId: last.author_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null,
   };
 }
@@ -1075,7 +1079,7 @@ api.get('/bootstrap', auth, (req, res) => {
   const dms = db.prepare('SELECT * FROM dm_channels WHERE user_a = ? OR user_b = ? ORDER BY last_message_at DESC').all(uid, uid).map((d) => serializeDm(d, uid));
   const relationships = db.prepare('SELECT * FROM friendships WHERE requester_id = ? OR addressee_id = ?').all(uid, uid).map((r) => relationshipFor(r, uid));
   const ids = new Set([uid]);
-  servers.forEach((s) => s.memberIds.forEach((i) => ids.add(i)));
+  servers.forEach((s) => { s.memberIds.forEach((i) => ids.add(i)); (s.bots || []).forEach((i) => ids.add(i)); });
   dms.forEach((d) => ids.add(d.userId));
   relationships.forEach((r) => ids.add(r.userId));
   const users = {};
@@ -2619,7 +2623,7 @@ app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
 
 // The news bot (server/newsbot.js): follows feeds and posts new items into channels.
 const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer,
-  canManageServer: (s, uid) => can(s, uid, PM.MANAGE_SERVER), serializeMessage, toChannel, checkMediaToken, emitServerFeeds: () => {},
+  canManageServer: (s, uid) => can(s, uid, PM.MANAGE_SERVER), serializeMessage, toChannel, checkMediaToken, emitServerFeeds: (serverId) => emitServer(serverId),
   searchSteam: (q) => ACT.searchGames(q),
   // Personal trackers found something: tell the person's open apps, and push a notification if they want one.
   notifyUser: (uid, p) => {
@@ -2676,17 +2680,52 @@ const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, ge
 function iceServersFor(uid) {
   const list = [iceServers[0]];
   const urls = turnUrls();
-  const relays = [...(urls.length ? [{ region: 'Main server', urls }] : []), ...REG.liveRelays().map((r) => ({ region: r.name, urls: r.urls }))];
+  const relays = [...(urls.length ? [{ id: 'main', region: 'Main server', urls }] : []), ...REG.liveRelays().map((r) => ({ id: r.id, region: r.name, urls: r.urls }))];
   if (relays.length && turnSecret()) {
     const username = `${Math.floor(Date.now() / 1000) + 12 * 3600}:${uid}`;
     const credential = crypto.createHmac('sha1', turnSecret()).update(username).digest('base64');
-    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region });
+    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region, regionId: r.id });
   } else if (urls.length && process.env.TURN_USERNAME) {
     list.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL || '' });
   }
   return list;
 }
 api.get('/ice', auth, (req, res) => res.json(iceServersFor(req.userId)));
+
+// A call's region, like Discord's: pick which relay everyone in a voice channel or DM call goes through, and
+// everyone in the call switches together. "auto" (null) = direct when possible, otherwise the nearest relays.
+// Who can change it: in a server, people with Manage Channels; in a group chat or DM call, anyone in it.
+api.post('/calls/region', auth, (req, res) => {
+  rateLimit('callregion:' + req.userId, 20, 60000);
+  const b = req.body || {};
+  const room = String(b.room || '');
+  const want = b.region === null || b.region === 'auto' || b.region === undefined ? null : String(b.region);
+  if (want !== null) {
+    const known = want === 'main' ? turnUrls().length > 0 : !!db.prepare('SELECT 1 FROM regions WHERE id = ?').get(want);
+    if (!known) fail(400, 'No such region.');
+  }
+  const me = req.userId;
+  const tell = (ids, extra = {}) => {
+    const out = { room, region: want, by: me, ...extra };
+    io.to(`voice:${room}`).emit('call:region', out);
+    ids.forEach((id) => io.to(`user:${id}`).emit('call:region', out));
+  };
+  if (room.startsWith('dm:')) {
+    const d = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(room.slice(3));
+    if (!d || (d.user_a !== me && d.user_b !== me)) fail(404, 'No such call.');
+    db.prepare('UPDATE dm_channels SET rtc_region = ? WHERE id = ?').run(want, d.id);
+    tell([d.user_a, d.user_b]);
+    return res.json({ room, region: want });
+  }
+  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(room);
+  const srv = c && db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
+  if (!c || !srv || c.type !== 'voice' || !isMember(srv.id, me) || !(perms.channel(srv, c, me) & PM.VIEW_CHANNEL)) fail(404, 'No such call.');
+  if (srv.kind !== 'group' && !canIn(srv, c, me, PM.MANAGE_CHANNELS)) fail(403, 'You need the Manage Channels permission to change this channel’s region.');
+  db.prepare('UPDATE channels SET rtc_region = ? WHERE id = ?').run(want, c.id);
+  emitServer(srv.id);
+  tell([]);
+  res.json({ room, region: want });
+});
 api.get('/admin/turn', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
   res.json({ urls: turnUrls(), secretSet: !!turnSecret(), source: getSetting('turnUrls') ? 'app' : process.env.TURN_URL ? 'env' : null });

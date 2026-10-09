@@ -471,6 +471,11 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .vp-status.q-failed { color: var(--danger); }
 .vp-where { font-size: 12.5px; color: var(--muted); display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 .vp-where:hover { color: var(--text-2); text-decoration: underline; }
+.vp-region { display: inline-flex; align-items: center; gap: 5px; flex: none; max-width: 120px; padding: 4px 8px; border-radius: 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.vp-region span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vp-region .ic { width: 14px; height: 14px; flex: none; }
+.vp-region:hover { background: var(--hover); color: var(--text); }
+.vp-region.pinned { color: var(--accent); }
 .vp-controls { display: flex; gap: 4px; }
 .vp-controls .icon-btn { flex: 1; height: 32px; background: var(--hover); }
 .vp-controls .icon-btn.off { color: var(--danger); background: rgb(239 84 102 / .12); }
