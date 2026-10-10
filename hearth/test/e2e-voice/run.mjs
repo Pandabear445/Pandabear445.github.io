@@ -291,6 +291,16 @@ try {
   });
 
   await scenario('region switch to a region whose relay is down: "switching", then falls back to automatic and says so', async () => {
+    // Both apps need the relay list that includes the new region: they get it when they reconnect.
+    for (const u of [A, B]) {
+      const known = (await V(u, () => JSON.stringify(window.__hearthVoice.getIceServers()))).includes(`127.0.0.1:${deadPort}`);
+      if (!known) {
+        await V(u, () => window.__hearthVoice.socket.io.engine.close());
+        await waitFor(u, () => window.__hearthVoice.state === 'reconnecting', null, 5000).catch(() => {});
+      }
+    }
+    await sleep(500);
+    await waitUp(A, 1, 30000); await waitUp(B, 1, 30000);
     const t0 = Date.now();
     await server.api('POST', '/calls/region', A.token, { room, region: regionId });
     await waitFor(A, () => window.__hearthVoice.history.some((e) => /State: switching/.test(e.event)), null, 5000);
@@ -310,7 +320,11 @@ try {
     timings.switchToAutoMs = Date.now() - t0;
     const engine = await V(A, () => window.__hearthVoice.lastSwitchMs);
     timings.switchEngineMs = engine;
-    return `everyone connected ${timings.switchToAutoMs} ms after the request (engine measured ${engine} ms from the announcement)`;
+    // The media gap: from the old connection closing to the new one connected (the 800 ms before it, the old
+    // connection keeps carrying audio).
+    const gaps = [await V(A, () => window.__hearthVoice.lastGapMs), await V(B, () => window.__hearthVoice.lastGapMs)];
+    timings.switchGapMs = Math.max(...gaps.filter((x) => typeof x === 'number'));
+    return `everyone connected ${timings.switchToAutoMs} ms after the request (engine: ${engine} ms from the announcement; media gap ${timings.switchGapMs} ms)`;
   });
 
   await scenario('two region changes at once: last write wins, everyone converges on the server’s value', async () => {
@@ -325,7 +339,8 @@ try {
     for (const u of [A, B]) await waitFor(u, ([id, v]) => (window.__hearthCallRegion(id) || {}).version === v, [room, row.version], 5000);
     const seen = [await V(A, (id) => window.__hearthCallRegion(id), room), await V(B, (id) => window.__hearthCallRegion(id), room)];
     assert(seen.every((x) => (x.region || null) === (row.region || null)), `both apps agree with the server: ${JSON.stringify(seen)}`);
-    // Late joiner check: the join answer carries the active region (covered in the node tests too).
+    // Each change that reached an app rebuilds its connections 800 ms later: let the last of them finish.
+    await sleep(2000);
     await waitUp(A, 1, 40000); await waitUp(B, 1, 40000);
     // Back to automatic for the rest.
     if (row.region) { await server.api('POST', '/calls/region', A.token, { room, region: null }); await sleep(300); await waitUp(A, 1, 40000); await waitUp(B, 1, 40000); }
@@ -333,6 +348,7 @@ try {
   });
 
   await scenario('devices: the mic in use disappears → default mic, live; the camera disappears → video off, with a reason', async () => {
+    await waitUp(A, 1, 40000);
     const before = await V(A, () => { const p = [...window.__hearthVoice.peers.values()][0]; window.__pcBefore = p.pc; return p.pc.getTransceivers()[0].sender.track && p.pc.getTransceivers()[0].sender.track.id; });
     await V(A, () => {
       const md = navigator.mediaDevices;
@@ -411,6 +427,7 @@ try {
   });
   await scenario('impairment: media path cut for 12 s → not shown as connected; recovers by itself afterwards', async () => {
     if (!impair) return 'skipped (set IMPAIR=iptables, as root, to run it)';
+    const t0 = Date.now();
     fw('-I', []);
     let sawTrouble = false; let uiDuring = null;
     try {
@@ -424,7 +441,7 @@ try {
     const back = Date.now();
     await waitUp(A, 1, 60000); await waitUp(B, 1, 60000);
     timings.cutRecoverMs = Date.now() - back;
-    const restarts = await V(A, () => window.__hearthVoice.history.filter((e) => /Restarting the network path|fresh connection/.test(e.event)).length);
+    const restarts = await V(A, (t0) => window.__hearthVoice.history.filter((e) => e.t >= t0 && /Restarting the network path|fresh connection/.test(e.event)).length, t0);
     assert(sawTrouble, 'the call should have shown trouble while the media path was cut');
     assert(!/Connected/.test(uiDuring || ''), `the call bar didn't claim "Connected" during the cut: ${uiDuring}`);
     return `call bar during the cut: "${uiDuring}"; connected again ${timings.cutRecoverMs} ms after the path came back (${restarts} restart steps on Ana's side)`;
