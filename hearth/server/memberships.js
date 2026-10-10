@@ -353,8 +353,10 @@ module.exports = function setupMemberships(ctx) {
     res.json({
       config: { enabled: c.enabled, keySet: !!c.key, keyMode: c.key ? (/_test_/.test(c.key) ? 'test' : 'live') : '', webhookSet: !!c.webhookSecret, feePercent: c.feePercent, currency: c.currency },
       stats: { creators: db.prepare('SELECT COUNT(*) n FROM creator_accounts WHERE ready = 1').get().n, members: live.n, monthlyCents: live.cents, feeCents: Math.round(live.cents * c.feePercent / 100),
-        // Subscriptions of deleted servers that Stripe hasn't confirmed as ended yet (retried every hour).
-        pendingCancellations: db.prepare('SELECT COUNT(*) n FROM membership_cancellations').get().n },
+        // Subscriptions of deleted servers that Stripe hasn't confirmed as ended yet (retried every hour), and what
+        // Stripe said the last time one failed (empty while they're still being worked through).
+        pendingCancellations: db.prepare('SELECT COUNT(*) n FROM membership_cancellations').get().n,
+        cancelError: (db.prepare("SELECT last_error FROM membership_cancellations WHERE last_error != '' ORDER BY tried_at DESC LIMIT 1").get() || {}).last_error || '' },
     });
   });
   // Every change goes in the audit log (names of what changed, never the secrets). Replacing the Stripe key or the
@@ -409,28 +411,48 @@ module.exports = function setupMemberships(ctx) {
     db.transaction(() => subs.forEach((m) => add.run(m.stripe_sub, sid, m.user_id, now())))();
     if (subs.length) setImmediate(() => { retryCancellations().catch(() => {}); });
   }
-  let retrying = false;
-  async function retryCancellations() {
-    if (retrying) return;
-    retrying = true;
-    try {
-      const due = db.prepare('SELECT * FROM membership_cancellations ORDER BY tried_at IS NOT NULL, tried_at LIMIT 50').all();
-      for (const p of due) {
-        const sub = encodeURIComponent(p.stripe_sub);
-        let done = false; let error = '';
-        try { await stripe('DELETE', `/v1/subscriptions/${sub}`); done = true; } catch (e) {
-          error = e.message;
-          // Already gone (no such subscription, or it had ended anyway): nothing is being billed.
-          if (e.code === 'stripe_not_found') done = true;
-          else { try { done = STATUS[(await stripe('GET', `/v1/subscriptions/${sub}`)).status] === 'ended'; } catch (e2) { if (e2.code === 'stripe_not_found') done = true; } }
-        }
-        if (done) db.prepare('DELETE FROM membership_cancellations WHERE stripe_sub = ?').run(p.stripe_sub);
-        else {
-          db.prepare('UPDATE membership_cancellations SET attempts = attempts + 1, last_error = ?, tried_at = ? WHERE stripe_sub = ?').run(String(error).slice(0, 300), now(), p.stripe_sub);
-          console.warn('Couldn’t end a membership of a deleted server (trying again later):', error);
-        }
-      }
-    } finally { retrying = false; }
+  // Ends one listed subscription. Returns true once Stripe says it's over (or it never existed).
+  async function cancelListed(p) {
+    const sub = encodeURIComponent(p.stripe_sub);
+    let done = false; let error = '';
+    try { await stripe('DELETE', `/v1/subscriptions/${sub}`); done = true; } catch (e) {
+      error = e.message;
+      // Already gone (no such subscription, or it had ended anyway): nothing is being billed.
+      if (e.code === 'stripe_not_found') done = true;
+      else { try { done = STATUS[(await stripe('GET', `/v1/subscriptions/${sub}`)).status] === 'ended'; } catch (e2) { if (e2.code === 'stripe_not_found') done = true; } }
+    }
+    if (done) db.prepare('DELETE FROM membership_cancellations WHERE stripe_sub = ?').run(p.stripe_sub);
+    else {
+      db.prepare('UPDATE membership_cancellations SET attempts = attempts + 1, last_error = ?, tried_at = ? WHERE stripe_sub = ?').run(String(error).slice(0, 300), now(), p.stripe_sub);
+      console.warn('Couldn’t end a membership of a deleted server (trying again later):', error);
+    }
+    return done;
+  }
+  // A run goes through the whole list (new ones first, a few at a time), not just a first batch, so members of a
+  // big server aren't left for the hourly retry. A call made while a run is going (another server deleted
+  // meanwhile) starts another run right after it instead of being dropped. Only when Stripe keeps failing does a
+  // run stop early; the rest then wait for the next hourly try.
+  let running = null; let again = false;
+  function retryCancellations() {
+    if (running) { again = true; return running; }
+    running = (async () => {
+      try { do { again = false; await cancellationRun(); } while (again); } finally { running = null; }
+    })();
+    return running;
+  }
+  async function cancellationRun() {
+    const started = now();
+    // Each subscription is tried once per run: one that just failed waits for the next run.
+    const pick = db.prepare('SELECT * FROM membership_cancellations WHERE tried_at IS NULL OR tried_at < ? ORDER BY tried_at IS NOT NULL, tried_at LIMIT 50');
+    let failedInARow = 0;
+    for (;;) {
+      const queue = pick.all(started);
+      if (!queue.length) return;
+      await Promise.all(Array.from({ length: Math.min(4, queue.length) }, async () => {
+        for (let p; failedInARow < 5 && (p = queue.shift());) failedInARow = (await cancelListed(p)) ? 0 : failedInARow + 1;
+      }));
+      if (failedInARow >= 5) return; // Stripe is down (or the key stopped working): no use hammering it
+    }
   }
   // A missed webhook can't leave someone with access they stopped paying for (or without access they paid
   // for): memberships past their end date are checked with Stripe.

@@ -561,7 +561,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Paying members'), h('strong', null, String(m.stats.members))),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Memberships a month'), h('strong', null, cur(m.stats.monthlyCents, c.currency))),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, `Your ${c.feePercent}% a month`), h('strong', null, cur(m.stats.feeCents, c.currency)))),
-      m.stats.pendingCancellations ? h('p', { class: 'warn-box' }, `${m.stats.pendingCancellations} membership${m.stats.pendingCancellations === 1 ? '' : 's'} of deleted servers still need${m.stats.pendingCancellations === 1 ? 's' : ''} cancelling in Stripe (Stripe couldn’t be reached). Hearth tries again every hour; you can also cancel them in your Stripe dashboard.`) : '',
+      m.stats.pendingCancellations ? h('p', { class: 'warn-box' }, `${m.stats.pendingCancellations} membership${m.stats.pendingCancellations === 1 ? '' : 's'} of deleted servers still need${m.stats.pendingCancellations === 1 ? 's' : ''} cancelling in Stripe${m.stats.cancelError ? ` (last try: ${m.stats.cancelError.replace(/\.$/, '')}). Hearth tries again every hour` : ' (being cancelled now)'}. You can also cancel them in your Stripe dashboard.`) : '',
       h('ol', { class: 'steps' },
         h('li', null, 'In Stripe, turn on Connect (Connect \u2192 Get started, choose \u201cExpress\u201d accounts). Stripe handles the creators\u2019 identity checks, payouts and tax forms.'),
         h('li', null, 'Developers \u2192 API keys: paste your secret key below (or a restricted key with write access to Accounts, Account Links, Checkout Sessions and Subscriptions).'),
@@ -592,6 +592,14 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const rawgKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.rawgKeySet ? 'Saved (paste to replace, or clear)' : 'RAWG API key (optional)' });
     const saveKeys = async (patch) => { try { await api('PATCH', '/admin/activity', patch); toast('Saved.'); owner(); } catch (e) { toast(e.message, 'error'); } };
     const save = async (patch, msg = 'Saved.') => { try { await api('PUT', '/admin/owner', patch); toast(msg); owner(); } catch (e) { toast(e.message, 'error'); } };
+    // A new donation link, or fewer (or no) automatic backups, needs the password again. Cancelling puts the form back.
+    const saveConfirmed = async (patch, opts) => {
+      try { if (await withPassword((x) => api('PUT', '/admin/owner', { ...patch, ...x }), opts)) toast('Saved.'); } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+      owner();
+    };
+    const saveBackups = (patch) => (!patch.autoBackup.enabled && o.autoBackup.enabled) || Math.max(1, Math.min(60, Math.round(+patch.autoBackup.keep) || 7)) < o.autoBackup.keep
+      ? saveConfirmed(patch, { title: 'Confirm the backup change', text: 'Keeping fewer backups (or turning them off) deletes older ones sooner, so it needs your password.' })
+      : save(patch);
     const name = h('input', { class: 'input', maxlength: '40', value: o.brand.name });
     const tagline = h('input', { class: 'input', maxlength: '140', value: o.brand.tagline, placeholder: 'e.g. Our little corner of the internet' });
     const sw = (label, key, hint) => h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, label), hint ? h('span', { class: 'field-hint' }, hint) : null),
@@ -630,7 +638,10 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       h('div', { class: 'grid-2' }, field('Donation link', fund.url), field('Monthly cost', fund.monthly), field('Raised this month', fund.raised), field('Currency (USD, EUR\u2026)', fund.currency)),
       field('Message', fund.note),
       field('Storage for supporters (MB)', supQuota, 'More room for people who help pay. Empty or 0 = same limit as everyone. Automatic payments and other perks: the Money tab.'),
-      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value }) }, 'Save')),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => {
+        const patch = { funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value };
+        return patch.funding.url !== (F.url || '') ? saveConfirmed(patch, { title: 'Confirm the donation link', text: 'Changing where donations go needs your password.' }) : save(patch);
+      } }, 'Save')),
       o.supporters.length ? h('div', { class: 'adm-table' }, ...o.supporters.map((u) => h('div', { class: 'adm-row three' }, userCell(u, openUser), h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter'), h('button', { class: 'btn ghost sm', onclick: () => openUser(u.id) }, 'Manage')))) : h('p', { class: 'field-hint' }, 'No supporters yet.'),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Email (password resets)'), h('span', { class: `rpill ${mail.ready ? 'ok' : 'warn'}` }, mail.ready ? 'Working' : 'Not set up')),
@@ -660,8 +671,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Backing up…';
           try { const r = await api('POST', '/admin/backups'); toast(r.verified && r.verified.ok ? 'Backup made and restore-tested.' : `Backup made, but its restore test FAILED: ${(r.verified || {}).error || ''}`, r.verified && r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); btn.disabled = false; btn.textContent = 'Back up now'; }
         } }, 'Back up now'),
-        h('label', { class: 'row gap tight' }, h('input', { type: 'checkbox', checked: o.autoBackup.enabled, onchange: (e) => save({ autoBackup: { enabled: e.target.checked, keep: keep.value } }) }), 'Automatic daily backup, keep'),
-        keep, h('button', { class: 'btn ghost sm', onclick: () => save({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save'),
+        h('label', { class: 'row gap tight' }, h('input', { type: 'checkbox', checked: o.autoBackup.enabled, onchange: (e) => saveBackups({ autoBackup: { enabled: e.target.checked, keep: keep.value } }) }), 'Automatic daily backup, keep'),
+        keep, h('button', { class: 'btn ghost sm', onclick: () => saveBackups({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save'),
         o.keyFrom === 'file' && confirm ? h('button', { class: 'btn ghost sm', onclick: async () => {
           try {
             const r = await confirm((x) => api('POST', '/admin/backups/key', x), { title: 'Show the backup key', text: 'Save it in a password manager. Without it, no backup can be restored (for example if this server is lost).' });
@@ -697,7 +708,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       const next = await api('GET', `/admin/log?before=${oldest}`); addRows(next); if (next.length) oldest = next[next.length - 1].id; more.hidden = next.length < 200;
     } }, 'Older entries');
     clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Audit log'), h('span', { class: 'field-hint' }, 'Staff actions and account security events, newest first. Entries can\u2019t be edited or deleted.')),
-      chain ? (chain.ok ? h('div', { class: 'chain-ok' }, icon('check'), `Tamper check passed: all ${chain.entries} entries are intact and in order.`)
+      chain ? (chain.ok ? h('div', { class: 'chain-ok' }, icon('check'), `Tamper check passed: all ${chain.entries} entries are intact and in order.${chain.keyedFrom > 1 && chain.keyedSince
+        ? ` Entries before #${chain.keyedFrom} were written by an older version of Hearth (this server has signed entries since ${fmtStamp(chain.keyedSince)}), so they’re checked less strictly.` : ''}`)
         : h('div', { class: 'chain-bad' }, icon('shield'), chain.reason === 'missing'
           ? `Tamper check FAILED: entries up to #${chain.anchoredId} were recorded on this machine, but the log now ends at #${chain.brokenAt - 1}. Entries were removed outside Hearth, or an older copy of the database was put back.`
           : chain.reason === 'anchor' || chain.reason === 'keyed_from' ? 'Tamper check FAILED: the files Hearth uses to check the log were changed outside Hearth.'

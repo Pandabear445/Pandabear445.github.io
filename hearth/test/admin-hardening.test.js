@@ -12,7 +12,7 @@ const { startServer, confirmEmail, hex, sleep } = require('./helpers');
 
 const WHSEC = 'whsec_' + 'a'.repeat(32);
 const PAY_WHSEC = 'whsec_' + 'p'.repeat(32);
-let srv; let fake; let stripeDown = false; const stripeCalls = []; const subs = new Map();
+let srv; let fake; let stripeDown = false; let stripeDelay = 0; const stripeCalls = []; const subs = new Map();
 let owner; let admin; let mod; let alice; let bob; let space; let text;
 const as = (u, method, p, body) => srv.api(method, p, { token: u.token, ip: u.ip, body });
 const cipher = () => 'v2:' + crypto.randomBytes(48).toString('base64');
@@ -54,7 +54,7 @@ before(async () => {
         const s = subs.get(m[1]);
         if (!s) return send({ error: { message: 'No such subscription' } }, 404);
         if (req.method === 'DELETE') s.status = 'canceled';
-        return send(s);
+        return setTimeout(() => send(s), stripeDelay); // Stripe takes a moment to answer
       }
       send({ error: { message: 'unknown ' + req.url } }, 404);
     });
@@ -412,19 +412,33 @@ test('admin-8/data-6: the plaintext snapshot never appears in backups/encrypted,
   await srv.restart();
 });
 
-test('admin-8/data-6/data-7: leftovers of a crashed backup are removed at startup', async () => {
+test('admin-8/data-6/data-7: leftovers of a crashed backup are removed at startup, but not a backup still running', async () => {
   const enc = path.join(srv.dir, 'backups', 'encrypted'); const tmp = path.join(srv.dir, 'backups', '.tmp');
+  const verify = path.join(srv.dir, 'backups', '.verify-abc123');
   fs.mkdirSync(enc, { recursive: true }); fs.mkdirSync(tmp, { recursive: true });
   fs.copyFileSync(path.join(srv.dir, 'hearth.db'), path.join(enc, '.snapshot-2026-01-01T00-00-00-000Z.db')); // where older versions put it
   fs.writeFileSync(path.join(enc, 'hearth-2026-01-01T00-00-00-000Z.hbk.part'), crypto.randomBytes(1000));
   fs.copyFileSync(path.join(srv.dir, 'hearth.db'), path.join(tmp, '.snapshot-2026-01-02T00-00-00-000Z.db'));
-  fs.mkdirSync(path.join(srv.dir, 'backups', '.verify-abc123'));
-  fs.writeFileSync(path.join(srv.dir, 'backups', '.verify-abc123', 'secret.key'), 'x');
+  fs.mkdirSync(verify);
+  fs.writeFileSync(path.join(verify, 'secret.key'), 'x');
+  // Left by a crash an hour ago: nothing has touched them since.
+  const hourAgo = (Date.now() - 3600000) / 1000;
+  for (const p of [path.join(enc, '.snapshot-2026-01-01T00-00-00-000Z.db'), path.join(enc, 'hearth-2026-01-01T00-00-00-000Z.hbk.part'),
+    path.join(tmp, '.snapshot-2026-01-02T00-00-00-000Z.db'), path.join(verify, 'secret.key'), verify]) fs.utimesSync(p, hourAgo, hourAgo);
+  // A backup made from the command line (a cron job) that's still writing while the server restarts.
+  const running = { part: path.join(enc, 'hearth-2026-01-03T00-00-00-000Z.hbk.part'), snap: path.join(tmp, '.snapshot-2026-01-03T00-00-00-000Z.db'), verify: path.join(srv.dir, 'backups', '.verify-run123') };
+  fs.writeFileSync(running.part, crypto.randomBytes(1000)); fs.writeFileSync(running.snap, 'x');
+  fs.mkdirSync(path.join(running.verify, 'uploads'), { recursive: true });
+  fs.writeFileSync(path.join(running.verify, 'uploads', 'being-written.bin'), 'x');
+  // Its folders were made long ago; only the file being written is fresh.
+  fs.utimesSync(path.join(running.verify, 'uploads'), hourAgo, hourAgo); fs.utimesSync(running.verify, hourAgo, hourAgo);
   const keep = fs.readdirSync(enc).filter((f) => f.endsWith('.hbk'));
   await srv.restart();
-  assert.deepEqual(fs.readdirSync(enc).sort(), keep.sort(), 'only finished backups remain');
-  assert.deepEqual(fs.readdirSync(tmp), []);
-  assert.ok(!fs.existsSync(path.join(srv.dir, 'backups', '.verify-abc123')));
+  assert.deepEqual(fs.readdirSync(enc).sort(), [...keep, path.basename(running.part)].sort(), 'only finished backups (and the running one) remain');
+  assert.deepEqual(fs.readdirSync(tmp), [path.basename(running.snap)]);
+  assert.ok(!fs.existsSync(verify));
+  assert.ok(fs.existsSync(path.join(running.verify, 'uploads', 'being-written.bin')), 'a restore test still writing is left alone');
+  for (const p of Object.values(running)) fs.rmSync(p, { recursive: true, force: true });
 });
 
 // ------------------------------------------------------------------ data-7: uploads deleted while a backup streams
@@ -540,6 +554,10 @@ test('admin-7: logs from before the keyed chain still verify, and new entries ar
     await s3.restart();
     const v1 = (await s3.api('GET', '/admin/log/verify', { token: o.token, ip: o.ip })).json;
     assert.equal(v1.ok, true, JSON.stringify(v1)); assert.equal(v1.keyedFrom, legacyCount + 1); assert.equal(v1.gaps.length, 0);
+    // The switch-over is in the log itself, signed and dated: the old entries can be told apart from the new.
+    const switched = s3.sql('SELECT * FROM admin_log WHERE id = ?', legacyCount + 1)[0];
+    assert.equal(switched.action, 'audit_chain_keyed'); assert.match(switched.detail, new RegExp(`#${legacyCount + 1}`));
+    assert.equal(v1.keyedSince, switched.created_at);
     const u = await s3.register();
     await s3.api('PUT', '/admin/staff', { token: o.token, ip: o.ip, body: { userId: u.id, role: 'moderator', authKey: o.authKey } });
     const v2 = (await s3.api('GET', '/admin/log/verify', { token: o.token, ip: o.ip })).json;
@@ -548,5 +566,208 @@ test('admin-7: logs from before the keyed chain still verify, and new entries ar
     const last = s3.sql('SELECT * FROM admin_log ORDER BY id DESC LIMIT 1')[0];
     const plain = crypto.createHash('sha256').update(JSON.stringify([last.prev_hash, last.id, last.admin_id || '', last.action, last.target || '', last.detail || '', last.ip || '', last.created_at])).digest('hex');
     assert.notEqual(last.hash, plain);
+    // Doing the same to the keyed log (edit, re-hash it all with plain SHA-256, delete the markers) can't be passed
+    // off as an older version's log: signing starts over, in a new dated entry the check lists as a problem.
+    await sleep(20);
+    s3.child.kill('SIGTERM'); for (let i = 0; i < 100 && s3.child.exitCode === null; i++) await sleep(50);
+    const d2 = s3.db();
+    d2.exec('DROP TRIGGER admin_log_no_update');
+    prev = '';
+    for (const r of d2.prepare('SELECT * FROM admin_log ORDER BY id').all()) {
+      const detail = r.id === 2 ? 'nothing to see here' : r.detail;
+      const h = crypto.createHash('sha256').update(JSON.stringify([prev, r.id, r.admin_id || '', r.action, r.target || '', detail || '', r.ip || '', r.created_at])).digest('hex');
+      d2.prepare('UPDATE admin_log SET detail = ?, prev_hash = ?, hash = ? WHERE id = ?').run(detail, prev, h, r.id);
+      prev = h;
+    }
+    const resetAt = d2.prepare('SELECT MAX(id) m FROM admin_log').get().m + 1;
+    d2.prepare("DELETE FROM instance_settings WHERE key = 'auditKeyedFrom'").run();
+    d2.close();
+    fs.rmSync(path.join(s3.dir, 'audit-anchor.json'));
+    await s3.restart();
+    const v3 = (await s3.api('GET', '/admin/log/verify', { token: o.token, ip: o.ip })).json;
+    assert.equal(v3.keyedFrom, resetAt);
+    assert.ok(v3.keyedSince > switched.created_at, 'dated when it was reset');
+    assert.deepEqual(v3.gaps.map((g) => [g.id, g.action]), [[resetAt, 'audit_chain_keyed']], 'the reset is flagged');
   } finally { await s3.stop(); }
+});
+
+// ------------------------------------------------------------------ review: the keyed chain can't be quietly turned back into a plain one
+test('admin-7: deleting the keyed-chain markers doesn’t make an edited log pass (keyed entries left, or hashes NULLed)', async () => {
+  const s4 = await startServer();
+  try {
+    const o = s4.owner;
+    for (let i = 0; i < 4; i++) { const u = await s4.register(); await s4.api('PUT', '/admin/staff', { token: o.token, ip: o.ip, body: { userId: u.id, role: 'moderator', authKey: o.authKey } }); }
+    const verify = async () => (await s4.api('GET', '/admin/log/verify', { token: o.token, ip: o.ip })).json;
+    const v0 = await verify();
+    assert.equal(v0.ok, true, JSON.stringify(v0)); assert.equal(v0.keyedFrom, 1);
+    const stop = async () => { s4.child.kill('SIGTERM'); for (let i = 0; i < 100 && s4.child.exitCode === null; i++) await sleep(50); };
+    const dropMarkers = (d) => { d.prepare("DELETE FROM instance_settings WHERE key = 'auditKeyedFrom'").run(); fs.rmSync(path.join(s4.dir, 'audit-anchor.json'), { force: true }); };
+    // (a) The newest entries are cut off and both markers deleted: the entries still signed with this server's key
+    // give it away.
+    await stop();
+    let d = s4.db();
+    d.exec('DROP TRIGGER admin_log_no_delete');
+    d.prepare('DELETE FROM admin_log WHERE id > (SELECT MAX(id) - 2 FROM admin_log)').run();
+    dropMarkers(d);
+    d.close();
+    await s4.restart();
+    const v1 = await verify();
+    assert.equal(v1.ok, false, JSON.stringify(v1)); assert.equal(v1.reason, 'keyed_from');
+    // (b) The reviewer's case: cut off, an entry edited, every hash and prev_hash NULLed, markers deleted. Nothing
+    // re-chains the NULLs (that was a one-time upgrade for databases older than v13).
+    await stop();
+    d = s4.db();
+    d.exec('DROP TRIGGER admin_log_no_update');
+    d.prepare("UPDATE admin_log SET detail = 'nothing to see here' WHERE id = 2").run();
+    d.prepare('UPDATE admin_log SET hash = NULL, prev_hash = NULL').run();
+    dropMarkers(d);
+    d.close();
+    await s4.restart();
+    assert.equal(s4.sql('SELECT hash FROM admin_log WHERE id = 1')[0].hash, null, 'not re-chained');
+    const v2 = await verify();
+    assert.equal(v2.ok, false, JSON.stringify(v2)); assert.equal(v2.brokenAt, 1); assert.equal(v2.reason, 'changed');
+  } finally { await s4.stop(); }
+});
+
+// ------------------------------------------------------------------ review: every subscription of a deleted server ends right away
+async function moreSubs({ server, tier, fan }, n) {
+  const d = srv.db();
+  const add = d.prepare(`INSERT INTO memberships (id, server_id, tier_id, user_id, stripe_sub, status, amount_cents, currency, period_end, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'active', 500, 'USD', ?, ?, ?)`);
+  d.transaction(() => {
+    for (let i = 0; i < n; i++) {
+      const sub = 'sub_' + hex(8);
+      subs.set(sub, { id: sub, status: 'active', customer: 'cus_' + hex(4), cancel_at_period_end: false, current_period_end: Math.floor(Date.now() / 1000) + 30 * 86400, metadata: { kind: 'membership', server: server.id, tier: tier.id, user: fan.id } });
+      add.run('mb' + hex(6), server.id, tier.id, fan.id, sub, Date.now() + 20 * 86400000, Date.now(), Date.now());
+    }
+  })();
+  d.close();
+  return srv.sql('SELECT stripe_sub FROM memberships WHERE server_id = ?', server.id).map((r) => r.stripe_sub);
+}
+// Waits (up to a few seconds, far less than the hourly retry) until Stripe has ended them all and none is left on
+// the list. Returns how many are still going.
+async function untilCancelled(list) {
+  const left = () => list.filter((s) => subs.get(s).status !== 'canceled').length
+    + srv.sql(`SELECT COUNT(*) n FROM membership_cancellations WHERE stripe_sub IN (${list.map(() => '?').join(',')})`, ...list)[0].n;
+  for (let i = 0; i < 300 && left(); i++) await sleep(50);
+  return left();
+}
+
+test('data-8: deleting a server with more than 50 memberships ends all of them right away, not 50 an hour', async () => {
+  // Let the retry that runs shortly after a start go by first, so only the deletion itself can do the work.
+  await srv.restart(); await sleep(5500);
+  const big = await creatorSetup();
+  const list = await moreSubs(big, 129);
+  assert.equal(list.length, 130);
+  stripeDelay = 5;
+  try {
+    assert.equal((await as(big.creator, 'DELETE', `/servers/${big.server.id}`)).status, 200);
+    assert.equal(await untilCancelled(list), 0, 'every subscription ended, none left waiting');
+  } finally { stripeDelay = 0; }
+});
+
+test('data-8: a server deleted while another one’s memberships are still being ended isn’t skipped', async () => {
+  const a = await creatorSetup(); const b = await creatorSetup();
+  const listA = await moreSubs(a, 59); const listB = await moreSubs(b, 2);
+  stripeDelay = 20;
+  try {
+    assert.equal((await as(a.creator, 'DELETE', `/servers/${a.server.id}`)).status, 200);
+    await sleep(100);
+    assert.ok(listA.some((s) => subs.get(s).status !== 'canceled'), 'still working through the first server');
+    assert.equal((await as(b.creator, 'DELETE', `/servers/${b.server.id}`)).status, 200);
+    assert.equal(await untilCancelled([...listA, ...listB]), 0);
+  } finally { stripeDelay = 0; }
+  assert.equal((await as(admin, 'GET', '/admin/memberships')).json.stats.pendingCancellations, 0);
+});
+
+// ------------------------------------------------------------------ review: backups can't be thinned out with only a session
+test('admin-2: keeping fewer backups or none needs the password, and backups made by hand can’t push out older days', async () => {
+  const enc = path.join(srv.dir, 'backups', 'encrypted');
+  fs.mkdirSync(enc, { recursive: true });
+  // Backups from the last few days, as the daily schedule leaves them.
+  const old = [1, 2, 3].map((daysAgo) => {
+    const name = `hearth-old-${daysAgo}d.hbk`;
+    fs.writeFileSync(path.join(enc, name), crypto.randomBytes(256));
+    const t = (Date.now() - daysAgo * 86400000) / 1000;
+    fs.utimesSync(path.join(enc, name), t, t);
+    return name;
+  });
+  const settings = async () => (await as(owner, 'GET', '/admin/owner')).json.autoBackup;
+  // With only the session: neither fewer backups nor none.
+  const r1 = await as(owner, 'PUT', '/admin/owner', { autoBackup: { enabled: true, keep: 1 } });
+  assert.equal(r1.status, 401); assert.equal(r1.json.code, 'bad_password');
+  assert.equal((await as(owner, 'PUT', '/admin/owner', { autoBackup: { enabled: false, keep: 7 } })).status, 401);
+  assert.equal((await as(owner, 'PUT', '/admin/owner', { autoBackup: { enabled: true, keep: 1 }, authKey: hex(32) })).status, 401);
+  assert.deepEqual(await settings(), { enabled: true, keep: 7 });
+  for (let i = 0; i < 2; i++) assert.equal((await as(owner, 'POST', '/admin/backups', {})).status, 200);
+  for (const name of old) assert.ok(fs.existsSync(path.join(enc, name)), `${name} is still there`);
+  // The owner, with the password, keeps 2. A backup made by hand then removes only what the daily schedule would
+  // (yesterday's stays), and each removal is in the audit log.
+  assert.equal((await as(owner, 'PUT', '/admin/owner', { autoBackup: { enabled: true, keep: 2 }, authKey: owner.authKey })).status, 200);
+  assert.match(logRows('owner_settings').pop().detail, /keep 7 → on, keep 2/);
+  assert.equal((await as(owner, 'POST', '/admin/backups', {})).status, 200);
+  assert.ok(fs.existsSync(path.join(enc, old[0])), 'yesterday’s backup is kept');
+  const pruned = logRows('backup_pruned').map((r) => r.detail);
+  for (const name of old.slice(1)) {
+    assert.ok(!fs.existsSync(path.join(enc, name)), `${name} is past what's kept`);
+    assert.ok(pruned.some((d) => d.startsWith(name)), `removing ${name} is logged`);
+  }
+  // More backups again needs no password.
+  assert.equal((await as(owner, 'PUT', '/admin/owner', { autoBackup: { enabled: true, keep: 7 } })).status, 200);
+  assert.deepEqual(await settings(), { enabled: true, keep: 7 });
+});
+
+test('admin-6: a new donation link needs the password too; the rest of the funding card doesn’t', async () => {
+  const fundingNow = async () => (await as(owner, 'GET', '/admin/owner')).json.funding;
+  const before = (await fundingNow()).url;
+  const r = await as(owner, 'PUT', '/admin/owner', { funding: { url: 'https://ko-fi.com/someone-else' } });
+  assert.equal(r.status, 401); assert.equal(r.json.code, 'bad_password');
+  assert.equal((await fundingNow()).url, before);
+  // The form sends the link with every save: unchanged, it needs nothing.
+  assert.equal((await as(owner, 'PUT', '/admin/owner', { funding: { url: before, monthly: 40, note: 'Thanks!' } })).status, 200);
+  assert.equal((await fundingNow()).monthly, 40);
+  const ok = await as(owner, 'PUT', '/admin/owner', { funding: { url: 'https://ko-fi.com/hearth-host' }, authKey: owner.authKey });
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal((await fundingNow()).url, 'https://ko-fi.com/hearth-host');
+  const row = logRows('owner_settings').pop();
+  assert.match(row.detail, /donation link changed/); assert.ok(!row.detail.includes('authKey'));
+});
+
+// ------------------------------------------------------------------ review: thread replies and group chats
+test('admin-4: a thread can’t be removed when it has replies by staff at the remover’s level or above', async () => {
+  const reply = (root, author) => {
+    const id = 'm' + hex(8);
+    srv.sql('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, created_at, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', id, text.id, author.id, '', cipher(), 1, Date.now(), root);
+    return id;
+  };
+  const count = (...ids) => srv.sql(`SELECT COUNT(*) n FROM messages WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids)[0].n;
+  const root = channelMsg(alice); const ownerReply = reply(root, owner);
+  const r = await as(mod, 'DELETE', `/admin/messages/${root}`);
+  assert.equal(r.status, 403, r.text);
+  assert.equal(count(root, ownerReply), 2, 'nothing removed');
+  const mine = channelMsg(mod); const adminReply = reply(mine, admin);
+  assert.equal((await as(mod, 'DELETE', `/admin/messages/${mine}`)).status, 403, 'not even under their own message');
+  assert.equal(count(mine, adminReply), 2);
+  // Replies by people below them still go with the thread; someone ranked higher can remove the others.
+  const spam = channelMsg(alice); const r1 = reply(spam, bob); const r2 = reply(spam, alice);
+  assert.equal((await as(mod, 'DELETE', `/admin/messages/${spam}`)).status, 200);
+  assert.equal(count(spam, r1, r2), 0);
+  assert.equal((await as(admin, 'DELETE', `/admin/messages/${mine}`)).status, 200);
+  assert.equal((await as(owner, 'DELETE', `/admin/messages/${root}`)).status, 200);
+  assert.equal(count(root, ownerReply, mine, adminReply), 0);
+});
+
+test('admin-4: group chat messages, like DMs, can only be removed by staff when they were reported', async () => {
+  const g = await as(alice, 'POST', '/groups', { userIds: [bob.id] });
+  assert.equal(g.status, 200, g.text);
+  const chat = srv.sql("SELECT id FROM channels WHERE server_id = ? AND type = 'text'", g.json.id)[0].id;
+  const id = 'm' + hex(8);
+  srv.sql('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', id, chat, alice.id, '', cipher(), 1, Date.now());
+  const r = await as(mod, 'DELETE', `/admin/messages/${id}`);
+  assert.equal(r.status, 403, r.text);
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM messages WHERE id = ?', id)[0].n, 1);
+  const rep = await as(bob, 'POST', '/reports', { category: 'harassment', context: { kind: 'message', messageId: id }, evidence: [{ id, text: 'mean' }] });
+  assert.equal(rep.status, 200, rep.text);
+  assert.equal((await as(mod, 'DELETE', `/admin/messages/${id}`)).status, 200, 'reported: can be removed');
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM messages WHERE id = ?', id)[0].n, 0);
 });

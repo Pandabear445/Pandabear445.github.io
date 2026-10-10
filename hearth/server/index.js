@@ -3160,19 +3160,21 @@ api.patch('/admin/reports/:id', auth, staffOnly, (req, res) => {
 const inReport = (mid) => !!db.prepare(`SELECT 1 FROM reports r WHERE (CASE WHEN json_valid(r.context) THEN json_extract(r.context, '$.messageId') END) = ?
   OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r.evidence) THEN r.evidence ELSE '[]' END) e WHERE json_extract(e.value, '$.id') = ?) LIMIT 1`).get(mid, mid);
 // Remove a reported message for everyone. Like every other staff action on a person, only messages by people
-// ranked below you (or your own) can be removed. Direct messages are private, so staff can only remove ones
-// that were reported.
+// ranked below you (or your own) can be removed; that goes for the replies in its thread too, since they go with
+// it. Direct messages and group chats are private, so staff can only remove ones that were reported.
 api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   const d = !m && db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
   if (!m && !d) fail(404, 'Message already gone.');
+  const outranks = (author) => !author || author === req.userId || staffRank(author) < staffRank(req.userId);
   const author = (m || d).author_id;
-  if (author && author !== req.userId && staffRank(author) >= staffRank(req.userId)) {
-    fail(403, `You can’t remove messages by ${staffRole(author) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
-  }
-  if (d && !inReport(d.id)) fail(403, 'Direct messages can only be removed when they were reported.');
+  if (!outranks(author)) fail(403, `You can’t remove messages by ${staffRole(author) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
+  const c = m && db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
+  const group = !!c && !!db.prepare("SELECT 1 FROM servers WHERE id = ? AND kind = 'group'").get(c.server_id);
+  if ((d || group) && !inReport((m || d).id)) fail(403, `${d ? 'Direct messages' : 'Group chat messages'} can only be removed when they were reported.`);
   if (m) {
-    const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
+    const above = db.prepare('SELECT DISTINCT author_id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.author_id).find((a) => !outranks(a));
+    if (above) fail(403, `This thread has replies by ${staffRole(above) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them has to remove it.`);
     const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.id)];
     removeMessageFiles(ids);
     const q = ids.map(() => '?').join(',');
@@ -3704,8 +3706,18 @@ api.get('/admin/owner', auth, ownerOnly, (req, res) => {
   res.json({ brand: brand(), features: features(), funding: funding(), supporterQuotaMb: +(getSetting('supporterQuotaMb') || 0),
     supporters: db.prepare('SELECT id FROM users WHERE supporter = 1').all().map((r) => brief(r.id)), ...backupInfo(), autoBackup: autoBackup() });
 });
-api.put('/admin/owner', auth, ownerOnly, (req, res) => {
+// The donation link is where supporters' money goes, and fewer (or no) automatic backups means older ones get
+// deleted sooner: like deleting a backup or changing payment destinations, those need the password (and
+// two-factor) again, so a stolen session can't quietly do it.
+api.put('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
   const b = req.body || {};
+  const fundingUrl = b.funding && b.funding.url !== undefined ? String(b.funding.url || '').slice(0, 300) : null;
+  if (fundingUrl && !/^https:\/\/[^\s]+$/i.test(fundingUrl)) fail(400, 'The donation link must start with https://');
+  const urlChanged = fundingUrl !== null && fundingUrl !== funding().url;
+  const was = autoBackup();
+  const nextBackup = b.autoBackup ? { enabled: !!b.autoBackup.enabled, keep: Math.max(1, Math.min(60, Math.round(+b.autoBackup.keep) || 7)) } : null;
+  const fewerBackups = !!nextBackup && ((was.enabled && !nextBackup.enabled) || nextBackup.keep < was.keep);
+  if (urlChanged || fewerBackups) await stepUp(req, b);
   if (b.brand) {
     checkWords(b.brand.name, b.brand.tagline);
     if (b.brand.name !== undefined) setSetting('brandName', String(b.brand.name).trim().slice(0, 40) || null);
@@ -3724,11 +3736,13 @@ api.put('/admin/owner', auth, ownerOnly, (req, res) => {
       currency: /^[A-Z]{3}$/.test(f.currency) ? f.currency : 'USD', note: String(f.note || '').slice(0, 300) }));
   }
   if (b.supporterQuotaMb !== undefined) setSetting('supporterQuotaMb', String(Math.max(0, Math.min(1e6, Math.round(+b.supporterQuotaMb) || 0))));
-  if (b.autoBackup) setSetting('autoBackup', JSON.stringify({ enabled: !!b.autoBackup.enabled, keep: Math.max(1, Math.min(60, Math.round(+b.autoBackup.keep) || 7)) }));
-  adminLog(req, 'owner_settings', null, Object.keys(b).join(', '));
+  if (nextBackup) setSetting('autoBackup', JSON.stringify(nextBackup));
+  const what = Object.keys(b).filter((k) => !['authKey', 'totp', 'backupCode'].includes(k)).map((k) => (k === 'funding' && urlChanged ? 'funding (donation link changed)'
+    : k === 'autoBackup' ? `autoBackup (${was.enabled ? 'on' : 'off'}, keep ${was.keep} → ${nextBackup.enabled ? 'on' : 'off'}, keep ${nextBackup.keep})` : k));
+  adminLog(req, 'owner_settings', null, what.join(', '));
   io.emit('config:update', { name: brand().name, tagline: brand().tagline, features: features(), funding: fundingPublic() });
   res.json({ ok: true });
-});
+}));
 // Backups, two kinds:
 //   - database copies in data/backups/*.db (daily, and before every upgrade): for quickly undoing a bad update on
 //     this machine. They never leave the server (not even as a download): they're as sensitive as the database.
@@ -3741,7 +3755,9 @@ const ENC_DIR = path.join(BACKUP_DIR, 'encrypted');
 // one people copy off-site as it is.
 const BACKUP_TMP = path.join(BACKUP_DIR, '.tmp');
 const BK = require('./backup');
-const cleanStaleBackups = (olderThanMs = 0) => {
+// Leftovers untouched this long can't belong to a backup that's still running (it keeps writing to its files).
+const STALE_BACKUP_MS = 10 * 60000;
+const cleanStaleBackups = (olderThanMs = STALE_BACKUP_MS) => {
   const removed = BK.cleanStale({ outDir: ENC_DIR, tmpDir: BACKUP_TMP, scratchDir: BACKUP_DIR, olderThanMs });
   if (removed.length) console.log(`Removed leftovers of an interrupted backup: ${removed.join(', ')}`);
 };
@@ -3771,6 +3787,19 @@ async function makeBackup(kind) {
   await db.backup(path.join(BACKUP_DIR, name));
   return name;
 }
+// Which encrypted backups retention removes (list: newest first). It keeps the newest `keep` (at least 2), and also
+// the newest backup of each of the last `keep` days that have one, so a burst of backups made by hand (say, by a
+// stolen session) can't push older days out any faster than the daily schedule does.
+function backupsToPrune(list, keep) {
+  const n = Math.max(2, keep);
+  const kept = new Set(list.slice(0, n).map((x) => x.name));
+  const days = new Set();
+  for (const x of list) {
+    const day = new Date(x.at).toISOString().slice(0, 10);
+    if (!days.has(day) && days.size < n) { days.add(day); kept.add(x.name); }
+  }
+  return list.filter((x) => !kept.has(x.name));
+}
 let encBusy = null;
 // Make → restore-test → copy off-site. One at a time.
 function makeEncryptedBackup() {
@@ -3793,8 +3822,10 @@ function makeEncryptedBackup() {
       saveBackupStatus(b.name, { regions });
       for (const r of Object.values(regions)) if (!r.ok) { console.error(`Copying ${b.name} to region ${r.name || ''} failed: ${r.error}`); auditLog(null, 'backup_region_failed', null, `${b.name} → ${r.name || '?'}: ${r.error}`); }
     }
-    const a = autoBackup();
-    listEncBackups().slice(Math.max(2, a.keep)).forEach((x) => fs.promises.unlink(path.join(ENC_DIR, x.name)).catch(() => {}));
+    const keep = autoBackup().keep;
+    for (const x of backupsToPrune(listEncBackups(), keep)) {
+      try { fs.unlinkSync(path.join(ENC_DIR, x.name)); auditLog(null, 'backup_pruned', null, `${x.name} (keeping ${keep})`); } catch { /* already gone */ }
+    }
     return { ...b, verified, offsite, regions };
   })().finally(() => { encBusy = null; });
   return encBusy;
@@ -4244,8 +4275,12 @@ function setupSockets(server) {
   else server = http.createServer(app);
   setupSockets(server);
   try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
-  // A backup cut off by a crash or a forced stop may have left a plaintext snapshot or a half-written file.
-  try { cleanStaleBackups(0); } catch (e) { console.error('Could not clean up old backup files:', e.message); }
+  // A backup cut off by a crash or a forced stop may have left a plaintext snapshot or a half-written file. Files
+  // touched in the last few minutes may belong to a backup that's still running (`node server/cli.js backup` from
+  // a cron job, say), so those are looked at again a little later instead.
+  const cleanLeftovers = () => { try { cleanStaleBackups(STALE_BACKUP_MS); } catch (e) { console.error('Could not clean up old backup files:', e.message); } };
+  cleanLeftovers();
+  setTimeout(cleanLeftovers, STALE_BACKUP_MS + 60000).unref();
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
     console.log(`\n  ${INSTANCE_NAME} is running.\n`);

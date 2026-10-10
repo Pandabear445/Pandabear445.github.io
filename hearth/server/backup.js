@@ -150,12 +150,19 @@ function removeInFlight() {
 
 // Leftovers of a backup or restore test that was cut off by a crash or a forced stop: plaintext snapshots
 // (older versions made them inside outDir), decrypted restore tests and half-written .part files. Run at startup
-// (olderThanMs 0) and before each new backup (only things old enough not to belong to one still running, e.g. from
-// the command line). Returns the names removed.
+// and before each new backup, for things untouched for olderThanMs: a backup still running (from the command line,
+// say, while the server restarts) keeps writing to its files, so it's left alone. Returns the names removed.
 function cleanStale({ outDir, tmpDir, scratchDir, olderThanMs = 0 }) {
   const removed = [];
   const list = (d) => { try { return d ? fs.readdirSync(d) : []; } catch { return []; } };
-  const old = (p) => { try { return Date.now() - fs.statSync(p).mtimeMs >= olderThanMs; } catch { return false; } };
+  // The last change to a file, or to anything in a folder (a restore test writes into uploads/ inside it).
+  const touched = (p, depth = 0) => {
+    const st = fs.statSync(p);
+    let t = st.mtimeMs;
+    if (st.isDirectory() && depth < 3) for (const f of fs.readdirSync(p)) { try { t = Math.max(t, touched(path.join(p, f), depth + 1)); } catch { /* gone meanwhile */ } }
+    return t;
+  };
+  const old = (p) => { if (olderThanMs <= 0) return true; try { return Date.now() - touched(p) >= olderThanMs; } catch { return false; } };
   const rm = (dir, f) => { const p = path.join(dir, f); if (inFlight.has(p) || !old(p)) return; try { fs.rmSync(p, { recursive: true, force: true }); removed.push(f); } catch { /* next time */ } };
   for (const f of list(outDir)) if (f.startsWith('.snapshot-') || f.endsWith('.hbk.part')) rm(outDir, f);
   for (const f of list(tmpDir)) rm(tmpDir, f);
