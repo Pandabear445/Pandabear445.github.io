@@ -1,6 +1,19 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.28.0', items: [
+    'Search got much better (Ctrl+K): filters like from:@name, in:#channel, before:/after:/during: a date, has:file, has:image, has:link, is:edited and "exact phrases", and it can look through your whole history. Your search words never leave your device.',
+    'Calls survive hiccups: if your connection drops, the call keeps going and rejoins by itself (others see you as reconnecting), even after a server restart. The call bar shows what’s really happening, and Call diagnostics (ⓘ in a call) shows how your connection is doing.',
+    'Never lose your place: unread badges and a “New messages” line that follow you to every device, Jump to first unread, Mark as read/unread, and drafts that survive reloads.',
+    'Saved messages sync to all your devices, with private notes only you can read. Notifications your way: per server, channel and DM, mute for a while, ignore @everyone, quiet hours. Lock screens just say “New message” unless you choose otherwise.',
+    'Big files: uploads over 8 MB show real progress, can be cancelled and carry on after a dropped connection. Pictures open in a gallery, videos and songs play right in the chat, and Settings → Storage shows what you use.',
+    'Bots: servers can add bots with slash commands, signed webhooks and only the access you approve (Server settings → Bots). Bots can’t read your messages; bot messages are marked as not end-to-end encrypted.',
+    'Export my data (Settings → Privacy & safety): a zip of your account and every message you can read, decrypted on your device.',
+    'Moderators can time someone out (they can read but not post or talk), and pins have a history.',
+    'Security: a big round of fixes from a full audit. Removed members no longer get their roles back by rejoining, private channels can’t be opened by someone who can’t see them, sensitive owner actions ask for your password again, invites can be revoked, and much more (see SECURITY.md on the server’s code page).',
+    'Easier to use with a keyboard and screen readers, and faster in big servers.',
+    'For server owners: Admin \u2192 Health shows background jobs, backups, relays and disk space, and emails you when something needs a look. Admin \u2192 Security \u2192 Storage & limits shows who uses the space.',
+  ] },
   { version: '1.27.1', items: [
     'Change your display name in a couple of taps: click your name at the bottom left \u2192 Change display name, or Settings \u2192 Security. It\u2019s what people see in chats and member lists, doesn\u2019t have to be unique, and emoji are welcome.',
   ] },
