@@ -764,10 +764,20 @@ function setAudioPref(k, v) { const p = audioPrefs(); p[k] = v; localStorage.set
 
 function voiceTab(app) {
   const prefs = audioPrefs();
-  const inputSel = h('select', { class: 'input', onchange: (e) => { setAudioPref('inputId', e.target.value); if (micTest) startTest(); } });
-  const outputSel = h('select', { class: 'input', onchange: (e) => setAudioPref('outputId', e.target.value) });
+  // In a call, a new device takes over straight away (same connection, the track is swapped).
+  const live = () => app.voice && app.voice.inVoice;
+  const inputSel = h('select', { class: 'input', onchange: (e) => {
+    setAudioPref('inputId', e.target.value);
+    if (micTest) startTest();
+    if (live()) app.voice.setInputDevice().then((r) => { if (r === 'mic') toast('Your call now uses this microphone.'); }).catch((err) => toast(err.message, 'error'));
+  } });
+  const outputSel = h('select', { class: 'input', onchange: (e) => { setAudioPref('outputId', e.target.value); if (live()) app.voice.setOutputDevice(e.target.value); } });
   // Camera: pick a device and preview it.
-  const camSel = h('select', { class: 'input', onchange: (e) => { setAudioPref('cameraId', e.target.value); if (camStream) startCam(); } });
+  const camSel = h('select', { class: 'input', onchange: (e) => {
+    setAudioPref('cameraId', e.target.value);
+    if (camStream) startCam();
+    if (live() && app.voice.camStream) app.voice.setCameraDevice().catch((err) => toast(err.name === 'NotFoundError' ? 'That camera isn\u2019t available.' : err.message, 'error'));
+  } });
   const camVideo = h('video', { class: 'cam-preview', autoplay: true, playsinline: true });
   camVideo.muted = true;
   let camStream = null;

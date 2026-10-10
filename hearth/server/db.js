@@ -1146,6 +1146,12 @@ CREATE TABLE IF NOT EXISTS member_timeouts (
 CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
 `);
 
+// v18 (voice reliability): a version number for each call's region. Every change bumps it, so when two people
+// switch the region at the same moment the last write wins and every app settles on the newest one, whatever
+// order the announcements arrive in.
+addColumn('channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('dm_channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;
