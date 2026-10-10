@@ -2007,7 +2007,8 @@ img.cemoji.big { width: 40px; height: 40px; }
 
 /* ------------------------------------------------------------------ MySpace-style profile pages
    Everything is driven by --pg-* variables set from the person's page settings. Their own CSS is
-   scoped to .mys-page[data-page="<id>"]; contain: paint keeps it from drawing outside the page. */
+   scoped to .mys-page[data-page="<id>"], so it can restyle the page (even its own containment) but never
+   its parent: .mys-shell's contain + isolation keep everything on the page inside the page's box. */
 .mys-modal.modal { width: min(1180px, calc(100vw - 32px)); max-width: none; height: calc(100vh - 48px); max-height: none; padding: 0; overflow: hidden; }
 .mys-modal .modal-body { padding: 0; height: 100%; overflow: hidden; }
 .mys-modal .mys-close { position: absolute; top: 10px; right: 12px; z-index: 30; background: rgb(0 0 0 / .55); color: #fff; }
@@ -2054,8 +2055,6 @@ img.cemoji.big { width: 40px; height: 40px; }
 .mys-friend span:last-child { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mys-friend:hover span:last-child { text-decoration: underline; }
 .mys-muted { opacity: .75; font-size: .9em; }
-.mys-comment-form { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
-.mys-comment-form .input { width: 100%; }
 .mys-comment { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 12px; padding: 10px 0; border-top: 1px solid rgb(127 127 127 / .25); }
 .mys-comment-who { display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--pg-link); font-size: .85em; text-align: center; overflow-wrap: anywhere; }
 .mys-comment-meta { display: flex; gap: 10px; align-items: center; font-weight: 700; font-size: .85em; opacity: .85; margin-bottom: 4px; }
@@ -2064,7 +2063,7 @@ img.cemoji.big { width: 40px; height: 40px; }
 .mys-marquee { overflow: hidden; white-space: nowrap; margin-bottom: 14px; padding: 6px 0; background: var(--pg-box); border: var(--pg-border); border-radius: var(--pg-radius); color: var(--pg-heading); font-weight: 700; display: flex; }
 .mys-marquee span { flex: none; padding-right: 60%; animation: mys-marquee 16s linear infinite; }
 @keyframes mys-marquee { from { transform: translateX(60%); } to { transform: translateX(-100%); } }
-.mys-shell { position: relative; height: 100%; overflow: hidden; }
+.mys-shell { position: relative; height: 100%; overflow: hidden; contain: layout paint; isolation: isolate; }
 .mys-fx { z-index: 5; }
 .mys-trail { position: absolute; z-index: 20; pointer-events: none; transform: translate(-50%, -50%); animation: mys-trail .9s ease-out forwards; font-size: 18px; }
 @keyframes mys-trail { to { opacity: 0; transform: translate(-50%, 30px) scale(.4) rotate(90deg); } }

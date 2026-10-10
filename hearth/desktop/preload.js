@@ -1,6 +1,8 @@
 // The only bridge between the page and the desktop shell. The page can set the unread badge,
 // bring the window forward, (on the connect screen) choose a server, and get the game/song being played.
-// main.js checks that every message comes from your server's own pages (or the built-in connect screen).
+// main.js checks that every message comes from the main window showing your server's own pages (exactly
+// its origin; see origin.js) or the built-in connect screen. Screen sharing has no channel here: the app
+// shows its own picker (picker.html), so the page never sees your windows.
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Subscribes to a message from the app; returns a function that stops listening.
@@ -20,9 +22,6 @@ contextBridge.exposeInMainWorld('hearthDesktop', {
   connect: (url) => ipcRenderer.invoke('connect', String(url)),
   // The "can't reach your server" screen: asks again; the app loads the server when it answers.
   retryServer: () => ipcRenderer.invoke('retry-server'),
-  // Screen-share picker (the app sends the list of screens/windows; the page answers with one id or null).
-  onPickScreen: (cb) => ipcRenderer.on('screen-pick', (e, sources) => cb(sources)),
-  pickScreen: (id) => ipcRenderer.send('screen-picked', id == null ? null : String(id)),
   // Games & music: the page turns detection on/off (following the person's sharing settings) and gets
   // { game, music } back every 20 seconds while it's on. See detect.js.
   detectActivity: (o) => ipcRenderer.send('detect', { games: !!(o && o.games), songs: !!(o && o.songs) }),
@@ -33,7 +32,8 @@ contextBridge.exposeInMainWorld('hearthDesktop', {
   // Taskbar: flash on @mention; Mute/Deafen buttons in the taskbar preview while in a call.
   flash: () => ipcRenderer.send('flash'),
   setCallState: (s) => ipcRenderer.send('call-state', { inCall: !!(s && s.inCall), muted: !!(s && s.muted), deafened: !!(s && s.deafened) }),
-  // Updates from your server: told when one is downloaded; installUpdate() restarts into it.
+  // Updates from your server: told when one is downloaded; installUpdate() asks the person (a native
+  // dialog) and restarts into it only if they say yes.
   onUpdateReady: (cb) => ipcRenderer.on('update-ready', (e, u) => cb(u)),
   updateReady: () => ipcRenderer.sendSync('update-status'),
   installUpdate: () => ipcRenderer.send('install-update'),

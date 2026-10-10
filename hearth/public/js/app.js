@@ -5203,7 +5203,8 @@ async function acceptRing(room, video = false) {
   await joinRoom(room, { video });
 }
 
-// Desktop app: "Choose what to share" picker for screen sharing (Electron has none built in).
+// Older desktop apps: "Choose what to share" picker for screen sharing (Electron has none built in). Current
+// ones show their own picker window instead and don't offer onPickScreen, so the page never sees your windows.
 if (window.hearthDesktop && window.hearthDesktop.onPickScreen) {
   window.hearthDesktop.onPickScreen((sources) => {
     let answered = false;

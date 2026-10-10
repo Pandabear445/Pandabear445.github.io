@@ -40,6 +40,11 @@
     "files": [
       "main.js",
       "preload.js",
+      "origin.js",
+      "permissions.js",
+      "update-verify.js",
+      "picker.html",
+      "picker-preload.js",
       "detect.js",
       "hotkeys.js",
       "connect.html",

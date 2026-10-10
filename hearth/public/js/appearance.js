@@ -92,24 +92,40 @@ export function exportAppearance() {
   const a = loadAppearance();
   return { hearthAppearance: 1, exported: new Date().toISOString(), settings: { ...a, bg: { ...a.bg, kind: a.bg.kind === 'image' ? 'preset' : a.bg.kind } } };
 }
-// Accepts what exportAppearance made. Unknown keys are dropped and values are checked when applied,
-// so a broken or hand-edited file can't break the app. Returns false if the file isn't a Hearth look.
+// A look file's settings, cleaned: only known keys (also inside bg and layout), each of the expected type,
+// and the background checked value by value. Looks get shared with friends, so a file is untrusted input:
+// anything that ends up in CSS must be a plain number or one of the known words.
+export function cleanAppearance(src) {
+  const clean = {};
+  for (const k of Object.keys(DEFAULTS)) {
+    if (!Object.hasOwn(src, k)) continue;
+    const v = src[k];
+    const d = DEFAULTS[k];
+    if (d && typeof d === 'object' && !Array.isArray(d)) {
+      if (v && typeof v === 'object' && !Array.isArray(v)) clean[k] = Object.fromEntries(Object.keys(d).map((x) => [x, Object.hasOwn(v, x) && typeof v[x] === typeof d[x] ? v[x] : d[x]]));
+    } else if (typeof v === typeof d) clean[k] = v;
+  }
+  if (clean.bg) {
+    const b = clean.bg;
+    if (!['preset', 'gradient'].includes(b.kind)) b.kind = 'preset';
+    if (!BACKGROUNDS.some((x) => x.id === b.preset)) b.preset = DEFAULTS.bg.preset;
+    const colors = Array.isArray(src.bg.colors) ? src.bg.colors : [];
+    b.colors = colors.length >= 3 ? colors.slice(0, 3).map((c) => (HEX.test(c) ? c : '#000000')) : [...DEFAULTS.bg.colors];
+    b.angle = cleanAngle(b.angle);
+    if (!GRADIENT_STYLES.includes(b.style)) b.style = DEFAULTS.bg.style;
+  }
+  if (clean.layout) {
+    const valid = ['rail', 'sidebar', 'main', 'panel'];
+    const order = Array.isArray(src.layout.order) ? src.layout.order : [];
+    clean.layout.order = order.length === 4 && valid.every((x) => order.includes(x)) ? [...order] : [...DEFAULTS.layout.order];
+  }
+  return clean;
+}
+// Accepts what exportAppearance made. Returns false if the file isn't a Hearth look.
 export function importAppearance(data) {
   const src = data && data.hearthAppearance && data.settings;
   if (!src || typeof src !== 'object') return false;
-  const clean = {};
-  for (const k of Object.keys(DEFAULTS)) {
-    if (!(k in src)) continue;
-    const v = src[k];
-    const d = DEFAULTS[k];
-    if (d && typeof d === 'object' && !Array.isArray(d)) { if (v && typeof v === 'object' && !Array.isArray(v)) clean[k] = { ...d, ...v }; }
-    else if (typeof v === typeof d) clean[k] = v;
-  }
-  if (clean.bg) {
-    if (!['preset', 'gradient'].includes(clean.bg.kind)) clean.bg.kind = 'preset';
-    if (!Array.isArray(clean.bg.colors) || clean.bg.colors.length < 3) clean.bg.colors = [...DEFAULTS.bg.colors];
-    clean.bg.colors = clean.bg.colors.slice(0, 3).map((c) => (HEX.test(c) ? c : '#000000'));
-  }
+  const clean = cleanAppearance(src);
   const current = loadAppearance();
   saveAppearance({ ...clean, bg: clean.bg ? clean.bg : current.bg.kind === 'image' ? current.bg : DEFAULTS.bg });
   return true;
@@ -133,15 +149,20 @@ function luminance(hex) {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
+// Gradient angles go into CSS: always a whole number of degrees (a look saved before this check, or a
+// hand-made file, could hold any text there).
+const GRADIENT_STYLES = ['linear', 'radial', 'mesh', 'conic'];
+const cleanAngle = (a) => { const n = Number(a); return Number.isFinite(n) ? Math.round(Math.min(360, Math.max(0, n))) : DEFAULTS.bg.angle; };
 export function gradientCss(bg) {
   const colors = (bg.three ? bg.colors.slice(0, 3) : bg.colors.slice(0, 2)).map((c) => (HEX.test(c) ? c : '#000000'));
+  const angle = cleanAngle(bg.angle);
   if (bg.style === 'radial') return `radial-gradient(circle at 30% 20%, ${colors.join(', ')})`;
-  if (bg.style === 'conic') return `conic-gradient(from ${bg.angle}deg at 50% 50%, ${colors.join(', ')}, ${colors[0]})`;
+  if (bg.style === 'conic') return `conic-gradient(from ${angle}deg at 50% 50%, ${colors.join(', ')}, ${colors[0]})`;
   if (bg.style === 'mesh') {
     const [a, b, c = colors[0]] = colors;
     return `radial-gradient(55% 55% at 15% 20%, ${a}cc, transparent 70%), radial-gradient(55% 55% at 85% 30%, ${b}aa, transparent 70%), radial-gradient(60% 60% at 50% 100%, ${c}99, transparent 70%), rgb(var(--bg))`;
   }
-  return `linear-gradient(${bg.angle}deg, ${colors.join(', ')})`;
+  return `linear-gradient(${angle}deg, ${colors.join(', ')})`;
 }
 
 // What the background layer should paint for these settings (image URL handled separately).

@@ -65,7 +65,9 @@ import java.util.Set;
  *  - self-signed certificates: asks once, shows the fingerprint, remembers that exact certificate
  *  - notifications while the app is open or in the background, and saving files to Downloads
  *  - links to other sites open in the browser; only your server (and the connect screen) load in the app
- * The page talks to this code through window.HearthAndroid, which exists only on your server's own pages.
+ * The page talks to this code through window.HearthAndroid, which exists only on your server's own pages
+ * and the connect screen; BridgePolicy decides which of them may send what (only the connect screen may
+ * change the server).
  */
 public class MainActivity extends BridgeActivity {
     private static final String PREFS = "hearth";
@@ -247,6 +249,9 @@ public class MainActivity extends BridgeActivity {
         try {
             JSONObject m = new JSONObject(message.getData());
             String type = m.optString("type");
+            // Who sent it decides what it may do: only the connect screen may change the saved server.
+            String from = sourceOrigin == null ? "" : originOf(sourceOrigin.toString());
+            if (!BridgePolicy.allowed(type, from, localOrigin(), serverOrigin())) return;
             switch (type) {
                 case "hello": reply.postMessage(info().toString()); break;
                 case "setServer": {

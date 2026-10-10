@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>Choose what to share</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; background: #100e16; color: #ede9f5; font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+    header { padding: 18px 20px 6px; }
+    h1 { font-size: 18px; margin: 0 0 4px; overflow-wrap: anywhere; }
+    p { margin: 0; color: #b6afc6; font-size: 13px; }
+    main { flex: 1; overflow: auto; padding: 8px 20px 12px; }
+    h2 { font-size: 13px; font-weight: 600; color: #b6afc6; margin: 14px 0 8px; text-transform: uppercase; letter-spacing: .04em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+    button.src { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: 12px; border: 2px solid transparent; background: #1a1724; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+    button.src:hover { background: #221e2e; }
+    button.src:focus-visible, button.src.on { border-color: #f2a541; outline: none; }
+    button.src img { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #000; border-radius: 8px; }
+    button.src span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+    footer { display: flex; gap: 10px; justify-content: flex-end; align-items: center; padding: 12px 20px 16px; border-top: 1px solid rgba(255,255,255,.08); }
+    footer .hint { margin-right: auto; color: #847c97; font-size: 12.5px; }
+    footer button { height: 38px; padding: 0 18px; border: 0; border-radius: 10px; font: 600 14px system-ui, sans-serif; cursor: pointer; }
+    #cancel { background: rgba(255,255,255,.08); color: #ede9f5; }
+    #share { background: #f2a541; color: #1a1407; }
+    #share:disabled { opacity: .5; cursor: default; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">Share your screen</h1>
+    <p>Pick a screen or a window. Nothing is shared until you press Share.</p>
+  </header>
+  <main id="list"></main>
+  <footer>
+    <span class="hint" id="audio"></span>
+    <button id="cancel" type="button">Cancel</button>
+    <button id="share" type="button" disabled>Share</button>
+  </footer>
+  <script>
+    // Built with textContent and data: previews only: window titles are whatever other programs call them.
+    const P = window.hearthPicker;
+    const $ = (id) => document.getElementById(id);
+    let chosen = null;
+    const answer = (id) => { P.choose(id); };
+    function card(src) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'src';
+      const img = document.createElement('img');
+      img.alt = '';
+      if (/^data:image\/(png|jpeg);base64,/.test(src.thumb || '')) img.src = src.thumb;
+      const name = document.createElement('span');
+      name.textContent = src.name || (src.screen ? 'Screen' : 'Window');
+      b.title = name.textContent;
+      b.append(img, name);
+      b.addEventListener('click', () => {
+        document.querySelectorAll('button.src.on').forEach((x) => x.classList.remove('on'));
+        b.classList.add('on'); chosen = src.id; $('share').disabled = false;
+      });
+      b.addEventListener('dblclick', () => answer(src.id));
+      return b;
+    }
+    function section(title, list) {
+      if (!list.length) return;
+      const h = document.createElement('h2'); h.textContent = title;
+      const g = document.createElement('div'); g.className = 'grid';
+      list.forEach((s) => g.append(card(s)));
+      $('list').append(h, g);
+    }
+    P.onSources(({ host, audio, sources }) => {
+      $('title').textContent = host ? `${host} wants to see your screen` : 'Share your screen';
+      $('audio').textContent = audio ? 'Your computer’s sound is shared too.' : '';
+      const list = Array.isArray(sources) ? sources : [];
+      section('Screens', list.filter((s) => s.screen));
+      section('Windows', list.filter((s) => !s.screen));
+      const first = document.querySelector('button.src');
+      if (first) first.focus();
+    });
+    $('share').addEventListener('click', () => { if (chosen) answer(chosen); });
+    $('cancel').addEventListener('click', () => answer(null));
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') answer(null); });
+  </script>
+</body>
+</html>
