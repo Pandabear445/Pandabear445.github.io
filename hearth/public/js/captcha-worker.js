@@ -48,6 +48,8 @@ function solve(salt, difficulty, report) {
   return -1;
 }
 self.onmessage = (e) => {
+  // Only the page that started this worker can message it (those messages carry no origin); anything else is ignored.
+  if (e.origin && e.origin !== self.location.origin) return;
   const { salt, difficulty } = e.data;
   const nonce = solve(salt, difficulty, (progress) => self.postMessage({ progress }));
   self.postMessage({ nonce });

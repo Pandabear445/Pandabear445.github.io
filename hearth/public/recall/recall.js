@@ -26,6 +26,8 @@ const safeLang = l => typeof l === 'string' && /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}
 const txt = (s, n = 20000) => (typeof s === 'string' ? s : s == null ? '' : String(s)).slice(0, n);
 const num = (v, d = 0) => Number.isFinite(+v) ? +v : d;
 const word = (v, d = '') => typeof v === 'string' && /^[\w.:-]{0,40}$/.test(v) ? v : d;
+// Removes HTML tags from pasted text, again and again until none are left ("<<b>i>" leaves no "<i>" behind).
+const stripTags = s => { let prev; do { prev = s; s = s.replace(/<[^>]+>/g, ''); } while (s !== prev); return s; };
 function cleanOpts(o){ const r = {}; if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) { if (!/^\w{1,30}$/.test(k)) continue; if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) r[k] = v; else if (typeof v === 'string' && /^[\w.:-]{0,40}$/.test(v)) r[k] = v; } return r; }
 function cleanCard(c){
   if (!c || typeof c !== 'object') return null;
@@ -42,21 +44,25 @@ function cleanDeck(d){
     examDate:typeof d.examDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d.examDate) ? d.examDate : '', termLang:safeLang(d.termLang), defLang:safeLang(d.defLang),
     createdAt:num(d.createdAt, Date.now()), updatedAt:num(d.updatedAt), opts:cleanOpts(d.opts), cards };
 }
-function cleanProfile(p){
-  p = { ...defaultProfile(), ...(p && typeof p === 'object' ? p : {}) };
+function cleanProfile(src){
+  // A new object with only the known fields, each checked, so nothing else in the saved data comes along.
+  const p = src && typeof src === 'object' ? src : {}, def = defaultProfile();
   const ids = a => Array.isArray(a) ? a.filter(x => typeof x === 'string' && ID_RE.test(x)) : [];
   const nums = o => { const r = {}; if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) if (/^[\w-]{1,40}$/.test(k) && Number.isFinite(+v)) r[k] = +v; return r; };
-  p.courses = (Array.isArray(p.courses) ? p.courses : []).filter(c => c && typeof c === 'object').slice(0, 200)
-    .map(c => ({ id:safeId(c.id), name:txt(c.name, 60).replace(/[<>&"'`]/g, ''), color:safeColor(c.color) }));
-  p.activity = nums(p.activity); p.best = nums(p.best);
-  p.theme = ['auto','light','dark'].includes(p.theme) ? p.theme : 'auto';
-  p.homeCourse = typeof p.homeCourse === 'string' && ID_RE.test(p.homeCourse) ? p.homeCourse : '';
-  p.lastDay = typeof p.lastDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(p.lastDay) ? p.lastDay : null;
-  for (const k of ['streak','xp','goal','newPerDay','focus','updatedAt','lastBackup']) if (k in p) p[k] = num(p[k], defaultProfile()[k] || 0);
-  p.newToday = { day:word(p.newToday?.day), n:num(p.newToday?.n) };
-  p.deleted = ids(p.deleted).slice(-200);
-  if (p.combo) p.combo = { decks:ids(p.combo.decks), filter:word(p.combo.filter, 'all'), front:p.combo.front === 'def' ? 'def' : 'term' };
-  return p;
+  const out = {
+    activity:nums(p.activity), streak:num(p.streak, def.streak),
+    lastDay:typeof p.lastDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(p.lastDay) ? p.lastDay : null,
+    xp:num(p.xp, def.xp), best:nums(p.best), goal:num(p.goal, def.goal), newPerDay:num(p.newPerDay, def.newPerDay),
+    newToday:{ day:word(p.newToday?.day), n:num(p.newToday?.n) }, deleted:ids(p.deleted).slice(-200),
+    theme:['auto','light','dark'].includes(p.theme) ? p.theme : 'auto', seedCleared:p.seedCleared !== false,
+    courses:(Array.isArray(p.courses) ? p.courses : []).filter(c => c && typeof c === 'object').slice(0, 200)
+      .map(c => ({ id:safeId(c.id), name:txt(c.name, 60).replace(/[<>&"'`]/g, ''), color:safeColor(c.color) })),
+    homeCourse:typeof p.homeCourse === 'string' && ID_RE.test(p.homeCourse) ? p.homeCourse : '',
+    focus:num(p.focus, def.focus), updatedAt:num(p.updatedAt, def.updatedAt),
+  };
+  if ('lastBackup' in p) out.lastBackup = num(p.lastBackup);
+  if (p.combo) out.combo = { decks:ids(p.combo.decks), filter:word(p.combo.filter, 'all'), front:p.combo.front === 'def' ? 'def' : 'term' };
+  return out;
 }
 function cleanState(s){
   const seen = new Set();
@@ -921,8 +927,8 @@ function parseText(text, sep){
     let s = sep, i = r.indexOf(s);
     if (i < 0 && s === '\t'){ for (const alt of [' - ', ',', ':']){ i = r.indexOf(alt); if (i >= 0){ s = alt; break; } } }
     if (i < 0){ const cz = cloze(r); return cz ? newCard(r, '') : null; }
-    const t = r.slice(0, i).trim().replace(/^"|"$/g,''), df = r.slice(i + s.length).trim().replace(/^"|"$/g,'').replace(/""/g,'"').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
-    return t && df ? newCard(t.replace(/<[^>]+>/g, ''), df) : null;
+    const t = r.slice(0, i).trim().replace(/^"|"$/g,''), df = r.slice(i + s.length).trim().replace(/^"|"$/g,'').replace(/""/g,'"').replace(/<br\s*\/?>/gi, '\n');
+    return t && df ? newCard(stripTags(t), stripTags(df)) : null;
   }).filter(Boolean);
 }
 function restoreBackup(text){

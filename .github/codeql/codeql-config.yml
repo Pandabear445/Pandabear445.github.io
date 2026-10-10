@@ -1,0 +1,20 @@
+# CodeQL settings for the "codeql" job in workflows/hearth-security.yml.
+name: Hearth CodeQL config
+
+queries:
+  - uses: security-extended
+
+# What's scanned is the code that runs in a Hearth server, its apps and the site. The test suites and the
+# CI-only drills are left out: they deliberately read files and send them to a throwaway local server, use
+# fixed passwords, and so on, which is what these rules look for in real code.
+paths-ignore:
+  - hearth/test
+  - hearth/scripts/*-drill.js
+
+query-filters:
+  # Hearth rate-limits with its own limiter (rateLimit() in hearth/server/index.js): every signed-in request
+  # counts toward a per-account ceiling in auth(), bots have their own in botAuth(), and the routes that work
+  # without signing in limit themselves (sign-in, sign-up, password reset, media proxies, webhooks). This rule
+  # only recognises a few npm rate-limiting packages, so it reported every route as unlimited.
+  - exclude:
+      id: js/missing-rate-limiting

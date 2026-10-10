@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
+const { readOrCreate } = require('./secretfile');
 
 const MAGIC = Buffer.from('HEARTHBK1\n');
 const CHUNK = 1 << 20;
@@ -29,8 +30,7 @@ function loadKey(dataDir) {
     return Buffer.from(process.env.BACKUP_KEY, 'hex');
   }
   const file = path.join(dataDir, 'backup.key');
-  if (!fs.existsSync(file)) fs.writeFileSync(file, crypto.randomBytes(32).toString('hex') + '\n', { mode: 0o600 });
-  return Buffer.from(fs.readFileSync(file, 'utf8').trim(), 'hex');
+  return Buffer.from(readOrCreate(file, () => crypto.randomBytes(32).toString('hex') + '\n').trim(), 'hex');
 }
 const fileKey = (master, salt) => Buffer.from(crypto.hkdfSync('sha256', master, salt, 'hearth-backup-v1', 32));
 const nonceFor = (prefix, n, last) => { const b = Buffer.alloc(12); prefix.copy(b, 0); b.writeUInt32BE(n, 7); b[11] = last ? 1 : 0; return b; };

@@ -4,6 +4,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const log = require('./log');
+const { readOrCreate } = require('./secretfile');
 
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
@@ -260,11 +261,8 @@ const KEY_FILE = path.join(DATA_DIR, 'secret.key');
 let atRestKey;
 if (process.env.AT_REST_KEY) {
   atRestKey = Buffer.from(process.env.AT_REST_KEY, 'hex');
-} else if (fs.existsSync(KEY_FILE)) {
-  atRestKey = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
 } else {
-  atRestKey = crypto.randomBytes(32);
-  fs.writeFileSync(KEY_FILE, atRestKey.toString('hex'), { mode: 0o600 });
+  atRestKey = Buffer.from(readOrCreate(KEY_FILE, () => crypto.randomBytes(32).toString('hex')).trim(), 'hex');
 }
 if (atRestKey.length !== 32) throw new Error('At-rest key must be 32 bytes (64 hex chars).');
 

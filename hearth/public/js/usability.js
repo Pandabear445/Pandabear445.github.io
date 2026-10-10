@@ -8,28 +8,32 @@ const DRAFT_MAX = 200;
 const DRAFT_AGE = 30 * 86400000;
 export function createDrafts(userId) {
   const key = `hearth.drafts.${userId}`;
-  let all = {};
-  try { all = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch { all = {}; }
+  // Kept in a Map (conversation key -> { t, at }), so no key can clash with an object's built-in properties.
+  const load = (text) => {
+    try { const o = JSON.parse(text || '{}'); return new Map(o && typeof o === 'object' ? Object.entries(o) : []); } catch { return null; }
+  };
+  const stored = () => JSON.stringify(Object.fromEntries(all));
+  let all;
+  try { all = load(localStorage.getItem(key)) || new Map(); } catch { all = new Map(); }
   const cutoff = Date.now() - DRAFT_AGE;
-  for (const [k, v] of Object.entries(all)) if (!v || typeof v.t !== 'string' || !(v.at > cutoff)) delete all[k];
+  for (const [k, v] of all) if (!v || typeof v.t !== 'string' || !(v.at > cutoff)) all.delete(k);
   let timer = 0;
   const save = () => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      const keep = Object.entries(all).sort((a, b) => b[1].at - a[1].at).slice(0, DRAFT_MAX);
-      all = Object.fromEntries(keep);
-      try { if (keep.length) localStorage.setItem(key, JSON.stringify(all)); else localStorage.removeItem(key); } catch { /* full or blocked */ }
+      all = new Map([...all].sort((a, b) => b[1].at - a[1].at).slice(0, DRAFT_MAX));
+      try { if (all.size) localStorage.setItem(key, stored()); else localStorage.removeItem(key); } catch { /* full or blocked */ }
     }, 300);
   };
   // Another tab typed somewhere: pick it up so the next conversation switch shows it.
-  window.addEventListener('storage', (e) => { if (e.key === key) { try { all = JSON.parse(e.newValue || '{}') || {}; } catch { /* keep ours */ } } });
+  window.addEventListener('storage', (e) => { if (e.key === key) all = load(e.newValue) || all; });
   return {
-    get: (k) => (all[k] ? all[k].t : ''),
-    set(k, t) { if (t) all[k] = { t: String(t).slice(0, 4000), at: Date.now() }; else delete all[k]; save(); },
-    delete(k) { delete all[k]; save(); },
-    entries: () => Object.entries(all).map(([k, v]) => [k, v.t]),
-    flush() { clearTimeout(timer); try { localStorage.setItem(key, JSON.stringify(all)); } catch { /* ignore */ } },
-    clear() { all = {}; clearTimeout(timer); try { localStorage.removeItem(key); } catch { /* ignore */ } },
+    get: (k) => (all.has(k) ? all.get(k).t : ''),
+    set(k, t) { if (t) all.set(k, { t: String(t).slice(0, 4000), at: Date.now() }); else all.delete(k); save(); },
+    delete(k) { all.delete(k); save(); },
+    entries: () => [...all].map(([k, v]) => [k, v.t]),
+    flush() { clearTimeout(timer); try { localStorage.setItem(key, stored()); } catch { /* ignore */ } },
+    clear() { all = new Map(); clearTimeout(timer); try { localStorage.removeItem(key); } catch { /* ignore */ } },
   };
 }
 export const clearAllDrafts = () => {

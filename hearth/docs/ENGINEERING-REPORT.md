@@ -617,3 +617,46 @@ implementer). Benchmark, 200,000 messages: one page in 4–12 ms (p50), a 1,000-
 - Bots against third-party services.
 - Exports larger than a test account.
 - Media end-to-end encryption, which is designed in `docs/VOICE.md` but not built.
+
+## 12. Code scanning cleanup (1.28.1)
+
+CodeQL (`security-extended`, the same queries as CI) was run locally on 1.28.0 with the CodeQL CLI. It reported
+493 results: 437 `js/missing-rate-limiting` and 56 others. Each was traced from source to sink.
+
+- **Fixed in code (32):**
+  - Uploaded-file paths go through `uploadPath()`, which resolves the stored name inside the uploads folder and
+    refuses anything else. This covers multer's paths, `/uploads/:file`, emoji and the GIF library.
+  - Secret files (`secret.key`, `backup.key`, `vapid.json`) are created exclusively (`server/secretfile.js`), so
+    two processes starting at once can't end up with different keys. The self-signed certificate is read once
+    rather than checked and then read.
+  - The static file packer and `doctor`'s read-only open read through one open file, so the date or size they
+    checked is the file they read.
+  - Profile CSS drops every `<` while it is cleaned.
+  - Recall's tag stripping repeats until nothing changes. Recall's saved profile is rebuilt from known, checked
+    fields instead of copied.
+  - Client code:
+    - Ids taken from the address bar are encoded in API paths.
+    - Drafts and the last-channel memory are kept in Maps.
+    - The admin page lookup checks it found a function.
+    - The service worker and captcha worker check where a message came from.
+  - The service worker script is sent with an explicit JavaScript `Content-Type`.
+  - Regression tests: `test/scan-hardening.test.js`.
+- **Left out of the scan (19, test and drill code):** CodeQL now skips `hearth/test` and
+  `hearth/scripts/*-drill.js` (`.github/codeql/codeql-config.yml`). That code never runs in a server, and it is
+  meant to read files and send them to a throwaway local server.
+- **Rule turned off (437):** `js/missing-rate-limiting`. It only recognises a few npm packages, so it reported
+  every route, including ones that call Hearth's own `rateLimit()`. Two changes stand behind turning it off:
+  - What was really missing was a limit for ordinary signed-in requests. That limit is now in `auth()`:
+    `API_RATE_LIMIT`, 1200 a minute per account by default (SECURITY.md row 91).
+  - Bots already had their own limit, and the routes that work without signing in limit themselves.
+- **By design (5), to dismiss on GitHub with these reasons:**
+  - `js/weak-cryptographic-algorithm`: TURN REST credentials are HMAC-SHA1 because coturn requires it.
+    HMAC-SHA1 is not a broken MAC.
+  - `js/request-forgery`: the GIF media proxy. The host is checked against an allow-list, and checked again on
+    every redirect.
+  - `js/http-to-file-access`: `MAIL_OUTBOX_DIR`, the test-only mail sink.
+  - `js/user-controlled-bypass` (×2): heuristic matches. The "sensitive action" is storing a reset token the user
+    pasted, or rendering a message.
+
+Verified locally by a fresh CodeQL database and analysis of the working tree: nothing left beyond the 5 above and
+the turned-off rule. On GitHub, alerts close when the CodeQL job runs on the default branch with these changes.

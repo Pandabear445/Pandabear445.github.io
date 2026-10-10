@@ -141,6 +141,7 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 88 | Health checks leak internals, or a background job takes the server down | `/api/health/live` and `/ready` say only ok/degraded/fail and short codes; `/api/admin/health` is for instance admins. Job errors are caught, recorded and alerted, never fatal; a client hanging up mid-request can't crash the access log | `observability.test.js` |
 | 89 | Someone takes over a dropped call place | Rejoining a call after a dropped connection only works from the same session, within the grace window, re-checks permissions, and ends as soon as that session is signed out | `voice-reliability.test.js` |
 | 90 | The server slips an unlisted listener into a call | The app warns when it has a live call connection to someone the server never listed, and closes connections to people it stops listing after 20 s. A server that lists the extra participant openly is not detected (§4) | `voice-reliability.test.js`, `npm run test:voice` › hidden listener |
+| 91 | One account floods the server with ordinary requests | Every signed-in request counts toward a per-account ceiling (1200 a minute by default, `API_RATE_LIMIT`), on top of the tighter limits on sign-in, uploads, messages and the other sensitive routes. Bots have their own ceiling, and the routes that work without signing in limit themselves. Logging out is never refused | `scan-hardening.test.js` › per-account ceiling |
 
 ## 4. What each adversary can still do (honest limits)
 
@@ -302,7 +303,7 @@ Internet ─► VPS firewall (ufw: 22, 80, 443, relay ports) ─► Caddy (HTTPS
   - `npm audit` (fails on high or critical in server dependencies);
   - gitleaks over the full git history;
   - a Trivy scan of the Docker image (fails on fixable high or critical) and of its configuration;
-  - CodeQL.
+  - CodeQL (`security-extended`; `.github/codeql/codeql-config.yml` says what's left out and why).
 - **Release workflow** (`hearth-apps.yml`): read-only token for every job except the one that creates the GitHub
   release; Android installs exactly what its `package-lock.json` lists; installers reach people's apps only from `app-v*` tags and the default branch; the server copy needs a
   pinned host key.

@@ -496,6 +496,7 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `MAIL_FROM` | — | Email for password resets (or set it in Admin → Owner → Email) |
 | `PUBLIC_URL` | — | This server's public address, used in reset links |
 | `SESSION_IDLE_DAYS` / `SESSION_MAX_DAYS` | `60` / `365` | A device is signed out after this many days unused / after this many days in total |
+| `API_RATE_LIMIT` | `1200` | Requests a minute one signed-in account can make in all (the sensitive routes have tighter limits of their own); `0` turns it off |
 | `BACKUP_KEY` | `data/backup.key` | 64 hex characters: the key encrypted backups use (made automatically if not set) |
 | `BACKUP_RCLONE_REMOTE` | — | Copy every encrypted backup off-site with rclone, e.g. `b2:my-bucket/hearth` |
 | `HEARTH_BIND` | all interfaces | Docker only: the address port 3000 listens on. Set `127.0.0.1` behind Caddy |

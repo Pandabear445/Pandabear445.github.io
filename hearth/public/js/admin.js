@@ -76,7 +76,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     const page = tab === 'security' ? secSub : tab;
-    ({ overview, online, reports, users, servers, bots, security, storage, broadcast, admins, registration, log, regions, health: healthPage, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    const pages = new Map(Object.entries({ overview, online, reports, users, servers, bots, security, storage, broadcast, admins, registration, log, regions, health: healthPage, money, owner }));
+    const show = pages.get(page);
+    (typeof show === 'function' ? show : overview)().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
   // Security's sub-tabs stay on top of whichever page is showing (pages redraw the body themselves).
   const subBar = h('div', { class: 'set-subtabs admin-subtabs', role: 'tablist' });
