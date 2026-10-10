@@ -1,0 +1,161 @@
+# Security checks for the Hearth server.
+#   Runs on every push and pull request that changes hearth/ or .github/, every Monday (new vulnerabilities
+#   get published all the time, even when the code doesn't change), and from the Actions tab ("Run workflow").
+#   - tests:   Hearth's test suite (npm test).
+#   - audit:   known vulnerabilities in the server's npm dependencies (fails on high/critical).
+#   - secrets: gitleaks over the whole git history (passwords, API keys, private keys committed by mistake).
+#   - image:   builds the Docker image and scans it with Trivy (fails on fixable high/critical), plus a
+#              configuration check of the Dockerfile and docker-compose.yml (report only).
+#   - codeql:  GitHub's code analysis for JavaScript; findings show under Security → Code scanning.
+# Third-party actions are pinned to exact commits (the comment says which version); Dependabot updates them.
+name: Hearth security
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'hearth/**'
+      - '.github/**'
+  pull_request:
+    paths:
+      - 'hearth/**'
+      - '.github/**'
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+# Least privilege: every job can only read the code unless it says otherwise.
+permissions:
+  contents: read
+
+concurrency:
+  group: hearth-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    # The tests start real servers; they take a few minutes.
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: hearth
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hearth/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Server dependencies (fails on high or critical)
+        working-directory: hearth
+        run: npm audit --omit=dev --audit-level=high
+      - name: Desktop app dependencies (report only; build tooling)
+        working-directory: hearth/desktop
+        continue-on-error: true
+        run: npm audit --omit=dev --audit-level=high
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz. Pinned here (not only read from the release), so a
+      # replaced release file is caught too. When updating: take it from the release's checksums.txt.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the whole history, not just the latest commit
+          persist-credentials: false
+      - name: Install gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tarball" "$base/$tarball"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/checksums.txt" "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep -qx "${GITLEAKS_SHA256}  ${tarball}" "$RUNNER_TEMP/checksums.txt" \
+            || { echo "::error::Pinned checksum doesn't match the release's checksums.txt"; exit 1; }
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+      - name: Scan the full git history
+        run: |
+          # --redact: never print the secret itself into the (public) log. A finding fails the job.
+          # False positives: add them to .gitleaks.toml (allowlist) or put "gitleaks:allow" on that line.
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --verbose --exit-code 1 .
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Docker Hub rate-limits shared CI runners (429 Too Many Requests). Fetch the base image first,
+      # retrying with backoff and falling back to Google's Docker Hub mirror, then build from that copy.
+      - name: Fetch the base image
+        run: |
+          base=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' hearth/Dockerfile | head -n1)
+          for wait in 0 10 30 60; do
+            sleep "$wait"
+            docker pull "$base" && exit 0
+            docker pull "mirror.gcr.io/library/$base" && docker tag "mirror.gcr.io/library/$base" "$base" && exit 0
+          done
+          exit 1
+      - name: Build the Docker image
+        run: docker build -t hearth:ci hearth
+      - name: Scan the image (fails on fixable high/critical)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: hearth:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '1'
+      - name: Check Dockerfile and docker-compose.yml settings (report only)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: hearth
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: '0'
+          trivyignores: hearth/.trivyignore # intentional findings, each with its reason
+
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # to upload the results to Security → Code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: /language:javascript-typescript

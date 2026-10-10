@@ -1,0 +1,9 @@
+{
+  "appName": "Hearth",
+  "appId": "app.hearth.desktop",
+  "defaultServer": "https://kappachat.duckdns.org",
+  "lockServer": false,
+  "closeToTray": true,
+  "autoUpdate": true,
+  "trustedSelfSignedHosts": []
+}

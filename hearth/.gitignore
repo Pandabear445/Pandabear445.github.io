@@ -1,0 +1,26 @@
+node_modules/
+*.log
+desktop/node_modules/
+desktop/dist/
+
+# Server data and secrets: never commit these.
+data/
+data-backup*/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.keystore
+*.jks
+# Databases and backups (Hearth backups: *.hbk)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.hbk
+*.bak

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#100e16">
+  <title>Get the app</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/css/app.css">
+  <style>
+    body { overflow: auto; background: radial-gradient(60% 50% at 50% 0%, rgb(var(--accent-rgb) / .14), transparent 70%), rgb(var(--bg)); }
+    .dl { max-width: 760px; margin: 0 auto; padding: 56px 20px 64px; display: flex; flex-direction: column; gap: 28px; }
+    .dl-head { display: flex; align-items: center; gap: 16px; }
+    .dl-head img { width: 64px; height: 64px; border-radius: 16px; }
+    .dl-head h1 { font-size: 30px; font-weight: 800; }
+    .dl-head p { margin: 4px 0 0; color: var(--text-2); }
+    .dl-main { padding: 22px; border-radius: 20px; background: rgb(var(--s1)); border: 1px solid var(--line-2); display: flex; flex-direction: column; gap: 14px; }
+    .dl-main h2 { font-size: 20px; }
+    .dl-main .btn { height: 46px; font-size: 15px; padding: 0 20px; }
+    .dl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+    .dl-card { padding: 16px; border-radius: 16px; background: rgb(var(--s1)); border: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+    .dl-card h3 { font-size: 15px; font-family: var(--font); }
+    .dl-card p, .dl-card li { color: var(--text-2); font-size: 13.5px; margin: 0; }
+    .dl-card ol { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+    .dl-files { display: flex; flex-direction: column; gap: 6px; }
+    .dl-files a { display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: 10px; background: var(--hover); color: var(--text); font-size: 13.5px; font-weight: 600; }
+    .dl-files a span { color: var(--muted); font-weight: 500; }
+    .dl-note { color: var(--muted); font-size: 13px; }
+    .row-btns { display: flex; gap: 10px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <main class="dl">
+    <header class="dl-head">
+      <img src="/icons/icon-192.png" alt="">
+      <div><h1 data-name>Hearth</h1><p>Private chat, voice and communities — end-to-end encrypted.</p></div>
+    </header>
+    <section class="dl-main" id="primary"></section>
+    <section>
+      <div class="dl-grid" id="all"></div>
+    </section>
+    <p class="dl-note">Already have an account? <a href="/">Open in your browser</a>. Your messages are encrypted on your device, whichever app you use.</p>
+  </main>
+  <script type="module" src="/js/download-page.js"></script>
+</body>
+</html>

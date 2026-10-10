@@ -1,0 +1,655 @@
+// Hearth desktop: a secure window onto your Hearth server, with tray, badge, notifications and auto-start.
+// All chat code (including end-to-end encryption) runs from your server exactly as in the browser.
+const {
+  app, BrowserWindow, Menu, Tray, shell, session, ipcMain, nativeImage, dialog, net, desktopCapturer, powerMonitor,
+  screen, clipboard, Notification,
+} = require('electron');
+const path = require('path');
+const fs = require('fs');
+const CONFIG = require('./hearth.config.json');
+
+const APP_NAME = CONFIG.appName || 'Hearth';
+const IS_MAC = process.platform === 'darwin';
+const IS_WIN = process.platform === 'win32';
+const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
+let settings = {};
+try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) || {}; } catch { /* first run */ }
+let saveTimer = null;
+const writeSettings = () => { clearTimeout(saveTimer); saveTimer = null; try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch { /* ignore */ } };
+// Window moves fire many times a second: write at most twice a second (and always on quit).
+const saveSettings = (soon) => { if (soon) { if (!saveTimer) saveTimer = setTimeout(writeSettings, 500); } else writeSettings(); };
+
+// Hardware acceleration can only be switched off before the app is ready (Settings → Apps & devices,
+// for the rare graphics driver that shows a black or flickering window). Takes effect after a restart.
+const HW_ACCEL_AT_START = settings.hardwareAcceleration !== false;
+if (!HW_ACCEL_AT_START) app.disableHardwareAcceleration();
+
+let win = null;
+let tray = null;
+let quitting = false;
+let unread = 0;
+
+const normalize = (u) => {
+  try {
+    const url = new URL(/^https?:\/\//i.test(u) ? u : `https://${u}`);
+    return url.origin;
+  } catch { return null; }
+};
+const serverOrigin = () => normalize((CONFIG.lockServer ? CONFIG.defaultServer : settings.server || CONFIG.defaultServer) || '') || null;
+const onServerPage = () => { const o = serverOrigin(); return !!(win && o && win.webContents.getURL().startsWith(o)); };
+
+// ---------------------------------------------------------------- desktop settings (Settings → Apps & devices)
+const CAN_START_AT_LOGIN = IS_WIN || IS_MAC; // Linux desktops each do this differently
+const closeToTray = () => !IS_MAC && (settings.closeToTray ?? CONFIG.closeToTray ?? true);
+const startHidden = () => !settings.startVisible; // stored the old way so existing choices carry over
+const spellcheckOn = () => settings.spellcheck !== false;
+const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const clampZoom = (z) => { z = Number(z); return Number.isFinite(z) ? Math.min(2, Math.max(0.5, Math.round(z * 100) / 100)) : 1; };
+const zoom = () => clampZoom(settings.zoom ?? 1);
+
+function startAtLogin() {
+  if (!CAN_START_AT_LOGIN) return false;
+  try {
+    // Windows only reports "on" when the arguments match the ones it was turned on with.
+    return app.getLoginItemSettings({ args: ['--hidden'] }).openAtLogin || app.getLoginItemSettings({ args: [] }).openAtLogin;
+  } catch { return false; }
+}
+function applyLoginItem(on) {
+  if (!CAN_START_AT_LOGIN) return;
+  try { app.setLoginItemSettings({ openAtLogin: !!on, args: startHidden() ? ['--hidden'] : [] }); } catch { /* not allowed here */ }
+}
+
+function desktopSettings() {
+  return {
+    startAtLogin: startAtLogin(),
+    startHidden: startHidden(),
+    closeToTray: closeToTray(),
+    hardwareAcceleration: settings.hardwareAcceleration !== false,
+    hardwareAccelerationActive: HW_ACCEL_AT_START, // what this run uses; a change applies after a restart
+    zoom: zoom(),
+    spellcheck: spellcheckOn(),
+    server: serverOrigin(),
+    serverLocked: !!CONFIG.lockServer,
+    version: app.getVersion(),
+    updateReady,
+    platform: process.platform,
+    supports: { startAtLogin: CAN_START_AT_LOGIN, closeToTray: !IS_MAC, updates: updatesSupported() },
+  };
+}
+const settingsChanged = () => { refreshTrayMenu(); sendToPage('desktop-settings', desktopSettings()); };
+
+// Every change goes through here (from the page, the tray menu or a shortcut), so they all stay in step.
+function setDesktopSetting(key, value) {
+  const bool = typeof value === 'boolean';
+  switch (key) {
+    case 'startAtLogin':
+      if (!bool) return { ok: false, error: 'Expected on or off.' };
+      if (!CAN_START_AT_LOGIN) return { ok: false, error: 'Not available on this system.' };
+      applyLoginItem(value);
+      break;
+    case 'startHidden':
+      if (!bool) return { ok: false, error: 'Expected on or off.' };
+      settings.startVisible = !value; saveSettings();
+      if (startAtLogin()) applyLoginItem(true); // re-register with the new arguments
+      break;
+    case 'closeToTray':
+      if (!bool) return { ok: false, error: 'Expected on or off.' };
+      if (IS_MAC) return { ok: false, error: 'Not available on this system.' };
+      settings.closeToTray = value; saveSettings();
+      break;
+    case 'hardwareAcceleration':
+      if (!bool) return { ok: false, error: 'Expected on or off.' };
+      settings.hardwareAcceleration = value; saveSettings();
+      settingsChanged();
+      return { ok: true, restartNeeded: value !== HW_ACCEL_AT_START, settings: desktopSettings() };
+    case 'spellcheck':
+      if (!bool) return { ok: false, error: 'Expected on or off.' };
+      settings.spellcheck = value; saveSettings();
+      try { session.defaultSession.setSpellCheckerEnabled(value); } catch { /* ignore */ }
+      break;
+    case 'zoom':
+      if (typeof value !== 'number' || !Number.isFinite(value)) return { ok: false, error: 'Expected a number.' };
+      settings.zoom = clampZoom(value); saveSettings();
+      applyZoom();
+      break;
+    default:
+      return { ok: false, error: 'Unknown setting.' };
+  }
+  settingsChanged();
+  return { ok: true, settings: desktopSettings() };
+}
+
+function applyZoom() { if (win && !win.isDestroyed()) win.webContents.setZoomFactor(zoom()); }
+function stepZoom(dir) {
+  const z = zoom();
+  const next = dir > 0 ? (ZOOM_STEPS.find((s) => s > z + 0.001) ?? 2) : ([...ZOOM_STEPS].reverse().find((s) => s < z - 0.001) ?? 0.5);
+  setDesktopSetting('zoom', next);
+}
+function openSettings() {
+  showWindow();
+  if (onServerPage()) sendToPage('open-settings');
+}
+function restartApp() {
+  quitting = true;
+  app.relaunch({ args: process.argv.slice(1).filter((a) => a !== '--hidden' && !a.startsWith(`${PROTOCOL}://`)) });
+  app.quit();
+}
+
+// ---------------------------------------------------------------- single instance
+if (!app.requestSingleInstanceLock()) app.quit();
+// hearth:// links (e.g. hearth://invite/abcd2345 from the browser) open here. Windows and Linux pass them on
+// the command line; macOS sends open-url.
+const PROTOCOL = 'hearth';
+if (process.defaultApp && process.argv.length >= 2) app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
+else app.setAsDefaultProtocolClient(PROTOCOL);
+let pendingLink = (process.argv.find((a) => a.startsWith(`${PROTOCOL}://`)) || '');
+function openLink(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return; }
+  if (u.protocol !== `${PROTOCOL}:`) return;
+  const origin = serverOrigin();
+  const parts = `${u.hostname}${u.pathname}`.split('/').filter(Boolean);
+  showWindow();
+  if (!origin || !win) { pendingLink = raw; return; }
+  if (parts[0] === 'invite' && /^[A-Za-z0-9_-]{2,64}$/.test(parts[1] || '')) win.loadURL(`${origin}/invite/${parts[1]}`);
+}
+app.on('second-instance', (e, argv) => {
+  const link = (argv || []).find((a) => a.startsWith(`${PROTOCOL}://`));
+  if (link) openLink(link); else showWindow();
+});
+app.on('open-url', (e, url) => { e.preventDefault(); if (app.isReady()) openLink(url); else pendingLink = url; });
+app.setAppUserModelId(CONFIG.appId || 'app.hearth.desktop');
+
+// ---------------------------------------------------------------- window
+function showWindow() {
+  if (!win) return createWindow();
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+// The saved position, if its title bar is still on a connected screen; otherwise (a monitor was
+// unplugged, or the resolution changed) a normal-sized window in the middle of the main screen.
+const DEFAULT_SIZE = { width: 1280, height: 820 };
+function onScreen(b) {
+  if (!b || ![b.x, b.y, b.width, b.height].every(Number.isFinite)) return null;
+  for (const d of screen.getAllDisplays()) {
+    const a = d.workArea;
+    const across = Math.min(b.x + b.width, a.x + a.width) - Math.max(b.x, a.x);
+    const down = Math.min(b.y + 40, a.y + a.height) - Math.max(b.y, a.y); // the title bar
+    if (across >= 120 && down >= 20) return { ...b, width: Math.min(b.width, a.width), height: Math.min(b.height, a.height) };
+  }
+  return null;
+}
+function centeredOnPrimary(size = DEFAULT_SIZE) {
+  const a = screen.getPrimaryDisplay().workArea;
+  const width = Math.min(size.width || DEFAULT_SIZE.width, a.width);
+  const height = Math.min(size.height || DEFAULT_SIZE.height, a.height);
+  return { width, height, x: Math.round(a.x + (a.width - width) / 2), y: Math.round(a.y + (a.height - height) / 2) };
+}
+function keepOnScreen() {
+  if (!win || win.isDestroyed() || win.isMaximized() || win.isFullScreen()) return;
+  if (!onScreen(win.getBounds())) win.setBounds(centeredOnPrimary(win.getBounds()));
+}
+
+function createWindow() {
+  const saved = settings.bounds || null;
+  const b = onScreen(saved) || centeredOnPrimary(saved || DEFAULT_SIZE);
+  win = new BrowserWindow({
+    width: b.width, height: b.height, x: b.x, y: b.y,
+    minWidth: 900, minHeight: 580, show: false, title: APP_NAME,
+    backgroundColor: '#100e16', autoHideMenuBar: true,
+    icon: path.join(__dirname, 'build', 'icon.png'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true,
+      spellcheck: spellcheckOn(), zoomFactor: zoom(),
+    },
+  });
+  if (settings.maximized) win.maximize();
+  const openedAtLogin = IS_MAC && startHidden() && (() => { try { return app.getLoginItemSettings().wasOpenedAtLogin; } catch { return false; } })();
+  win.once('ready-to-show', () => { if (!process.argv.includes('--hidden') && !openedAtLogin) win.show(); });
+
+  const remember = () => {
+    if (!win || win.isMinimized() || win.isFullScreen()) return;
+    settings.maximized = win.isMaximized();
+    if (!settings.maximized) settings.bounds = win.getBounds();
+    saveSettings(true);
+  };
+  win.on('resize', remember);
+  win.on('move', remember);
+  win.on('focus', () => win.flashFrame(false));
+  win.on('close', (e) => {
+    remember();
+    if (!quitting && (closeToTray() || IS_MAC)) {
+      e.preventDefault();
+      win.hide();
+      if (!IS_MAC) trayHintOnce();
+    }
+  });
+  win.on('closed', () => { win = null; });
+  // A reload or a new page starts outside any call until the page says otherwise. The server being down
+  // behind a proxy (Caddy answers 502 while Hearth restarts) gets the "can't reach" screen too.
+  win.webContents.on('did-navigate', (e, url, code) => {
+    call = { inCall: false, muted: false, deafened: false }; drawThumbar();
+    applyZoom();
+    const origin = serverOrigin();
+    if (origin && url.startsWith(origin) && [502, 503, 504, 520, 521, 522, 523, 524].includes(code)) loadOffline(`HTTP_${code}`);
+  });
+
+  // Links to other sites open in the normal browser, never inside the app.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (e, url) => {
+    const origin = serverOrigin();
+    if (url.startsWith('file:') || (origin && url.startsWith(origin))) return;
+    e.preventDefault();
+    if (/^https?:/i.test(url)) shell.openExternal(url);
+  });
+  win.webContents.on('did-fail-load', (e, code, desc, url, isMain) => {
+    if (!isMain || code === -3) return; // -3: the load was replaced by another one
+    // Certificate problems keep the old screen: the certificate prompt (below) takes it from there.
+    if (code <= -200 && code > -300) loadConnect(`Couldn't reach ${url} (${desc}). Check the address and your connection.`);
+    else loadOffline(desc);
+  });
+
+  // Right-click menu, zoom keys / Ctrl+wheel, Ctrl+, for Settings.
+  win.webContents.on('context-menu', (e, params) => {
+    const menu = contextMenu(win.webContents, params);
+    if (menu) menu.popup({ window: win, frame: params.frame || undefined });
+  });
+  win.webContents.on('zoom-changed', (e, dir) => stepZoom(dir === 'in' ? 1 : -1));
+  win.webContents.on('before-input-event', (e, input) => {
+    if (IS_MAC || input.type !== 'keyDown' || !input.control || input.alt || input.meta) return; // macOS: the menu handles these
+    const k = input.key;
+    if (k === ',') { e.preventDefault(); openSettings(); }
+    else if (k === '=' || k === '+' || input.code === 'NumpadAdd') { e.preventDefault(); stepZoom(1); }
+    else if (k === '-' || k === '_' || input.code === 'NumpadSubtract') { e.preventDefault(); stepZoom(-1); }
+    else if ((k === '0' || input.code === 'Numpad0') && !input.shift) { e.preventDefault(); setDesktopSetting('zoom', 1); }
+  });
+
+  load();
+}
+
+function load() {
+  const origin = serverOrigin();
+  if (origin) win.loadURL(origin + '/');
+  else loadConnect();
+}
+function connectQuery(extra) {
+  return { locked: CONFIG.lockServer ? '1' : '', name: APP_NAME, server: serverOrigin() || '', ...extra };
+}
+function loadConnect(error = '') {
+  win.loadFile(path.join(__dirname, 'connect.html'), { query: connectQuery({ error }) });
+}
+// The server didn't answer: a friendly screen that keeps trying and comes back by itself.
+function loadOffline(reason = '') {
+  if (!win || win.isDestroyed()) return;
+  if (!serverOrigin()) return loadConnect(reason);
+  win.loadFile(path.join(__dirname, 'connect.html'), { query: connectQuery({ offline: '1', reason }) });
+}
+
+// ---------------------------------------------------------------- right-click menu
+const short = (s, n = 28) => { s = String(s).replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n - 1)}…` : s; };
+const copyText = (t) => { try { Promise.resolve(clipboard.writeText(String(t))).catch(() => {}); } catch { /* ignore */ } };
+function contextMenu(wc, p) {
+  const items = [];
+  const sep = () => { if (items.length && items[items.length - 1].type !== 'separator') items.push({ type: 'separator' }); };
+  const f = p.editFlags || {};
+
+  // Spelling: suggestions for the word under the mouse, and "Add to dictionary".
+  if (p.isEditable && p.misspelledWord) {
+    const sugg = (p.dictionarySuggestions || []).slice(0, 6);
+    for (const s of sugg) items.push({ label: s, click: () => wc.replaceMisspelling(s) });
+    if (!sugg.length) items.push({ label: 'No spelling suggestions', enabled: false });
+    items.push({ label: 'Add to dictionary', click: () => wc.session.addWordToSpellCheckerDictionary(p.misspelledWord) });
+    sep();
+  }
+
+  const link = p.linkURL && /^(https?|mailto):/i.test(p.linkURL) ? p.linkURL : '';
+  if (link) {
+    if (/^https?:/i.test(link)) items.push({ label: 'Open link in browser', click: () => shell.openExternal(link) });
+    items.push({ label: /^mailto:/i.test(link) ? 'Copy email address' : 'Copy link', click: () => copyText(link.replace(/^mailto:/i, '')) });
+    sep();
+  }
+
+  if (p.mediaType === 'image' && p.srcURL) {
+    items.push({ label: 'Copy image', click: () => wc.copyImageAt(p.x, p.y) });
+    if (/^(https?|blob|data):/i.test(p.srcURL)) items.push({ label: 'Save image as…', click: () => wc.downloadURL(p.srcURL) });
+    if (/^https?:/i.test(p.srcURL)) items.push({ label: 'Copy image address', click: () => copyText(p.srcURL) });
+    sep();
+  }
+
+  if (p.isEditable) {
+    items.push(
+      { role: 'undo', label: 'Undo', enabled: f.canUndo !== false },
+      { role: 'redo', label: 'Redo', enabled: f.canRedo !== false },
+      { type: 'separator' },
+      { role: 'cut', label: 'Cut', enabled: !!f.canCut },
+      { role: 'copy', label: 'Copy', enabled: !!f.canCopy },
+      { role: 'paste', label: 'Paste', enabled: f.canPaste !== false },
+      { role: 'pasteAndMatchStyle', label: 'Paste as plain text', enabled: f.canPaste !== false },
+      { role: 'selectAll', label: 'Select all', enabled: f.canSelectAll !== false },
+    );
+  } else if (p.selectionText && p.selectionText.trim()) {
+    items.push({ role: 'copy', label: 'Copy', enabled: f.canCopy !== false });
+  }
+  const sel = (p.selectionText || '').trim();
+  if (sel && !/^\s*$/.test(sel)) {
+    sep();
+    items.push({ label: `Search the web for “${short(sel)}”`, click: () => shell.openExternal(`https://www.google.com/search?q=${encodeURIComponent(sel.slice(0, 500))}`) });
+  }
+  if (!app.isPackaged) { sep(); items.push({ label: 'Inspect', click: () => wc.inspectElement(p.x, p.y) }); }
+
+  while (items.length && items[items.length - 1].type === 'separator') items.pop();
+  return items.length ? Menu.buildFromTemplate(items) : null;
+}
+
+// ---------------------------------------------------------------- security: permissions + certificates
+app.whenReady().then(() => {
+  // display-capture: what newer Electron versions call screen-share requests (still only from your server).
+  const allowed = ['media', 'display-capture', 'notifications', 'clipboard-sanitized-write', 'clipboard-read', 'fullscreen'];
+  const ok = (url, perm) => {
+    const origin = serverOrigin();
+    try { return !!origin && new URL(url).origin === origin && allowed.includes(perm); } catch { return false; }
+  };
+  session.defaultSession.setPermissionRequestHandler((wc, perm, cb, details) => cb(ok(details.requestingUrl || wc.getURL(), perm)));
+  session.defaultSession.setPermissionCheckHandler((wc, perm, requestingOrigin) => ok(requestingOrigin, perm));
+  try { session.defaultSession.setSpellCheckerEnabled(spellcheckOn()); } catch { /* ignore */ }
+
+  // Screen sharing: Electron has no built-in picker, so we list screens/windows and let the page show
+  // one (newer macOS uses its own system picker). On Windows the computer's audio can be shared too.
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    // The callback may be called once; null means "no" (an empty object throws in current Electron).
+    let answered = false;
+    const answer = (streams) => { if (answered) return; answered = true; try { callback(streams); } catch { /* the page gets an error */ } };
+    try {
+      const origin = serverOrigin();
+      if (!origin || !request.securityOrigin || !request.securityOrigin.startsWith(origin)) return answer(null);
+      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } });
+      const id = await pickSource(sources.map((s) => ({ id: s.id, name: s.name, screen: s.id.startsWith('screen:'), thumb: s.thumbnail.toDataURL() })));
+      const chosen = id && sources.find((s) => s.id === id);
+      if (!chosen) return answer(null);
+      answer({ video: chosen, audio: IS_WIN && request.audioRequested ? 'loopback' : undefined });
+    } catch { answer(null); }
+  }, { useSystemPicker: true });
+});
+function pickSource(list) {
+  return new Promise((resolve) => {
+    if (!win) return resolve(null);
+    const done = (e, id) => { if (fromOurPage(e)) { clearTimeout(t); ipcMain.removeListener('screen-picked', done); resolve(typeof id === 'string' ? id : null); } };
+    const t = setTimeout(() => { ipcMain.removeListener('screen-picked', done); resolve(null); }, 120000);
+    ipcMain.on('screen-picked', done);
+    win.webContents.send('screen-pick', list);
+  });
+}
+
+// Self-signed certificates: trusted only for hosts listed in hearth.config.json, or after the user
+// explicitly accepts that exact certificate fingerprint (remembered, and re-asked if it ever changes).
+app.on('certificate-error', async (event, wc, url, error, cert, callback) => {
+  const host = new URL(url).host;
+  const trusted = settings.trustedCerts || {};
+  if ((CONFIG.trustedSelfSignedHosts || []).includes(host) || trusted[host] === cert.fingerprint) {
+    event.preventDefault();
+    return callback(true);
+  }
+  callback(false);
+  if (!win || new URL(url).origin !== serverOrigin()) return;
+  const changed = !!trusted[host];
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: ['Cancel', 'Trust this certificate'],
+    defaultId: 0, cancelId: 0,
+    title: changed ? 'Certificate changed' : 'Unverified certificate',
+    message: changed ? `The security certificate for ${host} has changed.` : `${host} uses a certificate that isn't signed by a trusted authority.`,
+    detail: `${changed ? 'This can mean someone is intercepting your connection. ' : 'That is normal for a self-hosted server without a domain. '}Only continue if the server owner confirms this fingerprint:\n\n${cert.fingerprint}`,
+  });
+  if (response === 1) {
+    settings.trustedCerts = { ...trusted, [host]: cert.fingerprint };
+    saveSettings();
+    load();
+  }
+});
+
+// ---------------------------------------------------------------- unread badge
+const buildImage = (name) => nativeImage.createFromPath(path.join(__dirname, 'build', `${name}.png`));
+function redDot(count) { return buildImage(`badge-${count > 9 ? '9plus' : count}`); }
+function setBadge(n) {
+  unread = Math.max(0, Math.floor(n) || 0);
+  if (IS_WIN && win) win.setOverlayIcon(unread ? redDot(unread) : null, unread ? `${unread} unread` : '');
+  else app.setBadgeCount(unread);
+  if (tray) tray.setToolTip(unread ? `${APP_NAME} — ${unread} unread` : APP_NAME);
+  if (unread && win && !win.isFocused()) win.flashFrame(true);
+}
+
+// ---------------------------------------------------------------- calls: taskbar buttons + global keys
+// While you're in a call, the taskbar preview (hover Hearth's taskbar button) gets Mute and Deafen buttons.
+let call = { inCall: false, muted: false, deafened: false };
+function drawThumbar() {
+  if (!IS_WIN || !win) return;
+  if (!call.inCall) { win.setThumbarButtons([]); return; }
+  win.setThumbarButtons([
+    { tooltip: call.muted ? 'Unmute' : 'Mute', icon: buildImage(call.muted ? 'thumb-mic-off' : 'thumb-mic'), click: () => sendToPage('hotkey', { action: 'mute' }) },
+    { tooltip: call.deafened ? 'Undeafen' : 'Deafen', icon: buildImage(call.deafened ? 'thumb-deafen-off' : 'thumb-deafen'), click: () => sendToPage('hotkey', { action: 'deafen' }) },
+  ]);
+}
+const sendToPage = (ch, data) => { if (win && !win.isDestroyed()) win.webContents.send(ch, data); };
+const hotkeys = require('./hotkeys');
+
+// ---------------------------------------------------------------- updates
+// The app updates itself from your own Hearth server (data/downloads, filled by GitHub Actions or by hand):
+// it downloads in the background and asks to restart. Mac builds need code signing for this, so Mac skips it.
+let updateReady = null;
+let updater = null;
+let updateState = { state: 'idle' };
+const updatesSupported = () => app.isPackaged && CONFIG.autoUpdate !== false && !IS_MAC;
+function setUpdateState(s) { updateState = s; sendToPage('update-state', s); }
+function getUpdater() {
+  if (updater || !updatesSupported()) return updater;
+  try { updater = require('electron-updater').autoUpdater; } catch { return null; }
+  updater.autoDownload = true;
+  updater.autoInstallOnAppQuit = true;
+  updater.on('checking-for-update', () => setUpdateState({ state: 'checking' }));
+  updater.on('update-available', (info) => setUpdateState({ state: 'downloading', version: info.version, percent: 0 }));
+  updater.on('download-progress', (p) => setUpdateState({ state: 'downloading', version: updateState.version, percent: Math.round(p.percent || 0) }));
+  updater.on('update-not-available', () => setUpdateState({ state: 'none', version: app.getVersion() }));
+  updater.on('update-downloaded', (info) => {
+    updateReady = info.version;
+    setUpdateState({ state: 'ready', version: info.version });
+    sendToPage('update-ready', { version: info.version });
+    settingsChanged();
+  });
+  // No update published yet, or offline: try again later.
+  updater.on('error', (err) => setUpdateState({ state: 'error', message: friendlyUpdateError(err) }));
+  return updater;
+}
+function friendlyUpdateError(err) {
+  const m = String((err && err.message) || err || '');
+  if (/404|latest\.yml|Cannot find/i.test(m)) return 'Your server doesn’t offer app updates yet.';
+  if (/not signed by the application owner|publisherName|signature/i.test(m)) return 'The update isn’t signed by the same publisher as this app, so it wasn’t installed.';
+  if (/ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ERR_INTERNET|net::/i.test(m)) return 'Couldn’t reach your server.';
+  return 'Couldn’t check for updates right now.';
+}
+async function checkForUpdates() {
+  if (updateReady) return { state: 'ready', version: updateReady };
+  if (!updatesSupported()) {
+    return { state: 'unavailable', message: !app.isPackaged ? 'Updates work in the installed app.' : IS_MAC ? 'Download new versions from your server’s /download page.' : 'Automatic updates are turned off in this build.' };
+  }
+  const origin = serverOrigin();
+  const au = getUpdater();
+  if (!origin || !au) return { state: 'unavailable', message: 'Connect to a server first.' };
+  if (updateState.state === 'checking' || updateState.state === 'downloading') return updateState;
+  try {
+    au.setFeedURL({ provider: 'generic', url: `${origin}/updates/` });
+    const r = await au.checkForUpdates();
+    if (r && r.isUpdateAvailable) return { state: 'downloading', version: r.updateInfo.version, percent: 0 };
+    return { state: 'none', version: app.getVersion() };
+  } catch (err) {
+    return { state: 'error', message: friendlyUpdateError(err) };
+  }
+}
+function setupUpdates() {
+  if (!updatesSupported()) return;
+  setTimeout(() => checkForUpdates().catch(() => {}), 15000);
+  setInterval(() => checkForUpdates().catch(() => {}), 4 * 3600000);
+}
+function installUpdate() {
+  if (!updateReady) return;
+  quitting = true;
+  try { require('electron-updater').autoUpdater.quitAndInstall(false, true); } catch { app.quit(); }
+}
+
+// ---------------------------------------------------------------- tray + menus
+function buildTray() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, 'build', IS_MAC ? 'tray-16.png' : 'tray-32.png'));
+  tray = new Tray(icon);
+  tray.setToolTip(APP_NAME);
+  tray.on('click', () => showWindow());
+  refreshTrayMenu();
+}
+function refreshTrayMenu() {
+  if (!tray) return;
+  const login = startAtLogin();
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: `Open ${APP_NAME}`, click: showWindow },
+    { label: 'Settings…', click: openSettings },
+    updateReady ? { label: `Restart to update (${updateReady})`, click: installUpdate } : null,
+    { type: 'separator' },
+    CAN_START_AT_LOGIN ? { label: 'Start when I log in', type: 'checkbox', checked: login, click: (i) => setDesktopSetting('startAtLogin', i.checked) } : null,
+    CAN_START_AT_LOGIN && login ? { label: 'Start minimised in the tray', type: 'checkbox', checked: startHidden(), click: (i) => setDesktopSetting('startHidden', i.checked) } : null,
+    !IS_MAC ? { label: 'Keep running in the tray when closed', type: 'checkbox', checked: closeToTray(), click: (i) => setDesktopSetting('closeToTray', i.checked) } : null,
+    CONFIG.lockServer ? null : { label: 'Change server…', click: () => { showWindow(); loadConnect(); } },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { quitting = true; app.quit(); } },
+  ].filter(Boolean)));
+}
+// The first time the window goes to the tray, say so (otherwise it looks like Hearth quit).
+function trayHintOnce() {
+  if (settings.trayHintShown) return;
+  settings.trayHintShown = true; saveSettings();
+  const content = `${APP_NAME} is still running here so you keep getting messages. To quit, right-click this icon and choose Quit. You can change this in Settings → Apps & devices.`;
+  try {
+    if (IS_WIN && tray) tray.displayBalloon({ iconType: 'info', title: `${APP_NAME} is still running`, content });
+    else if (Notification.isSupported()) new Notification({ title: `${APP_NAME} is still running`, body: content, silent: true }).show();
+  } catch { /* ignore */ }
+}
+function buildAppMenu() {
+  // On Windows and Linux the zoom and Settings keys are handled in before-input-event (so Ctrl+=, Ctrl++ and
+  // the number pad all work); the menu only shows them.
+  const shown = (accelerator) => ({ accelerator, registerAccelerator: IS_MAC });
+  const settingsItem = { label: 'Settings…', ...shown('CmdOrCtrl+,'), click: openSettings };
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    ...(IS_MAC ? [{ label: APP_NAME, submenu: [
+      { role: 'about' }, { type: 'separator' }, settingsItem, { type: 'separator' },
+      { role: 'services' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' },
+    ] }] : [{ label: 'File', submenu: [settingsItem, { type: 'separator' }, { label: 'Quit', click: () => { quitting = true; app.quit(); } }] }]),
+    { role: 'editMenu' },
+    { label: 'View', submenu: [
+      { role: 'reload' }, { role: 'forceReload' }, { type: 'separator' },
+      { label: 'Actual size', ...shown('CmdOrCtrl+0'), click: () => setDesktopSetting('zoom', 1) },
+      { label: 'Zoom in', ...shown('CmdOrCtrl+='), click: () => stepZoom(1) },
+      { label: 'Zoom out', ...shown('CmdOrCtrl+-'), click: () => stepZoom(-1) },
+      { type: 'separator' },
+      { role: 'togglefullscreen' }, { role: 'toggleDevTools' },
+    ] },
+    { role: 'windowMenu' },
+    { label: 'Help', submenu: [
+      { label: 'Open in browser', click: () => { const o = serverOrigin(); if (o) shell.openExternal(o); } },
+      ...(CONFIG.lockServer ? [] : [{ label: 'Change server…', click: () => { showWindow(); loadConnect(); } }]),
+      { type: 'separator' },
+      { label: `Version ${app.getVersion()}`, enabled: false },
+    ] },
+  ]));
+}
+
+// ---------------------------------------------------------------- IPC from the page (see preload.js)
+const fromOurPage = (e) => {
+  const url = e.senderFrame ? e.senderFrame.url : '';
+  const origin = serverOrigin();
+  return url.startsWith('file:') || (!!origin && url.startsWith(origin));
+};
+const fromConnectScreen = (e) => !!(e.senderFrame && e.senderFrame.url.startsWith('file:'));
+ipcMain.on('version', (e) => { e.returnValue = app.getVersion(); });
+ipcMain.on('badge', (e, n) => { if (fromOurPage(e)) setBadge(n); });
+ipcMain.on('focus', (e) => { if (fromOurPage(e)) showWindow(); });
+ipcMain.on('change-server', (e) => { if (fromOurPage(e) && !CONFIG.lockServer) loadConnect(); });
+// Keybinds from Settings → Keybinds: push-to-talk / mute / deafen, even while a game has focus.
+ipcMain.handle('keybinds', (e, b) => (fromOurPage(e) ? hotkeys.set(b, (ev) => sendToPage('hotkey', ev)) : { ok: false }));
+// A @mention while Hearth isn't focused: flash the taskbar button until it is.
+ipcMain.on('flash', (e) => { if (fromOurPage(e) && win && !win.isFocused()) win.flashFrame(true); });
+ipcMain.on('call-state', (e, s) => {
+  if (!fromOurPage(e)) return;
+  call = { inCall: !!(s && s.inCall), muted: !!(s && s.muted), deafened: !!(s && s.deafened) };
+  drawThumbar();
+});
+ipcMain.on('install-update', (e) => { if (fromOurPage(e)) installUpdate(); });
+ipcMain.on('update-status', (e) => { e.returnValue = updateReady; });
+// Settings → Apps & devices: the app's own settings, the update check and "Restart now".
+ipcMain.handle('desktop-settings:get', (e) => (fromOurPage(e) ? desktopSettings() : null));
+ipcMain.handle('desktop-settings:set', (e, key, value) => (fromOurPage(e) ? setDesktopSetting(String(key), value) : { ok: false, error: 'Not allowed.' }));
+ipcMain.handle('check-updates', (e) => (fromOurPage(e) ? checkForUpdates() : { state: 'error', message: 'Not allowed.' }));
+ipcMain.on('restart', (e) => { if (fromOurPage(e)) restartApp(); });
+// Game / music detection (detect.js), only while the person shares it.
+const detect = require('./detect');
+ipcMain.on('detect', (e, o) => {
+  if (!fromOurPage(e)) return;
+  if (o && (o.games || o.songs)) detect.start((a) => { if (win && !win.isDestroyed()) win.webContents.send('activity', a); }, o);
+  else detect.stop();
+});
+// Is it a Hearth server? (/api/config answers with its name.) A certificate error counts as "there": the
+// certificate prompt handles it when the page loads.
+async function probe(origin) {
+  try {
+    const res = await net.fetch(origin + '/api/config', { signal: AbortSignal.timeout(10000), cache: 'no-store' });
+    const cfg = await res.json().catch(() => ({}));
+    if (!res.ok || typeof cfg.name !== 'string') return { ok: false, error: res.ok ? 'NOT_HEARTH' : `HTTP_${res.status}` };
+    return { ok: true, name: cfg.name };
+  } catch (err) {
+    const m = String(err && err.message);
+    if (/CERT|certificate/i.test(m)) return { ok: true, cert: true };
+    return { ok: false, error: /timeout|abort/i.test(m) ? 'timed out' : m.replace(/^net::/, '') };
+  }
+}
+// The connect screen checks that the address really is a Hearth server before saving it.
+ipcMain.handle('connect', async (e, raw) => {
+  if (!fromConnectScreen(e)) return { ok: false, error: 'Not allowed.' };
+  if (CONFIG.lockServer) return { ok: false, error: 'This app only connects to its own server.' };
+  const origin = normalize(String(raw || '').trim());
+  if (!origin) return { ok: false, error: 'That doesn’t look like a web address.' };
+  const r = await probe(origin);
+  if (!r.ok) return { ok: false, error: `Couldn’t find a Hearth server at ${origin}.` };
+  settings.server = origin;
+  saveSettings();
+  load();
+  settingsChanged();
+  return { ok: true, name: r.name };
+});
+// The "can't reach your server" screen asks this every few seconds; when the server answers, it loads.
+ipcMain.handle('retry-server', async (e) => {
+  if (!fromConnectScreen(e)) return { ok: false, error: 'Not allowed.' };
+  const origin = serverOrigin();
+  if (!origin) return { ok: false, error: 'No server yet.' };
+  const r = await probe(origin);
+  if (r.ok && win && !win.isDestroyed() && win.webContents.getURL().startsWith('file:')) load();
+  return { ok: r.ok, error: r.error || '' };
+});
+
+// ---------------------------------------------------------------- lifecycle
+app.whenReady().then(() => {
+  buildAppMenu();
+  createWindow();
+  buildTray();
+  setupUpdates();
+  if (pendingLink) win.webContents.once('did-finish-load', () => { const l = pendingLink; pendingLink = ''; openLink(l); });
+  // Back from sleep or the lock screen: tell the page to reconnect right away instead of waiting.
+  powerMonitor.on('resume', () => sendToPage('resume'));
+  powerMonitor.on('unlock-screen', () => sendToPage('resume'));
+  // A monitor was unplugged or rearranged: bring the window back if it's now off every screen.
+  screen.on('display-removed', keepOnScreen);
+  screen.on('display-metrics-changed', keepOnScreen);
+});
+app.on('will-quit', () => { hotkeys.stop(); if (saveTimer) writeSettings(); });
+app.on('activate', () => showWindow());
+app.on('before-quit', () => { quitting = true; });
+app.on('window-all-closed', () => { if (!IS_MAC && !closeToTray()) app.quit(); });

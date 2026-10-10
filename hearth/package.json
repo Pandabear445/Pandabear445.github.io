@@ -1,0 +1,32 @@
+{
+  "name": "hearth",
+  "version": "1.27.1",
+  "description": "Self-hostable chat with voice, end-to-end encrypted DMs and free profile customization",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test:security": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.5",
+    "express": "^4.22.3",
+    "hash-wasm": "^4.12.0",
+    "multer": "^2.4.0",
+    "nodemailer": "^10.0.16",
+    "selfsigned": "^5.5.0",
+    "socket.io": "^4.8.4",
+    "web-push": "^3.6.7"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true,
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}

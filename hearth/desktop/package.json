@@ -1,0 +1,99 @@
+{
+  "name": "hearth-desktop",
+  "productName": "Hearth",
+  "version": "1.1.0",
+  "description": "Desktop app for Hearth, the self-hosted encrypted chat.",
+  "main": "main.js",
+  "author": {
+    "name": "Hearth",
+    "email": "admin@example.com"
+  },
+  "homepage": "https://github.com/Pandabear445/Pandabear445.github.io",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "uiohook-napi": "^1.5.5"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "app.hearth.desktop",
+    "protocols": [
+      {
+        "name": "Hearth link",
+        "schemes": [
+          "hearth"
+        ]
+      }
+    ],
+    "productName": "Hearth",
+    "files": [
+      "main.js",
+      "preload.js",
+      "detect.js",
+      "hotkeys.js",
+      "connect.html",
+      "hearth.config.json",
+      "build/icon.png",
+      "build/tray*.png",
+      "build/badge-*.png",
+      "build/thumb-*.png"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://hearth.invalid/updates/"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.social-networking",
+      "icon": "build/icon.png",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Hearth uses your microphone for voice chat."
+      }
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Network;Chat;InstantMessaging",
+      "icon": "build/icon.png",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "asarUnpack": [
+      "node_modules/uiohook-napi/**"
+    ],
+    "npmRebuild": false
+  }
+}

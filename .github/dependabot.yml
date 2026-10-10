@@ -1,0 +1,59 @@
+# Dependabot: opens pull requests when Hearth's dependencies, the CI actions or the Docker base image have updates.
+# Minor and patch updates are grouped into one PR per ecosystem per week; major updates come one by one (they may
+# need code changes). Security fixes arrive as soon as they're published (when Dependabot security updates are on:
+# Settings → Code security).
+version: 2
+updates:
+  # The server (production dependencies, plus the lockfile).
+  - package-ecosystem: npm
+    directory: /hearth
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 10
+    groups:
+      server-minor-patch:
+        update-types: [minor, patch]
+
+  # Desktop app (Electron; build tooling).
+  - package-ecosystem: npm
+    directory: /hearth/desktop
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      desktop-minor-patch:
+        update-types: [minor, patch]
+
+  # Android app (Capacitor). No lockfile here, so Dependabot updates the version ranges in package.json.
+  - package-ecosystem: npm
+    directory: /hearth/mobile
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      mobile-minor-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions used by the workflows (they're pinned to commit SHAs; Dependabot updates SHA and comment together).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+
+  # The Node base image in hearth/Dockerfile.
+  - package-ecosystem: docker
+    directory: /hearth
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 3
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]
+
+  # The Caddy image in hearth/docker-compose.yml.
+  - package-ecosystem: docker-compose
+    directory: /hearth
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 3
+    groups:
+      compose-minor-patch:
+        update-types: [minor, patch]

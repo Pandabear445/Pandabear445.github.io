@@ -1,0 +1,96 @@
+# Builds the desktop app for Windows, macOS and Linux.
+#   Run it: push a tag like `desktop-v1.0.0`, or use "Run workflow" on the Actions tab.
+#   Result: installers attached to a GitHub release (tags only) and as workflow artifacts.
+#   Optional: set the VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR secrets to also copy the
+#   installers to your server's data/downloads folder, where they show up on https://your-server/download.
+name: Desktop app
+
+on:
+  push:
+    tags: ['desktop-v*']
+  workflow_dispatch:
+    inputs:
+      server:
+        description: 'Server address baked into this build (leave empty to ask on first launch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        shell: bash
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#desktop-v}"
+      - name: Bake in the server address
+        if: ${{ github.event.inputs.server != '' || vars.HEARTH_SERVER != '' }}
+        shell: bash
+        env:
+          SERVER: ${{ github.event.inputs.server || vars.HEARTH_SERVER }}
+        run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+      - run: npm install
+      - name: Build installers
+        run: npx electron-builder --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hearth-${{ matrix.os }}
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.dmg
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/latest*.yml
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  publish-to-vps:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      HAS_VPS: ${{ secrets.VPS_HOST != '' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        if: env.HAS_VPS == 'true'
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Copy installers to the server
+        if: env.HAS_VPS == 'true'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb'
+          target: ${{ secrets.VPS_DOWNLOADS_DIR }}
+          strip_components: 1

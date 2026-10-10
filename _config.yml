@@ -1,0 +1,5 @@
+# GitHub Pages (arc32.me): only the landing page and its images are published.
+# The app itself (hearth/) is code to download and run, not part of the website.
+exclude:
+  - hearth
+  - README.md

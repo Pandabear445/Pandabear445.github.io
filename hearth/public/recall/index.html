@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Recall — flashcards for university</title>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="recall.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="bar" id="bar">
+    <button class="brand" data-act="home" aria-label="Recall home"><span class="logo" aria-hidden="true"><i></i><i></i></span>Recall</button>
+    <div class="spacer"></div>
+    <span class="sync" id="sync"></span>
+    <button class="focus-chip hidden" id="focus-chip" data-act="timer" aria-label="Focus timer"></button>
+    <button class="icon-btn" data-act="search" data-icon="search" aria-label="Search all cards" title="Search ( / )"></button>
+    <button class="icon-btn" data-act="timer" data-icon="clock" aria-label="Focus timer" title="Focus timer"></button>
+    <div class="menu-wrap"><button class="icon-btn" data-act="settings" data-icon="gear" aria-label="Settings" aria-haspopup="true" title="Settings"></button></div>
+  </header>
+  <main id="app" aria-live="polite"></main>
+</div>
+<div id="modal-root"></div>
+<div id="print-root"></div>
+<input type="file" id="img-in" accept="image/*" class="hidden">
+<canvas id="fx" aria-hidden="true"></canvas>
+<script src="recall.js"></script>
+</body>
+</html>
