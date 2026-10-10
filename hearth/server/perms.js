@@ -33,6 +33,9 @@ const CHANNEL_SCOPED = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.AT
 // What everyone in a group chat can do. Only its owner manages it (adds channels, deletes other people's
 // messages…); renaming it and changing its picture are allowed to everyone by those routes themselves.
 const GROUP_MEMBER = DEFAULT_EVERYONE | P.MENTION_EVERYONE;
+// What a member who is timed out can't do until it ends: anything that posts or speaks. Reading, joining a call
+// to listen and leaving still work. Owners and Administrators can't be timed out (the route refuses them).
+const TALK = P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.MENTION_EVERYONE | P.CREATE_THREADS | P.SPEAK | P.EMBED_LINKS | P.CREATE_INVITE;
 
 function makePerms(db) {
   // Only roles held by a current member count: a role row left behind by someone who left can never come back
@@ -42,6 +45,9 @@ function makePerms(db) {
   const rolesOf = (serverId, userId) => db.prepare(`SELECT r.* FROM roles r WHERE r.server_id = ? AND (r.id = ? OR r.id IN (${heldRoles}))`)
     .all(serverId, serverId, serverId, userId);
 
+  // Is this member timed out in this server right now? (v18, see member_timeouts in db.js)
+  const timedOut = (serverId, userId) => !!db.prepare('SELECT 1 FROM member_timeouts WHERE server_id = ? AND user_id = ? AND until > ?').get(serverId, userId, Date.now());
+
   // Server-wide permissions for a member.
   function base(server, userId) {
     if (!server) return 0;
@@ -49,7 +55,8 @@ function makePerms(db) {
     if (server.kind === 'group') return GROUP_MEMBER;
     let p = 0;
     for (const r of rolesOf(server.id, userId)) p |= r.permissions;
-    return p & P.ADMINISTRATOR ? ALL : p;
+    if (p & P.ADMINISTRATOR) return ALL;
+    return timedOut(server.id, userId) ? p & ~TALK : p;
   }
 
   // Permissions in one channel, after overrides.
@@ -66,6 +73,8 @@ function makePerms(db) {
       p = (p & ~deny) | allow;
       const me = ov.find((o) => o.target_type === 'member' && o.target_id === userId);
       if (me) p = (p & ~me.deny) | me.allow;
+      // A channel override can't give a timed-out member their voice back.
+      if (server.kind !== 'group' && timedOut(server.id, userId)) p &= ~TALK;
     }
     return p & P.VIEW_CHANNEL ? p : 0;
   }
@@ -83,7 +92,7 @@ function makePerms(db) {
     return !!db.prepare('SELECT 1 FROM channel_overrides WHERE channel_id = ? AND (deny & ?) != 0').get(ch.id, P.VIEW_CHANNEL);
   }
 
-  return { base, channel, top, restricted, rolesOf };
+  return { base, channel, top, restricted, rolesOf, timedOut };
 }
 
-module.exports = { PERMS, ALL, DEFAULT_EVERYONE, CHANNEL_SCOPED, GROUP_MEMBER, makePerms };
+module.exports = { PERMS, ALL, DEFAULT_EVERYONE, CHANNEL_SCOPED, GROUP_MEMBER, TALK, makePerms };

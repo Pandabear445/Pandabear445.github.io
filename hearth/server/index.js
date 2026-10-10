@@ -262,6 +262,8 @@ function serializeServer(s, uid, common = serverCommon(s)) {
     bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
   };
   if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
+  const to = USE && out.kind !== 'group' ? USE.timeoutOf(s.id, uid) : null;
+  if (to) out.timeout = { until: to.until, reason: to.reason };
   return out;
 }
 // Everyone gets their own view (private channels and permissions differ per person). Every change to roles,
@@ -741,7 +743,7 @@ function forgetMessages(messageIds) {
   for (let i = 0; i < messageIds.length; i += 500) {
     const ids = messageIds.slice(i, i + 500);
     const q = ids.map(() => '?').join(',');
-    for (const t of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${t} WHERE message_id IN (${q})`).run(...ids);
+    for (const t of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${t} WHERE message_id IN (${q})`).run(...ids);
   }
 }
 // Before a server or group is deleted: its messages' files, reactions and votes, and its own pictures (icon,
@@ -764,7 +766,7 @@ function deleteMessageTree(id) {
     .forEach((m) => (unseal(m.body).attachments || []).forEach((a) => files.push(a.url)));
   db.transaction(() => {
     db.prepare(`DELETE FROM blobs WHERE message_id IN (${tree})`).run(id, id);
-    for (const x of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${x} WHERE message_id IN (${tree})`).run(id, id);
+    for (const x of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${x} WHERE message_id IN (${tree})`).run(id, id);
     db.prepare('DELETE FROM messages WHERE id = ? OR thread_id = ?').run(id, id);
   })();
   files.forEach((u) => removeUpload(u));
@@ -782,7 +784,7 @@ function sweepOrphans() {
   const blobs = db.prepare(`SELECT name FROM blobs WHERE ${gone('blobs')}`).all();
   blobs.forEach((b) => removeUpload('/uploads/' + b.name));
   if (blobs.length) db.prepare(`DELETE FROM blobs WHERE ${gone('blobs')}`).run();
-  for (const t of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${t} WHERE ${gone(t)}`).run();
+  for (const t of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${t} WHERE ${gone(t)}`).run();
   return blobs.length;
 }
 setTimeout(() => {
@@ -1179,7 +1181,10 @@ function pushFailed(endpoint) {
 // Notify people who have no Hearth window open. Message contents are end-to-end encrypted, so the
 // notification only says who and where — never what. It's worked out after the request that caused it has
 // been answered and sent a few at a time, so a big group or a slow push service never holds anyone up.
-function pushTo(userIds, payload) {
+// what: { kind, serverId, channelId, dmId } — checked against each person's notification preferences and Do Not
+// Disturb schedule (server/usability.js), which also decides how much the lock screen shows.
+let USE = null; // server/usability.js
+function pushTo(userIds, payload, what = { kind: 'message' }) {
   if (!vapid) return;
   const ids = [...new Set(userIds)];
   setImmediate(() => {
@@ -1187,7 +1192,9 @@ function pushTo(userIds, payload) {
       if ((onlineSockets.get(uid) || new Set()).size) continue;
       const row = getUserRow(uid);
       if (!row || row.status === 'dnd' || !pushUserOk(row)) continue;
-      for (const sub of pushSubsFor(uid)) queuePush(uid, sub, payload);
+      if (USE && !USE.pushAllowed(uid, what)) continue;
+      const shaped = USE ? USE.shapePush(uid, payload) : payload;
+      for (const sub of pushSubsFor(uid)) queuePush(uid, sub, shaped);
     }
     pumpPush();
   });
@@ -2389,21 +2396,35 @@ api.get('/channels/:id/messages', auth, (req, res) => {
 
 // Who gets a push for a channel message. The sender's app tells us which members it @mentions
 // (that's the only part of the message the server learns), plus replies and group DMs.
-function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions) {
+// everyone: the sender's app says the message uses @everyone / @channel / @here; it counts only from someone
+// with Mention Everyone in this channel. Mentions and replies are also kept (mention_marks) for unread counts.
+function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, everyone) {
   const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id).filter((u) => u !== senderId);
   const url = '/#m/' + id;
-  if (srv.kind === 'group') return pushTo(members, { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', tag: 'c:' + c.id, url });
-  const where = `#${c.name} \u00b7 ${srv.name}`;
+  const base = { tag: 'c:' + c.id, url, generic: 'New message' };
+  const what = (kind) => ({ kind, serverId: srv.id, channelId: c.id });
   // Only people who can see the channel: a push to anyone else would tell them a private channel's name.
   const open = !perms.restricted(srv, c);
   const reaches = (u) => members.includes(u) && (open || (perms.channel(srv, c, u) & PM.VIEW_CHANNEL) !== 0);
   const mentioned = Array.isArray(mentions) ? [...new Set(mentions.slice(0, 50).map(String))].filter(reaches) : [];
-  pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, tag: 'c:' + c.id, url });
+  const pingAll = srv.kind !== 'group' && everyone === true && canIn(srv, c, senderId, PM.MENTION_EVERYONE);
   const replyAuthor = replyTo && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(replyTo) || {}).author_id;
   const rootAuthor = threadId && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(threadId) || {}).author_id;
-  pushTo([replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && reaches(u)),
-    { title: `${nameOf(senderId)} replied to you`, body: where, tag: 'c:' + c.id, url });
+  const replied = [replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && reaches(u));
+  if (USE && !threadId && srv.kind !== 'group') USE.recordMentions(id, 'c:' + c.id, [...mentioned, ...replied], pingAll);
+  if (srv.kind === 'group') {
+    const named = new Set(mentioned);
+    pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: srv.name ? `in ${srv.name}` : 'in your group', ...base }, what('mention'));
+    return pushTo(members.filter((u) => !named.has(u)), { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', ...base }, what('group'));
+  }
+  const where = `#${c.name} \u00b7 ${srv.name}`;
+  pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, ...base }, what('mention'));
+  pushTo(replied, { title: `${nameOf(senderId)} replied to you`, body: where, ...base }, what('reply'));
+  const told = new Set([...mentioned, ...replied]);
+  if (pingAll) pushTo(members.filter((u) => !told.has(u) && reaches(u)), { title: `${nameOf(senderId)} mentioned everyone`, body: where, ...base }, what('everyone'));
+  // People who picked "All messages" for this channel or server hear about the rest too.
+  if (USE && !threadId && !pingAll) pushTo(USE.wantsAll(srv, c).filter((u) => u !== senderId && !told.has(u) && reaches(u)), { title: nameOf(senderId), body: where, ...base }, what('message'));
 }
 
 const validCipher = (c) => {
@@ -2455,7 +2476,8 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
   withNonce(msg, req.body);
   toChannel(c).emit('message:new', msg);
-  notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions);
+  notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions, (req.body || {}).everyone);
+  if (USE && !threadId) USE.markSent(req.userId, 'c:' + c.id, id);
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
   res.json(msg);
 });
@@ -2464,6 +2486,7 @@ api.patch('/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
   const c = requireChannel(m.channel_id, req.userId);
+  if (perms.timedOut(c.server_id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
   const { ciphertext, epoch } = req.body || {};
   validCipher(ciphertext);
   const ep = requireCurrentEpoch(c.server_id, epoch);
@@ -2510,23 +2533,32 @@ api.get('/messages/:id/locate', auth, (req, res) => {
   res.json({ kind: 'dm', dmId: dm.dm_id });
 });
 
-// Pins: shared per conversation. In servers, admins and the author can pin; in DMs, either person.
+// Pins: shared per conversation. In server channels pinning needs Manage Messages (your own messages too: pins
+// are the channel's notice board) and each pin and unpin is kept in the channel's pin history; in group chats
+// and DMs, anyone in the conversation can pin.
+const MAX_PINS = 50;
 function pinTarget(id, userId) {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
   if (m) {
     const c = requireChannel(m.channel_id, userId);
     const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
-    if (s.kind !== 'group' && m.author_id !== userId && !canIn(s, c, userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission to pin other people\u2019s messages.');
-    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id } };
+    if (s.kind !== 'group' && !canIn(s, c, userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission to pin messages here.');
+    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at };
   }
   const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
   if (!dm) fail(404, 'Message not found.');
   const d = requireDm(dm.dm_id, userId);
   if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
-  return { table: 'dm_messages', room: [`user:${d.user_a}`, `user:${d.user_b}`], payload: { messageId: dm.id, dmId: d.id } };
+  return { table: 'dm_messages', room: [`user:${d.user_a}`, `user:${d.user_b}`], payload: { messageId: dm.id, dmId: d.id }, dmId: d.id, pinned: !!dm.pinned_at };
 }
 api.post('/messages/:id/pin', auth, (req, res) => {
   const t = pinTarget(req.params.id, req.userId);
+  if (!t.pinned) {
+    const n = t.channelId ? db.prepare('SELECT COUNT(*) n FROM messages WHERE channel_id = ? AND pinned_at IS NOT NULL').get(t.channelId).n
+      : db.prepare('SELECT COUNT(*) n FROM dm_messages WHERE dm_id = ? AND pinned_at IS NOT NULL').get(t.dmId).n;
+    if (n >= MAX_PINS) fail(400, `This conversation already has ${MAX_PINS} pinned messages. Unpin one first.`);
+  }
+  if (t.channelId && USE && !t.pinned) USE.logPin(t.channelId, req.params.id, req.userId, 'pin');
   const at = now();
   db.prepare(`UPDATE ${t.table} SET pinned_at = ?, pinned_by = ? WHERE id = ?`).run(at, req.userId, req.params.id);
   (typeof t.room === 'object' && !Array.isArray(t.room) ? t.room : io.to(t.room)).emit('pin:update', { ...t.payload, pinnedAt: at, pinnedBy: req.userId });
@@ -2534,6 +2566,7 @@ api.post('/messages/:id/pin', auth, (req, res) => {
 });
 api.delete('/messages/:id/pin', auth, (req, res) => {
   const t = pinTarget(req.params.id, req.userId);
+  if (t.channelId && USE && t.pinned) USE.logPin(t.channelId, req.params.id, req.userId, 'unpin');
   db.prepare(`UPDATE ${t.table} SET pinned_at = NULL, pinned_by = NULL WHERE id = ?`).run(req.params.id);
   (typeof t.room === 'object' && !Array.isArray(t.room) ? t.room : io.to(t.room)).emit('pin:update', { ...t.payload, pinnedAt: null });
   res.json({ ok: true });
@@ -2624,7 +2657,8 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   const t = now();
   db.prepare('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, d.id, req.userId, ciphertext, replyTo, t);
   attachBlobs(files, req.userId, id);
-  pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id });
+  pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id, generic: 'New message' }, { kind: 'dm', dmId: d.id });
+  if (USE) USE.markSent(req.userId, 'd:' + d.id, id);
   db.prepare('UPDATE dm_channels SET last_message_at = ? WHERE id = ?').run(t, d.id);
   const msg = serializeDmMessage(db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id));
   withNonce(msg, req.body);
@@ -3617,7 +3651,7 @@ const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, s
   // Personal trackers found something: tell the person's open apps, and push a notification if they want one.
   notifyUser: (uid, p) => {
     io.to(`user:${uid}`).emit('updates:new', p);
-    if (p.notify) pushTo([uid], { title: `${p.count} new \u2014 ${p.title}`, body: p.first.title, tag: `updates-${p.feedId}`, url: '/#updates' });
+    if (p.notify) pushTo([uid], { title: `${p.count} new \u2014 ${p.title}`, body: p.first.title, tag: `updates-${p.feedId}`, url: '/#updates', generic: 'New updates' }, { kind: 'tracker' });
   } });
 // Study tools (server/study.js): encrypted sync for Recall's decks, pictures and profile.
 require('./study')({ api, auth, db, fail, rateLimit, pushTo: (...a) => pushTo(...a), emitToUser: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
@@ -3927,6 +3961,12 @@ api.post('/reports', auth, (req, res) => {
     if (!evidence.some((e) => e.reported)) fail(400, 'Include the reported message.');
   }
   if (!getUserRow(targetId) || targetId === req.userId) fail(400, 'You can\u2019t report that account.');
+  // Reporting the same message again while staff haven't closed the first report adds nothing: the first one stands.
+  if (context.messageId) {
+    const dup = db.prepare(`SELECT id FROM reports WHERE reporter_id = ? AND status IN ('open','reviewing') AND json_valid(context)
+      AND json_extract(context, '$.messageId') = ? LIMIT 1`).get(req.userId, context.messageId);
+    if (dup) return res.json({ ok: true, id: dup.id, duplicate: true });
+  }
   const target = getUserRow(targetId);
   const ips = [...new Set([target.last_ip, ...ipsOf(targetId).map((x) => x.ip)].filter(Boolean))].slice(0, 20);
   const id = newId();
@@ -4412,7 +4452,11 @@ api.delete('/profile-comments/:id', auth, (req, res) => {
 // act: voting or ending it, which a block stops in a DM like any other new interaction (reading it still works).
 function pollTarget(messageId, userId, act = false) {
   const cm = db.prepare('SELECT id, channel_id FROM messages WHERE id = ?').get(messageId);
-  if (cm) { const c = requireChannel(cm.channel_id, userId); return { emit: (ev, data) => toChannel(c).emit(ev, data) }; }
+  if (cm) {
+    const c = requireChannel(cm.channel_id, userId);
+    if (act && perms.timedOut(c.server_id, userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
+    return { emit: (ev, data) => toChannel(c).emit(ev, data) };
+  }
   const dm = db.prepare('SELECT id, dm_id FROM dm_messages WHERE id = ?').get(messageId);
   if (dm) {
     const d = requireDm(dm.dm_id, userId);
@@ -4557,7 +4601,7 @@ setInterval(() => {
       WHERE r.event_id = ? AND r.status IN ('going', 'maybe')`).all(e.server_id, e.id).map((r) => r.user_id);
     const srv = db.prepare('SELECT name FROM servers WHERE id = ?').get(e.server_id) || {};
     who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: eventChannelFor(e, u) }));
-    pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/' });
+    pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/', generic: 'An event is starting soon' }, { kind: 'event', serverId: srv.id });
   }
 }, 60000).unref();
 
@@ -4679,6 +4723,10 @@ const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, ge
   mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
 // Message search (server/search.js): filters by where, who and when; the search words stay in the app.
 require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
+// Saved messages, read state, notification preferences, pin history, timeouts, data export (server/usability.js).
+USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
+  emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
+  requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();
@@ -5224,7 +5272,7 @@ function setupSockets(server) {
         const d = dmOfRoom(c.id);
         const ch = !d && db.prepare('SELECT * FROM channels WHERE id = ?').get(c.id);
         ring.forEach((u) => io.to(`user:${u}`).emit('call:ring', { room: c.id, dmId: d ? d.id : null, serverId: ch ? ch.server_id : null, from: uid, video: !!p.video }));
-        if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/' });
+        if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/', generic: 'Incoming call' }, { kind: 'call' });
       }
       return { ok: true, peers, canSpeak: speak };
     }));

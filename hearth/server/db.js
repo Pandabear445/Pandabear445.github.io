@@ -15,7 +15,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -976,6 +976,71 @@ CREATE TABLE IF NOT EXISTS server_key_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
+`);
+
+// v18 (usability): saved messages, read state, notification preferences, pin history and member timeouts.
+// Saved messages and read state hold message ids only (a saved item's note is end-to-end encrypted, x1:, like
+// study data). mention_marks records who a message pings (the ids the sender's app already sends for push), so
+// mention counts survive a reload; user_id '*' is @everyone. Timeouts are their own table so leaving and
+// rejoining a server doesn't clear one.
+db.exec(`
+CREATE TABLE IF NOT EXISTS saved_messages (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  note TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_saved_messages_time ON saved_messages(user_id, created_at);
+CREATE TABLE IF NOT EXISTS read_states (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conv TEXT NOT NULL,
+  last_read_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, conv)
+);
+CREATE TABLE IF NOT EXISTS mention_marks (
+  message_id TEXT NOT NULL,
+  conv TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  PRIMARY KEY (message_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mention_marks_conv ON mention_marks(conv, user_id, message_id);
+CREATE TABLE IF NOT EXISTS notify_prefs (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'default',
+  mute_until INTEGER,
+  suppress_everyone INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, target)
+);
+CREATE INDEX IF NOT EXISTS idx_notify_prefs_target ON notify_prefs(target, level);
+CREATE TABLE IF NOT EXISTS user_prefs (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  data TEXT NOT NULL DEFAULT '{}',
+  read_baseline TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pin_log (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  user_id TEXT,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pin_log_channel ON pin_log(channel_id, created_at);
+CREATE TABLE IF NOT EXISTS member_timeouts (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  until INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  by_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
