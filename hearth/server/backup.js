@@ -157,9 +157,12 @@ function referencedFiles(source) {
   try {
     const out = new Set();
     const has = (t) => !!d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
-    for (const [t, col] of [['blobs', 'name'], ['user_files', 'name'], ['gif_library', 'file']]) {
+    // user_files rows of kind 'reserved' hold room for an upload still in progress (server/storage.js); there's no
+    // file for them in uploads/ yet, so they aren't missing files.
+    const hasKind = has('user_files') && d.prepare('PRAGMA table_info(user_files)').all().some((c) => c.name === 'kind');
+    for (const [t, col, where] of [['blobs', 'name', ''], ['user_files', 'name', hasKind ? " WHERE kind IS NOT 'reserved'" : ''], ['gif_library', 'file', '']]) {
       if (!has(t)) continue;
-      for (const r of d.prepare(`SELECT ${col} AS f FROM ${t}`).iterate()) if (typeof r.f === 'string' && /^[\w.-]+$/.test(r.f)) out.add(r.f);
+      for (const r of d.prepare(`SELECT ${col} AS f FROM ${t}${where}`).iterate()) if (typeof r.f === 'string' && /^[\w.-]+$/.test(r.f)) out.add(r.f);
     }
     return out;
   } finally { if (typeof source === 'string') d.close(); }

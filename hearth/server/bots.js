@@ -18,6 +18,7 @@
 //  - A bot's own actions never come back to it as events, and no bot code ever runs inside Hearth.
 // See docs/BOTS.md for the developer side.
 const crypto = require('crypto');
+const jobs = require('./jobs');
 const netguard = require('./netguard');
 
 const SCOPES = {
@@ -235,16 +236,16 @@ module.exports = function setupBots(ctx) {
       setImmediate(pump);
     }
   }
-  setInterval(pump, 5000).unref();
-  setTimeout(pump, 1000).unref();
+  // Also on a timer (a safe job: errors are logged and counted in Admin → Health), in case a wake-up was missed.
+  jobs.every('bots.deliveries', 5000, pump, { firstDelay: 1000 });
   // Delivered events are kept 3 days (for "recent deliveries"), dead letters 30 days, at most 500 per bot.
-  setInterval(() => {
+  jobs.every('bots.prune_deliveries', 3600000, () => {
     const t = now();
     db.prepare("DELETE FROM bot_deliveries WHERE (status = 'ok' AND done_at < ?) OR (status = 'dead' AND done_at < ?)").run(t - 3 * 86400000, t - 30 * 86400000);
     for (const b of db.prepare('SELECT bot_id FROM bot_deliveries GROUP BY bot_id HAVING COUNT(*) > 500').all()) {
       db.prepare("DELETE FROM bot_deliveries WHERE bot_id = ? AND status != 'pending' AND id NOT IN (SELECT id FROM bot_deliveries WHERE bot_id = ? ORDER BY created_at DESC LIMIT 500)").run(b.bot_id, b.bot_id);
     }
-  }, 3600000).unref();
+  });
 
   const deliveryOut = (d) => {
     let data = {};

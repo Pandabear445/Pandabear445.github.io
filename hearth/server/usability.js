@@ -28,6 +28,7 @@
 //   GET    /me/export/messages      one conversation's messages as ciphertext, oldest first (X-Export-Token)
 
 const crypto = require('crypto');
+const jobs = require('./jobs');
 
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 const CONV = /^([cd]):([A-Za-z0-9_-]{1,64})$/;
@@ -382,7 +383,6 @@ module.exports = function setupUsability(ctx) {
     for (const g of gone) emitTo(g.user_id, 'timeout:update', { serverId: g.server_id, until: null });
     [...new Set(gone.map((g) => g.server_id))].forEach((sid) => emitServer(sid));
   }
-  setInterval(endExpired, 60000).unref();
   // Read markers and preferences for channels and DMs that no longer exist (deleted channels and servers).
   function sweepStale() {
     for (const t of [['read_states', 'conv'], ['notify_prefs', 'target']]) {
@@ -391,9 +391,9 @@ module.exports = function setupUsability(ctx) {
     }
     db.prepare("DELETE FROM notify_prefs WHERE target LIKE 's:%' AND NOT EXISTS (SELECT 1 FROM servers WHERE id = substr(notify_prefs.target, 3))").run();
   }
-  setTimeout(() => { try { sweepStale(); } catch (e) { console.error('Read-state cleanup failed:', e.message); } }, 90000).unref();
-  setInterval(() => { try { sweepStale(); } catch (e) { console.error('Read-state cleanup failed:', e.message); } }, 24 * 3600000).unref();
-  setTimeout(endExpired, 5000).unref();
+  // Safe jobs (errors logged and shown in Admin → Health, never a crash).
+  jobs.every('usability.end_timeouts', 60000, endExpired, { firstDelay: 5000 });
+  jobs.every('usability.sweep_stale', 24 * 3600000, sweepStale, { firstDelay: 90000 });
   api.get('/servers/:id/timeouts', auth, (req, res) => {
     const s = requirePerm(req.params.id, req.userId, PM.KICK_MEMBERS, 'You need the Kick Members permission.');
     res.json(db.prepare('SELECT user_id, until, reason, by_id, created_at FROM member_timeouts WHERE server_id = ? AND until > ? ORDER BY until').all(s.id, now())

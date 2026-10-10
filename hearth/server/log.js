@@ -172,7 +172,14 @@ function requestLogger() {
     req.id = reqId;
     res.setHeader('X-Request-Id', reqId);
     const start = process.hrtime.bigint();
+    // Read the address now: once the connection is gone (a client that hangs up, or an upload cut off for being too
+    // big), Express can't work it out any more and req.ip throws, which inside this handler would crash the server.
+    let ip = null;
+    try { ip = req.ip; } catch { /* no socket */ }
     res.on('finish', () => {
+      try { logRequest(); } catch (e) { try { write('warn', 'http', 'access_log_failed', { error: e }); } catch { /* never let logging crash */ } }
+    });
+    const logRequest = () => {
       if (config.access === 'off') return;
       const durationMs = Math.round(Number(process.hrtime.bigint() - start) / 1e5) / 10;
       const status = res.statusCode;
@@ -181,9 +188,9 @@ function requestLogger() {
       if (!slow && config.access === 'errors' && status < 400) return;
       if (!slow && okRead && Math.random() >= config.sample) return;
       const level = slow || status >= 500 ? 'warn' : 'info';
-      const fields = { method: req.method, route: routeOf(req), status, durationMs, outcome: status >= 500 ? 'error' : status >= 400 ? 'denied' : slow ? 'slow' : 'ok', uid: userHash(req.userId), ip: req.ip };
+      const fields = { method: req.method, route: routeOf(req), status, durationMs, outcome: status >= 500 ? 'error' : status >= 400 ? 'denied' : slow ? 'slow' : 'ok', uid: userHash(req.userId), ip };
       withContext({ reqId }, () => write(level, 'http', slow ? 'slow_request' : 'request', fields));
-    });
+    };
     als.run({ reqId }, next);
   };
 }

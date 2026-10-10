@@ -24,6 +24,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const jobs = require('./jobs');
 
 module.exports = function setupStorage(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, limitNet, HttpError, quotaOf, overLimit, uploadLimits, fmtMb, MB, getUserRow,
@@ -262,8 +263,7 @@ module.exports = function setupStorage(ctx) {
     db.prepare("DELETE FROM user_files WHERE kind = 'reserved' AND substr(name, 8) NOT IN (SELECT id FROM upload_sessions)").run();
     return removed;
   }
-  setTimeout(() => { try { sweepUploads(); } catch (e) { console.error('Upload cleanup failed:', e.message); } }, 1000).unref();
-  setInterval(() => { try { sweepUploads(); } catch (e) { console.error('Upload cleanup failed:', e.message); } }, SWEEP_MS).unref();
+  jobs.every('storage.sweep_uploads', SWEEP_MS, sweepUploads, { firstDelay: 1000 });
 
   // ------------------------------------------------------------------ what is referenced
   // A file in data/uploads/ is in use if anything points at it. Built from what the database says, never from

@@ -441,3 +441,20 @@ test('server: the access log can be turned down to errors only', async () => {
     assert.ok(all.some((l) => l.reqId === 'loud-401' && l.status === 401 && l.outcome === 'denied'));
   } finally { await srv.stop(); }
 });
+
+test('log: the access log never throws when the connection is already gone (it used to crash the server)', () => {
+  const { EventEmitter } = require('node:events');
+  const mw = log.requestLogger();
+  // Express works the address out from the socket; after a hang-up (or an upload cut off for being too big) that
+  // throws. The logger must read it up front and never let the access line take the process down.
+  let gone = false;
+  const req = { method: 'PUT', headers: {}, url: '/api/uploads/x', route: { path: '/uploads/:id' }, baseUrl: '/api', get ip() { if (gone) throw new TypeError("Cannot read properties of null (reading 'remoteAddress')"); return '198.18.7.9'; } };
+  const res = Object.assign(new EventEmitter(), { statusCode: 413, setHeader() {} });
+  mw(req, res, () => {});
+  gone = true;
+  const out = capture(() => assert.doesNotThrow(() => res.emit('finish')));
+  const line = lines(out).find((l) => l.op === 'request');
+  assert.ok(line, out);
+  assert.equal(line.status, 413);
+  assert.equal(line.ip, '198.18.7.0/24');
+});
