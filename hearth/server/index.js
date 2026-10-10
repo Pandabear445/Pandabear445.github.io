@@ -2466,8 +2466,10 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   if (Array.isArray(files) && files.length && !(cp & PM.ATTACH_FILES)) fail(403, 'You don\u2019t have permission to attach files here.');
   if ((req.body || {}).threadId && !(cp & PM.CREATE_THREADS)) fail(403, 'You don\u2019t have permission to reply in threads here.');
   if (c.slowmode > 0 && !(cp & (PM.MANAGE_MESSAGES | PM.MANAGE_CHANNELS))) {
-    const last = db.prepare('SELECT created_at FROM messages WHERE channel_id = ? AND author_id = ? ORDER BY id DESC LIMIT 1').get(c.id, req.userId);
-    const wait = last ? Math.ceil((last.created_at + c.slowmode * 1000 - now()) / 1000) : 0;
+    // Their latest message here: one lookup in the (channel, author, time) index. Ordering by id instead walked the
+    // channel's whole history, newest first, for someone who had never written there.
+    const last = db.prepare('SELECT MAX(created_at) AS created_at FROM messages WHERE channel_id = ? AND author_id = ?').get(c.id, req.userId);
+    const wait = last && last.created_at != null ? Math.ceil((last.created_at + c.slowmode * 1000 - now()) / 1000) : 0;
     if (wait > 0) fail(429, `Slowmode is on. You can send another message in ${wait}s.`, 'slowmode');
   }
   const ep = requireCurrentEpoch(c.server_id, epoch);
