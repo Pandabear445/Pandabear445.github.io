@@ -134,15 +134,17 @@ module.exports = function setupStorage(ctx) {
       res.setHeader('Connection', 'close');
       fail(413, `Chunks can be up to ${cap} bytes here.`, 'chunk_too_big');
     }
+    // Taken before the first await, so two chunks sent at once can't both get in.
+    let aborted = false;
+    let tooBig = false;
+    active.set(s.id, { abort: () => { aborted = true; req.destroy(); } });
     let fh;
     try { fh = await fs.promises.open(partOf(s.id), 'r+'); } catch {
+      active.delete(s.id);
       drop(s.id);
       fail(410, 'This upload expired. Start it again.', 'no_upload');
     }
     let pos = s.received;
-    let aborted = false;
-    let tooBig = false;
-    active.set(s.id, { abort: () => { aborted = true; req.destroy(); } });
     try {
       // Anything past what the server confirmed (a chunk cut off before a crash) is dropped first.
       await fh.truncate(s.received);

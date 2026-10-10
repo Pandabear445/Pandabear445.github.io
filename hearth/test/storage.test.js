@@ -166,6 +166,18 @@ test('storage-2: oversize chunks, files over the limit and nonsense sizes are re
   const ok = await put(u, small.id, 0, crypto.randomBytes(1000));
   assert.equal(ok.status, 200, ok.text);
   for (const id of [s.id, small.id]) assert.equal((await as(u, 'DELETE', `/uploads/${id}`)).status, 200);
+
+  // Two chunks for the same place at once (a retry racing the original): one gets in, the other is told to wait
+  // or where to carry on; the file never gets a mix of both.
+  const x = crypto.randomBytes(CHUNK); const y = crypto.randomBytes(CHUNK); const rest = crypto.randomBytes(500);
+  const race = (await start(u, CHUNK + 500)).json;
+  const both = await Promise.all([put(u, race.id, 0, x), put(u, race.id, 0, y)]);
+  assert.deepEqual(both.map((r) => r.status).sort(), [200, 409], both.map((r) => r.text).join('\n'));
+  const winner = both[0].status === 200 ? x : y;
+  assert.equal((await as(u, 'GET', `/uploads/${race.id}`)).json.received, CHUNK);
+  assert.deepEqual(fs.readFileSync(partFile(race.id)), winner);
+  assert.equal((await put(u, race.id, CHUNK, rest)).status, 200);
+  assert.equal((await complete(u, race.id, sha(Buffer.concat([winner, rest])))).status, 200);
 });
 
 // ------------------------------------------------------------------ storage-3: damaged files
