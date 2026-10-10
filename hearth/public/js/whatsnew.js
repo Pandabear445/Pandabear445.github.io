@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.28.1', items: [
+    'Security fixes from an automated code scan: a generous per-account limit on requests, so one account can\u2019t flood the server; stricter checks on file names, profile CSS and links you open; and the server\u2019s own keys are created safely even if two copies start at once.',
+  ] },
   { version: '1.28.0', items: [
     'Search got much better (Ctrl+K): filters like from:@name, in:#channel, before:/after:/during: a date, has:file, has:image, has:link, is:edited and "exact phrases", and it can look through your whole history. Your search words never leave your device.',
     'Calls survive hiccups: if your connection drops, the call keeps going and rejoins by itself (others see you as reconnecting), even after a server restart. The call bar shows what’s really happening, and Call diagnostics (ⓘ in a call) shows how your connection is doing.',

@@ -54,12 +54,12 @@ const PAGE_DEFAULTS = {
 function sanitizeCss(css) {
   let s = String(css || '').slice(0, 12000);
   // Repeat until nothing changes, so removing one word can't join the pieces around it into another
-  // ("<sty<stylele" → "<style").
+  // ("javajavascript:script:" → "javascript:").
   for (let prev = null, i = 0; s !== prev && i < 20; i++) {
     prev = s;
     s = s.replace(/\/\*[\s\S]*?\*\//g, '') // comments
       .replace(/\\/g, '') // escapes could hide the words below
-      .replace(/<\/?\s*style/gi, '')
+      .replace(/</g, '') // no tags at all, so nothing can close the <style> element this ends up in
       .replace(/@(import|charset|namespace|font-face|property|layer|container|supports|page|document)\b[^;{]*(;|\{[^}]*\})?/gi, '')
       .replace(/\b(url|image-set|image|src|expression|element|cross-fade)\s*\(/gi, 'blocked(')
       .replace(/javascript\s*:/gi, '')

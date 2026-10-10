@@ -79,14 +79,14 @@ export function createRecall(ctx) {
     const json = JSON.stringify(obj);
     if (saved.get(id) === json) return;
     const data = await E2EE.sealVault(await vkey(), kind, id, obj);
-    const r = await api('PUT', `/me/study/${id}`, { kind, data });
+    const r = await api('PUT', `/me/study/${encodeURIComponent(id)}`, { kind, data });
     items.set(id, { kind, obj, updatedAt: r.updatedAt });
     saved.set(id, json);
     ownChange(r.updatedAt);
   }
   async function del(id) {
     items.delete(id); saved.delete(id);
-    const r = await api('DELETE', `/me/study/${id}`).catch(() => null);
+    const r = await api('DELETE', `/me/study/${encodeURIComponent(id)}`).catch(() => null);
     if (r) ownChange(r.updatedAt);
   }
   const deckItemId = (deckId) => 'r-' + deckId;

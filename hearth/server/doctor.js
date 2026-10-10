@@ -29,10 +29,15 @@ const codeSchema = () => Number((/const SCHEMA_VERSION = (\d+);/.exec(fs.readFil
 // rollback-journal file, which an in-memory database needs); a bigger one is opened read-only as usual.
 function openReadOnly(file) {
   const Database = require('better-sqlite3');
-  if (!fs.existsSync(`${file}-wal`) && fs.statSync(file).size <= 256 * 1048576) {
-    const buf = fs.readFileSync(file);
-    if (buf.length >= 100 && buf.toString('latin1', 0, 15) === 'SQLite format 3') { buf[18] = 1; buf[19] = 1; }
-    return new Database(buf, { readonly: true });
+  if (!fs.existsSync(`${file}-wal`)) {
+    // The size check and the read use the same open file.
+    const fd = fs.openSync(file, 'r');
+    let buf = null;
+    try { if (fs.fstatSync(fd).size <= 256 * 1048576) buf = fs.readFileSync(fd); } finally { fs.closeSync(fd); }
+    if (buf) {
+      if (buf.length >= 100 && buf.toString('latin1', 0, 15) === 'SQLite format 3') { buf[18] = 1; buf[19] = 1; }
+      return new Database(buf, { readonly: true });
+    }
   }
   const db = new Database(file, { readonly: true, fileMustExist: true });
   db.pragma('busy_timeout = 3000');

@@ -1106,7 +1106,7 @@ function setView(v) {
   if (S.panel === 'pins') S.panel = null;
   if (S.panel === null && P.showMembers && wideEnoughForPanel() && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
   document.body.classList.remove('nav-open');
-  if (v.type === 'channel') { const lc = P.lastChannel; lc[v.serverId] = v.channelId; P.lastChannel = lc; }
+  if (v.type === 'channel') { const lc = new Map(Object.entries(P.lastChannel)); lc.set(v.serverId, v.channelId); P.lastChannel = Object.fromEntries(lc); }
   // Where "New messages" goes: the read marker as it was when you opened the conversation.
   const ck = currentKey();
   S.unreadMarker = ck && S.unread.has(ck) ? ck : null;
@@ -1172,7 +1172,7 @@ function applyNotifyPref(r) {
 async function setNotify(key, level, extra = {}) {
   const body = { ...extra };
   if (level !== undefined) body.level = level === 'muted' ? 'none' : level;
-  try { applyNotifyPref(await api('PUT', `/me/notify/${key}`, body)); } catch (e) { toast(e.message, 'error'); }
+  try { applyNotifyPref(await api('PUT', `/me/notify/${encodeURIComponent(key)}`, body)); } catch (e) { toast(e.message, 'error'); }
 }
 async function setNotifySettings(body) {
   const r = await api('PUT', '/me/notify-settings', body);
@@ -2382,7 +2382,7 @@ function onMessageAreaClick(e) {
   if (mention) openProfilePop(mention, mention.dataset.user, 'right');
 }
 
-const msgUrl = (key) => (key.startsWith('c:') ? `/channels/${key.slice(2)}/messages` : `/dms/${key.slice(2)}/messages`);
+const msgUrl = (key) => (key.startsWith('c:') ? `/channels/${encodeURIComponent(key.slice(2))}/messages` : `/dms/${encodeURIComponent(key.slice(2))}/messages`);
 // mode: 'latest' | 'older' | 'newer' | { around: id }
 async function loadMessages(key, mode = 'latest') {
   let store = S.msgs[key];
@@ -2394,9 +2394,9 @@ async function loadMessages(key, mode = 'latest') {
   if (store.loading || (mode === 'older' && !store.hasMore) || (mode === 'newer' && !store.hasNewer)) return;
   store.loading = true;
   let q = '';
-  if (mode === 'older' && store.list.length) q = `?before=${store.list[0].id}`;
-  else if (mode === 'newer' && store.list.length) q = `?after=${store.list[store.list.length - 1].id}`;
-  else if (typeof mode === 'object') q = `?around=${mode.around}`;
+  if (mode === 'older' && store.list.length) q = `?before=${encodeURIComponent(store.list[0].id)}`;
+  else if (mode === 'newer' && store.list.length) q = `?after=${encodeURIComponent(store.list[store.list.length - 1].id)}`;
+  else if (typeof mode === 'object') q = `?around=${encodeURIComponent(mode.around)}`;
   if (!store.loaded) renderMessages(true);
   try {
     const res = await api('GET', msgUrl(key) + q);
@@ -2938,7 +2938,7 @@ async function fileInfo(url, where) {
 }
 async function jumpToMessageId(id) {
   try {
-    const loc = await api('GET', `/messages/${id}/locate`);
+    const loc = await api('GET', `/messages/${encodeURIComponent(id)}/locate`);
     if (loc.kind === 'dm') return jumpToMessage('d:' + loc.dmId, id);
     if (loc.threadId) {
       await jumpToMessage('c:' + loc.channelId, loc.threadId);
@@ -3639,7 +3639,7 @@ async function pinsPanel(el) {
   const list = h('div', { class: 'pin-list' }, h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
   el.append(list);
   try {
-    const url = key.startsWith('c:') ? `/channels/${key.slice(2)}/pins` : `/dms/${key.slice(2)}/pins`;
+    const url = key.startsWith('c:') ? `/channels/${encodeURIComponent(key.slice(2))}/pins` : `/dms/${encodeURIComponent(key.slice(2))}/pins`;
     const pins = await api('GET', url);
     await Promise.all(pins.map(decryptMessage));
     if (currentKey() !== key || panelMode() !== 'pins') return;

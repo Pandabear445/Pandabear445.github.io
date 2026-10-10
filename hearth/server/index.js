@@ -15,6 +15,7 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
 const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION } = require('./db');
+const { readOrCreate } = require('./secretfile');
 // User ids in the access log are keyed hashes: groupable, but not checkable against a list of ids.
 log.setUserHashKey(atRestKey);
 // Job health is saved (at most once a minute per job, right away when one starts or stops failing) for the
@@ -608,6 +609,13 @@ function recordFile(userId, name, kind, size) {
   if (!userId || !name) return;
   db.prepare('INSERT OR REPLACE INTO user_files (name, user_id, kind, size, created_at) VALUES (?, ?, ?, ?, ?)').run(name, userId, kind, size || 0, now());
 }
+// Where an uploaded file is on disk, by its stored name. The names are made here (fileName()), but they also come
+// back in requests and database rows, so a name that isn't a plain file inside the uploads folder gets null.
+const UPLOAD_ROOT = path.resolve(UPLOAD_DIR);
+function uploadPath(name) {
+  const p = path.resolve(UPLOAD_ROOT, String(name || ''));
+  return p.startsWith(UPLOAD_ROOT + path.sep) && path.dirname(p) === UPLOAD_ROOT ? p : null;
+}
 function removeUpload(url) {
   if (!url || !url.startsWith('/uploads/')) return;
   const name = path.basename(url);
@@ -662,9 +670,9 @@ function overLimit(uid, q, size) {
 // Public pictures lose their hidden metadata (EXIF, GPS position, XMP…) before anyone can download them;
 // see server/imagemeta.js. That runs in a worker thread, so a big (or hostile) picture can't hold up the server.
 // A picture that can't be cleaned is refused rather than kept with its metadata.
-async function stripUploadedImage(file) {
+async function stripUploadedImage(file, stored) {
   try {
-    const size = await stripFile(file.path);
+    const size = await stripFile(stored);
     if (size != null) file.size = size;
   } catch (e) {
     if (e instanceof ImageRejected) throw new HttpError(400, 'That picture couldn\u2019t be checked for hidden data (like a GPS position), so it wasn\u2019t saved. Save it again as a normal JPG or PNG and try once more.', 'bad_image');
@@ -725,27 +733,28 @@ function limited(kind, base, field) {
       if (err) return next(err);
       const file = req.file;
       if (!file) { release(); return next(); }
+      const stored = file.path ? uploadPath(file.filename) : null;
       // Still counted as in progress while the picture is cleaned, so the disk can't fill up meanwhile.
-      const cleaned = PUBLIC_KINDS.has(kind) && file.path ? stripUploadedImage(file) : Promise.resolve();
+      const cleaned = PUBLIC_KINDS.has(kind) && stored ? stripUploadedImage(file, stored) : Promise.resolve();
       cleaned.then(() => {
         release();
         try {
           // No await from here to recordFile(): see overLimit().
           const over = overLimit(req.userId, q, file.size);
           if (over) {
-            if (file.path) fs.promises.unlink(file.path).catch(() => {});
+            if (stored) fs.promises.unlink(stored).catch(() => {});
             return next(over);
           }
           recordFile(req.userId, file.filename, kind === 'file' ? 'attachment' : kind, file.size);
         } catch (e) {
-          if (file.path) fs.promises.unlink(file.path).catch(() => {});
+          if (stored) fs.promises.unlink(stored).catch(() => {});
           return next(e);
         }
         res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + file.filename); });
         next();
       }, (e) => {
         release();
-        if (file.path) fs.promises.unlink(file.path).catch(() => {});
+        if (stored) fs.promises.unlink(stored).catch(() => {});
         next(e);
       });
     });
@@ -847,8 +856,8 @@ jobs.every('uploads.orphan_sweep', 24 * 3600 * 1000, sweepOrphans, { firstDelay:
 app.get('/uploads/:file', (req, res) => {
   const f = req.params.file;
   if (!/^[a-z0-9]+(\.[a-z0-9]{1,8})?$/i.test(f)) return res.sendStatus(404);
-  const p = path.join(UPLOAD_DIR, f);
-  if (!fs.existsSync(p)) return res.sendStatus(404);
+  const p = uploadPath(f);
+  if (!p || !fs.existsSync(p)) return res.sendStatus(404);
   const type = INLINE_TYPES[path.extname(f).toLowerCase()];
   if (type) {
     res.type(type);
@@ -903,7 +912,8 @@ const APP_ASSETS = ['/', '/manifest.webmanifest', '/vendor/argon2.js', '/socket.
 const BUILD = crypto.createHash('sha256').update(walk(PUBLIC_DIR).sort().map((f) => f + fs.readFileSync(path.join(PUBLIC_DIR, f)).length + fs.statSync(path.join(PUBLIC_DIR, f)).mtimeMs).join('|')).digest('hex').slice(0, 12);
 app.get('/sw.js', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
-  res.type('application/javascript').send(SW_TEMPLATE.replace('__VERSION__', BUILD).replace("'__ASSETS__'", JSON.stringify(APP_ASSETS)));
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.send(SW_TEMPLATE.replace('__VERSION__', BUILD).replace("'__ASSETS__'", JSON.stringify(APP_ASSETS)));
 });
 app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
@@ -951,14 +961,20 @@ app.use((req, res, next) => {
   if (!enc) return next();
   const file = path.join(PUBLIC_DIR, rel);
   if (!file.startsWith(PUBLIC_DIR + path.sep)) return next();
-  let st;
-  try { st = fs.statSync(file); } catch { return next(); }
-  if (!st.isFile()) return next();
-  let e = packed.get(file);
-  if (!e || e.mtime !== st.mtimeMs) {
-    e = { mtime: st.mtimeMs, tag: `${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}`, raw: fs.readFileSync(file) };
-    packed.set(file, e);
-  }
+  // The date check and the read use the same open file, so a file replaced in between can't be cached under the
+  // old one's date.
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return next(); }
+  let e;
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return next();
+    e = packed.get(file);
+    if (!e || e.mtime !== st.mtimeMs) {
+      e = { mtime: st.mtimeMs, tag: `${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}`, raw: fs.readFileSync(fd) };
+      packed.set(file, e);
+    }
+  } finally { fs.closeSync(fd); }
   if (!e[enc]) e[enc] = enc === 'br' ? zlib.brotliCompressSync(e.raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 9 } }) : zlib.gzipSync(e.raw, { level: 9 });
   const etag = `W/"${e.tag}-${enc}"`;
   res.setHeader('Vary', 'Accept-Encoding');
@@ -1092,6 +1108,11 @@ jobs.every('sessions.purge', 3600000, () => {
   db.prepare('DELETE FROM sessions WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ? OR COALESCE(last_used_at, created_at) < ?')
     .run(t - 30 * 86400000, t - 30 * 86400000, t - SESSION_IDLE_MS - 30 * 86400000);
 });
+// Every signed-in request also counts toward a per-account ceiling: API_RATE_LIMIT requests a minute (default 1200;
+// 0 turns it off). That's far more than the app needs, even next to a big upload going at its own limit of 600
+// pieces a minute, and it sits on top of the tighter limits on sensitive routes, so one account can't flood the
+// server with requests that each look cheap.
+const API_PER_MIN = /^\d+$/.test(String(process.env.API_RATE_LIMIT || '').trim()) ? +process.env.API_RATE_LIMIT : 1200;
 function auth(req, res, next) {
   const token = tokenFrom(req);
   const s = sessionFor(token);
@@ -1105,6 +1126,7 @@ function auth(req, res, next) {
   // A ban covers people who were already signed in, too (staff excepted, so nobody locks the admins out).
   if (!loggingOut && ipBanned(req.ip) && !isStaff(s.user_id)) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
   if (!loggingOut && maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
+  if (!loggingOut && API_PER_MIN) rateLimit('api:' + s.user_id, API_PER_MIN, 60000);
   req.userId = s.user_id;
   req.token = token;
   req.session = s;
@@ -1148,8 +1170,7 @@ let vapid = null;
 try {
   const VAPID_FILE = path.join(DATA_DIR, 'vapid.json');
   if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) vapid = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
-  else if (fs.existsSync(VAPID_FILE)) vapid = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8'));
-  else { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(VAPID_FILE, JSON.stringify(vapid), { mode: 0o600 }); }
+  else vapid = JSON.parse(readOrCreate(VAPID_FILE, () => JSON.stringify(webpush.generateVAPIDKeys())));
   webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
 } catch (e) { log.warn('push', 'disabled', { err: e, msg: 'Push notifications are off.' }); vapid = null; }
 
@@ -3041,7 +3062,7 @@ api.post('/servers/:id/emojis', auth, limited('image', uploadImage, 'file'), (re
   const url = '/uploads/' + req.file.filename;
   try {
     if (req.file.size > EMOJI_MAX) fail(400, 'Emoji images can be up to 2 MB.');
-    const animated = isAnimatedImage(fs.readFileSync(path.join(UPLOAD_DIR, req.file.filename)));
+    const animated = isAnimatedImage(fs.readFileSync(uploadPath(req.file.filename)));
     res.json(addEmoji(s, emojiName((req.body || {}).name), url, animated, req.userId));
   } catch (e) { removeUpload(url); throw e; }
 });
@@ -3553,7 +3574,7 @@ function addToLibrary({ buf, file, size, ext, title, tags, sticker, source, sour
     size = buf.length;
   } else {
     head = Buffer.alloc(32);
-    const fd = fs.openSync(path.join(UPLOAD_DIR, file), 'r');
+    const fd = fs.openSync(uploadPath(file), 'r');
     try { head = head.subarray(0, fs.readSync(fd, head, 0, 32, 0)); } finally { fs.closeSync(fd); }
   }
   const [w, hgt] = imageDims(head);
@@ -3562,7 +3583,7 @@ function addToLibrary({ buf, file, size, ext, title, tags, sticker, source, sour
     db.prepare(`INSERT INTO gif_library (id, file, title, tags, width, height, size, sticker, source, source_id, added_by, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, file, String(title || '').slice(0, 120), cleanTags(title || '', tags || ''), w, hgt, size, sticker ? 1 : 0, source, sourceId || null, userId || null, now());
   } catch (e) {
-    if (buf) fs.promises.unlink(path.join(UPLOAD_DIR, file)).catch(() => {}); // e.g. two people sent the same new GIF at once
+    if (buf) fs.promises.unlink(uploadPath(file)).catch(() => {}); // e.g. two people sent the same new GIF at once
     throw e;
   }
   trimLibrary();
@@ -5143,7 +5164,10 @@ async function loadTls() {
   }
   const certPath = path.join(DATA_DIR, 'cert.pem');
   const keyPath = path.join(DATA_DIR, 'key.pem');
-  if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+  const readPem = (f) => { try { return fs.readFileSync(f); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+  let cert = readPem(certPath);
+  let key = readPem(keyPath);
+  if (!cert || !key) {
     const selfsigned = require('selfsigned');
     const altNames = [{ type: 2, value: 'localhost' }, { type: 7, ip: '127.0.0.1' }];
     for (const list of Object.values(os.networkInterfaces())) {
@@ -5161,8 +5185,10 @@ async function loadTls() {
     fs.writeFileSync(certPath, pems.cert);
     fs.writeFileSync(keyPath, pems.private, { mode: 0o600 });
     log.info('tls', 'self_signed', { msg: `Generated a self-signed certificate in ${DATA_DIR}` });
+    cert = Buffer.from(pems.cert);
+    key = Buffer.from(pems.private);
   }
-  return { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
+  return { cert, key };
 }
 
 let io;

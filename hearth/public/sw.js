@@ -21,6 +21,9 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('message', (e) => {
+  // Only this site's own pages can take the new version live (browsers that leave the origin out only deliver
+  // messages from those pages anyway).
+  if (e.origin && e.origin !== self.location.origin) return;
   if (e.data === 'skipWaiting') self.skipWaiting();
 });
 

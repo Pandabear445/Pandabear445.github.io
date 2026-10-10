@@ -6,7 +6,9 @@
 #   - secrets: gitleaks over the whole git history (passwords, API keys, private keys committed by mistake).
 #   - image:   builds the Docker image and scans it with Trivy (fails on fixable high/critical), plus a
 #              configuration check of the Dockerfile and docker-compose.yml (report only).
-#   - codeql:  GitHub's code analysis for JavaScript; findings show under Security → Code scanning.
+#   - codeql:  GitHub's code analysis for JavaScript; findings show under Security → Code scanning. GitHub only
+#              offers it to private repositories with GitHub Advanced Security, so while this repository is private
+#              the job checks that and skips the scan (it runs again by itself if the repository goes public).
 #   - upgrade-drill: the last release before the security overhaul (c55a9dc, database version 16) and this commit,
 #              each filled through its API and then upgraded in place to this commit (also killed half-way through
 #              the upgrade, then restarted); plus the recovery drill's report (hearth/docs/RECOVERY.md).
@@ -151,15 +153,27 @@ jobs:
       actions: read
       security-events: write # to upload the results to Security → Code scanning
     steps:
+      # Asked rather than read from the event: scheduled runs don't say whether the repository is private.
+      - name: Is code scanning available here?
+        id: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          private=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)
+          echo "private=$private" >> "$GITHUB_OUTPUT"
+          if [ "$private" = true ]; then echo "::notice::This repository is private, so the CodeQL scan is skipped (it needs GitHub Advanced Security)."; fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.repo.outputs.private == 'false'
         with:
           persist-credentials: false
       - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: steps.repo.outputs.private == 'false'
         with:
           languages: javascript-typescript
           build-mode: none
-          queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml # security-extended; what's scanned and why
       - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: steps.repo.outputs.private == 'false'
         with:
           category: /language:javascript-typescript
 
