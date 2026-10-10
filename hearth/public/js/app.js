@@ -384,7 +384,7 @@ function startApp() {
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
-    onChange: () => { shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
+    onChange: () => { shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
     onSpeaking: (id, on) => {
       const uid = id === 'me' ? S.me.id : id;
       // Never show someone as speaking while they're muted or deafened, whatever audio arrives.
@@ -645,7 +645,9 @@ function startApp() {
     if (!voice || voice.channelId !== room) return;
     S.watch[room] = state;
     watchPlayer(room, watchCtx(room)).apply(state);
+    if (state) wtDock.hidden = false; // a new video shows up even if you hid the last one
     renderCallStages();
+    syncWatchDock();
   });
   socket.on('voice:state', ({ channelId, users }) => {
     if (!S.me) return;
@@ -1576,7 +1578,7 @@ function renderVoicePanel() {
   const ch = !room.startsWith('dm:') && channelById(room);
   const srv = ch && serverOfChannel(ch.id);
   const where = room.startsWith('dm:') ? `Call with ${roomTitle(room)}` : srv ? (isGroup(srv) ? groupName(srv) : `${ch.name} \u00b7 ${srv.name}`) : '';
-  const go = () => { if (room.startsWith('dm:')) openDm(room.slice(3)); else if (isGroup(srv)) openGroup(srv.id); else if (ch) openVoiceRoom(ch.id, srv.id); };
+  const go = () => goToCall(room);
   el.append(
     h('div', { class: 'vp-top' },
       h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}` }, label), h('button', { class: 'vp-where', onclick: go }, where)),
@@ -4958,17 +4960,14 @@ function fillStage(el) {
   const body = spot
     ? h('div', { class: 'cs-spot' }, tileEl(room, tiles.find((t) => t.key === spot), true), h('div', { class: 'cs-strip' }, tiles.filter((t) => t.key !== spot).map((t) => tileEl(room, t, false))))
     : h('div', { class: `cs-grid n${Math.min(tiles.length, 9)}` }, tiles.map((t) => tileEl(room, t, false)));
-  // The shared video player sits in its own box that redraws leave alone (moving it would reload the video).
+  // The shared video only has a placeholder here: the player itself lives in its own layer and is laid over this
+  // box (moving a video in the page would reload it), or shrinks to a mini player when you're elsewhere.
   const inCall = voice && voice.channelId === room;
   let host = el.querySelector(':scope > .cs-watch-host');
   if (inCall && S.watch[room]) {
-    const p = watchPlayer(room, watchCtx(room));
-    if (!host) host = h('div', { class: 'cs-watch-host' });
-    if (p.el.parentNode !== host) { host.append(p.el); p.apply(S.watch[room]); }
-  } else {
-    if (!inCall) { dropWatchPlayer(room); delete S.watch[room]; }
-    if (host) { host.remove(); host = null; }
-  }
+    if (!host) host = h('div', { class: 'cs-watch-host', dataset: { room } });
+  } else if (host) { host.remove(); host = null; }
+  syncWatchDock();
   [...el.children].forEach((c) => { if (c !== host) c.remove(); });
   const rest = [tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)];
   if (host) { if (!host.parentNode) el.append(host); el.insertBefore(head, host); el.append(...rest); el.classList.add('watching'); }
@@ -4979,6 +4978,104 @@ const watchCtx = (room) => ({
   userName: (id) => (id ? displayName(getUser(id)) : 'someone'),
   openStart: (queue) => openWatchStart(room, queue),
 });
+// Open the page of the call you're in (voice channel, DM or group).
+function goToCall(room) {
+  if (!room) return;
+  if (room.startsWith('dm:')) return openDm(room.slice(3));
+  const ch = channelById(room);
+  const srv = ch && serverOfChannel(ch.id);
+  if (srv && isGroup(srv)) openGroup(srv.id); else if (ch && srv) openVoiceRoom(ch.id, srv.id);
+}
+
+// ---- the watch-together dock
+// The shared video lives in one fixed layer that is never moved around the page (moving a video reloads it,
+// which paused it and made it jump). When the call is on screen it's laid exactly over the call's video box;
+// anywhere else in the app it becomes a mini player in the corner that keeps playing in sync. You can drag the
+// mini player, go back to the call, or hide it (the sound keeps playing; it comes back in the call).
+const wtDock = { el: null, body: null, head: null, title: null, room: null, hidden: false, raf: 0, pos: null, mode: '' };
+function wtDockEl() {
+  if (wtDock.el) return wtDock.el;
+  try { wtDock.pos = JSON.parse(sessionStorage.getItem('hearth.wtMini') || 'null'); } catch { wtDock.pos = null; }
+  wtDock.title = h('span', { class: 'wt-dock-title' });
+  wtDock.head = h('div', { class: 'wt-dock-head' },
+    icon('eye', 'ic'), wtDock.title,
+    ibtn('maximize', 'Back to the call', () => goToCall(wtDock.room), { cls: 'sm' }),
+    ibtn('close', 'Hide (it keeps playing)', () => { wtDock.hidden = true; placeWatchDock(); }, { cls: 'sm' }));
+  wtDock.body = h('div', { class: 'wt-dock-body' });
+  wtDock.el = h('div', { class: 'wt-dock', hidden: true }, wtDock.head, wtDock.body);
+  // Drag the mini player by its top bar.
+  wtDock.head.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('button') || wtDock.mode !== 'mini') return;
+    const r = wtDock.el.getBoundingClientRect(); const dx = e.clientX - r.left; const dy = e.clientY - r.top;
+    wtDock.head.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      wtDock.pos = { x: Math.max(0, Math.min(innerWidth - r.width, ev.clientX - dx)), y: Math.max(0, Math.min(innerHeight - r.height, ev.clientY - dy)) };
+      placeWatchDock();
+    };
+    const up = () => { wtDock.head.removeEventListener('pointermove', move); try { sessionStorage.setItem('hearth.wtMini', JSON.stringify(wtDock.pos)); } catch { /* private mode */ } };
+    wtDock.head.addEventListener('pointermove', move);
+    wtDock.head.addEventListener('pointerup', up, { once: true });
+  });
+  wtDock.head.addEventListener('dblclick', (e) => { if (!e.target.closest('button')) goToCall(wtDock.room); });
+  document.body.append(wtDock.el);
+  return wtDock.el;
+}
+// Called whenever the call or the shared video changes: show, move or drop the player.
+function syncWatchDock() {
+  const room = voice && voice.channelId;
+  const state = room && S.watch[room];
+  // Left the call (or switched to another one): that video is done for us.
+  if (wtDock.room && wtDock.room !== room) { dropWatchPlayer(wtDock.room); delete S.watch[wtDock.room]; wtDock.room = null; }
+  if (!state) {
+    if (wtDock.room) { dropWatchPlayer(wtDock.room); wtDock.room = null; }
+    if (wtDock.el) wtDock.el.hidden = true;
+    cancelAnimationFrame(wtDock.raf); wtDock.raf = 0; wtDock.hidden = false;
+    return;
+  }
+  const p = watchPlayer(room, watchCtx(room));
+  wtDockEl();
+  if (p.el.parentNode !== wtDock.body) { clear(wtDock.body).append(p.el); p.apply(state); }
+  wtDock.room = room;
+  wtDock.title.textContent = state.item.title || state.item.link || 'Watching together';
+  if (!wtDock.raf) { const loop = () => { placeWatchDock(); wtDock.raf = requestAnimationFrame(loop); }; wtDock.raf = requestAnimationFrame(loop); }
+}
+// Every frame while something is playing: over the call's box if it's on screen, otherwise the mini player.
+function placeWatchDock() {
+  const el = wtDock.el;
+  if (!el || !wtDock.room) return;
+  if (wtDock.body.querySelector('.wt-is-full')) { el.style.clipPath = ''; el.hidden = false; return; } // full screen: leave it be
+  const host = $$('.cs-watch-host').find((x) => x.dataset.room === wtDock.room && x.isConnected && x.getClientRects().length);
+  const style = el.style;
+  if (host) {
+    wtDock.hidden = false;
+    const r = host.getBoundingClientRect();
+    // Only the part of the box that's visible in its scrolling area (the video mustn't float over other things).
+    let clip = { top: 0, bottom: innerHeight, left: 0, right: innerWidth };
+    for (let a = host.parentElement; a && a !== document.body; a = a.parentElement) {
+      const o = getComputedStyle(a);
+      if (/(auto|scroll|hidden)/.test(o.overflowY + o.overflowX)) { const ar = a.getBoundingClientRect(); clip = { top: Math.max(clip.top, ar.top), bottom: Math.min(clip.bottom, ar.bottom), left: Math.max(clip.left, ar.left), right: Math.min(clip.right, ar.right) }; }
+    }
+    // The call's buttons stick to the bottom of the call while you scroll: never cover them.
+    const ctl = host.parentElement && host.parentElement.querySelector(':scope > .cs-controls');
+    if (ctl) { const c = ctl.getBoundingClientRect(); if (c.height && c.top < clip.bottom) clip.bottom = c.top; }
+    if (wtDock.mode !== 'inline') { wtDock.mode = 'inline'; el.classList.remove('mini'); el.classList.add('inline'); }
+    el.hidden = false;
+    style.left = `${r.left}px`; style.top = `${r.top}px`; style.width = `${r.width}px`; style.right = ''; style.bottom = '';
+    const ct = Math.max(0, clip.top - r.top); const cb = Math.max(0, r.top + el.offsetHeight - clip.bottom);
+    const cl = Math.max(0, clip.left - r.left); const cr = Math.max(0, r.right - clip.right);
+    style.clipPath = ct || cb || cl || cr ? `inset(${ct}px ${cr}px ${cb}px ${cl}px)` : '';
+    // The placeholder takes the player's height, so the call's tiles and buttons sit below it.
+    const want = `${el.offsetHeight}px`;
+    if (host.style.height !== want) host.style.height = want;
+    return;
+  }
+  if (wtDock.mode !== 'mini') { wtDock.mode = 'mini'; el.classList.remove('inline'); el.classList.add('mini'); style.clipPath = ''; style.width = ''; }
+  el.hidden = wtDock.hidden;
+  if (wtDock.pos) {
+    const w = el.offsetWidth || 320; const hgt = el.offsetHeight || 200;
+    style.left = `${Math.max(0, Math.min(innerWidth - w, wtDock.pos.x))}px`; style.top = `${Math.max(0, Math.min(innerHeight - hgt, wtDock.pos.y))}px`; style.right = 'auto'; style.bottom = 'auto';
+  } else { style.left = 'auto'; style.top = 'auto'; style.right = ''; style.bottom = ''; }
+}
 // Start (or queue) a video for everyone in the call.
 // What kind of link this is (the server checks again): YouTube, Vimeo, Twitch or a video file.
 function watchKind(raw) {

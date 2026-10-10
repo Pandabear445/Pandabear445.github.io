@@ -2122,6 +2122,18 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 
 /* ------------------------------------------------------------------ watch together */
 .cs-watch-host { min-height: 0; }
+/* The watch-together player's own layer: laid over .cs-watch-host in the call, a mini player elsewhere. */
+.wt-dock { position: fixed; z-index: 15; }
+.wt-dock[hidden] { display: none; }
+.wt-dock-head { display: none; }
+.wt-dock.mini { z-index: 24; right: 18px; bottom: 96px; width: min(360px, calc(100vw - 24px)); border-radius: 14px; overflow: hidden; background: rgb(var(--s1)); border: 1px solid var(--line); box-shadow: var(--pop-shadow); }
+.wt-dock.mini .wt-dock-head { display: flex; align-items: center; gap: 6px; padding: 4px 4px 4px 10px; cursor: grab; user-select: none; touch-action: none; font-size: 13px; font-weight: 600; }
+.wt-dock.mini .wt-dock-head > .ic { width: 15px; height: 15px; color: var(--accent); flex: none; }
+.wt-dock-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-dock.mini .wt { gap: 0; }
+.wt-dock.mini .wt-stage { border-radius: 0; min-height: 0; max-height: none; }
+.wt-dock.mini .wt-bar, .wt-dock.mini .wt-queue { display: none; }
+@media (max-width: 760px) { .wt-dock.mini { width: min(62vw, 280px); right: 10px; bottom: 84px; } }
 .wt { display: flex; flex-direction: column; gap: 8px; }
 .wt-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; max-height: min(62vh, calc(100vh - 380px)); min-height: 200px; background: #000; border-radius: 12px; overflow: hidden; }
 .wt-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }

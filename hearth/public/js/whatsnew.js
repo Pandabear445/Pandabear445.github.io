@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.26.2', items: [
+    'Watch together keeps playing when you leave the call\u2019s page: it shrinks into a mini player in the corner (drag it anywhere) and stays in sync with everyone, so you can chat or browse while you watch. Press \u2922 on it to go back to the call, or \u2715 to hide it (the sound keeps going). No more pausing and jumping back when you return.',
+  ] },
   { version: '1.26.1', items: [
     'Watch together has a full screen button (or press F, or double-click the video). The shared controls and Sync stay at the bottom and fade away while you watch; Esc goes back. On phones it fills the screen and turns sideways where it can.',
   ] },
