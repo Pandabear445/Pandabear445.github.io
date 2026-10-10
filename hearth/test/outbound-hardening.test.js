@@ -10,6 +10,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const zlib = require('node:zlib');
@@ -59,22 +60,43 @@ test('netguard: a host is refused if ANY of its addresses is private, however it
   netguard.setResolver(null);
 });
 
-test('netguard: a slow DNS server can only tie up two lookups, and nobody waits past their deadline', async () => {
-  let active = 0; let most = 0;
-  netguard.setResolver(async (host) => {
-    active++; most = Math.max(most, active);
-    await sleep(600); active--;
-    if (host === 'fine.test') return [{ address: '93.184.216.34', family: 4 }];
-    throw new Error('not found');
+test('netguard: a slow DNS server only slows its own names; system lookups are capped at two, and nobody waits past their deadline', async () => {
+  // Public names go to Node's DNS client, which has no shared limit for a slow name server to use up.
+  const systemCalls = []; let active = 0; let most = 0;
+  const err = (code) => Object.assign(new Error(code), { code });
+  netguard.setResolver({
+    dns: async (host) => {
+      if (host.startsWith('slow')) { await sleep(2000); throw err('ETIMEOUT'); }
+      if (host === 'broken.attacker.test') throw err('ESERVFAIL');
+      if (host === 'fcm.googleapis.com') return [{ address: '142.250.72.10', family: 4 }];
+      throw err('ENOTFOUND');
+    },
+    // The system lookup (on the thread pool) is only for local names and names DNS doesn't have.
+    system: async (host) => {
+      systemCalls.push(host); active++; most = Math.max(most, active);
+      await sleep(600); active--;
+      if (host === 'nas.lan') return [{ address: '93.184.216.34', family: 4 }];
+      if (host === 'intranet.example.test') return [{ address: '10.0.0.9', family: 4 }];
+      throw err('ENOTFOUND');
+    },
   });
   try {
-    const t = Date.now();
-    const codes = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => codeOf(netguard.checkPublicUrl(`http://slow${i}.test/`, { timeout: 300 }))));
+    const slow = [1, 2, 3, 4, 5, 6].map((i) => codeOf(netguard.checkPublicUrl(`http://slow${i}.attacker.test/`, { timeout: 1000 })));
+    let t = Date.now();
+    assert.equal((await netguard.checkPublicUrl('https://fcm.googleapis.com/x', { timeout: 1000 })).hostname, 'fcm.googleapis.com');
+    assert.ok(Date.now() - t < 300, `a push service was looked up in ${Date.now() - t} ms while six slow lookups were in flight`);
+    assert.deepEqual(await Promise.all(slow), Array(6).fill('TIMEOUT'));
+    assert.equal(await codeOf(netguard.checkPublicUrl('http://broken.attacker.test/')), 'NOT_FOUND');
+    assert.deepEqual(systemCalls, [], 'a slow or broken DNS answer never falls through to the system lookup');
+
+    t = Date.now();
+    const codes = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => codeOf(netguard.checkPublicUrl(`http://box${i}.lan/`, { timeout: 300 }))));
     assert.deepEqual(codes, Array(6).fill('TIMEOUT'));
     assert.ok(Date.now() - t < 1000, 'given up on at the deadline');
-    assert.ok(most <= 2, `${most} lookups ran at once`);
+    assert.ok(most <= 2, `${most} system lookups ran at once`);
     await sleep(700); // the two that did start finish and free their places
-    assert.equal((await netguard.checkPublicUrl('http://fine.test/')).hostname, 'fine.test');
+    assert.equal((await netguard.checkPublicUrl('http://nas.lan/')).hostname, 'nas.lan', 'local names still work');
+    assert.equal(await codeOf(netguard.checkPublicUrl('http://intranet.example.test/')), 'PRIVATE', 'a name DNS lacks is tried in /etc/hosts too, and still checked');
   } finally { netguard.setResolver(null); }
 });
 
@@ -165,6 +187,77 @@ test('netguard: one deadline for the whole request; answers are capped while the
   } finally { await closeAll(site); }
 });
 
+test('netguard: a refused compressed answer stops unpacking at once, so no CPU is left burning on it', async () => {
+  // About a kilobyte of brotli that unpacks to 1 GiB of zeros (seconds of CPU to unpack in full).
+  const bomb = await new Promise((resolve) => {
+    const z = zlib.createBrotliCompress({ params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5, [zlib.constants.BROTLI_PARAM_LGWIN]: 24 } });
+    const out = []; z.on('data', (c) => out.push(c)); z.on('end', () => resolve(Buffer.concat(out)));
+    const zeros = Buffer.alloc(16 << 20); let left = 64;
+    const pump = () => { while (left > 0) { left--; if (!z.write(zeros)) return z.once('drain', pump); } z.end(); };
+    pump();
+  });
+  assert.ok(bomb.length < 4096, `${bomb.length} bytes`);
+  const site = http.createServer((req, res) => { res.writeHead(200, { 'content-encoding': 'br', 'content-type': 'image/png' }); res.end(bomb); });
+  const port = await listen(site);
+  try {
+    assert.equal(await codeOf(netguard.request(`http://127.0.0.1:${port}/bomb.png`, { allowPrivate: true, maxBytes: 1 << 20 })), 'TOO_BIG');
+    const before = process.cpuUsage();
+    await sleep(1500);
+    const used = process.cpuUsage(before);
+    const ms = Math.round((used.user + used.system) / 1000);
+    assert.ok(ms < 300, `${ms} ms of CPU went on it after it was refused`);
+  } finally { await closeAll(site); }
+});
+
+test('netguard: misconfigured but readable answers read the way fetch() reads them; real garbage does not', async () => {
+  const text = rss('Lenient');
+  const gz = zlib.gzipSync(text);
+  const site = http.createServer((req, res) => {
+    const send = (encoding, body) => { res.writeHead(200, { 'content-type': 'application/rss+xml', 'content-encoding': encoding }); res.end(body); };
+    if (req.url === '/utf8') return send('UTF-8', text); // a charset where the encoding goes
+    if (req.url === '/none') return send('none', text);
+    if (req.url === '/raw-deflate') return send('deflate', zlib.deflateRawSync(text)); // no zlib header
+    if (req.url === '/deflate') return send('deflate', zlib.deflateSync(text));
+    if (req.url === '/no-trailer') return send('gzip', gz.subarray(0, gz.length - 8)); // cut before its checksum
+    if (req.url === '/two') return send('deflate, gzip', zlib.gzipSync(zlib.deflateSync(text)));
+    if (req.url === '/br') return send('br', zlib.brotliCompressSync(text));
+    return send('gzip', Buffer.from('this was never gzip, whatever the header says'));
+  });
+  const port = await listen(site);
+  const url = (p) => `http://127.0.0.1:${port}${p}`;
+  try {
+    for (const p of ['/utf8', '/none', '/raw-deflate', '/deflate', '/no-trailer', '/two', '/br']) {
+      assert.equal((await netguard.request(url(p), { allowPrivate: true })).body.toString(), text, p);
+      assert.equal(await (await fetch(url(p))).text(), text, `${p} (fetch reads it the same)`);
+    }
+    assert.equal(await codeOf(netguard.request(url('/garbage'), { allowPrivate: true })), 'BAD_ENCODING');
+  } finally { await closeAll(site); }
+});
+
+test("netguard: this server's own addresses are refused even when public (web ports aside), and so is OUTBOUND_BLOCK", async () => {
+  // Pretend this machine has a public address on an interface, as a VPS does.
+  const real = os.networkInterfaces;
+  os.networkInterfaces = () => ({ ...real(), eth9: [{ address: '93.184.216.99', family: 'IPv4' }, { address: '2606:4700:10::99', family: 'IPv6' }] });
+  process.env.OUTBOUND_BLOCK = '8.8.4.0/24, 2001:4860:4860::8844, nonsense';
+  netguard.refreshOwnAddresses();
+  fake({ 'self.test': ['93.184.216.99'], 'self6.test': ['2606:4700:10::99'], 'router.test': ['8.8.4.4'], 'fine.test': ['8.8.8.8'] });
+  try {
+    // A request to it would come back in on the loopback interface, past the firewall, to whatever listens there.
+    for (const u of ['http://93.184.216.99:5432/', 'http://self.test:8080/feed', 'https://self6.test:8443/x', 'http://[2606:4700:10::99]:22/', 'http://self.test:6379/']) {
+      assert.equal(await codeOf(netguard.checkPublicUrl(u)), 'PRIVATE', u);
+    }
+    assert.equal(await codeOf(netguard.request('http://self.test:6379/')), 'PRIVATE', 'and a request never connects');
+    // The ordinary web ports serve the public anyway (a blog with a feed next to Hearth keeps working).
+    for (const u of ['http://93.184.216.99/', 'https://self.test/feed', 'http://self.test:80/', 'https://[2606:4700:10::99]/']) assert.equal(await codeOf(netguard.checkPublicUrl(u)), 'ok', u);
+    // Addresses the admin listed are refused on every port.
+    for (const u of ['http://8.8.4.4/', 'https://router.test/', 'http://[2001:4860:4860::8844]/']) assert.equal(await codeOf(netguard.checkPublicUrl(u)), 'PRIVATE', u);
+    for (const u of ['http://8.8.8.8:8080/', 'https://fine.test/']) assert.equal(await codeOf(netguard.checkPublicUrl(u)), 'ok', u);
+  } finally {
+    os.networkInterfaces = real; delete process.env.OUTBOUND_BLOCK;
+    netguard.refreshOwnAddresses(); netguard.setResolver(null);
+  }
+});
+
 // ================================================================== through a real Hearth server
 // A fake resolver for the Hearth child: FAKE_DNS maps host → addresses (or a list of answers, one per lookup);
 // every lookup is logged to FAKE_DNS_LOG.
@@ -240,8 +333,10 @@ before(async () => {
     // One answer per lookup: the check when the tracker is previewed, the request itself, then (if anything
     // looked it up again) loopback.
     'rebind.test': ['127.0.0.1'], 'feed.pinned.test': [['127.0.0.2'], ['127.0.0.2'], ['127.0.0.1']], 'img.steamstatic.com': ['127.0.0.1'],
+    'push.again.test': ['142.250.72.11'], 'router.corp.test': ['203.0.114.9'],
   });
-  const common = { NODE_OPTIONS: `--require ${PRELOAD}`, FAKE_DNS, FAKE_DNS_LOG: DNS_LOG };
+  // OUTBOUND_BLOCK: addresses an admin refuses outright (like the server's own public address behind NAT).
+  const common = { NODE_OPTIONS: `--require ${PRELOAD}`, FAKE_DNS, FAKE_DNS_LOG: DNS_LOG, OUTBOUND_BLOCK: '203.0.114.0/24' };
   strict = await startServer(common);
   loose = await startServer({ ...common, FEED_ALLOW_PRIVATE: '1', PUSH_ALLOW_PRIVATE: '1', NODE_EXTRA_CA_CERTS: path.join(work, 'push-ca.pem'), ART_PROXY_EXTRA_HOSTS: `127.0.0.1:${artPort}` });
 });
@@ -270,6 +365,12 @@ test('trackers and feeds: disguised and DNS-hidden private addresses are refused
   for (const q of [`http://[::ffff:7f00:1]:${feedPort}/feed.xml`, `http://rebind.test:${feedPort}/feed.xml`]) {
     assert.equal((await as(strict, u, 'POST', `/servers/${s.id}/feeds`, { kind: 'rss', query: q, channelId: ch.id })).status, 400, q);
     assert.equal((await as(strict, u, 'POST', `/servers/${s.id}/feeds/preview`, { kind: 'rss', query: q })).status, 400, q);
+  }
+  // Addresses listed in OUTBOUND_BLOCK, by number or by name.
+  for (const q of ['http://203.0.114.9/feed.xml', 'http://router.corp.test/feed.xml']) {
+    const r = await as(strict, u, 'POST', '/me/trackers', { kind: 'rss', query: q });
+    assert.equal(r.status, 400, `${q} → ${r.status} ${r.text}`);
+    assert.match(r.json.error, /blocked on this server/, q);
   }
   // The news picture proxy too.
   const t = (await as(strict, u, 'GET', '/bootstrap')).json.mediaToken;
@@ -413,7 +514,7 @@ test('push: per-account cap, a subscribe limit, and sending off the request path
   // A push service that never answers: the message is sent at once, the server stays quick, and only a few
   // sends are ever in flight.
   let open = 0; let most = 0; const socks = new Set();
-  const hang = https.createServer({ key: tls.private, cert: tls.cert }, (req) => { req.resume(); open++; most = Math.max(most, open); req.on('close', () => { open--; }); });
+  const hang = https.createServer({ key: tls.private, cert: tls.cert }, (req, res) => { req.resume(); open++; most = Math.max(most, open); res.on('close', () => { open--; }); }); // open until the connection goes
   hang.on('secureConnection', (s) => { socks.add(s); s.on('close', () => socks.delete(s)); });
   const hangPort = await listen(hang);
   try {
@@ -423,12 +524,12 @@ test('push: per-account cap, a subscribe limit, and sending off the request path
     let t = Date.now();
     await send();
     assert.ok(Date.now() - t < 1500, `the message went out in ${Date.now() - t} ms`);
-    await waitFor(() => open >= 4, 3000);
+    await waitFor(() => open >= 2, 3000);
     t = Date.now();
     assert.equal((await loose.api('GET', '/config')).status, 200);
     assert.ok(Date.now() - t < 1000, 'other requests are not held up');
     await sleep(500);
-    assert.ok(most >= 1 && most <= 4, `${most} sends were in flight at once`);
+    assert.equal(most, 2, `${most} sends to one account's devices were in flight at once`);
   } finally { socks.forEach((s) => s.destroy()); await closeAll(hang); }
 });
 
@@ -519,4 +620,129 @@ test('push: expired sessions, suspended accounts and pre-upgrade subscriptions',
   const tok2 = (await loose.login(o)).json.token;
   assert.equal((await as(loose, o, 'POST', '/auth/logout', undefined, tok2)).status, 200);
   assert.equal(subRows(loose, o.id).length, 0);
+});
+
+// ------------------------------------------------------------------ fair sending (one account can't stall push for everyone)
+// A push service that takes the connection and never answers. Requests in flight are counted per path prefix
+// (the part before the first '-'), so a test can tell accounts apart.
+async function deadPushService() {
+  const svc = { open: new Map(), most: new Map(), total: 0, mostTotal: 0, socks: new Set() };
+  svc.server = https.createServer({ key: tls.private, cert: tls.cert }, (req, res) => {
+    const who = req.url.split('-')[0];
+    req.resume();
+    svc.open.set(who, (svc.open.get(who) || 0) + 1); svc.most.set(who, Math.max(svc.most.get(who) || 0, svc.open.get(who)));
+    svc.total++; svc.mostTotal = Math.max(svc.mostTotal, svc.total);
+    res.on('close', () => { svc.open.set(who, svc.open.get(who) - 1); svc.total--; }); // the connection went (never answered)
+  });
+  svc.server.on('secureConnection', (s) => { svc.socks.add(s); s.on('close', () => svc.socks.delete(s)); });
+  svc.port = await listen(svc.server);
+  svc.close = async () => { svc.socks.forEach((s) => s.destroy()); await closeAll(svc.server); };
+  return svc;
+}
+const hitsAt = (p) => pushHits.filter((h) => h.url === p).length;
+
+test("push: accounts whose push services never answer can't hold up anyone else's notifications", async () => {
+  const dead = await deadPushService();
+  try {
+    // Five accounts, each with three "devices" on a push service that hangs, and each flooded with messages.
+    const floods = [];
+    for (let k = 0; k < 5; k++) {
+      const w = await loose.register(); const wf = await loose.register();
+      for (let i = 0; i < 3; i++) assert.equal((await as(loose, w, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${dead.port}/w${k}-${i}`) })).status, 200);
+      floods.push(await dmLine(loose, wf, w));
+    }
+    for (let round = 0; round < 4; round++) for (const send of floods) await send();
+    await waitFor(() => dead.total >= 8, 3000);
+    // Someone else's message still gets its notification right away.
+    const v = await loose.register(); const vf = await loose.register();
+    const sendV = await dmLine(loose, vf, v);
+    const mine = `/fair-${hex(4)}`;
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://localhost:${pushPort}${mine}`) })).status, 200);
+    const t = Date.now();
+    await sendV();
+    assert.ok(await waitFor(() => hitsAt(mine) === 1, 5000), 'delivered');
+    assert.ok(Date.now() - t < 1500, `delivered after ${Date.now() - t} ms`);
+    await sleep(300);
+    for (const [who, n] of dead.most) assert.ok(n <= 2, `${n} sends to ${who}'s devices at once`);
+    assert.ok(dead.mostTotal <= 8, `${dead.mostTotal} sends to one push service at once`);
+  } finally { await dead.close(); }
+});
+
+test('push: a push service that keeps failing sits out longer each time, then is dropped; one that answers starts over', async () => {
+  let conns = 0;
+  const flaky = net.createServer((s) => { conns++; s.destroy(); }); // takes the connection and hangs up at once
+  const port = await listen(flaky);
+  try {
+    const v = await loose.register(); const vf = await loose.register();
+    const send = await dmLine(loose, vf, v);
+    const ep = `https://127.0.0.1:${port}/flaky`;
+    const row = () => subRows(loose, v.id)[0];
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(ep) })).status, 200);
+    await send();
+    assert.ok(await waitFor(() => row() && row().fails === 1), 'one failure counted');
+    assert.ok(row().retry_at > Date.now() + 50000, 'it sits out about a minute');
+    const tried = conns;
+    await send(); await sleep(600);
+    assert.equal(conns, tried, 'not tried again while it sits out');
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(ep) })).status, 200);
+    assert.equal(row().fails, 1, "subscribing again doesn't wipe the count");
+    // The 8th failure in a row (pretending the waits have passed) drops it.
+    loose.sql('UPDATE push_subs SET fails = 7, retry_at = ? WHERE endpoint = ?', Date.now() - 1, ep);
+    await send();
+    assert.ok(await waitFor(() => subRows(loose, v.id).length === 0), 'dropped');
+
+    // A working push service with a few failures behind it: delivered, and the count starts over.
+    const ok = `/recovered-${hex(4)}`;
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}${ok}`) })).status, 200);
+    loose.sql('UPDATE push_subs SET fails = 3, retry_at = ? WHERE user_id = ?', Date.now() - 1, v.id);
+    await send();
+    assert.ok(await waitFor(() => hitsAt(ok) === 1), 'delivered');
+    assert.ok(await waitFor(() => row().fails === 0 && row().retry_at === null));
+  } finally { await closeAll(flaky); }
+});
+
+test('push: a notification still waiting to go out is not sent once its device is signed out', async () => {
+  // Two hanging devices of v's own keep both of v's sending places busy, so a third device's notification waits.
+  const dead = await deadPushService();
+  try {
+    for (const expire of [false, true]) {
+      const v = await loose.register(); const vf = await loose.register();
+      const send = await dmLine(loose, vf, v);
+      const tokB = (await loose.login(v)).json.token;
+      const devB = `/waiting-${expire}-${hex(4)}`;
+      assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://localhost:${pushPort}${devB}`) }, tokB)).status, 200);
+      await sleep(5); // the hanging ones are newer, so they're sent first
+      for (let i = 0; i < 2; i++) assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${dead.port}/v${expire}-${i}`) })).status, 200);
+      await send();
+      assert.ok(await waitFor(() => (dead.open.get(`/v${expire}`) || 0) === 2, 3000), "both of v's places are taken");
+      await sleep(300);
+      assert.equal(hitsAt(devB), 0, 'B is still waiting its turn');
+      // B's session runs out while its notification waits. (Signing out deletes the row outright; this is the
+      // case where the row is still there.)
+      const sidB = subRows(loose, v.id).find((x) => x.endpoint.endsWith(devB)).session_id;
+      if (expire) loose.sql('UPDATE sessions SET expires_at = ? WHERE id = ?', Date.now() - 1000, sidB);
+      // The hanging sends give up (their connections drop), which frees v's places.
+      dead.socks.forEach((s) => s.destroy());
+      if (expire) {
+        assert.ok(await waitFor(() => !subRows(loose, v.id).some((x) => x.endpoint.endsWith(devB))), 'dropped instead of sent');
+        await sleep(300);
+        assert.equal(hitsAt(devB), 0, 'nothing reached the signed-out device');
+      } else {
+        assert.ok(await waitFor(() => hitsAt(devB) === 1), 'control: delivered once its turn came');
+      }
+    }
+  } finally { await dead.close(); }
+});
+
+// ------------------------------------------------------------------ subscribing (no lookups to spend)
+test('push: subscribing again to a known endpoint looks nothing up, and every subscribe call is rate limited', async () => {
+  const u = await strict.register();
+  const ep = 'https://push.again.test/wpush/' + hex(8);
+  const before = lookups('push.again.test');
+  assert.equal((await as(strict, u, 'POST', '/push/subscribe', { subscription: pushSub(ep) })).status, 200);
+  assert.equal(lookups('push.again.test') - before, 1, 'a new endpoint is checked');
+  const statuses = [];
+  for (let i = 0; i < 60; i++) statuses.push((await as(strict, u, 'POST', '/push/subscribe', { subscription: pushSub(ep) })).status);
+  assert.deepEqual(statuses, [...Array(59).fill(200), 429], '60 calls an hour, new endpoint or not');
+  assert.equal(lookups('push.again.test') - before, 1, 'and only the first one looked anything up');
 });

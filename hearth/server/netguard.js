@@ -10,12 +10,15 @@
 //    that answers "public" for the check and "private" a moment later (DNS rebinding) gets nowhere;
 //  - redirects are followed by hand, a few at most, and every hop is checked the same way;
 //  - one deadline covers everything (lookup, connect, redirects, the whole answer), and the answer is read as
-//    a stream with a size cap, so a hostile site can't hold a connection open or fill the memory.
+//    a stream with a size cap, so a hostile site can't hold a connection open or fill the memory;
+//  - this server's own addresses count as inside, even public ones (see ownAddress below).
 const dns = require('dns');
 const net = require('net');
+const os = require('os');
 const http = require('http');
 const https = require('https');
 const zlib = require('zlib');
+const { Transform } = require('stream');
 
 const MB = 1024 * 1024;
 
@@ -71,6 +74,46 @@ function blockedIp(ip) {
   return V6.check(s, 'ipv6');
 }
 
+// This server's own addresses. A public one is still this machine: a request to it comes back in through the
+// loopback interface, which firewalls (ufw, iptables) usually let through untouched, so it could reach
+// services that are firewalled off from the internet. So they're refused too, except on the ordinary web
+// ports (80, 443): those serve the public anyway, and a blog with a feed may well run next to Hearth.
+// OUTBOUND_BLOCK adds addresses or ranges that are refused on every port, such as this server's public
+// address when it sits behind NAT, or a router's.
+const WEB_PORTS = new Set([80, 443]);
+const own = { list: null, extra: null, at: 0 };
+function toBlockList(entries) {
+  const list = new net.BlockList();
+  for (const raw of entries) {
+    const [ip, bits] = String(raw).trim().replace(/%.*$/, '').split('/');
+    const kind = net.isIP(ip);
+    if (!kind) continue;
+    try {
+      if (bits === undefined) list.addAddress(ip, kind === 6 ? 'ipv6' : 'ipv4');
+      else list.addSubnet(ip, Number(bits), kind === 6 ? 'ipv6' : 'ipv4');
+    } catch { /* a bad prefix length: skip it */ }
+  }
+  return list;
+}
+// Looked at again every few minutes (addresses can change while the server runs).
+function refreshOwnAddresses() {
+  let found = [];
+  try { found = Object.values(os.networkInterfaces()).flat().filter(Boolean).map((a) => a.address); } catch { /* none to add */ }
+  own.list = toBlockList(found);
+  own.extra = toBlockList(String(process.env.OUTBOUND_BLOCK || '').split(','));
+  own.at = Date.now();
+}
+// Why `ip` may not be reached on `port` because it's this server, or listed in OUTBOUND_BLOCK ('' if it may).
+function ownAddress(ip, port) {
+  if (!own.list || Date.now() - own.at > 5 * 60000) refreshOwnAddresses();
+  const s = String(ip || '').replace(/^\[|\]$/g, '');
+  const kind = net.isIP(s);
+  if (!kind) return '';
+  const type = kind === 6 ? 'ipv6' : 'ipv4';
+  if (own.extra.check(s, type)) return 'That address is blocked on this server.';
+  return own.list.check(s, type) && !WEB_PORTS.has(Number(port)) ? 'That address is this server itself.' : '';
+}
+
 // ------------------------------------------------------------------ looking addresses up
 const TIMEOUT_MSG = 'The site took too long to answer.';
 
@@ -91,25 +134,54 @@ function beforeDeadline(promise, deadline, signal) {
   });
 }
 
-// How host names are looked up. Tests swap in a fake (setResolver) so they never touch real DNS.
-const systemResolver = (host) => dns.promises.lookup(host, { all: true, verbatim: true });
-let resolver = systemResolver;
-const setResolver = (fn) => { resolver = fn || systemResolver; };
+// How host names are looked up. Names go to Node's own DNS client (c-ares): it runs on the event loop, not on
+// the small thread pool that file access shares, and nothing caps how many lookups it runs at once. So a slow
+// DNS server that someone controls only slows down the lookups of its own names.
+// The system's lookup (getaddrinfo: /etc/hosts, mDNS, search domains) runs on that thread pool, so it's only
+// used for names public DNS can't answer: `localhost`, a bare `nas`, `jellyfin.lan`, or a name DNS says
+// doesn't exist (it may be in /etc/hosts). At most two of those run at once.
+const dnsClient = new dns.promises.Resolver({ timeout: 2500, tries: 2 });
+const LOCAL_NAME = /^[^.]+\.?$|\.(localhost|local|lan|internal|home\.arpa)\.?$/i;
+// "There's no such name in DNS" (or no DNS server at all), as opposed to a DNS server that's slow or broken.
+const NOT_IN_DNS = new Set(['ENOTFOUND', 'ENODATA', 'ECONNREFUSED']);
+const lanes = {
+  dns: async (host) => {
+    const got = await Promise.allSettled([dnsClient.resolve4(host), dnsClient.resolve6(host)]);
+    const found = got.flatMap((x) => (x.status === 'fulfilled' ? x.value : []));
+    if (found.length) return found.map((address) => ({ address, family: net.isIP(address) }));
+    const codes = got.map((x) => x.reason && x.reason.code);
+    throw Object.assign(new Error(`No address for ${host}`), { code: codes.find((c) => !NOT_IN_DNS.has(c)) || 'ENOTFOUND' });
+  },
+  system: (host) => dns.promises.lookup(host, { all: true, verbatim: true }),
+};
+// Tests swap in a fake so they never touch real DNS: a function answers every lookup itself; { dns, system }
+// replaces the two kinds of lookup underneath (each is optional).
+let resolver = null;
+const setResolver = (fn) => {
+  resolver = typeof fn === 'function' ? fn : null;
+  lanes.dns = (fn && fn.dns) || defaultLanes.dns;
+  lanes.system = (fn && fn.system) || defaultLanes.system;
+};
+const defaultLanes = { ...lanes };
 
-// The system lookup runs on Node's small thread pool (4 threads, shared with file access), and a slow DNS
-// server that someone controls could keep those threads busy. So only a couple of lookups run at once; the
-// rest wait their turn, but never past their own deadline.
-const MAX_LOOKUPS = 2;
-let lookupsBusy = 0;
-const lookupQueue = [];
-async function lookupHost(host, deadline) {
+const MAX_SYSTEM_LOOKUPS = 2;
+let systemBusy = 0;
+const systemQueue = [];
+async function systemLookup(host, deadline) {
   await new Promise((resolve, reject) => {
-    if (lookupsBusy < MAX_LOOKUPS) { lookupsBusy++; return resolve(); }
-    const timer = setTimeout(() => { lookupQueue.splice(lookupQueue.indexOf(turn), 1); reject(new GuardError('TIMEOUT', TIMEOUT_MSG)); }, Math.max(1, deadline - Date.now()));
+    if (systemBusy < MAX_SYSTEM_LOOKUPS) { systemBusy++; return resolve(); }
+    const timer = setTimeout(() => { systemQueue.splice(systemQueue.indexOf(turn), 1); reject(new GuardError('TIMEOUT', TIMEOUT_MSG)); }, Math.max(1, deadline - Date.now()));
     function turn() { clearTimeout(timer); resolve(); } // handed a slot by a lookup that finished
-    lookupQueue.push(turn);
+    systemQueue.push(turn);
   });
-  try { return await resolver(host); } finally { const next = lookupQueue.shift(); if (next) next(); else lookupsBusy--; }
+  try { return await lanes.system(host); } finally { const next = systemQueue.shift(); if (next) next(); else systemBusy--; }
+}
+async function lookupHost(host, deadline) {
+  if (resolver) return resolver(host);
+  if (!LOCAL_NAME.test(host)) {
+    try { return await lanes.dns(host); } catch (e) { if (!NOT_IN_DNS.has(e && e.code)) throw e; }
+  }
+  return systemLookup(host, deadline);
 }
 
 const allowedPrivate = (allowPrivate, u) => (typeof allowPrivate === 'function' ? !!allowPrivate(u) : !!allowPrivate);
@@ -123,9 +195,12 @@ function parseUrl(input, { protocols = ['http:', 'https:'] } = {}) {
   return u;
 }
 
+const portOf = (u) => Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
+
 // Every address the host has, all checked. Refuses the whole host if any one of them is private: there's no
-// telling which one a connection would get.
-async function resolvePublic(hostname, { allowPrivate = false, deadline = Date.now() + 8000, signal = null } = {}) {
+// telling which one a connection would get. `port` is where the connection will go (this server's own
+// addresses are allowed on the web ports only).
+async function resolvePublic(hostname, { allowPrivate = false, deadline = Date.now() + 8000, signal = null, port = 0 } = {}) {
   const host = String(hostname).replace(/^\[|\]$/g, '');
   const kind = net.isIP(host);
   let list = [];
@@ -136,7 +211,10 @@ async function resolvePublic(hostname, { allowPrivate = false, deadline = Date.n
     list = (Array.isArray(found) ? found : []).map((x) => String((x && x.address) || '')).filter((a) => net.isIP(a)).map((a) => ({ address: a, family: net.isIP(a) }));
   }
   if (!list.length) throw new GuardError('NOT_FOUND', `Couldn’t find ${host}.`);
-  if (!allowPrivate && list.some((x) => blockedIp(x.address))) throw new GuardError('PRIVATE', 'That address is inside a private network.');
+  if (allowPrivate) return list;
+  if (list.some((x) => blockedIp(x.address))) throw new GuardError('PRIVATE', 'That address is inside a private network.');
+  const self = list.map((x) => ownAddress(x.address, port)).find(Boolean);
+  if (self) throw new GuardError('PRIVATE', self);
   return list;
 }
 
@@ -144,12 +222,46 @@ async function resolvePublic(hostname, { allowPrivate = false, deadline = Date.n
 // saves it. Requests check again when they're made, since DNS answers can change in between.
 async function checkPublicUrl(input, { protocols, allowPrivate = false, timeout = 8000 } = {}) {
   const u = parseUrl(input, { protocols });
-  await resolvePublic(u.hostname, { allowPrivate: allowedPrivate(allowPrivate, u), deadline: Date.now() + timeout });
+  await resolvePublic(u.hostname, { allowPrivate: allowedPrivate(allowPrivate, u), deadline: Date.now() + timeout, port: portOf(u) });
   return u;
 }
 
 // ------------------------------------------------------------------ making the request
 const REDIRECT = new Set([301, 302, 303, 307, 308]);
+
+// Unpacking a compressed answer. Lenient like browsers and fetch(): an answer cut short still gives what
+// arrived, and "deflate" may be zlib-wrapped (as the standard says) or raw (as some servers send it).
+const ZLIB_LENIENT = { flush: zlib.constants.Z_SYNC_FLUSH, finishFlush: zlib.constants.Z_SYNC_FLUSH };
+function inflateEither() {
+  let inner = null;
+  return new Transform({
+    transform(chunk, enc, cb) {
+      if (!inner) {
+        if (!chunk.length) return cb();
+        // A zlib header's low four bits say "deflate" (8); raw deflate data has no header.
+        inner = (chunk[0] & 0x0f) === 0x08 ? zlib.createInflate(ZLIB_LENIENT) : zlib.createInflateRaw(ZLIB_LENIENT);
+        inner.on('data', (d) => this.push(d));
+        inner.on('error', (e) => this.destroy(e));
+      }
+      inner.write(chunk, () => cb());
+    },
+    flush(cb) { if (!inner) return cb(); inner.once('end', () => cb()); inner.end(); },
+    destroy(err, cb) { if (inner) inner.destroy(); cb(err); },
+  });
+}
+// The unpackers for a Content-Encoding header, outermost first ([] if there's nothing to unpack). Like fetch(),
+// a label it doesn't know means the answer is used as it is.
+function decodersFor(header) {
+  const codings = String(header || '').toLowerCase().split(',').map((x) => x.trim()).filter((x) => x && x !== 'identity');
+  const out = [];
+  for (const c of codings.reverse()) {
+    if (c === 'gzip' || c === 'x-gzip') out.push(() => zlib.createGunzip(ZLIB_LENIENT));
+    else if (c === 'deflate') out.push(inflateEither);
+    else if (c === 'br') out.push(() => zlib.createBrotliDecompress({ flush: zlib.constants.BROTLI_OPERATION_FLUSH, finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH }));
+    else return [];
+  }
+  return out;
+}
 
 // One request to one checked set of addresses.
 function once(u, addrs, { method, headers, body, deadline, maxBytes, truncate, decompress, signal, follow }) {
@@ -167,13 +279,18 @@ function once(u, addrs, { method, headers, body, deadline, maxBytes, truncate, d
     const h = { ...headers };
     if (decompress && !Object.keys(h).some((k) => k.toLowerCase() === 'accept-encoding')) h['Accept-Encoding'] = 'gzip, deflate, br';
     let over = false;
-    let req = null;
+    let req = null; let res = null; let unpackers = [];
     const timer = setTimeout(() => finish(new GuardError('TIMEOUT', TIMEOUT_MSG)), Math.max(1, deadline - Date.now()));
     const onAbort = () => finish(new GuardError('ABORTED', 'Stopped.'));
     function finish(err, value) {
       if (over) return;
       over = true; clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
+      // Everything stops here. An unpacker still holding compressed bytes would otherwise go on unpacking
+      // them after the answer was refused: a few KB of brotli can be gigabytes of work.
+      if (res && unpackers.length) res.unpipe(unpackers[0]);
+      unpackers.forEach((z) => z.destroy());
+      if (res) res.destroy();
       if (req) req.destroy(); // no keep-alive: every request gets its own pinned connection
       if (err) reject(err); else resolve(value);
     }
@@ -183,20 +300,20 @@ function once(u, addrs, { method, headers, body, deadline, maxBytes, truncate, d
       req = lib.request({ host, port: u.port || undefined, path: `${u.pathname}${u.search}`, method, headers: h, agent: false, lookup });
     } catch (e) { return finish(new GuardError('BAD_URL', 'That isn’t a web address.', e)); }
     req.on('error', (e) => finish(e instanceof GuardError ? e : new GuardError('NETWORK', `Couldn’t connect to ${host}.`, e)));
-    req.on('response', (res) => {
+    req.on('response', (answer) => {
+      res = answer;
       const status = res.statusCode;
       res.on('error', (e) => finish(new GuardError('NETWORK', 'The connection was cut off.', e)));
       if (follow && REDIRECT.has(status) && res.headers.location) return finish(null, { status, headers: res.headers, location: String(res.headers.location) });
       if (!truncate && +res.headers['content-length'] > maxBytes) return finish(new GuardError('TOO_BIG', 'That’s too big.'));
       let stream = res;
-      const enc = String(res.headers['content-encoding'] || '').trim().toLowerCase();
-      if (decompress && enc && enc !== 'identity') {
-        const z = enc === 'gzip' || enc === 'x-gzip' ? zlib.createGunzip() : enc === 'deflate' ? zlib.createInflate() : enc === 'br' ? zlib.createBrotliDecompress() : null;
-        if (!z) return finish(new GuardError('BAD_ENCODING', 'The site answered in a format this server can’t read.'));
-        z.on('error', (e) => finish(new GuardError('BAD_ENCODING', 'The site answered in a format this server can’t read.', e)));
+      if (decompress) {
         // The cap is on what comes out, so a small compressed answer can't unpack into gigabytes.
-        res.pipe(z);
-        stream = z;
+        unpackers = decodersFor(res.headers['content-encoding']).map((make) => make());
+        for (const z of unpackers) {
+          z.on('error', (e) => finish(new GuardError('BAD_ENCODING', 'The site answered in a format this server can’t read.', e)));
+          stream = stream.pipe(z);
+        }
       }
       const chunks = []; let size = 0;
       const result = (truncated) => ({ status, ok: status >= 200 && status < 300, headers: res.headers, type: String(res.headers['content-type'] || ''), body: Buffer.concat(chunks, size), url: u.href, truncated });
@@ -232,7 +349,7 @@ async function request(input, opts = {}) {
   for (let hop = 0; ; hop++) {
     const u = parseUrl(url, { protocols });
     if (allowUrl && !allowUrl(u)) throw new GuardError('NOT_ALLOWED', 'That address isn’t allowed.');
-    const addrs = await resolvePublic(u.hostname, { allowPrivate: allowedPrivate(allowPrivate, u), deadline, signal });
+    const addrs = await resolvePublic(u.hostname, { allowPrivate: allowedPrivate(allowPrivate, u), deadline, signal, port: portOf(u) });
     const r = await once(u, addrs, { method: m, headers: h, body: payload, deadline, maxBytes, truncate, decompress, signal, follow: maxRedirects > 0 });
     if (r.location === undefined) return r;
     if (hop >= maxRedirects) throw new GuardError('REDIRECTS', 'Too many redirects.');
@@ -248,4 +365,4 @@ async function request(input, opts = {}) {
   }
 }
 
-module.exports = { GuardError, blockedIp, parseUrl, resolvePublic, checkPublicUrl, request, setResolver };
+module.exports = { GuardError, blockedIp, parseUrl, resolvePublic, checkPublicUrl, request, setResolver, refreshOwnAddresses };

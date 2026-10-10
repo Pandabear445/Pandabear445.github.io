@@ -693,6 +693,10 @@ CREATE INDEX IF NOT EXISTS idx_memberships_server_user ON memberships(server_id,
 // (or revoking it, a password change, a suspension) stops its notifications. Older rows have none.
 addColumn('push_subs', 'session_id', 'TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
+// …and how many sends to it failed in a row (its push service timed out or couldn't be reached), and when
+// it may be tried again, so a dead or hostile push service sits out instead of holding up everyone's sends.
+addColumn('push_subs', 'fails', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('push_subs', 'retry_at', 'INTEGER');
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
