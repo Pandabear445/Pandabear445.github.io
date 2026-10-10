@@ -932,6 +932,49 @@ CREATE INDEX IF NOT EXISTS idx_dm_channels_b ON dm_channels(user_b);
 CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_id);
 CREATE INDEX IF NOT EXISTS idx_server_keys_user ON server_keys(server_id, user_id, epoch);
 CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_id);
+
+// v17 (crypto): the public keys a person had before a password reset without a recovery key. Key handoffs
+// and messages they signed back then still check out against the key that was valid when they were made,
+// and the people they talked to can still open their old direct messages. Public keys only.
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_key_history (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  public_key TEXT NOT NULL,
+  sign_public_key TEXT,
+  retired_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_key_history ON user_key_history(user_id, retired_at);
+`);
+// When this Hearth started encrypting channel messages end to end: the first encrypted message, or now. No
+// member's app can write a plaintext channel message after that, so apps refuse "older" plaintext rows dated
+// later (only the server could have written them). Set once, never moved (and only looked up that once: it
+// scans every message).
+if (!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'e2eeSince'").get()) {
+  db.prepare("INSERT OR IGNORE INTO instance_settings (key, value) VALUES ('e2eeSince', ?)")
+    .run(String(db.prepare('SELECT MIN(created_at) AS t FROM messages WHERE ciphertext IS NOT NULL').get().t || Date.now()));
+}
+// v17 (crypto): who was in a server before (left, kicked, banned, deleted their account). Coming back switches
+// to a new server key, so they can't read what was said while they were away. Not cleared by a password reset
+// (which deletes their key rows, the only other trace of having been there).
+// Reports that the current server key doesn't open: enough of them from different members make the apps
+// replace it, each member's count at most a few an hour (server/index.js reportBroken).
+// server_epochs by time: rotation limits count the keys made in the last hour.
+db.exec(`
+CREATE TABLE IF NOT EXISTS former_members (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  left_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS server_key_reports (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  epoch INTEGER NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, epoch, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);

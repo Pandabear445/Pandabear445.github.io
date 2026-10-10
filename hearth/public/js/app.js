@@ -37,7 +37,6 @@ const S = {
   config: null,
   me: null,
   privateKey: null,
-  encPrivateKey: '',
   users: {},
   servers: [],          // includes group DMs (kind: 'group')
   dms: [],
@@ -724,6 +723,17 @@ async function freshIce() {
   } catch { /* keep the old ones: the next check is soon */ }
 }
 setInterval(() => { if (S.me) freshIce(); }, 10 * 60000);
+// When this server switched on end-to-end encryption: plaintext channel messages dated later can only have come
+// from the server, so they aren't shown (secure.js). Remembered on this device, and the earliest time it was
+// ever told wins, so the server can't move it later.
+function rememberE2eeSince(t) {
+  let known = 0;
+  try { known = Number(localStorage.getItem('hearth.e2eeSince')) || 0; } catch { /* storage off */ }
+  const v = Number(t) || 0;
+  const out = known && v ? Math.min(known, v) : known || v;
+  try { if (out && out !== known) localStorage.setItem('hearth.e2eeSince', String(out)); } catch { /* storage off */ }
+  return out;
+}
 
 async function loadBootstrap() {
   const b = await api('GET', '/bootstrap');
@@ -732,7 +742,7 @@ async function loadBootstrap() {
   S.iceServers = b.iceServers;
   // With relays in several regions, find the nearest ones in the background (cached for 6 hours).
   if ((b.iceServers || []).filter((e) => [].concat(e.urls || []).some((u) => /^turns?:/.test(u))).length > 2) setTimeout(() => rankRelays(b.iceServers).then((r) => { S.relayRanks = r; }).catch(() => {}), 4000);
-  S.encPrivateKey = b.encPrivateKey;
+  S.e2eeSince = rememberE2eeSince(b.e2eeSince);
   S.users = b.users;
   S.servers = b.servers;
   S.serversLoaded = true;
@@ -2357,6 +2367,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       m.pinnedAt ? h('span', { class: 'msg-pin', 'data-tip': 'Pinned' }, icon('pin')) : null));
   }
   if (S.editing === m.id) body.append(editBox(m, ctx));
+  else if (m.dec && m.dec.forged) body.append(h('div', { class: 'msg-text undecryptable', 'data-tip': 'Members\u2019 apps can\u2019t send messages without end-to-end encryption, so only the server could have written this one.' }, icon('shield'), 'Hidden: a message without end-to-end encryption, dated after this server turned it on.'));
   else if (m.dec && m.dec.error) body.append(h('div', { class: 'msg-text undecryptable' }, icon('lock'), 'This message could not be decrypted on this device.'));
   else if (m.dec && m.dec.pending) {
     body.append(h('div', { class: 'msg-text undecryptable' }, icon('lock'), m.dec.before
@@ -2381,7 +2392,11 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     if (wc) body.append(wc);
     if (embed) body.append(newsCard(embed));
     if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
-    else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only.' }, 'Older message \u2014 not end-to-end encrypted'));
+    else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only, and nothing proves who wrote it: the server could have.' }, 'Older message \u2014 not end-to-end encrypted, sender not verified'));
+    // Opened or signed with a key that isn't the person's current, trusted one (secure.js keysOf).
+    else if (m.dec && m.dec.keyNote === 'listed') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'Written with a key the server says this person had before they reset their password. This device never saw that key as theirs and it can\u2019t be checked with safety numbers, so the server could have written this.' }, '\u26a0 Older key \u2014 not verified'));
+    else if (m.dec && m.dec.keyNote === 'new') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'This person\u2019s security key changed and you haven\u2019t verified the new one yet. Compare safety numbers from their profile.' }, '\u26a0 New key \u2014 not verified yet'));
+    else if (m.dec && m.dec.keyNote === 'pinned') body.append(h('div', { class: 'msg-flag', 'data-tip': 'Written with a key this person had before they changed keys. This device trusted that key back then.' }, 'Written with an older key'));
     else if (m.dec && m.dec.verified === false && !m.dmId) body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'The signature on this message does not match the sender\u2019s key.' }, '\u26a0 Sender could not be verified'));
   }
   if (m.reactions && m.reactions.length) {
@@ -4344,6 +4359,7 @@ function openServerSecurity(server) {
       h('p', { class: 'muted-p' }, `Messages and files in ${label} are encrypted on your device with a key that only members have. The server stores scrambled data it can\u2019t read, and every message is signed by its sender.`),
       h('p', { class: 'muted-p' }, 'When someone leaves or is removed, the key is replaced automatically so they can\u2019t read anything new.'),
       h('div', { class: 'kv' }, h('span', null, 'Key version'), h('strong', null, st.keyEpoch ? `#${st.keyEpoch}` : 'Not set up yet')),
+      st.keyCreatorId ? h('div', { class: 'kv' }, h('span', null, 'Made by'), h('strong', null, `${displayName(getUser(st.keyCreatorId))}${st.keyCreatedAt ? `, ${new Date(st.keyCreatedAt).toLocaleString()}` : ''}`)) : null,
       h('div', { class: 'kv' }, h('span', null, 'Members with the current key'), h('strong', null, `${Math.max(0, holders)} of ${server.memberIds.length}`)),
       changed.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `Security key changed for ${changed.map(displayName).join(', ')}. Verify them from their profile before the key can be shared.`)) : null,
       h('p', { class: 'field-hint' }, 'To make sure nobody is impersonating a member, compare safety numbers with them from their profile (\u22ef \u2192 Verify encryption).')),

@@ -422,10 +422,10 @@ function accountTab(app) {
       const oldParams = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
       const oldK = await E2EE.deriveKeys(S.me.username, oldPw.value, oldParams);
       const newK = await E2EE.deriveKeys(S.me.username, newPw.value, { kdf: 'argon2id', salt });
+      const locked = await lockedKey(oldK.authKey).catch((x) => { throw x.code === 'bad_password' ? new Error('Your current password is not right.') : x; });
       let enc;
-      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, S.encPrivateKey); } catch { throw new Error('Your current password is not right.'); }
+      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, locked); } catch { throw new Error('Your current password is not right.'); }
       await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }));
-      S.encPrivateKey = enc;
       S.me = { ...S.me, kdf: 'argon2id', kdfSalt: salt };
       oldPw.value = ''; newPw.value = ''; confirmPw.value = '';
       toast('Password changed. Other devices were logged out.');
@@ -496,13 +496,13 @@ function accountTab(app) {
       h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device'),
       h('p', { class: 'field-hint' }, 'To see or sign out your other devices, open Sessions.')),
     section('Delete account',
-      h('p', { class: 'muted-p' }, 'Erases your keys, email, profile, pictures and friends, takes you out of every server, and signs out every device. Messages you sent stay where they are (still encrypted) and show “Deleted user”. This can’t be undone.'),
+      h('p', { class: 'muted-p' }, 'Erases your private keys, email, profile, pictures and friends, takes you out of every server, and signs out every device. Messages you sent stay where they are (still encrypted, readable by the people who could read them before) and show “Deleted user”. This can’t be undone.'),
       h('div', null, h('button', { class: 'btn danger', onclick: () => deleteAccount(app).catch(quiet) }, 'Delete my account'))),
   );
 }
 async function deleteAccount(app) {
   const S = app.S;
-  const keys = await askPassword(app, { title: 'Delete your account?', text: 'This can’t be undone. Your old messages can never be read again by anyone, including you.', button: 'Continue' });
+  const keys = await askPassword(app, { title: 'Delete your account?', text: 'This can’t be undone. You won’t be able to read your old messages again; the people you sent them to still can.', button: 'Continue' });
   if (!keys) return;
   const confirmName = h('input', { class: 'input', autocomplete: 'off', placeholder: S.me.username });
   modal({ title: 'Type your username to confirm', size: 'sm',
@@ -516,7 +516,17 @@ async function deleteAccount(app) {
 }
 
 // ------------------------------------------------------------------ account safety: email, recovery key, 2FA
-// Asks for the password again (sensitive changes). Checked on this device first: it must unlock your key.
+// Your password-locked private key. The server only hands it out with the password, plus a two-factor code when
+// that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). A
+// wrong password fails here.
+async function lockedKey(authKey) {
+  try { return (await withCode((x) => api('POST', '/me/keys/wrapped', { authKey, ...x }))).encPrivateKey; } catch (e) {
+    if (e.code === 'bad_password') throw Object.assign(new Error('That password isn’t right.'), { code: 'bad_password' });
+    throw e;
+  }
+}
+// Asks for the password again (sensitive changes). It must also unlock your key on this device. Resolves with
+// the derived keys plus the locked private key (encPrivateKey), or null if cancelled.
 function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'Continue' } = {}) {
   const S = app.S;
   return new Promise((resolve) => {
@@ -526,8 +536,9 @@ function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'C
       actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        try { await E2EE.unwrapPrivateKey(keys.wrapKey, S.encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
-        resolve(keys);
+        const encPrivateKey = await lockedKey(keys.authKey);
+        try { await E2EE.unwrapPrivateKey(keys.wrapKey, encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
+        resolve({ ...keys, encPrivateKey });
       } }] });
   });
 }
@@ -628,7 +639,7 @@ function securitySections(app) {
     if (!keys) return;
     const code = E2EE.newRecoveryCode();
     const salt = E2EE.newKdfSalt();
-    const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), S.encPrivateKey);
+    const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), keys.encPrivateKey);
     const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }));
     await showSecretOnce({ title: `${S.config.name} recovery key for ${S.me.username}`, intro: 'Save this key. If you forget your password, the email reset plus this key brings back everything, including your old messages. It’s shown only now.',
       secret: code, filename: `${S.config.name.replace(/\W+/g, '-')}-recovery-key-${S.me.username}.txt`, note: 'Anyone with this key AND access to your email could get into your account, so keep it private (a password manager is ideal).' });
