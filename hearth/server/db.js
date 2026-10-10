@@ -861,20 +861,22 @@ function appendAuditRow(e) {
 // different (entries were cut off or changed, or an older copy of the database was put back), that goes into the
 // log first, so it can't be hidden by simply carrying on.
 function auditAppend(e) {
-  let head;
-  db.transaction(() => {
-    const a = readAnchor();
-    if (a && !a.valid) appendAuditRow({ action: 'audit_log_gap', detail: 'The audit log’s anchor file (data/audit-anchor.json) was changed, damaged or deleted outside Hearth.' });
-    else if (a && a.id > 0) {
-      const at = db.prepare('SELECT hash FROM admin_log WHERE id = ?').get(a.id);
-      if (!at || at.hash !== a.hash) {
-        appendAuditRow({ action: 'audit_log_gap', detail: `Entry #${a.id}, the newest one recorded on this machine, is ${at ? 'different' : 'missing'}: entries were removed or changed outside Hearth, or an older copy of the database was put back.` });
-      }
-    }
-    head = appendAuditRow(e);
-  })();
+  const head = db.transaction(auditRows)(e);
+  // Only once the entry is committed: the anchor must never name one that could still be rolled back.
   writeAnchor(AUDIT_FROM, head.id, head.hash);
   return head.id;
+}
+// The database part of auditAppend, inside the caller's transaction. Returns the new entry's { id, hash }.
+function auditRows(e) {
+  const a = readAnchor();
+  if (a && !a.valid) appendAuditRow({ action: 'audit_log_gap', detail: 'The audit log’s anchor file (data/audit-anchor.json) was changed, damaged or deleted outside Hearth.' });
+  else if (a && a.id > 0) {
+    const at = db.prepare('SELECT hash FROM admin_log WHERE id = ?').get(a.id);
+    if (!at || at.hash !== a.hash) {
+      appendAuditRow({ action: 'audit_log_gap', detail: `Entry #${a.id}, the newest one recorded on this machine, is ${at ? 'different' : 'missing'}: entries were removed or changed outside Hearth, or an older copy of the database was put back.` });
+    }
+  }
+  return appendAuditRow(e);
 }
 // Walks the whole chain. { ok, entries, brokenAt, reason, keyedFrom, anchored, gaps }. reason: 'changed' (an entry
 // doesn't match its hash), 'missing' (the log ends before the newest entry the anchor remembers), 'anchor' (the
@@ -903,37 +905,7 @@ function auditVerify() {
   if (!seen) return { ...bad('missing', last + 1), anchoredId: a.id };
   return out;
 }
-{
-  const anchor = readAnchor();
-  const anchored = !!(anchor && anchor.valid);
-  const marked = !!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'auditKeyedFrom'").get();
-  const set = keyedFromSetting();
-  const head = auditHead();
-  // Nothing says where the keyed entries start: either a log from before keyed hashing (this upgrade), or one whose
-  // markers were deleted outside Hearth so that entries edited and re-hashed with plain SHA-256 pass as old ones.
-  // An entry keyed with this server's key gives the second case away: the tamper check then reports 'keyed_from'.
-  let firstKeyed = null;
-  if (!marked && !anchored) {
-    for (const r of db.prepare('SELECT * FROM admin_log WHERE hash IS NOT NULL ORDER BY id').iterate()) if (r.hash === auditMac(r.prev_hash, r)) { firstKeyed = r.id; break; }
-  }
-  AUDIT_FROM = anchored ? anchor.keyedFrom : set !== null ? set : firstKeyed !== null ? firstKeyed : head.id + 1;
-  if (firstKeyed !== null) log.warn('db', 'audit_anchor', { msg: `The audit log has entries keyed by this server from #${firstKeyed}, but the record of where they start was deleted outside Hearth.` });
-  else if (!marked) db.prepare('INSERT INTO instance_settings (key, value) VALUES (?, ?)').run('auditKeyedFrom', `${AUDIT_FROM}.${auditMacOf(`keyed-from|${AUDIT_FROM}`)}`);
-  // Keyed hashing starts now, and the log says so in a keyed entry, with the date. Someone who wipes the markers to
-  // pass edited entries off as old ones can't avoid a new one of these, dated when they did it (and listed as a
-  // gap when an earlier one is still there).
-  const starting = !marked && !anchored && firstKeyed === null;
-  if (starting && (head.id > 0 || db.prepare('SELECT 1 FROM users LIMIT 1').get())) {
-    auditAppend({ action: 'audit_chain_keyed', detail: head.id
-      ? `Entries from #${AUDIT_FROM} on are signed with this server’s secret key. The ${head.id === 1 ? 'entry before it was' : `${head.id} entries before it were`} written by an older version of Hearth and only have plain hashes. If this server was already up to date, the log was reset outside Hearth.`
-      : `Entries from #${AUDIT_FROM} on are signed with this server’s secret key.` });
-  } else if (!anchor) {
-    // A keyed log without its anchor: a restored backup or a moved data folder (or the file was deleted). Start a
-    // new anchor, and say so in the log.
-    if (marked && head.id > 0) auditAppend({ action: 'audit_anchor_reset', detail: `The audit log’s anchor file was missing (a restored backup or a moved data folder?), so a new one was started at entry #${head.id + 1}. Entries cut off the end before this can’t be detected.` });
-    else writeAnchor(AUDIT_FROM, head.id, head.hash || '');
-  }
-}
+// (Where the keyed part starts is worked out after the upgrade has committed: see the end of this file's upgrade.)
 
 
 // v17 (data): indexes for lookups that run on every connection, start-up and server update but used to read whole
@@ -1178,6 +1150,48 @@ if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;
 if (anchorAfterCommit) writeAnchor(...anchorAfterCommit);
+
+// v17 (admin): where the audit log's keyed part starts, checked on every start. Only once the upgrade above has
+// committed: the anchor file is outside the database, so written during the upgrade it would outlive a rollback (a
+// later step failing, a crash, a restart) and name an entry that was never kept, which every start after that reports
+// as entries cut off the end. Everything here follows from the marker and the anchor, so after a crash it simply runs
+// again. The marker and the entry that says signing started are committed together, and the anchor written after.
+{
+  let anchorTo = null; // what the anchor file should name once this is committed
+  db.transaction(() => {
+    const anchor = readAnchor();
+    const anchored = !!(anchor && anchor.valid);
+    const marked = !!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'auditKeyedFrom'").get();
+    const set = keyedFromSetting();
+    const head = auditHead();
+    // Nothing says where the keyed entries start: either a log from before keyed hashing (this upgrade), or one whose
+    // markers were deleted outside Hearth so that entries edited and re-hashed with plain SHA-256 pass as old ones.
+    // An entry keyed with this server's key gives the second case away: the tamper check then reports 'keyed_from'.
+    let firstKeyed = null;
+    if (!marked && !anchored) {
+      for (const r of db.prepare('SELECT * FROM admin_log WHERE hash IS NOT NULL ORDER BY id').iterate()) if (r.hash === auditMac(r.prev_hash, r)) { firstKeyed = r.id; break; }
+    }
+    AUDIT_FROM = anchored ? anchor.keyedFrom : set !== null ? set : firstKeyed !== null ? firstKeyed : head.id + 1;
+    if (firstKeyed !== null) log.warn('db', 'audit_anchor', { msg: `The audit log has entries keyed by this server from #${firstKeyed}, but the record of where they start was deleted outside Hearth.` });
+    else if (!marked) db.prepare('INSERT INTO instance_settings (key, value) VALUES (?, ?)').run('auditKeyedFrom', `${AUDIT_FROM}.${auditMacOf(`keyed-from|${AUDIT_FROM}`)}`);
+    // Keyed hashing starts now, and the log says so in a keyed entry, with the date. Someone who wipes the markers to
+    // pass edited entries off as old ones can't avoid a new one of these, dated when they did it (and listed as a
+    // gap when an earlier one is still there).
+    const starting = !marked && !anchored && firstKeyed === null;
+    if (starting && (head.id > 0 || db.prepare('SELECT 1 FROM users LIMIT 1').get())) {
+      anchorTo = auditRows({ action: 'audit_chain_keyed', detail: head.id
+        ? `Entries from #${AUDIT_FROM} on are signed with this server’s secret key. The ${head.id === 1 ? 'entry before it was' : `${head.id} entries before it were`} written by an older version of Hearth and only have plain hashes. If this server was already up to date, the log was reset outside Hearth.`
+        : `Entries from #${AUDIT_FROM} on are signed with this server’s secret key.` });
+    } else if (!anchor) {
+      // A keyed log without its anchor: a restored backup or a moved data folder (or the file was deleted). Start a
+      // new anchor, and say so in the log.
+      anchorTo = marked && head.id > 0
+        ? auditRows({ action: 'audit_anchor_reset', detail: `The audit log’s anchor file was missing (a restored backup or a moved data folder?), so a new one was started at entry #${head.id + 1}. Entries cut off the end before this can’t be detected.` })
+        : head;
+    }
+  }).immediate();
+  if (anchorTo) writeAnchor(AUDIT_FROM, anchorTo.id, anchorTo.hash || '');
+}
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
 // hundreds of them, many run per message). Statements are only used with get/all/run (or an iterate() loop that

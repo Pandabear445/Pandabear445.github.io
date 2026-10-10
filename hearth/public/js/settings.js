@@ -536,6 +536,8 @@ function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'C
     modal({ title, size: 'sm', onClose: () => resolve(null),
       body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw)),
       actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
+        // (The password hashing library's own message for an empty one means nothing to people.)
+        if (!pw.value) throw new Error('Enter your password.');
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
         const encPrivateKey = await lockedKey(keys.authKey);
@@ -617,6 +619,7 @@ function securitySections(app) {
     modal({ title: S.me.email ? 'Change your email' : 'Add an email', size: 'sm',
       body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw)),
       actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
+        if (!pw.value) throw new Error('Enter your password.');
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
         setTimeout(() => withCode((x) => api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey, ...x })).then((r) => verifyEmail(r.sentTo)).catch(quiet), 150);
@@ -680,14 +683,27 @@ function securitySections(app) {
         }, 150);
       } }] });
   };
-  const disable2fa = async () => {
-    const keys = await askPassword(app, { title: 'Turn off two-factor sign-in' });
-    if (!keys) return;
+  // The password and a code in one dialog, sent together. (Asking for the password first with askPassword fetches
+  // the locked key, which takes a code of its own once the last one is 10 minutes old. That used up the code on
+  // the phone, so the one asked for next was refused until the app showed a new one.) Nothing needs unlocking
+  // here, so the password is only checked by the server.
+  const disable2fa = () => {
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
-    modal({ title: 'Enter a code to turn it off', size: 'sm', body: h('div', { class: 'stack' }, field('Code from your app (or a backup code)', code)),
+    modal({ title: 'Turn off two-factor sign-in', size: 'sm',
+      body: h('div', { class: 'stack' }, field('Your password', pw), field('Code from your app (or a backup code)', code)),
       actions: [{ label: 'Cancel' }, { label: 'Turn off', kind: 'danger', action: async () => {
-        const c = code.value.trim();
-        refresh(await api('POST', '/me/2fa/disable', { authKey: keys.authKey, ...(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c }) }));
+        if (!pw.value) throw new Error('Enter your password.');
+        const c = code.value.trim().replace(/\s/g, '');
+        if (!c) throw new Error('Enter the code from your authenticator app (or a backup code).');
+        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
+        const { authKey } = await E2EE.deriveKeys(S.me.username, pw.value, params);
+        try {
+          refresh(await api('POST', '/me/2fa/disable', { authKey, ...(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c }) }));
+        } catch (e) {
+          if (e.code === 'bad_password') throw new Error('That password isn’t right.');
+          throw e;
+        }
         toast('Two-factor sign-in is off.');
       } }] });
   };
@@ -704,7 +720,7 @@ function securitySections(app) {
     if (S.me.totpEnabled) {
       tfaBox.append(h('div', { class: 'kv' }, h('span', null, 'Two-factor sign-in'), h('span', { class: 'rpill ok' }, 'On')),
         h('p', { class: 'field-hint' }, `${S.me.backupCodesLeft} backup code${S.me.backupCodesLeft === 1 ? '' : 's'} left.`),
-        h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: newCodes }, 'New backup codes'), h('button', { class: 'btn ghost sm', onclick: () => disable2fa().catch((e) => toast(e.message, 'error')) }, 'Turn off')));
+        h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: newCodes }, 'New backup codes'), h('button', { class: 'btn ghost sm', onclick: disable2fa }, 'Turn off')));
     } else {
       tfaBox.append(h('p', { class: 'muted-p' }, 'After your password, sign-in asks for a 6-digit code from an app on your phone, so a stolen password alone isn’t enough. It’s also needed to reset your password by email.'),
         h('div', null, h('button', { class: 'btn primary', onclick: () => setup2fa().catch((e) => toast(e.message, 'error')) }, 'Set up two-factor sign-in')));

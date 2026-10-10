@@ -1044,6 +1044,12 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { if (gone.has(x.data.sid)) { x.emit('session:revoked', { reason }); x.disconnect(true); } })).catch(() => {});
   return ids.length;
 }
+// Closes every open app window of an account that can't be used any more (suspended, deleted, signed out by
+// staff), saying why first, like revokeSessions. Closing them straight away instead (disconnectSockets) would
+// overtake that notice, and the app would land on the sign-in screen without telling the person why.
+function closeWindows(userId, reason) {
+  if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { x.emit('session:revoked', { reason }); x.disconnect(true); })).catch(() => {});
+}
 // Revoked and expired sessions are kept 30 days (so Settings → Sessions can say what happened), then deleted.
 jobs.every('sessions.purge', 3600000, () => {
   const t = now();
@@ -1572,7 +1578,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
   files.forEach((f) => removeUpload(f));
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
   broadcastUser(row.id, audience);
-  io.in(`user:${row.id}`).disconnectSockets(true);
+  closeWindows(row.id, 'account_deleted');
   auditLog(req, 'account_deleted', row.id, row.username);
   ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
   res.json({ ok: true });
@@ -1960,15 +1966,17 @@ api.post('/servers/:id/leave', auth, (req, res) => {
     const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(s.id, req.userId);
     if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, s.id);
   } else if (s.owner_id === req.userId) fail(400, 'Owners cannot leave their own server. Delete it or hand it off first.');
-  removeMember(s.id, req.userId);
+  const held = removeMember(s.id, req.userId);
   const left = db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n;
   if (s.kind === 'group' && !left) {
     purgeServerContent(s);
     db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
   }
   // A server's members already got member:remove (their apps drop the person from the list). A group may also
-  // have a new owner, so its members get the whole group again.
-  else if (s.kind === 'group') emitServer(s.id);
+  // have a new owner, so its members get the whole group again. So does a server where the person had roles or
+  // their own channel permissions: apps that stay open would otherwise keep those and send them back when the
+  // person rejoins (ticking another role sends the roles they had; saving a channel sends its permissions).
+  else if (s.kind === 'group' || held) emitServer(s.id);
   res.json({ ok: true });
 });
 
@@ -1977,11 +1985,13 @@ function removeMember(serverId, userId) {
   kickFromVoiceInServer(serverId, userId);
   // Everything that was theirs as a member goes too: roles and per-channel overrides (or rejoining with any
   // invite, even after an unban, would hand back Administrator and private channels) and event RSVPs (or
-  // they'd keep getting reminders about events they can no longer see).
+  // they'd keep getting reminders about events they can no longer see). Returns how many roles and channel
+  // overrides went, so callers know whether the other members' copies of the server are out of date.
+  let held = 0;
   db.transaction(() => {
     db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
-    db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ?').run(serverId, userId);
-    db.prepare("DELETE FROM channel_overrides WHERE target_type = 'member' AND target_id = ? AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)").run(userId, serverId);
+    held = db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ?').run(serverId, userId).changes
+      + db.prepare("DELETE FROM channel_overrides WHERE target_type = 'member' AND target_id = ? AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)").run(userId, serverId).changes;
     db.prepare('DELETE FROM event_rsvps WHERE user_id = ? AND event_id IN (SELECT id FROM server_events WHERE server_id = ?)').run(userId, serverId);
     // Remembered on its own (not just through their key rows, which a password reset deletes), so coming back
     // switches keys again.
@@ -1994,6 +2004,7 @@ function removeMember(serverId, userId) {
   io.to(`server:${serverId}`).emit('member:remove', { serverId, userId });
   emitKeyState(serverId);
   if (BOTS) BOTS.event('member.left', serverId, { serverId, userId }, { actorId: userId });
+  return held;
 }
 
 api.delete('/servers/:id/members/:uid', auth, (req, res) => {
@@ -3964,7 +3975,7 @@ function suspendUser(uid, reason, hours = 0) {
   const until = hours > 0 ? now() + hours * 3600000 : null;
   db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ?, suspended_until = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), until, uid);
   revokeSessions(uid, { reason: 'suspended' });
-  io.in(`user:${uid}`).disconnectSockets(true);
+  closeWindows(uid, 'suspended');
 }
 const ipsOf = (uid) => db.prepare('SELECT ip, first_seen AS firstSeen, last_seen AS lastSeen FROM user_ips WHERE user_id = ? ORDER BY last_seen DESC LIMIT 20').all(uid);
 // Placeholder until the Support account exists (phase 2): every new account will get it as a friend.
@@ -4167,7 +4178,7 @@ api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
 api.post('/admin/users/:id/logout', auth, staffOnly, (req, res) => {
   requireOutranks(req, req.params.id);
   revokeSessions(req.params.id, { reason: 'staff' });
-  io.in(`user:${req.params.id}`).disconnectSockets(true);
+  closeWindows(req.params.id, 'staff');
   adminLog(req, 'sign_out_everywhere', req.params.id);
   res.json({ ok: true });
 });
@@ -4367,7 +4378,7 @@ api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
 api.post('/admin/sign-out-all', auth, adminOnly, (req, res) => {
   const victims = db.prepare('SELECT DISTINCT user_id FROM sessions WHERE revoked_at IS NULL').all().map((r) => r.user_id).filter((id) => !isStaff(id));
   db.transaction(() => victims.forEach((id) => revokeSessions(id, { reason: 'staff' })))();
-  victims.forEach((id) => io.in(`user:${id}`).disconnectSockets(true));
+  victims.forEach((id) => closeWindows(id, 'staff'));
   adminLog(req, 'sign_out_all', null, `${victims.length} accounts`);
   res.json({ ok: true, count: victims.length });
 });

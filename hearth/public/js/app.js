@@ -365,7 +365,15 @@ async function finishLogin(res, privateKey) {
   startApp();
 }
 
-async function logout() {
+// Signing out runs once: the server answers our own "Log out" by also telling this device its sign-in ended
+// ('session:revoked', see watchConnection), which must not start a second sign-out or explain it as one done
+// from somewhere else.
+let loggingOut = null;
+function logout() {
+  if (!loggingOut) loggingOut = signOutHere();
+  return loggingOut;
+}
+async function signOutHere() {
   // This browser stops getting notifications for the account (the server drops the subscription too), and
   // doesn't pass them on to whoever signs in here next. Never holds up signing out for more than a moment.
   if (localStorage.getItem('hearth.push') === 'on' && 'serviceWorker' in navigator) await Promise.race([disablePush().catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
@@ -462,8 +470,13 @@ function startApp() {
     paused: () => !!S.restarting, // expected: the server is restarting for an update
     onDown: () => { $('#conn-banner').hidden = false; },
     onSignedOut: (reason) => {
-      const why = { password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on', expired: 'Your sign-in expired', account_deleted: 'This account was deleted' }[reason];
-      if (reason !== 'unauthorized') sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
+      if (loggingOut) return; // already signing out (this device's own "Log out", say): nothing more to explain
+      const why = {
+        password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on',
+        expired: 'Your sign-in expired', account_deleted: 'This account was deleted', suspended: 'This account was suspended', staff: 'A server admin signed you out',
+      }[reason];
+      // 'logged_out' is this sign-in's own "Log out", pressed in another tab of this browser: nothing to explain.
+      if (reason !== 'unauthorized' && reason !== 'logged_out') sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
       logout();
     },
   });
@@ -613,6 +626,13 @@ function startApp() {
   socket.on('server:remove', ({ serverId }) => {
     const was = S.servers.find((s) => s.id === serverId);
     S.servers = S.servers.filter((s) => s.id !== serverId);
+    // Live updates stop while you're out, so what's loaded would be missing anything said meanwhile if you come
+    // back: load it fresh then.
+    if (was) {
+      const gone = new Set(was.channels.map((c) => c.id));
+      gone.forEach((id) => { delete S.msgs['c:' + id]; });
+      Object.entries(S.threads).forEach(([id, t]) => { if (t.root && gone.has(t.root.channelId)) delete S.threads[id]; });
+    }
     if (S.view.serverId === serverId) { toast(was && was.kind === 'group' ? 'You left the group.' : 'You are no longer in that server.'); goHome(); }
     else { renderRail(); if (!S.view.serverId) renderSidebar(); }
   });
@@ -621,11 +641,20 @@ function startApp() {
     sec.trust(user);
     const s = S.servers.find((x) => x.id === serverId);
     if (s && !s.memberIds.includes(user.id)) s.memberIds.push(user.id);
+    // Someone joining (or coming back) has no roles yet: any the server hands out follow in a server update.
+    if (s && s.memberRoles) s.memberRoles[user.id] = [];
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
   socket.on('member:remove', ({ serverId, userId }) => {
     const s = S.servers.find((x) => x.id === serverId);
-    if (s) s.memberIds = s.memberIds.filter((i) => i !== userId);
+    if (s) {
+      s.memberIds = s.memberIds.filter((i) => i !== userId);
+      // The server deleted their roles and their own channel permissions. Copies kept here would be sent back if
+      // they rejoin: the role menu sends the roles someone has plus the new one, and saving a channel's
+      // permissions sends all of its overrides.
+      if (s.memberRoles) delete s.memberRoles[userId];
+      s.channels.forEach((c) => { if (c.overrides) c.overrides = c.overrides.filter((o) => !(o.type === 'member' && o.id === userId)); });
+    }
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
   socket.on('channel:create', (ch) => {
@@ -5064,7 +5093,10 @@ function openServerSettings(server, startTab = 'overview') {
   const draw = () => {
     const s = live();
     const allowed = TABS.filter(([, , , ok]) => ok(s));
-    if (!allowed.some(([k]) => k === tab)) tab = allowed[0] ? allowed[0][0] : 'overview';
+    // Nothing left that's yours to change here (say, right after handing the server to someone else): close
+    // instead of showing forms the server would refuse.
+    if (!allowed.length) { mdl.close(); return; }
+    if (!allowed.some(([k]) => k === tab)) tab = allowed[0][0];
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
     ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bots: (sv) => botsTab(sv, body, { confirm: (fn, opts) => confirmedCall(app, fn, opts) }), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger })[tab](s);
