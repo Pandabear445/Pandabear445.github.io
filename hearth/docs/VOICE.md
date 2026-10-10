@@ -318,7 +318,7 @@ Three full runs of `IMPAIR=iptables npm run test:voice` on the final code (13/13
 | Switch to a region whose relay is dead → `connected` on automatic relays | 6956 ms | 6909 ms | 6907 ms | the 6 s "no relay candidate" timer, then a rebuild |
 | Switch back to automatic: request → everyone rebuilt and `connected` | 877 ms | 884 ms | 876 ms | 800 ms of it is the deliberate delay, during which the old connection still carries audio |
 | … actual media gap (old connection closed → new one connected) | 57 ms | 72 ms | 60 ms | |
-| 20% UDP loss for 8 s: worst loss shown in diagnostics | 8% | 6% | 7.7% | the call stayed `connected` |
+| 20% UDP loss for 8 s: worst loss shown in diagnostics | 8% | 6% | 7.7% | the call stayed `connected`; a fourth run showed 3.9%. The browser's own `packetsLost` stays well under the 20% drop rate; why wasn't investigated |
 | 12 s media-path cut: call bar during the cut | "Reconnecting audio…" | same | same | state `degraded`, never "Connected" |
 | 12 s media-path cut: back to `connected` after the path returns | 57 ms | 9 ms | 57 ms | |
 

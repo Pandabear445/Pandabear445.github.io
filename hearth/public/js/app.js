@@ -1703,7 +1703,7 @@ function renderVoicePanel() {
       }, icon('globe'), h('span', null, callRegion(room) ? regionName(callRegion(room)) : 'Auto')) : null),
     // Anything but a healthy call says what's going on, and a call that couldn't be restored can be retried.
     st.tone === 'warn' || st.tone === 'bad' ? h('div', { class: `vp-detail ${st.tone}` }, h('span', null, st.detail),
-      st.state === 'failed' ? h('button', { class: 'btn sm primary', onclick: () => voice.retry().catch((e) => toast(e.name === 'NotAllowedError' ? 'Allow microphone access in your browser to join.' : e.message, 'error')) }, 'Retry') : null) : null,
+      st.state === 'failed' ? h('button', { class: 'btn sm primary', onclick: () => voice.retry().catch((e) => toast(e.name === 'NotAllowedError' ? 'Allow microphone access in your browser to join.' : e.message, 'error')) }, 'Retry') : null) : '',
     h('div', { class: 'vp-controls' },
       ibtn(voice.muted ? 'micOff' : 'mic', voice.muted ? 'Unmute' : 'Mute', toggleMute, { cls: voice.muted ? 'off' : '' }),
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),

@@ -184,6 +184,8 @@ try {
     timings.joinMs = Date.now() - t0;
     const ui = await uiState(A);
     assert(/^connected: Connected/.test(ui || ''), `call bar should say Connected, says ${ui}`);
+    const bar = await A.page.locator('#voice-panel').innerText();
+    assert(!/\b(null|undefined)\b/.test(bar), `nothing stray in the call bar: ${bar}`);
     return `both connected ${timings.joinMs} ms after the first join; call bar: "${ui}"`;
   });
 
@@ -456,6 +458,7 @@ try {
     await V(A, (cid) => { const v = window.__hearthVoice; const orig = v.setListed.bind(v); v.setListed = (ids) => orig(ids.filter((x) => x !== cid)); v.setListed([...v.listed]); }, C.id);
     await V(C, (id) => window.__hearthVoice.join(id), room);
     await waitUp(A, 2, 30000);
+    await A.page.click('#voice-panel .vp-where'); // the call page, where the warning shows
     await A.page.waitForSelector('.cs-hidden-peers', { timeout: 10000 });
     const warn = await A.page.locator('.cs-hidden-peers').innerText();
     assert(/cara/.test(warn), `names the hidden peer: ${warn}`);
