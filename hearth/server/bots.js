@@ -600,6 +600,9 @@ module.exports = function setupBots(ctx) {
   });
   api.use('/bot/v1', bapi);
 
+  // Every people-side route counts against one allowance (the busier ones have their own on top).
+  const limitUi = (req, res, next) => { try { rateLimit('botui:' + req.userId, 120, 60000); next(); } catch (e) { next(e); } };
+
   // ------------------------------------------------------------------ slash commands (people's side)
   // In memory only: an interaction lives for BOT_INTERACTION_TIMEOUT_MS (10 s), then the person is told the bot
   // didn't answer. Nothing a person typed after a command is written to the database.
@@ -621,13 +624,13 @@ module.exports = function setupBots(ctx) {
         WHERE i.server_id = ? AND i.enabled = 1 AND b.disabled = 0 AND b.webhook_url IS NOT NULL ORDER BY k.name`).all(c.server_id);
     return rows.filter((r) => hasScope(r, 'commands') && channelAllowed(r, c, srv) && (!r.permission || (perms.channel(srv, c, userId) & PM[r.permission]) === PM[r.permission]));
   }
-  api.get('/channels/:id/commands', auth, (req, res) => {
+  api.get('/channels/:id/commands', auth, limitUi, (req, res) => {
     const c = requireChannel(req.params.id, req.userId);
     const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
     if (c.type !== 'text' || !(perms.channel(srv, c, req.userId) & PM.SEND_MESSAGES)) return res.json({ commands: [] });
     res.json({ commands: commandsIn(c, srv, req.userId).map((r) => ({ botId: r.bot_id, botName: (botRow(r.bot_id) || {}).name || '', ...commandOut(r) })) });
   });
-  api.post('/channels/:id/commands', auth, (req, res) => {
+  api.post('/channels/:id/commands', auth, limitUi, (req, res) => {
     const c = requireChannel(req.params.id, req.userId);
     const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
     if (c.type !== 'text') fail(400, 'Commands work in text channels.', 'bad_channel');
@@ -699,13 +702,13 @@ module.exports = function setupBots(ctx) {
     for (const r of db.prepare('SELECT server_id FROM bot_installations WHERE bot_id = ?').all(botId)) { io().to(`server:${r.server_id}`).emit('user:update', pu); emitServer(r.server_id); }
   };
 
-  api.get('/bots', auth, (req, res) => {
+  api.get('/bots', auth, limitUi, (req, res) => {
     const mine = db.prepare('SELECT * FROM bots WHERE owner_id = ? ORDER BY created_at').all(req.userId).map(botFull);
     // What can be installed: bots listed on this instance by their makers, and your own.
     const available = db.prepare('SELECT * FROM bots WHERE disabled = 0 AND (listed = 1 OR owner_id = ?) ORDER BY name COLLATE NOCASE LIMIT 200').all(req.userId).map(botBrief);
     res.json({ canCreate: canCreate(req.userId), scopes: SCOPES, events: Object.keys(EVENTS), argTypes: ARG_TYPES, mine, available });
   });
-  api.post('/bots', auth, wrap(async (req, res) => {
+  api.post('/bots', auth, limitUi, wrap(async (req, res) => {
     if (!canCreate(req.userId)) fail(403, 'On this Hearth, only some people can create bots. Ask an admin.');
     rateLimit('botcreate:' + req.userId, 10, 3600000);
     const b = req.body || {};
@@ -730,10 +733,10 @@ module.exports = function setupBots(ctx) {
     // The token and the webhook secret are shown this once: only a hash of the token is kept.
     res.json({ bot: botFull(botRow(id)), token: token.token, webhookSecret: secret });
   }));
-  api.patch('/bots/:id', auth, wrap(async (req, res) => {
+  api.patch('/bots/:id', auth, limitUi, wrap(async (req, res) => {
     const b = req.body || {};
     // Instance admins can switch any bot off (abuse); everything else is its maker's.
-    const bot = myBot(req.params.id, req.userId, { admin: Object.keys(b).every((k) => k === 'disabled') });
+    const bot = myBot(req.params.id, req.userId, { admin: b.disabled !== undefined && Object.keys(b).every((k) => k === 'disabled') });
     if (b.name !== undefined || b.description !== undefined) {
       const name = b.name !== undefined ? cleanName(b.name) : bot.name;
       const description = b.description !== undefined ? String(b.description || '').trim().slice(0, 300) : bot.description;
@@ -755,7 +758,7 @@ module.exports = function setupBots(ctx) {
   }));
   // A new token (optionally for one installation), shown once. rotate: true also revokes the others of the same
   // kind, in one step, so swapping a leaked token leaves no gap and no leftover.
-  api.post('/bots/:id/tokens', auth, wrap(async (req, res) => {
+  api.post('/bots/:id/tokens', auth, limitUi, wrap(async (req, res) => {
     const bot = myBot(req.params.id, req.userId);
     rateLimit('bottoken:' + req.userId, 20, 3600000);
     await stepUp(req, req.body);
@@ -778,7 +781,7 @@ module.exports = function setupBots(ctx) {
     auditLog(req, b.rotate ? 'bot_token_rotated' : 'bot_token_created', bot.id, `token ${token.id}${instId ? ` (installation ${instId})` : ' (whole bot)'}${b.rotate ? `, ${revoked} revoked` : ''}`);
     res.json({ token: token.token, id: token.id, revoked, bot: botFull(botRow(bot.id)) });
   }));
-  api.delete('/bots/:id/tokens/:tid', auth, (req, res) => {
+  api.delete('/bots/:id/tokens/:tid', auth, limitUi, (req, res) => {
     const bot = myBot(req.params.id, req.userId);
     const t = db.prepare('SELECT * FROM bot_tokens WHERE id = ? AND bot_id = ?').get(String(req.params.tid), bot.id);
     if (!t) fail(404, 'No such token.');
@@ -788,7 +791,7 @@ module.exports = function setupBots(ctx) {
     }
     res.json(botFull(botRow(bot.id)));
   });
-  api.post('/bots/:id/webhook-secret', auth, wrap(async (req, res) => {
+  api.post('/bots/:id/webhook-secret', auth, limitUi, wrap(async (req, res) => {
     const bot = myBot(req.params.id, req.userId);
     await stepUp(req, req.body);
     const secret = crypto.randomBytes(32).toString('base64url');
@@ -796,7 +799,7 @@ module.exports = function setupBots(ctx) {
     auditLog(req, 'bot_webhook_secret_rotated', bot.id, bot.name);
     res.json({ webhookSecret: secret });
   }));
-  api.delete('/bots/:id', auth, (req, res) => {
+  api.delete('/bots/:id', auth, limitUi, (req, res) => {
     const bot = myBot(req.params.id, req.userId, { admin: true });
     const servers = db.prepare('SELECT server_id FROM bot_installations WHERE bot_id = ?').all(bot.id).map((r) => r.server_id);
     // Its account stays (as deleted) so the messages it posted still have an author; it can't come back.
@@ -809,7 +812,7 @@ module.exports = function setupBots(ctx) {
     servers.forEach((s) => emitServer(s));
     res.json({ ok: true });
   });
-  api.get('/admin/bots', auth, (req, res) => {
+  api.get('/admin/bots', auth, limitUi, (req, res) => {
     if (!isInstanceAdmin(req.userId)) fail(403, 'Only admins can see this.');
     res.json({ bots: db.prepare('SELECT * FROM bots ORDER BY created_at DESC LIMIT 500').all().map((b) => ({ ...botBrief(b),
       installs: db.prepare('SELECT COUNT(*) n FROM bot_installations WHERE bot_id = ?').get(b.id).n })) });
@@ -828,7 +831,7 @@ module.exports = function setupBots(ctx) {
     return { ...instOut(inst), bot: botBrief(b), health: health(inst), lastOkAt: inst.last_ok_at, lastError: inst.last_error, lastErrorAt: inst.last_error_at,
       installedBy: inst.installed_by, webhook: !!b.webhook_url, pendingScopes: parseList(b.requested_scopes).filter((s) => !granted.includes(s)), channels: inst.channels === '"*"' ? '*' : parseList(inst.channels) };
   };
-  api.get('/servers/:id/bots', auth, (req, res) => {
+  api.get('/servers/:id/bots', auth, limitUi, (req, res) => {
     const s = requireManager(req.params.id, req.userId);
     const feeds = db.prepare('SELECT COUNT(*) n, SUM(paused = 0) live, MAX(last_ok) ok FROM feeds WHERE server_id = ?').get(s.id);
     res.json({
@@ -840,7 +843,7 @@ module.exports = function setupBots(ctx) {
   });
   // Installing needs the person to have approved exactly these scopes and channels in the app's dialog
   // (confirm: true); nothing is granted that the bot didn't ask for.
-  api.post('/servers/:id/bots', auth, (req, res) => {
+  api.post('/servers/:id/bots', auth, limitUi, (req, res) => {
     const s = requireManager(req.params.id, req.userId);
     rateLimit('botinstall:' + req.userId, 30, 3600000);
     const b = req.body || {};
@@ -862,7 +865,7 @@ module.exports = function setupBots(ctx) {
     res.json(installedOut(inst));
   });
   // Changing access. Taking things away never needs approval; adding scopes or channels does (confirm: true).
-  api.patch('/servers/:id/bots/:botId', auth, (req, res) => {
+  api.patch('/servers/:id/bots/:botId', auth, limitUi, (req, res) => {
     const s = requireManager(req.params.id, req.userId);
     const inst = installRow(String(req.params.botId), s.id);
     if (!inst) fail(404, 'That bot isn’t in this server.');
@@ -888,7 +891,7 @@ module.exports = function setupBots(ctx) {
     emitServer(s.id);
     res.json(installedOut(db.prepare('SELECT * FROM bot_installations WHERE id = ?').get(inst.id)));
   });
-  api.delete('/servers/:id/bots/:botId', auth, (req, res) => {
+  api.delete('/servers/:id/bots/:botId', auth, limitUi, (req, res) => {
     const s = requireManager(req.params.id, req.userId);
     const inst = installRow(String(req.params.botId), s.id);
     if (!inst) fail(404, 'That bot isn’t in this server.');
@@ -910,13 +913,13 @@ module.exports = function setupBots(ctx) {
     if (!inst) fail(404, 'That bot isn’t in this server.');
     return inst;
   };
-  api.get('/servers/:id/bots/:botId/deliveries', auth, (req, res) => res.json(deliveriesOf(managedInstall(req))));
-  api.post('/servers/:id/bots/:botId/deliveries/retry', auth, (req, res) => {
+  api.get('/servers/:id/bots/:botId/deliveries', auth, limitUi, (req, res) => res.json(deliveriesOf(managedInstall(req))));
+  api.post('/servers/:id/bots/:botId/deliveries/retry', auth, limitUi, (req, res) => {
     const inst = managedInstall(req);
     rateLimit('botretry:' + req.userId, 30, 60000);
     res.json({ retried: retryDead(inst, (req.body || {}).ids) });
   });
-  api.delete('/servers/:id/bots/:botId/deliveries/dead', auth, (req, res) => res.json({ cleared: clearDead(managedInstall(req)) }));
+  api.delete('/servers/:id/bots/:botId/deliveries/dead', auth, limitUi, (req, res) => res.json({ cleared: clearDead(managedInstall(req)) }));
 
   return { event, serverBots, SCOPES, EVENTS, sign, pump };
 };

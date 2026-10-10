@@ -591,6 +591,8 @@ test('a paused, uninstalled, disabled or deleted bot can’t act', async () => {
   // Switched off by an instance admin (abuse): every call refused, logged.
   await install(F, ['messages.send'], [general.id]);
   assert.equal((await as(alice, 'PATCH', `/bots/${F.id}`, { disabled: true })).status, 404, 'not alice’s bot, and she isn’t an admin');
+  assert.equal((await as(alice, 'GET', '/admin/bots')).status, 403);
+  assert.ok((await as(srv.owner, 'GET', '/admin/bots')).json.bots.some((x) => x.id === F.id));
   assert.equal((await as(srv.owner, 'PATCH', `/bots/${F.id}`, { disabled: true })).status, 200);
   assert.deepEqual([(await bot(F.token, 'GET', '/me')).status, (await bot(F.token, 'GET', '/me')).json.code], [403, 'bot_disabled']);
   assert.ok(srv.sql("SELECT 1 FROM admin_log WHERE action = 'bot_disabled' AND target = ?", F.id).length);

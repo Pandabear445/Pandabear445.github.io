@@ -7,7 +7,7 @@ import { renderDoc, render as md } from './markdown.js';
 import { rankRelays, relayTime } from './relays.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['bots', 'Bots', 'bot', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
 // Security groups three pages under one tab: protection (sign everyone out, blocked IPs, sign-in attempts),
 // storage & limits, and broadcast.
@@ -76,7 +76,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     const page = tab === 'security' ? secSub : tab;
-    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    ({ overview, online, reports, users, servers, bots, security, storage, broadcast, admins, registration, log, regions, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
   // Security's sub-tabs stay on top of whichever page is showing (pages redraw the body themselves).
   const subBar = h('div', { class: 'set-subtabs admin-subtabs', role: 'tablist' });
@@ -240,6 +240,24 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', { class: 'row gap tight' }, h('button', { class: 'btn ghost sm', onclick: () => transferServer(x, servers) }, 'Give to\u2026'), h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
             if (await confirmDialog({ title: `Delete ${x.name}?`, text: 'Every channel, message and file in it is deleted for everyone. This can\u2019t be undone.', confirm: 'Delete server', danger: true })) { await api('DELETE', `/admin/servers/${x.id}`).then(() => { toast('Server deleted.'); servers(); }, (e) => toast(e.message, 'error')); }
           } }, 'Delete'))))));
+  }
+
+  // Every bot on this Hearth. Switching one off stops all its API calls and webhooks everywhere (logged).
+  async function bots() {
+    const { bots: list } = await api('GET', '/admin/bots');
+    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, `Bots \u2014 ${list.length}`), h('span', { class: 'field-hint' }, 'Bots can\u2019t read people\u2019s messages: those are end-to-end encrypted')),
+      list.length ? h('div', { class: 'adm-table' }, h('div', { class: 'adm-row head' }, h('span', null, 'Bot'), h('span', null, 'Made by'), h('span', null, 'Servers'), h('span', null, 'Asks for'), h('span', null, '')),
+        ...list.map((b) => h('div', { class: 'adm-row' },
+          h('span', { class: 'adm-user-text' }, h('strong', null, b.name), h('span', null, `@${b.username || ''} \u00b7 ${b.listed ? 'listed' : 'not listed'} \u00b7 made ${fmtStamp(b.createdAt)}`)),
+          h('span', null, b.ownerName ? `@${b.ownerName}` : '\u2014'),
+          h('span', null, String(b.installs)),
+          h('span', { class: 'stat-sub' }, b.requestedScopes.join(', ') || 'nothing'),
+          h('span', { class: 'row gap tight' },
+            b.disabled ? h('span', { class: 'rpill bad' }, 'Off') : null,
+            h('button', { class: `btn ghost sm${b.disabled ? '' : ' danger-text'}`, onclick: async () => {
+              if (!b.disabled && !(await confirmDialog({ title: `Switch ${b.name} off?`, text: 'Its tokens and webhooks stop working in every server until you switch it back on.', confirm: 'Switch off', danger: true }))) return;
+              await api('PATCH', `/bots/${b.id}`, { disabled: !b.disabled }).then(() => bots(), (e) => toast(e.message, 'error'));
+            } }, b.disabled ? 'Switch on' : 'Switch off'))))) : h('p', { class: 'field-hint' }, 'Nobody has made a bot yet.'));
   }
 
   async function security() {

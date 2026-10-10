@@ -290,6 +290,8 @@ export function createSlash({ getSocketId, onEphemeral, members }) {
     try {
       const r = await api('POST', `/channels/${channelId}/commands`, { botId: cmd.botId, name: cmd.name, args: p.args, ack: true, socketId: getSocketId() });
       pending.set(r.interactionId, { botName: cmd.botName, channelId });
+      // If the server's answer never comes (it restarted, the connection dropped), still say so.
+      setTimeout(() => onInteraction({ interactionId: r.interactionId, status: 'timeout' }), Math.min(30000, Math.max(5000, r.respondBy - Date.now())) + 3000);
       toast(`Sent /${cmd.name} to ${cmd.botName}…`);
       return true;
     } catch (e) { toast(e.message, 'error'); return false; }
