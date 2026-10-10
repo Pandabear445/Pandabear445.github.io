@@ -48,8 +48,8 @@ function request(method, path, { body, json, onProgress, signal, timeout = 12000
   });
 }
 const failure = (r, fallback) => Object.assign(new Error((r.data && r.data.error) || fallback || `Upload failed (${r.status}).`), { status: r.status, code: r.data && r.data.code });
-// Network trouble, a busy server or "too many requests": worth waiting and trying again.
-const retryable = (r) => !r || r.status === 0 || r.status === 408 || r.status === 429 || r.status >= 500;
+// Network trouble, a busy server or "too many requests": worth waiting and trying again (a full disk isn't).
+const retryable = (r) => !r || r.status === 0 || r.status === 408 || r.status === 429 || (r.status >= 500 && r.status !== 507);
 
 export async function sha256Hex(buf) {
   const d = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
@@ -68,7 +68,7 @@ export async function uploadResumable(bytes, { onProgress = () => {}, onStatus =
   for (let tries = 0; ; tries++) {
     start = await request('POST', '/uploads', { json: { size }, signal }).catch((e) => { if (e.cancelled) throw e; return null; });
     if (start && start.status === 200) break;
-    if (!retryable(start) || tries >= 3) throw start ? failure(start) : new Error('Couldn’t reach the server. Check your connection and try again.');
+    if (!retryable(start) || tries >= 3) throw start ? failure(start) : new Error('Couldn\u2019t reach the server. Check your connection and try again.');
     await sleep(1000 * 2 ** tries, signal);
   }
   const { id, chunkSize } = start.data;
@@ -76,7 +76,7 @@ export async function uploadResumable(bytes, { onProgress = () => {}, onStatus =
   try {
     let tries = 0;
     const recover = async (r) => {
-      if (++tries > MAX_TRIES) throw new Error('The connection kept dropping, so the upload stopped. Try again when you’re back online.');
+      if (++tries > MAX_TRIES) throw new Error('The connection kept dropping, so the upload stopped. Try again when you\u2019re back online.');
       const wait = r && r.status === 429 && r.retryAfter ? r.retryAfter * 1000 : Math.min(30000, 1000 * 2 ** (tries - 1));
       onStatus({ retrying: true, wait });
       await sleep(wait, signal);
@@ -132,13 +132,13 @@ export async function download(url, { onProgress = () => {}, signal, expected = 
       res = await fetch(url, { signal, headers: got ? { Range: `bytes=${got}-` } : {} });
     } catch (e) {
       if (signal && signal.aborted) throw cancelledError();
-      if (tries >= 3) throw new Error('Couldn’t reach the server. Check your connection and try again.');
+      if (tries >= 3) throw new Error('Couldn\u2019t reach the server. Check your connection and try again.');
       await sleep(1000 * 2 ** tries, signal);
       continue;
     }
     if (res.status === 404 || res.status === 410) throw Object.assign(new Error('This file is no longer available. It was deleted, or the message it was in was.'), { code: 'gone' });
     if (got && res.status === 200) { parts.length = 0; got = 0; } // the server sent it all again
-    else if (!res.ok) throw new Error(`The server couldn’t send this file (${res.status}). Try again in a moment.`);
+    else if (!res.ok) throw new Error(`The server couldn\u2019t send this file (${res.status}). Try again in a moment.`);
     if (!got) total = Number(res.headers.get('Content-Length')) || expected;
     if (!res.body || !res.body.getReader) { const b = new Uint8Array(await res.arrayBuffer()); parts.push(b); got += b.length; break; }
     const reader = res.body.getReader();

@@ -2648,8 +2648,8 @@ function openForward(m) {
 const fileUrls = makeUrlCache();
 const fileJobs = new Map(); // url -> { job, listeners }: downloads in progress, shared by everyone asking
 const AUTOLOAD_MAX = 20 * 1024 * 1024; // bigger videos and songs wait for a click instead of downloading by themselves
-function decryptedUrl(m, f, { onProgress } = {}) {
-  if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn’t on this server.'));
+function decryptedUrl(m, f) {
+  if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn\u2019t on this server.'));
   const ready = fileUrls.get(f.url);
   if (ready) return Promise.resolve(ready);
   if (!fileJobs.has(f.url)) {
@@ -2664,11 +2664,10 @@ function decryptedUrl(m, f, { onProgress } = {}) {
     // A failed try isn't remembered: the next click fetches again instead of failing straight away.
     job.then(() => fileJobs.delete(f.url), () => fileJobs.delete(f.url));
   }
-  const entry = fileJobs.get(f.url);
-  if (onProgress) entry.listeners.add(onProgress);
-  return entry.job;
+  return fileJobs.get(f.url).job;
 }
-function forgetFile(...urls) { urls.forEach((u) => { if (u) fileUrls.drop(u); }); }
+// Download progress (0–1) of a file decryptedUrl is fetching right now, if it is.
+function watchFile(url, fn) { const entry = fileJobs.get(url); if (entry && fn) entry.listeners.add(fn); }
 function fileIcon(type, name) {
   if (/^image\//.test(type)) return 'image';
   if (/pdf|text|document|msword|sheet|presentation/.test(type) || /\.(pdf|txt|md|docx?|xlsx?|pptx?|csv)$/i.test(name)) return 'file';
@@ -2685,8 +2684,10 @@ async function downloadAttachment(m, f, btn) {
     // Big files show how far the download has got on the button.
     const onProgress = before != null && (f.size || 0) > 2 * 1024 * 1024 ? (x) => { label.textContent = `${Math.round(x * 100)}%`; } : null;
     // Only ever a decrypted copy or a file on this server: never a jump to another site.
-    const href = safeDownloadHref(enc ? await decryptedUrl(m, f, { onProgress }) : f.url, location.origin);
-    if (!href) throw new Error('This file isn’t on this server.');
+    const copy = enc ? decryptedUrl(m, f) : null;
+    if (copy) watchFile(f.url, onProgress);
+    const href = safeDownloadHref(enc ? await copy : f.url, location.origin);
+    if (!href) throw new Error('This file isn\u2019t on this server.');
     const a = h('a', { href, download: f.name || 'file' });
     document.body.append(a); a.click(); a.remove();
   } catch (e) {
@@ -2694,7 +2695,7 @@ async function downloadAttachment(m, f, btn) {
       const card = btn && btn.closest('.att-file, .att-media');
       if (card) markGone(card);
       toast(`${f.name || 'This file'} is no longer available.`, 'error');
-    } else toast(`Couldn’t download ${f.name || 'the file'}: ${e.message}`, 'error');
+    } else toast(`Couldn\u2019t download ${f.name || 'the file'}: ${e.message}`, 'error');
   } finally {
     if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
     if (before != null) label.textContent = before;
@@ -2722,7 +2723,7 @@ const loadQueue = makeQueue(3);
 function attachmentEl(f, m) {
   // Unencrypted entries (older messages) load straight from this server; anything else was dropped when the
   // message was decrypted (see attachments.js), and is refused here too.
-  const direct = () => (isUploadUrl(f.url) ? Promise.resolve(f.url) : Promise.reject(new Error('This file isn’t on this server.')));
+  const direct = () => (isUploadUrl(f.url) ? Promise.resolve(f.url) : Promise.reject(new Error('This file isn\u2019t on this server.')));
   if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : direct()));
   const enc = !!f.k || !!m.dmId;
   const type = f.type || '';
@@ -2741,9 +2742,10 @@ function attachmentEl(f, m) {
     }
     const meter = h('div', { class: 'att-meter', hidden: true }, h('i'));
     const onProgress = (x) => { meter.hidden = x >= 1; meter.firstChild.style.width = `${Math.round(x * 100)}%`; };
-    const full = () => (enc ? decryptedUrl(m, f, { onProgress }) : direct());
+    const full = () => (enc ? decryptedUrl(m, f) : direct());
+    const fullWatched = () => { const p = full(); watchFile(f.url, onProgress); return p; };
     if (media === 'img') {
-      el._full = full;
+      el._full = fullWatched;
       el.addEventListener('click', () => openViewer(el, { name: f.name, download: () => downloadAttachment(m, f) }));
       el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.click(); });
     }
@@ -2752,13 +2754,13 @@ function attachmentEl(f, m) {
     // Load only when it scrolls near the screen, a few at a time; images show the small thumbnail first.
     const load = () => {
       holder.classList.add('loading');
-      const want = media === 'img' && f.th ? () => decryptedUrl(m, { ...f.th, type: 'image/webp' }) : full;
+      const want = media === 'img' && f.th ? () => decryptedUrl(m, { ...f.th, type: 'image/webp' }) : fullWatched;
       loadQueue(want).then((u) => { el.src = u; holder.classList.remove('locked', 'loading', 'failed'); })
         .catch((e) => {
           holder.classList.remove('loading');
           if (e && e.code === 'gone') return markGone(holder);
           holder.classList.add('failed');
-          const again = h('button', { class: 'att-retry', onclick: (ev) => { ev.stopPropagation(); again.remove(); load(); } }, icon('arrowDown'), 'Couldn’t load — tap to retry');
+          const again = h('button', { class: 'att-retry', onclick: (ev) => { ev.stopPropagation(); again.remove(); load(); } }, icon('arrowDown'), 'Couldn\u2019t load \u2014 tap to retry');
           holder.append(again);
         });
     };
@@ -2769,7 +2771,7 @@ function attachmentEl(f, m) {
       el.hidden = true;
       const play = h('button', { class: 'att-play', type: 'button', onclick: (e) => {
         e.stopPropagation(); play.remove(); el.hidden = false; holder.classList.remove('click-to-load');
-        loadQueue(full, { front: true }).then((u) => { el.src = u; if (media === 'video') el.play().catch(() => {}); })
+        loadQueue(fullWatched, { front: true }).then((u) => { el.src = u; if (media === 'video') el.play().catch(() => {}); })
           .catch((err) => { if (err && err.code === 'gone') markGone(holder); else { toast(err.message, 'error'); holder.append(play); el.hidden = true; holder.classList.add('click-to-load'); } });
       } }, icon(media === 'video' ? 'play' : 'music'), h('span', null, `${media === 'video' ? 'Play video' : 'Play audio'} · ${fmtSize(f.size)}`));
       holder.append(play);

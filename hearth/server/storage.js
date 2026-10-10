@@ -53,7 +53,7 @@ module.exports = function setupStorage(ctx) {
   function own(req) {
     const id = String(req.params.id || '');
     const s = ID.test(id) && db.prepare('SELECT * FROM upload_sessions WHERE id = ?').get(id);
-    if (!s || s.user_id !== req.userId) fail(404, 'That upload isn’t here any more. Start it again.', 'no_upload');
+    if (!s || s.user_id !== req.userId) fail(404, 'That upload isn\u2019t here any more. Start it again.', 'no_upload');
     return s;
   }
   // Removes a session: its part file, its row and its reservation.
@@ -76,14 +76,14 @@ module.exports = function setupStorage(ctx) {
     const size = Number((req.body || {}).size);
     if (!Number.isSafeInteger(size) || size < 1) fail(400, 'Say how big the file is, in bytes.', 'bad_size');
     const q = quotaOf(req.userId);
-    if (q.blocked) fail(403, 'Uploads are turned off for your account. Ask an admin if you think that’s a mistake.');
+    if (q.blocked) fail(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.');
     // The same per-file limit as one-request uploads, with the same allowance for the encryption overhead.
     if (size > q.fileMb * MB + MB) fail(413, `That file is too big. Files can be up to ${q.fileMb} MB.`, 'too_big');
     if (db.prepare('SELECT COUNT(*) n FROM upload_sessions WHERE user_id = ?').get(req.userId).n >= MAX_SESSIONS) {
       fail(429, 'You have too many uploads going at once. Let one finish (or cancel one), then try again.', 'too_many_uploads');
     }
     const { free } = diskFree();
-    if (free != null && size > free - DISK_MARGIN) fail(507, 'The server is running out of disk space, so it can’t take this file right now. Let an admin know.', 'disk_full');
+    if (free != null && size > free - DISK_MARGIN) fail(507, 'The server is running out of disk space, so it can\u2019t take this file right now. Let an admin know.', 'disk_full');
     const id = crypto.randomBytes(16).toString('hex');
     fs.writeFileSync(partOf(id), '', { mode: 0o600 });
     try {
@@ -137,6 +137,7 @@ module.exports = function setupStorage(ctx) {
     // Taken before the first await, so two chunks sent at once can't both get in.
     let aborted = false;
     let tooBig = false;
+    let diskError = null;
     active.set(s.id, { abort: () => { aborted = true; req.destroy(); } });
     let fh;
     try { fh = await fs.promises.open(partOf(s.id), 'r+'); } catch {
@@ -150,7 +151,7 @@ module.exports = function setupStorage(ctx) {
       await fh.truncate(s.received);
       for await (const buf of req) {
         if (pos - s.received + buf.length > cap) { tooBig = true; break; }
-        await fh.write(buf, 0, buf.length, pos);
+        try { await fh.write(buf, 0, buf.length, pos); } catch (e) { diskError = e; break; }
         pos += buf.length;
       }
     } catch { /* the connection dropped: keep what arrived, the app asks where to carry on */ } finally {
@@ -158,15 +159,16 @@ module.exports = function setupStorage(ctx) {
       active.delete(s.id);
     }
     if (aborted) return; // cancelled meanwhile: the session is gone
-    if (tooBig) {
+    if (tooBig || diskError) {
       await fs.promises.truncate(partOf(s.id), s.received).catch(() => {});
       res.setHeader('Connection', 'close');
+      if (diskError) fail(507, 'The server couldn\u2019t save that piece (its disk may be full). Let an admin know.', 'disk_full');
       fail(413, `Chunks can be up to ${cap} bytes here.`, 'chunk_too_big');
     }
     // A session removed while this chunk was arriving (account deleted, admin cleanup) stays removed.
     if (!db.prepare('UPDATE upload_sessions SET received = ?, updated_at = ? WHERE id = ?').run(pos, now(), s.id).changes) {
       fs.promises.unlink(partOf(s.id)).catch(() => {});
-      fail(404, 'That upload isn’t here any more. Start it again.', 'no_upload');
+      fail(404, 'That upload isn\u2019t here any more. Start it again.', 'no_upload');
     }
     if (pos === s.received && !res.destroyed) fail(400, 'That chunk was empty.', 'empty_chunk');
     if (!res.destroyed) res.json({ received: pos, size: s.size });
@@ -196,11 +198,11 @@ module.exports = function setupStorage(ctx) {
     } finally { active.delete(s.id); }
     if (!got || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
       drop(s.id);
-      fail(400, 'The file arrived damaged (its checksum doesn’t match), so it wasn’t saved. Send it again.', 'hash_mismatch');
+      fail(400, 'The file arrived damaged (its checksum doesn\u2019t match), so it wasn\u2019t saved. Send it again.', 'hash_mismatch');
     }
     // Nothing awaits from here to the end: the file appears in uploads/ in one rename, already complete, and
     // its rows swap the reservation for the real file in one transaction.
-    if (!db.prepare('SELECT 1 FROM upload_sessions WHERE id = ?').get(s.id)) fail(404, 'That upload isn’t here any more. Start it again.', 'no_upload');
+    if (!db.prepare('SELECT 1 FROM upload_sessions WHERE id = ?').get(s.id)) fail(404, 'That upload isn\u2019t here any more. Start it again.', 'no_upload');
     const name = fileName('.bin');
     const dest = path.join(UPLOAD_DIR, name);
     fs.renameSync(partOf(s.id), dest);
@@ -375,7 +377,7 @@ module.exports = function setupStorage(ctx) {
     await stepUp(req, req.body);
     const graceMs = graceOf((req.body || {}).graceHours);
     const o = findOrphans(graceMs);
-    if (o.unverifiable) fail(409, `${o.unverifiable} older messages couldn’t be opened with this server’s key, so it can’t be sure which files they use. Nothing was deleted.`, 'unverifiable');
+    if (o.unverifiable) fail(409, `${o.unverifiable} older messages couldn\u2019t be opened with this server\u2019s key, so it can\u2019t be sure which files they use. Nothing was deleted.`, 'unverifiable');
     let bytes = 0;
     db.transaction(() => {
       for (const f of o.files) { db.prepare('DELETE FROM blobs WHERE name = ?').run(f.name); db.prepare('DELETE FROM user_files WHERE name = ?').run(f.name); }
