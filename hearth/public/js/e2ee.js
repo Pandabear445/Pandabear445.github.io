@@ -408,8 +408,28 @@ export async function keyFingerprint(user) {
 // pinned. Keys the server merely lists as someone's past keys (user.pastKeys) never are: nothing vouches for them
 // (safety numbers cover current keys only), so the server could list a key of its own there.
 const pinKey = (myId) => `hearth.pins.${myId}`;
-function loadPins(myId) { try { return JSON.parse(localStorage.getItem(pinKey(myId)) || '{}'); } catch { return {}; } }
-function savePins(myId, pins) { localStorage.setItem(pinKey(myId), JSON.stringify(pins)); }
+// The parsed store is kept while its stored text stays exactly the same. The member list asks about every member,
+// and parsing the whole store each time made a 1,000-member list take half a second. The text is still read on
+// every call, so a change made anywhere else (another tab, another account on this device) is picked up at once.
+let pinCache = { key: '', raw: null, pins: null };
+function loadPins(myId) {
+  const key = pinKey(myId);
+  let raw;
+  try { raw = localStorage.getItem(key); } catch { return {}; }
+  if (pinCache.pins && pinCache.key === key && pinCache.raw === raw) return pinCache.pins;
+  let pins;
+  try { pins = JSON.parse(raw || '{}'); } catch { pins = {}; }
+  if (!pins || typeof pins !== 'object' || Array.isArray(pins)) pins = {};
+  pinCache = { key, raw, pins };
+  return pins;
+}
+function savePins(myId, pins) {
+  const raw = JSON.stringify(pins);
+  // Forget the cache first: if saving fails, the next read goes back to what's really stored.
+  pinCache = { key: '', raw: null, pins: null };
+  localStorage.setItem(pinKey(myId), raw);
+  pinCache = { key: pinKey(myId), raw, pins };
+}
 // A usable "stopped being theirs" time: a real moment, and not in the future (that would let a key count for
 // things written after it was replaced).
 const validUntil = (t) => typeof t === 'number' && Number.isFinite(t) && t > 0 && t <= Date.now();
@@ -436,6 +456,22 @@ export function checkPin(myId, user) {
   if (p.s && user.signPublicKey && p.s !== user.signPublicKey) return 'changed';
   if (!p.s && user.signPublicKey) { p.s = user.signPublicKey; savePins(myId, pins); }
   return 'ok';
+}
+// checkPin for many people at once (a member list): the same pinning and the same answer for each person, with
+// the store read and saved once instead of once per person. Returns the ids whose keys changed.
+export function checkPins(myId, users) {
+  const pins = loadPins(myId);
+  const changed = new Set();
+  let save = false;
+  for (const user of users) {
+    if (!user || !user.publicKey || user.id === myId) continue;
+    const p = pins[user.id];
+    if (!p) { pins[user.id] = { e: user.publicKey, s: user.signPublicKey || null }; save = true; continue; }
+    if (p.e !== user.publicKey || (p.s && user.signPublicKey && p.s !== user.signPublicKey)) { changed.add(user.id); continue; }
+    if (!p.s && user.signPublicKey) { p.s = user.signPublicKey; save = true; }
+  }
+  if (save) savePins(myId, pins);
+  return changed;
 }
 // When the server says a key of someone's was replaced (0 if it doesn't list it with a usable date).
 export function listedRetiredAt(user, e) {

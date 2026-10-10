@@ -1,7 +1,9 @@
 // Accessibility and responsive-layout checks in a real browser (npm run test:a11y). Separate from
 // `npm test`: it needs Chromium and Playwright (see test/browser/harness.mjs). Each check below guards a
 // fix described in docs/ACCESSIBILITY.md, so it doesn't quietly come back.
-import { launch, signUp, createServer, sendMessage, settle, closeNav, PASSWORD } from '../browser/harness.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { launch, signUp, createServer, sendMessage, settle, closeNav, PASSWORD, ROOT } from '../browser/harness.mjs';
 import { auditDom, overflowDom } from './checks.mjs';
 import { checkContrast } from './contrast.mjs';
 
@@ -226,6 +228,26 @@ try {
   const toolsShown = await p.evaluate(() => getComputedStyle(document.activeElement.closest('.msg').querySelector('.msg-tools')).opacity);
   check(Number(toolsShown) > 0.5, 'the actions toolbar is visible while it has keyboard focus', toolsShown);
 
+  section('Image viewer');
+  // A real picture (the app icon), sent the normal way (resized, encrypted and uploaded by the app).
+  const png = fs.readFileSync(path.join(ROOT, 'public', 'icons', 'icon-192.png'));
+  await p.setInputFiles('.cw-main input[type=file]', { name: 'square.png', mimeType: 'image/png', buffer: png });
+  await settle(p, 300);
+  await p.press('#composer-input', 'Enter');
+  await p.waitForSelector('#messages .att-img[src]', { timeout: 20000 });
+  const pic = p.locator('#messages .att-img').last();
+  await pic.focus();
+  await p.keyboard.press('Enter'); await settle(p, 300);
+  check(await p.locator('.viewer').count() === 1, 'Enter on a picture opens it');
+  const inViewer = () => p.evaluate(() => !!document.activeElement.closest('.viewer'));
+  check(await inViewer(), 'focus moves into the viewer');
+  let left = false;
+  for (let i = 0; i < 8; i++) { await p.keyboard.press('Tab'); if (!(await inViewer())) left = true; }
+  check(!left, 'Tab stays inside the viewer');
+  await p.keyboard.press('Escape'); await settle(p, 300);
+  check(!(await p.locator('.viewer').count()), 'Esc closes it');
+  check(await p.evaluate(() => document.activeElement.classList.contains('att-img')), 'and focus returns to the picture', await active(p));
+
   section('Focus is visible');
   await p.focus('#composer-input');
   await p.keyboard.press('Shift+Tab');
@@ -369,6 +391,84 @@ try {
   const kbo = await kb.evaluate(() => ({ bottom: Math.round(document.querySelector('.composer').getBoundingClientRect().bottom), h: innerHeight, cls: document.documentElement.classList.contains('kb-open') }));
   check(!kbo.cls && kbo.bottom > kbo.h - 120, 'with it down again, the app fills the screen', kbo);
   await kb.close();
+
+  section('Long histories and big servers');
+  // 2,000 more messages in the channel (copies of a real one, so they decrypt) and 300 more members.
+  const lp = await H.newPage({ width: 1366, height: 768 });
+  await lp.goto(base);
+  await lp.fill('#login-form [name=username]', 'alice');
+  await lp.fill('#login-form [name=password]', PASSWORD);
+  await lp.click('#login-form button[type=submit]');
+  await lp.waitForSelector('#app:not([hidden]):not(.loading)', { timeout: 60000 });
+  const uid = await lp.evaluate(() => localStorage.getItem('hearth.userId'));
+  const db = H.srv.db();
+  const sid = db.prepare("SELECT id FROM servers WHERE name = 'Quality checks'").get().id;
+  const chan = db.prepare("SELECT id FROM channels WHERE server_id = ? AND type = 'text' ORDER BY position, id LIMIT 1").get(sid).id;
+  const row = db.prepare('SELECT * FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT 1').get(chan);
+  const cols = Object.keys(row);
+  const ins = db.prepare(`INSERT INTO messages (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`);
+  const t0 = row.created_at - 3e6 * 60;
+  const { randomBytes } = await import('node:crypto');
+  db.transaction(() => { for (let i = 0; i < 2000; i++) { const ts = t0 + i * 60000; ins.run(...cols.map((c) => (c === 'id' ? ts.toString(36).padStart(9, '0') + randomBytes(5).toString('hex') : c === 'created_at' ? ts : row[c]))); } })();
+  const me = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const ucols = Object.keys(me);
+  const uins = db.prepare(`INSERT INTO users (${ucols.join(',')}) VALUES (${ucols.map(() => '?').join(',')})`);
+  const mins = db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)');
+  const memberIds = [];
+  db.transaction(() => {
+    for (let i = 0; i < 300; i++) {
+      const id = (Date.now() + i).toString(36).padStart(9, '0') + randomBytes(5).toString('hex');
+      memberIds.push(id);
+      uins.run(...ucols.map((c) => (c === 'id' ? id : c === 'username' ? `crowd${i}` : c === 'email' ? null : c === 'profile' ? '{}' : c === 'public_key' ? randomBytes(65).toString('base64') : me[c])));
+      mins.run(sid, id, Date.now());
+    }
+  })();
+  db.close();
+  await H.srv.restart();
+  await lp.reload(); await lp.waitForSelector('#app:not([hidden]):not(.loading)');
+  await lp.click('#rail button[aria-label^="Quality checks"]');
+  await lp.waitForSelector('#messages .msg[data-mid]'); await settle(lp, 500);
+  const domIds = () => lp.evaluate(() => [...document.querySelectorAll('#messages > .msg[data-mid]')].map((m) => m.dataset.mid));
+  const ordered = (ids) => ids.every((id, i) => !i || ids[i - 1] < id);
+  for (let i = 0; i < 15; i++) {
+    const first = (await domIds())[0];
+    await lp.evaluate(() => { const sc = document.querySelector('#messages'); sc.scrollTop = 0; sc.dispatchEvent(new Event('scroll')); });
+    await lp.waitForFunction((f) => document.querySelector('#messages > .msg[data-mid]').dataset.mid !== f, first, { timeout: 15000 });
+  }
+  await settle(lp, 300);
+  const far = await domIds();
+  check(far.length <= 350, 'reading far back keeps at most about 300 messages on the page', far.length);
+  check(ordered(far) && new Set(far).size === far.length, 'what stays is in order, without repeats');
+  check(!(await lp.locator('#jump-latest[hidden]').count()), '"Jump to latest" shows once the newest messages were let go');
+  check(await lp.evaluate(() => document.querySelectorAll('#messages > .msg[tabindex="0"]').length) === 1, 'keyboard navigation still has exactly one current message');
+  // Scrolling back down brings the newer ones back, page by page, still bounded.
+  for (let i = 0; i < 40 && await lp.locator('#jump-latest:not([hidden])').count(); i++) {
+    const last = (await domIds()).at(-1);
+    await lp.evaluate(() => { const sc = document.querySelector('#messages'); sc.scrollTop = sc.scrollHeight; sc.dispatchEvent(new Event('scroll')); });
+    await lp.waitForFunction((l) => [...document.querySelectorAll('#messages > .msg[data-mid]')].at(-1).dataset.mid !== l || !!document.querySelector('#jump-latest[hidden]'), last, { timeout: 15000 }).catch(() => {});
+    await settle(lp, 150);
+  }
+  const down = await domIds();
+  check(down.length <= 350 && ordered(down), 'scrolling back down stays bounded and in order', down.length);
+  check(down.at(-1) === row.id, 'and ends at the newest message', [down.at(-1), row.id]);
+  // Members: every row is in the page (screen readers and Tab reach all of them), off-screen ones skip layout.
+  await lp.click('#main-head button[aria-label="Show members"]').catch(() => {});
+  await lp.waitForSelector('#members .member'); await settle(lp, 300);
+  const ml = await lp.evaluate(() => ({ rows: document.querySelectorAll('#members .member').length, cv: getComputedStyle(document.querySelector('#members .member')).contentVisibility }));
+  check(ml.rows === 301, 'all 301 members are in the list', ml);
+  check(ml.cv === 'auto', 'rows out of view skip layout (content-visibility)', ml);
+  // A member whose key changes after this device pinned it still gets the warning (the batch check).
+  const victim = memberIds[7];
+  const db3 = H.srv.db();
+  db3.prepare('UPDATE users SET public_key = ? WHERE id = ?').run(randomBytes(65).toString('base64'), victim);
+  db3.close();
+  await lp.reload(); await lp.waitForSelector('#app:not([hidden]):not(.loading)');
+  await lp.click('#rail button[aria-label^="Quality checks"]'); await settle(lp, 400);
+  if (!(await lp.locator('#members .member').count())) await lp.click('#main-head button[aria-label="Show members"]');
+  await lp.waitForSelector('#members .member'); await settle(lp, 300);
+  const warned = await lp.evaluate(() => [...document.querySelectorAll('#members .member')].filter((m) => m.querySelector('.key-warn')).map((m) => m.textContent.trim()));
+  check(warned.length === 1 && /crowd7\b/.test(warned[0]), 'denied: a changed key is still flagged in the member list', warned);
+  await lp.close();
 
   check(!H.errors.length, 'no script errors on any page', H.errors.slice(0, 5));
 } catch (e) {

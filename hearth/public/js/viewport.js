@@ -8,14 +8,20 @@ export function trackViewport(win = window) {
   const root = win.document.documentElement;
   if (!vv) return () => {};
   let frame = 0;
+  let last = '';
   const apply = () => {
     frame = 0;
     // Pinch-zoom shrinks the visual viewport too; scaling back up leaves only the keyboard's share.
     const visible = Math.round(vv.height * (vv.scale || 1));
     const full = win.innerHeight;
     const keyboard = full - visible > 120;
-    root.style.setProperty('--app-h', keyboard ? `${visible}px` : '100%');
-    root.classList.toggle('kb-open', keyboard);
+    const h = keyboard ? `${visible}px` : '100%';
+    // Only touch the page when something changed: every write restyles the whole app.
+    if (h !== last) {
+      last = h;
+      root.style.setProperty('--app-h', h);
+      root.classList.toggle('kb-open', keyboard);
+    }
     // iOS scrolls the whole page up to show the focused box; with the app already resized, undo that
     // so the header doesn't slide off the top.
     if (keyboard && (vv.offsetTop || win.scrollY)) win.scrollTo(0, 0);

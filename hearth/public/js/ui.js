@@ -10,7 +10,7 @@ export function focusables(root) {
   return [...root.querySelectorAll(FOCUSABLE)].filter((el) => !el.closest('[hidden], [inert]') && el.getClientRects().length);
 }
 // Keeps Tab and Shift+Tab inside `root` (open dialogs), wrapping at either end.
-function trapTab(e, root) {
+export function trapTab(e, root) {
   if (e.key !== 'Tab') return;
   const list = focusables(root);
   if (!list.length) { e.preventDefault(); root.focus({ preventScroll: true }); return; }

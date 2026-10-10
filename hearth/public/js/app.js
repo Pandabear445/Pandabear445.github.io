@@ -23,7 +23,7 @@ import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
-import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn, markInvalid, clearInvalid } from './ui.js';
+import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn, markInvalid, clearInvalid, trapTab } from './ui.js';
 import { openSettings, applyAppearance, confirmedCall, displayNameDialog } from './settings.js';
 import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
@@ -31,6 +31,7 @@ import { createRecall } from './recall-host.js';
 import { openMemberships, membershipsTab } from './memberships.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 import { trackViewport } from './viewport.js';
+import { createBlobCache, blobUrlsInPage } from './blobcache.js';
 
 // ======================================================================= state
 const S = {
@@ -1770,7 +1771,14 @@ function togglePanel(mode) {
 function renderHeader() {
   const head = $('#main-head');
   if (!head || !S.me) return;
+  // Redrawing replaces the buttons: keep keyboard focus on the same one ("Show members" becomes "Hide members").
+  const buttons = () => [...head.querySelectorAll('button')];
+  const at = buttons().indexOf(document.activeElement);
   clear(head);
+  drawHeader(head);
+  if (at >= 0 && buttons()[at]) buttons()[at].focus({ preventScroll: true });
+}
+function drawHeader(head) {
   head.append(navToggle());
   const v = S.view;
   const key = currentKey();
@@ -2131,10 +2139,11 @@ async function loadMessages(key, mode = 'latest') {
       const prevTop = sc.scrollTop;
       if (!prependOlder(sc, store, fresh)) renderMessages(false);
       sc.scrollTop = sc.scrollHeight - prevH + prevTop;
+      dropNewest(sc, store);
     } else if (mode === 'newer') {
-      const top = sc.scrollTop;
-      renderMessages(false);
-      sc.scrollTop = top;
+      // Coming back down: let go of the oldest ones instead, and keep what you're reading where it is.
+      if (store.list.length > HISTORY_WINDOW) { store.list.splice(0, store.list.length - HISTORY_WINDOW); store.hasMore = true; }
+      keepAnchor(sc, () => renderMessages(false));
     } else renderMessages(typeof mode !== 'object');
     if (!store.hasNewer) markRead(key);
   } catch (e) {
@@ -2148,6 +2157,38 @@ function trimStore(store, keep) {
   store.list.splice(0, store.list.length - keep);
   store.hasMore = true;
   return true;
+}
+// Reading far back: at most this many messages stay loaded and on screen. Scrolling up lets go of the newest
+// ones (they load again on the way down), so a long read back through history doesn't keep growing the page.
+const HISTORY_WINDOW = 300;
+function dropNewest(sc, store) {
+  if (store.list.length <= HISTORY_WINDOW) return false;
+  const gone = new Set(store.list.splice(HISTORY_WINDOW).map((m) => m.id));
+  store.hasNewer = true;
+  for (const el of sc.querySelectorAll(':scope > .msg[data-mid]')) if (gone.has(el.dataset.mid)) el.remove();
+  // Your own unsent messages and dividers left dangling at the bottom go too (they come back with the latest).
+  for (let el = sc.lastElementChild; el && !el.matches('.msg[data-mid]');) {
+    const prev = el.previousElementSibling;
+    if (el.matches('.day-div, .new-div, .msg.sending')) el.remove();
+    el = prev;
+  }
+  // The message keyboard focus was on may be gone: give the Tab order a current one again.
+  ensureCurrentMessage(sc);
+  const jl = $('#jump-latest');
+  if (jl) jl.hidden = false;
+  return true;
+}
+// Redraws with `fn` and keeps the first message in view at the same spot on screen.
+function keepAnchor(sc, fn) {
+  const top = sc.getBoundingClientRect().top;
+  const anchor = [...sc.querySelectorAll(':scope > .msg[data-mid]')].find((el) => el.getBoundingClientRect().bottom > top);
+  const id = anchor && anchor.dataset.mid;
+  const offset = anchor ? anchor.getBoundingClientRect().top - top : 0;
+  const before = sc.scrollTop;
+  fn();
+  const again = id && sc.querySelector(`.msg[data-mid="${id}"]`);
+  if (again) sc.scrollTop += again.getBoundingClientRect().top - top - offset;
+  else sc.scrollTop = before;
 }
 // Scrolling up: add just the older messages at the top instead of redrawing everything.
 function prependOlder(sc, store, fresh) {
@@ -2698,22 +2739,17 @@ function openForward(m) {
 }
 
 // ======================================================================= attachments + media viewer
-const blobCache = new Map();
+// Decrypted files, newest 150 kept (blobcache.js). A failed try isn't remembered: the next click fetches again.
+const blobCache = createBlobCache({ keep: 150, inUse: () => blobUrlsInPage() });
 function decryptedUrl(m, f) {
   if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn\u2019t on this server.'));
-  if (!blobCache.has(f.url)) {
-    const job = (async () => {
-      const res = await fetch(f.url).catch(() => { throw new Error('Couldn\u2019t reach the server. Check your connection and try again.'); });
-      if (res.status === 404) throw new Error('This file was deleted.');
-      if (!res.ok) throw new Error(`The server couldn\u2019t send this file (${res.status}). Try again in a moment.`);
-      const plain = await sec.decryptAttachment(m, f, await res.arrayBuffer());
-      return URL.createObjectURL(new Blob([plain], { type: f.type || 'application/octet-stream' }));
-    })();
-    blobCache.set(f.url, job);
-    // A failed try isn't remembered: the next click fetches again instead of failing straight away.
-    job.catch(() => { if (blobCache.get(f.url) === job) blobCache.delete(f.url); });
-  }
-  return blobCache.get(f.url);
+  return blobCache.get(f.url, async () => {
+    const res = await fetch(f.url).catch(() => { throw new Error('Couldn\u2019t reach the server. Check your connection and try again.'); });
+    if (res.status === 404) throw new Error('This file was deleted.');
+    if (!res.ok) throw new Error(`The server couldn\u2019t send this file (${res.status}). Try again in a moment.`);
+    const plain = await sec.decryptAttachment(m, f, await res.arrayBuffer());
+    return URL.createObjectURL(new Blob([plain], { type: f.type || 'application/octet-stream' }));
+  });
 }
 function fileIcon(type, name) {
   if (/^image\//.test(type)) return 'image';
@@ -2765,7 +2801,8 @@ function attachmentEl(f, m) {
     if (media === 'img') {
       el._full = full;
       el.addEventListener('click', () => openViewer(el, { name: f.name, download: () => downloadAttachment(m, f) }));
-      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.click(); });
+      // It's a button for screen readers and keyboards, so Enter and Space open it too.
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); } });
     }
     if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
     holder.append(mediaDownloadBtn(m, f));
@@ -2792,6 +2829,7 @@ function attachmentEl(f, m) {
 }
 
 function openViewer(fromImg, { name, download } = {}) {
+  const opener = document.activeElement;
   const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src);
   let idx = Math.max(0, imgs.indexOf(fromImg));
   let scale = 1; let tx = 0; let ty = 0;
@@ -2813,9 +2851,14 @@ function openViewer(fromImg, { name, download } = {}) {
     scale = 1; tx = 0; ty = 0; apply();
   };
   const zoom = (f) => { scale = Math.min(6, Math.max(1, scale * f)); if (scale === 1) { tx = 0; ty = 0; } apply(); };
-  const close = () => { overlay.classList.add('closing'); setTimeout(() => overlay.remove(), 140); document.removeEventListener('keydown', keys, true); };
+  const close = () => {
+    overlay.classList.add('closing'); setTimeout(() => overlay.remove(), 140); document.removeEventListener('keydown', keys, true);
+    // Back to whatever opened it (the picture in the chat), like other dialogs.
+    if (opener && opener.isConnected && opener !== document.body) opener.focus({ preventScroll: true });
+  };
   const keys = (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    if (e.key === 'Tab') trapTab(e, overlay);
     if (e.key === 'ArrowRight') show(idx + 1);
     if (e.key === 'ArrowLeft') show(idx - 1);
     if (e.key === '+' || e.key === '=') zoom(1.4);
@@ -3076,6 +3119,7 @@ function membersPanel(el) {
     clear(list);
     const q = search.value.trim().toLowerCase();
     const users = server.memberIds.map(getUser).filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q));
+    const changedKeys = sec.keysChanged(users);
     // Like Discord: online people grouped under their highest "show separately" role, then Online, then Offline.
     const hoisted = (server.roleDefs || []).filter((r) => r.hoist && !r.everyone).sort((a, b) => b.position - a.position);
     const sections = new Map(hoisted.map((r) => [r.id, []]));
@@ -3099,7 +3143,7 @@ function membersPanel(el) {
         h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color }),
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
-          sec.keyChanged(u) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
+          changedKeys.has(u.id) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
         activityLine(u) ? h('span', { class: 'member-status' }, activityLine(u)) : cs ? h('span', { class: 'member-status' }, cs) : null));
     };
     for (const r of hoisted) {
