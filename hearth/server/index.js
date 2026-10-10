@@ -112,6 +112,15 @@ let ACCT = null; // server/accounts.js: email, recovery key, two-factor
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+// Many accounts at once (a big server's member list): one query instead of one per person. id -> row.
+function userRows(ids) {
+  const out = new Map();
+  const list = [...ids];
+  for (let i = 0; i < list.length; i += 5000) {
+    for (const r of db.prepare('SELECT * FROM users WHERE id IN (SELECT value FROM json_each(?))').all(JSON.stringify(list.slice(i, i + 5000)))) out.set(r.id, r);
+  }
+  return out;
+}
 // Public keys people had before a reset without a recovery key (newest first, up to 10 each), added to a
 // { id: user } map. Apps may open old direct messages and old server keys with them, shown as not verified
 // (nothing vouches for them: see public/js/secure.js keysOf). Only GET /users/:id and the start-up users list
@@ -188,14 +197,15 @@ function serverKeyInfo(serverId) {
   const cur = s.key_epoch ? db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, s.key_epoch) : null;
   return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
 }
+// createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
+const keyOut = (k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at });
+const keyStateFrom = (serverId, info, keys) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt });
 function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
   if (!info) return null;
-  // createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
   const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
       JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
-      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId)
-    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at }));
-  return { serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt };
+      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId).map(keyOut);
+  return keyStateFrom(serverId, info, keys);
 }
 // Is this person connected right now? Updates for anyone who isn't would go nowhere (they get the current state
 // when their app starts), so a big server's fan-out only does work for the people actually online.
@@ -203,8 +213,14 @@ const connected = (userId) => io.sockets.adapter.rooms.has(`user:${userId}`);
 function emitKeyState(serverId) {
   const info = serverKeyInfo(serverId);
   if (!info) return;
-  db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
-    .forEach((m) => { if (connected(m.user_id)) io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id, info)); });
+  const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
+  if (!online.length) return;
+  // Everyone's own wrapped keys in one query (the same rows keyState reads one person at a time).
+  const keys = new Map(online.map((u) => [u, []]));
+  for (const k of db.prepare(`SELECT k.user_id, k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
+      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
+      WHERE k.server_id = ? AND k.user_id IN (SELECT value FROM json_each(?)) ORDER BY k.user_id, k.epoch`).iterate(serverId, JSON.stringify(online))) keys.get(k.user_id).push(keyOut(k));
+  for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list));
 }
 
 const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined });
@@ -1621,7 +1637,8 @@ api.get('/bootstrap', auth, (req, res) => {
   dms.forEach((d) => ids.add(d.userId));
   relationships.forEach((r) => ids.add(r.userId));
   const users = {};
-  for (const id of ids) { const u = publicUser(getUserRow(id)); if (u) users[id] = u; }
+  const rows = userRows(ids);
+  for (const id of ids) { const u = publicUser(rows.get(id)); if (u) users[id] = u; }
   withPastKeys(users);
   users[uid] = selfUser(me);
   const voice = {};
@@ -2100,7 +2117,8 @@ api.post('/invites/:code/join', auth, (req, res) => {
   }
   const server = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(sid), req.userId);
   const users = {};
-  server.memberIds.forEach((id) => { users[id] = publicUser(getUserRow(id)); });
+  const rows = userRows(server.memberIds);
+  server.memberIds.forEach((id) => { users[id] = publicUser(rows.get(id)); });
   const voice = {};
   server.channels.filter((c) => c.type === 'voice').forEach((c) => { voice[c.id] = voiceStateList(c.id); });
   io.to(`user:${req.userId}`).emit('server:add', { server, users, voice, keyState: keyState(sid, req.userId) });
