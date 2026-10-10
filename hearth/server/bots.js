@@ -140,7 +140,7 @@ module.exports = function setupBots(ctx) {
     const e = envelope(type, bot, inst, data);
     db.prepare('INSERT INTO bot_deliveries (id, bot_id, installation_id, server_id, type, body, status, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?)')
       .run(e.id, bot.id, inst ? inst.id : null, inst ? inst.server_id : null, type, e.body, now(), now());
-    setImmediate(pump);
+    setImmediate(pumpSafely);
     return e.id;
   }
   // Something happened in a server: tell every installation allowed to know. `channel` is the channel it
@@ -190,6 +190,9 @@ module.exports = function setupBots(ctx) {
   const inflight = new Map(); // bot id -> deliveries being sent right now
   const sending = new Set(); // delivery ids being sent
   let pumping = false; let again = false; let wake = null;
+  // The wake-ups (after a send, at the next retry) run it as a safe job too: a database error is logged and shown
+  // in Admin → Health instead of stopping the server.
+  const pumpSafely = jobs.job('bots.deliveries', pump);
   function pump() {
     if (pumping) { again = true; return; }
     pumping = true;
@@ -208,7 +211,7 @@ module.exports = function setupBots(ctx) {
     if (wake) clearTimeout(wake);
     // (Deliveries already due but waiting for a busy bot start when one of its sends finishes, so there's no
     // need to spin for them: look again in a quarter of a second at the soonest.)
-    wake = next ? setTimeout(pump, next <= now() ? 250 : Math.max(20, next - now() + 5)) : null;
+    wake = next ? setTimeout(pumpSafely, next <= now() ? 250 : Math.max(20, next - now() + 5)) : null;
     if (wake) wake.unref();
   }
   async function attempt(d) {
@@ -233,7 +236,7 @@ module.exports = function setupBots(ctx) {
     } finally {
       sending.delete(d.id);
       inflight.set(d.bot_id, inflight.get(d.bot_id) - 1);
-      setImmediate(pump);
+      setImmediate(pumpSafely);
     }
   }
   // Also on a timer (a safe job: errors are logged and counted in Admin → Health), in case a wake-up was missed.
@@ -261,7 +264,7 @@ module.exports = function setupBots(ctx) {
     let n = 0;
     const list = Array.isArray(ids) ? ids.slice(0, 100).map(String) : db.prepare("SELECT id FROM bot_deliveries WHERE installation_id = ? AND status = 'dead'").all(inst.id).map((r) => r.id);
     db.transaction(() => list.forEach((id) => { n += st.run(now(), id, inst.id).changes; }))();
-    setImmediate(pump);
+    setImmediate(pumpSafely);
     return n;
   }
   const clearDead = (inst) => db.prepare("DELETE FROM bot_deliveries WHERE installation_id = ? AND status = 'dead'").run(inst.id).changes;

@@ -374,7 +374,7 @@ module.exports = function setupUsability(ctx) {
     clearTimeout(expiry.get(k));
     const wait = until - now();
     if (wait > 2 ** 31 - 1) return; // the minute sweep catches long ones
-    expiry.set(k, setTimeout(() => { expiry.delete(k); endExpired(); }, Math.max(0, wait) + 50).unref());
+    expiry.set(k, setTimeout(jobs.job('usability.end_timeouts', () => { expiry.delete(k); endExpired(); }), Math.max(0, wait) + 50).unref());
   }
   function endExpired() {
     const gone = db.prepare('SELECT server_id, user_id FROM member_timeouts WHERE until <= ?').all(now());

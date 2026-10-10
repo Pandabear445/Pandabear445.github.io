@@ -5609,7 +5609,8 @@ function setupSockets(server) {
       if (s && s.socketId === socket.id) {
         s.reconnecting = true;
         clearTimeout(s.grace);
-        s.grace = setTimeout(() => { if (voiceChannels.get(ch)?.get(uid) === s && s.reconnecting) leaveVoice(uid); }, VOICE_GRACE_MS);
+        // A safe job: an error ending the kept place is logged, never fatal.
+        s.grace = setTimeout(jobs.job('voice.grace_end', () => { if (voiceChannels.get(ch)?.get(uid) === s && s.reconnecting) leaveVoice(uid); }), VOICE_GRACE_MS);
         s.grace.unref?.();
         emitVoiceState(ch);
       }

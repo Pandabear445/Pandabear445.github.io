@@ -106,8 +106,11 @@ broadcasts (presence, profile updates, watch-together).
 - Records are saved to the `job_health` table at most once a minute per job, and right away when a job starts or
   stops failing, so Admin → Health shows them after a restart and `doctor` can read them from outside.
 
-The one timer not converted is each socket's 1-second flood-allowance refill: it's per connection and only does
-arithmetic. Fetch timeouts and the shutdown timers aren't jobs either.
+Wake-up timers that touch the database run through the same wrapper (`jobs.job`): the bot delivery pump's
+wake-ups (`bots.deliveries`), the end of a call's reconnect grace window (`voice.grace_end`) and each timeout's
+expiry (`usability.end_timeouts`). Timers that only do arithmetic or clean memory aren't jobs: each socket's
+1-second flood-allowance refill, the export-token sweep, slash-command answer timeouts, fetch timeouts and the
+shutdown timers.
 
 ### Crashes
 
@@ -172,7 +175,8 @@ The overall status is the worst of the parts.
 
 ### Reverse proxy and Docker health checks
 
-Docker (in `docker-compose.yml`, or a `HEALTHCHECK` in the Dockerfile). The image has no curl, so use Node:
+Docker: the image's own `HEALTHCHECK` (Dockerfile) already probes `/api/health/live`. To use readiness instead, or
+for another orchestrator, add one in `docker-compose.yml`. The image has no curl, so use Node:
 
 ```yaml
 services:
