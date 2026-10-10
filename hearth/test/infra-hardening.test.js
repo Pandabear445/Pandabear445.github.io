@@ -228,7 +228,7 @@ test('nothing run as root writes to a fixed name in /tmp', async () => {
   // The region installer (run as root on a fresh VPS) writes its helper into a mktemp folder.
   const srv = await startServer();
   try {
-    const add = await srv.api('POST', '/admin/regions', { token: srv.owner.token, ip: srv.owner.ip, body: { name: 'Test', origin: 'https://chat.example.test' } });
+    const add = await srv.api('POST', '/admin/regions', { token: srv.owner.token, ip: srv.owner.ip, body: { name: 'Test', origin: 'https://chat.example.test', authKey: srv.owner.authKey } });
     assert.equal(add.status, 200, add.text);
     const token = add.json.command.match(/k=([0-9a-f]+)/)[1];
     const script = await (await fetch(`${srv.base}/regions/install/${add.json.region.id}?k=${token}`)).text();

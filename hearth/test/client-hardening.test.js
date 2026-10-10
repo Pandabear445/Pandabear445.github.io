@@ -445,7 +445,7 @@ test('infra-1: build/sign-update.js signs every latest*.yml and bakes the public
   assert.ok(wf.indexOf('node build/sign-update.js sign dist') > wf.indexOf('node build/after-signing.js dist'), 'signs after SignPath rewrites latest.yml');
   assert.ok(wf.indexOf('node build/sign-update.js bake') < wf.indexOf('npx electron-builder --publish never'), 'bakes the key before building');
   assert.match(wf, /hearth\/desktop\/dist\/latest\*\.yml\.sig/, 'uploads the signatures');
-  assert.match(wf, /dist\/latest\*\.yml\.sig'/, 'copies them to the server');
+  assert.match(wf, /files=\([^)]*dist\/latest\*\.yml\.sig\)/, 'copies them to the server (the pinned-host scp step)');
 });
 
 // ------------------------------------------------------------------ xss-6: shared looks

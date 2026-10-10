@@ -828,7 +828,11 @@ test('files-5/xss-3 + files-6 in Chromium: attacker attachment URLs are never lo
     const mallory = await srv.register('browsermallory');
     const myPriv = await crypto.webcrypto.subtle.importKey('pkcs8', mallory.privateKey.export({ type: 'pkcs8', format: 'der' }), { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
     const sk = await E.createSigningKey(myPriv, mallory.publicKey);
-    assert.equal((await as(srv, mallory, 'POST', '/me/sign-key', { signPublicKey: sk.signPublicKey, encSignPrivateKey: sk.encSignPrivateKey })).status, 200);
+    // Uploaded the way the app does it: with proof of the identity key and of the new signing key (crypto-11).
+    const ch = (await as(srv, mallory, 'POST', '/me/sign-key/challenge')).json;
+    const keyProof = await E.signKeyProof(myPriv, ch.serverPublicKey, ch.nonce, mallory.id, sk.signPublicKey);
+    const signature = await E.sign(sk.signKey, `hearth-sign-key|${mallory.id}|${mallory.publicKey}|${ch.nonce}`);
+    assert.equal((await as(srv, mallory, 'POST', '/me/sign-key', { signPublicKey: sk.signPublicKey, encSignPrivateKey: sk.encSignPrivateKey, nonce: ch.nonce, keyProof, signature })).status, 200);
     const { code } = (await as(srv, alice, 'POST', `/servers/${server.id}/invites`, {})).json;
     assert.equal((await as(srv, mallory, 'POST', `/invites/${code}/join`)).status, 200);
     let st;

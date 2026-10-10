@@ -293,7 +293,9 @@ test('start-up data for someone in quiet groups doesn’t depend on how many mes
   const d = srv.db();
   const ins = d.prepare("INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, created_at) VALUES (?, ?, ?, '', 'v2:x', 1, ?)");
   const t0 = Date.now() - 2e6;
-  d.transaction(() => { for (let i = 0; i < 300000; i++) ins.run(idAt(t0 + i), busy.id, alice.id, t0 + i); })();
+  // In chunks, so this outside writer never holds the database lock long enough (5 s) for the running server's
+  // own writes to give up while the machine is busy.
+  for (let c = 0; c < 300000; c += 20000) d.transaction(() => { for (let i = c; i < c + 20000; i++) ins.run(idAt(t0 + i), busy.id, alice.id, t0 + i); })();
   d.close();
   const loud = await time();
   // Before: each quiet group walked every message on the instance (about 0.7 s more for 300k messages here).
