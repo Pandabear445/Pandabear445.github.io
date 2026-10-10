@@ -72,6 +72,10 @@ db.pragma('foreign_keys = ON');
 // next start, instead of leaving it half-changed with the old version number (which could stop it ever starting).
 // So nothing below may use VACUUM or change journal_mode/foreign_keys: SQLite doesn't allow those in a transaction.
 db.exec('BEGIN IMMEDIATE');
+// While this transaction is open, files outside the database that describe it (the audit log's anchor) wait for
+// the commit: written now, a crash before COMMIT would leave them pointing at rows that were rolled back.
+let MIGRATING = true;
+let anchorAfterCommit = null;
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -828,6 +832,7 @@ function readAnchor() {
   return ok ? { keyedFrom: a.keyedFrom, id: a.id, hash: a.hash, valid: true } : { valid: false };
 }
 function writeAnchor(keyedFrom, id, hash) {
+  if (MIGRATING) { anchorAfterCommit = [keyedFrom, id, hash]; return; } // written once the upgrade is committed
   const a = { keyedFrom, id, hash };
   const tmp = `${AUDIT_ANCHOR}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ ...a, mac: anchorMac(a) }), { mode: 0o600 });
@@ -992,6 +997,8 @@ CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id,
 if (fromVersion < SCHEMA_VERSION && process.env.NODE_ENV === 'test' && process.env.HEARTH_TEST_KILL_IN_MIGRATION === '1') process.kill(process.pid, 'SIGKILL');
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
+MIGRATING = false;
+if (anchorAfterCommit) writeAnchor(...anchorAfterCommit);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
 // hundreds of them, many run per message). Statements are only used with get/all/run (or an iterate() loop that
