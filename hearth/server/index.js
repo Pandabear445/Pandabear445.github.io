@@ -483,7 +483,9 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
 // Strict browser security policy for the app's own pages:
 //   scripts       only files from this server (+ WebAssembly for password hashing) — no inline or injected code
-//   connections   only back to this server (its API and live connection), so a bug can't send data elsewhere
+//   connections   fetch/XHR/WebSocket only back to this server (its API and live connection). This isn't a complete
+//                 barrier: injected markup could still leak data through https: image/media URLs, the allowed video
+//                 frames or navigation, so it limits what an XSS bug can do rather than making leaks impossible.
 //   framing       nobody can put Hearth inside their page (clickjacking); no plugins; forms only post here
 //   styles        inline style attributes are allowed (the UI sets colours and sizes that way); CSS can't run code
 //   images/media  any https: source, for link previews and profile songs people choose (and blob: for decrypted files)

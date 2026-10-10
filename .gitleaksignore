@@ -1,0 +1,4 @@
+# Known false positives for the gitleaks scan in .github/workflows/hearth-security.yml (it scans the whole
+# history, so a finding in an old commit is listed by its fingerprint). Only made-up test values belong here.
+# Fake GIF provider key in the "API keys are sealed at rest" test.
+dde6609d2d22e5495b1c6b40b477b0d71bcaccb1:hearth/test/admin-hardening.test.js:generic-api-key:266
