@@ -16,7 +16,8 @@ Prices and rules below were checked in October 2026. They change, so check the l
 
 | Warning | What fixes it | Cost | Effort |
 |---|---|---|---|
-| Windows: "Windows protected your PC", "Unknown publisher" | Sign the installer: **Azure Artifact Signing** (recommended) | about **$9.99 / month** | an evening, plus a few days for the ID check |
+| Windows: "Windows protected your PC", "Unknown publisher" | Sign the installer for free through the **SignPath Foundation** (Hearth is open source) | **free** | an application, then an evening; approval can take days to weeks |
+| Windows, same | or: **Azure Artifact Signing** (your own name as publisher) | about **$9.99 / month** | an evening, plus a few days for the ID check |
 | Windows: SmartScreen still warns about a *signed* installer for a while | Nothing to buy; it fades as people download it (reputation) | free | wait |
 | Android: "Install unknown apps", Play Protect "unrecognised app" | Install from **Google Play** (internal testing for friends) | **$25 once** | an evening, plus Google's ID check |
 | Browser padlock / "Not secure" on your website | Already done: Caddy gets a real TLS certificate | free | none |
@@ -55,7 +56,73 @@ Good to know:
 - **Auto-updates are fine either way.** The app updates itself from your server. Once you sign, the installed
   app only accepts updates signed with the **same publisher name** (see "Keep signing once you start").
 
-### Option A (recommended): Azure Artifact Signing, about $9.99/month
+### Option S (free, recommended for Hearth): SignPath Foundation
+
+The [SignPath Foundation](https://signpath.org/) signs open-source apps for free. Hearth qualifies: it's MIT
+licensed (every part of it, no closed-source pieces), its code is public, and the installers are built by GitHub
+Actions straight from that code. Windows then shows **SignPath Foundation** as the publisher (their certificate,
+not your name), and the build's signing requests come from GitHub, so SignPath can check each file really was
+built from your repository.
+
+What to know first:
+- **You apply, they decide.** They want an actively maintained project that's already released (the `/download`
+  page and arc32.me count), with no malware or adware, and a **code signing policy** page. That page is ready:
+  [arc32.me/code-signing.html](https://arc32.me/code-signing.html) (the file `code-signing.html` in this repo).
+  Keep it accurate if more people join the project.
+- **You approve every release.** Each signing request waits until you (the approver) click *Approve* on
+  signpath.io. Each Windows release makes two requests: the app, then the installer. The build waits up to an
+  hour for each.
+- **Only release builds are signed:** `app-v*` tags, pushes to the default branch, and *Run workflow*. Builds of
+  other branches stay unsigned (they're for testing) and are no longer copied to your server, so they can never
+  reach people's apps.
+- SmartScreen: signed files start building reputation right away. A brand-new release may still show the
+  warning for a short while; with your name gone from "Unknown publisher" it's far less scary either way.
+
+**Step by step:**
+
+1. **Apply** at [signpath.org](https://signpath.org/) (the *Apply* link). Give the GitHub repository, the
+   website (`https://arc32.me`) and the code signing policy page above. Use a GitHub account with two-factor
+   authentication on: SignPath requires it for everyone with commit rights.
+2. **When you're accepted**, sign in at [app.signpath.io](https://app.signpath.io). The Foundation sets up your
+   project there. Check (or create) these, and note their *slugs* (short ids):
+   - **Project:** e.g. `hearth`. Its repository must be this GitHub repository, with the trusted build system
+     **GitHub.com** linked (SignPath only accepts files built by GitHub Actions for it).
+   - **Signing policy:** `release-signing` (the Foundation's certificate; you're its approver).
+   - **Artifact configuration:** paste this one (it signs the `.exe` inside each file the build sends) and note
+     its slug, or make it the project's default:
+
+     ```xml
+     <?xml version="1.0" encoding="utf-8"?>
+     <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+       <zip-file>
+         <pe-file path="*.exe">
+           <authenticode-sign />
+         </pe-file>
+       </zip-file>
+     </artifact-configuration>
+     ```
+3. **Make a login for GitHub:** *Users → Add CI user* (e.g. `github-actions`), give it the **Submitter** role on
+   the `release-signing` policy, and create an **API token** for it. Copy the token straight into GitHub (step 4).
+   Your **organization ID** is in *Settings* (a GUID).
+4. **Fill in GitHub:** your repository → *Settings → Secrets and variables → Actions*.
+
+   | Kind | Name | Value |
+   |---|---|---|
+   | Secret | `SIGNPATH_API_TOKEN` | the CI user's API token |
+   | Variable | `SIGNPATH_ORGANIZATION_ID` | your organization ID |
+   | Variable | `SIGNPATH_PROJECT_SLUG` | e.g. `hearth` |
+   | Variable (optional) | `SIGNPATH_POLICY_SLUG` | only if it isn't `release-signing` |
+   | Variable (optional) | `SIGNPATH_ARTIFACT_CONFIG_SLUG` | the artifact configuration's slug (default `initial`) |
+   | Variable (optional) | `SIGNPATH_PUBLISHER` | only if the certificate's name isn't exactly `SignPath Foundation` |
+
+5. **Build a release:** *Actions → Hearth apps → Run workflow* (or push an `app-v1.26.0` tag). The Windows job
+   says **"Signing with SignPath"**, then waits: open [app.signpath.io](https://app.signpath.io) → *Signing
+   requests*, and approve the app, then (a minute later) the installer. The **Check the signature** step prints
+   `Valid` and `SignPath Foundation`. Right-click the downloaded installer → *Properties → Digital Signatures* to
+   see it yourself.
+6. Once a signed version is out, set **`WINDOWS_REQUIRE_SIGNING`** to `true` (see "Keep signing once you start").
+
+### Option A: Azure Artifact Signing, about $9.99/month
 
 Microsoft's own signing service (it used to be called *Trusted Signing*). Microsoft checks your identity once,
 keeps the signing key in their vault, and the GitHub build asks it to sign each release. Nothing to plug in,
@@ -140,7 +207,8 @@ that lets you export it), the build can use it:
 | Secret | `WIN_CSC_KEY_PASSWORD` | the `.pfx` password |
 | Variable (optional) | `WIN_PUBLISHER_NAME` | only if the name to check differs from the certificate's own name |
 
-The publisher name is read from the certificate automatically. Azure (option A) wins if both are set up.
+The publisher name is read from the certificate automatically. Azure (option A) wins if both are set up, then
+the .pfx, then SignPath.
 
 **Buying one new mostly doesn't fit this route:** since June 2023 every new code-signing certificate's key
 must live on a hardware token (a USB stick) or the seller's cloud vault, so it can't be exported as a `.pfx`
@@ -150,8 +218,7 @@ an "OV" certificate in 2026: about $200–$450 per year (Sectigo through reselle
 $440/year, Certum's cloud certificate less), and since March 2026 a certificate is valid for at most about 15
 months, so you renew yearly. For one person, option A is cheaper and simpler.
 
-If Hearth stays open source, the [SignPath Foundation](https://signpath.org/) signs qualifying open-source
-projects for free (strict rules, and it needs their own GitHub integration).
+If Hearth stays open source, the free SignPath route (option S above) is the better deal.
 
 ### Option C: stay unsigned
 
@@ -267,6 +334,8 @@ All in GitHub: your repository → *Settings → Secrets and variables → Actio
 | `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`, `AZURE_SIGNING_PUBLISHER` | Variable | Windows, option A |
 | `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` | Secret | Windows, option B |
 | `WIN_PUBLISHER_NAME`, `WIN_TIMESTAMP_SERVER` | Variable (optional) | Windows, option B |
+| `SIGNPATH_API_TOKEN` | Secret | Windows, option S |
+| `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` (+ optional `SIGNPATH_POLICY_SLUG`, `SIGNPATH_ARTIFACT_CONFIG_SLUG`, `SIGNPATH_PUBLISHER`) | Variable | Windows, option S |
 | `WINDOWS_REQUIRE_SIGNING` | Variable | `true` = fail instead of building unsigned |
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | Secret | Android signing key, Play bundle |
 | `PLAY_SERVICE_ACCOUNT_JSON` | Secret | upload to Play internal testing |

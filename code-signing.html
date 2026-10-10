@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hearth code signing policy</title>
+<meta name="description" content="How the Hearth Windows app is signed, who can release it, and what it sends over the network.">
+<meta name="theme-color" content="#100e16">
+<link rel="icon" href="site/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="site/icon-192.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,800&family=Figtree:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { color-scheme: dark; --bg: #100e16; --s1: #18151f; --line: #2e2939; --text: #f3eff8; --text-2: #b9b1c7; --muted: #8a8299; --accent: #f2a541; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.65 'Figtree', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  main { width: min(760px, 100% - 32px); margin: 0 auto; padding: 40px 0 72px; }
+  a { color: var(--accent); }
+  .back { display: inline-flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; font-weight: 700; margin-bottom: 36px; }
+  .back img { width: 28px; height: 28px; border-radius: 8px; }
+  h1 { font: 800 clamp(32px, 5vw, 44px)/1.1 'Bricolage Grotesque', 'Figtree', sans-serif; letter-spacing: -.02em; margin: 0 0 12px; }
+  h2 { font-size: 20px; margin: 36px 0 8px; }
+  p, li { color: var(--text-2); }
+  .card { background: var(--s1); border: 1px solid var(--line); border-radius: 16px; padding: 18px 20px; margin-top: 20px; }
+  .card p { margin: 0; color: var(--text); }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-size: 14px; font-weight: 600; }
+  td { color: var(--text-2); }
+  footer { margin-top: 48px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="./"><img src="site/icon-192.png" alt="" width="28" height="28">Hearth</a>
+  <h1>Code signing policy</h1>
+  <p>How the Hearth apps are signed, who can release them, and what they send over the network.</p>
+
+  <div class="card"><p>Free code signing provided by <a href="https://signpath.io">SignPath.io</a>, certificate by <a href="https://signpath.org">SignPath Foundation</a>.</p></div>
+
+  <h2>What gets signed</h2>
+  <p>The Windows desktop app (<code>Hearth.exe</code>) and its installer (<code>Hearth-Setup-&lt;version&gt;.exe</code>). They are built by GitHub Actions straight from the public source code in <a href="https://github.com/Pandabear445/Pandabear445.github.io/tree/main/hearth">the Hearth repository</a> (the workflow is <code>.github/workflows/hearth-apps.yml</code>). Only release builds are signed: version tags, the main branch and builds started by hand. Every signing request is approved by a person before it's signed.</p>
+  <p>Hearth is open source under the MIT license. Every component it ships is open source too.</p>
+
+  <h2>Team roles</h2>
+  <table>
+    <tr><th>Role</th><th>Who</th></tr>
+    <tr><td>Committers and reviewers</td><td><a href="https://github.com/Pandabear445">Pandabear445</a></td></tr>
+    <tr><td>Approvers (approve each signing request)</td><td><a href="https://github.com/Pandabear445">Pandabear445</a></td></tr>
+  </table>
+  <p>Everyone with these roles uses two-factor authentication on GitHub and SignPath. Changes from other people come in as pull requests, which a committer reviews before they're merged.</p>
+
+  <h2>Privacy</h2>
+  <p>This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.</p>
+  <p>In practice, the desktop app only connects to the Hearth server you choose when you first open it (or the one your community set up for you). It downloads its updates from that same server. If you turn on game or music detection (Settings → Profile → Games &amp; music), it sends the name of the game or song to that server so your friends can see it. Links you click open in your normal web browser.</p>
+
+  <h2>Reporting a problem</h2>
+  <p>If you think a signed Hearth file was tampered with, or you found a security problem, please open an issue on the <a href="https://github.com/Pandabear445/Pandabear445.github.io/issues">GitHub repository</a> (for security problems, see <code>hearth/SECURITY.md</code> first).</p>
+
+  <footer>Hearth · MIT licensed · <a href="./">arc32.me</a></footer>
+</main>
+</body>
+</html>

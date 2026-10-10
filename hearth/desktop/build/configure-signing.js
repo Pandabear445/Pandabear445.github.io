@@ -6,10 +6,15 @@
 //      AZURE_CLIENT_SECRET, AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, AZURE_SIGNING_PROFILE and
 //      AZURE_SIGNING_PUBLISHER are set.
 //   2. A code-signing certificate file (.pfx), when WIN_CSC_LINK (+ WIN_CSC_KEY_PASSWORD) is set.
-//   3. Otherwise unsigned, with a warning in the build log. WINDOWS_REQUIRE_SIGNING=true turns that warning
+//   3. SignPath (free for open-source projects, through the SignPath Foundation), when SIGNPATH_API_TOKEN,
+//      SIGNPATH_ORGANIZATION_ID and SIGNPATH_PROJECT_SLUG are set. Only release builds are signed this way
+//      (tags, the default branch and manual runs: SIGN_THIS_BUILD=true), because each signing request waits
+//      for your approval on signpath.io. The workflow does the signing after electron-builder; here we only
+//      record the publisher name the installed app will expect on updates.
+//   4. Otherwise unsigned, with a warning in the build log. WINDOWS_REQUIRE_SIGNING=true turns that warning
 //      into a failed build (use it once you sign: installed signed apps refuse unsigned updates).
 //
-// Writes "method=azure|pfx|none" to $GITHUB_OUTPUT when it exists.
+// Writes "method=azure|pfx|signpath|none" to $GITHUB_OUTPUT when it exists.
 const fs = require('fs');
 const path = require('path');
 
@@ -46,6 +51,14 @@ if (has(...azureSome)) {
   if (env('WIN_PUBLISHER_NAME')) win.signtoolOptions.publisherName = env('WIN_PUBLISHER_NAME');
   method = 'pfx';
   notice('Signing with the certificate in WIN_CSC_LINK.');
+} else if (has('SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG') && /^true$/i.test(env('SIGN_THIS_BUILD'))) {
+  // The certificate belongs to the SignPath Foundation, so that's the publisher Windows shows and the name the
+  // installed app checks on every update.
+  win.signtoolOptions = { publisherName: [env('SIGNPATH_PUBLISHER') || 'SignPath Foundation'] };
+  method = 'signpath';
+  notice(`Signing with SignPath (project ${env('SIGNPATH_PROJECT_SLUG')}). Approve the signing requests on signpath.io when they appear.`);
+} else if (has('SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG')) {
+  notice('SignPath signs release builds only (app-v* tags, the default branch and manual runs). This build is NOT signed: don\'t hand it out.');
 } else {
   const partial = azureSome.filter((k) => env(k) !== '');
   if (partial.length) warn(`Some Azure signing settings are set (${partial.join(', ')}) but not all of them, so the build is NOT signed. See hearth/docs/SIGNING.md.`);

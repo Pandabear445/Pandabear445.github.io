@@ -559,7 +559,7 @@ Decks made with the earlier Hearth study tools are moved into Recall the first t
 
 See [docs/SIGNING.md](docs/SIGNING.md):
 
-- **Windows:** sign the installer with Azure Artifact Signing (about $10 a month) or a code-signing certificate.
+- **Windows:** sign the app and installer for free through the SignPath Foundation (Hearth is open source; you approve each release on signpath.io), or with Azure Artifact Signing (about $10 a month, your own name as publisher) or a code-signing certificate.
 - **Android:** publish through Google Play's internal testing track ($25 once), so friends install from Play without warnings.
 
 The GitHub workflow signs automatically once the secrets are added.

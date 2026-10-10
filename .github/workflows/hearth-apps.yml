@@ -14,6 +14,10 @@
 #     Windows, Azure Artifact Signing: secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET and
 #       variables AZURE_SIGNING_ENDPOINT / AZURE_SIGNING_ACCOUNT / AZURE_SIGNING_PROFILE / AZURE_SIGNING_PUBLISHER.
 #     Windows, a .pfx certificate: secrets WIN_CSC_LINK (the .pfx, base64) / WIN_CSC_KEY_PASSWORD.
+#     Windows, SignPath (free for open-source projects): secret SIGNPATH_API_TOKEN and variables
+#       SIGNPATH_ORGANIZATION_ID / SIGNPATH_PROJECT_SLUG (optional: SIGNPATH_POLICY_SLUG, default release-signing;
+#       SIGNPATH_ARTIFACT_CONFIG_SLUG, default initial). Release builds only: app-v* tags, the default branch and
+#       manual runs; approve each request on signpath.io.
 #     Windows: variable WINDOWS_REQUIRE_SIGNING=true fails the build instead of making an unsigned installer.
 #     Google Play: secret PLAY_SERVICE_ACCOUNT_JSON uploads the bundle to the internal testing track
 #       (needs the ANDROID_KEYSTORE_* secrets; variable PLAY_RELEASE_STATUS=draft while the app is still a draft).
@@ -86,6 +90,11 @@ jobs:
           WIN_PUBLISHER_NAME: ${{ vars.WIN_PUBLISHER_NAME }}
           WIN_TIMESTAMP_SERVER: ${{ vars.WIN_TIMESTAMP_SERVER }}
           WINDOWS_REQUIRE_SIGNING: ${{ vars.WINDOWS_REQUIRE_SIGNING }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_PUBLISHER: ${{ vars.SIGNPATH_PUBLISHER }}
+          SIGN_THIS_BUILD: ${{ startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch' }}
       - name: Build installers
         run: npx electron-builder --publish never
         env:
@@ -96,6 +105,66 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ steps.signing.outputs.method == 'azure' && secrets.AZURE_CLIENT_SECRET || '' }}
           WIN_CSC_LINK: ${{ steps.signing.outputs.method == 'pfx' && secrets.WIN_CSC_LINK || '' }}
           WIN_CSC_KEY_PASSWORD: ${{ steps.signing.outputs.method == 'pfx' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
+      # SignPath: sign Hearth.exe, wrap the installer around the signed app, then sign the installer too.
+      # Each request waits (up to an hour) for you to approve it on signpath.io.
+      - name: Hand the app to SignPath
+        id: unsigned-app
+        if: steps.signing.outputs.method == 'signpath'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hearth-windows-unsigned-app
+          path: hearth/desktop/dist/win-unpacked/Hearth.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: Sign the app (SignPath)
+        if: steps.signing.outputs.method == 'signpath'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG || 'initial' }}
+          github-artifact-id: ${{ steps.unsigned-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: hearth/desktop/signed/app
+      - name: Build the installer around the signed app
+        if: steps.signing.outputs.method == 'signpath'
+        run: |
+          cp signed/app/Hearth.exe dist/win-unpacked/Hearth.exe
+          rm -f dist/*.exe dist/*.blockmap dist/latest.yml
+          npx electron-builder --win nsis --prepackaged dist/win-unpacked --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Hand the installer to SignPath
+        id: unsigned-setup
+        if: steps.signing.outputs.method == 'signpath'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hearth-windows-unsigned-setup
+          path: hearth/desktop/dist/Hearth-Setup-*.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: Sign the installer (SignPath)
+        if: steps.signing.outputs.method == 'signpath'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG || 'initial' }}
+          github-artifact-id: ${{ steps.unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: hearth/desktop/signed/setup
+      # Signing changed the installer's bytes: update latest.yml and the .blockmap so auto-updates accept it.
+      - name: Put the signed installer in place
+        if: steps.signing.outputs.method == 'signpath'
+        run: |
+          cp signed/setup/Hearth-Setup-*.exe dist/
+          node build/after-signing.js dist
       - name: Check the signature
         if: runner.os == 'Windows' && steps.signing.outputs.method != 'none'
         shell: pwsh
@@ -267,9 +336,13 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
+  # Only release builds reach everyone's apps: tags, the default branch and manual runs (never feature branches,
+  # whose Windows builds aren't signed when signing goes through SignPath).
   publish-to-vps:
     needs: [desktop, android]
-    if: always() && (needs.desktop.result == 'success' || needs.android.result == 'success')
+    if: >-
+      always() && (needs.desktop.result == 'success' || needs.android.result == 'success') &&
+      (startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     env:
       HAS_VPS: ${{ secrets.VPS_HOST != '' }}
