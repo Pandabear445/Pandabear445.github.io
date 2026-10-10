@@ -29,3 +29,7 @@ data-backup*/
 /dist/
 hearth-update-*.zip
 hearth-update-*.zip.sha256
+
+# Visual regression screenshots: made on the machine that checks them (see docs/ACCESSIBILITY.md).
+/test/visual/baseline/
+/test/visual/output/

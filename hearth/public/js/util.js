@@ -19,6 +19,12 @@ export function h(tag, props, ...kids) {
       else if (k === 'checked') el.checked = !!v;
       else el.setAttribute(k, v === true ? '' : v);
     }
+    // Buttons that open a popup (data-pop-anchor, see ui.js) tell screen readers so; popover() keeps
+    // aria-expanded up to date.
+    if (props['data-pop-anchor'] != null && props['data-pop-anchor'] !== false && tag === 'button') {
+      if (!el.hasAttribute('aria-haspopup')) el.setAttribute('aria-haspopup', 'true');
+      if (!el.hasAttribute('aria-expanded')) el.setAttribute('aria-expanded', 'false');
+    }
   }
   for (const c of kids.flat(Infinity)) {
     if (c == null || c === false) continue;
@@ -76,12 +82,18 @@ export function fmtSize(n) {
 }
 
 // ------------------------------------------------------------ toasts
+// #toasts is a polite live region, so screen readers read each toast once; errors use role=alert so
+// they're read straight away. Pointing at or focusing a toast keeps it up until you move away.
 export function toast(message, kind = 'info') {
   const host = document.getElementById('toasts');
-  const el = h('div', { class: `toast toast-${kind}`, role: 'status' }, message);
+  const el = h('div', { class: `toast toast-${kind}`, role: kind === 'error' ? 'alert' : null }, message);
   host.append(el);
-  setTimeout(() => el.classList.add('out'), 3800);
-  setTimeout(() => el.remove(), 4300);
+  let timers = [];
+  const schedule = (ms) => { timers = [setTimeout(() => el.classList.add('out'), ms), setTimeout(() => el.remove(), ms + 500)]; };
+  const hold = () => { timers.forEach(clearTimeout); el.classList.remove('out'); };
+  el.addEventListener('mouseenter', hold);
+  el.addEventListener('mouseleave', () => schedule(1500));
+  schedule(kind === 'error' ? 6000 : 3800);
 }
 
 // Sounds live in sounds.js (distinct, meaningful sounds with per-sound settings).

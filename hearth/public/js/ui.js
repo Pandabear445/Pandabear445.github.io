@@ -4,8 +4,37 @@ import { h, icon } from './util.js';
 const layer = () => document.getElementById('layer');
 let openPop = null;
 
+// Everything a keyboard user can reach inside `root`, in tab order.
+const FOCUSABLE = 'a[href], button:not(:disabled), input:not(:disabled):not([type=hidden]), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
+export function focusables(root) {
+  return [...root.querySelectorAll(FOCUSABLE)].filter((el) => !el.closest('[hidden], [inert]') && el.getClientRects().length);
+}
+// Keeps Tab and Shift+Tab inside `root` (open dialogs), wrapping at either end.
+function trapTab(e, root) {
+  if (e.key !== 'Tab') return;
+  const list = focusables(root);
+  if (!list.length) { e.preventDefault(); root.focus({ preventScroll: true }); return; }
+  const first = list[0];
+  const last = list[list.length - 1];
+  const at = document.activeElement;
+  if (e.shiftKey && (at === first || !root.contains(at))) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && (at === last || !root.contains(at))) { e.preventDefault(); first.focus(); }
+}
+// Puts focus back where it was before a dialog or popup opened, if that place still exists.
+function restoreFocus(...targets) {
+  const t = targets.find((el) => el && el.isConnected && el.getClientRects().length);
+  if (t) t.focus({ preventScroll: true });
+}
+
 export function closePopover() {
-  if (openPop) { openPop.remove(); openPop = null; }
+  if (!openPop) return;
+  const pop = openPop;
+  openPop = null;
+  const hadFocus = pop.contains(document.activeElement);
+  pop.remove();
+  if (pop._anchor && pop._anchor.hasAttribute('aria-expanded')) pop._anchor.setAttribute('aria-expanded', 'false');
+  // Focus was inside the popup: send it back to the button that opened it, so it isn't lost on the page.
+  if (hadFocus) restoreFocus(pop._anchor, pop._returnTo);
 }
 
 document.addEventListener('mousedown', (e) => {
@@ -13,16 +42,29 @@ document.addEventListener('mousedown', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (openPop) { closePopover(); e.stopPropagation(); return; }
-  const modals = document.querySelectorAll('.modal-backdrop');
+  if (openPop) { const pop = openPop; const inside = pop.contains(document.activeElement); closePopover(); if (!inside) restoreFocus(pop._anchor, pop._returnTo); e.stopPropagation(); return; }
+  const modals = document.querySelectorAll('.modal-backdrop:not(.closing)');
   const top = modals[modals.length - 1];
   if (top && top._close) top._close();
 });
 
 // Position `content` next to `anchor`. side: 'right' | 'left' | 'top' | 'bottom'
-export function popover(anchor, content, { side = 'right', align = 'start', className = '' } = {}) {
+export function popover(anchor, content, { side = 'right', align = 'start', className = '', label = '', focus = true } = {}) {
+  const returnTo = document.activeElement;
   closePopover();
-  const pop = h('div', { class: `popover ${className}`, role: 'dialog' }, content);
+  const isMenu = content.classList && content.classList.contains('menu');
+  if (isMenu) menuSemantics(content);
+  // A menu is its own widget; anything else (pickers, profile cards) is a small non-modal dialog.
+  const name = label || (anchor && anchor.getAttribute && (anchor.getAttribute('aria-label') || anchor.getAttribute('data-tip'))) || '';
+  const pop = h('div', { class: `popover ${className}`, role: isMenu ? null : 'dialog', 'aria-label': isMenu ? null : name || 'Popup', tabindex: '-1' }, content);
+  pop._anchor = anchor && anchor.isConnected && anchor.matches('button, [role=button], a') ? anchor : null;
+  pop._returnTo = returnTo;
+  if (pop._anchor) pop._anchor.setAttribute('aria-expanded', 'true');
+  pop.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    // Tab leaves a menu (like a native one); other popups keep focus inside until Esc.
+    if (isMenu) { e.preventDefault(); closePopover(); restoreFocus(pop._anchor, pop._returnTo); } else trapTab(e, pop);
+  });
   layer().append(pop);
   openPop = pop;
   const r = anchor.getBoundingClientRect();
@@ -40,14 +82,47 @@ export function popover(anchor, content, { side = 'right', align = 'start', clas
   y = Math.max(8, Math.min(y, window.innerHeight - pr.height - 8));
   pop.style.left = x + 'px';
   pop.style.top = y + 'px';
+  // Menus focus their first item; other popups take focus themselves unless something inside asks for it
+  // (a search box), so keyboard users land inside instead of behind them.
+  requestAnimationFrame(() => {
+    if (!focus || openPop !== pop || pop.contains(document.activeElement)) return;
+    const first = isMenu ? pop.querySelector('.menu-item') : null;
+    (first || pop).focus({ preventScroll: true });
+  });
   return pop;
+}
+
+// Roles and arrow keys for a .menu built by hand (the status menu) or by menuEl.
+function menuSemantics(el) {
+  if (el._menu) return;
+  el._menu = true;
+  if (!el.getAttribute('role')) el.setAttribute('role', 'menu');
+  for (const it of el.querySelectorAll('.menu-item')) if (!it.getAttribute('role')) it.setAttribute('role', 'menuitem');
+  for (const it of el.querySelectorAll('.menu-sep')) if (!it.getAttribute('role')) it.setAttribute('role', 'separator');
+  el.addEventListener('keydown', (e) => {
+    const btns = [...el.querySelectorAll('.menu-item:not(:disabled)')];
+    if (!btns.length) return;
+    const i = btns.indexOf(document.activeElement);
+    let next = null;
+    if (e.key === 'ArrowDown') next = btns[(i + 1) % btns.length];
+    else if (e.key === 'ArrowUp') next = btns[(i - 1 + btns.length) % btns.length];
+    else if (e.key === 'Home') next = btns[0];
+    else if (e.key === 'End') next = btns[btns.length - 1];
+    else if (e.key.length === 1 && /\S/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Typing a letter jumps to the next item that starts with it.
+      const k = e.key.toLowerCase();
+      const order = [...btns.slice(i + 1), ...btns.slice(0, i + 1)];
+      next = order.find((b) => b.textContent.trim().toLowerCase().startsWith(k)) || null;
+    }
+    if (next) { e.preventDefault(); next.focus(); }
+  });
 }
 
 // Menu items: { label, icon, hint, danger, action } | '-' (separator) | { header: 'Text' }
 function menuEl(items) {
   const el = h('div', { class: 'menu', role: 'menu' }, items.filter(Boolean).map((it) => {
     if (it === '-') return h('div', { class: 'menu-sep', role: 'separator' });
-    if (it.header) return h('div', { class: 'menu-header' }, it.header);
+    if (it.header) return h('div', { class: 'menu-header', role: 'presentation' }, it.header);
     return h('button', {
       class: `menu-item${it.danger ? ' danger' : ''}${it.checked ? ' checked' : ''}`,
       role: it.checked !== undefined ? 'menuitemradio' : 'menuitem',
@@ -56,21 +131,12 @@ function menuEl(items) {
     }, it.icon ? icon(it.icon, 'ic menu-ic') : null, h('span', { class: 'menu-label' }, it.label),
     it.checked ? icon('check', 'ic menu-check') : it.hint ? h('span', { class: 'menu-hint' }, it.hint) : null);
   }));
-  // Arrow-key navigation inside menus.
-  el.addEventListener('keydown', (e) => {
-    const btns = [...el.querySelectorAll('.menu-item')];
-    const i = btns.indexOf(document.activeElement);
-    if (e.key === 'ArrowDown') { e.preventDefault(); btns[(i + 1) % btns.length].focus(); }
-    if (e.key === 'ArrowUp') { e.preventDefault(); btns[(i - 1 + btns.length) % btns.length].focus(); }
-  });
+  menuSemantics(el);
   return el;
 }
 
 export function menu(anchor, items, opts = {}) {
-  const pop = popover(anchor, menuEl(items), { side: 'bottom', ...opts });
-  const first = pop.querySelector('.menu-item');
-  if (first && opts.focus !== false) requestAnimationFrame(() => first.focus({ preventScroll: true }));
-  return pop;
+  return popover(anchor, menuEl(items), { side: 'bottom', ...opts });
 }
 
 // Right-click menu at the pointer.
@@ -128,40 +194,65 @@ export function ibtn(name, label, onclick, { cls = '', side, active = false, att
   }, icon(name));
 }
 
-export function modal({ title, body, actions = [], size = 'md', onClose, className = '', dismissable = true }) {
+let dialogSeq = 0;
+export function modal({ title, label, body, actions = [], size = 'md', onClose, className = '', dismissable = true }) {
   closePopover();
+  // Where focus goes back to on close. If this dialog was opened from inside another one that is closing
+  // (Back / Next between dialogs), fall back to whatever opened that one.
+  const opener = document.activeElement;
+  const parent = opener && opener.closest && opener.closest('.modal-backdrop');
+  const fallback = parent ? parent._opener : null;
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
+    const hadFocus = backdrop.contains(document.activeElement) || document.activeElement === document.body;
     backdrop.classList.add('closing');
     setTimeout(() => backdrop.remove(), 140);
     if (onClose) onClose();
+    // Only take focus back if no newer dialog opened on top in the meantime (it has focus now).
+    const newer = [...document.querySelectorAll('.modal-backdrop:not(.closing)')].some((b) => backdrop.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (hadFocus && !newer) restoreFocus(opener, fallback);
   };
-  const box = h('div', { class: `modal modal-${size} ${className}`, role: 'dialog', 'aria-modal': 'true', 'aria-label': title || 'Dialog' },
-    title ? h('div', { class: 'modal-head' }, h('h2', null, title),
-      dismissable ? h('button', { class: 'icon-btn modal-x', 'aria-label': 'Close', onclick: close }, icon('close')) : null) : null,
-    h('div', { class: 'modal-body' }, body),
-    actions.length ? h('div', { class: 'modal-foot' }, actions.map((a) => h('button', {
-      class: `btn ${a.kind || 'ghost'}`,
-      type: a.submit ? 'submit' : 'button',
-      onclick: async (e) => {
-        if (!a.action) return close();
-        const btn = e.currentTarget;
-        btn.disabled = true;
-        try {
-          const keep = await a.action();
-          if (keep !== false) close();
-        } catch (err) {
-          showError(box, err.message);
-        } finally { btn.disabled = false; }
-      },
-    }, a.label))) : null);
+  const titleId = `dlg-${++dialogSeq}`;
+  const box = h('div', {
+    class: `modal modal-${size} ${className}`, role: 'dialog', 'aria-modal': 'true', tabindex: '-1',
+    'aria-labelledby': title ? titleId : null, 'aria-label': title ? null : label || 'Dialog',
+  },
+  title ? h('div', { class: 'modal-head' }, h('h2', { id: titleId }, title),
+    dismissable ? h('button', { class: 'icon-btn modal-x', 'aria-label': 'Close', onclick: close }, icon('close')) : null) : null,
+  h('div', { class: 'modal-body' }, body),
+  actions.length ? h('div', { class: 'modal-foot' }, actions.map((a) => h('button', {
+    class: `btn ${a.kind || 'ghost'}`,
+    type: a.submit ? 'submit' : 'button',
+    onclick: async (e) => {
+      if (!a.action) return close();
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const keep = await a.action();
+        if (keep !== false) close();
+      } catch (err) {
+        showError(box, err.message);
+      } finally { btn.disabled = false; }
+    },
+  }, a.label))) : null);
   const backdrop = h('div', { class: 'modal-backdrop', onmousedown: (e) => { if (dismissable && e.target === backdrop) close(); } }, box);
   backdrop._close = dismissable ? close : () => {};
+  backdrop._opener = opener && opener.isConnected && !(parent && parent.classList.contains('closing')) ? opener : fallback || opener;
   backdrop.dataset.locked = dismissable ? '' : '1';
   layer().append(backdrop);
+  // Focus the first field; dialogs without one focus themselves so screen readers start at the title.
   const first = box.querySelector('input:not([type=file]), textarea, select');
-  if (first && !className.includes('mys-modal')) setTimeout(() => first.focus({ preventScroll: true }), 30);
-  // enter submits primary
+  setTimeout(() => {
+    if (closed || box.contains(document.activeElement)) return;
+    if (first && !className.includes('mys-modal')) first.focus({ preventScroll: true });
+    else box.focus({ preventScroll: true });
+  }, 30);
   box.addEventListener('keydown', (e) => {
+    // Tab stays inside the dialog that's on top.
+    if (e.key === 'Tab' && !openPop) trapTab(e, box);
+    // enter submits primary
     if (e.key === 'Enter' && !e.shiftKey && e.target.tagName === 'INPUT') {
       const primary = box.querySelector('.modal-foot .btn.primary, .modal-foot .btn.danger');
       if (primary) { e.preventDefault(); primary.click(); }
@@ -170,13 +261,36 @@ export function modal({ title, body, actions = [], size = 'md', onClose, classNa
   return { close, box };
 }
 
-export function showError(box, message) {
+// Shows an error in a dialog and ties it to the field it's about (`input`, or the field that has focus,
+// or the dialog's only field), so screen readers read it with that field.
+export function showError(box, message, input) {
   let err = box.querySelector('.form-error');
   if (!err) {
     err = h('div', { class: 'form-error', role: 'alert' });
     (box.querySelector('.modal-body') || box).append(err);
   }
+  if (!err.id) err.id = `err-${++dialogSeq}`;
   err.textContent = message;
+  const fields = [...box.querySelectorAll('input:not([type=hidden]):not([type=file]):not([type=checkbox]):not([type=radio]), textarea, select')];
+  const target = input || (fields.includes(document.activeElement) ? document.activeElement : fields.length === 1 ? fields[0] : null);
+  if (target) markInvalid(target, err);
+}
+
+// aria-invalid + aria-describedby on `input` pointing at `err`, cleared again as soon as the person edits it.
+export function markInvalid(input, err) {
+  if (!err.id) err.id = `err-${++dialogSeq}`;
+  input.setAttribute('aria-invalid', 'true');
+  const ids = (input.getAttribute('aria-describedby') || '').split(/\s+/).filter((x) => x && x !== err.id);
+  input.setAttribute('aria-describedby', [...ids, err.id].join(' '));
+  if (!input._clearsError) {
+    input._clearsError = true;
+    input.addEventListener('input', () => clearInvalid(input));
+  }
+}
+export function clearInvalid(input) {
+  input.removeAttribute('aria-invalid');
+  const ids = (input.getAttribute('aria-describedby') || '').split(/\s+/).filter((x) => x && !x.startsWith('err-'));
+  if (ids.length) input.setAttribute('aria-describedby', ids.join(' ')); else input.removeAttribute('aria-describedby');
 }
 
 export function confirmDialog({ title, text, confirm = 'Confirm', danger = false }) {

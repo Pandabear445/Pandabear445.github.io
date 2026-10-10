@@ -7,7 +7,10 @@
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
-    "test:security": "node --test --test-concurrency=1 test/*.test.js"
+    "test:security": "node --test --test-concurrency=1 test/*.test.js",
+    "test:a11y": "node test/a11y/run.mjs",
+    "test:visual": "node test/visual/run.mjs",
+    "bench:client": "node scripts/bench-client.mjs"
   },
   "license": "MIT",
   "dependencies": {
