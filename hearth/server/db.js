@@ -932,6 +932,7 @@ CREATE INDEX IF NOT EXISTS idx_dm_channels_b ON dm_channels(user_b);
 CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_id);
 CREATE INDEX IF NOT EXISTS idx_server_keys_user ON server_keys(server_id, user_id, epoch);
 CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_id);
+`);
 
 // v17 (crypto): the public keys a person had before a password reset without a recovery key. Key handoffs
 // and messages they signed back then still check out against the key that was valid when they were made,
