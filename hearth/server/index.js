@@ -1921,15 +1921,17 @@ api.post('/servers/:id/leave', auth, (req, res) => {
     const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(s.id, req.userId);
     if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, s.id);
   } else if (s.owner_id === req.userId) fail(400, 'Owners cannot leave their own server. Delete it or hand it off first.');
-  removeMember(s.id, req.userId);
+  const held = removeMember(s.id, req.userId);
   const left = db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n;
   if (s.kind === 'group' && !left) {
     purgeServerContent(s);
     db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
   }
   // A server's members already got member:remove (their apps drop the person from the list). A group may also
-  // have a new owner, so its members get the whole group again.
-  else if (s.kind === 'group') emitServer(s.id);
+  // have a new owner, so its members get the whole group again. So does a server where the person had roles or
+  // their own channel permissions: apps that stay open would otherwise keep those and send them back when the
+  // person rejoins (ticking another role sends the roles they had; saving a channel sends its permissions).
+  else if (s.kind === 'group' || held) emitServer(s.id);
   res.json({ ok: true });
 });
 
@@ -1938,11 +1940,13 @@ function removeMember(serverId, userId) {
   kickFromVoiceInServer(serverId, userId);
   // Everything that was theirs as a member goes too: roles and per-channel overrides (or rejoining with any
   // invite, even after an unban, would hand back Administrator and private channels) and event RSVPs (or
-  // they'd keep getting reminders about events they can no longer see).
+  // they'd keep getting reminders about events they can no longer see). Returns how many roles and channel
+  // overrides went, so callers know whether the other members' copies of the server are out of date.
+  let held = 0;
   db.transaction(() => {
     db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
-    db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ?').run(serverId, userId);
-    db.prepare("DELETE FROM channel_overrides WHERE target_type = 'member' AND target_id = ? AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)").run(userId, serverId);
+    held = db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ?').run(serverId, userId).changes
+      + db.prepare("DELETE FROM channel_overrides WHERE target_type = 'member' AND target_id = ? AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)").run(userId, serverId).changes;
     db.prepare('DELETE FROM event_rsvps WHERE user_id = ? AND event_id IN (SELECT id FROM server_events WHERE server_id = ?)').run(userId, serverId);
     // Remembered on its own (not just through their key rows, which a password reset deletes), so coming back
     // switches keys again.
@@ -1954,6 +1958,7 @@ function removeMember(serverId, userId) {
   io.to(`user:${userId}`).emit('server:remove', { serverId });
   io.to(`server:${serverId}`).emit('member:remove', { serverId, userId });
   emitKeyState(serverId);
+  return held;
 }
 
 api.delete('/servers/:id/members/:uid', auth, (req, res) => {

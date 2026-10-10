@@ -732,21 +732,52 @@ async function twoFactor(t) {
   await f.locator('button[type=submit]').click();
   await alice.waitApp();
 
-  // Turning it off takes the password and a code.
+  // Turning it off takes the password and one code, in one dialog, also when the last code was a while ago (this
+  // sign-in's is made 11 minutes old here). Asking for the password used to fetch the locked key first, which then
+  // wanted a code of its own: that used up the one on the phone, and the code asked for next was refused.
+  t.server.sql("UPDATE sessions SET mfa_at = ? WHERE revoked_at IS NULL AND user_id = (SELECT id FROM users WHERE username = 'alice_w')", Date.now() - 11 * 60000);
+  const asked = [];
+  const onRequest = (r) => { const p = new URL(r.url()).pathname; if (p.startsWith('/api/me/')) asked.push(p); };
+  alice.page.on('request', onRequest);
   await alice.openSettings('Security');
   await alice.$('.set-content .set-section', { hasText: 'Two-factor sign-in' }).locator('button', { hasText: exact('Turn off') }).click();
-  await alice.confirmPassword('Turn off two-factor sign-in', t.pw.alice);
-  const off = await alice.dialog('Enter a code to turn it off');
-  await off.locator('input').fill(backup[1]);
+  const off = await alice.dialog('Turn off two-factor sign-in');
+  await off.locator('input[type=password]').fill(t.pw.alice);
+  // The code the app shows next: the current one may have turned two-factor on, less than 30 seconds ago.
+  await off.locator('input[autocomplete="one-time-code"]').fill(totp(secret, Date.now() + 30000));
   await off.locator('.modal-foot .btn.danger').click();
   await alice.toast('Two-factor sign-in is off.');
+  alice.page.off('request', onRequest);
+  check(!asked.includes('/api/me/keys/wrapped'), `Turning two-factor off shouldn't need the locked key (asked for: ${asked.join(', ')}).`);
+  check(asked.filter((p) => p === '/api/me/2fa/disable').length === 1, `One request should turn it off (asked for: ${asked.join(', ')}).`);
+  await alice.$('.set-content button', { hasText: 'Set up two-factor sign-in' }).waitFor();
   await alice.closeSettings();
 }
 
 // ------------------------------------------------------------------ 15. leaving and coming back (key rotation)
 async function rejoin(t) {
   const { alice, bob } = t.people;
+  // Bob (the owner now) gives alice a role and lets her into the private #staff-room by name. Leaving takes both away,
+  // and bob's open app has to forget them too: it sends what it has back when he next changes her roles (the ones
+  // she has plus the new one) or saves the channel's permissions.
   await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.showMembers();
+  await bob.member('Alice Wonder').click({ button: 'right' });
+  await bob.menuItem('Keepers').click();
+  await alice.page.locator('#sidebar-body button[aria-label^="Create channel in"]').first().waitFor();
+  await bob.channelRow('staff-room').locator('.ch-main').click({ button: 'right' });
+  await bob.menuItem('Permissions').click();
+  const perms = await bob.dialog('staff-room');
+  const add = perms.locator('select[aria-label="Add a role or member"]');
+  await add.selectOption(await add.locator('option', { hasText: 'Alice Wonder' }).getAttribute('value'));
+  await perms.locator('.ov-perms .ov-row', { hasText: 'View channels' }).locator('.tri-btn.allow').click();
+  await perms.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await bob.toast('Channel saved.');
+  await bob.noModals();
+  await alice.channelRow('staff-room').waitFor();
+
   await alice.serverMenu('Leave server');
   await alice.modal(`Leave ${SERVER}?`).locator('.modal-foot .btn.danger').click();
   await alice.$(`#rail button[aria-label="${SERVER}"]`).waitFor({ state: 'detached' });
@@ -761,8 +792,24 @@ async function rejoin(t) {
   await alice.message('the mango is ripe').waitFor();
   await alice.send('Back after rejoining: lime');
   await bob.message('Back after rejoining: lime').waitFor();
+  // Bob's app knows she came back with nothing: the role isn't ticked, and saving #staff-room's permissions as they
+  // are doesn't let her back in.
+  await bob.showMembers();
+  await bob.member('Alice Wonder').click({ button: 'right' });
+  const keepers = await bob.menuItem('Keepers').getAttribute('aria-checked');
+  await bob.page.keyboard.press('Escape');
+  check(keepers === 'false', 'Bob\u2019s app should know alice lost the Keepers role when she left.');
+  await bob.channelRow('staff-room').locator('.ch-main').click({ button: 'right' });
+  await bob.menuItem('Permissions').click();
+  const again = await bob.dialog('staff-room');
+  check(!(await again.locator('.ov-list .role-name', { hasText: 'Alice Wonder' }).count()), 'Bob\u2019s app should know alice\u2019s #staff-room permission went when she left.');
+  await again.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await bob.toast('Channel saved.');
+  await bob.noModals();
   await bob.send('Welcome back: grape');
   await alice.message('Welcome back: grape').waitFor();
+  // (Bob's save reached alice before this message did.)
+  check(!(await alice.channelRow('staff-room').count()), 'Alice should not see #staff-room again after rejoining.');
   check(!(await bob.$('#messages .msg-text.undecryptable').count()), 'Bob should read everything in #general.');
   // What was said while she was away shows up (without a reload) as written before she joined: its key is
   // never handed to her, so "waiting for the key" would wait forever.
@@ -915,8 +962,8 @@ export const FLOWS = [
   ['step-up: delete and hand over a server, staff, relay, region, backups, owner', stepUp],
   ['account deletion: a throwaway account deletes itself', deleteAccount],
   ['recovery: recovery key, email, password change, reset by email keeps messages', recovery],
-  ['two-factor: turn on, sign in with a backup code, turn off', twoFactor],
-  ['rejoin: leave and come back, messages still flow both ways', rejoin],
+  ['two-factor: turn on, sign in with a backup code, turn off with one code', twoFactor],
+  ['rejoin: leave and come back without the old role or channel access, messages still flow both ways', rejoin],
   ['instance: new owner removes staff, announces, maintenance on and off', broadcastAndMaintenance],
   ['moderation: staff sign-out and suspension say why; unsuspend', moderation],
   ['smoke: every settings, admin and server settings page loads', smoke],

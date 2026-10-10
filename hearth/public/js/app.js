@@ -614,11 +614,20 @@ function startApp() {
     sec.trust(user);
     const s = S.servers.find((x) => x.id === serverId);
     if (s && !s.memberIds.includes(user.id)) s.memberIds.push(user.id);
+    // Someone joining (or coming back) has no roles yet: any the server hands out follow in a server update.
+    if (s && s.memberRoles) s.memberRoles[user.id] = [];
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
   socket.on('member:remove', ({ serverId, userId }) => {
     const s = S.servers.find((x) => x.id === serverId);
-    if (s) s.memberIds = s.memberIds.filter((i) => i !== userId);
+    if (s) {
+      s.memberIds = s.memberIds.filter((i) => i !== userId);
+      // The server deleted their roles and their own channel permissions. Copies kept here would be sent back if
+      // they rejoin: the role menu sends the roles someone has plus the new one, and saving a channel's
+      // permissions sends all of its overrides.
+      if (s.memberRoles) delete s.memberRoles[userId];
+      s.channels.forEach((c) => { if (c.overrides) c.overrides = c.overrides.filter((o) => !(o.type === 'member' && o.id === userId)); });
+    }
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
   socket.on('channel:create', (ch) => {

@@ -8,6 +8,7 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -74,6 +75,13 @@ export async function startServer() {
     mails() {
       if (!fs.existsSync(outbox)) return [];
       return fs.readdirSync(outbox).sort().map((f) => JSON.parse(fs.readFileSync(path.join(outbox, f), 'utf8')));
+    },
+    // Changes the database directly, as the server's operator could: for states a browser can't reach quickly (a
+    // two-factor check from more than 10 minutes ago, say). The server reads them on its next request.
+    sql(q, ...args) {
+      const Database = createRequire(path.join(ROOT, 'package.json'))('better-sqlite3');
+      const d = new Database(path.join(dir, 'hearth.db'));
+      try { d.pragma('busy_timeout = 5000'); return d.prepare(q).run(...args); } finally { d.close(); }
     },
     // The newest email to this address that matches, once it arrives.
     async mail(to, match, timeout = 15000) {
