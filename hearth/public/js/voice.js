@@ -86,6 +86,8 @@ export class Voice {
     this.listed = new Set(); // who the server says is in the call (app.js passes it in)
     this.relayFallback = false; // the call's region relay didn't answer: this call uses automatic relays
     this.lastSwitchMs = null;
+    this.switchPending = new Set(); // during a region switch: people whose connection hasn't been rebuilt yet
+    this.lastGapMs = null; // the last time a connection was rebuilt: how long media stopped
     this.listeners = [];
 
     // Signals from one person are handled one at a time, in the order they were sent: a network candidate that
@@ -136,7 +138,8 @@ export class Voice {
     const peers = [...this.peers.values()];
     const up = (p) => p.pc.connectionState === 'connected';
     if (this.state === 'switching') {
-      if (peers.every(up)) {
+      // Done once every connection has been replaced (whoever started it rebuilds it) and is up again.
+      if (!this.switchPending.size && peers.every(up)) {
         this.lastSwitchMs = Date.now() - this.switchStarted;
         this.log(`Region switch finished in ${this.lastSwitchMs} ms`);
       } else if (Date.now() < this.switchUntil) return;
@@ -248,8 +251,9 @@ export class Voice {
   }
   silentStream() {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      return ctx.createMediaStreamDestination().stream;
+      // One context for every silent stand-in: browsers only allow a few at a time.
+      this.silentCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+      return this.silentCtx.createMediaStreamDestination().stream;
     } catch { return new MediaStream([]); }
   }
   useMic({ raw, noMic }) {
@@ -404,7 +408,7 @@ export class Voice {
     }
   }
   // Connections to people the server doesn't list. Someone never listed at all is the one to worry about: an
-  // extra listener the server added without telling anyone (see docs/VOICE.md, "Hidden listeners").
+  // extra listener the server added without telling anyone (docs/VOICE.md, section 6).
   unlistedPeers(minAgeMs = 3000) {
     const t = Date.now();
     return [...this.peers.values()].filter((p) => !p.closed && !this.listed.has(p.userId) && t - (p.unlistedSince || p.createdAt) >= minAgeMs)
@@ -577,6 +581,7 @@ export class Voice {
     if (!this.channelId) return;
     if (LIVE.has(this.state) && this.peers.size) {
       this.setState('switching');
+      this.switchPending = new Set([...this.peers.values()].map((p) => p.userId));
       this.switchStarted = Date.now();
       this.switchUntil = this.switchStarted + 20000;
       clearTimeout(this.switchTimer);
@@ -597,11 +602,12 @@ export class Voice {
     // empty call would briefly count as "connected".)
     this.swapping = (this.swapping || 0) + 1;
     let peer;
+    const gapFrom = Date.now(); // media to and from them stops here, until the new connection is up
     try {
       this.closePeer(socketId, null);
       peer = await this.createPeer(socketId, old.userId, true);
     } finally { this.swapping--; }
-    if (peer) { peer.events = (old.events || []).slice(-20); this.log('Started a fresh connection', peer); }
+    if (peer) { peer.events = (old.events || []).slice(-20); peer.gapFrom = gapFrom; this.log('Started a fresh connection', peer); }
     this.recompute();
     return peer;
   }
@@ -634,6 +640,7 @@ export class Voice {
     peer.candidates = 0;
     if (peer.relayOnly) peer.relayTimer = setTimeout(() => { if (!peer.closed && !peer.candidates) this.relayDown(); }, 6000);
     this.peers.set(socketId, peer);
+    this.switchPending.delete(userId);
     this.log(initiator ? 'Calling' : 'Answering', peer);
     if (initiator) {
       // The caller creates the four lanes; the other side gets them from the offer (see setupLanes).
@@ -700,6 +707,7 @@ export class Voice {
         if (peer.failed || peer.restarts) this.log(`Recovered after ${peer.restarts} restart${peer.restarts === 1 ? '' : 's'}`, peer);
         peer.failed = false; peer.restarts = 0; clearTimeout(peer.watchdog);
         peer.lastSetupMs = Date.now() - peer.createdAt;
+        if (peer.gapFrom) { this.lastGapMs = Date.now() - peer.gapFrom; peer.gapFrom = null; this.log(`Media back after a ${this.lastGapMs} ms gap`, peer); }
       }
       if (st === 'failed' || st === 'disconnected') {
         clearTimeout(peer.watchdog);
@@ -1047,7 +1055,7 @@ export class Voice {
         metrics: summary.metrics, events: (p.events || []).slice(-20),
       });
     }
-    return { state: this.state, since: this.stateSince, relayFallback: this.relayFallback, lastSwitchMs: this.lastSwitchMs, events: this.history.slice(-30), peers };
+    return { state: this.state, since: this.stateSince, relayFallback: this.relayFallback, lastSwitchMs: this.lastSwitchMs, lastGapMs: this.lastGapMs ?? null, events: this.history.slice(-30), peers };
   }
   // For tests and the debug hook: how many connections this call has open.
   debugInfo() {

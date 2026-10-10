@@ -36,7 +36,8 @@ export function openCallDiagnostics({ voice, name, relays, region }) {
     const head = h('div', null,
       h('p', null, h('strong', null, st.label || d.state), st.detail ? ` — ${st.detail}` : ''),
       h('p', { class: 'field-hint' }, `Call region: ${region() || 'Automatic'}${d.relayFallback ? ' (its relay didn’t answer, so automatic relays are in use)' : ''}.`
-        + (d.lastSwitchMs !== null ? ` Last region switch took ${d.lastSwitchMs} ms.` : '')));
+        + (d.lastSwitchMs !== null ? ` Last region switch took ${d.lastSwitchMs} ms.` : '')
+        + (d.lastGapMs !== null ? ` The last rebuilt connection was silent for ${d.lastGapMs} ms.` : '')));
     const peers = d.peers.length ? d.peers.map((p) => h('div', { class: 'diag-peer' },
       h('h3', null, name(p.userId), h('span', { class: 'field-hint' }, STATE[p.state] || p.state)),
       p.listed ? null : h('p', { class: 'diag-warn' }, 'The server doesn’t list this person in the call. If you didn’t expect them, leave the call.'),

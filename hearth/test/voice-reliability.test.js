@@ -552,7 +552,25 @@ test('engine: region switch shows "switching" until every connection is back, an
   peersOf(v)[0].pc.set('connected');
   assert.equal(v.state, 'connected');
   assert.equal(typeof v.lastSwitchMs, 'number');
+  assert.equal(typeof v.lastGapMs, 'number', 'the media gap is measured too');
   v.cleanup();
+  // The other side (it answered, so it doesn't rebuild): still "switching" while its old connection is up, until
+  // the fresh connection from the other side has replaced it.
+  const s2 = fakeSocket();
+  const w = make(Voice, s2);
+  w.channelId = 'room'; w.state = 'connected';
+  await w.queueSignal({ from: 'A', userId: 'ua', data: { sdp: { type: 'offer', sdp: 'o1' }, sig: 's', pc: 'a1' } });
+  w.peers.get('A').pc.set('connected');
+  w.switchNetwork();
+  assert.equal(w.state, 'switching');
+  w.recompute();
+  assert.equal(w.state, 'switching', 'not done just because the old connection is still up');
+  await w.queueSignal({ from: 'A', userId: 'ua', data: { reset: true, pc: 'a1' } });
+  await w.queueSignal({ from: 'A', userId: 'ua', data: { sdp: { type: 'offer', sdp: 'o2' }, sig: 's', pc: 'a2' } });
+  assert.equal(w.state, 'switching');
+  w.peers.get('A').pc.set('connected');
+  assert.equal(w.state, 'connected');
+  w.cleanup();
 });
 
 test('diagnostics: numbers from getStats, null ("unavailable") when missing (not 0), never an address or device id', async () => {
