@@ -803,6 +803,15 @@ const can = (server, bit) => has(myPerms(server), bit);
 const chanPerms = (c) => (!c ? 0 : c.perms ?? ALL_PERMS);
 const canIn = (c, bit) => has(chanPerms(c), bit);
 const isAdmin = (server) => can(server, PERMS.MANAGE_CHANNELS); // can manage channels & categories
+// One channel's settings and permissions need the permission server-wide and in that channel (the server checks
+// both, so a per-channel deny hides what would only fail).
+const canEditChannel = (server, c) => isAdmin(server) && canIn(c, PERMS.MANAGE_CHANNELS);
+const canEditChannelPerms = (server, c) => can(server, PERMS.MANAGE_ROLES) && canIn(c, PERMS.MANAGE_ROLES);
+// The owner and Administrators can change anything; anyone else's changes can't take their own access away.
+const isFullAdmin = (server) => isOwner(server) || can(server, PERMS.ADMINISTRATOR);
+// You can only give a role whose permissions you have yourself (the server also checks its channel overrides,
+// which the app can't see for every channel, and explains when that's the reason).
+const mayGiveRole = (server, r) => !(r.permissions & ALL_PERMS & ~myPerms(server));
 const canManageServer = (server) => !!server && !isGroup(server) && (can(server, PERMS.MANAGE_SERVER) || can(server, PERMS.MANAGE_ROLES) || can(server, PERMS.MANAGE_EMOJIS) || can(server, PERMS.BAN_MEMBERS) || can(server, PERMS.KICK_MEMBERS));
 // Name color + badge for a member, from their roles in this server.
 function roleStyle(server, userId) {
@@ -1458,12 +1467,13 @@ function channelRow(c, server) {
   }, icon(mentions ? 'at' : channelIcon(c), 'ic ch-ic'), h('span', { class: 'ch-name' }, c.name),
   muted ? icon('bellOff', 'ic ch-muted') : null,
   mentions ? h('span', { class: 'badge' }, mentions) : null),
-  isAdmin(server) ? ibtn('gear', 'Edit channel', () => openEditChannel(c), { cls: 'sm ch-gear' }) : null);
+  canEditChannel(server, c) || canEditChannelPerms(server, c) ? ibtn('gear', 'Edit channel', () => openEditChannel(c), { cls: 'sm ch-gear' }) : null);
 }
 function channelMenuItems(c, server) {
   const k = 'c:' + c.id;
   const admin = isAdmin(server);
-  const roles = can(server, PERMS.MANAGE_ROLES);
+  const edit = canEditChannel(server, c);
+  const roles = canEditChannelPerms(server, c);
   const lvl = P.notify[k] || 'default';
   return [
     c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => { S.unread.delete(k); S.mentions.delete(k); renderSidebar(); renderRail(); updateTitle(); } } : null,
@@ -1472,25 +1482,32 @@ function channelMenuItems(c, server) {
     ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
     '-',
     { label: 'Copy channel link', icon: 'link', action: () => { copyText(`${location.origin}/#c/${c.id}`); toast('Link copied.'); } },
-    admin ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
+    edit ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
     roles ? { label: 'Permissions', icon: 'shield', action: () => openEditChannel(c, 'perms') } : null,
     roles && c.type === 'text' ? { label: 'Make read-only (announcements)', icon: 'megaphone', action: () => quickOverride(server, c, 'readonly') } : null,
     roles ? { label: 'Make private', icon: 'lock', action: () => quickOverride(server, c, 'private') } : null,
     admin ? { label: 'Move up', icon: 'arrowUp', action: () => moveChannel(server, c, -1) } : null,
     admin ? { label: 'Move down', icon: 'arrowDown', action: () => moveChannel(server, c, 1) } : null,
-    admin ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
+    edit ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
   ];
 }
 // One-click channel setups: read-only for @everyone, or hidden from @everyone (then pick who can see it).
 async function quickOverride(server, c, kind) {
-  const list = (c.overrides || []).filter((o) => !(o.type === 'role' && o.id === server.id));
-  const everyone = (c.overrides || []).find((o) => o.type === 'role' && o.id === server.id) || { type: 'role', id: server.id, allow: 0, deny: 0 };
-  if (kind === 'readonly') everyone.deny |= PERMS.SEND_MESSAGES | PERMS.CREATE_THREADS;
-  else everyone.deny |= PERMS.VIEW_CHANNEL;
+  const bits = kind === 'readonly' ? PERMS.SEND_MESSAGES | PERMS.CREATE_THREADS : PERMS.VIEW_CHANNEL;
+  const isEveryone = (o) => o.type === 'role' && o.id === server.id;
+  const isMe = (o) => o.type === 'member' && o.id === S.me.id;
+  const old = (c.overrides || []).find(isEveryone) || { type: 'role', id: server.id, allow: 0, deny: 0 };
+  const everyone = { ...old, allow: old.allow & ~bits, deny: old.deny | bits };
+  // Unless you're the owner or an Administrator, the @everyone deny reaches you too, and the server refuses a
+  // change that takes your own access away (you couldn't undo it), so keep yours with an override for yourself.
+  const keep = isFullAdmin(server) ? 0 : bits & chanPerms(c);
+  const meOld = (c.overrides || []).find(isMe);
+  const me = keep ? { type: 'member', id: S.me.id, allow: ((meOld && meOld.allow) || 0) | keep, deny: ((meOld && meOld.deny) || 0) & ~keep } : meOld;
+  const overrides = [...(c.overrides || []).filter((o) => !isEveryone(o) && !isMe(o)), everyone, ...(me ? [me] : [])];
   try {
-    await api('PUT', `/channels/${c.id}/overrides`, { overrides: [...list, { ...everyone, allow: everyone.allow & ~everyone.deny }] });
+    await api('PUT', `/channels/${c.id}/overrides`, { overrides });
     toast(kind === 'readonly' ? `#${c.name} is now read-only. Give roles "Send messages" in its permissions to let them post.` : `#${c.name} is now private. Add roles or people who should see it.`);
-    if (kind === 'private') openEditChannel({ ...c, overrides: [...list, everyone] }, 'perms');
+    if (kind === 'private') openEditChannel(c, 'perms', { overrides });
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -2969,10 +2986,11 @@ function memberMenuItems(server, u) {
   const myTop = server.ownerId === S.me.id ? Infinity : Math.max(0, ...memberRoles(server, S.me.id).map((r) => r.position));
   const theirTop = isOwnerTarget ? Infinity : Math.max(0, ...memberRoles(server, u.id).map((r) => r.position));
   if (can(server, PERMS.MANAGE_ROLES)) {
-    const assignable = (server.roleDefs || []).filter((r) => !r.everyone && r.position < myTop);
+    const current = (server.memberRoles || {})[u.id] || [];
+    // Roles below yours: ones they have (taking one away is fine) and ones you could give.
+    const assignable = (server.roleDefs || []).filter((r) => !r.everyone && r.position < myTop && (current.includes(r.id) || mayGiveRole(server, r)));
     if (assignable.length && (me || theirTop < myTop)) {
       items.push('-', { header: 'Roles' });
-      const current = (server.memberRoles || {})[u.id] || [];
       assignable.forEach((r) => items.push({
         label: `${r.icon ? r.icon + ' ' : ''}${r.name}`, checked: current.includes(r.id),
         action: () => api('PUT', `/servers/${server.id}/members/${u.id}/roles`, { roleIds: current.includes(r.id) ? current.filter((x) => x !== r.id) : [...current, r.id] }).catch((e) => toast(e.message, 'error')),
@@ -3104,7 +3122,10 @@ function createComposer({ id, key, threadId, placeholder }) {
     const people = s.memberIds.filter((x) => x !== S.me.id).map(getUser);
     if (isGroup(s)) return people;
     const ch = channelById(kk.slice(2));
-    const pingAll = canIn(ch, PERMS.MENTION_EVERYONE);
+    // Other people's apps decide whether @everyone or a role mention pings them from the sender's server-wide
+    // permission (they can't see channel overrides), so only suggest them when the sender has that and this
+    // channel doesn't deny it. A per-channel allow alone would offer pings that never arrive.
+    const pingAll = can(s, PERMS.MENTION_EVERYONE) && canIn(ch, PERMS.MENTION_EVERYONE);
     const roles = (s.roleDefs || []).filter((r) => !r.everyone && (r.mentionable || pingAll)).map((r) => ({ role: r }));
     return [...people, ...roles, ...(pingAll ? [{ special: 'everyone', hint: 'Notify everyone in this server' }, { special: 'channel', hint: 'Notify everyone in this channel' }] : [])];
   };
@@ -4369,7 +4390,7 @@ function openServerSettings(server, startTab = 'overview') {
         sel.everyone ? null : h('h3', null, `Members \u2014 ${holders.length}`),
         sel.everyone ? null : h('div', { class: 'role-members' },
           ...holders.map((id) => { const u = getUser(id); return h('span', { class: 'chip active' }, avatarEl(u, 20), displayName(u), locked ? null : h('button', { class: 'chip-x', 'aria-label': `Remove ${displayName(u)} from role`, onclick: () => run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { roleIds: ((s.memberRoles || {})[id] || []).filter((x) => x !== sel.id) })) }, icon('close'))); }),
-          locked ? null : addSel),
+          locked ? null : mayGiveRole(s, sel) ? addSel : h('span', { class: 'field-hint' }, 'It has permissions you don\u2019t have, so you can\u2019t give it (you can take it away).')),
         locked ? null : h('div', { class: 'role-actions' },
           !sel.everyone ? h('button', { class: 'btn danger-ghost', onclick: async () => { if (await confirmDialog({ title: `Delete ${sel.name}?`, text: 'Everyone loses this role. This can\u2019t be undone.', confirm: 'Delete role', danger: true })) run(() => api('DELETE', `/roles/${sel.id}`), 'Role deleted.'); } }, 'Delete role') : h('span'),
           h('button', { class: 'btn primary', onclick: () => run(() => api('PATCH', `/roles/${sel.id}`, d), 'Role saved.') }, 'Save changes')));
@@ -4493,8 +4514,10 @@ function openServerSettings(server, startTab = 'overview') {
           if (!transfer.value) return;
           // Needs your password (and a two-factor code when it's on): it can't be undone.
           try {
-            const wait = nextServerUpdate(s.id);
-            const done = await confirmedCall(app, (x) => api('POST', `/servers/${s.id}/transfer`, { userId: transfer.value, ...x }),
+            // Start waiting for the live update only as the request goes out (typing the password can take longer
+            // than the wait lasts, and then the tabs would redraw from the old data, still showing owner controls).
+            let wait = null;
+            const done = await confirmedCall(app, (x) => { wait = nextServerUpdate(s.id); return api('POST', `/servers/${s.id}/transfer`, { userId: transfer.value, ...x }); },
               { title: 'Transfer ownership?', text: `You will lose owner controls for ${s.name}. Enter your password to confirm.`, button: 'Transfer' });
             if (!done) return;
             await wait; toast('Ownership transferred.'); draw();
@@ -4555,14 +4578,16 @@ function openCreateCategory(server) {
     } }],
   });
 }
-function openEditChannel(c, startTab = 'overview') {
+// overrides: what was just saved, when the live update with it may not have arrived yet.
+function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   const server = serverOfChannel(c.id) || S.servers.find((s) => s.id === c.serverId);
   if (!server) return;
-  let tab = can(server, PERMS.MANAGE_CHANNELS) ? startTab : 'perms';
   const fresh = () => (serverOfChannel(c.id) || server).channels.find((x) => x.id === c.id) || c;
   const ch0 = fresh();
+  const mayEdit = canEditChannel(server, ch0); const mayPerms = canEditChannelPerms(server, ch0);
+  let tab = mayEdit ? startTab : 'perms';
   // Overrides being edited: [{ type, id, allow, deny }]; @everyone always listed first.
-  let ovs = (ch0.overrides || []).map((o) => ({ ...o }));
+  let ovs = (overrides || ch0.overrides || []).map((o) => ({ ...o }));
   if (!ovs.some((o) => o.type === 'role' && o.id === server.id)) ovs.unshift({ type: 'role', id: server.id, allow: 0, deny: 0 });
   let selKey = `role:${server.id}`;
   const name = h('input', { class: 'input', maxlength: '48', value: ch0.name });
@@ -4583,7 +4608,7 @@ function openEditChannel(c, startTab = 'overview') {
   };
   const draw = () => {
     clear(tabs);
-    [['overview', 'Overview'], ['perms', 'Permissions']].filter(([k]) => k === 'perms' ? can(server, PERMS.MANAGE_ROLES) : can(server, PERMS.MANAGE_CHANNELS))
+    [['overview', 'Overview'], ['perms', 'Permissions']].filter(([k]) => (k === 'perms' ? mayPerms : mayEdit))
       .forEach(([k, l]) => tabs.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
     clear(body);
     if (tab === 'overview') {
@@ -4609,8 +4634,10 @@ function openEditChannel(c, startTab = 'overview') {
             h('span', { class: 'role-name' }, label(o))),
           o.type === 'role' && o.id === server.id ? null : ibtn('close', 'Remove override', () => { ovs = ovs.filter((x) => x !== o); selKey = `role:${server.id}`; draw(); }, { cls: 'sm' }))), addSel),
         h('div', { class: 'ov-perms' }, h('div', { class: 'perm-group-label' }, label(sel)),
-          ...scoped.map(([k, l, hint]) => {
+          ...scoped.map(([k, l, hint0]) => {
             const bit = PERMS[k]; const st = state(sel, bit);
+            // Pings are checked by each reader's app against the server-wide permission (see mayMentionRole).
+            const hint = k === 'MENTION_EVERYONE' ? 'Needs the permission server-wide too: allowing it only here doesn\u2019t make pings work. Denying it here hides the suggestions.' : hint0;
             return h('div', { class: 'ov-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, l), hint ? h('span', { class: 'field-hint' }, hint) : null),
               h('div', { class: 'tri', role: 'radiogroup', 'aria-label': l },
                 h('button', { class: `tri-btn deny${st === 'deny' ? ' on' : ''}`, 'aria-label': 'Deny', 'data-tip': 'Deny', onclick: () => setState(sel, bit, 'deny') }, icon('close')),
@@ -4622,11 +4649,12 @@ function openEditChannel(c, startTab = 'overview') {
     title: `${c.type === 'voice' ? '\uD83D\uDD0A' : '#'} ${ch0.name} \u2014 settings`, size: 'lg', className: 'channel-settings',
     body: h('div', { class: 'stack' }, tabs, body),
     actions: [
-      can(server, PERMS.MANAGE_CHANNELS) ? { label: 'Delete channel', kind: 'danger-ghost', action: () => deleteChannel(c) } : null,
+      mayEdit ? { label: 'Delete channel', kind: 'danger-ghost', action: () => deleteChannel(c) } : null,
       { label: 'Cancel' },
       { label: 'Save', kind: 'primary', action: async () => {
-        if (can(server, PERMS.MANAGE_CHANNELS)) await api('PATCH', `/channels/${c.id}`, { name: name.value, topic: topic.value, category: cat.input.value.trim(), slowmode: +slow.value });
-        if (can(server, PERMS.MANAGE_ROLES)) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
+        // Each part only when it's yours to change here, so one refusal doesn't stop the other from saving.
+        if (mayEdit) await api('PATCH', `/channels/${c.id}`, { name: name.value, topic: topic.value, category: cat.input.value.trim(), slowmode: +slow.value });
+        if (mayPerms) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
         toast('Channel saved.');
       } },
     ].filter(Boolean),

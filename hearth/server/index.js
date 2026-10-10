@@ -1420,7 +1420,9 @@ api.delete('/servers/:id/members/:uid', auth, (req, res) => {
 
 // Give/take roles. You can only hand out roles below your own highest role, and only roles whose permissions
 // you have yourself (or a Manage Roles holder could give anyone, themselves included, an Administrator role
-// that happens to sit lower in the list).
+// that happens to sit lower in the list). A role's per-channel overrides count too: giving it can't allow, and
+// taking it away can't lift a deny on, anything you don't have in that channel yourself (or a lower role that
+// can see a private channel, or one that keeps someone out of it, would be a way in).
 api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.MANAGE_ROLES, 'You need the Manage Roles permission.');
   const uid = req.params.uid;
@@ -1432,15 +1434,27 @@ api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   const wanted = new Set((Array.isArray((req.body || {}).roleIds) ? req.body.roleIds : []).map(String));
   const all = db.prepare('SELECT * FROM roles WHERE server_id = ? AND id != ?').all(s.id, s.id);
   const current = new Set(db.prepare('SELECT role_id FROM member_roles WHERE server_id = ? AND user_id = ?').all(s.id, uid).map((r) => r.role_id));
+  const changed = all.filter((r) => current.has(r.id) !== wanted.has(r.id));
+  const lifted = new Map(); // channel id -> deny bits of roles being taken away there
+  const myIn = (chId) => perms.channel(s, { id: chId }, req.userId);
+  for (const r of changed) {
+    const want = wanted.has(r.id);
+    if (r.position >= myTop) fail(403, `You can't assign or remove "${r.name}" — it's not below your highest role.`);
+    if (want && (r.permissions & ALL_PERMS & ~mine)) fail(403, `You can't give "${r.name}": it has permissions you don't have.`);
+    for (const o of db.prepare("SELECT channel_id, allow, deny FROM channel_overrides WHERE target_type = 'role' AND target_id = ?").all(r.id)) {
+      if (want && (o.allow & CHANNEL_SCOPED & ~myIn(o.channel_id))) fail(403, `You can't give "${r.name}": it has channel permissions you don't have.`);
+      if (!want && o.deny) lifted.set(o.channel_id, (lifted.get(o.channel_id) || 0) | o.deny);
+    }
+  }
+  // Only what the person really gets back counts (unmuting someone in a channel where everyone is muted anyway is fine).
+  const was = [...lifted.keys()].map((chId) => [chId, perms.channel(s, { id: chId }, uid), myIn(chId)]);
   db.transaction(() => {
-    for (const r of all) {
-      const has = current.has(r.id); const want = wanted.has(r.id);
-      if (has === want) continue;
-      if (r.position >= myTop) fail(403, `You can't assign or remove "${r.name}" — it's not below your highest role.`);
-      // Taking a role away never gives anyone more power, so only giving one is limited to what you have.
-      if (want && (r.permissions & ALL_PERMS & ~mine)) fail(403, `You can't give "${r.name}": it has permissions you don't have.`);
-      if (want) db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(s.id, uid, r.id);
+    for (const r of changed) {
+      if (wanted.has(r.id)) db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(s.id, uid, r.id);
       else db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(s.id, uid, r.id);
+    }
+    for (const [chId, before, my] of was) {
+      if ((perms.channel(s, { id: chId }, uid) & ~before) & lifted.get(chId) & ~my) fail(403, 'You can\u2019t take that role away: it limits them in a channel where you don\u2019t have that permission yourself.');
     }
   })();
   emitServer(s.id);
@@ -1467,8 +1481,12 @@ api.post('/servers/:id/invites', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   if (s.kind === 'group') fail(400, 'Add people to a group from its member list.');
   if (!can(s, req.userId, PM.CREATE_INVITE)) fail(403, 'You don\u2019t have permission to create invites.');
-  const maxUses = Math.max(0, Math.min(1000, parseInt((req.body || {}).maxUses || '0', 10) || 0));
-  const hours = Math.max(0, Math.min(24 * 30, parseInt((req.body || {}).expiresHours || '0', 10) || 0));
+  const b = req.body || {};
+  const maxUses = Math.max(0, Math.min(1000, parseInt(b.maxUses || '0', 10) || 0));
+  // A link expires after 7 days unless the request picks something else (0 = never), so API clients and older
+  // apps that leave it out don't make permanent links by accident.
+  const hours = b.expiresHours === undefined || b.expiresHours === null || b.expiresHours === '' ? 168
+    : Math.max(0, Math.min(24 * 30, parseInt(b.expiresHours, 10) || 0));
   const code = randomCode(8);
   db.prepare('INSERT INTO invites (code, server_id, creator_id, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(code, s.id, req.userId, maxUses, hours ? now() + hours * 3600000 : null, now());
@@ -2104,10 +2122,17 @@ api.post('/servers/:id/roles/order', auth, (req, res) => {
   emitServer(s.id);
   res.json({ ok: true });
 });
+// Members whose highest role is at or above `top` (with no role of your own above @everyone, that's everyone).
+const membersAtOrAbove = (serverId, top) => db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND (? <= 0 OR EXISTS
+    (SELECT 1 FROM member_roles mr JOIN roles r ON r.id = mr.role_id WHERE mr.server_id = m.server_id AND mr.user_id = m.user_id AND r.position >= ?))`)
+  .all(serverId, top, top).map((r) => r.user_id);
 // Per-channel overrides: [{ type: 'role'|'member', id, allow, deny }]. The list replaces the channel's overrides,
 // within your reach: you need Manage Roles in this channel (one you can see), you can only allow or deny what you
 // have here yourself (other bits keep their old value), and overrides for roles or people at or above your
-// highest role aren't yours to add, change or remove, the same rule as editing roles.
+// highest role aren't yours to add, change or remove, the same rule as editing roles. Unless you're the owner or
+// an Administrator, the change also can't take anything away from anyone at or above your highest role, yourself
+// included: denying @everyone reaches everyone, so checking targets alone would still let a junior moderator lock
+// seniors out of a channel (or lock themselves out with no way back).
 api.put('/channels/:id/overrides', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
   const s = requirePerm(c.server_id, req.userId, PM.MANAGE_ROLES, 'You need the Manage Roles permission.');
@@ -2141,9 +2166,17 @@ api.put('/channels/:id/overrides', auth, (req, res) => {
     if (reachable(o || n)) continue;
     if (!o || !n || o.allow !== n.allow || o.deny !== n.deny) fail(403, 'You can only change overrides for roles and people below your highest role.');
   }
+  const guarded = perms.base(s, req.userId) === ALL_PERMS ? [] : membersAtOrAbove(s.id, myTop).filter((u) => u !== s.owner_id);
+  const had = guarded.map((u) => [u, perms.channel(s, c, u)]);
+  // Write, then compare what each guarded person can do here now; any loss throws, which undoes the write.
   db.transaction(() => {
     db.prepare('DELETE FROM channel_overrides WHERE channel_id = ?').run(c.id);
     for (const o of next.values()) db.prepare('INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, ?, ?)').run(c.id, o.type, o.id, o.allow, o.deny);
+    for (const [u, was] of had) {
+      if (!(was & ~perms.channel(s, c, u))) continue;
+      if (u === req.userId) fail(409, 'That would take permissions in this channel away from you too, and you couldn\u2019t undo it. Allow them for yourself in the same change.');
+      fail(403, 'That would take permissions in this channel away from people at or above your highest role.');
+    }
   })();
   // Anyone who just lost access leaves the voice channel.
   for (const [uid] of voiceChannels.get(c.id) || []) if (!(perms.channel(s, c, uid) & PM.CONNECT)) leaveVoice(uid, true);
@@ -3475,11 +3508,16 @@ api.delete('/profile-comments/:id', auth, (req, res) => {
 // ---------------------------------------------------------------- polls
 // The question and options travel inside the encrypted message; the server only stores which option
 // number each person picked, so it can count votes without knowing what they're about.
-function pollTarget(messageId, userId) {
+// act: voting or ending it, which a block stops in a DM like any other new interaction (reading it still works).
+function pollTarget(messageId, userId, act = false) {
   const cm = db.prepare('SELECT id, channel_id FROM messages WHERE id = ?').get(messageId);
   if (cm) { const c = requireChannel(cm.channel_id, userId); return { emit: (ev, data) => toChannel(c).emit(ev, data) }; }
   const dm = db.prepare('SELECT id, dm_id FROM dm_messages WHERE id = ?').get(messageId);
-  if (dm) { const d = requireDm(dm.dm_id, userId); return { emit: (ev, data) => io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit(ev, data) }; }
+  if (dm) {
+    const d = requireDm(dm.dm_id, userId);
+    if (act && isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
+    return { emit: (ev, data) => io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit(ev, data) };
+  }
   fail(404, 'That poll no longer exists.');
 }
 function pollState(messageId) {
@@ -3489,7 +3527,7 @@ function pollState(messageId) {
 }
 api.get('/polls/:id', auth, (req, res) => { pollTarget(req.params.id, req.userId); res.json(pollState(req.params.id)); });
 api.post('/polls/:id/vote', auth, (req, res) => {
-  const t = pollTarget(req.params.id, req.userId);
+  const t = pollTarget(req.params.id, req.userId, true);
   rateLimit('vote:' + req.userId, 60, 60000);
   if (db.prepare('SELECT 1 FROM poll_closed WHERE message_id = ?').get(req.params.id)) fail(400, 'This poll has ended.');
   const choices = [...new Set((Array.isArray((req.body || {}).choices) ? req.body.choices : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < 10))].slice(0, 10);
@@ -3502,7 +3540,7 @@ api.post('/polls/:id/vote', auth, (req, res) => {
   res.json(st);
 });
 api.post('/polls/:id/close', auth, (req, res) => {
-  const t = pollTarget(req.params.id, req.userId);
+  const t = pollTarget(req.params.id, req.userId, true);
   const row = db.prepare('SELECT author_id FROM messages WHERE id = ? UNION SELECT author_id FROM dm_messages WHERE id = ?').get(req.params.id, req.params.id);
   if (!row || row.author_id !== req.userId) fail(403, 'Only the person who made the poll can end it.');
   db.prepare('INSERT OR IGNORE INTO poll_closed (message_id, closed_at) VALUES (?, ?)').run(req.params.id, now());
@@ -3518,10 +3556,17 @@ function eventChannelFor(e, uid) {
   const c = e.channel_id && db.prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?').get(e.channel_id, e.server_id);
   return c && isMember(c.server_id, uid) && (perms.channel(serverOf(c), c, uid) & PM.VIEW_CHANNEL) ? c.id : null;
 }
+const mayEditEvent = (e, srv, uid) => e.created_by === uid || can(srv, uid, PM.MANAGE_SERVER) || can(srv, uid, PM.MANAGE_CHANNELS);
 const eventOut = (e, uid) => {
   // RSVPs of current members only (someone who left or was removed isn't coming).
   const rsvps = db.prepare('SELECT r.user_id, r.status FROM event_rsvps r JOIN members m ON m.server_id = ? AND m.user_id = r.user_id WHERE r.event_id = ?').all(e.server_id, e.id);
-  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId: eventChannelFor(e, uid), startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
+  const channelId = eventChannelFor(e, uid);
+  // Someone who may edit it learns only that it links to a channel they can't see, so the editor can keep that
+  // link instead of showing "no channel" and quietly dropping or replacing it on save.
+  const channelHidden = !channelId && !!e.channel_id && !!db.prepare('SELECT 1 FROM channels WHERE id = ? AND server_id = ?').get(e.channel_id, e.server_id)
+    && mayEditEvent(e, serverOf(e), uid);
+  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId, startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
+    ...(channelHidden ? { channelHidden: true } : {}),
     going: rsvps.filter((r) => r.status === 'going').map((r) => r.user_id), maybe: rsvps.filter((r) => r.status === 'maybe').map((r) => r.user_id), no: rsvps.filter((r) => r.status === 'no').map((r) => r.user_id),
     mine: (rsvps.find((r) => r.user_id === uid) || {}).status || null };
 };
@@ -3573,7 +3618,7 @@ function requireEventEditor(eventId, uid) {
   const e = db.prepare('SELECT * FROM server_events WHERE id = ?').get(eventId);
   if (!e) fail(404, 'That event no longer exists.');
   const srv = requireServer(e.server_id, uid);
-  if (e.created_by !== uid && !can(srv, uid, PM.MANAGE_SERVER) && !can(srv, uid, PM.MANAGE_CHANNELS)) fail(403, 'Only the person who made it (or a server admin) can change this event.');
+  if (!mayEditEvent(e, srv, uid)) fail(403, 'Only the person who made it (or a server admin) can change this event.');
   return { e, srv };
 }
 api.patch('/events/:id', auth, (req, res) => {

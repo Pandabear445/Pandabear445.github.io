@@ -160,7 +160,7 @@ test("authz-2: Manage Roles can't rewrite overrides on a channel it can't see, o
   const mallory = await user('mallory'); const sam = await user('sam');
   await give(mallory, [junior.id]); await give(sam, [senior.id]);
   const room = await mkChannel('lobby');
-  const seniorOv = { type: 'role', id: senior.id, allow: P.MANAGE_MESSAGES, deny: 0 };
+  const seniorOv = { type: 'role', id: senior.id, allow: P.MANAGE_MESSAGES | P.ADD_REACTIONS, deny: 0 };
   assert.equal((await as(boss, 'PUT', `/channels/${room.id}/overrides`, { overrides: [seniorOv] })).status, 200);
   const lock = await as(mallory, 'PUT', `/channels/${room.id}/overrides`, { overrides: [seniorOv, { type: 'role', id: senior.id, allow: 0, deny: P.VIEW | P.SEND }] });
   assert.equal(lock.status, 403, 'can’t lock a higher role out');
@@ -168,20 +168,83 @@ test("authz-2: Manage Roles can't rewrite overrides on a channel it can't see, o
   assert.equal((await as(mallory, 'PUT', `/channels/${room.id}/overrides`, { overrides: [{ type: 'member', id: sam.id, allow: 0, deny: P.VIEW }] })).status, 403, 'or target a higher member');
   assert.equal((await as(sam, 'GET', `/channels/${room.id}/messages`)).status, 200, 'Senior still reads the channel');
 
-  // Normal use: overrides for lower roles and @everyone, leaving the higher role's override as it was.
+  // Normal use: overrides for lower roles and @everyone, leaving the higher role's override as it was. Taking
+  // Add Reactions from @everyone reaches Senior and Mallory too: it's fine because Senior's own override allows it
+  // and Mallory keeps hers with an override for herself.
   const ok = await as(mallory, 'PUT', `/channels/${room.id}/overrides`, { overrides: [seniorOv,
-    { type: 'role', id: cosmetic.id, allow: P.MANAGE_MESSAGES, deny: P.SEND }, { type: 'role', id: server.id, allow: 0, deny: P.ADD_REACTIONS }] });
+    { type: 'role', id: cosmetic.id, allow: P.MANAGE_MESSAGES, deny: P.SEND }, { type: 'role', id: server.id, allow: 0, deny: P.ADD_REACTIONS },
+    { type: 'member', id: mallory.id, allow: P.ADD_REACTIONS, deny: 0 }] });
   assert.equal(ok.status, 200, ok.text);
   const now = overridesOf(room.id);
-  assert.deepEqual(now.find((o) => o.id === senior.id), { type: 'role', id: senior.id, allow: P.MANAGE_MESSAGES, deny: 0 }, 'higher role untouched');
+  assert.deepEqual(now.find((o) => o.id === senior.id), seniorOv, 'higher role untouched');
   assert.deepEqual(now.find((o) => o.id === cosmetic.id), { type: 'role', id: cosmetic.id, allow: 0, deny: P.SEND }, 'can’t grant Manage Messages she lacks');
   assert.ok(now.find((o) => o.id === server.id), '@everyone override saved');
+
+  // @everyone reaches everyone, so it can't be used to lock out people above you either (the review's case).
+  const hall = await mkChannel('hall');
+  putMsg(hall.id, boss.id);
+  const hide = { type: 'role', id: server.id, allow: 0, deny: P.VIEW };
+  const sneak = await as(mallory, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [hide, { type: 'member', id: mallory.id, allow: P.VIEW | P.SEND, deny: 0 }] });
+  assert.equal(sneak.status, 403, sneak.text);
+  assert.deepEqual(overridesOf(hall.id), [], 'nothing saved');
+  assert.equal((await as(sam, 'GET', `/channels/${hall.id}/messages`)).status, 200, 'Senior still reads #hall');
+  assert.equal((await as(mallory, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [{ type: 'role', id: server.id, allow: 0, deny: P.SEND },
+    { type: 'member', id: mallory.id, allow: P.SEND, deny: 0 }] })).status, 403, 'nor mute them there');
+  // People who share her highest role count too.
+  const june = await user('june');
+  await give(june, [junior.id]);
+  const seniorSees = { type: 'role', id: senior.id, allow: P.VIEW, deny: 0 };
+  assert.equal((await as(boss, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [seniorSees] })).status, 200);
+  assert.equal((await as(mallory, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [seniorSees, hide, { type: 'member', id: mallory.id, allow: P.VIEW, deny: 0 }] })).status, 403, 'June would lose #hall');
+  assert.equal((await as(june, 'GET', `/channels/${hall.id}/messages`)).status, 200);
+  // Once the owner has given those roles their own access, she can hide #hall from everyone below her.
+  const juniorSees = { type: 'role', id: junior.id, allow: P.VIEW, deny: 0 };
+  assert.equal((await as(boss, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [seniorSees, juniorSees] })).status, 200);
+  const hid = await as(mallory, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [seniorSees, juniorSees, hide] });
+  assert.equal(hid.status, 200, hid.text);
+  for (const u of [sam, june, mallory]) assert.equal((await as(u, 'GET', `/channels/${hall.id}/messages`)).status, 200);
+  assert.equal((await as(carol, 'GET', `/channels/${hall.id}/messages`)).status, 404, 'hidden from people below her');
+  // The owner (or an Administrator) can still lock anyone out.
+  assert.equal((await as(boss, 'PUT', `/channels/${hall.id}/overrides`, { overrides: [hide] })).status, 200);
+  assert.equal((await as(sam, 'GET', `/channels/${hall.id}/messages`)).status, 404);
 
   // A per-channel deny of Manage Roles is respected.
   const rules = await mkChannel('rules-ro');
   assert.equal((await as(boss, 'PUT', `/channels/${rules.id}/overrides`, { overrides: [{ type: 'member', id: mallory.id, allow: 0, deny: P.MANAGE_ROLES }] })).status, 200);
   assert.equal((await as(mallory, 'PUT', `/channels/${rules.id}/overrides`, { overrides: [{ type: 'role', id: server.id, allow: 0, deny: P.SEND }] })).status, 403);
   assert.equal(overridesOf(rules.id).length, 1);
+});
+
+// The review's blocker: "Make private" by a moderator who isn't an Administrator must not lock them out.
+test('authz-2: a moderator who isn’t an admin can make a channel private and then keep managing it', async () => {
+  const fans = await mkRole('Fans', 0);
+  const chanMod = await mkRole('Channel mod', P.MANAGE_ROLES | P.MANAGE_CHANNELS); // newest: nobody else is at or above it
+  const mod = await user('modp'); const fan = await user('fan'); const plain = await user('plain');
+  await give(mod, [chanMod.id]); await give(fan, [fans.id]);
+  const plans = await mkChannel('plans');
+  putMsg(plans.id, boss.id);
+  const read = async (u) => (await as(u, 'GET', `/channels/${plans.id}/messages`)).status;
+  const hide = { type: 'role', id: server.id, allow: 0, deny: P.VIEW };
+  // Hiding it from @everyone alone would hide it from the moderator too, with no way back: refused.
+  const alone = await as(mod, 'PUT', `/channels/${plans.id}/overrides`, { overrides: [hide] });
+  assert.equal(alone.status, 409, alone.text);
+  assert.deepEqual(overridesOf(plans.id), []);
+  assert.equal(await read(mod), 200);
+  // What the app's "Make private" sends: @everyone hidden, plus the moderator's own access.
+  const self = { type: 'member', id: mod.id, allow: P.VIEW, deny: 0 };
+  const priv = await as(mod, 'PUT', `/channels/${plans.id}/overrides`, { overrides: [hide, self] });
+  assert.equal(priv.status, 200, priv.text);
+  assert.equal(await read(plain), 404, 'hidden from everyone else');
+  assert.equal(await read(mod), 200);
+  // Then they pick who can see it, and can keep editing the channel.
+  const pick = await as(mod, 'PUT', `/channels/${plans.id}/overrides`, { overrides: [hide, self, { type: 'role', id: fans.id, allow: P.VIEW, deny: 0 }] });
+  assert.equal(pick.status, 200, pick.text);
+  assert.equal(await read(fan), 200);
+  assert.equal(await read(plain), 404);
+  assert.equal((await as(mod, 'PATCH', `/channels/${plans.id}`, { topic: 'planning' })).status, 200);
+  // Dropping their own access later is refused the same way.
+  assert.equal((await as(mod, 'PUT', `/channels/${plans.id}/overrides`, { overrides: [hide, { type: 'role', id: fans.id, allow: P.VIEW, deny: 0 }] })).status, 409);
+  assert.equal(await read(mod), 200);
 });
 
 // ------------------------------------------------------------------ authz-3
@@ -281,6 +344,28 @@ test('authz-7: a block also stops DM edits, new reactions, pins and typing', asy
   bs.close(); cs.close();
 });
 
+test('authz-7: a block also stops voting in (or ending) polls in the DM', async () => {
+  const bob = await user('bobpoll'); const carol = await user('carolpoll');
+  const dm = (await as(bob, 'POST', '/dms', { userId: carol.id })).json;
+  const poll = (await as(carol, 'POST', `/dms/${dm.id}/messages`, { ciphertext: cipher() })).json.id;
+  assert.equal((await as(bob, 'POST', `/polls/${poll}/vote`, { choices: [0] })).status, 200);
+  const cs = await sock(carol);
+  const updates = collect(cs, 'poll:update');
+  assert.equal((await as(carol, 'POST', `/blocks/${bob.id}`)).status, 200);
+  assert.equal((await as(bob, 'POST', `/polls/${poll}/vote`, { choices: [1] })).status, 403);
+  assert.equal((await as(bob, 'POST', `/polls/${poll}/vote`, { choices: [] })).status, 403, 'not taking a vote back either');
+  assert.equal((await as(carol, 'POST', `/polls/${poll}/close`)).status, 403, 'frozen both ways');
+  await sleep(300);
+  assert.equal(updates.length, 0, 'no poll activity reaches the blocker');
+  const st = await as(bob, 'GET', `/polls/${poll}`);
+  assert.equal(st.status, 200, 'the result can still be read');
+  assert.deepEqual(st.json.votes, { 0: [bob.id] });
+  assert.equal(st.json.closed, false);
+  await as(carol, 'DELETE', `/blocks/${bob.id}`);
+  assert.equal((await as(bob, 'POST', `/polls/${poll}/vote`, { choices: [1] })).status, 200, 'unblocked: back to normal');
+  cs.close();
+});
+
 // ------------------------------------------------------------------ authz-8
 test('authz-8: mention and reply pushes only reach people who can see the channel', async () => {
   const viewer = await user('viewer'); const outsider = await user('outside');
@@ -348,8 +433,21 @@ test('authz-10: events hide private channels from people who can’t see them, a
   assert.equal(srv.sql('SELECT channel_id FROM server_events WHERE id = ?', sneaky.json.id)[0].channel_id, null, 'can’t link a channel you can’t see');
   const fine = await as(frank, 'POST', `/servers/${server.id}/events`, { title: 'hangout', startsAt: Date.now() + 86400000, channelId: general.id });
   assert.equal(fine.json.channelId, general.id, 'linking a channel you can see works');
-  // An admin editing the owner's event keeps its channel even without seeing it.
-  assert.equal(srv.sql('SELECT channel_id FROM server_events WHERE id = ?', ev.json.id)[0].channel_id, hidden.id);
+  // Someone who may edit the event but can't see its channel is told only that there is one, and saving their
+  // edits (the app leaves the channel out unless they pick another) keeps the link.
+  const planner = await user('planner');
+  await give(planner, [(await mkRole('Planner', P.MANAGE_CHANNELS)).id]);
+  const seen = (await as(planner, 'GET', `/servers/${server.id}/events`)).json.find((e) => e.id === ev.json.id);
+  assert.equal(seen.channelId, null);
+  assert.equal(seen.channelHidden, true);
+  assert.equal(theirs.channelHidden, undefined, 'people who can’t edit it aren’t told');
+  const edit = await as(planner, 'PATCH', `/events/${ev.json.id}`, { title: 'staff sync (moved)', startsAt: seen.startsAt + 3600000, endsAt: null, location: 'room 2', description: '' });
+  assert.equal(edit.status, 200, edit.text);
+  assert.equal(edit.json.channelHidden, true);
+  assert.deepEqual(srv.sql('SELECT title, channel_id FROM server_events WHERE id = ?', ev.json.id)[0], { title: 'staff sync (moved)', channel_id: hidden.id }, 'edited, still linked');
+  // Picking another channel on purpose still works.
+  assert.equal((await as(planner, 'PATCH', `/events/${ev.json.id}`, { channelId: general.id })).json.channelId, general.id);
+  assert.equal((await as(boss, 'PATCH', `/events/${ev.json.id}`, { channelId: hidden.id })).json.channelId, hidden.id);
 
   // Muted everywhere (no Send Messages): no events either.
   const everyone = srv.sql('SELECT permissions FROM roles WHERE id = ?', server.id)[0].permissions;
@@ -406,6 +504,37 @@ test('authz-12: Manage Roles can’t hand out a role with permissions it doesn�
   assert.deepEqual((await myServer(boss)).memberRoles[pat.id], [cosmetic.id]);
 });
 
+test('authz-12: a lower role’s channel overrides count too: no handing out a private channel, no lifting your own limits', async () => {
+  const vault = await mkChannel('vault12'); const open = await mkChannel('open12'); const ro = await mkChannel('ro12');
+  putMsg(vault.id, boss.id);
+  const peek = await mkRole('Vault access', 0); const poster = await mkRole('Reactor', 0);
+  const keepOut = await mkRole('Not in open12', 0); const muted = await mkRole('Muted12', 0);
+  const mgr = await mkRole('Role manager 12', P.MANAGE_ROLES); // above all of these
+  const set = async (c, overrides) => assert.equal((await as(boss, 'PUT', `/channels/${c.id}/overrides`, { overrides })).status, 200);
+  await set(vault, [{ type: 'role', id: server.id, allow: 0, deny: P.VIEW }, { type: 'role', id: peek.id, allow: P.VIEW | P.SEND, deny: 0 }]);
+  await set(open, [{ type: 'role', id: keepOut.id, allow: 0, deny: P.VIEW }]);
+  await set(ro, [{ type: 'role', id: server.id, allow: 0, deny: P.SEND }, { type: 'role', id: muted.id, allow: 0, deny: P.SEND }]);
+  await set(general, [{ type: 'role', id: poster.id, allow: P.ADD_REACTIONS, deny: 0 }, { type: 'role', id: muted.id, allow: 0, deny: P.SEND }]);
+  const ivan = await user('ivan'); const pat = await user('pat12');
+  await give(ivan, [mgr.id, keepOut.id]); await give(pat, [muted.id]);
+  const rolesOf = (u) => srv.sql('SELECT role_id FROM member_roles WHERE user_id = ? ORDER BY role_id', u.id).map((r) => r.role_id);
+  const ivanRoles = rolesOf(ivan);
+
+  // A role that can see a channel Ivan can't: not for him, not for anyone else.
+  assert.equal((await as(ivan, 'PUT', `/servers/${server.id}/members/${ivan.id}/roles`, { roleIds: [mgr.id, keepOut.id, peek.id] })).status, 403);
+  assert.equal((await as(ivan, 'PUT', `/servers/${server.id}/members/${pat.id}/roles`, { roleIds: [muted.id, peek.id] })).status, 403);
+  assert.equal((await as(ivan, 'GET', `/channels/${vault.id}/messages`)).status, 404);
+  // A role that keeps him out of a channel: he can't take it off himself.
+  assert.equal((await as(ivan, 'PUT', `/servers/${server.id}/members/${ivan.id}/roles`, { roleIds: [mgr.id] })).status, 403);
+  assert.equal((await as(ivan, 'GET', `/channels/${open.id}/messages`)).status, 404, 'still out of #open12');
+  assert.deepEqual(rolesOf(ivan), ivanRoles);
+  // Normal use: a role whose channel grants he has himself, and unmuting someone (in #ro12 nobody may post anyway,
+  // so the only thing they get back is posting in #general, which Ivan can do too).
+  assert.equal((await as(ivan, 'PUT', `/servers/${server.id}/members/${pat.id}/roles`, { roleIds: [poster.id] })).status, 200);
+  assert.deepEqual(rolesOf(pat), [poster.id]);
+  await set(general, []);
+});
+
 // ------------------------------------------------------------------ authz-13
 test('authz-13: invites can be listed and revoked by the right people, and a ban kills the banned person’s invites', async () => {
   const frank = await user('franki'); const mod = await user('modi'); const newbie = await srv.register(`new${hex(3)}`);
@@ -430,6 +559,14 @@ test('authz-13: invites can be listed and revoked by the right people, and a ban
   assert.equal((await as(newbie, 'POST', `/invites/${mine}/join`)).status, 404, 'a revoked invite stops working');
   assert.equal((await as(mod, 'DELETE', `/invites/${other}`)).status, 200, 'Manage Server: anyone’s');
   assert.equal((await as(newbie, 'GET', `/invites/${other}`)).status, 404);
+
+  // Without a choice, a new link lasts 7 days (API clients too); 0 still means never.
+  const later = (await as(boss, 'POST', `/servers/${server.id}/invites`, {})).json.code;
+  const dflt = srv.sql('SELECT expires_at FROM invites WHERE code = ?', later)[0].expires_at;
+  assert.ok(dflt > Date.now() + 167 * 3600000 && dflt <= Date.now() + 168 * 3600000, `expires in 7 days (${dflt})`);
+  const forever = (await as(boss, 'POST', `/servers/${server.id}/invites`, { expiresHours: 0 })).json.code;
+  assert.equal(srv.sql('SELECT expires_at FROM invites WHERE code = ?', forever)[0].expires_at, null);
+  for (const c of [later, forever]) assert.equal((await as(boss, 'DELETE', `/invites/${c}`)).status, 200);
 
   const fromFrank = (await as(frank, 'POST', `/servers/${server.id}/invites`, {})).json.code;
   assert.equal((await as(boss, 'POST', `/servers/${server.id}/bans`, { userId: frank.id })).status, 200);
