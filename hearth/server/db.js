@@ -580,9 +580,15 @@ addColumn('users', 'deleted_at', 'INTEGER');
 // log shows whether it's intact).
 addColumn('admin_log', 'prev_hash', 'TEXT');
 addColumn('admin_log', 'hash', 'TEXT');
-const auditHash = (prev, r) => crypto.createHash('sha256').update(JSON.stringify([prev || '', r.id, r.admin_id || '', r.action, r.target || '', r.detail || '', r.ip || '', r.created_at])).digest('hex');
+const auditFields = (prev, r) => JSON.stringify([prev || '', r.id, r.admin_id || '', r.action, r.target || '', r.detail || '', r.ip || '', r.created_at]);
+// Plain SHA-256: entries written before v17. Newer entries are keyed (auditMac, v17 below).
+const auditHash = (prev, r) => crypto.createHash('sha256').update(auditFields(prev, r)).digest('hex');
+const AUDIT_ANCHOR = path.join(DATA_DIR, 'audit-anchor.json');
 {
-  const unchained = db.prepare('SELECT * FROM admin_log WHERE hash IS NULL ORDER BY id').all();
+  // One-time upgrade of a database from before the chain existed (older than v13). It never runs on a newer one,
+  // whatever else was deleted, so a hash someone set to NULL stays a break instead of being quietly recomputed.
+  const keyed = db.prepare("SELECT 1 FROM instance_settings WHERE key = 'auditKeyedFrom'").get() || fs.existsSync(AUDIT_ANCHOR);
+  const unchained = !hasData || fromVersion >= 13 || keyed ? [] : db.prepare('SELECT * FROM admin_log WHERE hash IS NULL ORDER BY id').all();
   if (unchained.length) {
     db.exec('DROP TRIGGER IF EXISTS admin_log_no_update');
     let prev = (db.prepare('SELECT hash FROM admin_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1').get() || {}).hash || '';
@@ -720,6 +726,160 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
 addColumn('push_subs', 'fails', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('push_subs', 'retry_at', 'INTEGER');
 
+// v17 (admin): owner tools hardening.
+// Subscriptions of a deleted server that Stripe hasn't confirmed as cancelled yet. The membership rows go with the
+// server, so these are kept separately (no foreign keys) and retried until Stripe says they've ended.
+db.exec(`
+CREATE TABLE IF NOT EXISTS membership_cancellations (
+  stripe_sub TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL,
+  user_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  tried_at INTEGER
+);
+`);
+
+// v17 (admin): secrets kept in settings (GIF and activity API keys, payment webhook secrets) are sealed with
+// secret.key, like the SMTP password. Older versions stored them as plain text; those are sealed here, once.
+const SEALED = 'sealed:';
+const sealSecret = (v) => (v ? SEALED + seal({ k: String(v) }) : '');
+const openSecret = (v) => (typeof v !== 'string' ? '' : v.startsWith(SEALED) ? String((unseal(v.slice(SEALED.length)) || {}).k || '') : v);
+{
+  const get = (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value;
+  const put = (k, v) => db.prepare('UPDATE instance_settings SET value = ? WHERE key = ?').run(v, k);
+  for (const k of ['giphyKey', 'klipyKey', 'lastfmKey', 'rawgKey']) { const v = get(k); if (v && !v.startsWith(SEALED)) put(k, sealSecret(v)); }
+  for (const [k, fields] of [['payments', ['kofiToken', 'stripeSecret']], ['memberships', ['webhookSecret']]]) {
+    let v = null;
+    try { v = JSON.parse(get(k) || 'null'); } catch { /* leave it */ }
+    if (!v || typeof v !== 'object') continue;
+    const plain = fields.filter((f) => typeof v[f] === 'string' && v[f] && !v[f].startsWith(SEALED));
+    plain.forEach((f) => { v[f] = sealSecret(v[f]); });
+    if (plain.length) put(k, JSON.stringify(v));
+  }
+}
+
+// v17 (admin): the audit log's chain is keyed. New entries are HMAC-SHA256 with a key derived from secret.key, so
+// someone with only the database can't recompute the chain after editing it. The newest entry is also anchored in
+// a file outside the database (data/audit-anchor.json), so cutting entries off the end shows up too. Entries from
+// before this upgrade keep their plain SHA-256 hashes; the signed 'auditKeyedFrom' setting says where the keyed
+// part starts.
+const AUDIT_KEY = Buffer.from(crypto.hkdfSync('sha256', atRestKey, Buffer.alloc(0), 'hearth-audit-log-v1', 32));
+const auditMacOf = (s) => crypto.createHmac('sha256', AUDIT_KEY).update(s).digest('hex');
+const auditMac = (prev, r) => auditMacOf(auditFields(prev, r));
+const anchorMac = (a) => auditMacOf(`anchor|${a.keyedFrom}|${a.id}|${a.hash}`);
+const macEq = (a, b) => typeof a === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+let anchorSeen = false; // once this process has seen (or written) the anchor, its disappearing counts as tampering
+function readAnchor() {
+  let a;
+  try { a = JSON.parse(fs.readFileSync(AUDIT_ANCHOR, 'utf8')); } catch (e) { return e.code === 'ENOENT' && !anchorSeen ? null : { valid: false }; }
+  const ok = !!a && Number.isInteger(a.keyedFrom) && Number.isInteger(a.id) && typeof a.hash === 'string' && macEq(a.mac, anchorMac(a));
+  if (ok) anchorSeen = true;
+  return ok ? { keyedFrom: a.keyedFrom, id: a.id, hash: a.hash, valid: true } : { valid: false };
+}
+function writeAnchor(keyedFrom, id, hash) {
+  const a = { keyedFrom, id, hash };
+  const tmp = `${AUDIT_ANCHOR}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ ...a, mac: anchorMac(a) }), { mode: 0o600 });
+  fs.renameSync(tmp, AUDIT_ANCHOR);
+  anchorSeen = true;
+}
+// "<id>.<mac>": the first keyed entry. Returns the id, or null when it's missing or wasn't written by this server.
+function keyedFromSetting() {
+  const v = (db.prepare("SELECT value FROM instance_settings WHERE key = 'auditKeyedFrom'").get() || {}).value;
+  const m = /^(\d+)\.([0-9a-f]{64})$/.exec(v || '');
+  return m && macEq(m[2], auditMacOf(`keyed-from|${m[1]}`)) ? +m[1] : null;
+}
+const auditHead = () => db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
+let AUDIT_FROM;
+function appendAuditRow(e) {
+  const last = auditHead();
+  const prev = last.hash || '';
+  const r = { id: last.id + 1, admin_id: e.admin_id || null, action: e.action, target: e.target || null, detail: String(e.detail || '').slice(0, 1000), ip: e.ip || null, created_at: Date.now() };
+  const hash = r.id >= AUDIT_FROM ? auditMac(prev, r) : auditHash(prev, r);
+  db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(r.id, r.admin_id, r.action, r.target, r.detail, r.ip, r.created_at, prev, hash);
+  return { id: r.id, hash };
+}
+// Adds an entry ({ admin_id, action, target, detail, ip }). If the newest entry the anchor remembers is missing or
+// different (entries were cut off or changed, or an older copy of the database was put back), that goes into the
+// log first, so it can't be hidden by simply carrying on.
+function auditAppend(e) {
+  let head;
+  db.transaction(() => {
+    const a = readAnchor();
+    if (a && !a.valid) appendAuditRow({ action: 'audit_log_gap', detail: 'The audit log’s anchor file (data/audit-anchor.json) was changed, damaged or deleted outside Hearth.' });
+    else if (a && a.id > 0) {
+      const at = db.prepare('SELECT hash FROM admin_log WHERE id = ?').get(a.id);
+      if (!at || at.hash !== a.hash) {
+        appendAuditRow({ action: 'audit_log_gap', detail: `Entry #${a.id}, the newest one recorded on this machine, is ${at ? 'different' : 'missing'}: entries were removed or changed outside Hearth, or an older copy of the database was put back.` });
+      }
+    }
+    head = appendAuditRow(e);
+  })();
+  writeAnchor(AUDIT_FROM, head.id, head.hash);
+  return head.id;
+}
+// Walks the whole chain. { ok, entries, brokenAt, reason, keyedFrom, anchored, gaps }. reason: 'changed' (an entry
+// doesn't match its hash), 'missing' (the log ends before the newest entry the anchor remembers), 'anchor' (the
+// anchor file was edited) or 'keyed_from' (the setting saying where keyed entries start was edited or deleted).
+// gaps: entries where Hearth found and recorded such a problem earlier (the log has been intact since), including
+// signing being started over. keyedSince: when signing started (entries before keyedFrom only have plain hashes).
+function auditVerify() {
+  const a = readAnchor();
+  const out = { ok: true, entries: 0, brokenAt: null, reason: null, keyedFrom: AUDIT_FROM, keyedSince: null, anchored: !!(a && a.valid), gaps: [] };
+  const bad = (reason, brokenAt = null) => ({ ...out, ok: false, reason, brokenAt });
+  if (a && !a.valid) return bad('anchor');
+  if (keyedFromSetting() !== AUDIT_FROM || (a && a.keyedFrom !== AUDIT_FROM)) return bad('keyed_from');
+  let prev = ''; let last = 0; let seen = !a || a.id === 0; let switches = 0;
+  for (const r of db.prepare('SELECT * FROM admin_log ORDER BY id').iterate()) {
+    out.entries++;
+    const want = r.id >= AUDIT_FROM ? auditMac(prev, r) : auditHash(prev, r);
+    if (r.hash == null || (r.prev_hash || '') !== prev || r.hash !== want || (a && r.id === a.id && r.hash !== a.hash)) return bad('changed', r.id);
+    if (a && r.id === a.id) seen = true;
+    // When signing started (shown with the check). Signing only ever starts once, so a later start means the log
+    // was reset outside Hearth.
+    const restarted = r.action === 'audit_chain_keyed' && switches++ > 0;
+    if (r.action === 'audit_chain_keyed' && r.id === AUDIT_FROM) out.keyedSince = r.created_at;
+    if (r.action === 'audit_log_gap' || r.action === 'audit_anchor_reset' || restarted) out.gaps.push({ id: r.id, at: r.created_at, action: r.action, detail: r.detail });
+    prev = r.hash; last = r.id;
+  }
+  if (!seen) return { ...bad('missing', last + 1), anchoredId: a.id };
+  return out;
+}
+{
+  const anchor = readAnchor();
+  const anchored = !!(anchor && anchor.valid);
+  const marked = !!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'auditKeyedFrom'").get();
+  const set = keyedFromSetting();
+  const head = auditHead();
+  // Nothing says where the keyed entries start: either a log from before keyed hashing (this upgrade), or one whose
+  // markers were deleted outside Hearth so that entries edited and re-hashed with plain SHA-256 pass as old ones.
+  // An entry keyed with this server's key gives the second case away: the tamper check then reports 'keyed_from'.
+  let firstKeyed = null;
+  if (!marked && !anchored) {
+    for (const r of db.prepare('SELECT * FROM admin_log WHERE hash IS NOT NULL ORDER BY id').iterate()) if (r.hash === auditMac(r.prev_hash, r)) { firstKeyed = r.id; break; }
+  }
+  AUDIT_FROM = anchored ? anchor.keyedFrom : set !== null ? set : firstKeyed !== null ? firstKeyed : head.id + 1;
+  if (firstKeyed !== null) console.error(`The audit log has entries keyed by this server from #${firstKeyed}, but the record of where they start was deleted outside Hearth.`);
+  else if (!marked) db.prepare('INSERT INTO instance_settings (key, value) VALUES (?, ?)').run('auditKeyedFrom', `${AUDIT_FROM}.${auditMacOf(`keyed-from|${AUDIT_FROM}`)}`);
+  // Keyed hashing starts now, and the log says so in a keyed entry, with the date. Someone who wipes the markers to
+  // pass edited entries off as old ones can't avoid a new one of these, dated when they did it (and listed as a
+  // gap when an earlier one is still there).
+  const starting = !marked && !anchored && firstKeyed === null;
+  if (starting && (head.id > 0 || db.prepare('SELECT 1 FROM users LIMIT 1').get())) {
+    auditAppend({ action: 'audit_chain_keyed', detail: head.id
+      ? `Entries from #${AUDIT_FROM} on are signed with this server’s secret key. The ${head.id === 1 ? 'entry before it was' : `${head.id} entries before it were`} written by an older version of Hearth and only have plain hashes. If this server was already up to date, the log was reset outside Hearth.`
+      : `Entries from #${AUDIT_FROM} on are signed with this server’s secret key.` });
+  } else if (!anchor) {
+    // A keyed log without its anchor: a restored backup or a moved data folder (or the file was deleted). Start a
+    // new anchor, and say so in the log.
+    if (marked && head.id > 0) auditAppend({ action: 'audit_anchor_reset', detail: `The audit log’s anchor file was missing (a restored backup or a moved data folder?), so a new one was started at entry #${head.id + 1}. Entries cut off the end before this can’t be detected.` });
+    else writeAnchor(AUDIT_FROM, head.id, head.hash || '');
+  }
+}
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
@@ -733,4 +893,4 @@ db.prepare = (sql) => {
   return st;
 };
 
-module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash };
+module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret };

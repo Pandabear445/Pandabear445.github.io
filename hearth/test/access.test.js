@@ -113,6 +113,7 @@ test('every admin endpoint refuses normal users (403) and anonymous callers (401
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'accounts.js'), 'utf8')
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'activity.js'), 'utf8')
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'money.js'), 'utf8')
+    + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'memberships.js'), 'utf8')
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'regions.js'), 'utf8');
   const routes = [...src.matchAll(/api\.(get|post|put|patch|delete)\('(\/admin\/[^']*)'/g)].map((m) => [m[1].toUpperCase(), m[2].replace(/:(\w+)/g, (x, k) => (k === 'id' ? alice.id : 'x'))]);
   assert.ok(routes.length > 40, `found ${routes.length} admin routes`);
@@ -126,8 +127,8 @@ test('every admin endpoint refuses normal users (403) and anonymous callers (401
 
 test('staff ranks: a moderator can’t use admin tools or act on admins; admins can’t touch the owner', async () => {
   const mod = await srv.register(); const admin = await srv.register();
-  await as(srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator' });
-  await as(srv.owner, 'PUT', '/admin/staff', { userId: admin.id, role: 'admin' });
+  await as(srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator', authKey: srv.owner.authKey });
+  await as(srv.owner, 'PUT', '/admin/staff', { userId: admin.id, role: 'admin', authKey: srv.owner.authKey });
   assert.equal((await as(mod, 'GET', '/admin/settings')).status, 403);
   assert.equal((await as(mod, 'PUT', '/admin/registration', { mode: 'open' })).status, 403);
   assert.equal((await as(mod, 'POST', `/admin/users/${admin.id}/suspend`, { reason: 'x' })).status, 403);

@@ -80,7 +80,7 @@ test('security events land in the audit log', async () => {
   const u = await srv.register(); await confirmEmail(srv, u, `${u.username}@example.test`);
   await srv.api('POST', '/auth/forgot', { body: { login: u.username }, ip: newIp() });
   await enable2fa(srv, u);
-  await srv.api('PUT', '/admin/staff', { token: srv.owner.token, ip: srv.owner.ip, body: { userId: u.id, role: 'moderator' } });
+  await srv.api('PUT', '/admin/staff', { token: srv.owner.token, ip: srv.owner.ip, body: { userId: u.id, role: 'moderator', authKey: srv.owner.authKey } });
   await srv.api('POST', `/admin/users/${u.id}/2fa/remove`, { token: srv.owner.token, ip: srv.owner.ip });
   const actions = srv.sql('SELECT action FROM admin_log WHERE target = ? ORDER BY id', u.id).map((r) => r.action);
   for (const a of ['email_changed', 'password_reset_requested', '2fa_enabled', 'role_moderator', '2fa_removed']) assert.ok(actions.includes(a), `${a} in ${actions}`);

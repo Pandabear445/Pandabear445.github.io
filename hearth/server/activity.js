@@ -46,11 +46,13 @@ const GAME_ID = /^(steam:\d{1,10}|wiki:\d{1,12}|rawg:\d{1,10})$/;
 const NOT_GAMES = new Set(['431960', '250820', '228980', '1070560', '1391110', '1493710']);
 
 module.exports = function setupActivity(ctx) {
-  const { api, app, auth, db, fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, requireInstanceAdmin, checkWords, DATA_DIR, version } = ctx;
+  const { api, app, auth, db, fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, requireInstanceAdmin, checkWords, DATA_DIR, version,
+    sealSecret, openSecret, auditLog } = ctx;
   const UA = `Hearth/${version} (self-hosted chat; https://github.com/)`;
   const now = () => Date.now();
-  const lastfmKey = () => getSetting('lastfmKey') || env.LASTFM_API_KEY || '';
-  const rawgKey = () => getSetting('rawgKey') || env.RAWG_API_KEY || '';
+  // Keys saved in the app are sealed with data/secret.key (see sealSecret in db.js).
+  const lastfmKey = () => openSecret(getSetting('lastfmKey')) || env.LASTFM_API_KEY || '';
+  const rawgKey = () => openSecret(getSetting('rawgKey')) || env.RAWG_API_KEY || '';
 
   // Follows up to 3 redirects itself, checking every hop, so a redirect can't send this server somewhere else.
   // Each hop also goes through the outbound guard (netguard.js): the host's addresses must be public and the
@@ -505,8 +507,10 @@ module.exports = function setupActivity(ctx) {
   api.patch('/admin/activity', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
     const b = req.body || {};
-    if (b.lastfmKey !== undefined) setSetting('lastfmKey', String(b.lastfmKey || '').trim().slice(0, 64) || null);
-    if (b.rawgKey !== undefined) { setSetting('rawgKey', String(b.rawgKey || '').trim().slice(0, 64) || null); searchCache.clear(); }
+    if (b.lastfmKey !== undefined) setSetting('lastfmKey', sealSecret(String(b.lastfmKey || '').trim().slice(0, 64)) || null);
+    if (b.rawgKey !== undefined) { setSetting('rawgKey', sealSecret(String(b.rawgKey || '').trim().slice(0, 64)) || null); searchCache.clear(); }
+    const changed = ['lastfmKey', 'rawgKey'].filter((k) => b[k] !== undefined);
+    if (changed.length) auditLog(req, 'activity_settings', null, changed.join(', '));
     res.json({ ok: true, lastfmKeySet: !!lastfmKey(), rawgKeySet: !!rawgKey() });
   });
 

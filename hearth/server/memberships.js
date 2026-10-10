@@ -13,7 +13,7 @@ const crypto = require('crypto');
 
 module.exports = function setupMemberships(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
-    isMember, emitServer, emitTo, seal, unseal, newId, brief, PM, mailPublicUrl } = ctx;
+    isMember, emitServer, emitTo, seal, unseal, newId, brief, PM, mailPublicUrl, auditLog, stepUp, sealSecret, openSecret } = ctx;
   const now = () => Date.now();
   const API = () => (process.env.STRIPE_API_BASE || 'https://api.stripe.com').replace(/\/+$/, '');
   const MAX_TIERS = 5;
@@ -30,7 +30,7 @@ module.exports = function setupMemberships(ctx) {
     return {
       enabled: !!v.enabled,
       key,
-      webhookSecret: typeof v.webhookSecret === 'string' ? v.webhookSecret : '',
+      webhookSecret: openSecret(v.webhookSecret), // sealed with data/secret.key: anyone with it could fake payments
       feePercent: Number.isFinite(+v.feePercent) ? Math.max(0, Math.min(30, +v.feePercent)) : 5,
       currency: typeof v.currency === 'string' && /^[A-Z]{3}$/.test(v.currency) ? v.currency : 'USD',
     };
@@ -62,7 +62,7 @@ module.exports = function setupMemberships(ctx) {
       });
     } catch { fail(502, 'Couldn’t reach Stripe. Try again in a moment.'); }
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) fail(502, `Stripe: ${String((j.error && j.error.message) || r.status).slice(0, 200)}`);
+    if (!r.ok) fail(502, `Stripe: ${String((j.error && j.error.message) || r.status).slice(0, 200)}`, r.status === 404 ? 'stripe_not_found' : 'stripe_error');
     return j;
   }
 
@@ -70,6 +70,12 @@ module.exports = function setupMemberships(ctx) {
   const tierRow = (id) => db.prepare('SELECT * FROM membership_tiers WHERE id = ?').get(id);
   const account = (sid) => db.prepare('SELECT * FROM creator_accounts WHERE server_id = ?').get(sid);
   const roleRow = (sid, rid) => rid && db.prepare('SELECT * FROM roles WHERE id = ? AND server_id = ?').get(rid, sid);
+  // A role that comes with moderator powers, either itself or through a channel override.
+  const powerful = (r) => !!r && (!!(r.permissions & POWERFUL)
+    || !!db.prepare("SELECT 1 FROM channel_overrides WHERE target_type = 'role' AND target_id = ? AND (allow & ?) != 0").get(r.id, POWERFUL));
+  // The membership that gives a role, while it's on sale or anyone still has it (or is signing up), or null.
+  const tierForRole = (rid) => (rid && db.prepare(`SELECT t.* FROM membership_tiers t WHERE t.role_id = ? AND (t.active = 1
+    OR EXISTS (SELECT 1 FROM memberships m WHERE m.tier_id = t.id AND m.status IN ('active', 'past_due', 'pending'))) ORDER BY t.active DESC, t.created_at LIMIT 1`).get(rid)) || null;
   const publicTier = (t) => {
     const r = roleRow(t.server_id, t.role_id);
     return { id: t.id, name: t.name, description: t.description, priceCents: t.price_cents, currency: t.currency, active: !!t.active,
@@ -96,7 +102,10 @@ module.exports = function setupMemberships(ctx) {
     const has = new Set(db.prepare('SELECT role_id FROM member_roles WHERE server_id = ? AND user_id = ?').all(sid, uid).map((r) => r.role_id));
     let changed = false;
     for (const rid of tierRoles) {
-      if (!roleRow(sid, rid)) continue;
+      const role = roleRow(sid, rid);
+      if (!role) continue;
+      // Moderator powers can't be bought: a tier role that got them later (an edit, an override) isn't handed out.
+      if (want.has(rid) && !has.has(rid) && powerful(role)) { console.warn(`Not giving the membership role "${role.name}": it has moderator powers.`); continue; }
       if (want.has(rid) && !has.has(rid)) { db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(sid, uid, rid); changed = true; }
       if (!want.has(rid) && has.has(rid)) { db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(sid, uid, rid); changed = true; }
     }
@@ -153,6 +162,8 @@ module.exports = function setupMemberships(ctx) {
         const sub = typeof o.subscription === 'object' ? o.subscription : await stripe('GET', `/v1/subscriptions/${encodeURIComponent(o.subscription)}`);
         applySubscription(sub, o.metadata);
       } else if (ev.type === 'customer.subscription.created' || ev.type === 'customer.subscription.updated' || ev.type === 'customer.subscription.deleted') {
+        // Stripe confirms a subscription of a deleted server has ended: nothing left to retry.
+        if (ev.type === 'customer.subscription.deleted' || STATUS[o.status] === 'ended') db.prepare('DELETE FROM membership_cancellations WHERE stripe_sub = ?').run(String(o.id || ''));
         if ((o.metadata || {}).kind === 'membership' || db.prepare('SELECT 1 FROM memberships WHERE stripe_sub = ?').get(String(o.id || ''))) applySubscription(o);
       } else if (ev.type === 'invoice.paid' && (o.subscription || (o.parent && o.parent.subscription_details))) {
         // Newer Stripe API versions keep it under parent.subscription_details.
@@ -201,6 +212,8 @@ module.exports = function setupMemberships(ctx) {
     const t = tierRow(req.params.tid);
     if (!usable(c) || !acct || !acct.ready) fail(400, 'This server isn’t taking memberships right now.');
     if (!t || t.server_id !== s.id || !t.active) fail(404, 'That membership isn’t available.');
+    // Its role was deleted: there'd be nothing to get for the money.
+    if (t.role_id && !roleRow(s.id, t.role_id)) fail(404, 'That membership isn’t available.');
     if (s.owner_id === req.userId) fail(400, 'This is your own server, so there’s nothing to pay for.');
     if (db.prepare("SELECT 1 FROM memberships WHERE server_id = ? AND user_id = ? AND tier_id = ? AND status IN ('active', 'past_due')").get(s.id, req.userId, t.id)) {
       fail(400, 'You already have this membership.');
@@ -290,7 +303,7 @@ module.exports = function setupMemberships(ctx) {
     if (roleId) {
       const r = roleRow(s.id, roleId);
       if (!r || r.id === s.id) fail(400, 'Pick one of this server’s roles (not @everyone).');
-      if (r.permissions & POWERFUL) fail(400, `"${r.name}" has moderator powers, so it can’t be sold. Pick or make a role without them.`);
+      if (powerful(r)) fail(400, `"${r.name}" has moderator powers (itself or in a channel), so it can’t be sold. Pick or make a role without them.`);
       const other = db.prepare('SELECT name FROM membership_tiers WHERE server_id = ? AND role_id = ? AND id != ?').get(s.id, roleId, current.id || '');
       if (other) fail(400, `"${r.name}" already belongs to the "${other.name}" membership.`);
     }
@@ -339,30 +352,47 @@ module.exports = function setupMemberships(ctx) {
     const live = db.prepare("SELECT COUNT(*) n, COALESCE(SUM(amount_cents), 0) cents FROM memberships WHERE status IN ('active', 'past_due')").get();
     res.json({
       config: { enabled: c.enabled, keySet: !!c.key, keyMode: c.key ? (/_test_/.test(c.key) ? 'test' : 'live') : '', webhookSet: !!c.webhookSecret, feePercent: c.feePercent, currency: c.currency },
-      stats: { creators: db.prepare('SELECT COUNT(*) n FROM creator_accounts WHERE ready = 1').get().n, members: live.n, monthlyCents: live.cents, feeCents: Math.round(live.cents * c.feePercent / 100) },
+      stats: { creators: db.prepare('SELECT COUNT(*) n FROM creator_accounts WHERE ready = 1').get().n, members: live.n, monthlyCents: live.cents, feeCents: Math.round(live.cents * c.feePercent / 100),
+        // Subscriptions of deleted servers that Stripe hasn't confirmed as ended yet (retried every hour), and what
+        // Stripe said the last time one failed (empty while they're still being worked through).
+        pendingCancellations: db.prepare('SELECT COUNT(*) n FROM membership_cancellations').get().n,
+        cancelError: (db.prepare("SELECT last_error FROM membership_cancellations WHERE last_error != '' ORDER BY tried_at DESC LIMIT 1").get() || {}).last_error || '' },
     });
   });
-  api.put('/admin/memberships', auth, (req, res) => {
+  // Every change goes in the audit log (names of what changed, never the secrets). Replacing the Stripe key or the
+  // webhook secret decides where the money goes, so it needs the password (and two-factor) again.
+  api.put('/admin/memberships', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
     const b = req.body || {};
+    const before = cfg();
     let v = {};
     try { v = JSON.parse(getSetting('memberships') || '{}') || {}; } catch { /* fresh */ }
-    if (b.enabled !== undefined) v.enabled = !!b.enabled;
+    const changed = [];
+    if (b.enabled !== undefined) { v.enabled = !!b.enabled; if (v.enabled !== before.enabled) changed.push('enabled'); }
     if (b.key !== undefined) {
       const k = String(b.key || '').trim();
       if (k && !/^(sk|rk)_(live|test)_[A-Za-z0-9]{10,}$/.test(k)) fail(400, 'Use a Stripe secret key (sk_live_…) or restricted key (rk_live_…).');
       v.key = k ? seal({ k }) : '';
+      if (k !== before.key) changed.push('key');
     }
     if (b.webhookSecret !== undefined) {
       const w = String(b.webhookSecret || '').trim();
       if (w && !/^whsec_[A-Za-z0-9]{10,}$/.test(w)) fail(400, 'The webhook signing secret starts with whsec_');
-      v.webhookSecret = w;
+      v.webhookSecret = sealSecret(w);
+      if (w !== before.webhookSecret) changed.push('webhookSecret');
     }
-    if (b.feePercent !== undefined) { const f = +b.feePercent; if (!Number.isFinite(f) || f < 0 || f > 30) fail(400, 'The fee can be 0 to 30%.'); v.feePercent = Math.round(f * 10) / 10; }
-    if (b.currency !== undefined) { const cur = String(b.currency || '').toUpperCase(); if (!/^[A-Z]{3}$/.test(cur)) fail(400, 'Use a 3-letter currency code like USD.'); v.currency = cur; }
+    if (b.feePercent !== undefined) {
+      const f = +b.feePercent;
+      if (!Number.isFinite(f) || f < 0 || f > 30) fail(400, 'The fee can be 0 to 30%.');
+      v.feePercent = Math.round(f * 10) / 10;
+      if (v.feePercent !== before.feePercent) changed.push(`feePercent ${before.feePercent} \u2192 ${v.feePercent}`);
+    }
+    if (b.currency !== undefined) { const cur = String(b.currency || '').toUpperCase(); if (!/^[A-Z]{3}$/.test(cur)) fail(400, 'Use a 3-letter currency code like USD.'); v.currency = cur; if (cur !== before.currency) changed.push('currency'); }
+    if (changed.includes('key') || changed.includes('webhookSecret')) await stepUp(req, b);
     setSetting('memberships', JSON.stringify(v));
+    if (changed.length) auditLog(req, 'membership_settings', null, changed.join(', '));
     res.json({ ok: true });
-  });
+  }));
 
   // ------------------------------------------------------------------ keeping things right
   // Someone left (or was removed from) a server: stop billing them at the end of what they paid for.
@@ -372,11 +402,56 @@ module.exports = function setupMemberships(ctx) {
       stripe('POST', `/v1/subscriptions/${encodeURIComponent(sub)}`, { cancel_at_period_end: true }).then((x) => applySubscription(x)).catch((e) => console.warn('Couldn’t cancel a membership:', e.message));
     }
   }
-  // A server is being deleted: end everyone's membership now (there's nothing left to pay for).
+  // A server is being deleted: end everyone's membership now (there's nothing left to pay for). The membership rows
+  // go with the server, so each subscription is first written down in membership_cancellations and only crossed off
+  // once Stripe confirms it ended: if Stripe can't be reached right now, nobody keeps being billed (it's retried).
   function onServerDeleted(sid) {
-    const subs = db.prepare("SELECT stripe_sub FROM memberships WHERE server_id = ? AND status != 'ended'").all(sid);
-    for (const { stripe_sub: sub } of subs) {
-      stripe('DELETE', `/v1/subscriptions/${encodeURIComponent(sub)}`).catch((e) => console.warn('Couldn’t end a membership:', e.message));
+    const subs = db.prepare("SELECT stripe_sub, user_id FROM memberships WHERE server_id = ? AND status != 'ended'").all(sid);
+    const add = db.prepare('INSERT OR IGNORE INTO membership_cancellations (stripe_sub, server_id, user_id, created_at) VALUES (?, ?, ?, ?)');
+    db.transaction(() => subs.forEach((m) => add.run(m.stripe_sub, sid, m.user_id, now())))();
+    if (subs.length) setImmediate(() => { retryCancellations().catch(() => {}); });
+  }
+  // Ends one listed subscription. Returns true once Stripe says it's over (or it never existed).
+  async function cancelListed(p) {
+    const sub = encodeURIComponent(p.stripe_sub);
+    let done = false; let error = '';
+    try { await stripe('DELETE', `/v1/subscriptions/${sub}`); done = true; } catch (e) {
+      error = e.message;
+      // Already gone (no such subscription, or it had ended anyway): nothing is being billed.
+      if (e.code === 'stripe_not_found') done = true;
+      else { try { done = STATUS[(await stripe('GET', `/v1/subscriptions/${sub}`)).status] === 'ended'; } catch (e2) { if (e2.code === 'stripe_not_found') done = true; } }
+    }
+    if (done) db.prepare('DELETE FROM membership_cancellations WHERE stripe_sub = ?').run(p.stripe_sub);
+    else {
+      db.prepare('UPDATE membership_cancellations SET attempts = attempts + 1, last_error = ?, tried_at = ? WHERE stripe_sub = ?').run(String(error).slice(0, 300), now(), p.stripe_sub);
+      console.warn('Couldn’t end a membership of a deleted server (trying again later):', error);
+    }
+    return done;
+  }
+  // A run goes through the whole list (new ones first, a few at a time), not just a first batch, so members of a
+  // big server aren't left for the hourly retry. A call made while a run is going (another server deleted
+  // meanwhile) starts another run right after it instead of being dropped. Only when Stripe keeps failing does a
+  // run stop early; the rest then wait for the next hourly try.
+  let running = null; let again = false;
+  function retryCancellations() {
+    if (running) { again = true; return running; }
+    running = (async () => {
+      try { do { again = false; await cancellationRun(); } while (again); } finally { running = null; }
+    })();
+    return running;
+  }
+  async function cancellationRun() {
+    const started = now();
+    // Each subscription is tried once per run: one that just failed waits for the next run.
+    const pick = db.prepare('SELECT * FROM membership_cancellations WHERE tried_at IS NULL OR tried_at < ? ORDER BY tried_at IS NOT NULL, tried_at LIMIT 50');
+    let failedInARow = 0;
+    for (;;) {
+      const queue = pick.all(started);
+      if (!queue.length) return;
+      await Promise.all(Array.from({ length: Math.min(4, queue.length) }, async () => {
+        for (let p; failedInARow < 5 && (p = queue.shift());) failedInARow = (await cancelListed(p)) ? 0 : failedInARow + 1;
+      }));
+      if (failedInARow >= 5) return; // Stripe is down (or the key stopped working): no use hammering it
     }
   }
   // A missed webhook can't leave someone with access they stopped paying for (or without access they paid
@@ -388,7 +463,8 @@ module.exports = function setupMemberships(ctx) {
       try { applySubscription(await stripe('GET', `/v1/subscriptions/${encodeURIComponent(sub)}`)); } catch { /* next time */ }
     }
   }
-  setInterval(() => { reconcile().catch(() => {}); }, 3600000).unref();
+  setInterval(() => { reconcile().catch(() => {}); retryCancellations().catch(() => {}); }, 3600000).unref();
+  setTimeout(() => { retryCancellations().catch(() => {}); }, 5000).unref();
 
-  return { offers, syncRoles, onLeave, onServerDeleted, usable };
+  return { offers, syncRoles, onLeave, onServerDeleted, usable, POWERFUL, tierForRole, retryCancellations };
 };

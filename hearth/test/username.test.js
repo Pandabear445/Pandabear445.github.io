@@ -59,7 +59,7 @@ test('admins can rename someone; others can’t; the owner stays the owner after
   const owner = srv.owner;
   const u = await srv.register('rude' + hex(3));
   const mod = await srv.register('mod' + hex(3));
-  assert.equal((await as(owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator' })).status, 200);
+  assert.equal((await as(owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator', authKey: owner.authKey })).status, 200);
   const name = 'renamed' + hex(3);
   assert.equal((await as(u, 'POST', `/admin/users/${owner.id}/username`, { username: 'hijack' + hex(2) })).status, 403, 'not staff');
   assert.equal((await as(mod, 'POST', `/admin/users/${u.id}/username`, { username: name })).status, 403, 'moderators can’t');
