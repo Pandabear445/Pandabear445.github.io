@@ -364,7 +364,7 @@ jobs:
           strip_components: 1
       - name: Keep only the two newest of each installer on the server
         if: env.HAS_VPS == 'true'
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@v1.2.5
         env:
           DIR: ${{ secrets.VPS_DOWNLOADS_DIR }}
         with:
