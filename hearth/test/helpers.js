@@ -67,7 +67,10 @@ async function startServer(extraEnv = {}) {
   const port = await freePort();
   const env = {
     ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test',
-    MAIL_OUTBOX_DIR: path.join(dir, 'outbox'), PUBLIC_URL: 'https://chat.example.test', FEED_ALLOW_PRIVATE: '', ...extraEnv,
+    MAIL_OUTBOX_DIR: path.join(dir, 'outbox'), PUBLIC_URL: 'https://chat.example.test', FEED_ALLOW_PRIVATE: '',
+    // The readable log format prints stack traces on their own lines, which the attack suite counts as crashes
+    // (JSON lines would hide them inside a string). Tests that parse the log ask for LOG_FORMAT=json.
+    LOG_FORMAT: 'pretty', ...extraEnv,
   };
   let log = '';
   let child;

@@ -25,8 +25,9 @@ const config = {
 };
 
 // ------------------------------------------------------------------ redaction
-// Field names whose values are never written. (Matched on the whole key, case-insensitively.)
-const SECRET_KEY = /^(.*(token|password|passwd|secret|authorization|cookie|ciphertext|authkey|auth_key|recovery|backupcode|totp|privatekey|private_key|wrapped|apikey|api_key|signature|sig)s?|pass|key|body|text|content|evidence|details|enc_.*|wrap.*)$/i;
+// Field names whose values are never written: any name containing one of the words, or exactly one of the short
+// ones. (Case-insensitive. Over-redacting a harmless field is fine; under-redacting isn't.)
+const SECRET_KEY = /token|passw|secret|authoriz|cookie|cipher|authkey|auth_key|recovery|backupcode|totp|private|wrapped|apikey|api_key|signature|^(pass|key|sig|body|text|content|evidence|details|enc_.*|wrap.*)$/i;
 const IP_KEY = /^(ip|ips|remote|remoteaddress|clientip|peer)$/i;
 const HEX_TOKEN = /\b[0-9a-f]{40,}\b/gi; // session tokens (64 hex), reset links, backup keys, hashes
 const BEARER = /\b(bearer|basic)\s+[^\s"',;]+/gi;

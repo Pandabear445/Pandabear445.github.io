@@ -74,7 +74,7 @@ module.exports = function setupAlerts(ctx) {
     k.active = true;
     k.lastSeen = now();
     if (!c.enabled) return 'off';
-    if (now() - k.lastSent < c.cooldownMin * 60000) { k.suppressed++; return 'cooldown'; }
+    if (k.lastSent && now() - k.lastSent < c.cooldownMin * 60000) { k.suppressed++; return 'cooldown'; }
     if (sentLastHour() >= MAX_PER_HOUR) { k.suppressed++; return 'capped'; }
     const held = k.suppressed;
     const alert = { key, severity, title: log.scrub(title).slice(0, 140), detail: log.scrub(detail).slice(0, 600), at: now(), held, delivered: true };

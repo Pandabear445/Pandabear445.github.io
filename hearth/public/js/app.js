@@ -522,6 +522,11 @@ function startApp() {
     playSound('mention');
     if (S.view.type === 'admin' && S.view.tab === 'reports') renderMain();
   });
+  // Problems the server found (failed backup, a relay down, low disk...): staff see them as they happen.
+  socket.on('admin:alert', ({ title, severity }) => {
+    toast(`${severity === 'critical' ? 'Urgent: ' : ''}${title}. Open Admin \u2192 Health.`, severity === 'critical' ? 'error' : undefined);
+    if (S.view.type === 'admin' && S.view.tab === 'health') renderMain();
+  });
   socket.on('profile:comment', ({ from }) => toast(`${displayName(getUser(from))} commented on your profile.`));
   socket.on('config:update', (c) => {
     Object.assign(S.config, c);
