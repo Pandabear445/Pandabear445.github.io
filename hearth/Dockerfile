@@ -6,7 +6,7 @@
 
 # Stage 1: install dependencies. better-sqlite3 normally downloads a prebuilt binary, but if that
 # download isn't available it compiles from source — which needs Python and a C++ toolchain.
-FROM node:22.23-bookworm-slim AS deps
+FROM node:26.10-bookworm-slim AS deps
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
@@ -15,7 +15,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
 # Stage 2: the small image that actually runs Hearth (no compilers inside).
-FROM node:22.23-bookworm-slim
+FROM node:26.10-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production DATA_DIR=/data
 # OS security fixes released after the base image was built, and the SSH client (sftp) that copies
