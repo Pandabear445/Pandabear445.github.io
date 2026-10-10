@@ -183,12 +183,12 @@
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
         <h3>Encrypted by default</h3>
-        <p>Messages, DMs and files are locked on your device before they're sent. Even whoever runs the server can't read them.</p>
+        <p>Messages, DMs and files are locked on your device before they're sent, so the server only ever stores scrambled data.</p>
       </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></div>
         <h3>Voice, video and screen share</h3>
-        <p>Drop into a voice channel, turn on your camera or share your screen with sound. Calls go straight between you and your friends.</p>
+        <p>Drop into a voice channel, turn on your camera or share your screen with sound. Calls go straight between you and your friends, and stay encrypted when a relay has to help.</p>
       </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M10 9l5 2.5-5 2.5z"/><path d="M8 21h8"/></svg></div>
@@ -280,10 +280,10 @@
         </ul>
       </div>
       <div class="card">
-        <h3>🔒 What the server can't see</h3>
+        <h3>🔒 What the server can't read</h3>
         <ul>
-          <li>Your messages, DMs and files (they're encrypted on your device)</li>
-          <li>Your calls (they go directly between people in the call)</li>
+          <li>Your messages, DMs and files (they're encrypted on your device; the server still sees who talks to whom, and when)</li>
+          <li>Your calls (encrypted between the people in the call, even through a relay)</li>
           <li>Your study decks (encrypted and synced like everything else)</li>
         </ul>
       </div>
@@ -328,7 +328,7 @@ docker compose up -d</pre>
     </details>
     <details>
       <summary>Can the people running the server read my messages?</summary>
-      <p>No. Messages, DMs and files are encrypted in your app before they're sent, and only the people in that chat have the keys. The server stores scrambled data. Calls go directly between the people in them.</p>
+      <p>Not from what the server stores. Messages, DMs and files are encrypted in your app before they're sent, and only the people in that chat have the keys; the server keeps scrambled data, and calls stay encrypted between the people in them. The server does see who talks to whom and when. The app's code also comes from the server, so you're trusting whoever runs it not to change that code: pick a server you trust, or host your own. The details are in the <a href="https://github.com/Pandabear445/Pandabear445.github.io/blob/main/hearth/SECURITY.md">security notes</a>.</p>
     </details>
     <details>
       <summary>How is this different from Discord?</summary>

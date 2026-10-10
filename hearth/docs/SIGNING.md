@@ -2,7 +2,8 @@
 
 This page explains, in plain language, why Windows and Android warn people before they install the Hearth
 apps, what you can buy or set up to make those warnings go away (or get smaller), what it costs, and exactly
-which GitHub settings to fill in. The build (`.github/workflows/hearth-apps.yml`) already knows how to sign:
+which GitHub settings to fill in. It also covers signing the desktop app's updates, which protects people's apps
+from a server that's been broken into. The build (`.github/workflows/hearth-apps.yml`) already knows how to sign:
 it signs automatically as soon as the secrets below exist, and builds unsigned apps (like today) when they
 don't.
 
@@ -21,6 +22,7 @@ Prices and rules below were checked in October 2026. They change, so check the l
 | Windows: SmartScreen still warns about a *signed* installer for a while | Nothing to buy; it fades as people download it (reputation) | free | wait |
 | Android: "Install unknown apps", Play Protect "unrecognised app" | Install from **Google Play** (internal testing for friends) | **$25 once** | an evening, plus Google's ID check |
 | Browser padlock / "Not secure" on your website | Already done: Caddy gets a real TLS certificate | free | none |
+| Desktop apps installing an update someone else put on your server | Your own **update signing key** (`UPDATE_SIGNING_KEY`, see [Signing desktop updates](#signing-desktop-updates)) | **free** | ten minutes |
 
 ## First: the website certificate is a different thing
 
@@ -53,8 +55,12 @@ name shown). It gets better as more people install it. You can also submit a sig
 Good to know:
 - **EV certificates no longer skip SmartScreen.** Since 2024, "Extended Validation" certificates don't get
   instant reputation any more. They cost more and are meant for companies; they aren't worth it here.
-- **Auto-updates are fine either way.** The app updates itself from your server. Once you sign, the installed
-  app only accepts updates signed with the **same publisher name** (see "Keep signing once you start").
+- **Auto-updates work either way, but Windows signing alone doesn't make them safe.** The app updates itself from
+  your server's `/updates` (its `data/downloads` folder), so whoever can write that folder decides what's offered.
+  Once you sign, the installed Windows app only accepts updates signed with the **same publisher name** (see "Keep
+  signing once you start"), but that check looks at the name only, and with SignPath the name is "SignPath
+  Foundation", which every project SignPath signs shares. Linux builds have no code signature at all. What really
+  protects updates is the separate **update signing key** (see [Signing desktop updates](#signing-desktop-updates)).
 
 ### Option S (free, recommended for Hearth): SignPath Foundation
 
@@ -227,8 +233,10 @@ log. People click **More info → Run anyway** once.
 
 ### Keep signing once you start
 
-When the app is signed, the installed app remembers the publisher name and only installs updates signed with
-**that same name** (a protection: someone who breaks into your server can't push a fake update). So:
+When the app is signed, the installed Windows app remembers the publisher name and only installs updates signed
+with **that same name**. That stops an unsigned or differently-named fake update, but it checks the name only
+(with SignPath, every SignPath-signed project has the same name). Against someone who breaks into your server,
+rely on the [update signing key](#signing-desktop-updates). So:
 
 - **Set `WINDOWS_REQUIRE_SIGNING=true`** (a repository *variable*) after your first signed release. Then a build
   fails, instead of quietly producing an unsigned installer, if the secrets are missing or expired. An unsigned
@@ -239,6 +247,49 @@ When the app is signed, the installed app remembers the publisher name and only 
   option B to A with a different name), people need to download the new installer once from your server's
   `/download` page.
 - Going from unsigned to signed is no problem: today's unsigned app accepts the first signed update.
+
+---
+
+## Signing desktop updates
+
+Separate from Windows code signing, and free: an **update signing key** of your own (Ed25519). The desktop app
+downloads its updates from the server it's connected to, so without this key, whoever can write that server's
+`data/downloads` folder (anyone who breaks into it, or a server you don't run) decides what your users install.
+
+Apps built with the key carry its public half (in `hearth.config.json` as `updatePublicKey`) and install an update
+only when:
+
+1. its `latest*.yml` comes with a `latest*.yml.sig` that is a valid signature by your private key over that exact
+   file and its name;
+2. the signed version is newer than the one running (no going back to an old, signed version);
+3. the installer's SHA-512 matches one the signed file lists (checked again right before it runs).
+
+Apps built without the key still update, but always ask first and say the update can't be verified (Settings →
+Apps & devices shows which kind you have). Either way the app never installs an update without asking, and nothing
+installs on quit. macOS builds don't update themselves (people download new versions from `/download`).
+
+**Set it up once:**
+
+1. Make a key pair on your own computer: `node hearth/desktop/build/sign-update.js keygen`. It prints a private key
+   (PEM) and its public half.
+2. Put the **whole** private key (with the BEGIN/END lines, or its base64) in the repository **secret**
+   `UPDATE_SIGNING_KEY`. Keep an offline copy (a password manager). Never commit it.
+3. Build a release (an `app-v*` tag or *Run workflow*). The workflow bakes the public key into the app
+   (`sign-update.js bake`), and after any step that rewrites `latest*.yml` (SignPath's re-signing included) writes
+   `latest*.yml.sig` next to each one (`sign-update.js sign dist`). The release and the server copy include the
+   `.sig` files. Without the secret the build prints a warning and the apps can't verify updates.
+
+**Uploading by hand:** copy each `latest*.yml.sig` next to its `latest*.yml` in `data/downloads`, or the signed apps
+refuse the update. To sign files you built yourself:
+`UPDATE_SIGNING_KEY="$(cat update-key.pem)" node build/sign-update.js sign dist` (run in `hearth/desktop`).
+
+**Good to know:**
+
+- Losing or changing the key means apps built with the old public key refuse every new update. People then
+  install the next version by hand from your server's `/download` page, once.
+- Apps built before this feature, and fork builds without the secret, can't verify signatures. The first update
+  from such an app to a signed build is installed the old way (after asking).
+- Forks should make their own key; they can't sign with yours.
 
 ---
 
@@ -340,6 +391,9 @@ All in GitHub: your repository → *Settings → Secrets and variables → Actio
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | Secret | Android signing key, Play bundle |
 | `PLAY_SERVICE_ACCOUNT_JSON` | Secret | upload to Play internal testing |
 | `PLAY_RELEASE_STATUS` | Variable (optional) | `draft` while the Play app is still a draft |
+| `UPDATE_SIGNING_KEY` | Secret | Signs desktop updates; apps built with it only install updates you signed |
+| `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DOWNLOADS_DIR` | Secret | Copy release installers and update files to your server's `data/downloads` (use a user that can only write that folder, not root) |
+| `VPS_HOST_FINGERPRINT` | Secret | **Required with `VPS_HOST`:** the server's SSH host key fingerprint (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server, the `SHA256:…` part). Without it the copy fails and copies nothing |
 
 Forks and Dependabot runs don't get your secrets; their builds are simply unsigned.
 

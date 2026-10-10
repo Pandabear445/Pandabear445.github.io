@@ -40,7 +40,9 @@ or lower limits. Keep the GIF library cap (default 5 GB) in mind too.
 
 **Bandwidth (300 Mbit/s ≈ 37 MB/s).** Chat text is negligible. Calls go directly between people, so they use
 none of your bandwidth — except calls that need the relay (TURN) if it runs on this same server: about
-3,000 relayed voice streams or ~100 relayed video streams fill the port. Pictures: a 1.5 MB photo seen by 30
+3,000 relayed voice streams or ~100 relayed video streams fill the port. `scripts/setup-turn.sh` caps each relayed
+connection at 6 Mbit/s each way (`TURN_MAX_MBIT`); set `TURN_CAPACITY_MBIT` to cap all relayed calls together
+(default: no total cap), e.g. `TURN_CAPACITY_MBIT=200 sudo bash scripts/setup-turn.sh`. Pictures: a 1.5 MB photo seen by 30
 people is 45 MB. GIFs loaded "through this server" (privacy setting) are the biggest user of bandwidth; turn
 that off in Settings → Instance if bandwidth ever becomes a problem.
 
@@ -70,9 +72,11 @@ delay. So a region is a small relay server near people.
 
 **How the regions link up (built in, Admin → Regions):**
 
-1. *Add a region* → name it (e.g. "Frankfurt") → you get a one-line install command.
+1. *Add a region* → name it (e.g. "Frankfurt") → confirm with your password → you get a one-line install command.
+   (Adding, reinstalling, renaming and removing regions are all written to the audit log.)
 2. Rent the cheapest VPS there, log in as root, paste the line. It installs the relay with your server's secret,
-   plus a tiny check-in that reports to your server every minute (address, CPU, memory, traffic this month).
+   plus a tiny check-in that reports to your server every minute (address, CPU, memory, traffic this month). The
+   address a region reports must be a real public IP; private, loopback and look-alike spellings are refused.
 3. Within a minute the region shows **Online** in Admin → Regions, and every call includes it.
 4. Each person's app measures which relays answer fastest from where they are and uses the two nearest. A region
    that stops checking in is dropped from calls after 3 minutes and comes back by itself.
@@ -94,8 +98,15 @@ goes through that region's relay (still end-to-end encrypted: the relay only for
 In a server, changing a voice channel's region needs **Manage Channels**; in DM and group calls anyone in the call
 can change it. If a picked region goes offline, the call falls back to Automatic by itself.
 
-The install link expires after 24 hours (*Reinstall* makes a new one). When your server uses its own self-signed
-certificate, the command pins that exact certificate, so the new region only ever talks to your server.
+The install link expires after 24 hours (*Reinstall* makes a new one, and needs your password too). When your
+server uses its own self-signed certificate, the command pins that exact certificate, so the new region only ever
+talks to your server.
+
+**What a region holds.** The relay secret is the same on every relay (the main one and each region), so someone
+who breaks into one region can make relay logins that work on all of them, and can change the address that region
+reports. Only rent regions from providers you'd trust with that. To change the secret, set a new one (Settings →
+Instance → Calls, or `sudo bash scripts/setup-turn.sh` again) and **Reinstall** every region. Relay logins already
+handed out keep working until they run out (12–18 hours).
 
 **Where to put them, cheaply** (prices checked October 2026; they change):
 
@@ -117,6 +128,57 @@ third (Asia or US West) covers thousands of people. Oracle's free tier makes the
 near everyone, hides your server's IP and blocks floods, also at $0. WebSockets work on the free plan. It needs
 a domain (next section).
 
+## Operating notes
+
+**Visitors' addresses behind a proxy (`TRUST_PROXY`).** IP bans, sign-in limits and the addresses in the audit log
+all depend on knowing who a visitor is. Hearth believes the `X-Forwarded-For` header only from a trusted proxy: by
+default this machine (Caddy or nginx on the same host), and with `docker-compose.yml` its own Caddy network
+(`10.231.47.0/28`). Anything else — nginx in another container, Traefik, a tunnel, a proxy on another machine —
+needs `TRUST_PROXY=<its address or subnet>` in `.env`, or every visitor shares the proxy's address and one set of
+sign-in limits; Hearth's log names each ignored proxy address once. In Docker, a value in `.env` replaces the
+compose default. Never set it to a number, or to Docker's gateway (`x.x.x.1`), unless `HEARTH_BIND=127.0.0.1`:
+then anyone reaching port 3000 directly could claim any address. `TRUST_PROXY=1` now really means "one proxy in
+front" (before, that value never matched, so everyone behind Caddy shared one address). Older Docker installs keep
+their `docker-compose.yml`, so `hearth-update` adds `TRUST_PROXY=<your proxy network's subnet>` to `.env` by itself
+and says so.
+
+**Shipping a server update.** `bash scripts/make-update-zip.sh [folder]` makes `hearth-update-<version>.zip` and
+`hearth-update-<version>.zip.sha256` from the last commit (default folder: `hearth/dist`, which git ignores). Hand
+out both, and put the SHA-256 in the release notes too. The update tools and `hearth-update` refuse a zip that
+doesn't match the `.sha256` next to it, print the SHA-256 they install, and check the upload again on the server
+in a private temporary folder. Without a `.sha256` they only print the SHA-256, so compare it yourself. A checksum
+isn't a signature: someone who can replace both files can replace both, which is why the published copy matters.
+Exit codes 90–92 from the tools mean the updater never ran (damaged upload, no updater in the zip, no private
+folder).
+
+**Shipping the desktop apps.** Set the `UPDATE_SIGNING_KEY` secret so installed apps only take updates you signed
+(see [SIGNING.md](SIGNING.md#signing-desktop-updates)). To have GitHub copy the installers to your server, add
+`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DOWNLOADS_DIR` **and** `VPS_HOST_FINGERPRINT`: the `SHA256:…` value from
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server. Without the fingerprint the copy step fails and
+copies nothing. Use a user with no sudo that can only write `data/downloads`, not root. Only `app-v*` tags and the
+default branch are copied.
+
+**The call relay (TURN).** Relay passwords are per person and run out 12–18 hours after they're handed out; the app
+fetches new ones by itself. Relay setups made before the bandwidth caps need `sudo bash scripts/setup-turn.sh` run
+again, and each region reinstalled. Setting coturn up by hand from `deploy/turnserver.conf`: remove the `#` from
+`static-auth-secret=` and set a long random secret (left as it is, the relay accepts no one), add `max-bps` if you
+want a cap, and give Hearth `TURN_URL` and `TURN_SECRET`. `TURN_USERNAME`/`TURN_CREDENTIAL` still work but hand
+everyone, including people you remove, one password that never expires (the server warns at start-up). Changing
+the relay's secret or addresses needs your password and is audit-logged.
+
+**Outbound requests and push.** Feeds, trackers, news and music pictures and push notifications may only reach
+public internet addresses, never this server's own (except ports 80 and 443). Behind NAT the public IP isn't on a
+network interface, so list it in `OUTBOUND_BLOCK` (comma-separated addresses or CIDR ranges, refused on every port),
+together with anything else on your network that should never be reached. `PUSH_ALLOW_PRIVATE=1` allows push
+endpoints on private addresses: only for tests, or a push service on your own network.
+
+**Backups.** The encrypted backups in `data/backups/encrypted/` are the only thing to copy off-site; that folder
+only ever holds `.hbk` files (and `.hbk.part` while one is being written). The plain database snapshot each backup
+is made from lives in `data/backups/.tmp` (readable by Hearth alone) and is deleted afterwards, at shutdown, and at
+start-up when a crash left one (anything untouched for 10 minutes). Copying with rclone yourself? Use
+`rclone copy data/backups/encrypted remote:hearth --include '*.hbk'`. `cli.js restore` and `verify-backup` warn
+when a backup comes from a newer Hearth, which this version won't start on.
+
 ## Making money without being invasive
 
 Hearth's chats are end-to-end encrypted, so there's no data to sell even if you wanted to. That's a selling
@@ -135,6 +197,11 @@ Point it at your server and put Caddy in front (README → "On a VPS with a doma
      person's code to the link, so nothing needs pasting.
    * Payments without a code wait in Admin → Money: one click gives them to the right person.
    * Payments also count toward the funding card's "raised this month" by themselves.
+   * Changing where money goes (the Ko-fi page or token, the Stripe link or signing secret, the funding card's
+     donation link) needs your password again, and every change is audit-logged (without the secrets).
+   * Refunds and chargebacks don't take supporter time away; unmark the supporter by hand in Admin → Users.
+   * If one Stripe account sends events to both webhooks, `/api/pay/stripe` ignores creator-membership payments,
+     so they aren't counted as donations.
 2. **Perks that cost you money to provide, never basics.** More storage (Owner → Funding), bigger files (Money →
    perks), the badge. Keep chat, privacy, calls, profiles, games & music free: that's the promise that makes
    people trust you.
@@ -153,8 +220,11 @@ Point it at your server and put Caddy in front (README → "On a VPS with a doma
    * Set up once: Stripe → Connect (Express accounts), paste a secret key and add a webhook to
      `https://your-server/api/pay/memberships` (events `checkout.session.completed`,
      `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`), then turn it on.
-   * Roles with moderator powers can't be sold. Leaving or being removed from a server stops renewals at the end
-     of the paid month; deleting a server ends its memberships.
+   * Setting or changing the Stripe key or webhook secret needs your password again.
+   * Roles with moderator powers can't be sold, and a sold role can't gain them later. Leaving or being removed
+     from a server stops renewals at the end of the paid month; deleting a server ends all its memberships right
+     away. If Stripe is down at that moment, the cancellations are kept and retried every hour until Stripe
+     confirms them; Admin → Money shows how many are waiting and Stripe's last error.
    * With Express accounts the platform (you) is responsible for refunds and disputes Stripe can't recover
      from the creator, so only enable it for creators you trust, and read Stripe's Connect terms.
 
@@ -165,7 +235,8 @@ Avoid: ads, tracking pixels, selling data, paywalling safety or privacy features
 
 ## Telling people about it
 
-* **The pitch:** "Private by design — the people running it can't read your chats. No ads, no tracking.
+* **The pitch:** "Private by design — your chats are end-to-end encrypted, so the server only stores scrambled
+  data. No ads, no tracking.
   MySpace-style profiles, watch-together, voice and video. Runs for under a cent per person a month, paid for
   by the community." Back it with real numbers (this page) and a public "what it costs" note on the funding
   card.
@@ -174,7 +245,9 @@ Avoid: ads, tracking pixels, selling data, paywalling safety or privacy features
   (r/privacy, r/selfhosted), and a "Show HN"/Product Hunt launch when you're ready for a spike — the
   capacity numbers above say one server can take it.
 * **Be careful with:** claims you can't back up. "End-to-end encrypted" is true for messages, files and calls;
-  who-talks-to-whom (metadata) is visible to the server — say so.
+  who-talks-to-whom (metadata) is visible to the server — say so. Don't promise that even a hostile host can't
+  read chats: the apps load their code from the server, so people are trusting whoever runs it (see SECURITY.md
+  §4).
 
 ## Things to keep an eye on legally
 
