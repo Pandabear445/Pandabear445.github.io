@@ -1,7 +1,7 @@
 // Accessibility and responsive-layout checks in a real browser (npm run test:a11y). Separate from
 // `npm test`: it needs Chromium and Playwright (see test/browser/harness.mjs). Each check below guards a
 // fix described in docs/ACCESSIBILITY.md, so it doesn't quietly come back.
-import { launch, signUp, createServer, sendMessage, settle, PASSWORD } from '../browser/harness.mjs';
+import { launch, signUp, createServer, sendMessage, settle, closeNav, PASSWORD } from '../browser/harness.mjs';
 import { auditDom, overflowDom } from './checks.mjs';
 import { checkContrast } from './contrast.mjs';
 
@@ -306,12 +306,12 @@ try {
   await ph.click('.nav-toggle'); await settle(ph, 400);
   const inView = (sel) => ph.evaluate((s) => { const e = document.querySelector(s); if (!e) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.left >= -1 && r.right <= innerWidth + 1 && r.top >= -1 && r.bottom <= innerHeight + 1; }, sel);
   check(await inView('#user-panel button[aria-label="Settings"]'), 'settings button is on screen in the navigation drawer');
-  await ph.click('#sidebar-body .ch-row >> nth=0').catch(() => {});
-  await ph.click('#rail button[aria-label^="Quality checks"]').catch(() => {});
+  await ph.keyboard.press('Escape'); await settle(ph, 300);
+  check(!(await ph.locator('body.nav-open').count()), 'Esc closes the navigation drawer');
+  await ph.click('.nav-toggle'); await settle(ph, 300);
+  await ph.click('#rail button[aria-label^="Quality checks"]');
   await settle(ph, 400);
-  if (await ph.locator('body.nav-open').count()) { await ph.click('#sidebar-body .ch-row >> nth=0').catch(() => {}); await settle(ph, 400); }
-  if (await ph.locator('body.nav-open').count()) await ph.click('.nav-scrim', { force: true }).catch(() => {});
-  await settle(ph, 300);
+  await closeNav(ph);
   check(await inView('#composer-input'), 'the message box is on screen');
   check(await inView('#main-head button[aria-label^="Search"]'), 'search is reachable from the header');
   await ph.click('#main-head button[aria-label^="Search"]'); await settle(ph, 400);
@@ -330,8 +330,7 @@ try {
   if (!(await ph.locator('body.nav-open').count())) await ph.click('.nav-toggle');
   await settle(ph, 300);
   await ph.click('#sidebar-body >> text=Lounge'); await settle(ph, 800);
-  if (await ph.locator('body.nav-open').count()) await ph.click('.nav-scrim', { force: true }).catch(() => {});
-  await settle(ph, 300);
+  await closeNav(ph);
   const join = ph.locator('.cs-controls .btn.primary');
   if (await join.count()) { await join.click(); await settle(ph, 1500); }
   check(await inView('.cs-controls button[aria-label="Leave call"]') || await inView('.cs-controls .btn.primary'), 'call controls are on screen', await ph.evaluate(() => [...document.querySelectorAll('.cs-controls button')].map((b) => b.getAttribute('aria-label') || b.textContent)));
@@ -356,10 +355,9 @@ try {
   await kb.click('#login-form button[type=submit]');
   await kb.waitForSelector('#app:not([hidden]):not(.loading)', { timeout: 60000 });
   await kb.click('.nav-toggle'); await settle(kb, 300);
-  await kb.click('#rail button[aria-label^="Quality checks"]').catch(() => {});
+  await kb.click('#rail button[aria-label^="Quality checks"]');
   await settle(kb, 300);
-  await kb.click('#sidebar-body .ch-row >> nth=0').catch(() => {});
-  if (await kb.locator('body.nav-open').count()) await kb.click('.nav-scrim', { force: true }).catch(() => {});
+  await closeNav(kb);
   await kb.waitForSelector('#composer-input');
   await kb.focus('#composer-input');
   await kb.evaluate(() => window.__setKeyboard(340));

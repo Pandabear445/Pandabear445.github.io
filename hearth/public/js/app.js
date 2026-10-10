@@ -1169,7 +1169,9 @@ function globalKeys(e) {
   if ((e.ctrlKey || e.metaKey) && k === 'k') { e.preventDefault(); openSearch(); return; }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); stepChannel(e.key === 'ArrowUp' ? -1 : 1); }
   if (e.key === 'Escape' && !document.querySelector('.modal-backdrop, .popover')) {
-    if (S.editing) { S.editing = null; renderMessages(false); }
+    // Phones: the navigation drawer closes first, and focus goes back to the button that opened it.
+    if (document.body.classList.contains('nav-open')) { document.body.classList.remove('nav-open'); const t = $('.nav-toggle'); if (t) t.focus(); }
+    else if (S.editing) { S.editing = null; renderMessages(false); }
     else if (composers.main && composers.main.state.replyTo) composers.main.setReply(null);
     else if (S.panel === 'thread') closeThread();
   }

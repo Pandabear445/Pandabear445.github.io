@@ -91,6 +91,15 @@ export async function createServer(page, name) {
   await settle(page);
 }
 
+// Phones: closes the navigation drawer by tapping the dimmed part of the screen to its right.
+export async function closeNav(page) {
+  if (!(await page.locator('body.nav-open').count())) return;
+  const { width, height } = page.viewportSize();
+  await page.mouse.click(width - 8, Math.round(height / 2));
+  await page.waitForFunction(() => !document.body.classList.contains('nav-open'), null, { timeout: 5000 });
+  await settle(page, 250);
+}
+
 // Types into the main composer and waits until the message shows as sent.
 export async function sendMessage(page, text) {
   const before = await page.locator('#messages .msg:not(.pending)').count();
