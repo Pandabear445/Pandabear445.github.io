@@ -189,7 +189,8 @@ function serializeServer(s, uid) {
     }));
   const mrows = db.prepare('SELECT user_id FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id);
   const memberRoles = {};
-  db.prepare('SELECT user_id, role_id FROM member_roles WHERE server_id = ?').all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
+  db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
+    WHERE mr.server_id = ?`).all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
   const roleDefs = db.prepare('SELECT * FROM roles WHERE server_id = ? ORDER BY position DESC').all(s.id)
     .map((r) => ({ id: r.id, name: r.name, color: r.color, icon: r.icon, position: r.position, permissions: r.permissions, hoist: !!r.hoist, mentionable: !!r.mentionable, everyone: r.id === s.id }));
   const emojis = db.prepare('SELECT id, name, url, animated FROM emojis WHERE server_id = ? ORDER BY name').all(s.id).map((e) => ({ ...e, animated: !!e.animated }));
@@ -1090,7 +1091,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
       last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
-    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
     db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0 WHERE id = ?").run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
@@ -1335,7 +1336,9 @@ api.patch('/servers/:id', auth, (req, res) => {
 });
 
 api.post('/servers/:id/icon', auth, limited('image', uploadImage, 'icon'), (req, res) => {
-  const srv = requirePerm(req.params.id, req.userId, PM.MANAGE_SERVER);
+  const srv = requireServer(req.params.id, req.userId);
+  // Anyone in a group chat can change its picture (like its name); servers need Manage Server.
+  if (srv.kind !== 'group' && !can(srv, req.userId, PM.MANAGE_SERVER)) fail(403, 'You don’t have permission to do that.');
   if (!req.file) fail(400, 'Choose an image.');
   db.prepare('UPDATE servers SET icon = ? WHERE id = ?').run('/uploads/' + req.file.filename, srv.id);
   removeUpload(srv.icon);
@@ -1350,8 +1353,12 @@ function kickFromVoiceInServer(serverId, userId) {
   if (!c || c.server_id === serverId) leaveVoice(userId, true);
 }
 
-api.delete('/servers/:id', auth, (req, res) => {
-  const s = requireOwner(req.params.id, req.userId);
+// Deleting a server or handing it to someone else can't be undone, so like other sensitive changes it needs your
+// password (and a two-factor code when that's on): a stolen sign-in alone can't wipe or take your servers.
+api.delete('/servers/:id', auth, wrap(async (req, res) => {
+  requireOwner(req.params.id, req.userId);
+  const row = await stepUp(req, req.body);
+  const s = requireOwner(req.params.id, req.userId); // checked again: the password check took a moment
   db.prepare('SELECT id FROM channels WHERE server_id = ?').all(s.id).forEach((c) => {
     const m = voiceChannels.get(c.id);
     if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
@@ -1363,8 +1370,10 @@ api.delete('/servers/:id', auth, (req, res) => {
   removeUpload(s.icon);
   io.to(`server:${s.id}`).emit('server:remove', { serverId: s.id });
   io.in(`server:${s.id}`).socketsLeave(`server:${s.id}`);
+  auditLog(req, 'server_deleted', s.id, s.name);
+  ACCT.notify(row, 'a server was deleted', `${row.username} deleted the server "${s.name}" with all its channels, messages and files.`);
   res.json({ ok: true });
-});
+}));
 
 api.post('/servers/:id/leave', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
@@ -1382,7 +1391,15 @@ api.post('/servers/:id/leave', auth, (req, res) => {
 function removeMember(serverId, userId) {
   MEMB.onLeave(serverId, userId);
   kickFromVoiceInServer(serverId, userId);
-  db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
+  // Everything that was theirs as a member goes too: roles and per-channel overrides (or rejoining with any
+  // invite, even after an unban, would hand back Administrator and private channels) and event RSVPs (or
+  // they'd keep getting reminders about events they can no longer see).
+  db.transaction(() => {
+    db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
+    db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ?').run(serverId, userId);
+    db.prepare("DELETE FROM channel_overrides WHERE target_type = 'member' AND target_id = ? AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)").run(userId, serverId);
+    db.prepare('DELETE FROM event_rsvps WHERE user_id = ? AND event_id IN (SELECT id FROM server_events WHERE server_id = ?)').run(userId, serverId);
+  })();
   // They still hold old keys, so the remaining members must switch to a fresh key.
   db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ?').run(serverId);
   io.in(`user:${userId}`).socketsLeave(`server:${serverId}`);
@@ -1401,12 +1418,15 @@ api.delete('/servers/:id/members/:uid', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Give/take roles. You can only hand out roles below your own highest role.
+// Give/take roles. You can only hand out roles below your own highest role, and only roles whose permissions
+// you have yourself (or a Manage Roles holder could give anyone, themselves included, an Administrator role
+// that happens to sit lower in the list).
 api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.MANAGE_ROLES, 'You need the Manage Roles permission.');
   const uid = req.params.uid;
   if (!isMember(s.id, uid)) fail(404, 'That person is not in this server.');
   const myTop = perms.top(s, req.userId);
+  const mine = perms.base(s, req.userId);
   if (uid === s.owner_id && req.userId !== s.owner_id) fail(403, 'Only the owner can change the owner\u2019s roles.');
   if (uid !== req.userId && uid !== s.owner_id && perms.top(s, uid) >= myTop) fail(403, 'You can only change roles for people below you.');
   const wanted = new Set((Array.isArray((req.body || {}).roleIds) ? req.body.roleIds : []).map(String));
@@ -1417,6 +1437,8 @@ api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
       const has = current.has(r.id); const want = wanted.has(r.id);
       if (has === want) continue;
       if (r.position >= myTop) fail(403, `You can't assign or remove "${r.name}" — it's not below your highest role.`);
+      // Taking a role away never gives anyone more power, so only giving one is limited to what you have.
+      if (want && (r.permissions & ALL_PERMS & ~mine)) fail(403, `You can't give "${r.name}": it has permissions you don't have.`);
       if (want) db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(s.id, uid, r.id);
       else db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(s.id, uid, r.id);
     }
@@ -1425,15 +1447,20 @@ api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-api.post('/servers/:id/transfer', auth, (req, res) => {
-  const s = requireOwner(req.params.id, req.userId);
+api.post('/servers/:id/transfer', auth, wrap(async (req, res) => {
   const to = String((req.body || {}).userId || '');
+  if (!isMember(requireOwner(req.params.id, req.userId).id, to)) fail(404, 'That person is not in this server.');
+  const row = await stepUp(req, req.body); // see DELETE /servers/:id
+  const s = requireOwner(req.params.id, req.userId);
   if (!isMember(s.id, to)) fail(404, 'That person is not in this server.');
   db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(to, s.id);
   emitServer(s.id);
+  const toName = (getUserRow(to) || {}).username || to;
+  auditLog(req, 'server_transferred', s.id, `${s.name} \u2192 ${toName}`);
+  ACCT.notify(row, 'you handed over a server', `${row.username} made ${toName} the owner of the server "${s.name}".`);
   const out = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(s.id), req.userId);
   res.json(out);
-});
+}));
 
 // ---------------------------------------------------------------- invites
 api.post('/servers/:id/invites', auth, (req, res) => {
@@ -1446,6 +1473,25 @@ api.post('/servers/:id/invites', auth, (req, res) => {
   db.prepare('INSERT INTO invites (code, server_id, creator_id, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(code, s.id, req.userId, maxUses, hours ? now() + hours * 3600000 : null, now());
   res.json({ code });
+});
+
+// The invites that still work. People with Manage Server see them all (to revoke a leaked one); anyone else
+// sees only the ones they made.
+const inviteOut = (i) => ({ code: i.code, creatorId: i.creator_id, uses: i.uses, maxUses: i.max_uses, expiresAt: i.expires_at, createdAt: i.created_at });
+api.get('/servers/:id/invites', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  const all = can(s, req.userId, PM.MANAGE_SERVER);
+  res.json(db.prepare(`SELECT * FROM invites WHERE server_id = ? AND (? OR creator_id = ?) AND (expires_at IS NULL OR expires_at > ?)
+      AND (max_uses = 0 OR uses < max_uses) ORDER BY created_at DESC LIMIT 200`).all(s.id, all ? 1 : 0, req.userId, now()).map(inviteOut));
+});
+// Revoke an invite: whoever made it, or anyone with Manage Server in the invite's own server.
+api.delete('/invites/:code', auth, (req, res) => {
+  const inv = db.prepare('SELECT * FROM invites WHERE code = ?').get(String(req.params.code));
+  if (!inv) fail(404, 'That invite does not exist.');
+  const s = requireServer(inv.server_id, req.userId);
+  if (inv.creator_id !== req.userId && !can(s, req.userId, PM.MANAGE_SERVER)) fail(403, 'Only the person who made this invite (or someone with Manage Server) can revoke it.');
+  db.prepare('DELETE FROM invites WHERE code = ?').run(inv.code);
+  res.json({ ok: true });
 });
 
 function validInvite(code) {
@@ -1599,10 +1645,16 @@ api.post('/servers/:id/channels', auth, (req, res) => {
   res.json(ch);
 });
 
+// Editing or deleting a channel needs Manage Channels in that channel: a channel you can't see stays "not found",
+// and a per-channel deny of Manage Channels is respected.
+function requireManageableChannel(channelId, userId) {
+  const c = requireChannel(channelId, userId);
+  const s = requireAdmin(c.server_id, userId);
+  if (!canIn(s, c, userId, PM.MANAGE_CHANNELS)) fail(403, 'You don\u2019t have permission to manage this channel.');
+  return c;
+}
 api.patch('/channels/:id', auth, (req, res) => {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!c) fail(404, 'Channel not found.');
-  requireAdmin(c.server_id, req.userId);
+  const c = requireManageableChannel(req.params.id, req.userId);
   const name = req.body.name !== undefined ? cleanChannelName(req.body.name, c.type) : c.name;
   const topic = req.body.topic !== undefined ? String(req.body.topic).slice(0, 300) : c.topic;
   const category = req.body.category !== undefined ? (cleanCategory(req.body.category) || c.category) : c.category;
@@ -1615,9 +1667,7 @@ api.patch('/channels/:id', auth, (req, res) => {
 });
 
 api.delete('/channels/:id', auth, (req, res) => {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!c) fail(404, 'Channel not found.');
-  requireAdmin(c.server_id, req.userId);
+  const c = requireManageableChannel(req.params.id, req.userId);
   const m = voiceChannels.get(c.id);
   if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
   removeMessageFiles(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
@@ -1665,11 +1715,14 @@ function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions) {
   const url = '/#m/' + id;
   if (srv.kind === 'group') return pushTo(members, { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', tag: 'c:' + c.id, url });
   const where = `#${c.name} \u00b7 ${srv.name}`;
-  const mentioned = Array.isArray(mentions) ? mentions.slice(0, 50).map(String).filter((u) => members.includes(u)) : [];
+  // Only people who can see the channel: a push to anyone else would tell them a private channel's name.
+  const open = !perms.restricted(srv, c);
+  const reaches = (u) => members.includes(u) && (open || (perms.channel(srv, c, u) & PM.VIEW_CHANNEL) !== 0);
+  const mentioned = Array.isArray(mentions) ? [...new Set(mentions.slice(0, 50).map(String))].filter(reaches) : [];
   pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, tag: 'c:' + c.id, url });
   const replyAuthor = replyTo && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(replyTo) || {}).author_id;
   const rootAuthor = threadId && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(threadId) || {}).author_id;
-  pushTo([replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && members.includes(u)),
+  pushTo([replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && reaches(u)),
     { title: `${nameOf(senderId)} replied to you`, body: where, tag: 'c:' + c.id, url });
 }
 
@@ -1792,6 +1845,7 @@ function pinTarget(id, userId) {
   const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
   if (!dm) fail(404, 'Message not found.');
   const d = requireDm(dm.dm_id, userId);
+  if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
   return { table: 'dm_messages', room: [`user:${d.user_a}`, `user:${d.user_b}`], payload: { messageId: dm.id, dmId: d.id } };
 }
 api.post('/messages/:id/pin', auth, (req, res) => {
@@ -1837,6 +1891,9 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
     const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
     if (!dm) fail(404, 'Message not found.');
     const d = requireDm(dm.dm_id, req.userId);
+    // After a block, nobody in the conversation can add reactions (taking your own away is still fine).
+    const mine = db.prepare('SELECT 1 FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?').get(dm.id, req.userId, emoji);
+    if (!mine && isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
     target = [`user:${d.user_a}`, `user:${d.user_b}`];
     payload = { messageId: dm.id, dmId: d.id };
   }
@@ -1903,6 +1960,8 @@ api.patch('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
   if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
   const d = requireDm(m.dm_id, req.userId);
+  // Editing is sending new words: a block stops it like it stops new messages (deleting your own still works).
+  if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t message this person.');
   const { ciphertext } = req.body || {};
   validCipher(ciphertext);
   db.prepare('UPDATE dm_messages SET ciphertext = ?, edited_at = ? WHERE id = ?').run(ciphertext, now(), m.id);
@@ -2045,24 +2104,46 @@ api.post('/servers/:id/roles/order', auth, (req, res) => {
   emitServer(s.id);
   res.json({ ok: true });
 });
-// Per-channel overrides: [{ type: 'role'|'member', id, allow, deny }]
+// Per-channel overrides: [{ type: 'role'|'member', id, allow, deny }]. The list replaces the channel's overrides,
+// within your reach: you need Manage Roles in this channel (one you can see), you can only allow or deny what you
+// have here yourself (other bits keep their old value), and overrides for roles or people at or above your
+// highest role aren't yours to add, change or remove, the same rule as editing roles.
 api.put('/channels/:id/overrides', auth, (req, res) => {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!c) fail(404, 'Channel not found.');
+  const c = requireChannel(req.params.id, req.userId);
   const s = requirePerm(c.server_id, req.userId, PM.MANAGE_ROLES, 'You need the Manage Roles permission.');
+  if (!canIn(s, c, req.userId, PM.MANAGE_ROLES)) fail(403, 'You don\u2019t have permission to change this channel\u2019s permissions.');
   const list = Array.isArray((req.body || {}).overrides) ? req.body.overrides.slice(0, 100) : [];
-  const roleIds = new Set(db.prepare('SELECT id FROM roles WHERE server_id = ?').all(s.id).map((r) => r.id));
-  const mine = perms.base(s, req.userId);
+  const roles = new Map(db.prepare('SELECT id, position FROM roles WHERE server_id = ?').all(s.id).map((r) => [r.id, r]));
+  const mine = perms.channel(s, c, req.userId) & CHANNEL_SCOPED;
+  const myTop = perms.top(s, req.userId);
+  const reachable = (o) => (o.type === 'role'
+    ? o.id === s.id || (roles.has(o.id) && roles.get(o.id).position < myTop)
+    : o.id === req.userId || perms.top(s, o.id) < myTop);
+  const key = (o) => `${o.type}:${o.id}`;
+  // What's stored now, cleaned the same way new entries are (so an untouched override compares equal).
+  const old = new Map();
+  for (const r of db.prepare('SELECT * FROM channel_overrides WHERE channel_id = ?').all(c.id)) {
+    const allow = r.allow & CHANNEL_SCOPED; const deny = r.deny & CHANNEL_SCOPED & ~allow;
+    const o = { type: r.target_type, id: r.target_id, allow, deny };
+    if (allow || deny) old.set(key(o), o);
+  }
+  const next = new Map();
+  for (const o of list) {
+    const t = { type: o.type === 'member' ? 'member' : 'role', id: String(o.id || '') };
+    if (t.type === 'role' ? !roles.has(t.id) : !isMember(s.id, t.id)) continue;
+    const prev = old.get(key(t)) || { allow: 0, deny: 0 };
+    const allow = (((parseInt(o.allow, 10) || 0) & mine) | (prev.allow & ~mine)) & CHANNEL_SCOPED;
+    const deny = (((parseInt(o.deny, 10) || 0) & mine) | (prev.deny & ~mine)) & CHANNEL_SCOPED & ~allow;
+    if (allow || deny) next.set(key(t), { ...t, allow, deny });
+  }
+  for (const k of new Set([...old.keys(), ...next.keys()])) {
+    const o = old.get(k); const n = next.get(k);
+    if (reachable(o || n)) continue;
+    if (!o || !n || o.allow !== n.allow || o.deny !== n.deny) fail(403, 'You can only change overrides for roles and people below your highest role.');
+  }
   db.transaction(() => {
     db.prepare('DELETE FROM channel_overrides WHERE channel_id = ?').run(c.id);
-    for (const o of list) {
-      const type = o.type === 'member' ? 'member' : 'role';
-      const id = String(o.id || '');
-      if (type === 'role' ? !roleIds.has(id) : !isMember(s.id, id)) continue;
-      const allow = (parseInt(o.allow, 10) || 0) & CHANNEL_SCOPED & mine;
-      const deny = (parseInt(o.deny, 10) || 0) & CHANNEL_SCOPED & ~allow;
-      if (allow || deny) db.prepare('INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, ?, ?)').run(c.id, type, id, allow, deny);
-    }
+    for (const o of next.values()) db.prepare('INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, ?, ?)').run(c.id, o.type, o.id, o.allow, o.deny);
   })();
   // Anyone who just lost access leaves the voice channel.
   for (const [uid] of voiceChannels.get(c.id) || []) if (!(perms.channel(s, c, uid) & PM.CONNECT)) leaveVoice(uid, true);
@@ -2082,6 +2163,8 @@ api.post('/servers/:id/bans', auth, (req, res) => {
   if (!getUserRow(uid) || uid === s.owner_id || uid === req.userId) fail(400, 'You can\u2019t ban that person.');
   if (isMember(s.id, uid) && perms.top(s, uid) >= perms.top(s, req.userId)) fail(403, 'You can only ban people whose highest role is below yours.');
   db.prepare('INSERT OR REPLACE INTO bans (server_id, user_id, banned_by, reason, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, uid, req.userId, String((req.body || {}).reason || '').slice(0, 300), now());
+  // Invites a banned person made stop working too: they could have handed them to a new account.
+  db.prepare('DELETE FROM invites WHERE server_id = ? AND creator_id = ?').run(s.id, uid);
   if (isMember(s.id, uid)) removeMember(s.id, uid);
   emitServer(s.id);
   res.json({ ok: true });
@@ -2171,7 +2254,14 @@ api.delete('/emojis/:id', auth, (req, res) => {
 // ---------------------------------------------------------------- group DMs
 // A group DM is a small private "server" (one text channel + one call channel) so it gets the same
 // end-to-end encrypted group keys, key rotation and voice. It never shows up in the server rail.
-const canAddToGroup = (adder, uid) => uid !== adder && getUserRow(uid) && !isBlocked(adder, uid) && (areFriends(adder, uid) || sharesServer(adder, uid));
+// You can add friends and people you share a server with, but someone who takes DMs only from friends can't be
+// pulled into a group chat (and rung in it) by a non-friend either.
+function requireGroupAddable(adder, uid) {
+  const row = uid !== adder && getUserRow(uid);
+  const friends = !!row && areFriends(adder, uid);
+  if (!row || isBlocked(adder, uid) || !(friends || sharesServer(adder, uid))) fail(403, 'You can add friends and people who share a server with you.');
+  if (!friends && privacyOf(row).dms === 'friends') fail(403, `${row.username} only accepts messages from friends.`);
+}
 // Group chats: up to GROUP_MAX people, end-to-end encrypted like servers (they are small servers with one chat
 // and one call). Anyone in the group can add friends or people they share a server with; the person who made
 // it (the owner, passed on if they leave) can also remove people.
@@ -2181,7 +2271,7 @@ api.post('/groups', auth, (req, res) => {
   const ids = [...new Set(((req.body || {}).userIds || []).map(String))].filter((u) => u !== req.userId);
   if (!ids.length) fail(400, 'Pick at least one person.');
   if (ids.length > GROUP_MAX - 1) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
-  ids.forEach((u) => { if (!canAddToGroup(req.userId, u)) fail(403, 'You can add friends and people who share a server with you.'); });
+  ids.forEach((u) => requireGroupAddable(req.userId, u));
   const id = newId();
   const t = now();
   db.transaction(() => {
@@ -2207,7 +2297,7 @@ api.post('/groups/:id/members', auth, (req, res) => {
   const uid = String((req.body || {}).userId || '');
   if (isMember(s.id, uid)) fail(409, 'They\u2019re already in this group.');
   if (db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n >= GROUP_MAX) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
-  if (!canAddToGroup(req.userId, uid)) fail(403, 'You can add friends and people who share a server with you.');
+  requireGroupAddable(req.userId, uid);
   db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(s.id, uid, now());
   io.to(`server:${s.id}`).emit('member:add', { serverId: s.id, user: publicUser(getUserRow(uid)) });
   io.in(`user:${uid}`).socketsJoin(`server:${s.id}`);
@@ -3423,20 +3513,28 @@ api.post('/polls/:id/close', auth, (req, res) => {
 
 // ---------------------------------------------------------------- server events (hangouts, game nights…)
 // Not end-to-end encrypted (the server needs the time to send reminders) — the app says so.
+// An event's channel, for this person: only a channel they can see (a private channel's id isn't for everyone).
+function eventChannelFor(e, uid) {
+  const c = e.channel_id && db.prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?').get(e.channel_id, e.server_id);
+  return c && isMember(c.server_id, uid) && (perms.channel(serverOf(c), c, uid) & PM.VIEW_CHANNEL) ? c.id : null;
+}
 const eventOut = (e, uid) => {
-  const rsvps = db.prepare('SELECT user_id, status FROM event_rsvps WHERE event_id = ?').all(e.id);
-  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId: e.channel_id, startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
+  // RSVPs of current members only (someone who left or was removed isn't coming).
+  const rsvps = db.prepare('SELECT r.user_id, r.status FROM event_rsvps r JOIN members m ON m.server_id = ? AND m.user_id = r.user_id WHERE r.event_id = ?').all(e.server_id, e.id);
+  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId: eventChannelFor(e, uid), startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
     going: rsvps.filter((r) => r.status === 'going').map((r) => r.user_id), maybe: rsvps.filter((r) => r.status === 'maybe').map((r) => r.user_id), no: rsvps.filter((r) => r.status === 'no').map((r) => r.user_id),
     mine: (rsvps.find((r) => r.user_id === uid) || {}).status || null };
 };
-function cleanEvent(b, srv) {
+// uid: who's saving it (they can only link a channel they can see); keep: the channel it already links to.
+function cleanEvent(b, srv, uid, keep = null) {
   const title = String(b.title || '').trim().slice(0, 100);
   if (!title) fail(400, 'Give the event a name.');
   const startsAt = Number(b.startsAt);
   if (!Number.isFinite(startsAt) || startsAt < now() - 3600000 || startsAt > now() + 400 * 86400000) fail(400, 'Pick a time in the next year.');
   const endsAt = b.endsAt ? Number(b.endsAt) : null;
   if (endsAt && (!Number.isFinite(endsAt) || endsAt <= startsAt)) fail(400, 'The end has to be after the start.');
-  const channelId = b.channelId && db.prepare('SELECT id FROM channels WHERE id = ? AND server_id = ?').get(String(b.channelId), srv.id) ? String(b.channelId) : null;
+  const want = b.channelId ? String(b.channelId) : null;
+  const channelId = want && (want === keep || eventChannelFor({ channel_id: want, server_id: srv.id }, uid)) ? want : null;
   const out = { title, description: String(b.description || '').slice(0, 2000), location: String(b.location || '').slice(0, 120), startsAt, endsAt, channelId };
   checkWords(out.title, out.description, out.location);
   return out;
@@ -3451,11 +3549,19 @@ api.get('/events', auth, (req, res) => {
   res.json(db.prepare(`SELECT e.* FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE m.user_id = ? AND COALESCE(e.ends_at, e.starts_at + 3 * 3600000) > ? AND e.starts_at < ? ORDER BY e.starts_at LIMIT 20`)
     .all(req.userId, now(), now() + 14 * 86400000).map((e) => eventOut(e, req.userId)));
 });
+// Events show up for everyone in the server, so posting one takes what posting a message does: someone muted
+// everywhere can't post events instead. Admins always can.
+function requireEventPoster(srv, uid) {
+  if (can(srv, uid, PM.MANAGE_SERVER) || can(srv, uid, PM.MANAGE_CHANNELS)) return;
+  const text = db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text'").all(srv.id);
+  if (!text.some((c) => canIn(srv, c, uid, PM.VIEW_CHANNEL | PM.SEND_MESSAGES))) fail(403, 'You need permission to send messages here to post events.');
+}
 api.post('/servers/:id/events', auth, (req, res) => {
   const srv = requireServer(req.params.id, req.userId);
   if (srv.kind === 'group') fail(400, 'Events are for servers.');
   rateLimit('event:' + req.userId, 20, 3600000);
-  const e = cleanEvent(req.body || {}, srv);
+  requireEventPoster(srv, req.userId);
+  const e = cleanEvent(req.body || {}, srv, req.userId);
   const id = newId();
   db.prepare('INSERT INTO server_events (id, server_id, title, description, location, channel_id, starts_at, ends_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(id, srv.id, e.title, e.description, e.location, e.channelId, e.startsAt, e.endsAt, req.userId, now());
@@ -3472,7 +3578,8 @@ function requireEventEditor(eventId, uid) {
 }
 api.patch('/events/:id', auth, (req, res) => {
   const { e, srv } = requireEventEditor(req.params.id, req.userId);
-  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id }, ...(req.body || {}) }, srv);
+  requireEventPoster(srv, req.userId);
+  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id }, ...(req.body || {}) }, srv, req.userId, e.channel_id);
   db.prepare('UPDATE server_events SET title = ?, description = ?, location = ?, channel_id = ?, starts_at = ?, ends_at = ?, reminded = CASE WHEN starts_at = ? THEN reminded ELSE 0 END WHERE id = ?')
     .run(v.title, v.description, v.location, v.channelId, v.startsAt, v.endsAt, v.startsAt, e.id);
   emitEvents(srv.id);
@@ -3499,9 +3606,11 @@ setInterval(() => {
   const soon = db.prepare('SELECT * FROM server_events WHERE reminded = 0 AND starts_at <= ? AND starts_at > ?').all(now() + 15 * 60000, now() - 5 * 60000);
   for (const e of soon) {
     db.prepare('UPDATE server_events SET reminded = 1 WHERE id = ?').run(e.id);
-    const who = db.prepare("SELECT user_id FROM event_rsvps WHERE event_id = ? AND status IN ('going', 'maybe')").all(e.id).map((r) => r.user_id);
+    // Only people still in the server (an RSVP doesn't outlive membership).
+    const who = db.prepare(`SELECT r.user_id FROM event_rsvps r JOIN members m ON m.server_id = ? AND m.user_id = r.user_id
+      WHERE r.event_id = ? AND r.status IN ('going', 'maybe')`).all(e.server_id, e.id).map((r) => r.user_id);
     const srv = db.prepare('SELECT name FROM servers WHERE id = ?').get(e.server_id) || {};
-    who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: e.channel_id }));
+    who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: eventChannelFor(e, u) }));
     pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/' });
   }
 }, 60000).unref();
@@ -4002,6 +4111,7 @@ function setupSockets(server) {
         toChannel(c, socket).emit('typing', { channelId: c.id, userId: uid });
       } else if (p.dmId) {
         const d = requireDm(String(p.dmId), uid);
+        if (isBlocked(d.user_a, d.user_b)) return; // quietly: they can't message, so they aren't typing to anyone
         const other = d.user_a === uid ? d.user_b : d.user_a;
         io.to(`user:${other}`).emit('typing', { dmId: d.id, userId: uid });
       }
@@ -4068,8 +4178,11 @@ function setupSockets(server) {
     // Declining a call: tell whoever is calling, and stop this person's other devices ringing.
     socket.on('call:decline', guard((p = {}) => {
       const room = String(p.room || '');
-      const d = dmOfRoom(room);
-      if (d && d.user_a !== uid && d.user_b !== uid) fail(403, 'Not your call.');
+      // Only someone who could join the call can decline it (or anyone could fake "X declined" into any call).
+      if (room.startsWith('dm:')) {
+        const d = dmOfRoom(room);
+        if (!d || (d.user_a !== uid && d.user_b !== uid)) fail(403, 'Not your call.');
+      } else requireChannel(room, uid);
       const m = voiceChannels.get(room);
       if (m) for (const [u] of m) io.to(`user:${u}`).emit('call:declined', { room, userId: uid });
       io.to(`user:${uid}`).emit('call:end', { room });

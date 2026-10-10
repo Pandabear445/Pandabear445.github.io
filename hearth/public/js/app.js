@@ -5,7 +5,7 @@ import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playS
 import { api, upload, getToken, setToken } from './api.js';
 import * as E2EE from './e2ee.js';
 import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers } from './markdown.js';
-import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor } from './perms.js';
+import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor, mayMentionRole } from './perms.js';
 import { openCropper } from './cropper.js';
 import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
@@ -798,7 +798,7 @@ const currentKey = () => (S.view.type === 'channel' ? 'c:' + S.view.channelId : 
 const currentServer = () => S.servers.find((s) => s.id === S.view.serverId);
 const isOwner = (server) => !!server && server.ownerId === S.me.id;
 // ---- permissions (the server sends our own, already resolved, per server and per channel)
-const myPerms = (server) => (!server ? 0 : server.kind === 'group' ? ALL_PERMS : server.myPerms || 0);
+const myPerms = (server) => (!server ? 0 : server.myPerms || 0);
 const can = (server, bit) => has(myPerms(server), bit);
 const chanPerms = (c) => (!c ? 0 : c.perms ?? ALL_PERMS);
 const canIn = (c, bit) => has(chanPerms(c), bit);
@@ -2135,7 +2135,7 @@ function mentionKind(m) {
   if (m.dmId) return null;
   const server = S.servers.find((x) => x.id === m.serverId);
   const mine = server ? (server.memberRoles || {})[S.me.id] || [] : [];
-  for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id)) return 'roleMention';
+  for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id) && mayMentionRole(server, id, m.authorId)) return 'roleMention';
   if (/(^|\s)@(everyone|channel|here)\b/i.test(t) && authorMayPingEveryone(m)) return 'everyone';
   return null;
 }
@@ -3356,7 +3356,7 @@ async function uploadEncryptedFiles(key, files, onProgress) {
 function mentionedIds(server, text) {
   const t = String(text || '');
   const names = new Set([...t.matchAll(/(?:^|\s)@([\w.]{2,24})/g)].map((m) => m[1].toLowerCase()));
-  const roleIds = new Set([...t.matchAll(/<@&([a-z0-9]{6,40})>/g)].map((m) => m[1]));
+  const roleIds = new Set([...t.matchAll(/<@&([a-z0-9]{6,40})>/g)].map((m) => m[1]).filter((id) => mayMentionRole(server, id, S.me.id)));
   if (!names.size && !roleIds.size) return [];
   return server.memberIds.filter((id) => id !== S.me.id && (names.has((getUser(id).username || '').toLowerCase())
     || ((server.memberRoles || {})[id] || []).some((r) => roleIds.has(r))));
@@ -4106,7 +4106,9 @@ function openJoinModal(code) {
 }
 function openInvite(server) {
   const out = h('input', { class: 'input mono', readonly: true, value: 'Creating\u2026', 'aria-label': 'Invite link' });
-  const expires = h('select', { class: 'input' }, [['0', 'Never'], ['1', '1 hour'], ['24', '1 day'], ['168', '7 days']].map(([v, l]) => h('option', { value: v }, l)));
+  // Links expire after 7 days unless you choose otherwise, so one that leaks or gets forgotten stops working.
+  const expires = h('select', { class: 'input' }, [['1', '1 hour'], ['24', '1 day'], ['168', '7 days'], ['720', '30 days'], ['0', 'Never']].map(([v, l]) => h('option', { value: v }, l)));
+  expires.value = '168';
   const uses = h('select', { class: 'input' }, [['0', 'No limit'], ['1', '1 use'], ['5', '5 uses'], ['10', '10 uses'], ['25', '25 uses']].map(([v, l]) => h('option', { value: v }, l)));
   const make = async () => {
     try {
@@ -4120,7 +4122,8 @@ function openInvite(server) {
     body: h('div', { class: 'stack' },
       h('p', { class: 'muted-p' }, 'Send this link to people. They need to be able to reach this computer or VPS.'),
       h('div', { class: 'row gap' }, out, h('button', { class: 'btn primary', onclick: async (e) => { await copyText(out.value); e.target.textContent = 'Copied'; setTimeout(() => { e.target.textContent = 'Copy'; }, 1500); } }, 'Copy')),
-      h('div', { class: 'row gap' }, field('Expires after', expires), field('Max uses', uses))),
+      h('div', { class: 'row gap' }, field('Expires after', expires), field('Max uses', uses)),
+      can(server, PERMS.MANAGE_SERVER) ? h('p', { class: 'field-hint' }, 'See or revoke invite links in Server settings \u2192 Invites.') : null),
   });
   make();
 }
@@ -4228,6 +4231,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['emoji', 'Emoji', 'smile', (s) => can(s, PERMS.MANAGE_EMOJIS)],
     ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bans', 'Bans', 'ban', (s) => can(s, PERMS.BAN_MEMBERS)],
+    ['invites', 'Invites', 'link', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
   ];
@@ -4245,7 +4249,7 @@ function openServerSettings(server, startTab = 'overview') {
     if (!allowed.some(([k]) => k === tab)) tab = allowed[0] ? allowed[0][0] : 'overview';
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
-    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, danger })[tab](s);
+    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger })[tab](s);
   };
 
   function overview(s) {
@@ -4463,6 +4467,23 @@ function openServerSettings(server, startTab = 'overview') {
     } catch (e) { clear(host).append(h('p', { class: 'form-error' }, e.message)); }
   }
 
+  // Invite links that still work, newest first, with who made them; a leaked or old one can be revoked here.
+  async function invites(s) {
+    add(body, h('h3', null, 'Invites'));
+    const host = h('div', { class: 'stack tight' }, h('span', { class: 'spinner' }));
+    add(body, host);
+    try {
+      const list = await api('GET', `/servers/${s.id}/invites`);
+      clear(host);
+      if (!list.length) add(host, h('p', { class: 'muted-p' }, 'No invite links are active.'));
+      list.forEach((i) => add(host, h('div', { class: 'ss-row' }, avatarEl(getUser(i.creatorId), 30),
+        h('span', { class: 'ss-row-name' }, h('span', { class: 'mono' }, i.code),
+          h('span', null, [`by ${displayName(getUser(i.creatorId))}`, `${i.uses}${i.maxUses ? ` of ${i.maxUses}` : ''} use${i.uses === 1 && !i.maxUses ? '' : 's'}`,
+            i.expiresAt ? `expires ${fmtStamp(i.expiresAt)}` : 'never expires'].join(' \u00b7 '))),
+        h('button', { class: 'btn ghost sm danger-text', onclick: () => api('DELETE', `/invites/${encodeURIComponent(i.code)}`).then(() => { toast('Invite revoked.'); draw(); }).catch((e) => toast(e.message, 'error')) }, 'Revoke'))));
+    } catch (e) { clear(host).append(h('p', { class: 'form-error' }, e.message)); }
+  }
+
   function danger(s) {
     const transfer = h('select', { class: 'input' }, h('option', { value: '' }, 'Choose a member'),
       s.memberIds.filter((id) => id !== S.me.id).map((id) => h('option', { value: id }, `${displayName(getUser(id))} (${getUser(id).username})`)));
@@ -4470,7 +4491,14 @@ function openServerSettings(server, startTab = 'overview') {
       h('div', { class: 'danger-zone' }, h('strong', null, 'Transfer ownership'), h('p', { class: 'muted-p' }, 'You\u2019ll keep your roles but lose owner powers.'),
         h('div', { class: 'row gap' }, transfer, h('button', { class: 'btn ghost', onclick: async () => {
           if (!transfer.value) return;
-          if (await confirmDialog({ title: 'Transfer ownership?', text: 'You will lose owner controls for this server.', confirm: 'Transfer', danger: true })) run(() => api('POST', `/servers/${s.id}/transfer`, { userId: transfer.value }), 'Ownership transferred.');
+          // Needs your password (and a two-factor code when it's on): it can't be undone.
+          try {
+            const wait = nextServerUpdate(s.id);
+            const done = await confirmedCall(app, (x) => api('POST', `/servers/${s.id}/transfer`, { userId: transfer.value, ...x }),
+              { title: 'Transfer ownership?', text: `You will lose owner controls for ${s.name}. Enter your password to confirm.`, button: 'Transfer' });
+            if (!done) return;
+            await wait; toast('Ownership transferred.'); draw();
+          } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
         } }, 'Transfer'))),
       h('div', { class: 'danger-zone' }, h('strong', null, 'Delete server'), h('p', { class: 'muted-p' }, 'Deletes every channel, message and file. This can\u2019t be undone.'),
         h('div', null, h('button', { class: 'btn danger', onclick: async () => { if (await deleteServer(s)) mdl.close(); } }, 'Delete server'))));
@@ -4480,9 +4508,13 @@ function openServerSettings(server, startTab = 'overview') {
   draw();
 }
 
+// Needs your password (and a two-factor code when it's on), like other changes that can't be undone.
 async function deleteServer(server) {
-  if (!(await confirmDialog({ title: `Delete ${server.name}?`, text: 'This deletes every channel and message in it. This cannot be undone.', confirm: 'Delete server', danger: true }))) return false;
-  try { await api('DELETE', `/servers/${server.id}`); return true; } catch (e) { toast(e.message, 'error'); return false; }
+  try {
+    const done = await confirmedCall(app, (x) => api('DELETE', `/servers/${server.id}`, x).then(() => true),
+      { title: `Delete ${server.name}?`, text: 'This deletes every channel and message in it. This cannot be undone. Enter your password to confirm.', button: 'Delete server' });
+    return !!done;
+  } catch (e) { if (!e.cancelled) toast(e.message, 'error'); return false; }
 }
 function categoryField(server, value) {
   const cats = orderedCategories(server);
@@ -4542,8 +4574,8 @@ function openEditChannel(c, startTab = 'overview') {
   const tabs = h('div', { class: 'seg' });
   const body = h('div', { class: 'stack' });
   const scoped = PERM_GROUPS.flatMap(([, l]) => l).filter(([k]) => (c.type === 'voice'
-    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MANAGE_CHANNELS', 'MANAGE_ROLES', 'CREATE_INVITE']
-    : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES', 'CREATE_INVITE']).includes(k));
+    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MANAGE_CHANNELS', 'MANAGE_ROLES']
+    : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES']).includes(k));
   const label = (o) => {
     if (o.type === 'member') return displayName(getUser(o.id));
     const r = (server.roleDefs || []).find((x) => x.id === o.id);

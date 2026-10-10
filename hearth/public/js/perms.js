@@ -39,6 +39,9 @@ export const PERM_GROUPS = [
 ];
 export const ALL = Object.values(P).reduce((a, b) => a | b, 0);
 export const has = (perms, bit) => (perms & bit) === bit;
+// What everyone in a group chat can do (its owner can do everything), as on the server.
+export const GROUP_MEMBER = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
+  | P.CONNECT | P.SPEAK | P.CREATE_INVITE | P.CREATE_THREADS | P.MENTION_EVERYONE;
 
 // Roles a member has, highest first (excluding @everyone).
 export function memberRoles(server, userId) {
@@ -48,9 +51,16 @@ export function memberRoles(server, userId) {
 // Server-wide permissions for any member (the server only sends our own; this is for display rules).
 export function basePerms(server, userId) {
   if (!server) return 0;
-  if (server.ownerId === userId || server.kind === 'group') return ALL;
+  if (server.ownerId === userId) return ALL;
+  if (server.kind === 'group') return GROUP_MEMBER;
   let p = 0;
   for (const r of server.roleDefs || []) if (r.everyone || ((server.memberRoles || {})[userId] || []).includes(r.id)) p |= r.permissions;
   return p & P.ADMINISTRATOR ? ALL : p;
+}
+// Does a <@&role> in this person's message ping the role's members? Only if the role is mentionable or they may
+// mention everyone. The composer only offers those roles, but a hand-typed mention must not ping either.
+export function mayMentionRole(server, roleId, authorId) {
+  const r = ((server && server.roleDefs) || []).find((x) => x.id === roleId);
+  return !!r && !r.everyone && (r.mentionable || has(basePerms(server, authorId), P.MENTION_EVERYONE));
 }
 export const topColor = (server, userId) => (memberRoles(server, userId).find((r) => r.color) || {}).color || '';
