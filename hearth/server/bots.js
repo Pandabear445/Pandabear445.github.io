@@ -205,7 +205,9 @@ module.exports = function setupBots(ctx) {
     // Sleep until the next retry is due (the interval below is only a safety net).
     const next = db.prepare("SELECT MIN(next_at) t FROM bot_deliveries WHERE status = 'pending'").get().t;
     if (wake) clearTimeout(wake);
-    wake = next ? setTimeout(pump, Math.max(20, next - now() + 5)) : null;
+    // (Deliveries already due but waiting for a busy bot start when one of its sends finishes, so there's no
+    // need to spin for them: look again in a quarter of a second at the soonest.)
+    wake = next ? setTimeout(pump, next <= now() ? 250 : Math.max(20, next - now() + 5)) : null;
     if (wake) wake.unref();
   }
   async function attempt(d) {
