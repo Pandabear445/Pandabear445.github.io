@@ -750,13 +750,15 @@ app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
 // The desktop app's self-updater reads latest.yml (latest-linux.yml…) here, then downloads the installer it
 // names. electron-builder writes these next to the installers; GitHub Actions copies them to data/downloads.
-const UPDATE_FILE = /^(latest(-mac|-linux)?\.yml|[\w.-]+\.(exe|blockmap|AppImage|zip|dmg))$/;
+// latest*.yml.sig is the publisher's signature over latest*.yml (desktop/build/sign-update.js): apps built
+// with a signing key refuse an update without it, whatever this server serves.
+const UPDATE_FILE = /^(latest(-mac|-linux)?\.yml(\.sig)?|[\w.-]+\.(exe|blockmap|AppImage|zip|dmg))$/;
 app.get('/updates/:file', (req, res) => {
   const name = String(req.params.file);
   if (!UPDATE_FILE.test(name) || name.includes('..')) return res.status(404).send('Not found');
   const file = path.join(DOWNLOADS_DIR, name);
   if (!fs.existsSync(file)) return res.status(404).send('Not found');
-  if (name.endsWith('.yml')) res.setHeader('Cache-Control', 'no-cache');
+  if (/\.yml(\.sig)?$/.test(name)) res.setHeader('Cache-Control', 'no-cache');
   res.sendFile(file);
 });
 app.get('/downloads/:file', (req, res) => {
@@ -1391,6 +1393,8 @@ api.delete('/me', auth, wrap(async (req, res) => {
   if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
   const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
   if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
+  // Who has them on screen, worked out before their servers and friendships go: they all see "Deleted user".
+  const audience = userAudience(row.id);
   revokeSessions(row.id, { reason: 'account_deleted' });
   for (const m of db.prepare('SELECT s.id, s.kind, s.owner_id FROM members m JOIN servers s ON s.id = m.server_id WHERE m.user_id = ?').all(row.id)) {
     if (m.kind === 'group' && m.owner_id === row.id) {
@@ -1419,7 +1423,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
   })();
   files.forEach((f) => removeUpload(f));
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
-  broadcastUser(row.id);
+  broadcastUser(row.id, audience);
   io.in(`user:${row.id}`).disconnectSockets(true);
   auditLog(req, 'account_deleted', row.id, row.username);
   ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
@@ -1482,22 +1486,59 @@ function broadcastPresence(userId) {
   if (!presenceTimer) presenceTimer = setTimeout(flushPresence, 1000);
   io.to(`user:${userId}`).emit('user:update', selfUser(row));
 }
-function broadcastUser(userId) {
+// Who sees a person in their app: everyone in a server with them, friends and friend requests, and DM partners.
+// Profile changes go only there (not to every socket on the instance), and a burst of changes becomes one
+// update a second, so one account editing in a loop can't make every open app redraw.
+function userAudience(userId) {
+  const rooms = db.prepare('SELECT server_id FROM members WHERE user_id = ?').all(userId).map((r) => `server:${r.server_id}`);
+  const peers = db.prepare(`SELECT CASE WHEN requester_id = ? THEN addressee_id ELSE requester_id END AS id FROM friendships WHERE requester_id = ? OR addressee_id = ?
+    UNION SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END FROM dm_channels WHERE user_a = ? OR user_b = ?`).all(userId, userId, userId, userId, userId, userId);
+  return [...rooms, ...peers.map((p) => `user:${p.id}`)];
+}
+const userUpdateQueue = new Map(); // user id -> rooms told on top of whoever shares something with them then
+let userUpdateTimer = null;
+function flushUserUpdates() {
+  userUpdateTimer = null;
+  const queued = [...userUpdateQueue];
+  userUpdateQueue.clear();
+  for (const [id, extra] of queued) {
+    const row = getUserRow(id);
+    const rooms = row ? [...new Set([...extra, ...userAudience(id)])] : [];
+    if (rooms.length) io.to(rooms).except(`user:${id}`).emit('user:update', publicUser(row));
+  }
+}
+// audience: rooms worked out before a change that also ends what they shared (deleting an account leaves every
+// server and friendship first), so the people who still have that person on screen hear about it too.
+function broadcastUser(userId, audience) {
   const row = getUserRow(userId);
-  io.except(`user:${userId}`).emit('user:update', publicUser(row));
-  io.to(`user:${userId}`).emit('user:update', selfUser(row));
+  if (!row) return;
+  io.to(`user:${userId}`).emit('user:update', selfUser(row)); // their own apps: right away
+  const rooms = userUpdateQueue.get(userId) || new Set();
+  if (Array.isArray(audience)) audience.forEach((r) => rooms.add(r));
+  userUpdateQueue.set(userId, rooms);
+  if (!userUpdateTimer) userUpdateTimer = setTimeout(flushUserUpdates, 1000);
+}
+// Profile edits: plenty for a person saving changes, not enough to flood the instance from a script.
+function limitProfileWrites(req) {
+  rateLimit('profile:' + req.userId, 30, 60000);
+  rateLimit('profileh:' + req.userId, 300, 3600000);
+  limitNet(req, 'profile', 120, 60000);
 }
 
 api.patch('/me/profile', auth, (req, res) => {
   requireUnlocked(req.userId);
+  limitProfileWrites(req);
   const row = getUserRow(req.userId);
   const profile = sanitizeProfile(req.body || {}, parseProfile(row));
   checkWords(profile.displayName, profile.pronouns, profile.bio, profile.aboutMe, profile.headline, profile.mood.text, profile.customStatus.text, profile.interests, profile.songTitle, profile.links.map((l) => l.label));
   if (!profile.displayName) profile.displayName = row.username;
   // Top friends must actually be friends.
   profile.topFriends = profile.topFriends.filter((id) => areFriends(req.userId, id));
-  db.prepare('UPDATE users SET profile = ? WHERE id = ?').run(JSON.stringify(profile), req.userId);
-  broadcastUser(req.userId);
+  const json = JSON.stringify(profile);
+  if (json !== row.profile) { // saving the same thing again changes nothing, so nobody needs telling
+    db.prepare('UPDATE users SET profile = ? WHERE id = ?').run(json, req.userId);
+    broadcastUser(req.userId);
+  }
   res.json(selfUser(getUserRow(req.userId)));
 });
 
@@ -1534,10 +1575,13 @@ api.post('/me/song', auth, (req, res, next) => { try { requireUnlocked(req.userI
   res.json(selfUser(getUserRow(req.userId)));
 });
 api.delete('/me/song', auth, (req, res) => {
+  limitProfileWrites(req);
   const row = getUserRow(req.userId);
-  db.prepare('UPDATE users SET song = NULL WHERE id = ?').run(req.userId);
-  removeUpload(row.song);
-  broadcastUser(req.userId);
+  if (row.song) {
+    db.prepare('UPDATE users SET song = NULL WHERE id = ?').run(req.userId);
+    removeUpload(row.song);
+    broadcastUser(req.userId);
+  }
   res.json(selfUser(getUserRow(req.userId)));
 });
 api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(req.userId); next(); } catch (e) { next(e); } }, limited('image', uploadImage, 'file'), (req, res) => {
@@ -1556,11 +1600,14 @@ api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(re
 api.delete('/me/media/:kind', auth, (req, res) => {
   const col = Object.hasOwn(MEDIA_KINDS, req.params.kind) ? MEDIA_KINDS[req.params.kind] : null;
   if (!col) fail(404, 'Unknown media type.');
+  limitProfileWrites(req);
   const old = getUserRow(req.userId)[col];
-  db.prepare(`UPDATE users SET ${col} = NULL WHERE id = ?`).run(req.userId);
-  setMediaCrop(req.userId, req.params.kind, {});
-  removeUpload(old);
-  broadcastUser(req.userId);
+  if (old) {
+    db.prepare(`UPDATE users SET ${col} = NULL WHERE id = ?`).run(req.userId);
+    setMediaCrop(req.userId, req.params.kind, {});
+    removeUpload(old);
+    broadcastUser(req.userId);
+  }
   res.json(selfUser(getUserRow(req.userId)));
 });
 
@@ -4007,6 +4054,13 @@ function canCommentOn(viewerId, row, page) {
   return page.comments === 'everyone' ? true : areFriends(viewerId, row.id);
 }
 const commentOut = (c) => ({ id: c.id, text: c.text, createdAt: c.created_at, author: publicUser(getUserRow(c.author_id)) });
+// "Last seen", as the app shows it: the day only. Nothing at all while the person is invisible, or when
+// either of you has blocked the other: the exact time would tell a watcher when they're using Hearth.
+const DAY_MS = 86400000;
+function lastSeenFor(viewerId, row, blocked = row && viewerId !== row.id && isBlocked(viewerId, row.id)) {
+  if (!row || !row.last_seen_at || row.status === 'invisible' || row.is_bot || blocked) return null;
+  return Math.floor(row.last_seen_at / DAY_MS) * DAY_MS + DAY_MS / 2; // noon UTC: the same date almost everywhere
+}
 api.get('/users/:id/page', auth, (req, res) => {
   const row = getUserRow(req.params.id);
   if (!row) fail(404, 'User not found.');
@@ -4023,9 +4077,9 @@ api.get('/users/:id/page', auth, (req, res) => {
   res.json({
     page: features().customCss ? page : { ...page, css: '' }, pageBg: row.page_bg || null, views,
     friendCount: db.prepare("SELECT COUNT(*) n FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)").get(row.id, row.id).n,
-    topFriends: prof.topFriends.map((id) => publicUser(getUserRow(id))).filter(Boolean),
+    topFriends: blocked ? [] : prof.topFriends.map((id) => publicUser(getUserRow(id))).filter(Boolean),
     isFriend: areFriends(req.userId, row.id),
-    lastSeen: row.last_seen_at || null,
+    lastSeen: lastSeenFor(req.userId, row, blocked),
     comments: blocked ? [] : db.prepare('SELECT * FROM profile_comments WHERE profile_id = ? ORDER BY created_at DESC LIMIT 100').all(row.id).map(commentOut),
     commentCount: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE profile_id = ?').get(row.id).n,
     canComment: canCommentOn(req.userId, row, page),
@@ -4034,6 +4088,7 @@ api.get('/users/:id/page', auth, (req, res) => {
 });
 api.put('/me/page', auth, (req, res) => {
   requireUnlocked(req.userId);
+  limitProfileWrites(req);
   const row = getUserRow(req.userId);
   const page = sanitizePage(req.body || {}, parsePage(row));
   checkWords(page.meet, page.details.map((d) => [d.label, d.value]), Object.values(page.interests));
@@ -4228,7 +4283,8 @@ api.get('/people', auth, (req, res) => {
       u.id IN (SELECT y.user_id FROM members x JOIN members y ON x.server_id = y.server_id WHERE x.user_id = ?)
       OR u.id IN (SELECT CASE WHEN requester_id = ? THEN addressee_id ELSE requester_id END FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)))
     LIMIT 2000`).all(req.userId, req.userId, req.userId, req.userId, req.userId);
-  let list = rows.map((r) => ({ ...publicUser(r), views: r.page_views || 0, lastSeen: r.last_seen_at || 0 }))
+  const blockedIds = new Set(db.prepare('SELECT blocked_id AS id FROM blocks WHERE blocker_id = ? UNION SELECT blocker_id FROM blocks WHERE blocked_id = ?').all(req.userId, req.userId).map((b) => b.id));
+  let list = rows.map((r) => ({ ...publicUser(r), views: r.page_views || 0, lastSeen: lastSeenFor(req.userId, r, blockedIds.has(r.id)) || 0 }))
     .filter((u) => !q || u.username.toLowerCase().includes(q) || (u.profile.displayName || '').toLowerCase().includes(q)
       || (u.profile.interests || []).some((t) => t.toLowerCase().includes(q)) || (u.profile.headline || '').toLowerCase().includes(q));
   const on = (u) => (u.presence && u.presence !== 'offline' ? 1 : 0);

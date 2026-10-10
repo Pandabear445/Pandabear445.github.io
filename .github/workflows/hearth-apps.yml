@@ -9,6 +9,10 @@
 #   and kept in the Actions cache. With them, a Google Play bundle (.aab) is built too.
 #   Optional secrets VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR: copy the installers to your server's
 #   data/downloads folder, where they show up on https://your-server/download.
+#   Optional secret UPDATE_SIGNING_KEY (an Ed25519 private key; make one with
+#   `node hearth/desktop/build/sign-update.js keygen`): signs the desktop update files (latest*.yml.sig) and
+#   builds the matching public key into the apps, which then only install updates signed with it. Without it
+#   the apps still update, but ask first and say the update can't be verified.
 #
 #   Code signing (all optional; builds stay unsigned without them; step-by-step guide: hearth/docs/SIGNING.md):
 #     Windows, Azure Artifact Signing: secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET and
@@ -71,6 +75,16 @@ jobs:
       - name: Bake in the server address
         if: env.SERVER != ''
         run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+      # Signed updates: the installed app gets the public key and refuses updates not signed with the private one.
+      - name: Bake in the update signing key
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_KEY" ]; then
+            node build/sign-update.js bake
+          else
+            echo "::warning title=Update signing::No UPDATE_SIGNING_KEY secret: these apps can't verify their updates and will ask before installing each one. See hearth/desktop/build/sign-update.js."
+          fi
       - run: npm ci --no-audit --no-fund
       # Windows: sign with Azure Artifact Signing or a .pfx certificate when those secrets exist; otherwise an
       # unsigned installer and a warning (see hearth/docs/SIGNING.md).
@@ -176,6 +190,14 @@ jobs:
             if ($s.Status -ne 'Valid') { $bad = $true }
           }
           if ($bad) { Write-Host "::error::An .exe is not validly signed."; exit 1 }
+      # Last, after anything that rewrites latest.yml (SignPath's after-signing.js): sign the update files.
+      # macOS doesn't update itself, so there's nothing to sign there.
+      - name: Sign the update files
+        if: runner.os != 'macOS'
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_KEY" ]; then node build/sign-update.js sign dist; fi
       - uses: actions/upload-artifact@v4
         with:
           name: hearth-desktop-${{ runner.os }}
@@ -186,6 +208,7 @@ jobs:
             hearth/desktop/dist/*.deb
             hearth/desktop/dist/*.blockmap
             hearth/desktop/dist/latest*.yml
+            hearth/desktop/dist/latest*.yml.sig
           if-no-files-found: error
 
   android:
@@ -223,7 +246,7 @@ jobs:
       - name: Create the Android project
         run: |
           npx cap add android
-          cp native/MainActivity.java android/app/src/main/java/app/hearth/mobile/MainActivity.java
+          cp native/*.java android/app/src/main/java/app/hearth/mobile/
           # Microphone and camera for calls and voice messages, notifications for new messages.
           sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />#' android/app/src/main/AndroidManifest.xml
           grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
@@ -359,7 +382,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb,dist/*.apk,dist/*.blockmap,dist/latest*.yml'
+          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb,dist/*.apk,dist/*.blockmap,dist/latest*.yml,dist/latest*.yml.sig'
           target: ${{ secrets.VPS_DOWNLOADS_DIR }}
           strip_components: 1
       - name: Keep only the two newest of each installer on the server

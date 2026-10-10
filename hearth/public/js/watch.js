@@ -15,14 +15,19 @@ export function expectedPosition(st, offset) {
 }
 
 // ---- a small adapter per kind of player: load, play, pause, seek, rate, and "what time is it"
+// The players run sandboxed: scripts, their own storage, fullscreen and "open on YouTube" popups, but they
+// can never navigate the Hearth tab itself.
+const PLAYER_SANDBOX = 'allow-scripts allow-same-origin allow-presentation allow-popups allow-popups-to-escape-sandbox';
+const YOUTUBE_ORIGIN = 'https://www.youtube-nocookie.com';
 function youtubeAdapter(item, onEvent) {
   let t = 0; let state = -1; let ready = false; let dur = 0; let rate = 1;
   // YouTube's embed doesn't report seeks, so a jump in its reported time is one: dragging the progress bar,
   // the arrow keys, or double-tapping. (Without this, a seek was undone by the next drift check.)
   let lastT = null; let lastAt = 0; let ownSeekUntil = 0;
-  const src = `https://www.youtube-nocookie.com/embed/${item.src}?enablejsapi=1&playsinline=1&rel=0&modestbranding=1&controls=1&origin=${encodeURIComponent(location.origin)}`;
-  const frame = h('iframe', { class: 'wt-frame', src, allow: 'autoplay; encrypted-media; picture-in-picture; fullscreen', allowfullscreen: true, title: item.title || 'YouTube video', referrerpolicy: 'strict-origin-when-cross-origin' });
-  const send = (func, args = []) => frame.contentWindow && frame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
+  const src = `${YOUTUBE_ORIGIN}/embed/${item.src}?enablejsapi=1&playsinline=1&rel=0&modestbranding=1&controls=1&origin=${encodeURIComponent(location.origin)}`;
+  const frame = h('iframe', { class: 'wt-frame', sandbox: PLAYER_SANDBOX, src, allow: 'autoplay; encrypted-media; picture-in-picture; fullscreen', allowfullscreen: true, title: item.title || 'YouTube video', referrerpolicy: 'strict-origin-when-cross-origin' });
+  // Commands go only to YouTube's player, never to whatever page the frame might have ended up on.
+  const send = (func, args = []) => frame.contentWindow && frame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), YOUTUBE_ORIGIN);
   const onMsg = (e) => {
     if (e.source !== frame.contentWindow) return;
     let d; try { d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
@@ -48,7 +53,7 @@ function youtubeAdapter(item, onEvent) {
   window.addEventListener('message', onMsg);
   frame.addEventListener('load', () => {
     // Ask the player to report its state, and to tell us about play/pause.
-    frame.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 'hearth', channel: 'widget' }), '*');
+    frame.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 'hearth', channel: 'widget' }), YOUTUBE_ORIGIN);
     send('addEventListener', ['onStateChange']);
     setTimeout(() => { if (!ready) { ready = true; onEvent('ready'); } }, 1500);
   });
@@ -62,7 +67,7 @@ function youtubeAdapter(item, onEvent) {
 }
 function vimeoAdapter(item, onEvent) {
   let t = 0; let playing = false; let dur = 0;
-  const frame = h('iframe', { class: 'wt-frame', src: `https://player.vimeo.com/video/${item.src}?api=1&dnt=1&autopause=0`, allow: 'autoplay; fullscreen; picture-in-picture', allowfullscreen: true, title: item.title || 'Vimeo video' });
+  const frame = h('iframe', { class: 'wt-frame', sandbox: PLAYER_SANDBOX, src: `https://player.vimeo.com/video/${item.src}?api=1&dnt=1&autopause=0`, allow: 'autoplay; fullscreen; picture-in-picture', allowfullscreen: true, title: item.title || 'Vimeo video' });
   const send = (method, value) => frame.contentWindow && frame.contentWindow.postMessage(JSON.stringify(value === undefined ? { method } : { method, value }), 'https://player.vimeo.com');
   const onMsg = (e) => {
     if (e.source !== frame.contentWindow) return;
@@ -84,7 +89,7 @@ function vimeoAdapter(item, onEvent) {
   };
 }
 function twitchAdapter(item) {
-  const frame = h('iframe', { class: 'wt-frame', src: `https://player.twitch.tv/?channel=${encodeURIComponent(item.src)}&parent=${encodeURIComponent(location.hostname)}&muted=false&autoplay=true`, allow: 'autoplay; fullscreen', allowfullscreen: true, title: item.title || 'Twitch stream' });
+  const frame = h('iframe', { class: 'wt-frame', sandbox: PLAYER_SANDBOX, src: `https://player.twitch.tv/?channel=${encodeURIComponent(item.src)}&parent=${encodeURIComponent(location.hostname)}&muted=false&autoplay=true`, allow: 'autoplay; fullscreen', allowfullscreen: true, title: item.title || 'Twitch stream' });
   // Live: everyone already sees the same moment, so there's nothing to keep in step.
   return { el: frame, live: true, play() {}, pause() {}, seek() {}, rate() {}, time: () => 0, playing: () => true, duration: () => 0, destroy() {} };
 }

@@ -29,14 +29,14 @@ let tray = null;
 let quitting = false;
 let unread = 0;
 
-const normalize = (u) => {
-  try {
-    const url = new URL(/^https?:\/\//i.test(u) ? u : `https://${u}`);
-    return url.origin;
-  } catch { return null; }
-};
+// Which pages are "ours": exact origin / exact file comparisons (origin.js), never "starts with".
+const { normalize, isServerUrl, isAppFile, isHttpsUpgrade } = require('./origin');
+const CONNECT_FILE = path.join(__dirname, 'connect.html');
+const PICKER_FILE = path.join(__dirname, 'picker.html');
 const serverOrigin = () => normalize((CONFIG.lockServer ? CONFIG.defaultServer : settings.server || CONFIG.defaultServer) || '') || null;
-const onServerPage = () => { const o = serverOrigin(); return !!(win && o && win.webContents.getURL().startsWith(o)); };
+const isServer = (url) => isServerUrl(url, serverOrigin());
+const isConnectScreen = (url) => isAppFile(url, CONNECT_FILE);
+const onServerPage = () => !!(win && !win.isDestroyed() && isServer(win.webContents.getURL()));
 
 // ---------------------------------------------------------------- desktop settings (Settings → Apps & devices)
 const CAN_START_AT_LOGIN = IS_WIN || IS_MAC; // Linux desktops each do this differently
@@ -72,6 +72,7 @@ function desktopSettings() {
     serverLocked: !!CONFIG.lockServer,
     version: app.getVersion(),
     updateReady,
+    updatesSigned: !!UPDATE_KEY, // this build only installs updates signed by its publisher
     platform: process.platform,
     supports: { startAtLogin: CAN_START_AT_LOGIN, closeToTray: !IS_MAC, updates: updatesSupported() },
   };
@@ -227,25 +228,40 @@ function createWindow() {
     }
   });
   win.on('closed', () => { win = null; });
+  // A page can't stop the app from leaving it ("Leave site?" / beforeunload): the reload that ends an
+  // old-style screen capture (chooseScreen) must happen, and so must closing, quitting and changing server.
+  // Hearth's own pages never ask.
+  win.webContents.on('will-prevent-unload', (e) => e.preventDefault());
   // A reload or a new page starts outside any call until the page says otherwise. The server being down
   // behind a proxy (Caddy answers 502 while Hearth restarts) gets the "can't reach" screen too.
   win.webContents.on('did-navigate', (e, url, code) => {
     call = { inCall: false, muted: false, deafened: false }; drawThumbar();
     applyZoom();
-    const origin = serverOrigin();
-    if (origin && url.startsWith(origin) && [502, 503, 504, 520, 521, 522, 523, 524].includes(code)) loadOffline(`HTTP_${code}`);
+    if (isServer(url) && [502, 503, 504, 520, 521, 522, 523, 524].includes(code)) loadOffline(`HTTP_${code}`);
   });
 
-  // Links to other sites open in the normal browser, never inside the app.
+  // Links to other sites open in the normal browser, never inside the app (which has no address bar, and
+  // whose bridge only your server's pages may use). Same for a redirect away from your server.
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.webContents.on('will-navigate', (e, url) => {
-    const origin = serverOrigin();
-    if (url.startsWith('file:') || (origin && url.startsWith(origin))) return;
+  const elsewhere = (e, url) => {
     e.preventDefault();
     if (/^https?:/i.test(url)) shell.openExternal(url);
+  };
+  win.webContents.on('will-navigate', (e, url) => {
+    if (isServer(url) || isConnectScreen(url)) return;
+    elsewhere(e, url);
+  });
+  win.webContents.on('will-redirect', (e, legacyUrl, legacyInPlace, legacyMainFrame) => {
+    const url = (e && e.url) || legacyUrl;
+    const mainFrame = e && typeof e.isMainFrame === 'boolean' ? e.isMainFrame : legacyMainFrame;
+    if (!mainFrame || isServer(url) || isHttpsUpgrade(url, serverOrigin())) return;
+    elsewhere(e, url);
+    // Nothing of the server's was showing yet (the app starting, Retry, Connect): without this the window
+    // would stay empty. The connect screen says what happened, so the person can try again or switch servers.
+    setImmediate(() => { if (win && !win.isDestroyed() && !onServerPage()) loadConnect(redirectedAway(url)); });
   });
   win.webContents.on('did-fail-load', (e, code, desc, url, isMain) => {
     if (!isMain || code === -3) return; // -3: the load was replaced by another one
@@ -282,6 +298,14 @@ function connectQuery(extra) {
 }
 function loadConnect(error = '') {
   win.loadFile(path.join(__dirname, 'connect.html'), { query: connectQuery({ error }) });
+}
+// What the connect screen says when the server sent the app somewhere else (a sign-in page in front of it, say).
+function redirectedAway(url) {
+  let host = '';
+  try { const u = new URL(url); if (/^https?:$/.test(u.protocol)) host = u.host; } catch { /* not a web address */ }
+  return host
+    ? `Your server sent the app on to ${host}, which was opened in your browser instead. The app only shows your Hearth server’s own pages.`
+    : 'Your server sent the app to an address it can’t open. The app only shows your Hearth server’s own pages.';
 }
 // The server didn't answer: a friendly screen that keeps trying and comes back by itself.
 function loadOffline(reason = '') {
@@ -347,41 +371,146 @@ function contextMenu(wc, p) {
 }
 
 // ---------------------------------------------------------------- security: permissions + certificates
+// Microphone, camera and reading the clipboard: the person says yes once per server in a native dialog (as a
+// browser would ask), never the page by itself. See permissions.js for what's allowed without asking.
+const consent = require('./permissions');
+const deniedThisRun = new Set(); // "origin|kind" the person said no to: not asked again until the app restarts
+const asking = new Map(); // one dialog at a time per question, however often the page asks
+const granted = (origin) => (origin && settings.permissions && settings.permissions[origin]) || {};
+function askConsent(origin, kinds) {
+  if (kinds.some((k) => deniedThisRun.has(`${origin}|${k}`))) return Promise.resolve(false);
+  const key = `${origin}|${kinds.join(',')}`;
+  if (!asking.has(key)) {
+    asking.set(key, (async () => {
+      if (!win || win.isDestroyed()) return false;
+      const host = (() => { try { return new URL(origin).host; } catch { return origin; } })();
+      const { response, checkboxChecked } = await dialog.showMessageBox(win, consent.prompt(kinds, host));
+      if (response !== 1) { kinds.forEach((k) => deniedThisRun.add(`${origin}|${k}`)); return false; }
+      if (checkboxChecked) {
+        settings.permissions = { ...(settings.permissions || {}), [origin]: { ...granted(origin), ...Object.fromEntries(kinds.map((k) => [k, true])) } };
+        saveSettings();
+      }
+      return true;
+    })().catch(() => false).finally(() => asking.delete(key)));
+  }
+  return asking.get(key);
+}
+function resetPermissions() {
+  delete settings.permissions;
+  deniedThisRun.clear();
+  saveSettings();
+}
+
+// Screen sharing. Electron asks one "media" permission with no device named for getDisplayMedia() *and* for
+// the old getUserMedia({ video: { mandatory: { chromeMediaSource: 'desktop' } } }), which captures the whole
+// desktop at once, without the display-media handler. So the person picks what to share right at that
+// permission (the picker below); getDisplayMedia then carries on into the display-media handler, which shares
+// exactly that choice. If that handler doesn't follow within a few seconds, it was the old kind of request,
+// which Hearth never makes: the page's renderer is stopped and the page loaded again, which ends that capture.
+let pendingShare = null; // { origin, source, at }: the person's choice, waiting for the display-media handler
+const SHARE_HANDOFF_MS = 3000;
+// Stopping the renderer process (rather than asking the page to reload) means nothing the page runs can keep
+// the capture going: not a "Leave site?" handler, a busy loop or a worker. Once it's gone, the page loads
+// again in a new one (a reload sent any sooner is lost with the old process).
+function restartPage() {
+  if (!win || win.isDestroyed()) return;
+  const wc = win.webContents;
+  const again = () => setImmediate(() => { if (!wc.isDestroyed()) wc.reload(); });
+  wc.once('render-process-gone', again);
+  try { wc.forcefullyCrashRenderer(); } catch { wc.removeListener('render-process-gone', again); wc.reload(); }
+}
+async function chooseScreen(origin) {
+  if (pendingShare && Date.now() - pendingShare.at < SHARE_HANDOFF_MS) return false; // one share at a time
+  const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } });
+  const id = await pickSource(sources.map((s) => ({ id: s.id, name: s.name, screen: s.id.startsWith('screen:'), thumb: s.thumbnail.toDataURL() })), { host: new URL(origin).host, audio: IS_WIN });
+  const source = id && sources.find((s) => s.id === id);
+  if (!source || serverOrigin() !== origin) return false;
+  const mine = { origin, source, at: Date.now() };
+  pendingShare = mine;
+  setTimeout(() => {
+    if (pendingShare !== mine) return; // taken by the display-media handler, as it should be
+    pendingShare = null;
+    if (win && !win.isDestroyed() && isServer(win.webContents.getURL())) restartPage();
+  }, SHARE_HANDOFF_MS);
+  return true;
+}
+
 app.whenReady().then(() => {
-  // display-capture: what newer Electron versions call screen-share requests (still only from your server).
-  const allowed = ['media', 'display-capture', 'notifications', 'clipboard-sanitized-write', 'clipboard-read', 'fullscreen'];
-  const ok = (url, perm) => {
+  session.defaultSession.setPermissionRequestHandler((wc, perm, cb, details = {}) => {
     const origin = serverOrigin();
-    try { return !!origin && new URL(url).origin === origin && allowed.includes(perm); } catch { return false; }
-  };
-  session.defaultSession.setPermissionRequestHandler((wc, perm, cb, details) => cb(ok(details.requestingUrl || wc.getURL(), perm)));
-  session.defaultSession.setPermissionCheckHandler((wc, perm, requestingOrigin) => ok(requestingOrigin, perm));
+    const fromServer = !!(win && !win.isDestroyed() && wc && wc.id === win.webContents.id) && isServerUrl(details.requestingUrl || wc.getURL(), origin);
+    const d = consent.decide(perm, details, { fromServer, granted: granted(origin) });
+    if (d.result === 'screen') return chooseScreen(origin).then((yes) => cb(!!yes), () => cb(false));
+    if (d.result !== 'ask') return cb(d.result === 'allow');
+    askConsent(origin, d.kinds).then((yes) => cb(!!yes), () => cb(false));
+  });
+  // Checks (navigator.permissions, device names) answer "yes" only for what the person already allowed.
+  session.defaultSession.setPermissionCheckHandler((wc, perm, requestingOrigin, details = {}) => {
+    const origin = serverOrigin();
+    return consent.decide(perm, details, { fromServer: isServerUrl(requestingOrigin, origin), granted: granted(origin) }).result === 'allow';
+  });
   try { session.defaultSession.setSpellCheckerEnabled(spellcheckOn()); } catch { /* ignore */ }
 
-  // Screen sharing: Electron has no built-in picker, so we list screens/windows and let the page show
-  // one (newer macOS uses its own system picker). On Windows the computer's audio can be shared too.
+  // Screen sharing: Electron has no built-in picker, so the app shows its own (picker.html, a local window
+  // the server's page can't see or script; see chooseScreen above), on every system: macOS's own picker
+  // would come after the app's and skip this handler. The server's page only asks to share: it never gets
+  // the list of windows or their previews, and nothing is shared until the person picks. getDisplayMedia
+  // shares exactly that pick; the old getUserMedia desktop capture (which Hearth never uses) gets the whole
+  // screen, but only until chooseScreen stops the page, about 3 seconds later. On Windows the computer's
+  // audio can be shared too.
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     // The callback may be called once; null means "no" (an empty object throws in current Electron).
     let answered = false;
     const answer = (streams) => { if (answered) return; answered = true; try { callback(streams); } catch { /* the page gets an error */ } };
     try {
       const origin = serverOrigin();
-      if (!origin || !request.securityOrigin || !request.securityOrigin.startsWith(origin)) return answer(null);
-      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } });
-      const id = await pickSource(sources.map((s) => ({ id: s.id, name: s.name, screen: s.id.startsWith('screen:'), thumb: s.thumbnail.toDataURL() })));
-      const chosen = id && sources.find((s) => s.id === id);
-      if (!chosen) return answer(null);
-      answer({ video: chosen, audio: IS_WIN && request.audioRequested ? 'loopback' : undefined });
+      const choice = pendingShare;
+      pendingShare = null;
+      if (!origin || !isServerUrl(request.securityOrigin, origin)) return answer(null);
+      if (!choice || choice.origin !== origin || Date.now() - choice.at > SHARE_HANDOFF_MS) return answer(null);
+      answer({ video: choice.source, audio: IS_WIN && request.audioRequested ? 'loopback' : undefined });
     } catch { answer(null); }
-  }, { useSystemPicker: true });
+  });
 });
-function pickSource(list) {
+// Opens the picker over the main window; resolves to the chosen source id, or null (cancelled, closed,
+// or two minutes without an answer).
+let picker = null;
+function pickSource(list, { host, audio }) {
   return new Promise((resolve) => {
-    if (!win) return resolve(null);
-    const done = (e, id) => { if (fromOurPage(e)) { clearTimeout(t); ipcMain.removeListener('screen-picked', done); resolve(typeof id === 'string' ? id : null); } };
-    const t = setTimeout(() => { ipcMain.removeListener('screen-picked', done); resolve(null); }, 120000);
-    ipcMain.on('screen-picked', done);
-    win.webContents.send('screen-pick', list);
+    if (!win || win.isDestroyed() || picker) return resolve(null);
+    const p = new BrowserWindow({
+      parent: win, modal: true, width: 760, height: 560, minWidth: 480, minHeight: 360, show: false,
+      title: 'Choose what to share', backgroundColor: '#100e16', autoHideMenuBar: true,
+      minimizable: false, maximizable: false, fullscreenable: false,
+      webPreferences: { preload: path.join(__dirname, 'picker-preload.js'), contextIsolation: true, sandbox: true, spellcheck: false },
+    });
+    picker = p;
+    let done = false;
+    const finish = (id) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      ipcMain.removeListener('picker:choose', onChoose);
+      picker = null;
+      if (!p.isDestroyed()) p.destroy();
+      resolve(id);
+    };
+    // Only this window's own page answers, and only with an id that was on the list.
+    const onChoose = (e, id) => {
+      if (p.isDestroyed() || e.sender !== p.webContents || !e.senderFrame || !isAppFile(e.senderFrame.url, PICKER_FILE)) return;
+      finish(typeof id === 'string' && list.some((s) => s.id === id) ? id : null);
+    };
+    const t = setTimeout(() => finish(null), 120000);
+    ipcMain.on('picker:choose', onChoose);
+    p.on('closed', () => finish(null));
+    p.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    p.webContents.on('will-navigate', (e) => e.preventDefault());
+    p.webContents.once('did-finish-load', () => {
+      if (p.isDestroyed()) return;
+      p.webContents.send('picker:sources', { host, audio, sources: list });
+      p.show();
+    });
+    p.loadFile(PICKER_FILE).catch(() => finish(null));
   });
 }
 
@@ -439,8 +568,15 @@ const hotkeys = require('./hotkeys');
 
 // ---------------------------------------------------------------- updates
 // The app updates itself from your own Hearth server (data/downloads, filled by GitHub Actions or by hand):
-// it downloads in the background and asks to restart. Mac builds need code signing for this, so Mac skips it.
+// it downloads in the background, then asks before installing (a native dialog; never silently on quit).
+// Builds made with a signing key only install updates signed by their publisher (update-verify.js), so
+// whoever controls a server's downloads folder can't get their own program run on your computer.
+// Mac builds need code signing for this, so Mac skips it.
+const UPDATES = require('./update-verify');
+const UPDATE_KEY = typeof CONFIG.updatePublicKey === 'string' ? CONFIG.updatePublicKey.trim() : '';
 let updateReady = null;
+let readyUpdate = null; // { version, file, verified, hashes } once a download has passed the checks
+let updateFeed = null; // where the updater was pointed (…/updates/)
 let updater = null;
 let updateState = { state: 'idle' };
 const updatesSupported = () => app.isPackaged && CONFIG.autoUpdate !== false && !IS_MAC;
@@ -449,16 +585,25 @@ function getUpdater() {
   if (updater || !updatesSupported()) return updater;
   try { updater = require('electron-updater').autoUpdater; } catch { return null; }
   updater.autoDownload = true;
-  updater.autoInstallOnAppQuit = true;
+  updater.autoInstallOnAppQuit = false; // installing always waits for the person's yes (installUpdate)
   updater.on('checking-for-update', () => setUpdateState({ state: 'checking' }));
   updater.on('update-available', (info) => setUpdateState({ state: 'downloading', version: info.version, percent: 0 }));
   updater.on('download-progress', (p) => setUpdateState({ state: 'downloading', version: updateState.version, percent: Math.round(p.percent || 0) }));
   updater.on('update-not-available', () => setUpdateState({ state: 'none', version: app.getVersion() }));
   updater.on('update-downloaded', (info) => {
-    updateReady = info.version;
-    setUpdateState({ state: 'ready', version: info.version });
-    sendToPage('update-ready', { version: info.version });
-    settingsChanged();
+    vetUpdate(info).then((r) => {
+      if (!r.ok) {
+        updateReady = null; readyUpdate = null;
+        setUpdateState({ state: 'error', message: r.error });
+        settingsChanged();
+        return;
+      }
+      readyUpdate = r;
+      updateReady = info.version;
+      setUpdateState({ state: 'ready', version: info.version, verified: r.verified });
+      sendToPage('update-ready', { version: info.version });
+      settingsChanged();
+    });
   });
   // No update published yet, or offline: try again later.
   updater.on('error', (err) => setUpdateState({ state: 'error', message: friendlyUpdateError(err) }));
@@ -481,7 +626,8 @@ async function checkForUpdates() {
   if (!origin || !au) return { state: 'unavailable', message: 'Connect to a server first.' };
   if (updateState.state === 'checking' || updateState.state === 'downloading') return updateState;
   try {
-    au.setFeedURL({ provider: 'generic', url: `${origin}/updates/` });
+    updateFeed = `${origin}/updates/`;
+    au.setFeedURL({ provider: 'generic', url: updateFeed });
     const r = await au.checkForUpdates();
     if (r && r.isUpdateAvailable) return { state: 'downloading', version: r.updateInfo.version, percent: 0 };
     return { state: 'none', version: app.getVersion() };
@@ -494,11 +640,59 @@ function setupUpdates() {
   setTimeout(() => checkForUpdates().catch(() => {}), 15000);
   setInterval(() => checkForUpdates().catch(() => {}), 4 * 3600000);
 }
-function installUpdate() {
-  if (!updateReady) return;
-  quitting = true;
-  try { require('electron-updater').autoUpdater.quitAndInstall(false, true); } catch { app.quit(); }
+// The file that quitAndInstall would run.
+const installerFile = (info) => (updater && updater.installerPath) || (info && (info.downloadedFile || info.file)) || null;
+async function fetchUpdateFile(name) {
+  const res = await net.fetch(updateFeed + name, { cache: 'no-store', signal: AbortSignal.timeout(20000) });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`HTTP_${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
 }
+// A finished download: with a signing key, its signed details and its SHA-512 must check out; without one,
+// it's marked unverified (and the install dialog says so).
+async function vetUpdate(info) {
+  const file = installerFile(info);
+  if (!info || !file) return { ok: false, error: 'The update didn’t finish downloading. Hearth will try again later.' };
+  if (!UPDATE_KEY) return { ok: true, verified: false, version: info.version, file };
+  try {
+    if (!updateFeed) return { ok: false, error: 'Couldn’t check the update’s signature right now.' };
+    // Never a "web installer" with a separate package: Hearth's releases don't use one.
+    if (updater && updater.downloadedUpdateHelper && updater.downloadedUpdateHelper.packageFile) return { ok: false, error: UPDATES.NOT_SIGNED_FILE };
+    const name = UPDATES.channelFile(process.platform, process.arch);
+    const [yml, sig] = await Promise.all([fetchUpdateFile(name), fetchUpdateFile(`${name}.sig`)]);
+    const feed = UPDATES.verifyFeed({ name, yml, sig: sig && sig.toString('utf8'), publicKey: UPDATE_KEY, version: info.version, currentVersion: app.getVersion() });
+    if (!feed.ok) return feed;
+    if (!UPDATES.fileMatches(await UPDATES.sha512File(file), feed.hashes)) return { ok: false, error: UPDATES.NOT_SIGNED_FILE };
+    return { ok: true, verified: true, version: info.version, file, hashes: feed.hashes };
+  } catch {
+    return { ok: false, error: 'Couldn’t check the update’s signature right now. Hearth will try again later.' };
+  }
+}
+// "Restart to update" (Settings, the tray, the page's banner): checks the file once more, then asks.
+let installing = false;
+async function installUpdate() {
+  if (!updateReady || !readyUpdate || installing) return;
+  installing = true;
+  try {
+    const file = installerFile(readyUpdate);
+    let ok = file === readyUpdate.file;
+    if (ok && readyUpdate.verified) ok = UPDATES.fileMatches(await UPDATES.sha512File(file).catch(() => ''), readyUpdate.hashes);
+    if (!ok) {
+      updateReady = null; readyUpdate = null;
+      setUpdateState({ state: 'error', message: UPDATES.NOT_SIGNED_FILE });
+      settingsChanged();
+      return;
+    }
+    const host = (() => { try { return new URL(updateFeed).host; } catch { return ''; } })();
+    const opts = UPDATES.installPrompt({ version: readyUpdate.version, verified: readyUpdate.verified, host });
+    if (win && !win.isDestroyed()) showWindow();
+    const { response } = await (win && !win.isDestroyed() ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts));
+    if (response !== 1 || !updateReady) return;
+    quitting = true;
+    try { updater.quitAndInstall(false, true); } catch { app.quit(); }
+  } finally { installing = false; }
+}
+const askToInstall = () => { installUpdate().catch(() => { installing = false; }); };
 
 // ---------------------------------------------------------------- tray + menus
 function buildTray() {
@@ -514,7 +708,7 @@ function refreshTrayMenu() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: `Open ${APP_NAME}`, click: showWindow },
     { label: 'Settings…', click: openSettings },
-    updateReady ? { label: `Restart to update (${updateReady})`, click: installUpdate } : null,
+    updateReady ? { label: `Restart to update (${updateReady})`, click: askToInstall } : null,
     { type: 'separator' },
     CAN_START_AT_LOGIN ? { label: 'Start when I log in', type: 'checkbox', checked: login, click: (i) => setDesktopSetting('startAtLogin', i.checked) } : null,
     CAN_START_AT_LOGIN && login ? { label: 'Start minimised in the tray', type: 'checkbox', checked: startHidden(), click: (i) => setDesktopSetting('startHidden', i.checked) } : null,
@@ -557,6 +751,11 @@ function buildAppMenu() {
     { label: 'Help', submenu: [
       { label: 'Open in browser', click: () => { const o = serverOrigin(); if (o) shell.openExternal(o); } },
       ...(CONFIG.lockServer ? [] : [{ label: 'Change server…', click: () => { showWindow(); loadConnect(); } }]),
+      { label: 'Reset permissions', click: () => {
+        resetPermissions();
+        const o = { type: 'info', message: 'Hearth will ask again before using your microphone, camera or clipboard.' };
+        (win && !win.isDestroyed() ? dialog.showMessageBox(win, o) : dialog.showMessageBox(o)).catch(() => {});
+      } },
       { type: 'separator' },
       { label: `Version ${app.getVersion()}`, enabled: false },
     ] },
@@ -564,12 +763,11 @@ function buildAppMenu() {
 }
 
 // ---------------------------------------------------------------- IPC from the page (see preload.js)
-const fromOurPage = (e) => {
-  const url = e.senderFrame ? e.senderFrame.url : '';
-  const origin = serverOrigin();
-  return url.startsWith('file:') || (!!origin && url.startsWith(origin));
-};
-const fromConnectScreen = (e) => !!(e.senderFrame && e.senderFrame.url.startsWith('file:'));
+// A message counts only from the main window's top frame, showing your server's page (exact origin) or the
+// built-in connect screen. A look-alike address (https://your.server.evil.net) is not your server.
+const fromMainWindow = (e) => !!(win && !win.isDestroyed() && e.sender === win.webContents && e.senderFrame && !e.senderFrame.parent);
+const fromOurPage = (e) => fromMainWindow(e) && (isServer(e.senderFrame.url) || isConnectScreen(e.senderFrame.url));
+const fromConnectScreen = (e) => fromMainWindow(e) && isConnectScreen(e.senderFrame.url);
 ipcMain.on('version', (e) => { e.returnValue = app.getVersion(); });
 ipcMain.on('badge', (e, n) => { if (fromOurPage(e)) setBadge(n); });
 ipcMain.on('focus', (e) => { if (fromOurPage(e)) showWindow(); });
@@ -583,7 +781,7 @@ ipcMain.on('call-state', (e, s) => {
   call = { inCall: !!(s && s.inCall), muted: !!(s && s.muted), deafened: !!(s && s.deafened) };
   drawThumbar();
 });
-ipcMain.on('install-update', (e) => { if (fromOurPage(e)) installUpdate(); });
+ipcMain.on('install-update', (e) => { if (fromOurPage(e)) askToInstall(); });
 ipcMain.on('update-status', (e) => { e.returnValue = updateReady; });
 // Settings → Apps & devices: the app's own settings, the update check and "Restart now".
 ipcMain.handle('desktop-settings:get', (e) => (fromOurPage(e) ? desktopSettings() : null));
@@ -631,7 +829,7 @@ ipcMain.handle('retry-server', async (e) => {
   const origin = serverOrigin();
   if (!origin) return { ok: false, error: 'No server yet.' };
   const r = await probe(origin);
-  if (r.ok && win && !win.isDestroyed() && win.webContents.getURL().startsWith('file:')) load();
+  if (r.ok && win && !win.isDestroyed() && isConnectScreen(win.webContents.getURL())) load();
   return { ok: r.ok, error: r.error || '' };
 });
 

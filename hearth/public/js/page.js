@@ -2,7 +2,7 @@
 import { h, clear, icon, toast, fmtStamp, fmtDay } from './util.js';
 import { api, upload } from './api.js';
 import { avatarEl, nameEl, displayName, effectLayer, splitGlyphs, FONT_STACKS, cropStyle, songPlayer, bannerEl } from './profile-ui.js';
-import { confirmDialog } from './ui.js';
+import { confirmDialog, modal } from './ui.js';
 import { renderDoc, render as md } from './markdown.js';
 import { activityCards, favoriteGamesEl, recentGamesEl } from './activity.js';
 
@@ -58,8 +58,10 @@ function pageStyle(p, pageBg) {
 }
 
 // People's own CSS, made safe: the browser parses it, every rule is limited to this one page, and
-// anything that would load from elsewhere (url(), @import…) is dropped. The page also contains its
-// own painting, so nothing can cover the rest of the app.
+// anything that would load from elsewhere (url(), @import…) is dropped. Rules can only reach the page
+// itself and what's inside it; the page's parent (.mys-shell, which page CSS can't select) contains
+// its layout and painting, so nothing on the page can cover the rest of the app or its close button.
+// The page's own @keyframes get names of their own, so they can't redefine the app's animations.
 export function scopeCss(css, scope) {
   if (!css || !css.trim() || typeof CSSStyleSheet !== 'function') return '';
   let sheet;
@@ -68,10 +70,33 @@ export function scopeCss(css, scope) {
   const root = /^(html|body|:root|\.mys-page)(?![\w-])/;
   const sel = (t) => t.split(',').map((x) => x.trim()).filter(Boolean)
     .map((x) => (root.test(x) ? x.replace(root, scope) : `${scope} ${x}`)).join(', ');
+  const isKeyframes = (r) => typeof CSSKeyframesRule !== 'undefined' && r instanceof CSSKeyframesRule;
+  let tag = 0;
+  for (const ch of scope) tag = (tag * 31 + ch.charCodeAt(0)) >>> 0;
+  const renamed = new Map(); // the page's animation name (as written, and as the browser serializes it) -> its own name
+  const collect = (rules) => [...rules].forEach((r) => {
+    if (isKeyframes(r) && !renamed.has(r.name)) { const to = CSS.escape(`pg${tag.toString(36)}-${r.name}`); renamed.set(r.name, to); renamed.set(CSS.escape(r.name), to); }
+    else if (r instanceof CSSMediaRule) collect(r.cssRules);
+  });
+  collect(sheet.cssRules);
+  const fixAnimations = (style) => {
+    const names = style.getPropertyValue('animation-name');
+    if (names && renamed.size) style.setProperty('animation-name', names.split(',').map((n) => renamed.get(n.trim()) || n.trim()).join(', '));
+  };
+  // Masking would make the page's text look like a password field: gone from rules and animation frames alike.
+  const unmask = (style) => { style.removeProperty('-webkit-text-security'); return style.cssText; };
   const walk = (rules) => [...rules].map((r) => {
-    if (r instanceof CSSStyleRule) return bad.test(r.style.cssText) || !r.style.cssText ? '' : `${sel(r.selectorText)} { ${r.style.cssText} }`;
+    if (r instanceof CSSStyleRule) {
+      unmask(r.style);
+      fixAnimations(r.style);
+      return bad.test(r.style.cssText) || !r.style.cssText ? '' : `${sel(r.selectorText)} { ${r.style.cssText} }`;
+    }
     if (r instanceof CSSMediaRule) return `@media ${r.conditionText || r.media.mediaText} { ${walk(r.cssRules)} }`;
-    if (typeof CSSKeyframesRule !== 'undefined' && r instanceof CSSKeyframesRule) return bad.test(r.cssText) ? '' : r.cssText;
+    if (isKeyframes(r)) {
+      if (bad.test(r.cssText)) return '';
+      const inner = [...r.cssRules].map((k) => `${k.keyText} { ${unmask(k.style)} }`).join(' ');
+      return `@keyframes ${renamed.get(r.name)} { ${inner} }`;
+    }
     return '';
   }).filter(Boolean).join('\n');
   return walk(sheet.cssRules);
@@ -180,15 +205,23 @@ export function renderPage(d, u, opts = {}) {
     });
   };
   drawComments();
-  const form = d.canComment && !opts.preview ? (() => {
-    const ta = h('textarea', { class: 'input', rows: '3', maxlength: '1000', placeholder: self ? 'Write on your own wall…' : `Leave ${name} a comment…` });
-    return h('div', { class: 'mys-comment-form' }, ta, h('button', { class: 'btn primary sm', onclick: async (e) => {
-      if (!ta.value.trim()) return;
-      e.currentTarget.disabled = true;
-      try { const c = await api('POST', `/users/${u.id}/comments`, { text: ta.value }); comments.unshift(c); ta.value = ''; drawComments(); } catch (x) { toast(x.message, 'error'); }
-      e.currentTarget.disabled = false;
-    } }, 'Add comment'));
-  })() : h('p', { class: 'mys-muted' }, p.comments === 'off' ? `${name} has turned comments off.` : p.comments === 'friends' ? `Only ${name}'s friends can comment.` : '');
+  // The text box opens in the app's own dialog, outside the page: the page's CSS can restyle anything on
+  // the page, so a box on it could be dressed up as a "sign in again" prompt that posts to this wall.
+  const writeComment = () => {
+    const ta = h('textarea', { class: 'input', rows: '4', maxlength: '1000', placeholder: self ? 'Write on your own wall…' : `Leave ${name} a comment…` });
+    modal({
+      title: self ? 'Write on your wall' : `Comment on ${name}'s page`, size: 'sm',
+      body: h('div', { class: 'stack' }, ta, h('p', { class: 'field-hint' }, `Everyone who opens ${self ? 'your' : `${name}'s`} page can read this.`)),
+      actions: [{ label: 'Cancel' }, { label: 'Post comment', kind: 'primary', action: async () => {
+        if (!ta.value.trim()) throw new Error('Write something first.');
+        const c = await api('POST', `/users/${u.id}/comments`, { text: ta.value });
+        comments.unshift(c); drawComments();
+      } }],
+    });
+  };
+  const form = d.canComment && !opts.preview
+    ? h('button', { class: 'btn primary sm mys-comment-open', type: 'button', onclick: writeComment }, icon('edit'), self ? 'Write on your wall' : 'Leave a comment')
+    : h('p', { class: 'mys-muted' }, p.comments === 'off' ? `${name} has turned comments off.` : p.comments === 'friends' ? `Only ${name}'s friends can comment.` : '');
   right.push(box(`${name}'s Friends' Comments`, 'mys-comments', h('p', { class: 'mys-muted' }, `Displaying ${comments.length} of ${d.commentCount} comments`), form, list));
 
   const head = prof.headline && p.marquee ? h('div', { class: 'mys-marquee', 'aria-label': prof.headline }, h('span', null, prof.headline), h('span', { 'aria-hidden': 'true' }, prof.headline)) : null;
