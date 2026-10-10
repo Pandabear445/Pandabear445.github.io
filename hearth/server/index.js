@@ -700,8 +700,15 @@ function recordIp(userId, ip, token) {
   db.prepare('INSERT INTO user_ips (user_id, ip, first_seen, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen').run(userId, ip, t, t);
   if (token) db.prepare('UPDATE sessions SET ip = ? WHERE token_hash = ?').run(ip, tokenId(token));
 }
-// IP bans: single addresses or IPv4 ranges (CIDR), checked on sign-up, login and live connections.
-const ipBans = () => { try { return JSON.parse(getSetting('ipBans') || '[]'); } catch { return []; } };
+// IP bans: single addresses or IPv4 ranges (CIDR), checked on sign-up, login, password resets, every signed-in
+// request (staff excepted) and live connections. The parsed list is kept until the setting changes.
+let banCache = { raw: null, list: [] };
+const ipBans = () => {
+  const raw = getSetting('ipBans') || '[]';
+  if (raw !== banCache.raw) { let list = []; try { list = JSON.parse(raw); } catch { /* none */ } banCache = { raw, list: Array.isArray(list) ? list : [] }; }
+  return banCache.list;
+};
+const BANNED_MSG = 'Access from your network has been blocked by this server\u2019s administrators.';
 const ip4num = (ip) => { const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip); return m ? ((+m[1] << 24) >>> 0) + (+m[2] << 16) + (+m[3] << 8) + +m[4] : null; };
 function ipBanned(ip) {
   ip = cleanIp(ip);
@@ -781,6 +788,8 @@ function auth(req, res, next) {
   const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
   if (!u || u.deleted_at) return res.status(401).json({ error: 'Not signed in.', code: 'signed_out' });
   if (stillSuspended(u)) return res.status(403).json({ error: suspendedMsg(u), code: 'suspended' });
+  // A ban covers people who were already signed in, too (staff excepted, so nobody locks the admins out).
+  if (ipBanned(req.ip) && !isStaff(s.user_id)) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
   if (maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
   req.userId = s.user_id;
   req.token = token;
@@ -903,7 +912,7 @@ const isSalt = (s) => typeof s === 'string' && /^[A-Za-z0-9+/=]{20,64}$/.test(s)
 // Which password-hashing scheme and salt to use for a username. For unknown usernames we return a
 // stable fake salt so this endpoint doesn't reveal which accounts exist.
 api.get('/auth/params', (req, res) => {
-  rateLimit('params:' + req.ip, 60, 60 * 1000);
+  limitNet(req, 'params', 60, 60 * 1000); // per network: rotating addresses inside one IPv6 /64 doesn't get around it
   const username = String(req.query.username || '').slice(0, 24);
   const row = db.prepare('SELECT kdf, kdf_salt FROM users WHERE username = ?').get(username);
   if (row && row.kdf === 'argon2id') return res.json({ kdf: 'argon2id', salt: row.kdf_salt });
@@ -912,16 +921,15 @@ api.get('/auth/params', (req, res) => {
   res.json({ kdf: 'argon2id', salt });
 });
 
-// Banned IPs can't sign up, log in or connect.
-api.use(['/auth/register', '/auth/login'], (req, res, next) => {
+// Banned IPs can't sign up, log in, reset a password (which hands out a new session) or connect.
+api.use(['/auth/register', '/auth/login', '/auth/forgot', '/auth/reset'], (req, res, next) => {
   const b = ipBanned(req.ip);
-  if (b) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: 'Access from your network has been blocked by this server\u2019s administrators.', code: 'ip_banned' }); }
+  if (b) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
   next();
 });
 api.post('/auth/register', wrap(async (req, res) => {
   limitNet(req, 'reg', 5, 60 * 60 * 1000);
   rateLimit('reg:day:' + netOf(req.ip), 10, 24 * 60 * 60 * 1000);
-  rateLimit('reg:all', 120, 60 * 60 * 1000); // slows bot floods across many IPs
   const mode = regMode();
   if (mode === 'closed') fail(403, 'Registration is closed on this server.');
   const { username, authKey, publicKey, encPrivateKey, code, kdfSalt, acceptTos } = req.body || {};
@@ -929,11 +937,16 @@ api.post('/auth/register', wrap(async (req, res) => {
   const tos = termsInfo();
   if (tos.version && +acceptTos !== tos.version) fail(400, 'Please read and accept the Terms of Service to create an account.');
   verifyCaptcha((req.body || {}).captcha, 'register');
+  // Slows bot floods across many IPs. Counted only after the robot check, so requests without a solved one
+  // can't use it up and stop everyone else from signing up.
+  rateLimit('reg:all', 120, 60 * 60 * 1000);
   if (typeof username !== 'string' || !USERNAME_RE.test(username)) fail(400, 'Usernames are 2–24 characters: letters, numbers, _ and . only.');
   if (typeof authKey !== 'string' || !/^[0-9a-f]{64}$/.test(authKey)) fail(400, 'Bad auth key.');
   if (!isB64ish(publicKey, 2000) || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
   if (!isSalt(kdfSalt)) fail(400, 'This page is out of date. Reload and try again.');
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) fail(409, 'That username is taken.');
+  // An ADMIN_USERS name its account renamed away from (or deleted) is still that account's: it brings admin powers.
+  if (envAdmins().includes(username.toLowerCase()) && envClaims()[username.toLowerCase()]) fail(409, 'That username is reserved.');
   const id = newId();
   const hash = await bcrypt.hash(authKey, 11);
   const profile = sanitizeProfile({ displayName: username });
@@ -945,6 +958,10 @@ api.post('/auth/register', wrap(async (req, res) => {
     if (String(e.code).startsWith('SQLITE_CONSTRAINT')) fail(409, 'That username is taken.');
     throw e;
   }
+  // The first account to take a free ADMIN_USERS name keeps it for good; and the very first account settles who
+  // owns the server (nothing awaits between the insert and here, so two sign-ups can't both claim).
+  claimEnvAdmin(getUserRow(id));
+  ownerId();
   const token = createSession(req, id);
   addSupportFriend(id);
   res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey });
@@ -955,17 +972,24 @@ api.post('/auth/register', wrap(async (req, res) => {
 const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 11);
 api.post('/auth/login', wrap(async (req, res) => {
   limitNet(req, 'login', 20, 10 * 60 * 1000);
+  // The robot check comes before every shared limit: a request without a solved one is turned away here, so
+  // junk can't use up the instance-wide limit or an account's own (which would lock real people out).
+  verifyCaptcha((req.body || {}).captcha, 'login');
   rateLimit('login:all', 3000, 10 * 60 * 1000); // password checks are slow on purpose; this keeps a flood from using all the CPU
   const { username, authKey } = req.body || {};
   const name = typeof username === 'string' ? username.slice(0, 40) : '';
   const row = name ? db.prepare('SELECT * FROM users WHERE username = ?').get(name) : null;
-  // Per-account limits too, so guessing one person's password from many IPs is slowed down. The short one
-  // doesn't apply from networks this account has signed in from before, so nobody can lock a person out of
-  // their usual devices by spamming; the daily one counts every network.
+  // Per-account limits too, so guessing one person's password from many IPs is slowed down. Attempts from
+  // networks this account has signed in from before are counted apart (per network, per day), so nobody can
+  // lock a person out of their usual devices by spamming from somewhere else.
+  // (The name is encoded so a made-up one like "day:alice" can't land in alice's buckets.)
+  const lname = Buffer.from(name.toLowerCase()).toString('base64url');
   const knownIp = row && db.prepare('SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?').get(row.id, cleanIp(req.ip));
-  if (!knownIp) rateLimit('loginuser:' + name.toLowerCase(), 10, 15 * 60 * 1000);
-  rateLimit('loginuser:day:' + name.toLowerCase(), 100, 24 * 60 * 60 * 1000);
-  verifyCaptcha((req.body || {}).captcha, 'login');
+  if (knownIp) rateLimit(`loginuser:known:${lname}:${netOf(req.ip)}`, 100, 24 * 60 * 60 * 1000);
+  else {
+    rateLimit('loginuser:' + lname, 10, 15 * 60 * 1000);
+    rateLimit('loginuser:day:' + lname, 100, 24 * 60 * 60 * 1000);
+  }
   const key = typeof authKey === 'string' ? authKey.slice(0, 128) : '';
   const ok = await bcrypt.compare(key, row ? row.auth_hash : DUMMY_HASH);
   if (!ok || !row || row.is_bot || row.deleted_at) { noteAuthFailure(req.ip); secEvent('failed_login', req.ip, name); fail(401, 'Wrong username or password.'); }
@@ -1000,8 +1024,8 @@ async function stepUp(req, body, authKeyField = 'authKey') {
 // ---------------------------------------------------------------- changing a username
 // The old name is free for anyone the moment it changes. Passwords don't depend on the username (the password
 // salt is stored per account), except for accounts still on the old pbkdf2 format: those are upgraded at their
-// next sign-in and only then can be renamed. Staff powers that come from ADMIN_USERS (matched by name) are
-// pinned to the account first, so a rename can't take them away or hand them to someone else.
+// next sign-in and only then can be renamed. Staff powers that come from ADMIN_USERS are tied to the account
+// that first held the name, so a rename can't take them away or hand them to someone else.
 function renameUser(uid, wanted, beforeWrite) {
   const row = getUserRow(uid);
   if (!row) fail(404, 'User not found.');
@@ -1011,12 +1035,11 @@ function renameUser(uid, wanted, beforeWrite) {
   if (row.kdf !== 'argon2id') fail(400, 'This account still uses the old password format. Sign out and back in once (it upgrades by itself), then try again.');
   const taken = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(name, uid);
   if (taken) fail(409, 'That username is taken.');
-  if (envAdmins().includes(name.toLowerCase()) && name.toLowerCase() !== row.username.toLowerCase()) fail(409, 'That username is reserved.');
-  // Keep staff powers with the account, not the name.
-  if (ownerId() === uid && !getSetting('owner')) setSetting('owner', uid);
-  if (envAdmins().includes(row.username.toLowerCase()) && staffRole(uid) === 'admin') {
-    const roles = staffRoles(); if (!roles[uid]) { roles[uid] = 'admin'; saveStaffRoles(roles); }
-  }
+  // ADMIN_USERS names: only the account that holds one may take it back (an unclaimed one would bring powers).
+  if (name.toLowerCase() !== row.username.toLowerCase() && envNameReserved(name, uid)) fail(409, 'That username is reserved.');
+  // Staff powers already belong to the account, not the name: the owner is written down (ownerId) and
+  // ADMIN_USERS names are claimed by account id (claimEnvAdmin), so a rename can't move them.
+  ownerId();
   if (beforeWrite) beforeWrite();
   try {
     db.prepare('UPDATE users SET username = ? WHERE id = ?').run(name, uid);
@@ -1048,10 +1071,16 @@ api.post('/me/password', auth, wrap(async (req, res) => {
   if (!isSalt(salt)) fail(400, 'This page is out of date. Reload and try again.');
   db.prepare(`UPDATE users SET auth_hash = ?, enc_private_key = ?, kdf = 'argon2id', kdf_salt = ? WHERE id = ?`)
     .run(await bcrypt.hash(newAuthKey, 11), encPrivateKey, salt, req.userId);
-  // Every other device is signed out — except for the automatic hashing upgrade at sign-in (same password).
-  const kept = keepSessions === true && row.kdf !== 'argon2id';
-  if (!kept) revokeSessions(req.userId, { except: req.session.id, reason: 'password_changed' });
-  if (!kept) {
+  ACCT.dropResetLinks(req.userId); // a reset link sent before the change can't be used to undo it
+  // Every other device is signed out — except for the automatic hashing upgrade the app does right after
+  // signing in to an old-format account (same password). Only a session that has just signed in can ask for
+  // that, and it's still logged and emailed: the server can't tell it from a change to a new password.
+  const kept = keepSessions === true && row.kdf !== 'argon2id' && now() - req.session.created_at < 10 * 60000;
+  if (kept) {
+    auditLog(req, 'password_upgraded', req.userId, row.username);
+    ACCT.notify(row, 'your password was re-saved', `Someone signed in to ${row.username} and the app re-saved its password in the newer, stronger format (this happens once, at the first sign-in after an update). Other devices stay signed in.`);
+  } else {
+    revokeSessions(req.userId, { except: req.session.id, reason: 'password_changed' });
     auditLog(req, 'password_changed', req.userId, row.username);
     ACCT.notify(row, 'your password was changed', `The password for ${row.username} was just changed, and every other device was signed out.`);
   }
@@ -1137,7 +1166,7 @@ api.get('/bootstrap', auth, (req, res) => {
   const keyStates = {};
   servers.forEach((s) => { keyStates[s.id] = keyState(s.id, uid); });
   const blocked = db.prepare('SELECT blocked_id FROM blocks WHERE blocker_id = ?').all(uid).map((r) => r.blocked_id);
-  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid), me: selfUser(me), encPrivateKey: me.enc_private_key, encSignPrivateKey: me.enc_sign_private_key, servers, dms, relationships, users, voice, keyStates, blocked });
+  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid, req.session.id), me: selfUser(me), encPrivateKey: me.enc_private_key, encSignPrivateKey: me.enc_sign_private_key, servers, dms, relationships, users, voice, keyStates, blocked });
 });
 
 // ---------------------------------------------------------------- profile
@@ -2333,18 +2362,41 @@ api.post('/me/sessions/revoke-others', auth, (req, res) => {
 
 // ---------------------------------------------------------------- instance settings + GIPHY
 // Instance staff, highest first:
-//   owner      one person: the first account (or the first ADMIN_USERS name that exists) until handed over.
-//              Only the owner can give or take away staff roles, and hand over ownership.
-//   admin      the whole admin dashboard and Settings → Instance. ADMIN_USERS names are always admins.
+//   owner      one person: the first account (or the first ADMIN_USERS name that has an account when the owner
+//              is first settled) until handed over. Only the owner can give or take away staff roles, and hand
+//              over ownership.
+//   admin      the whole admin dashboard and Settings → Instance. The accounts that took ADMIN_USERS names
+//              are always admins.
 //   moderator  reports, users (suspend, sign out, reset profile, notes), who's online and the audit log.
 // Staff can only act on people ranked below them.
 const getSetting = (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value;
 const setSetting = (k, v) => (v === null || v === undefined
   ? db.prepare('DELETE FROM instance_settings WHERE key = ?').run(k)
   : db.prepare('INSERT OR REPLACE INTO instance_settings (key, value) VALUES (?, ?)').run(k, String(v)));
-const firstAccount = () => (db.prepare('SELECT id FROM users WHERE is_bot = 0 ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
+const firstAccount = () => (db.prepare('SELECT id FROM users WHERE is_bot = 0 AND deleted_at IS NULL ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
+// A person's account that can still sign in (not deleted, not a bot): the only kind that can hold staff powers.
+const liveAccount = (id) => { const r = id && getUserRow(id); return r && !r.deleted_at && !r.is_bot ? r : null; };
 const STAFF_RANK = { moderator: 1, admin: 2, owner: 3 };
 const envAdmins = () => (process.env.ADMIN_USERS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+// ADMIN_USERS names are matched to an account once: { name: userId }. The first account to hold a listed name
+// keeps it, with its powers, even after renaming or deleting itself. So the name stays reserved, and nobody can
+// register it later and become an admin. (Removing the name from ADMIN_USERS takes the powers away.)
+function envClaims() {
+  try { const c = JSON.parse(getSetting('envAdminClaims') || '{}'); return c && typeof c === 'object' && !Array.isArray(c) ? c : {}; } catch { return {}; }
+}
+function claimEnvAdmin(row) {
+  const n = String((row && row.username) || '').toLowerCase();
+  if (!envAdmins().includes(n) || row.deleted_at || row.is_bot) return;
+  const c = envClaims();
+  if (c[n]) return;
+  c[n] = row.id;
+  setSetting('envAdminClaims', JSON.stringify(c));
+}
+// The ADMIN_USERS name an account holds its powers through, if any (it may have been renamed since).
+const envAdminName = (uid) => { const c = envClaims(); return envAdmins().find((n) => c[n] === uid) || null; };
+// True when nobody but `uid` may take this name because it's in ADMIN_USERS: it already belongs to another
+// account, or (for renames) nobody has it yet and it would bring admin powers with it.
+const envNameReserved = (name, uid) => { const n = String(name).toLowerCase(); return envAdmins().includes(n) && envClaims()[n] !== uid; };
 // { userId: 'admin' | 'moderator' }. Older versions kept a plain list of extra admins under 'admins'.
 function staffRoles() {
   let r = null;
@@ -2358,18 +2410,27 @@ function staffRoles() {
 const saveStaffRoles = (r) => setSetting('staffRoles', JSON.stringify(r));
 function ownerId() {
   const set = getSetting('owner');
-  if (set && getUserRow(set)) return set;
-  for (const n of envAdmins()) { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) return r.id; }
-  return firstAccount();
+  if (set && liveAccount(set)) return set;
+  // Not decided yet (or the owner's account can't sign in any more): the first ADMIN_USERS name that belongs to
+  // an account, else the first account. It's written down right away, so a later sign-up (say, of a name added
+  // to ADMIN_USERS) can't change who owns the server. Hand it over in the app, or with `node server/cli.js set-owner`.
+  const c = envClaims();
+  const id = envAdmins().map((n) => c[n]).find((x) => liveAccount(x)) || firstAccount();
+  if (id && id !== set) setSetting('owner', id);
+  return id;
 }
 function staffRole(uid) {
   const row = uid && getUserRow(uid);
-  if (!row) return null;
+  if (!row || row.deleted_at) return null;
   if (ownerId() === uid) return 'owner';
-  if (envAdmins().includes(row.username.toLowerCase())) return 'admin';
+  if (envAdminName(uid)) return 'admin';
   const r = staffRoles()[uid];
   return STAFF_RANK[r] && r !== 'owner' ? r : null;
 }
+// At start-up (ADMIN_USERS may have changed): tie listed names to the accounts holding them now, then settle
+// the owner. Sign-ups claim names as they're registered (see /auth/register).
+for (const n of envAdmins()) claimEnvAdmin(db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(n));
+ownerId();
 const staffRank = (uid) => STAFF_RANK[staffRole(uid)] || 0;
 const isStaff = (uid) => staffRank(uid) >= 1;
 function isInstanceAdmin(uid) { return staffRank(uid) >= 2; }
@@ -2634,16 +2695,21 @@ api.put('/admin/gif-library', auth, (req, res) => {
 // hosts are allowed, so this can't be used as an open proxy.
 const MEDIA_HOSTS = /^(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)$/i;
 const EXTRA_MEDIA_HOSTS = (process.env.GIF_PROXY_EXTRA_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean);
-function mediaToken(uid) {
+// The token belongs to one sign-in session: it stops working when that session ends (log out, revoked, expired)
+// or the account is suspended or deleted, not just after its 7 days.
+const mediaSig = (uid, sid, exp) => crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${sid}|${exp}`).digest('base64url').slice(0, 22);
+function mediaToken(uid, sid) {
   const exp = Math.floor(Date.now() / 1000) + 7 * 86400;
-  const sig = crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${exp}`).digest('base64url').slice(0, 22);
-  return `${uid}.${exp}.${sig}`;
+  return `${uid}.${sid}.${exp}.${mediaSig(uid, sid, exp)}`;
 }
 function checkMediaToken(t) {
-  const [uid, exp, sig] = String(t || '').split('.');
-  if (!uid || !exp || !sig || +exp < Date.now() / 1000) return false;
-  const good = crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${exp}`).digest('base64url').slice(0, 22);
-  return sig.length === good.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good)) && !!getUserRow(uid);
+  const [uid, sid, exp, sig, extra] = String(t || '').split('.');
+  if (!uid || !sid || !exp || !sig || extra !== undefined || +exp < Date.now() / 1000) return false;
+  const good = mediaSig(uid, sid, exp);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
+  const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sid);
+  const u = s && s.user_id === uid && sessionLive(s) && db.prepare('SELECT id, suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(uid);
+  return !!u && !u.deleted_at && !stillSuspended(u);
 }
 app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
   if (!gifProxyOn()) return res.status(404).end();
@@ -3164,9 +3230,9 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
 });
 // Staff roles. Everyone on staff can see the team; only the owner can change it.
 function staffList() {
-  const ids = new Set([ownerId(), ...Object.keys(staffRoles())]);
-  envAdmins().forEach((n) => { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) ids.add(r.id); });
-  return [...ids].filter((id) => id && staffRole(id)).map((id) => ({ ...brief(id), role: staffRole(id), fromEnv: envAdmins().includes((getUserRow(id) || {}).username?.toLowerCase()) && staffRole(id) !== 'owner' }))
+  const claims = envClaims();
+  const ids = new Set([ownerId(), ...Object.keys(staffRoles()), ...envAdmins().map((n) => claims[n])]);
+  return [...ids].filter((id) => id && staffRole(id)).map((id) => ({ ...brief(id), role: staffRole(id), fromEnv: !!envAdminName(id) && staffRole(id) !== 'owner' }))
     .sort((x, y) => STAFF_RANK[y.role] - STAFF_RANK[x.role] || x.username.localeCompare(y.username));
 }
 function staffChanged(uid) {
@@ -3181,7 +3247,7 @@ api.put('/admin/staff', auth, ownerOnly, (req, res) => {
   if (!row) fail(404, 'No account with that username.');
   if (row.id === ownerId()) fail(400, 'You\u2019re the owner. To step down, hand ownership to someone else first.');
   const role = b.role === 'admin' || b.role === 'moderator' ? b.role : null;
-  if (!role && envAdmins().includes(row.username.toLowerCase())) fail(400, `${row.username} is an admin through ADMIN_USERS in the server's .env file. Remove the name there and restart to take it away.`);
+  if (!role && envAdminName(row.id)) fail(400, `${row.username} is an admin through ADMIN_USERS (as ${envAdminName(row.id)}) in the server's .env file. Remove the name there and restart to take it away.`);
   const roles = staffRoles();
   if (role) roles[row.id] = role; else delete roles[row.id];
   saveStaffRoles(roles);
@@ -3194,6 +3260,8 @@ api.post('/admin/owner', auth, ownerOnly, (req, res) => {
   const row = getUserRow(String((req.body || {}).userId || ''));
   if (!row) fail(404, 'User not found.');
   if (row.id === req.userId) fail(400, 'You already own this server.');
+  // A deleted account or a bot can never sign in, so it could never use (or hand back) ownership.
+  if (row.deleted_at || row.is_bot) fail(400, 'That account can’t sign in, so it can’t own this server.');
   if (row.suspended_at) fail(400, 'Unsuspend them first.');
   const roles = staffRoles();
   delete roles[row.id];

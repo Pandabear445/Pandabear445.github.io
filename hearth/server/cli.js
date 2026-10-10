@@ -3,6 +3,8 @@
 //   node server/cli.js get-turn
 //   node server/cli.js get-turn-secret             (for setting up a relay in another region)
 //   node server/cli.js add-turn "turn:198.51.100.9:3478?transport=udp,…" [SECRET]   (adds, keeps the others)
+//   node server/cli.js set-owner USERNAME          make this account the instance owner (when the owner's account
+//                                                  is lost; in the app the owner hands it over in Team & roles)
 // Encrypted backups (see server/backup.js):
 //   node server/cli.js backup                      make one now (restore-tested, copied off-site if configured)
 //   node server/cli.js verify-backup FILE [KEY]    restore it into a scratch folder and check the database
@@ -35,6 +37,21 @@ const settings = () => {
     set('turnUrls', urls.join(','));
     if (b) set('turnSecret', b);
     console.log(`TURN relays saved (${urls.length / 2 | 0 || urls.length} relay${urls.length > 2 ? 's' : ''}). Calls use them right away.`);
+  } else if (cmd === 'set-owner' && a) {
+    const { db, get, set } = settings();
+    const r = db.prepare('SELECT id, username FROM users WHERE lower(username) = ? AND deleted_at IS NULL AND is_bot = 0').get(a.trim().replace(/^@/, '').toLowerCase());
+    if (!r) throw new Error(`There's no account called ${a} that can sign in.`);
+    const before = get('owner');
+    set('owner', r.id);
+    // On the audit log like an in-app handover (append-only, hash-chained; see auditLog in index.js).
+    const { auditHash } = require('./db');
+    db.transaction(() => {
+      const last = db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
+      const e = { id: last.id + 1, admin_id: null, action: 'ownership_set_cli', target: r.id, detail: r.username, ip: null, created_at: Date.now() };
+      db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(e.id, e.admin_id, e.action, e.target, e.detail, e.ip, e.created_at, last.hash || '', auditHash(last.hash || '', e));
+    })();
+    console.log(`${r.username} owns this server now (they see it after reloading the app).${before && before !== r.id ? ' The previous owner is no longer staff unless they had a role besides owner: check Admin → Team & roles.' : ''}`);
   } else if (cmd === 'backup') {
     const BK = require('./backup');
     const { db, UPLOAD_DIR } = require('./db');
@@ -51,7 +68,7 @@ const settings = () => {
     const entries = await require('./backup').restoreBackup(path.resolve(a), keyFrom(c), path.resolve(b));
     console.log(`Restored ${entries.length} files into ${path.resolve(b)}. Start Hearth with DATA_DIR=${path.resolve(b)} (or move it to data/).`);
   } else {
-    console.log('Usage: node server/cli.js set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key]');
+    console.log('Usage: node server/cli.js set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key]');
     process.exitCode = 1;
   }
 })().catch((e) => { console.error(e.message); process.exitCode = 1; });
