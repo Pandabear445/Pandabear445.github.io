@@ -3734,8 +3734,8 @@ api.post('/calls/region', auth, (req, res) => {
   if (!c || !srv || c.type !== 'voice' || !isMember(srv.id, me) || !(perms.channel(srv, c, me) & PM.VIEW_CHANNEL)) fail(404, 'No such call.');
   if (srv.kind !== 'group' && !canIn(srv, c, me, PM.MANAGE_CHANNELS)) fail(403, 'You need the Manage Channels permission to change this channel’s region.');
   const { v } = db.prepare('UPDATE channels SET rtc_region = ?, rtc_region_v = rtc_region_v + 1 WHERE id = ? RETURNING rtc_region_v AS v').get(want, c.id);
+  tell([], v); // (first: the call switches over on this, the channel update below only refreshes lists)
   emitServer(srv.id);
-  tell([], v);
   res.json({ room, region: want, version: v });
 });
 api.get('/admin/turn', auth, (req, res) => {
