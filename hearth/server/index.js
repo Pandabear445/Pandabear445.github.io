@@ -997,6 +997,49 @@ async function stepUp(req, body, authKeyField = 'authKey') {
   return row;
 }
 
+// ---------------------------------------------------------------- changing a username
+// The old name is free for anyone the moment it changes. Passwords don't depend on the username (the password
+// salt is stored per account), except for accounts still on the old pbkdf2 format: those are upgraded at their
+// next sign-in and only then can be renamed. Staff powers that come from ADMIN_USERS (matched by name) are
+// pinned to the account first, so a rename can't take them away or hand them to someone else.
+function renameUser(uid, wanted, beforeWrite) {
+  const row = getUserRow(uid);
+  if (!row) fail(404, 'User not found.');
+  const name = String(wanted || '').trim().replace(/^@/, '');
+  if (!USERNAME_RE.test(name)) fail(400, 'Usernames are 2\u201324 characters: letters, numbers, _ and . only.');
+  if (name === row.username) return row;
+  if (row.kdf !== 'argon2id') fail(400, 'This account still uses the old password format. Sign out and back in once (it upgrades by itself), then try again.');
+  const taken = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(name, uid);
+  if (taken) fail(409, 'That username is taken.');
+  if (envAdmins().includes(name.toLowerCase()) && name.toLowerCase() !== row.username.toLowerCase()) fail(409, 'That username is reserved.');
+  // Keep staff powers with the account, not the name.
+  if (ownerId() === uid && !getSetting('owner')) setSetting('owner', uid);
+  if (envAdmins().includes(row.username.toLowerCase()) && staffRole(uid) === 'admin') {
+    const roles = staffRoles(); if (!roles[uid]) { roles[uid] = 'admin'; saveStaffRoles(roles); }
+  }
+  if (beforeWrite) beforeWrite();
+  try {
+    db.prepare('UPDATE users SET username = ? WHERE id = ?').run(name, uid);
+  } catch (e) {
+    if (String(e.code).startsWith('SQLITE_CONSTRAINT')) fail(409, 'That username is taken.'); // two people at the same moment
+    throw e;
+  }
+  broadcastUser(uid);
+  return getUserRow(uid);
+}
+// Change your own username: needs your password (and a two-factor code when that's on), like other account changes.
+api.post('/me/username', auth, wrap(async (req, res) => {
+  rateLimit('rename-try:' + req.userId, 30, 3600 * 1000);
+  const before = await stepUp(req, req.body);
+  // Three actual changes a day, so a name can't be flipped back and forth to confuse people.
+  const row = renameUser(req.userId, (req.body || {}).username, () => rateLimit('rename:' + req.userId, 3, 24 * 3600 * 1000));
+  if (row.username !== before.username) {
+    secEvent('username_changed', req.ip, `${before.username} -> ${row.username}`);
+    ACCT.notify(row, 'your username was changed', `Your username was changed from ${before.username} to ${row.username}. Sign in with the new one from now on. If this wasn't you, change your password now.`);
+  }
+  res.json(selfUser(row));
+}));
+
 api.post('/me/password', auth, wrap(async (req, res) => {
   rateLimit('pw:' + req.userId, 10, 10 * 60 * 1000);
   const { newAuthKey, encPrivateKey, salt, keepSessions } = req.body || {};
@@ -3023,6 +3066,17 @@ api.post('/admin/users/:id/suspend', auth, staffOnly, (req, res) => {
   suspendUser(r.id, (req.body || {}).reason, hours);
   adminLog(req, 'suspend', r.id, `${hours ? `${hours} h` : 'until lifted'}${(req.body || {}).reason ? ` \u2014 ${req.body.reason}` : ''}`);
   res.json({ ok: true });
+});
+// Staff (admins and the owner) can change someone's username, e.g. an offensive or impersonating one.
+api.post('/admin/users/:id/username', auth, staffOnly, (req, res) => {
+  if (!isInstanceAdmin(req.userId)) fail(403, 'Only admins and the owner can change usernames.');
+  const target = requireOutranks(req, req.params.id);
+  const row = renameUser(target.id, (req.body || {}).username);
+  if (row.username !== target.username) {
+    adminLog(req, 'rename', row.id, `${target.username} \u2192 ${row.username}`);
+    ACCT.notify(row, 'your username was changed by an admin', `An admin changed your username from ${target.username} to ${row.username}. Sign in with the new one from now on.`);
+  }
+  res.json({ ok: true, username: row.username });
 });
 api.post('/admin/users/:id/unsuspend', auth, staffOnly, (req, res) => {
   requireOutranks(req, req.params.id);

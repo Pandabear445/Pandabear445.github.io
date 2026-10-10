@@ -450,10 +450,28 @@ function accountTab(app) {
       ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))));
   }).catch((e) => clear(storage).append(h('p', { class: 'form-error' }, e.message)));
 
+  // Change your username: any free name; the old one becomes free for others. Needs your password.
+  const unameEl = h('strong', null, S.me.username);
+  function changeUsername() {
+    const inp = h('input', { class: 'input', maxlength: '24', value: S.me.username, autocomplete: 'off', spellcheck: 'false', autocapitalize: 'off' });
+    const hint = h('span', { class: 'field-hint' }, '2–24 characters: letters, numbers, _ and . You sign in with the new name; your password and everything else stay the same. Your old name becomes free for anyone.');
+    modal({ title: 'Change your username', size: 'sm', body: h('div', { class: 'stack' }, field('New username', inp), hint),
+      actions: [{ label: 'Cancel' }, { label: 'Change', kind: 'primary', action: async () => {
+        const name = inp.value.trim().replace(/^@/, '');
+        if (!/^[a-zA-Z0-9_.]{2,24}$/.test(name)) throw new Error('Usernames are 2–24 characters: letters, numbers, _ and . only.');
+        if (name === S.me.username) return;
+        const u = await confirmedCall(app, (x) => api('POST', '/me/username', { username: name, ...x }), { title: 'Confirm it’s you', text: `Change your username to @${name}?`, button: 'Change username' }).catch((e) => { if (!e.cancelled) throw e; return null; });
+        if (!u) return false;
+        app.onMe(u); unameEl.textContent = u.username;
+        toast(`You’re now @${u.username}. Sign in with it from now on.`);
+      } }] });
+    setTimeout(() => inp.select(), 50);
+  }
+
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Account & security'),
     section('Your account',
-      h('div', { class: 'kv' }, h('span', null, 'Username'), h('strong', null, S.me.username)),
+      h('div', { class: 'kv' }, h('span', null, 'Username'), h('span', { class: 'row gap tight' }, unameEl, h('button', { class: 'btn ghost sm', onclick: changeUsername }, 'Change'))),
       h('div', { class: 'kv' }, h('span', null, 'Member since'), h('strong', null, new Date(S.me.createdAt).toLocaleDateString()))),
     ...securitySections(app),
     section('Storage', storage),

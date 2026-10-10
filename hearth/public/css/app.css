@@ -2564,3 +2564,5 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .mb-step-body { display: grid; gap: 10px; min-width: 0; }
 .mb-step-body h4 { margin: 2px 0 0; font-size: 15px; }
 .mb-row .ic { color: var(--accent); }
+.admin-subtabs .set-subtab { display: inline-flex; align-items: center; gap: 6px; }
+.admin-subtabs .set-subtab .ic { width: 15px; height: 15px; }

@@ -1,6 +1,11 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.27.0', items: [
+    'Change your username in Settings \u2192 Security (it needs your password). Any name nobody has works, and your old one is free for others right away. Your password, friends and messages stay the same.',
+    'Admins can change someone\u2019s username from their page in Admin \u2192 Users (for offensive or impersonating names).',
+    'Admin: Storage & limits and Broadcast now live under Security.',
+  ] },
   { version: '1.26.2', items: [
     'Watch together keeps playing when you leave the call\u2019s page: it shrinks into a mini player in the corner (drag it anywhere) and stays in sync with everyone, so you can chat or browse while you watch. Press \u2922 on it to go back to the call, or \u2715 to hide it (the sound keeps going). No more pausing and jumping back when you return.',
   ] },

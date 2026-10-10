@@ -7,8 +7,11 @@ import { renderDoc, render as md } from './markdown.js';
 import { rankRelays, relayTime } from './relays.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['storage', 'Storage & limits', 'download', 2], ['broadcast', 'Broadcast', 'megaphone', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
+// Security groups three pages under one tab: protection (sign everyone out, blocked IPs, sign-in attempts),
+// storage & limits, and broadcast.
+const SECURITY_SUBS = [['security', 'Protection', 'shield'], ['storage', 'Storage & limits', 'download'], ['broadcast', 'Broadcast', 'megaphone']];
 export const ROLE_LABEL = { owner: 'Owner', admin: 'Admin', moderator: 'Moderator' };
 const ROLE_HINT = {
   owner: 'Everything, plus giving and taking away staff roles.',
@@ -53,6 +56,9 @@ const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => 
 export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin', confirm = null } = {}) {
   const myRank = RANK[role] || 0;
   const tabs = TABS.filter((t) => myRank >= t[3]);
+  // Old links to the Storage or Broadcast tab open them inside Security.
+  let secSub = SECURITY_SUBS.some(([k]) => k === tab) ? tab : 'security';
+  if (secSub !== 'security') tab = 'security';
   if (!tabs.some((t) => t[0] === tab)) tab = 'overview';
   const wrap = h('div', { class: 'admin' });
   const nav = h('nav', { class: 'admin-tabs', role: 'tablist' });
@@ -64,8 +70,13 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
-    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, money, owner })[tab]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    const page = tab === 'security' ? secSub : tab;
+    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
+  // Security's sub-tabs stay on top of whichever page is showing (pages redraw the body themselves).
+  const subBar = h('div', { class: 'set-subtabs admin-subtabs', role: 'tablist' });
+  const drawSubBar = () => clear(subBar).append(...SECURITY_SUBS.map(([k, l, ic]) => h('button', { class: `set-subtab${secSub === k ? ' active' : ''}`, role: 'tab', onclick: () => { secSub = k; draw(); } }, icon(ic), l)));
+  new MutationObserver(() => { if (tab === 'security' && body.firstChild !== subBar) { drawSubBar(); body.prepend(subBar); } }).observe(body, { childList: true });
 
   async function overview() {
     const s = await api('GET', '/admin/stats');
@@ -228,7 +239,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   async function security() {
     const [sec, bans] = await Promise.all([api('GET', '/admin/security'), api('GET', '/admin/ip-bans')]);
     const ipIn = h('input', { class: 'input mono', placeholder: '203.0.113.7 or 203.0.113.0/24' });
-    const label = { failed_login: 'Failed login', captcha_failed: 'Failed robot check', blocked_ip: 'Blocked IP' };
+    const label = { failed_login: 'Failed login', captcha_failed: 'Failed robot check', blocked_ip: 'Blocked IP', username_changed: 'Username changed' };
     clear(body).append(
       h('div', { class: 'admin-head' }, h('h3', null, 'Emergency')),
       h('p', { class: 'field-hint' }, 'Sign every account out of every device \u2014 for example if you think passwords leaked. Staff stay signed in. People just log in again; nothing is lost.'),
@@ -730,6 +741,16 @@ async function userModal(id, refresh, myRank = 2) {
           h('button', { class: `chip${u.storage.blocked ? ' active' : ''}`, onclick: () => setLimits({ uploadsBlocked: !u.storage.blocked }, u.storage.blocked ? 'Uploads turned back on.' : 'Uploads turned off.') }, u.storage.blocked ? 'Uploads are off \u2014 turn on' : 'Turn off uploads'),
           myRank >= 2 && u.totpEnabled ? h('button', { class: 'chip', onclick: async () => { if (!(await confirmDialog({ title: `Remove two-factor sign-in for ${u.username}?`, text: 'Only do this if you\u2019re sure it\u2019s really them (they lost their phone and backup codes). They can set it up again in Settings.', confirm: 'Remove 2FA', danger: true }))) return; await api('POST', `/admin/users/${u.id}/2fa/remove`); toast('Two-factor sign-in removed.'); refresh(); } }, '\uD83D\uDD10 2FA on \u2014 remove') : null,
           myRank >= 2 ? h('button', { class: `chip${u.supporter ? ' active' : ''}`, onclick: () => setLimits({ supporter: !u.supporter }, u.supporter ? 'No longer a supporter.' : 'Marked as a supporter. Thank you, them!') }, u.supporter ? '\uD83D\uDC9C Supporter \u2014 remove' : 'Mark as supporter') : null,
+          myRank >= 2 ? h('button', { class: 'chip', onclick: () => {
+            const inp = h('input', { class: 'input', maxlength: '24', value: u.username, autocomplete: 'off', spellcheck: 'false' });
+            modal({ title: `Change @${u.username}\u2019s username`, size: 'sm',
+              body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'For offensive or impersonating names. They sign in with the new name from now on (their password stays the same), and they\u2019re told by email if they have one. The old name is free for anyone right away.'), inp),
+              actions: [{ label: 'Cancel' }, { label: 'Change username', kind: 'primary', action: async () => {
+                const r = await api('POST', `/admin/users/${id}/username`, { username: inp.value });
+                toast(`Now @${r.username}.`); m.close(); userModal(id, refresh, myRank); refresh();
+              } }] });
+            setTimeout(() => inp.select(), 50);
+          } }, 'Change username') : null,
           h('button', { class: `chip${u.profileLocked ? ' active' : ''}`, onclick: () => setLimits({ profileLocked: !u.profileLocked }, u.profileLocked ? 'Profile unlocked.' : 'Profile locked.') }, u.profileLocked ? 'Profile is locked \u2014 unlock' : 'Lock profile'),
           myRank >= 2 ? h('button', { class: 'chip', onclick: () => {
             const inp = h('input', { class: 'input', type: 'number', min: '0', placeholder: 'empty = server default', value: u.quotaOverride != null ? String(u.quotaOverride) : '' });

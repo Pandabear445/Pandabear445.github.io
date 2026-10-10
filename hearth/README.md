@@ -489,6 +489,13 @@ Password resets need the server to send email. In **Admin → Owner → Email**,
 
 Set **Your server’s address** to the public URL people use (for example `https://kappachat.duckdns.org`) — reset links point there. Or use `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`, `PUBLIC_URL`. The SMTP password is stored encrypted.
 
+## Usernames
+
+People change their username in **Settings → Security** (with their password, and a two-factor code if that's
+on). Any free name works; the old one is free for others right away, and their password, friends and messages
+stay the same. Admins (and the owner) can rename someone below them from **Admin → Users** (logged in the audit
+log). Names listed in `ADMIN_USERS` are reserved, and staff roles stay with the account, never with a name.
+
 ## Creator memberships
 
 Server owners can sell monthly memberships to their community, like Patreon inside the server. Each membership
