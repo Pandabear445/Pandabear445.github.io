@@ -239,4 +239,132 @@ them all). `test/quality.test.js` asserts the plans above.
 
 ## Frontend
 
-_Filled in by the frontend part of this workstream._
+### Method
+
+`scripts/bench-client.mjs` (`npm run bench:client`) drives the real web app in headless Chromium through the browser
+test harness (`test/browser/harness.mjs`). It runs against a fresh server and measures five things.
+
+**First load.** The JS and CSS files the sign-in screen loads, their raw size, and their brotli size computed from
+the files. It also times "usable" with CPU throttled 4× (CDP `Emulation.setCPUThrottlingRate`):
+- *sign-in form ready*: a fresh page until the username box shows;
+- *app ready*: a signed-in reload until the home view or message box shows.
+
+Each is measured over 5 runs.
+
+**A 10,000-message channel.**
+- Seeding: 10,000 copies of one real message (same ciphertext, so they decrypt) are written into the database.
+- Reading back: open the channel, then scroll to the top 60 times. Each time a page of older messages loads, and the
+  time until the first message changes is recorded.
+- Counts: messages and DOM nodes on the page, plus JS heap after a forced GC (`HeapProfiler.collectGarbage`, then
+  `Runtime.getHeapUsage`). Taken after opening, after reading back, and after jumping to the latest.
+
+**New messages arriving.** 100 messages are posted through the API while you're reading the latest. For each, the
+time from POST to the message appearing is recorded, and a `MutationObserver` counts the list nodes removed.
+
+**A 1,000-member server.**
+- Seeding: 999 extra members are written into the database.
+- *First open*: the first open of the member list. It also pins every member's keys on this device once.
+- *Open again*: 4 more opens, timed from the click to the frame after the list is drawn.
+- *Search keystroke*: one keystroke in the member search.
+
+Findings came from CDP CPU profiles of the slow steps.
+
+**Environment.** The same machine as above: a shared 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux 6.18, Node
+22.22, Chromium 141 (Playwright 1.56), on loopback. The server isn't throttled; only the page's CPU is.
+
+**Before/after.** The "before" column is the original client (`dec63ee`, run from a separate checkout); the "after"
+column is this branch. The two ran back to back with the same script (load average under 1). The load timings come
+from one pass each and are noisy here, so they're shown but no change is claimed for them.
+
+### Results
+
+| What | Before | After |
+|---|---|---|
+| JS on the sign-in screen: files, raw / brotli | 35, 1,131 KB / 405 KB | 37, 1,152 KB / 411 KB |
+| CSS raw / brotli | 205 KB / 31 KB | 206 KB / 32 KB |
+| Sign-in form ready, CPU 4×, p50 / p95 (n=5) | 427 / 445 ms | 392 / 437 ms (noise) |
+| App ready when signed in, CPU 4×, p50 / p95 (n=5) | 468 / 471 ms | 483 / 485 ms (noise) |
+| Load one older page of history, p50 / p95 (n=60) | 86 / 145 ms | 59 / 81 ms |
+| After scrolling back 60 pages: messages / DOM nodes / heap | 3,050 / 85,734 / 7.0 MB | 300 / 8,715 / 4.0 MB |
+| After jumping back to the latest: messages / DOM nodes / heap | 3,050 / 85,734 / 7.4 MB (nothing let go) | 50 / 1,715 / 3.7 MB |
+| New message on screen after posting, p50 / p95 (n=100) | 21 / 40 ms | 18 / 31 ms |
+| 1,000-member list, first open | 785 ms | 112 ms |
+| 1,000-member list, opened again, p50 / p95 (n=4) | 708 / 747 ms | 135 / 138 ms |
+| One member-search keystroke, p50 / p95 (n=5) | 282 / 284 ms | 21 / 21 ms |
+
+New messages arriving were already drawn incrementally: one message is appended per arrival, and the whole list is
+redrawn only once per ~75 messages, when the in-memory list is trimmed. In the "before" run, 3,279 list nodes were
+removed during the 100 arrivals. That's one trim of the 3,050 messages left over from reading back, not a redraw
+per message. The "after" run removed 0. No change was made to this path.
+
+### What changed and why
+
+1. **The member list re-read the key-pin store once per member.**
+   - The CPU profile of opening the 1,000-member list showed 505 ms of 594 ms in `secure.keyChanged`, which calls
+     `e2ee.checkPin`.
+   - Every call re-read and `JSON.parse`d the whole trust-on-first-use pin store from `localStorage` (about 250 KB
+     at 1,000 people).
+   - For every newly seen member, it also wrote the whole store back. So the cost grew with the square of the
+     member count.
+   - Fixes:
+     - `e2ee.checkPins(myId, users)` (exposed as `sec.keysChanged`) gives `checkPin`'s answers for a whole list with
+       one read and at most one save.
+     - `loadPins` keeps its parsed copy only while the stored text is byte-for-byte the same. The text is still read
+       on every call, so a change from another tab or device store is seen at once.
+     - A failed save drops the copy, so a pin that wasn't stored is never treated as stored.
+   - `test/quality-client.test.js` proves these give the same answers and the same stored pins as before, including
+     the denial cases. A browser check confirms a member whose key changed is still flagged.
+
+2. **Style and layout for 1,000 rows.** That took ~140 ms per open; it showed up in the profile as `remove` during
+   the header redraw. Member rows now use `content-visibility: auto; contain-intrinsic-size: auto 44px`. That brought
+   it down to ~8 ms.
+   - This was chosen over virtualization: every row stays in the DOM, so screen readers, Tab and find-in-page still
+     reach all of them.
+   - It had one visible side effect: the anti-aliasing of the member name changed (0.025% of pixels on one screen).
+     The visual baseline was updated for it.
+
+3. **Reading back through history grew without limit.**
+   - Every older page was prepended and nothing was ever dropped. After 60 pages the page held 3,050 messages and
+     85,734 nodes, and still did after jumping back to the latest.
+   - Now at most 300 messages (`HISTORY_WINDOW`) stay loaded:
+     - scrolling up drops the newest (`dropNewest`) and marks that newer ones exist, so they load again on the way
+       down;
+     - scrolling down drops the oldest and keeps the reader's place (`keepAnchor`).
+   - "Jump to latest" then starts from a fresh, small list.
+   - Each older page also got faster (p50 86 → 59 ms) because the list it's inserted into stays small.
+   - The browser suite checks: the bound holds, order is kept with no repeats, the way back down ends at the newest
+     message, and the keyboard's current message survives.
+
+4. **Decrypted attachments were never freed.**
+   - Every opened picture or file stayed as a `blob:` URL for the whole session.
+   - `public/js/blobcache.js` keeps the 150 most recently used. Older ones are revoked unless still on screen or
+     still decrypting.
+   - This is unit-tested (`test/quality-client.test.js`), not measured. Making the bench upload and decrypt more
+     than 150 files was out of proportion.
+
+5. Smaller things:
+   - `viewport.js` only touches the root style when the visible height actually changes.
+   - Header redraws keep keyboard focus, which before was dropped to the page on every "Show/Hide members".
+
+### Tried and not kept
+
+- **Minified Socket.IO client** (`/socket.io/socket.io.min.js`, 47 KB instead of 154 KB). A/B with request
+  routing, 12 runs each, CPU 4×: sign-in form ready p50 595 vs 587 ms, which is within noise. Not changed.
+- **Moving the decorative Google Fonts stylesheet off the critical path.** Both font stylesheets load in parallel
+  from the same host. With fonts blocked entirely, sign-in was ready ~150–300 ms sooner on this network. But removing
+  only the decorative one would save just the difference between the two requests, and the UI font has to block to
+  avoid a flash of fallback text. Not changed. This is the biggest load-time lever left; self-hosting the fonts would
+  remove the third-party round trip.
+- **Lazy-loading `settings.js` (121 KB) and `admin.js` (91 KB).** Not attempted. The CPU profile of a signed-in load
+  at 4× showed only ~60 ms of JS in total. Most of the time is native work (module loading, style, layout), so
+  splitting these two wouldn't be measurable at this scale.
+
+### Limitations
+
+- Only the sizes above were measured, on one shared machine, in Chromium, over loopback. Real networks add latency
+  that the 37-module waterfall and the Google Fonts request would feel more.
+- Phones weren't measured on real devices; 4× CPU throttling is a stand-in.
+- The member list still redraws all rows when someone's presence changes. That's batched per frame, and the server
+  flushes presence once a second; it costs ~45 ms of JS per redraw at 1,000 members. An incremental update would
+  remove that.
+- The decrypted-file cache limit is by count (150), not by bytes.
