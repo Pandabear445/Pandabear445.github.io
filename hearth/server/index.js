@@ -102,7 +102,10 @@ setInterval(() => { const t = now(); for (const [k, b] of buckets) if (b.reset <
 
 // ---------------------------------------------------------------- presence + voice state
 const onlineSockets = new Map(); // userId -> Set(socketId)
-const voiceChannels = new Map(); // channelId -> Map(userId -> { socketId, muted, deafened })
+const voiceChannels = new Map(); // channelId -> Map(userId -> { socketId, sid, muted, deafened, reconnecting, grace })
+// How long someone whose connection dropped keeps their place in a call (shown as "reconnecting" to the others).
+// Coming back with the same sign-in within it resumes the call where it was; after it, they've left.
+const VOICE_GRACE_MS = Math.max(1000, Math.min(60000, Number(process.env.VOICE_GRACE_MS) || 18000));
 const userVoice = new Map(); // userId -> channelId
 
 const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(userId).size > 0;
@@ -207,7 +210,7 @@ function emitKeyState(serverId) {
     .forEach((m) => { if (connected(m.user_id)) io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id, info)); });
 }
 
-const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined });
+const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
 const THEME_DEFAULT = { accent: '', banner: '', bannerCrop: null, background: { kind: 'none' }, welcome: '', roleColors: true, iconShape: 'rounded' };
 const themeOf = (s) => { try { return { ...THEME_DEFAULT, ...JSON.parse(s.theme || '{}') }; } catch { return { ...THEME_DEFAULT }; } };
 const NEWS_BOT_ID = require('./newsbot').BOT_ID;
@@ -374,7 +377,7 @@ function serializeDmMessage(row, reactions) {
 function serializeDm(row, userId) {
   const last = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE dm_id = ? ORDER BY id DESC LIMIT 1').get(row.id);
   return {
-    id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at, region: row.rtc_region || null,
+    id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at, region: row.rtc_region || null, regionVersion: row.rtc_region_v || 0,
     last: last ? { id: last.id, authorId: last.author_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null,
   };
 }
@@ -391,7 +394,7 @@ function relationshipFor(row, userId) {
 function voiceStateList(channelId) {
   const m = voiceChannels.get(channelId);
   if (!m) return [];
-  return [...m.entries()].map(([userId, s]) => ({ userId, muted: s.muted, deafened: s.deafened, video: !!s.video, screen: !!s.screen }));
+  return [...m.entries()].map(([userId, s]) => ({ userId, muted: s.muted, deafened: s.deafened, video: !!s.video, screen: !!s.screen, reconnecting: !!s.reconnecting }));
 }
 
 // ---------------------------------------------------------------- access checks
@@ -1002,6 +1005,9 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   ids.forEach((sid) => dropPush.run(userId, sid));
   db.prepare('DELETE FROM push_subs WHERE user_id = ? AND session_id IS NULL').run(userId);
   const gone = new Set(ids);
+  // A call kept open for one of these sessions while its connection was down can't be resumed: it ends now.
+  const inCall = voiceChannels.get(userVoice.get(userId))?.get(userId);
+  if (inCall && gone.has(inCall.sid)) leaveVoice(userId);
   if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { if (gone.has(x.data.sid)) { x.emit('session:revoked', { reason }); x.disconnect(true); } })).catch(() => {});
   return ids.length;
 }
@@ -3708,26 +3714,29 @@ api.post('/calls/region', auth, (req, res) => {
     if (!known) fail(400, 'No such region.');
   }
   const me = req.userId;
-  const tell = (ids, extra = {}) => {
-    const out = { room, region: want, by: me, ...extra };
+  // Two people switching at once: the last write wins. Each change gets the next version number, and apps only
+  // ever move to a newer version than the one they have, so everyone ends up on what the server holds.
+  const tell = (ids, version) => {
+    const out = { room, region: want, by: me, version };
     io.to(`voice:${room}`).emit('call:region', out);
     ids.forEach((id) => io.to(`user:${id}`).emit('call:region', out));
+    return out;
   };
   if (room.startsWith('dm:')) {
     const d = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(room.slice(3));
     if (!d || (d.user_a !== me && d.user_b !== me)) fail(404, 'No such call.');
-    db.prepare('UPDATE dm_channels SET rtc_region = ? WHERE id = ?').run(want, d.id);
-    tell([d.user_a, d.user_b]);
-    return res.json({ room, region: want });
+    const { v } = db.prepare('UPDATE dm_channels SET rtc_region = ?, rtc_region_v = rtc_region_v + 1 WHERE id = ? RETURNING rtc_region_v AS v').get(want, d.id);
+    tell([d.user_a, d.user_b], v);
+    return res.json({ room, region: want, version: v });
   }
   const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(room);
   const srv = c && db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (!c || !srv || c.type !== 'voice' || !isMember(srv.id, me) || !(perms.channel(srv, c, me) & PM.VIEW_CHANNEL)) fail(404, 'No such call.');
   if (srv.kind !== 'group' && !canIn(srv, c, me, PM.MANAGE_CHANNELS)) fail(403, 'You need the Manage Channels permission to change this channel’s region.');
-  db.prepare('UPDATE channels SET rtc_region = ? WHERE id = ?').run(want, c.id);
+  const { v } = db.prepare('UPDATE channels SET rtc_region = ?, rtc_region_v = rtc_region_v + 1 WHERE id = ? RETURNING rtc_region_v AS v').get(want, c.id);
   emitServer(srv.id);
-  tell([]);
-  res.json({ room, region: want });
+  tell([], v);
+  res.json({ room, region: want, version: v });
 });
 api.get('/admin/turn', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
@@ -4967,6 +4976,10 @@ let io;
 
 // Voice rooms are server voice channels (by channel id) or 1-to-1 DM calls ("dm:<dmId>").
 const dmOfRoom = (room) => (String(room).startsWith('dm:') ? db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(String(room).slice(3)) : null);
+function roomRegion(room) {
+  const row = dmOfRoom(room) || db.prepare('SELECT rtc_region, rtc_region_v FROM channels WHERE id = ?').get(String(room));
+  return { region: (row && row.rtc_region) || null, regionVersion: (row && row.rtc_region_v) || 0 };
+}
 function emitVoiceState(room) {
   const payload = { channelId: room, users: voiceStateList(room) };
   const d = dmOfRoom(room);
@@ -5055,6 +5068,7 @@ function leaveVoice(userId, notifyUser = false) {
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
   const state = m && m.get(userId);
+  if (state) clearTimeout(state.grace);
   if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); dropWatch(channelId); } }
   userVoice.delete(userId);
   if (state) {
@@ -5204,29 +5218,58 @@ function setupSockets(server) {
         room = c.id;
       }
       const c = { id: room };
+      // The call's region and its version: an app joining late uses the one that's active now, even if what it
+      // loaded at start-up is older.
+      const where = roomRegion(room);
+      // Coming back after a dropped connection (or a server restart, which forgets calls: then it's a fresh join).
+      // Only the same sign-in resumes; the access checks above ran again, so lost permissions still end it.
+      const prev = userVoice.get(uid) === room ? voiceChannels.get(room)?.get(uid) : null;
+      if (p.resume && prev && prev.sid === socket.data.sid) {
+        clearTimeout(prev.grace);
+        const oldSocket = prev.socketId;
+        if (oldSocket !== socket.id) {
+          // The old connection may not have been noticed as gone yet: it stops getting this call's events.
+          const old = io.sockets.sockets.get(oldSocket);
+          if (old) old.leave(`voice:${room}`);
+        }
+        const speak = !!(vp & PM.SPEAK);
+        Object.assign(prev, { socketId: socket.id, reconnecting: false, grace: null, speak, muted: !!p.muted || !speak, deafened: !!p.deafened, video: !!p.video, screen: !!p.screen });
+        socket.join(`voice:${room}`);
+        const m = voiceChannels.get(room);
+        const peers = [...m.entries()].filter(([userId]) => userId !== uid).map(([userId, s]) => ({ userId, socketId: s.socketId, reconnecting: !!s.reconnecting }));
+        // Everyone else points their connection to this person at the new socket (and renegotiates if needed).
+        socket.to(`voice:${room}`).emit('voice:peer-joined', { userId: uid, socketId: socket.id, resumed: true });
+        emitVoiceState(room);
+        if (watchRooms.has(room)) socket.emit('watch:state', { room, state: watchOut(room) });
+        return { ok: true, peers, canSpeak: speak, resumed: true, ...where };
+      }
       if (userVoice.has(uid)) {
         const prev = voiceChannels.get(userVoice.get(uid))?.get(uid);
         leaveVoice(uid, prev && prev.socketId !== socket.id);
       }
       if (!voiceChannels.has(c.id)) voiceChannels.set(c.id, new Map());
       const m = voiceChannels.get(c.id);
-      const peers = [...m.entries()].map(([userId, s]) => ({ userId, socketId: s.socketId }));
+      const peers = [...m.entries()].map(([userId, s]) => ({ userId, socketId: s.socketId, reconnecting: !!s.reconnecting }));
       // speak: whether they may talk here (the app keeps the mic off without it; recheckVoice keeps it current).
       const speak = !!(vp & PM.SPEAK);
-      m.set(uid, { socketId: socket.id, muted: !!p.muted || !speak, deafened: !!p.deafened, video: false, screen: false, speak });
+      m.set(uid, { socketId: socket.id, sid: socket.data.sid, muted: !!p.muted || !speak, deafened: !!p.deafened, video: false, screen: false, speak, reconnecting: false, grace: null });
       userVoice.set(uid, c.id);
       socket.join(`voice:${c.id}`);
+      // Anyone still connected to this person from before (their app reloaded, or the server restarted) moves
+      // that connection to the new socket; a brand-new connection replaces it if the app started over.
+      socket.to(`voice:${c.id}`).emit('voice:peer-joined', { userId: uid, socketId: socket.id, resumed: false });
       emitVoiceState(c.id);
       if (watchRooms.has(c.id)) socket.emit('watch:state', { room: c.id, state: watchOut(c.id) });
       // First one in a DM or group call: ring everyone else (and push-notify them if their app is closed).
-      if (!peers.length) {
+      // (Not when an app comes back after the server restarted: that call was already ringing or answered.)
+      if (!peers.length && !p.resume) {
         const ring = callees(c.id, uid);
         const d = dmOfRoom(c.id);
         const ch = !d && db.prepare('SELECT * FROM channels WHERE id = ?').get(c.id);
         ring.forEach((u) => io.to(`user:${u}`).emit('call:ring', { room: c.id, dmId: d ? d.id : null, serverId: ch ? ch.server_id : null, from: uid, video: !!p.video }));
         if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/' });
       }
-      return { ok: true, peers, canSpeak: speak };
+      return { ok: true, peers, canSpeak: speak, ...where };
     }));
 
     socket.on('voice:signal', guard((p = {}) => {
@@ -5357,13 +5400,22 @@ function setupSockets(server) {
     socket.on('voice:leave', guard(() => {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);
-      if (s && s.socketId === socket.id) leaveVoice(uid);
+      // (Or the same sign-in hanging up while its place was being kept after a dropped connection.)
+      if (s && (s.socketId === socket.id || (s.reconnecting && s.sid === socket.data.sid))) leaveVoice(uid);
     }));
 
     socket.on('disconnect', () => {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);
-      if (s && s.socketId === socket.id) leaveVoice(uid);
+      // A dropped connection keeps its place in the call for a short while (the media between the people in it
+      // often keeps flowing): the others see "reconnecting", and the app resumes the call when it's back.
+      if (s && s.socketId === socket.id) {
+        s.reconnecting = true;
+        clearTimeout(s.grace);
+        s.grace = setTimeout(() => { if (voiceChannels.get(ch)?.get(uid) === s && s.reconnecting) leaveVoice(uid); }, VOICE_GRACE_MS);
+        s.grace.unref?.();
+        emitVoiceState(ch);
+      }
       const set = onlineSockets.get(uid);
       if (set) { set.delete(socket.id); if (!set.size) onlineSockets.delete(uid); }
       if (!isOnline(uid)) { userBudget.delete(uid); typingAt.delete(uid); broadcastPresence(uid); }

@@ -15,7 +15,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -977,6 +977,12 @@ CREATE TABLE IF NOT EXISTS server_key_reports (
 CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
 `);
+
+// v18 (voice reliability): a version number for each call's region. Every change bumps it, so when two people
+// switch the region at the same moment the last write wins and every app settles on the newest one, whatever
+// order the announcements arrive in.
+addColumn('channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('dm_channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
