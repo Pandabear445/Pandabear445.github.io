@@ -27,6 +27,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   const generation = new Map(); // serverId -> bumps whenever new keys arrive
   const reported = new Set(); // keys we couldn't unlock and asked to be re-shared
   const rewrapped = new Set(); // `${serverId}|${epoch}`: keys already re-wrapped to ourselves this session
+  const unverified = new Set(); // `${serverId}|${epoch}`: keys only a server-listed past key vouched for (reading only)
 
   // ---------------------------------------------------------------- people + trust
   async function userWithKeys(id) {
@@ -44,22 +45,81 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   }
   const keyChanged = (user) => !!user && user.id !== S.me.id && E2EE.checkPin(S.me.id, user) === 'changed';
   function acceptKeys(user) { E2EE.acceptPin(S.me.id, user); warned.delete(user.id); }
-  // The signing keys accepted for what someone signed: their current key (unless it changed and you haven't
-  // verified it yet). For the past (older server keys, messages; past: true), also the keys this device trusted
-  // for them before, e.g. before they reset their password without a recovery key: those still count for what
-  // was written while they had them (`at`: when it was written, if known).
+  // Someone's keys to open (which: 'e', identity keys) or check (which: 's', signing keys) what they wrote at
+  // `at` (ms; 0 if unknown), best first, each with how far it's trusted:
+  //   'now'     their current key, or the one this device pinned for them (the same one unless it changed)
+  //   'new'     their current key when it changed and you haven't verified it yet
+  //   'pinned'  a key this device trusted for them before they changed keys; only for what was written while
+  //             they still had it (when the server says it was replaced, if it says so)
+  //   'listed'  a key the server says they had before a password reset, that this device never saw as theirs.
+  //             Nothing vouches for it (the server could list a key of its own), so whatever only it opens or
+  //             checks out is shown as "older key, not verified", and it never vouches for the key to write with.
+  function keysOf(user, which, at = 0) {
+    const out = [];
+    if (!user) return out;
+    const add = (key, trust) => { if (key && !out.some((x) => x.key === key)) out.push({ key, trust }); };
+    const field = which === 'e' ? 'publicKey' : 'signPublicKey';
+    if (user.id === S.me.id) { if (proven) add(proven[which], 'now'); return out; }
+    const changed = keyChanged(user);
+    const p = E2EE.pinnedKeys(S.me.id, user, at);
+    if (!changed) add(user[field], 'now');
+    if (p[which]) {
+      if (!changed) add(p[which], 'now');
+      else {
+        // Pinned here, but the server now lists other keys for them: theirs until it says they were replaced.
+        const gone = E2EE.listedRetiredAt(user, p.e);
+        if (!gone || (at > 0 && at <= gone)) add(p[which], 'pinned');
+      }
+    }
+    if (changed) add(user[field], 'new');
+    p.old.forEach((k) => add(k[which], 'pinned'));
+    E2EE.listedPastKeys(user, at).forEach((k) => add(k[which], 'listed'));
+    return out;
+  }
+  // The signing keys that vouch for what someone signed: their current key (unless it changed and you haven't
+  // verified it yet), and for the past (older server keys, messages; past: true) the keys this device trusted for
+  // them before, e.g. before they reset their password without a recovery key, for what was written while they
+  // had them (`at`: when it was written). Keys the server merely lists for them never vouch for anything.
   function signKeysFor(user, { past = true, at = 0 } = {}) {
-    if (!user) return [];
-    if (user.id === S.me.id) return [S.me.signPublicKey || user.signPublicKey].filter(Boolean);
-    const keys = user.signPublicKey && !keyChanged(user) ? [user.signPublicKey] : [];
-    if (past) for (const k of E2EE.pinnedKeys(S.me.id, user, at).s) if (!keys.includes(k)) keys.push(k);
-    return keys;
+    return keysOf(user, 's', at).filter((k) => k.trust === 'now' || (past && k.trust === 'pinned')).map((k) => k.key);
+  }
+
+  // ---------------------------------------------------------------- your own keys
+  // Your public keys come from the server. Before anything is trusted or locked with them, this device checks
+  // they really belong to the private keys it unlocked: your identity key (an ECDH round trip) and your signing
+  // key (sign and verify a fresh text). A server that hands out keys of its own as yours could otherwise plant a
+  // "current" server key that looks like your own copy, or read whatever you lock for yourself. Checked again
+  // whenever the server lists different keys for you; until then, the ones proven last are the ones used.
+  let ownCheck = null; // { e, s, signKey, ok }: the check for the keys S.me lists now
+  let proven = null; // { e, s }: your public keys as last proven
+  function ownKeysOk() {
+    const e = S.me && S.me.publicKey;
+    const s = S.me && S.me.signPublicKey;
+    if (!ownCheck || ownCheck.e !== e || ownCheck.s !== s || ownCheck.signKey !== S.signKey) {
+      const signKey = S.signKey;
+      const ok = (async () => {
+        if (!signKey || !e || !s) return false;
+        if (!(await E2EE.ownsPublicKey(S.privateKey, e))) return false;
+        const text = `hearth-own-key|${S.me.id}|${E2EE.b64(crypto.getRandomValues(new Uint8Array(16)))}`;
+        return E2EE.verify(s, text, await E2EE.sign(signKey, text));
+      })().catch(() => false).then((r) => { if (r) proven = { e, s }; return r; });
+      ownCheck = { e, s, signKey, ok };
+    }
+    return ownCheck.ok;
+  }
+  function ownKeysMismatch() {
+    const err = new Error('The keys this server lists for your account aren’t the ones your password unlocks, so nothing was decrypted or sent. Reload the page; if it keeps happening, tell the server’s owner.');
+    err.code = 'own_key_mismatch';
+    return err;
   }
 
   // ---------------------------------------------------------------- signing key
   async function ensureSigningKey(encSignPrivateKey) {
+    // Your signing key is locked with your public key: that must really be yours before it's used for that.
+    if (!(await E2EE.ownsPublicKey(S.privateKey, S.me.publicKey))) throw ownKeysMismatch();
     if (S.me.signPublicKey && encSignPrivateKey) {
       S.signKey = await E2EE.unwrapSigningKey(S.privateKey, S.me.publicKey, encSignPrivateKey);
+      if (!(await ownKeysOk())) throw ownKeysMismatch();
       return;
     }
     const k = await E2EE.createSigningKey(S.privateKey, S.me.publicKey);
@@ -76,6 +136,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       if (e.status === 409) throw new Error('Your signing key changed on another device. Reload the page.');
       throw e;
     }
+    if (!(await ownKeysOk())) throw ownKeysMismatch();
   }
 
   // ---------------------------------------------------------------- group keys
@@ -92,7 +153,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   }
   function currentKey(serverId) {
     const st = states.get(serverId);
-    if (!st || st.needsRotation || !st.keyEpoch || rolledBack(serverId)) return null;
+    if (!st || st.needsRotation || !st.keyEpoch || rolledBack(serverId) || unverified.has(`${serverId}|${st.keyEpoch}`)) return null;
     const raw = keysFor(serverId).get(st.keyEpoch);
     return raw ? { epoch: st.keyEpoch, raw } : null;
   }
@@ -106,40 +167,59 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     let added = false;
     const fresh = []; // keys someone else handed us (re-wrapped to ourselves below)
     for (const k of st.keys || []) {
-      if (mine.has(k.epoch)) continue;
       const current = k.epoch === st.keyEpoch;
+      const tag = `${st.serverId}|${k.epoch}`;
+      // Held already. A key held only for reading history (see `unverified`) is looked at again if the server
+      // now says it's the one to write with.
+      if (mine.has(k.epoch) && !(current && unverified.has(tag))) continue;
       try {
+        // A key "newer" than the current one: nobody made it through the server's rotation (only the server
+        // itself could have put it there).
+        if (k.epoch > st.keyEpoch) throw new Error('untrusted sharer');
         // The key everyone encrypts with now must come from a member. One handed out by someone who isn't in
         // the server (only the server itself could arrange that) is never used.
-        if (current && !st.needsRotation && server && k.wrapperId !== S.me.id && !server.memberIds.includes(k.wrapperId)) throw new Error('untrusted sharer');
-        const wrapper = await userWithKeys(k.wrapperId);
-        if (k.wrapperId !== S.me.id) trust(wrapper); // warns (once) if their key changed
+        const self = k.wrapperId === S.me.id;
+        if (current && !st.needsRotation && server && !self && !server.memberIds.includes(k.wrapperId)) throw new Error('untrusted sharer');
+        // Our own copy: only if the keys the server lists as ours really are ours (see ownKeysOk).
+        if (self && !(await ownKeysOk())) throw new Error('untrusted sharer');
+        const wrapper = self ? S.me : await userWithKeys(k.wrapperId);
+        if (!self) trust(wrapper); // warns (once) if their key changed
         // The key to encrypt with from now on: only from someone's current, trusted key. Older server keys (for
-        // reading history) may also come from keys they had before.
-        const signKeys = signKeysFor(wrapper, { past: !current });
-        if (!signKeys.length) throw new Error('untrusted sharer');
+        // reading history) may also come from keys this device trusted for them before, or, failing that, from a
+        // key the server lists as theirs before a reset. Such a key is only ever read with: every message in it
+        // is still checked against its own author's keys, and it's never kept as our own copy nor written with.
+        const at = Number(k.createdAt) || 0;
+        const keys = keysOf(wrapper, 's', at);
+        const trusted = keys.filter((x) => x.trust === 'now' || (!current && x.trust === 'pinned')).map((x) => x.key);
+        const listed = current ? [] : keys.filter((x) => x.trust === 'listed').map((x) => x.key);
+        if (!trusted.length && !listed.length) throw new Error('untrusted sharer');
+        const unwrap = (pubs) => E2EE.unwrapGroupKey({
+          wrapped: k.wrapped, serverId: st.serverId, epoch: k.epoch, myId: S.me.id, myPriv: S.privateKey,
+          wrapperId: k.wrapperId, wrapperSignPub: pubs,
+        });
         let raw;
+        let onlyListed = false;
         try {
-          raw = await E2EE.unwrapGroupKey({
-            wrapped: k.wrapped, serverId: st.serverId, epoch: k.epoch, myId: S.me.id, myPriv: S.privateKey,
-            wrapperId: k.wrapperId, wrapperSignPub: signKeys,
-          });
+          if (!trusted.length) throw new Error('Key signature did not verify');
+          raw = await unwrap(trusted);
         } catch (e) {
+          if (!/did not verify/.test(e.message)) throw e;
+          if (listed.length) { raw = await unwrap(listed); onlyListed = true; }
           // Signed by a new key of theirs you haven't verified (and none you trusted before): wait for that.
-          if (/did not verify/.test(e.message) && keyChanged(wrapper)) throw new Error('untrusted sharer');
-          throw e;
+          else if (keyChanged(wrapper)) throw new Error('untrusted sharer');
+          else throw e;
         }
         if ((await E2EE.keyCheck(raw, st.serverId, k.epoch)) !== k.check) throw new Error('key check mismatch');
         mine.set(k.epoch, raw);
+        if (onlyListed) unverified.add(tag); else unverified.delete(tag);
         added = true;
         generation.set(st.serverId, (generation.get(st.serverId) || 0) + 1);
-        if (k.wrapperId !== S.me.id) fresh.push({ epoch: k.epoch, raw });
+        if (!self && !onlyListed) fresh.push({ epoch: k.epoch, raw });
       } catch (e) {
         console.warn('Could not unlock a server key', st.serverId, k.epoch, e.message);
         // Locked for keys this account no longer has (or damaged): ask for it to be shared again. Once per
         // key per session, and only the current key (nobody can share an older one again, so the server keeps
         // those). Not for "untrusted sharer": that one waits for you to verify them.
-        const tag = `${st.serverId}|${k.epoch}`;
         if (current && e.message !== 'untrusted sharer' && !reported.has(tag)) { reported.add(tag); api('POST', `/servers/${st.serverId}/keys/bad`, { epoch: k.epoch }).catch(() => {}); }
       }
     }
@@ -154,27 +234,13 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   // copy we got, once per key. Our history then no longer depends on the sharer keeping their keys: deleting
   // their account or resetting their password can't lock us out of what was said back then.
   const keeping = new Map(); // serverId -> promise of the last upload (so tests and callers can wait for it)
-  // Our public key as the server tells it must really be ours before we wrap every key we hold to it: a round
-  // trip (wrap to it, open with our private key) proves it. Checked once per session.
-  let ownKeyCheck = null;
-  function ownKeyOk() {
-    if (!ownKeyCheck) {
-      ownKeyCheck = (async () => {
-        const raw = E2EE.newGroupKey();
-        const ctx = { serverId: 'self-check', epoch: 0, wrapperId: S.me.id };
-        const w = await E2EE.wrapGroupKey({ ...ctx, raw, recipientId: S.me.id, recipientPub: S.me.publicKey, signKey: S.signKey });
-        const back = await E2EE.unwrapGroupKey({ ...ctx, wrapped: w, myId: S.me.id, myPriv: S.privateKey, wrapperSignPub: S.me.signPublicKey });
-        return back.length === raw.length && back.every((b, i) => b === raw[i]);
-      })().catch(() => false);
-    }
-    return ownKeyCheck;
-  }
   function keepForMyself(serverId, list) {
     const todo = list.filter((k) => !rewrapped.has(`${serverId}|${k.epoch}`));
     if (!todo.length || !S.signKey || !S.me || !S.me.publicKey) return keeping.get(serverId);
     todo.forEach((k) => rewrapped.add(`${serverId}|${k.epoch}`));
     const job = (async () => {
-      if (!(await ownKeyOk())) throw new Error('our public key doesn’t match our private key');
+      // Our public key as the server tells it must really be ours before we wrap every key we hold to it.
+      if (!(await ownKeysOk())) throw new Error('our public keys don’t match our private keys');
       for (let i = 0; i < todo.length; i += 100) {
         const wraps = {};
         for (const k of todo.slice(i, i + 100)) {
@@ -205,7 +271,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!st || busy.has(serverId)) return;
     const server = S.servers.find((s) => s.id === serverId);
     if (!server) return;
-    const needsRotate = st.needsRotation || !st.keyEpoch;
+    const needsRotate = (st.needsRotation || !st.keyEpoch) && !held(serverId);
     const needsShare = !needsRotate && st.missing && st.missing.some((id) => id !== S.me.id) && currentKey(serverId);
     if (!needsRotate && !needsShare) return;
     busy.add(serverId);
@@ -216,10 +282,15 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
         if (needsRotate) await rotate(serverId);
         else await share(serverId, st.missing.filter((id) => id !== S.me.id));
       } catch (e) {
-        if (!['epoch', 'members'].includes(e.code)) console.warn('Key maintenance failed', e.message);
+        if (!['epoch', 'members', ...LIMITED].includes(e.code)) console.warn('Key maintenance failed', e.message);
       } finally { busy.delete(serverId); }
     })();
   }
+  // The server said "not you, not now" to a new key from us (we came back after being away, or we reported the
+  // last key broken, so someone else makes the next one): don't keep asking for a minute.
+  const LIMITED = ['rotate_too_soon', 'rate_limited'];
+  const holds = new Map(); // serverId -> time we may try to rotate again
+  const held = (serverId) => (holds.get(serverId) || 0) > Date.now();
 
   async function wrapFor(serverId, epoch, raw, userIds) {
     const wraps = {};
@@ -252,6 +323,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     const check = await E2EE.keyCheck(raw, serverId, epoch);
     const next = await api('POST', `/servers/${serverId}/keys/rotate`, { epoch, check, wraps, pubs }).catch(async (e) => {
       if (e.code === 'stale_keys') { await refreshUsers(server.memberIds.filter((id) => id !== S.me.id)); setTimeout(() => maintain(serverId), 500); }
+      if (LIMITED.includes(e.code)) holds.set(serverId, Date.now() + 60000);
       throw e;
     });
     keysFor(serverId).set(epoch, raw);
@@ -276,10 +348,11 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const ck = currentKey(serverId);
       if (ck) return ck;
       const st = states.get(serverId);
-      if (st && (st.needsRotation || !st.keyEpoch) && !busy.has(serverId)) {
+      if (st && (st.needsRotation || !st.keyEpoch) && !busy.has(serverId) && !held(serverId)) {
         busy.add(serverId);
+        // Refused for us (see holds): another member's app makes the new key, so wait for it like for a share.
         try { await rotate(serverId); } catch (e) {
-          if (!['epoch', 'members'].includes(e.code)) throw e;
+          if (!['epoch', 'members', ...LIMITED].includes(e.code)) throw e;
         } finally { busy.delete(serverId); }
         if (currentKey(serverId)) return currentKey(serverId);
       }
@@ -321,9 +394,16 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     }
     try {
       const author = await userWithKeys(authorId);
-      // Their current key if you trust it, or one you trusted for them before (posts from before a reset).
-      const { payload, verified } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: signKeysFor(author, { at }), text });
-      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), verified };
+      if (authorId === S.me.id) await ownKeysOk();
+      // Checked against every key we know for them (see keysOf); only 'now' and 'pinned' ones verify it. keyNote
+      // says when it wasn't their current trusted key, so the message can say so.
+      const keys = keysOf(author, 's', at);
+      const { payload, signedBy } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: keys.map((k) => k.key), text });
+      const how = signedBy ? keys.find((k) => k.key === signedBy).trust : null;
+      return {
+        t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p),
+        verified: how === 'now' || how === 'pinned', ...(how && how !== 'now' ? { keyNote: how } : {}),
+      };
     } catch {
       return { error: true, t: '', f: [] };
     }
@@ -352,7 +432,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       }
     }
     if (m.reply && (!m.reply.dec || m.reply.dec.pending)) {
-      m.reply.dec = m.reply.ciphertext ? await openGroup(m.serverId, m.channelId, m.reply.authorId, m.reply.ciphertext) : openLegacy(m.reply);
+      m.reply.dec = m.reply.ciphertext ? await openGroup(m.serverId, m.channelId, m.reply.authorId, m.reply.ciphertext, Number(m.reply.createdAt) || 0) : openLegacy(m.reply);
     }
   }
 
@@ -375,19 +455,23 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     trust(peer);
     return E2EE.encryptDm({ myPriv: S.privateKey, theirPub: peer.publicKey, dmId, authorId: S.me.id, payload });
   }
+  // The other person's identity keys a DM written at `at` may be locked with, best first (see keysOf): it's
+  // locked with whichever key they had then (before a password reset, or before they deleted their account).
+  async function dmKeys(dmId, at) {
+    const d = S.dms.find((x) => x.id === dmId);
+    if (!d) throw new Error('Conversation not found.');
+    const peer = await userWithKeys(d.userId);
+    if (peer && peer.publicKey) trust(peer);
+    return keysOf(peer, 'e', at);
+  }
+  // DMs aren't signed (so they stay deniable): the key that opens one is all that says who could have written it.
+  // keyNote says when that wasn't their current trusted key, so the message can say so.
   async function openDm(dmId, authorId, text, at = 0) {
     try {
-      const d = S.dms.find((x) => x.id === dmId);
-      if (!d) throw new Error('Conversation not found.');
-      const peer = await userWithKeys(d.userId);
-      if (peer && peer.publicKey) trust(peer);
-      // Their current key first, then the keys this device trusted for them before: a message is locked with
-      // whichever they had when it was written (before a password reset, or before they deleted their account).
-      const keys = [...new Set([peer && peer.publicKey, ...E2EE.pinnedKeys(S.me.id, peer, at).e].filter(Boolean))];
-      for (const theirPub of keys) {
+      for (const { key, trust: how } of await dmKeys(dmId, at)) {
         try {
-          const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub, dmId, authorId, text });
-          return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), legacyFormat: !!legacy };
+          const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub: key, dmId, authorId, text });
+          return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
         } catch { /* not this key */ }
       }
       throw new Error('Missing key');
@@ -398,13 +482,19 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   async function decryptDmMessage(m) {
     if (m.dec) return;
     m.dec = await openDm(m.dmId, m.authorId, m.ciphertext, Number(m.createdAt) || 0);
-    if (m.reply && m.reply.ciphertext && !m.reply.dec) m.reply.dec = await openDm(m.dmId, m.reply.authorId, m.reply.ciphertext);
+    if (m.reply && m.reply.ciphertext && !m.reply.dec) m.reply.dec = await openDm(m.dmId, m.reply.authorId, m.reply.ciphertext, Number(m.reply.createdAt) || 0);
   }
 
   // ---------------------------------------------------------------- attachments
   async function decryptAttachment(m, f, buf) {
     if (f.k) return E2EE.decryptFile(f.k, buf);
-    if (m.dmId) return E2EE.decryptLegacyDmFile(S.privateKey, (await dmPeer(m.dmId)).publicKey, buf);
+    if (m.dmId) {
+      // Files from the oldest DM format are locked with the conversation key itself: the same keys as the text.
+      for (const { key } of await dmKeys(m.dmId, Number(m.createdAt) || 0)) {
+        try { return await E2EE.decryptLegacyDmFile(S.privateKey, key, buf); } catch { /* not this key */ }
+      }
+      throw new Error('Missing key');
+    }
     throw new Error('Missing file key');
   }
 
@@ -417,7 +507,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     return E2EE.verify(u.signPublicKey, sdpText(channelId, fromUserId, S.me.id, desc), sig);
   }
 
-  function reset() { groupKeys.clear(); states.clear(); busy.clear(); warned.clear(); rewrapped.clear(); keeping.clear(); ownKeyCheck = null; E2EE.clearCaches(); }
+  function reset() {
+    groupKeys.clear(); states.clear(); busy.clear(); warned.clear(); rewrapped.clear(); keeping.clear(); unverified.clear(); holds.clear();
+    ownCheck = null; proven = null; E2EE.clearCaches();
+  }
 
   return {
     ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain,

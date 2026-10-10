@@ -220,9 +220,11 @@ test('the sharer resets without a recovery key: old keys still open, and old row
   const ep1 = (await channelMsgs(B, ch)).filter((x) => x.epoch === 1);
   for (const m of ep1) await od.sec.decryptChannelMessage(m);
   assert.deepEqual(ep1.map((m) => [m.dec.t, m.dec.verified]).sort(), [['alice epoch 1', true], ['victor before his reset', true]]);
-  // After "Numbers match" the old key stays trusted for what it signed back then...
+  // After "Numbers match" the old key stays trusted for what it signed back then (dated before the reset)...
   od.sec.acceptKeys(od.S.users[V.id]);
-  assert.deepEqual(od.sec.signKeysFor(od.S.users[V.id]), [now.signPublicKey, old.signPublicKey]);
+  const oldPost = ep1.find((m) => m.dec.t === 'victor before his reset');
+  assert.deepEqual(od.sec.signKeysFor(od.S.users[V.id], { at: oldPost.createdAt }), [now.signPublicKey, old.signPublicKey]);
+  assert.deepEqual(od.sec.signKeysFor(od.S.users[V.id]), [now.signPublicKey], 'an old key never vouches for something undated');
   // ...but not for anything newer (say it leaked): a post signed with it today isn't shown as Victor's.
   await sleep(5);
   const late = await send({ ...V, signKey: V0.signKey }, s.id, ch, 2, r2.raw, 'signed with the old key, today');
@@ -244,16 +246,18 @@ test('the sharer resets without a recovery key: old keys still open, and old row
   srv.sql('UPDATE servers SET key_epoch = 2, needs_rotation = 0 WHERE id = ?', s.id);
 
   // Bob on a brand-new phone (no pins at all), with his row put back as Victor wrapped it (his old device
-  // already re-wrapped it to Bob).
+  // already re-wrapped it to Bob). It can still read epoch 1 with the old key the server lists for Victor, but
+  // nothing vouches for that key (this phone never saw it as his, and safety numbers don't cover it): what only
+  // it checks out is shown as "older key, not verified", and the key isn't kept as Bob's own copy.
   assert.equal(rowsOf(s.id, B.id)[0].wrapper_id, B.id);
   srv.sql('UPDATE server_keys SET wrapped = ?, wrapper_id = ? WHERE server_id = ? AND user_id = ? AND epoch = 1', victorsWrap, V.id, s.id, B.id);
   const fresh = await device(B, new Map());
   assert.deepEqual(fresh.sec.heldEpochs(s.id).sort(), [1, 2]);
   const all = await channelMsgs(B, ch);
   for (const m of all) await fresh.sec.decryptChannelMessage(m);
-  assert.deepEqual(all.map((m) => [m.dec.t, m.dec.verified]).sort(),
-    [['alice epoch 1', true], ['signed with the old key, today', false], ['victor before his reset', true]]);
-  assert.deepEqual(rowsOf(s.id, B.id).map((x) => x.epoch), [1, 2], 'nothing was reported away');
+  assert.deepEqual(all.map((m) => [m.dec.t, m.dec.verified, m.dec.keyNote || null]).sort(),
+    [['alice epoch 1', true, null], ['signed with the old key, today', false, null], ['victor before his reset', false, 'listed']]);
+  assert.deepEqual(rowsOf(s.id, B.id).map((x) => [x.epoch, x.wrapper_id]), [[1, V.id], [2, B.id]], 'nothing reported away, nothing kept on a listed key’s word');
   // A key the server adds to someone's history LATER is not trusted by a device that already knows them.
   const fake = await E.createSigningKey(B.privateKey, B.publicKey);
   srv.sql('INSERT INTO user_key_history (user_id, public_key, sign_public_key, retired_at) VALUES (?, ?, ?, ?)', V.id, old.publicKey, fake.signPublicKey, Date.now());
@@ -267,11 +271,25 @@ test('after a reset without a recovery key, the other person still reads your ol
   const dm = (await as(A, 'POST', '/dms', { userId: V.id })).json;
   const ciphertext = await E.encryptDm({ myPriv: A.privateKey, theirPub: V.publicKey, dmId: dm.id, authorId: A.id, payload: { t: 'before the reset' } });
   assert.equal((await as(A, 'POST', `/dms/${dm.id}/messages`, { ciphertext })).status, 200);
+  const pins = new Map();
+  await device(A, pins); // a device of Alice's that knew Vera before
   V = await resetWithoutRecovery(V);
-  const d = await device(A, new Map()); // a new device of Alice's: learns Vera's old key from her history
+  // A new device of Alice's: opens it with the old key the server lists for Vera, flagged as not verified.
+  const d = await device(A, new Map());
   const m = (await as(A, 'GET', `/dms/${dm.id}/messages`)).json.messages[0];
   await d.sec.decryptDmMessage(m);
   assert.equal(m.dec.t, 'before the reset');
+  assert.equal(m.dec.keyNote, 'listed');
+  // The device that knew her: her old key is the one it pinned. Before and after "Numbers match" it opens with
+  // that (an older key of hers, trusted back then), not on the server's word.
+  const k = await device(A, pins);
+  for (const accept of [false, true]) {
+    if (accept) k.sec.acceptKeys(k.S.users[V.id]);
+    const again = (await as(A, 'GET', `/dms/${dm.id}/messages`)).json.messages[0];
+    await k.sec.decryptDmMessage(again);
+    assert.equal(again.dec.t, 'before the reset');
+    assert.equal(again.dec.keyNote, 'pinned');
+  }
 });
 
 // ------------------------------------------------------------------ crypto-3: rotation abuse
@@ -515,4 +533,292 @@ test('an app told the wrong public key for itself never wraps its keys to it', a
   const d = await device(B, new Map());
   assert.deepEqual(d.sec.heldEpochs(s.id), [1]);
   assert.equal(rowsOf(s.id, B.id)[0].wrapper_id, B.id);
+});
+
+// ------------------------------------------------------------------ second review round
+// A key pair the "server" controls (identity + signing), without a password.
+async function serverKeys() {
+  const wk = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const id = await E.createIdentity(wk);
+  return { ...id, ...(await E.createSigningKey(id.privateKey, id.publicKey)) };
+}
+const plantDm = (dmId, authorId, ciphertext, at) => {
+  const id = 'zz' + H.hex(6);
+  srv.sql('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at) VALUES (?, ?, ?, ?, NULL, ?)', id, dmId, authorId, ciphertext, at);
+  return id;
+};
+const plantPost = (ch, authorId, ciphertext, epoch, at) => {
+  const id = 'zz' + H.hex(6);
+  srv.sql('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)', id, ch, authorId, '', ciphertext, epoch, at);
+  return id;
+};
+const dmMsg = async (u, dmId, id) => (await as(u, 'GET', `/dms/${dmId}/messages`)).json.messages.find((x) => x.id === id);
+const keyRow = (sid) => ({ ...srv.sql('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?', sid)[0] });
+
+test('keys the server lists as someone’s past keys never vouch for anything, even after "Numbers match"', async () => {
+  const A = await person(uname('alice')); const V = await person(uname('vic'));
+  const { s, ch } = await serverWith(A, [V]);
+  const { raw: raw1 } = await rotate(A, s.id, 1, [A, V]);
+  const dm = (await as(A, 'POST', '/dms', { userId: V.id })).json;
+  // The server lists keys of its own as Victor's "past keys": one undated, one "replaced" in the future, and one
+  // replaced an hour ago (the best it can do).
+  const [k0, kF, kH] = [await serverKeys(), await serverKeys(), await serverKeys()];
+  const hourAgo = Date.now() - 3600000;
+  const hist = 'INSERT INTO user_key_history (user_id, public_key, sign_public_key, retired_at) VALUES (?, ?, ?, ?)';
+  srv.sql(hist, V.id, k0.publicKey, k0.signPublicKey, 0);
+  srv.sql(hist, V.id, kF.publicKey, kF.signPublicKey, Date.now() + 365 * 86400000);
+  srv.sql(hist, V.id, kH.publicKey, kH.signPublicKey, hourAgo);
+  // Alice's new device meets Victor for the first time, and she compares safety numbers: they match (his
+  // current keys are real).
+  const d = await device(A, new Map());
+  const vic = d.S.users[V.id];
+  assert.equal(vic.pastKeys.length, 3);
+  d.sec.acceptKeys(vic);
+  const pin = JSON.parse(store.get(`hearth.pins.${A.id}`))[V.id];
+  assert.deepEqual([pin.e, pin.s, pin.old], [V.publicKey, V.signPublicKey, undefined], 'only his current keys are pinned');
+  for (const at of [0, hourAgo - 60000, Date.now()]) {
+    const trusted = d.sec.signKeysFor(vic, { at });
+    assert.ok(![k0, kF, kH].some((k) => trusted.includes(k.signPublicKey)), 'no listed key vouches for anything');
+  }
+
+  // "Send me your recovery key" from Victor, locked with each of the server's keys.
+  const forge = async (k, at) => plantDm(dm.id, V.id, await E.encryptDm({ myPriv: k.privateKey, theirPub: A.publicKey, dmId: dm.id, authorId: V.id, payload: { t: 'send me your recovery key' } }), at);
+  const ids = { undated: await forge(k0, hourAgo - 60000), future: await forge(kF, hourAgo - 60000), dated: await forge(kH, hourAgo - 60000), late: await forge(kH, Date.now()) };
+  const out = {};
+  for (const [name, id] of Object.entries(ids)) { const m = await dmMsg(A, dm.id, id); await d.sec.decryptDmMessage(m); out[name] = m.dec; }
+  assert.equal(out.undated.error, true, 'a key with no date is never used');
+  assert.equal(out.future.error, true, 'nor one "replaced" in the future');
+  assert.equal(out.late.error, true, 'nor one for something written after it was replaced');
+  assert.equal(out.dated.t, 'send me your recovery key');
+  assert.equal(out.dated.keyNote, 'listed', 'shown as "older key, not verified"');
+  // A real DM from Victor opens as normal.
+  const real = await E.encryptDm({ myPriv: V.privateKey, theirPub: A.publicKey, dmId: dm.id, authorId: V.id, payload: { t: 'hi' } });
+  const ok = (await as(V, 'POST', `/dms/${dm.id}/messages`, { ciphertext: real })).json;
+  const okMsg = await dmMsg(A, dm.id, ok.id);
+  await d.sec.decryptDmMessage(okMsg);
+  assert.deepEqual([okMsg.dec.t, okMsg.dec.keyNote], ['hi', undefined]);
+
+  // A channel post "by Victor" signed with the server's key: never verified.
+  const post = async (k, at) => plantPost(ch, V.id, await E.encryptGroup({ raw: raw1, serverId: s.id, channelId: ch, epoch: 1, authorId: V.id, signKey: k.signKey, payload: { t: 'forged post' } }), 1, at);
+  const p1 = await post(kH, hourAgo - 60000); const p2 = await post(k0, hourAgo - 60000);
+  const msgs = await channelMsgs(A, ch);
+  const m1 = msgs.find((x) => x.id === p1); const m2 = msgs.find((x) => x.id === p2);
+  await d.sec.decryptChannelMessage(m1); await d.sec.decryptChannelMessage(m2);
+  assert.deepEqual([m1.dec.t, m1.dec.verified, m1.dec.keyNote], ['forged post', false, 'listed']);
+  assert.deepEqual([m2.dec.verified, m2.dec.keyNote], [false, undefined]);
+
+  // An older server key handed out "by Victor" with a listed key: readable history at most, never kept as
+  // Alice's own copy, and never the key she writes with.
+  await rotate(A, s.id, 2, [A, V]);
+  const fake1 = E.newGroupKey();
+  srv.sql('UPDATE server_epochs SET key_check = ? WHERE server_id = ? AND epoch = 1', await E.keyCheck(fake1, s.id, 1), s.id);
+  const w1 = await E.wrapGroupKey({ raw: fake1, serverId: s.id, epoch: 1, recipientId: A.id, recipientPub: A.publicKey, wrapperId: V.id, signKey: kH.signKey });
+  srv.sql('UPDATE server_keys SET wrapped = ?, wrapper_id = ?, created_at = ? WHERE server_id = ? AND user_id = ? AND epoch = 1', w1, V.id, hourAgo - 60000, s.id, A.id);
+  srv.sql('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = 2', s.id, A.id); // her copy of epoch 2 "lost"
+  const d2 = await device(A, d.pins);
+  assert.deepEqual(d2.sec.heldEpochs(s.id), [1]);
+  assert.equal(rowsOf(s.id, A.id).find((x) => x.epoch === 1).wrapper_id, V.id, 'not re-wrapped as Alice’s own');
+  // The server now says epoch 1 is current: the app won't write with it.
+  srv.sql('UPDATE servers SET key_epoch = 1 WHERE id = ?', s.id);
+  await d2.sec.refresh(s.id);
+  assert.equal(d2.sec.currentKey(s.id), null);
+  srv.sql('UPDATE servers SET key_epoch = 2 WHERE id = ?', s.id);
+});
+
+test('a server that lists its own keys as yours can’t plant a "self-wrapped" current key', async () => {
+  const A = await person(uname('alice')); const B = await person(uname('bob')); const X = await serverKeys();
+  const { s } = await serverWith(A, [B]);
+  await rotate(A, s.id, 1, [A, B]);
+  // Epoch 2: the server's key, wrapped to Alice, labelled as wrapped by Alice herself, signed with X; and X's
+  // signing key served as Alice's.
+  const evil = E.newGroupKey(); const t = Date.now();
+  srv.sql('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, 2, ?, ?, ?)', s.id, await E.keyCheck(evil, s.id, 2), A.id, t);
+  const w = await E.wrapGroupKey({ raw: evil, serverId: s.id, epoch: 2, recipientId: A.id, recipientPub: A.publicKey, wrapperId: A.id, signKey: X.signKey });
+  srv.sql('INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, 2, ?, ?, ?, ?)', s.id, A.id, w, A.id, t);
+  srv.sql('UPDATE servers SET key_epoch = 2 WHERE id = ?', s.id);
+  srv.sql('UPDATE users SET sign_public_key = ? WHERE id = ?', X.signPublicKey, A.id);
+  // The app stops at start-up with a clear error instead of trusting it.
+  await assert.rejects(device(A, new Map()), (e) => e.code === 'own_key_mismatch' && /aren’t the ones your password unlocks/.test(e.message));
+  // Even an app that skipped that check never takes the planted copy (only keys proven to be yours count).
+  store = new Map(); curIp = A.ip; API.setToken(A.token);
+  const boot = (await as(A, 'GET', '/bootstrap')).json;
+  const S = { me: boot.me, users: boot.users, servers: boot.servers, dms: boot.dms, privateKey: A.privateKey, signKey: A.signKey };
+  const sec = createSecure({ S });
+  for (const st of Object.values(boot.keyStates)) await sec.applyState(st);
+  assert.ok(!sec.heldEpochs(s.id).includes(2));
+  assert.equal(sec.currentKey(s.id), null);
+  // Alice's identity key swapped for X's: refused at start-up too (her signing key is locked with it).
+  srv.sql('UPDATE users SET sign_public_key = ?, public_key = ? WHERE id = ?', A.signPublicKey, X.publicKey, A.id);
+  await assert.rejects(device(A, new Map()), (e) => e.code === 'own_key_mismatch');
+  // With her real keys the app starts, and the planted key still isn't used (it isn't signed by her).
+  srv.sql('UPDATE users SET public_key = ? WHERE id = ?', A.publicKey, A.id);
+  const d = await device(A, new Map());
+  assert.deepEqual(d.sec.heldEpochs(s.id), [1]);
+  assert.equal(d.sec.currentKey(s.id), null);
+});
+
+test('refused rotations don’t use up the hour: the owner can still replace the key, and only real keys count', async () => {
+  const A = await person(uname('alice')); const B = await person(uname('bob')); const M = await person(uname('mallory'));
+  const { s } = await serverWith(A, [B, M]);
+  assert.equal((await rotate(A, s.id, 1, [A, B, M])).r.status, 200);
+  srv.sql('UPDATE server_epochs SET created_at = created_at - 11 * 60000 WHERE server_id = ?', s.id);
+  // Mallory (no permissions) sends a dozen rotations that leave someone out: all refused...
+  for (let i = 0; i < 13; i++) {
+    const r = (await rotate(M, s.id, 2, [A, M])).r;
+    assert.deepEqual([r.status, r.json.code], [409, 'members']);
+  }
+  // ...and they don't count: the owner's "Replace key now" works, and so does Mallory's own (the key is old).
+  assert.equal((await rotate(A, s.id, 2, [A, B, M])).r.status, 200);
+  srv.sql('UPDATE server_epochs SET created_at = created_at - 11 * 60000 WHERE server_id = ? AND epoch = 2', s.id);
+  assert.equal((await rotate(M, s.id, 3, [A, B, M])).r.status, 200);
+  // Twelve keys made in the last hour: plain members wait, the owner has an allowance of her own.
+  for (let e = 4; e <= 12; e++) assert.equal((await rotate(A, s.id, e, [A, B, M])).r.status, 200);
+  srv.sql('UPDATE server_epochs SET created_at = created_at - 11 * 60000 WHERE server_id = ? AND epoch = 12', s.id);
+  const r = (await rotate(M, s.id, 13, [A, B, M])).r;
+  assert.deepEqual([r.status, r.json.code], [429, 'rate_limited']);
+  assert.equal((await rotate(A, s.id, 13, [A, B, M])).r.status, 200);
+  // An hour later it's fine again.
+  srv.sql('UPDATE server_epochs SET created_at = created_at - 61 * 60000 WHERE server_id = ?', s.id);
+  assert.equal((await rotate(M, s.id, 14, [A, B, M])).r.status, 200);
+});
+
+test('reporting a good key doesn’t let anyone skip the rotation limits, nor keep the key churning', async () => {
+  const A = await person(uname('alice')); const B = await person(uname('bob')); const C = await person(uname('carol'));
+  const M = await person(uname('mallory')); const M2 = await person(uname('mallory2')); // Mallory's second account
+  const { s } = await serverWith(A, [B, C, M, M2]);
+  const everyone = [A, B, C, M, M2];
+  assert.equal((await rotate(A, s.id, 1, everyone)).r.status, 200);
+  const bobOnline = await srv.socket(B.token); // Bob's app is open (it opened the key fine)
+  try {
+    // Mallory may not replace the key yet...
+    let r = (await rotate(M, s.id, 2, everyone)).r;
+    assert.deepEqual([r.status, r.json.code], [429, 'rotate_too_soon']);
+    // ...so she says the (perfectly good) key Alice handed her doesn't open. One report isn't enough.
+    assert.equal((await as(M, 'POST', `/servers/${s.id}/keys/bad`, { epoch: 1 })).json.removed, 1);
+    assert.equal(keyRow(s.id).needs_rotation, 0);
+    r = (await rotate(M, s.id, 2, everyone, { check: 'B'.repeat(24) })).r;
+    assert.deepEqual([r.status, r.json.code], [429, 'rotate_too_soon']);
+    // With her second account too, the apps are asked for a new key, but neither of hers may make it (let
+    // alone one nobody can open): Bob is online and can.
+    assert.equal((await as(M2, 'POST', `/servers/${s.id}/keys/bad`, { epoch: 1 })).json.removed, 1);
+    assert.equal(keyRow(s.id).needs_rotation, 1);
+    for (const u of [M, M2]) {
+      r = (await rotate(u, s.id, 2, everyone, { check: 'B'.repeat(24) })).r;
+      assert.deepEqual([r.status, r.json.code], [429, 'rotate_too_soon']);
+    }
+    assert.equal((await rotate(B, s.id, 2, everyone)).r.status, 200);
+    // Each member's reports count only so often: the pair can't keep the key churning. (Each new key is made by
+    // whoever didn't make the one reported: Carol and Bob take turns.)
+    let forced = 1;
+    for (let e = 2; e < 20; e++) {
+      await as(M, 'POST', `/servers/${s.id}/keys/bad`, { epoch: e });
+      await as(M2, 'POST', `/servers/${s.id}/keys/bad`, { epoch: e });
+      if (!keyRow(s.id).needs_rotation) break;
+      forced++;
+      assert.equal((await rotate(e % 2 ? B : C, s.id, e + 1, everyone)).r.status, 200);
+    }
+    assert.equal(forced, 12, 'twelve reports an hour each, then no more');
+    assert.equal(keyRow(s.id).needs_rotation, 0);
+  } finally { bobOnline.close(); }
+
+  // A key that really is broken still gets replaced at once by the members it fails for (nobody else online).
+  srv.sql('UPDATE server_epochs SET created_at = created_at - 61 * 60000 WHERE server_id = ?', s.id);
+  srv.sql('DELETE FROM server_key_reports WHERE server_id = ?', s.id);
+  const e0 = keyRow(s.id).key_epoch;
+  const bad = await rotate(M, s.id, e0 + 1, everyone, { check: 'C'.repeat(24) });
+  assert.equal(bad.r.status, 200, bad.r.text);
+  // Mallory made it: once it's reported broken she can't make its replacement without the limits either.
+  await as(B, 'POST', `/servers/${s.id}/keys/bad`, { epoch: e0 + 1 });
+  await as(C, 'POST', `/servers/${s.id}/keys/bad`, { epoch: e0 + 1 });
+  assert.equal(keyRow(s.id).needs_rotation, 1);
+  const again = (await rotate(M, s.id, e0 + 2, everyone, { check: 'C'.repeat(24) })).r;
+  assert.deepEqual([again.status, again.json.code], [429, 'rotate_too_soon']);
+  // Carol's app (it couldn't open the key either) replaces it at once.
+  await device(C, new Map());
+  assert.ok(await until(() => keyRow(s.id).key_epoch === e0 + 2), 'a fresh key replaced the broken one');
+  assert.equal(srv.sql('SELECT creator_id FROM server_epochs WHERE server_id = ? AND epoch = ?', s.id, e0 + 2)[0].creator_id, C.id);
+});
+
+test('a kicked member who resets their password and rejoins still gets a new key', async () => {
+  const A = await person(uname('alice')); const B = await person(uname('bob')); let K = await person(uname('mike'));
+  const { s, code, ch } = await serverWith(A, [B, K]);
+  await rotate(A, s.id, 1, [A, B, K]);
+  assert.equal((await as(A, 'DELETE', `/servers/${s.id}/members/${K.id}`)).status, 200);
+  const { raw: raw2 } = await rotate(A, s.id, 2, [A, B]);
+  await send(A, s.id, ch, 2, raw2, 'mods: about mike');
+  K = await resetWithoutRecovery(K); // deletes all his key rows
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM server_keys WHERE user_id = ?', K.id)[0].n, 0);
+  assert.equal((await as(K, 'POST', `/invites/${code}/join`, {})).status, 200);
+  assert.deepEqual(keyRow(s.id), { key_epoch: 2, needs_rotation: 1 }, 'coming back still asks for a new key');
+  const w = await E.wrapGroupKey({ raw: raw2, serverId: s.id, epoch: 2, recipientId: K.id, recipientPub: K.publicKey, wrapperId: A.id, signKey: A.signKey });
+  assert.equal((await as(A, 'POST', `/servers/${s.id}/keys/share`, { epoch: 2, wraps: { [K.id]: w } })).status, 409);
+  // He can't make the new key himself without the usual limits (it would be his to choose).
+  const r = (await rotate(K, s.id, 3, [A, B, K])).r;
+  assert.deepEqual([r.status, r.json.code], [429, 'rotate_too_soon']);
+  // Bob's app does it.
+  assert.equal((await rotate(B, s.id, 3, [A, B, K])).r.status, 200);
+});
+
+test('the password-locked key needs a two-factor code when that’s on, and shares the password-check limit', async () => {
+  const A = await person(uname('alice'));
+  const { secret, used } = await H.enable2fa(srv, A);
+  srv.sql('UPDATE sessions SET mfa_at = NULL WHERE user_id = ?', A.id); // its last two-factor check was a while ago
+  let r = await as(A, 'POST', '/me/keys/wrapped', { authKey: A.authKey });
+  assert.deepEqual([r.status, r.json.code], [401, 'need_2fa'], 'the password alone isn’t enough');
+  r = await as(A, 'POST', '/me/keys/wrapped', { authKey: A.authKey, totp: await H.freshCode(secret, used) });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.encPrivateKey, A.encPrivateKey);
+  // Wrong passwords here and in the other password checks share one limit.
+  const B = await person(uname('bob'));
+  for (let i = 0; i < 5; i++) await as(B, 'POST', '/me/keys/wrapped', { authKey: H.hex(32) });
+  for (let i = 0; i < 5; i++) await as(B, 'DELETE', '/me/recovery', { authKey: H.hex(32) });
+  r = await as(B, 'POST', '/me/keys/wrapped', { authKey: B.authKey });
+  assert.equal(r.status, 429);
+});
+
+test('replies, old DM files and accepted keys use the keys from when things were written; lists stay lean', async () => {
+  const A = await person(uname('alice')); let V = await person(uname('vera'));
+  const { s, ch } = await serverWith(A, [V]);
+  const { raw } = await rotate(A, s.id, 1, [A, V]);
+  const dm = (await as(A, 'POST', '/dms', { userId: V.id })).json;
+  const pins = new Map();
+  await device(A, pins); // Alice's device knows Vera's first keys
+  const oldPost = await send(V, s.id, ch, 1, raw, 'before');
+  // An old-format DM file Vera sent before resetting (locked with the conversation key itself).
+  const sub = crypto.subtle;
+  const bits = await sub.deriveBits({ name: 'ECDH', public: await sub.importKey('spki', E.unb64(A.publicKey), { name: 'ECDH', namedCurve: 'P-256' }, false, []) }, V.privateKey, 256);
+  const fk = await sub.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode('hearth-dm-salt'), info: new TextEncoder().encode('hearth-dm-v1') },
+    await sub.importKey('raw', bits, 'HKDF', false, ['deriveKey']), { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+  const iv = crypto.randomBytes(12);
+  const fileBuf = Buffer.concat([iv, Buffer.from(await sub.encrypt({ name: 'AES-GCM', iv }, fk, Buffer.from('old file')))]);
+  const V0 = V;
+  await sleep(5);
+  V = await resetWithoutRecovery(V);
+  const retiredAt = srv.sql('SELECT retired_at FROM user_key_history WHERE user_id = ?', V.id)[0].retired_at;
+  // Someone posts with Vera's old signing key after her reset (say it leaked); Alice replies to it and to her old post.
+  await sleep(5);
+  const ct = await E.encryptGroup({ raw, serverId: s.id, channelId: ch, epoch: 1, authorId: V.id, signKey: V0.signKey, payload: { t: 'leaked' } });
+  const late = (await as(V, 'POST', `/channels/${ch}/messages`, { ciphertext: ct, epoch: 1 })).json.id;
+  const replyTo = async (to, t) => (await as(A, 'POST', `/channels/${ch}/messages`, { ciphertext: await E.encryptGroup({ raw, serverId: s.id, channelId: ch, epoch: 1, authorId: A.id, signKey: A.signKey, payload: { t } }), epoch: 1, replyTo: to })).json.id;
+  const reply = await replyTo(late, 're'); const reply2 = await replyTo(oldPost, 're2');
+
+  await sleep(20);
+  const d = await device(A, pins);
+  d.sec.acceptKeys(d.S.users[V.id]); // "Numbers match", a while after her reset
+  const pin = JSON.parse(store.get(`hearth.pins.${A.id}`))[V.id];
+  assert.equal(pin.old[0].until, retiredAt, 'the old key counts until the server says it was replaced, not until now');
+  const msgs = await channelMsgs(A, ch);
+  for (const id of [reply, reply2]) await d.sec.decryptChannelMessage(msgs.find((m) => m.id === id));
+  const rp = msgs.find((m) => m.id === reply).reply; const rp2 = msgs.find((m) => m.id === reply2).reply;
+  assert.ok(rp.createdAt && rp2.createdAt);
+  assert.deepEqual([rp.dec.t, rp.dec.verified], ['leaked', false], 'a reply preview isn’t verified with a key from before it');
+  assert.deepEqual([rp2.dec.t, rp2.dec.verified, rp2.dec.keyNote], ['before', true, 'pinned']);
+  // The old-format file opens with the key Vera had when she sent it.
+  const plain = await d.sec.decryptAttachment({ dmId: dm.id, createdAt: retiredAt - 1 }, {}, fileBuf);
+  assert.equal(Buffer.from(plain).toString(), 'old file');
+  // Past keys come with the user's own record and the start-up list, not with every list of people.
+  assert.equal((await as(A, 'GET', `/users/${V.id}`)).json.pastKeys.length, 1);
+  assert.equal(d.boot.users[V.id].pastKeys.length, 1);
+  const people = (await as(A, 'GET', '/people')).json.people;
+  assert.ok(people.some((x) => x.id === V.id) && people.every((x) => !('pastKeys' in x)));
 });

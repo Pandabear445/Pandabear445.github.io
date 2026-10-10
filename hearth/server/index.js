@@ -107,10 +107,23 @@ let ACCT = null; // server/accounts.js: email, recovery key, two-factor
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-// Public keys someone had before a reset without a recovery key (newest first). Apps check old key handoffs
-// and signatures against them, and open old direct messages with them.
-const pastKeysOf = (id) => db.prepare('SELECT public_key, sign_public_key, retired_at FROM user_key_history WHERE user_id = ? ORDER BY retired_at DESC LIMIT 10').all(id)
-  .map((k) => ({ publicKey: k.public_key, signPublicKey: k.sign_public_key || null, retiredAt: k.retired_at }));
+// Public keys people had before a reset without a recovery key (newest first, up to 10 each), added to a
+// { id: user } map. Apps may open old direct messages and old server keys with them, shown as not verified
+// (nothing vouches for them: see public/js/secure.js keysOf). Only GET /users/:id and the start-up users list
+// carry them, in one query, rather than every member list and broadcast.
+function withPastKeys(users) {
+  const ids = Object.keys(users || {});
+  if (!ids.length) return users;
+  const rows = db.prepare(`SELECT user_id, public_key, sign_public_key, retired_at FROM user_key_history
+      WHERE user_id IN (SELECT value FROM json_each(?)) ORDER BY retired_at DESC`).all(JSON.stringify(ids));
+  for (const k of rows) {
+    const u = users[k.user_id];
+    if (!u) continue;
+    u.pastKeys = u.pastKeys || [];
+    if (u.pastKeys.length < 10) u.pastKeys.push({ publicKey: k.public_key, signPublicKey: k.sign_public_key || null, retiredAt: k.retired_at });
+  }
+  return users;
+}
 
 function publicUser(row) {
   if (!row) return null;
@@ -118,7 +131,6 @@ function publicUser(row) {
   let presence = 'offline';
   if (isOnline(row.id) && row.status !== 'invisible') presence = row.status;
   if (row.is_bot) presence = 'online'; // bots run inside this server: they're up whenever it is
-  const pastKeys = pastKeysOf(row.id);
   return {
     id: row.id,
     username: row.username,
@@ -130,7 +142,6 @@ function publicUser(row) {
     profile,
     publicKey: row.public_key,
     signPublicKey: row.sign_public_key || null,
-    pastKeys: pastKeys.length ? pastKeys : undefined,
     supporter: !!row.supporter || undefined,
     bot: !!row.is_bot || undefined,
     deleted: !!row.deleted_at || undefined,
@@ -162,10 +173,11 @@ function selfUser(row) {
 function keyState(serverId, userId) {
   const s = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(serverId);
   if (!s) return null;
-  const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, e.key_check FROM server_keys k
+  // createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
+  const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
       JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
       WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId)
-    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check }));
+    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at }));
   const missing = s.key_epoch
     ? db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND NOT EXISTS
         (SELECT 1 FROM server_keys k WHERE k.server_id = m.server_id AND k.user_id = m.user_id AND k.epoch = ?)`)
@@ -245,7 +257,8 @@ function serializeMessage(row, channel, reactions) {
   let reply = null;
   if (row.reply_to) {
     const r = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.reply_to);
-    if (r && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch };
+    // createdAt: apps only check a reply against keys its author had when it was written.
+    if (r && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch, createdAt: r.created_at };
     else if (r) {
       const rd = unseal(r.body);
       reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0, createdAt: r.created_at, ...(rd.bot ? { bot: true } : {}) };
@@ -279,8 +292,8 @@ function threadInfo(row) {
 function serializeDmMessage(row, reactions) {
   let reply = null;
   if (row.reply_to) {
-    const r = db.prepare('SELECT id, author_id, ciphertext FROM dm_messages WHERE id = ?').get(row.reply_to);
-    if (r) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext };
+    const r = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE id = ?').get(row.reply_to);
+    if (r) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, createdAt: r.created_at };
   }
   return {
     id: row.id,
@@ -1170,12 +1183,10 @@ api.post('/me/sign-key', auth, wrap(async (req, res) => {
 
 // Your password-locked private key, for changing the password or making a recovery key on this device.
 // It needs the password (not just a session): with only a stolen session, someone could otherwise take the
-// locked key away and guess the password offline, as fast as they like.
+// locked key away and guess the password offline, as fast as they like. Checked like any other sensitive
+// change (stepUp): the same guess limit, and a two-factor code when that's on, as signing in would need.
 api.post('/me/keys/wrapped', auth, wrap(async (req, res) => {
-  rateLimit('wrappedkey:' + req.userId, 20, 10 * 60 * 1000);
-  const row = getUserRow(req.userId);
-  const key = (req.body || {}).authKey;
-  if (typeof key !== 'string' || !(await bcrypt.compare(key.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
+  const row = await stepUp(req, req.body);
   res.json({ encPrivateKey: row.enc_private_key, kdf: row.kdf, kdfSalt: row.kdf_salt });
 }));
 
@@ -1193,6 +1204,7 @@ api.get('/bootstrap', auth, (req, res) => {
   relationships.forEach((r) => ids.add(r.userId));
   const users = {};
   for (const id of ids) { const u = publicUser(getUserRow(id)); if (u) users[id] = u; }
+  withPastKeys(users);
   users[uid] = selfUser(me);
   const voice = {};
   servers.forEach((s) => s.channels.filter((c) => c.type === 'voice').forEach((c) => { voice[c.id] = voiceStateList(c.id); }));
@@ -1311,7 +1323,7 @@ api.delete('/me/media/:kind', auth, (req, res) => {
 api.get('/users/:id', auth, (req, res) => {
   const u = publicUser(getUserRow(req.params.id));
   if (!u) fail(404, 'User not found.');
-  res.json(u);
+  res.json(withPastKeys({ [u.id]: u })[u.id]);
 });
 
 // ---------------------------------------------------------------- friends
@@ -1449,7 +1461,9 @@ function removeMember(serverId, userId) {
   MEMB.onLeave(serverId, userId);
   kickFromVoiceInServer(serverId, userId);
   db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
-  // They still hold old keys, so the remaining members must switch to a fresh key.
+  // They still hold old keys, so the remaining members must switch to a fresh key. Remembered on its own (not
+  // just through their key rows, which a password reset deletes), so coming back switches keys again.
+  db.prepare('INSERT OR REPLACE INTO former_members (server_id, user_id, left_at) VALUES (?, ?, ?)').run(serverId, userId, now());
   db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ?').run(serverId);
   io.in(`user:${userId}`).socketsLeave(`server:${serverId}`);
   io.to(`user:${userId}`).emit('server:remove', { serverId });
@@ -1572,10 +1586,12 @@ function staleWraps(pubs, ids) {
   const get = db.prepare('SELECT public_key FROM users WHERE id = ?');
   return ids.filter((uid) => typeof pubs[uid] === 'string' && (get.get(uid) || {}).public_key !== pubs[uid]);
 }
-// Someone who was in this server before (they still hold keys from back then) is back, e.g. after a kick with
-// an invite they kept: switch to a new key, so they can't read what was said while they were away.
+// Someone who was in this server before is back, e.g. after a kick with an invite they kept: switch to a new key,
+// so they can't read what was said while they were away. Known from former_members (kept through a password
+// reset, which deletes their key rows), or from key rows of theirs (people who left before that was recorded).
 function keyOnRejoin(serverId, userId) {
-  if (db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ? LIMIT 1').get(serverId, userId)) {
+  if (db.prepare('SELECT 1 FROM former_members WHERE server_id = ? AND user_id = ?').get(serverId, userId)
+    || db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ? LIMIT 1').get(serverId, userId)) {
     db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ? AND key_epoch > 0').run(serverId);
   }
 }
@@ -1585,12 +1601,53 @@ api.get('/servers/:id/keys', auth, (req, res) => {
   res.json(keyState(req.params.id, req.userId));
 });
 
-// Start a new key epoch. The client generated a fresh random key and wrapped it to every member.
-// Replacing a key that's still fine (nobody left) is limited: every rotation adds a row per member, every app
-// unlocks every key it holds at start-up, and a member could otherwise keep swapping in keys the others can't
-// open. People who manage the server can do it any time (to fix things fast), others once the current key is
-// 10 minutes old, and at most 12 times an hour per server. A key that's needed (someone left) is never held up.
+const HOUR_MS = 60 * 60 * 1000;
 const VOLUNTARY_ROTATE_MS = 10 * 60 * 1000;
+const reportersOf = (serverId, epoch) => db.prepare(`SELECT COUNT(*) AS n FROM server_key_reports r JOIN members m
+    ON m.server_id = r.server_id AND m.user_id = r.user_id WHERE r.server_id = ? AND r.epoch = ?`).get(serverId, epoch).n;
+const membersBut = (serverId, userId) => db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ? AND user_id != ?').get(serverId, userId).n;
+// Whether this member is behind the current key needing replacing, in a way they could arrange on purpose. Their
+// own rotation then counts as voluntary (limitVoluntary), so nobody can skip the limits by asking for a new key
+// and then making it themselves, e.g. one nobody else can open:
+//   - they came back after this key was made (a kicked member with an old invite);
+//   - members reported this key broken, and they made it;
+//   - they reported it broken, while another member is online who neither made nor reported it (that member's
+//     app opened it fine, so it can make the next one). When everyone online reported it, it really is broken
+//     for them, and any of them may replace it at once.
+function causedRotation(serverId, epoch, userId) {
+  const ep = db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, epoch);
+  if (!ep) return false;
+  if (db.prepare(`SELECT 1 FROM former_members f JOIN members m ON m.server_id = f.server_id AND m.user_id = f.user_id
+      WHERE f.server_id = ? AND f.user_id = ? AND m.joined_at > ?`).get(serverId, userId, ep.created_at)) return true;
+  const reporters = db.prepare('SELECT user_id FROM server_key_reports WHERE server_id = ? AND epoch = ?').all(serverId, epoch).map((r) => r.user_id);
+  if (!reporters.length) return false;
+  if (userId === ep.creator_id) return true;
+  if (!reporters.includes(userId)) return false;
+  return db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
+    .some((m) => m.user_id !== userId && m.user_id !== ep.creator_id && !reporters.includes(m.user_id) && isOnline(m.user_id));
+}
+// Replacing a key nobody needs replaced: every rotation adds a row per member, every app unlocks every key it
+// holds at start-up, and a member could otherwise keep swapping in keys the others can't open. People who manage
+// the server have an allowance of their own (30 an hour), so nobody else's rotations can use it up; others wait
+// until the current key is 10 minutes old, and at most 12 keys an hour are made per server. Only keys actually
+// made count, never refused attempts, so sending bad ones can't hold anyone up.
+function limitVoluntary(s, epoch, userId) {
+  const t = now();
+  if (s.kind !== 'group' && can(s, userId, PM.MANAGE_SERVER)) {
+    const mine = db.prepare('SELECT COUNT(*) AS n, MIN(created_at) AS first FROM server_epochs WHERE server_id = ? AND creator_id = ? AND created_at > ?').get(s.id, userId, t - HOUR_MS);
+    if (mine.n >= 30) fail(429, 'You\u2019ve replaced this key many times in the last hour. Try again later.', 'rate_limited', Math.max(1, Math.ceil((mine.first + HOUR_MS - t) / 1000)));
+    return;
+  }
+  const last = db.prepare('SELECT created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, epoch);
+  const wait = last ? last.created_at + VOLUNTARY_ROTATE_MS - t : 0;
+  if (wait > 0) fail(429, `This key was replaced less than 10 minutes ago. Try again in ${Math.ceil(wait / 60000)} min, or ask someone who manages the server.`, 'rotate_too_soon', Math.ceil(wait / 1000));
+  const all = db.prepare('SELECT COUNT(*) AS n, MIN(created_at) AS first FROM server_epochs WHERE server_id = ? AND created_at > ?').get(s.id, t - HOUR_MS);
+  if (all.n >= 12) fail(429, 'This key was replaced many times in the last hour. Try again later, or ask someone who manages the server.', 'rate_limited', Math.max(1, Math.ceil((all.first + HOUR_MS - t) / 1000)));
+}
+
+// Start a new key epoch. The client generated a fresh random key and wrapped it to every member. A key that's
+// needed (someone left or came back, or members reported the current one broken) is never held up, except for
+// whoever caused that (causedRotation); any other new key is limited (limitVoluntary).
 api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('rotate:' + req.userId, 30, 60 * 1000);
@@ -1601,14 +1658,7 @@ api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const tx = db.transaction(() => {
     const cur = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(s.id);
     if (Number(epoch) !== cur.key_epoch + 1) fail(409, 'Someone else just refreshed the key.', 'epoch');
-    if (cur.key_epoch && !cur.needs_rotation) {
-      if (s.kind === 'group' || !can(s, req.userId, PM.MANAGE_SERVER)) {
-        const last = db.prepare('SELECT created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, cur.key_epoch);
-        const wait = last ? last.created_at + VOLUNTARY_ROTATE_MS - now() : 0;
-        if (wait > 0) fail(429, `This key was replaced less than 10 minutes ago. Try again in ${Math.ceil(wait / 60000)} min, or ask someone who manages the server.`, 'rotate_too_soon', Math.ceil(wait / 1000));
-      }
-      rateLimit('rotatevol:' + s.id, 12, 60 * 60 * 1000);
-    }
+    if (cur.key_epoch && !(cur.needs_rotation && !causedRotation(s.id, cur.key_epoch, req.userId))) limitVoluntary(s, cur.key_epoch, req.userId);
     const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(s.id).map((r) => r.user_id);
     const ids = Object.keys(wraps);
     if (ids.length !== members.length || !members.every((m) => isWrapped(wraps[m]))) fail(409, 'The member list changed. Try again.', 'members');
@@ -1658,16 +1708,28 @@ api.post('/servers/:id/keys/bad', auth, (req, res) => {
   const row = db.prepare('SELECT wrapper_id FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').get(s.id, req.userId, cur);
   const n = db.prepare('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').run(s.id, req.userId, cur).changes;
   if (n) {
-    // The copy the rotation itself handed out doesn't open: the new key is broken (or was made so that others
-    // can't open it). Sharing can't fix that, so the apps start a fresh key. A few times an hour at most.
     const ep = db.prepare('SELECT creator_id FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, cur);
-    if (row && ep && row.wrapper_id === ep.creator_id && ep.creator_id !== req.userId && countHit('badrotate:' + s.id, 60 * 60 * 1000) <= 6) {
-      db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ?').run(s.id);
-    }
+    if (row && ep && row.wrapper_id === ep.creator_id && ep.creator_id !== req.userId) reportBroken(s, cur, ep.creator_id, req.userId);
     emitKeyState(s.id);
   }
   res.json({ removed: n });
 });
+// The copy the rotation itself handed out doesn't open for this member: the key may be broken, or made so that
+// others can't open it, and sharing can't fix that. Once enough members say so, the apps make a fresh key: two of
+// them (or the only other member), or one who manages the server (they could replace it any time anyway). One
+// member's reports count at most 12 times an hour per server (twice what the 10-minute rule lets anyone break),
+// and neither the key's maker nor a reporter makes the next key without the usual limits while someone else
+// can (causedRotation): nobody can use reports to keep the key churning or to skip the limits.
+const REPORTS_PER_HOUR = 12;
+function reportBroken(s, epoch, creatorId, userId) {
+  const t = now();
+  db.prepare('DELETE FROM server_key_reports WHERE server_id = ? AND epoch < ? AND created_at < ?').run(s.id, epoch, t - HOUR_MS);
+  if (db.prepare('SELECT COUNT(*) AS n FROM server_key_reports WHERE server_id = ? AND user_id = ? AND created_at > ?').get(s.id, userId, t - HOUR_MS).n >= REPORTS_PER_HOUR) return;
+  db.prepare('INSERT OR IGNORE INTO server_key_reports (server_id, epoch, user_id, created_at) VALUES (?, ?, ?, ?)').run(s.id, epoch, userId, t);
+  const enough = (s.kind !== 'group' && can(s, userId, PM.MANAGE_SERVER))
+    || reportersOf(s.id, epoch) >= Math.min(2, Math.max(1, membersBut(s.id, creatorId)));
+  if (enough) db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ? AND key_epoch = ?').run(s.id, epoch);
+}
 // Your app re-wraps the keys it was handed to yourself (signed by you), so your own history no longer depends
 // on whoever shared them keeping their keys. Only your own rows, and only keys you already have.
 api.post('/servers/:id/keys/self', auth, (req, res) => {

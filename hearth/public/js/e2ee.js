@@ -174,6 +174,18 @@ export async function resetKeyProof(myPriv, serverPublicKeyB64, nonce, userId) {
   const mac = await subtle().importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return b64(await subtle().sign('HMAC', mac, enc.encode(`hearth-reset-proof|${userId}|${nonce}`)));
 }
+// Whether a public key (as the server tells it) really is the public half of this private key: ECDH from both
+// sides with a throwaway key pair gives the same bits only then. A server that hands an app some other key as
+// its own could otherwise read whatever the app locks "for itself" with it.
+export async function ownsPublicKey(myPriv, pubB64) {
+  try {
+    const eph = await subtle().generateKey(ECDH, true, ['deriveBits']);
+    const ephPub = b64(await subtle().exportKey('spki', eph.publicKey));
+    const a = new Uint8Array(await subtle().deriveBits({ name: 'ECDH', public: await importEcdhPublic(pubB64) }, eph.privateKey, 256));
+    const b = new Uint8Array(await subtle().deriveBits({ name: 'ECDH', public: await importEcdhPublic(ephPub) }, myPriv, 256));
+    return a.length === b.length && a.every((x, i) => x === b[i]);
+  } catch { return false; }
+}
 // The same kind of proof when uploading a new signing key, bound to that key: a stolen session alone (without
 // the identity key) can't plant a signing key that contacts would then trust.
 export async function signKeyProof(myPriv, serverPublicKeyB64, nonce, userId, signPublicKey) {
@@ -234,11 +246,11 @@ export async function verify(signPubB64, text, sigB64) {
   if (!signPubB64 || !sigB64) return false;
   try { return await subtle().verify(SIGN_ALG, await importVerifyKey(signPubB64), unb64(sigB64), enc.encode(text)); } catch { return false; }
 }
-// Checks against one key or a list of keys someone has had (their current one first, then ones this device
-// pinned before; see pinnedKeys): true if any of them made the signature.
+// Checks against one key or a list of keys someone has had (best first): the key that made the signature, or
+// null if none of them did.
 async function verifyAny(signPubs, text, sigB64) {
-  for (const k of [].concat(signPubs || [])) if (await verify(k, text, sigB64)) return true;
-  return false;
+  for (const k of [].concat(signPubs || [])) if (await verify(k, text, sigB64)) return k;
+  return null;
 }
 
 // ---------------------------------------------------------------- direct messages
@@ -344,15 +356,16 @@ export function groupEpoch(text) {
   const parts = String(text || '').split(':');
   return parts[0] === 'c2' ? parseInt(parts[1], 10) : null;
 }
-// authorSignPub: the author's signing key, or a list of the keys they've had (see unwrapGroupKey).
+// authorSignPub: the author's signing key, or a list of the keys they've had (see unwrapGroupKey). signedBy is
+// the one that made the signature (null if none did), so the caller can tell how far that key is trusted.
 export async function decryptGroup({ raw, serverId, channelId, authorId, authorSignPub, text }) {
   const [v, epoch, salt, iv, ct, sig] = text.split(':');
   if (v !== 'c2') throw new Error('Unknown format');
   const aad = `hearth-c2|${channelId}|${epoch}|${authorId}`;
   const key = await hkdfAes(await groupBase(raw, `${serverId}|${epoch}`), unb64(salt), `hearth-msg-v2|${channelId}`, ['decrypt']);
   const payload = JSON.parse(dec.decode(await aesDecrypt(key, unb64(iv), unb64(ct), aad)));
-  const verified = await verifyAny(authorSignPub, `${aad}|${epoch}:${salt}:${iv}:${ct}`, sig);
-  return { payload, verified };
+  const signedBy = await verifyAny(authorSignPub, `${aad}|${epoch}:${salt}:${iv}:${ct}`, sig);
+  return { payload, verified: !!signedBy, signedBy };
 }
 
 // ---------------------------------------------------------------- attachments (one random key per file)
@@ -389,53 +402,71 @@ export async function keyFingerprint(user) {
 }
 
 // Trust on first use: remember each person's keys and warn if the server ever hands out different ones.
+// A pin is { e, s, verified?, old? }: the identity and signing keys this device saw as theirs, and `old`, keys it
+// pinned for them before they changed keys and you accepted the new ones ([{ e, s, until }], oldest first; until:
+// when that key stopped being theirs). Only keys this device itself saw as someone's current keys are ever
+// pinned. Keys the server merely lists as someone's past keys (user.pastKeys) never are: nothing vouches for them
+// (safety numbers cover current keys only), so the server could list a key of its own there.
 const pinKey = (myId) => `hearth.pins.${myId}`;
 function loadPins(myId) { try { return JSON.parse(localStorage.getItem(pinKey(myId)) || '{}'); } catch { return {}; } }
 function savePins(myId, pins) { localStorage.setItem(pinKey(myId), JSON.stringify(pins)); }
-// The keys someone had before a reset, as the server lists them (user.pastKeys), in pin form:
-// [{ e, s, until }] (until: when that key was replaced).
-const pastOf = (user) => (Array.isArray(user.pastKeys) ? user.pastKeys : [])
-  .filter((k) => k && typeof k.publicKey === 'string' && k.publicKey).slice(0, 10)
-  .map((k) => ({ e: k.publicKey, s: typeof k.signPublicKey === 'string' && k.signPublicKey ? k.signPublicKey : null, until: Number(k.retiredAt) || 0 }));
-const uniq = (xs) => [...new Set(xs.filter(Boolean))];
-// Returns 'ok' | 'changed'. New people are pinned automatically: their keys, and the keys they had before as
-// the server lists them at that moment (trust on first use, like the keys themselves). Old keys the server
-// adds to the list later are never trusted, only ones this device saw.
+// A usable "stopped being theirs" time: a real moment, and not in the future (that would let a key count for
+// things written after it was replaced).
+const validUntil = (t) => typeof t === 'number' && Number.isFinite(t) && t > 0 && t <= Date.now();
+// The keys someone had before a password reset, as the server lists them (user.pastKeys): [{ e, s, until }],
+// only those with a usable date.
+function listedOf(user) {
+  return (Array.isArray(user && user.pastKeys) ? user.pastKeys : []).slice(0, 10)
+    .filter((k) => k && typeof k.publicKey === 'string' && k.publicKey)
+    .map((k) => ({ e: k.publicKey, s: typeof k.signPublicKey === 'string' && k.signPublicKey ? k.signPublicKey : null, until: Number(k.retiredAt) }))
+    .filter((k) => validUntil(k.until));
+}
+// Server-listed past keys that could have made something written at `at` (ms): none for something undated. Use
+// them only to open history, and show whatever only they open or check out as "older key, not verified".
+export function listedPastKeys(user, at = 0) {
+  return at > 0 ? listedOf(user).filter((k) => at <= k.until) : [];
+}
+// Returns 'ok' | 'changed'. New people are pinned automatically (their current keys only).
 export function checkPin(myId, user) {
   if (!user || !user.publicKey || user.id === myId) return 'ok';
   const pins = loadPins(myId);
   const p = pins[user.id];
-  if (!p) {
-    const old = pastOf(user).reverse(); // kept oldest first, like the list acceptPin builds
-    pins[user.id] = { e: user.publicKey, s: user.signPublicKey || null, ...(old.length ? { old } : {}) };
-    savePins(myId, pins);
-    return 'ok';
-  }
+  if (!p) { pins[user.id] = { e: user.publicKey, s: user.signPublicKey || null }; savePins(myId, pins); return 'ok'; }
   if (p.e !== user.publicKey) return 'changed';
   if (p.s && user.signPublicKey && p.s !== user.signPublicKey) return 'changed';
   if (!p.s && user.signPublicKey) { p.s = user.signPublicKey; savePins(myId, pins); }
   return 'ok';
 }
-// Trusting someone's new keys (after comparing safety numbers). The keys trusted until now stay on record for
-// what they signed (and the direct messages written) before now.
+// When the server says a key of someone's was replaced (0 if it doesn't list it with a usable date).
+export function listedRetiredAt(user, e) {
+  const k = listedOf(user).find((x) => x.e === e);
+  return k ? k.until : 0;
+}
+// Trusting someone's new keys (after comparing safety numbers). Only the keys this device trusted until now go on
+// record, for what was written before they were replaced: when the server says that happened if that's earlier
+// than now (a key that leaked shouldn't count for longer than it was theirs), otherwise now.
 export function acceptPin(myId, user) {
   const pins = loadPins(myId);
   const prev = pins[user.id];
   const cur = { e: user.publicKey, s: user.signPublicKey || null };
-  const old = (prev ? [...(Array.isArray(prev.old) ? prev.old : []), { e: prev.e, s: prev.s || null, until: Date.now() }] : [])
-    .filter((k, i, all) => k && k.e && !(k.e === cur.e && k.s === cur.s) && all.findIndex((x) => x && x.e === k.e && x.s === k.s) === i);
+  const listed = prev ? listedRetiredAt(user, prev.e) : 0;
+  const until = listed && listed < Date.now() ? listed : Date.now();
+  const old = (prev ? [...(Array.isArray(prev.old) ? prev.old : []), { e: prev.e, s: prev.s || null, until }] : [])
+    .filter((k, i, all) => k && typeof k.e === 'string' && k.e && validUntil(k.until) && !(k.e === cur.e && k.s === cur.s)
+      && all.findIndex((x) => x && x.e === k.e && x.s === k.s) === i);
   pins[user.id] = { ...cur, verified: true, ...(old.length ? { old: old.slice(-10) } : {}) };
   savePins(myId, pins);
 }
-// Every key this device has trusted for someone, newest first: { e: [identity keys], s: [signing keys] }. The
-// keys they have now as pinned here, then keys they had before. With `at` (when something was written), a key
-// they had before only counts if it was still theirs then: an old key that leaked can't vouch for anything newer.
+// The keys this device pinned for someone: { e, s } (the ones it holds as theirs now) and `old` ([{ e, s }],
+// newest first): keys it pinned for them before, only with `at` (when something was written) and only those
+// still theirs then. Without a date, none: an old key that leaked can't vouch for anything undated or newer.
 export function pinnedKeys(myId, user, at = 0) {
   const p = user && loadPins(myId)[user.id];
-  if (!p) return { e: [], s: [] };
-  const old = (Array.isArray(p.old) ? p.old.slice().reverse() : []).filter((k) => k && typeof k === 'object' && (!at || !k.until || at <= k.until));
-  const all = [{ e: p.e, s: p.s }, ...old];
-  return { e: uniq(all.map((k) => k.e)), s: uniq(all.map((k) => k.s)) };
+  if (!p) return { e: null, s: null, old: [] };
+  const old = at > 0 && Array.isArray(p.old)
+    ? p.old.slice().reverse().filter((k) => k && typeof k === 'object' && typeof k.e === 'string' && validUntil(k.until) && at <= k.until)
+    : [];
+  return { e: p.e || null, s: p.s || null, old: old.map((k) => ({ e: k.e, s: k.s || null })) };
 }
 
 // ---------------------------------------------------------------- local key storage (IndexedDB)

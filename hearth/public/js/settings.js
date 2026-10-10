@@ -516,10 +516,11 @@ async function deleteAccount(app) {
 }
 
 // ------------------------------------------------------------------ account safety: email, recovery key, 2FA
-// Your password-locked private key. The server only hands it out with the password (a session alone isn't
-// enough, so a stolen one can't be used to guess the password offline). A wrong password fails here.
+// Your password-locked private key. The server only hands it out with the password, plus a two-factor code when
+// that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). A
+// wrong password fails here.
 async function lockedKey(authKey) {
-  try { return (await api('POST', '/me/keys/wrapped', { authKey })).encPrivateKey; } catch (e) {
+  try { return (await withCode((x) => api('POST', '/me/keys/wrapped', { authKey, ...x }))).encPrivateKey; } catch (e) {
     if (e.code === 'bad_password') throw Object.assign(new Error('That password isn’t right.'), { code: 'bad_password' });
     throw e;
   }
