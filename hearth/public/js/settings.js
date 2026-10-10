@@ -450,6 +450,10 @@ function accountTab(app) {
       ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))));
   }).catch((e) => clear(storage).append(h('p', { class: 'form-error' }, e.message)));
 
+  // Change your display name: what people see in chats and member lists (doesn't have to be unique).
+  const dnameOf = () => (S.me.profile && S.me.profile.displayName) || S.me.username;
+  const dnameEl = h('strong', null, dnameOf());
+  const changeDisplayName = () => displayNameDialog(app, () => { dnameEl.textContent = dnameOf(); });
   // Change your username: any free name; the old one becomes free for others. Needs your password.
   const unameEl = h('strong', null, S.me.username);
   function changeUsername() {
@@ -471,6 +475,7 @@ function accountTab(app) {
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Account & security'),
     section('Your account',
+      h('div', { class: 'kv' }, h('span', null, 'Display name'), h('span', { class: 'row gap tight' }, dnameEl, h('button', { class: 'btn ghost sm', onclick: changeDisplayName }, 'Change'))),
       h('div', { class: 'kv' }, h('span', null, 'Username'), h('span', { class: 'row gap tight' }, unameEl, h('button', { class: 'btn ghost sm', onclick: changeUsername }, 'Change'))),
       h('div', { class: 'kv' }, h('span', null, 'Member since'), h('strong', null, new Date(S.me.createdAt).toLocaleDateString()))),
     ...securitySections(app),
@@ -545,6 +550,20 @@ function withCode(fn) {
   });
 }
 const quiet = (e) => { if (!e || !e.cancelled) toast(e.message, 'error'); };
+// Change your display name: what people see in chats and member lists (doesn't have to be unique). Used here
+// and from the menu under your name.
+export function displayNameDialog(app, onDone) {
+  const S = app.S;
+  const inp = h('input', { class: 'input', maxlength: '32', value: (S.me.profile && S.me.profile.displayName) || '', placeholder: S.me.username });
+  modal({ title: 'Change your display name', size: 'sm',
+    body: h('div', { class: 'stack' }, field('Display name', inp, 'Up to 32 characters, emoji welcome. It\u2019s what people see in chats and member lists, and it doesn\u2019t have to be unique. Leave it empty to show your username.')),
+    actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: async () => {
+      const u = await api('PATCH', '/me/profile', { displayName: inp.value.trim() });
+      app.onMe(u); if (onDone) onDone(u);
+      toast('Display name saved.');
+    } }] });
+  setTimeout(() => inp.select(), 50);
+}
 // Password (and a two-factor code if needed) for a sensitive request: fn gets { authKey, totp|backupCode }.
 // Resolves to null if the person cancels.
 export async function confirmedCall(app, fn, opts) {

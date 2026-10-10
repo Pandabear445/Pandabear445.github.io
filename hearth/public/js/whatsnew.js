@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.27.1', items: [
+    'Change your display name in a couple of taps: click your name at the bottom left \u2192 Change display name, or Settings \u2192 Security. It\u2019s what people see in chats and member lists, doesn\u2019t have to be unique, and emoji are welcome.',
+  ] },
   { version: '1.27.0', items: [
     'Change your username in Settings \u2192 Security (it needs your password). Any name nobody has works, and your old one is free for others right away. Your password, friends and messages stay the same.',
     'Admins can change someone\u2019s username from their page in Admin \u2192 Users (for offensive or impersonating names).',

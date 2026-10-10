@@ -22,7 +22,7 @@ import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
-import { openSettings, applyAppearance, confirmedCall } from './settings.js';
+import { openSettings, applyAppearance, confirmedCall, displayNameDialog } from './settings.js';
 import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
 import { createRecall } from './recall-host.js';
@@ -1622,6 +1622,7 @@ function statusMenu(anchor) {
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openActivityPicker(S.me.activity); } }, icon('gamepad', 'ic menu-ic'), 'Set what I\u2019m playing or listening to'),
     S.config.funding || S.config.support ? h('button', { class: 'menu-item', onclick: () => { closePopover(); openSupport(); } }, icon('coin', 'ic menu-ic'), `Support ${S.config.name}`) : null,
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openProfileModal(S.me.id); } }, icon('user', 'ic menu-ic'), 'View my profile'),
+    h('button', { class: 'menu-item', onclick: () => { closePopover(); displayNameDialog(app); } }, icon('user', 'ic menu-ic'), 'Change display name'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'profile'); } }, icon('edit', 'ic menu-ic'), 'Edit profile'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'appearance'); } }, icon('palette', 'ic menu-ic'), 'Theme and appearance'),
   );
