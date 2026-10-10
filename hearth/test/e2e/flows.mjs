@@ -396,7 +396,7 @@ async function voiceCall(t) {
     // A real connection between the two browsers (audio from the fake microphone).
     await me.page.waitForFunction(() => (window.__e2ePeers || []).some((pc) => pc.connectionState === 'connected'), null, { timeout: 30000 });
     await me.$('.voice-room .cs-tile .cs-conn').waitFor({ state: 'detached' });
-    await me.$('#voice-panel .vp-status', { hasText: 'In call' }).waitFor();
+    await me.$('#voice-panel .vp-status[data-call-state="connected"]').waitFor(); // the call engine's own state, not its wording
   }
 }
 
@@ -436,7 +436,7 @@ async function dmCall(t) {
   await bob.$('.ring-card button[aria-label="Accept"]').click();
   for (const p of [alice, bob]) {
     await connected(p);
-    await p.$('#voice-panel .vp-status', { hasText: 'In call' }).waitFor();
+    await p.$('#voice-panel .vp-status[data-call-state="connected"]').waitFor(); // the call engine's own state, not its wording
   }
   // Bob hangs up: a 1-to-1 call ends for alice too.
   await bob.$('#voice-panel button[aria-label="Leave call"]').click();
