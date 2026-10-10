@@ -7,7 +7,7 @@ import { renderDoc, render as md } from './markdown.js';
 import { rankRelays, relayTime } from './relays.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['bots', 'Bots', 'bot', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['health', 'Health', 'chart', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
 // Security groups three pages under one tab: protection (sign everyone out, blocked IPs, sign-in attempts),
 // storage & limits, and broadcast.
@@ -32,6 +32,10 @@ const ago = (ts) => {
   if (s < 60) return 'just now'; if (s < 3600) return `${Math.floor(s / 60)} min ago`; if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
   return fmtStamp(ts);
 };
+// Changes that need the password (and two-factor) again, like the team, ownership, backups and where payments
+// go: fn gets { authKey, totp|backupCode }. Resolves to null if the person cancels. Set by adminView.
+let confirmPw = null;
+const withPassword = (fn, opts) => (confirmPw ? confirmPw(fn, opts) : fn({}));
 const dur = (ms) => { const m = Math.floor(ms / 60000); return m < 60 ? `${m} min` : m < 1440 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${Math.floor(m / 1440)} d`; };
 export function device(ua) {
   ua = ua || '';
@@ -55,6 +59,7 @@ const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => 
 
 export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin', confirm = null } = {}) {
   const myRank = RANK[role] || 0;
+  confirmPw = confirm;
   const tabs = TABS.filter((t) => myRank >= t[3]);
   // Old links to the Storage or Broadcast tab open them inside Security.
   let secSub = SECURITY_SUBS.some(([k]) => k === tab) ? tab : 'security';
@@ -67,15 +72,15 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   const go = (t) => { clearInterval(timer); tab = t; setTab && setTab(t); draw(); };
   const openUser = (id) => userModal(id, () => draw(), myRank);
   const draw = () => {
-    clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
+    clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(tab === k), onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     const page = tab === 'security' ? secSub : tab;
-    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    ({ overview, online, reports, users, servers, bots, security, storage, broadcast, admins, registration, log, regions, health: healthPage, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
   // Security's sub-tabs stay on top of whichever page is showing (pages redraw the body themselves).
   const subBar = h('div', { class: 'set-subtabs admin-subtabs', role: 'tablist' });
-  const drawSubBar = () => clear(subBar).append(...SECURITY_SUBS.map(([k, l, ic]) => h('button', { class: `set-subtab${secSub === k ? ' active' : ''}`, role: 'tab', onclick: () => { secSub = k; draw(); } }, icon(ic), l)));
+  const drawSubBar = () => clear(subBar).append(...SECURITY_SUBS.map(([k, l, ic]) => h('button', { class: `set-subtab${secSub === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(secSub === k), onclick: () => { secSub = k; draw(); } }, icon(ic), l)));
   new MutationObserver(() => { if (tab === 'security' && body.firstChild !== subBar) { drawSubBar(); body.prepend(subBar); } }).observe(body, { childList: true });
 
   async function overview() {
@@ -142,7 +147,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const seg = h('div', { class: 'seg' }, [['open', 'Open'], ['resolved', 'Resolved'], ['dismissed', 'Dismissed'], ['all', 'All']].map(([k, l]) => h('button', {
       class: `seg-btn${status === k ? ' active' : ''}`, onclick: () => reports(k).catch((e) => toast(e.message, 'error')),
     }, l)));
-    const act = async (r, body2, msg) => { await api('PATCH', `/admin/reports/${r.id}`, body2); toast(msg); reports(status); };
+    // Reports about yourself or about staff at your level or above are for someone ranked higher (the server says so).
+    const act = async (r, body2, msg) => { try { await api('PATCH', `/admin/reports/${r.id}`, body2); toast(msg); reports(status); } catch (e) { toast(e.message, 'error'); } };
     clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Reports'), seg),
       ...(list.length ? [] : [h('div', { class: 'panel-empty' }, icon('shield'), h('p', null, status === 'open' ? 'No open reports. \uD83C\uDF89' : 'Nothing here.'))]),
       ...list.map((r) => h('div', { class: `report-card st-${r.status}` },
@@ -161,7 +167,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
             h('div', { class: 'ev-body' }, h('div', { class: 'ev-meta' }, h('strong', null, e.author ? e.author.displayName : 'Deleted user'), h('span', null, fmtStamp(e.createdAt)), e.reported ? h('span', { class: 'badge-tag bad' }, 'Reported') : null),
               h('div', { class: 'ev-text', html: e.text ? md(e.text) : (e.files.length ? `[${e.files.map((f) => f.replace(/[<>&"]/g, '')).join(', ')}]` : '(no text)') })),
             e.reported ? h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
-              if (await confirmDialog({ title: 'Delete this message for everyone?', text: 'It disappears from the conversation for all members.', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/messages/${e.id}`).catch((x) => toast(x.message, 'error')); toast('Message deleted.'); }
+              if (await confirmDialog({ title: 'Delete this message for everyone?', text: 'It disappears from the conversation for all members.', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/messages/${e.id}`).then(() => toast('Message deleted.'), (x) => toast(x.message, 'error')); }
             } }, 'Delete message') : null))) : null,
         r.resolution ? h('p', { class: 'stat-sub' }, `Note: ${r.resolution}${r.handledBy ? ` \u2014 ${r.handledBy.displayName}` : ''}`) : null,
         h('div', { class: 'report-actions' },
@@ -172,7 +178,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   }
 
   async function users(q = '', filter = '') {
-    const search = h('input', { class: 'input search-input', placeholder: 'Search by username, name or IP', value: q });
+    const search = h('input', { class: 'input search-input', placeholder: 'Search by username, name or IP', 'aria-label': 'Search users', value: q });
     const listEl = h('div', { class: 'adm-table' });
     const seg = h('div', { class: 'seg' }, [['', 'Everyone'], ['online', 'Online'], ['suspended', 'Suspended'], ['staff', 'Staff']].map(([k, l]) => h('button', {
       class: `seg-btn${filter === k ? ' active' : ''}`, onclick: () => users(search.value, k).catch((e) => toast(e.message, 'error')),
@@ -195,7 +201,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const reg = await api('GET', '/admin/registration');
     const terms = await api('GET', '/terms');
     const code = h('input', { class: 'input mono', value: reg.code || '', placeholder: 'invite code people must enter' });
-    const ta = h('textarea', { class: 'input mono', rows: '16', spellcheck: 'true' });
+    const ta = h('textarea', { class: 'input mono', rows: '16', spellcheck: 'true', 'aria-label': 'Terms of Service text' });
     ta.value = terms.text;
     const preview = h('div', { class: 'tos-text md', html: renderDoc(terms.text) });
     ta.addEventListener('input', () => { preview.innerHTML = renderDoc(ta.value); });
@@ -232,13 +238,31 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', null, `${x.members} \u00b7 ${x.messages}`),
           h('span', { class: 'stat-sub' }, ago(x.lastActive)),
           h('span', { class: 'row gap tight' }, h('button', { class: 'btn ghost sm', onclick: () => transferServer(x, servers) }, 'Give to\u2026'), h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
-            if (await confirmDialog({ title: `Delete ${x.name}?`, text: 'Every channel, message and file in it is deleted for everyone. This can\u2019t be undone.', confirm: 'Delete server', danger: true })) { await api('DELETE', `/admin/servers/${x.id}`); toast('Server deleted.'); servers(); }
+            if (await confirmDialog({ title: `Delete ${x.name}?`, text: 'Every channel, message and file in it is deleted for everyone. This can\u2019t be undone.', confirm: 'Delete server', danger: true })) { await api('DELETE', `/admin/servers/${x.id}`).then(() => { toast('Server deleted.'); servers(); }, (e) => toast(e.message, 'error')); }
           } }, 'Delete'))))));
+  }
+
+  // Every bot on this Hearth. Switching one off stops all its API calls and webhooks everywhere (logged).
+  async function bots() {
+    const { bots: list } = await api('GET', '/admin/bots');
+    clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, `Bots \u2014 ${list.length}`), h('span', { class: 'field-hint' }, 'Bots can\u2019t read people\u2019s messages: those are end-to-end encrypted')),
+      list.length ? h('div', { class: 'adm-table' }, h('div', { class: 'adm-row head' }, h('span', null, 'Bot'), h('span', null, 'Made by'), h('span', null, 'Servers'), h('span', null, 'Asks for'), h('span', null, '')),
+        ...list.map((b) => h('div', { class: 'adm-row' },
+          h('span', { class: 'adm-user-text' }, h('strong', null, b.name), h('span', null, `@${b.username || ''} \u00b7 ${b.listed ? 'listed' : 'not listed'} \u00b7 made ${fmtStamp(b.createdAt)}`)),
+          h('span', null, b.ownerName ? `@${b.ownerName}` : '\u2014'),
+          h('span', null, String(b.installs)),
+          h('span', { class: 'stat-sub' }, b.requestedScopes.join(', ') || 'nothing'),
+          h('span', { class: 'row gap tight' },
+            b.disabled ? h('span', { class: 'rpill bad' }, 'Off') : null,
+            h('button', { class: `btn ghost sm${b.disabled ? '' : ' danger-text'}`, onclick: async () => {
+              if (!b.disabled && !(await confirmDialog({ title: `Switch ${b.name} off?`, text: 'Its tokens and webhooks stop working in every server until you switch it back on.', confirm: 'Switch off', danger: true }))) return;
+              await api('PATCH', `/bots/${b.id}`, { disabled: !b.disabled }).then(() => bots(), (e) => toast(e.message, 'error'));
+            } }, b.disabled ? 'Switch on' : 'Switch off'))))) : h('p', { class: 'field-hint' }, 'Nobody has made a bot yet.'));
   }
 
   async function security() {
     const [sec, bans] = await Promise.all([api('GET', '/admin/security'), api('GET', '/admin/ip-bans')]);
-    const ipIn = h('input', { class: 'input mono', placeholder: '203.0.113.7 or 203.0.113.0/24' });
+    const ipIn = h('input', { class: 'input mono', placeholder: '203.0.113.7 or 203.0.113.0/24', 'aria-label': 'IP address or range to block' });
     const label = { failed_login: 'Failed login', captcha_failed: 'Failed robot check', blocked_ip: 'Blocked IP', username_changed: 'Username changed' };
     clear(body).append(
       h('div', { class: 'admin-head' }, h('h3', null, 'Emergency')),
@@ -278,7 +302,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       const inp = h('input', { class: 'input', type: 'number', min: '0', step: '1', value: String(L[k]), oninput: (e) => { L[k] = e.target.value; } });
       return h('label', { class: 'field' }, h('span', { class: 'field-label' }, label), h('div', { class: 'row gap tight' }, inp, h('span', { class: 'stat-sub' }, 'MB')), hint ? h('span', { class: 'field-hint' }, hint) : null);
     };
-    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji' };
+    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji', gif: 'GIF library', reserved: 'Uploads in progress' };
+    const report = h('div', { class: 'stack' }, h('p', { class: 'field-hint' }, 'Loading the storage report\u2026'));
+    storageReport(report);
     const words = h('textarea', { class: 'input', rows: '5', placeholder: 'one word or phrase per line' });
     words.value = (st.words || []).join('\n');
     clear(body).append(
@@ -305,6 +331,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', null, `${fmtSize(r.bytes)}${r.quotaMb ? ` / ${r.quotaMb} MB` : ''}`, r.blocked ? h('span', { class: 'badge-tag bad' }, 'Uploads off') : null),
           h('span', { class: 'stat-sub' }, ago(r.last)),
           h('button', { class: 'btn ghost sm', onclick: () => r.user && openUser(r.user.id) }, 'Manage')))),
+      report,
       ...gifSection,
       h('div', { class: 'admin-head' }, h('h3', null, 'Word filter')),
       h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so they can\u2019t be filtered.'),
@@ -313,6 +340,58 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         try { const r = await api('PUT', '/admin/words', { words: words.value }); toast(`Word filter saved (${r.words.length}).`); } catch (e) { toast(e.message, 'error'); }
       } }, 'Save word filter')));
   }
+
+  // Where the space goes (per server, direct messages, uploads in progress) and files nothing uses any more. The
+  // list of leftovers is only a report until "Clean up" (password again, logged); the server works it out again
+  // then, from what the database says is in use, and never deletes a file something still points at.
+  async function storageReport(box) {
+    let r;
+    try { r = await api('GET', `/admin/storage/report?graceHours=${encodeURIComponent(grace)}`); } catch (e) { clear(box).append(h('p', { class: 'form-error' }, e.message)); return; }
+    const o = r.orphans;
+    const graceIn = h('input', { class: 'input', type: 'number', min: '1', step: '1', value: String(grace), style: { width: '90px' } });
+    const clean = h('button', { class: 'btn danger', disabled: !o.count && !o.staleRows && !o.deadBlobRows }, 'Clean up orphans now');
+    clean.onclick = async () => {
+      clean.disabled = true;
+      try {
+        const x = await withPassword((y) => api('POST', '/admin/storage/cleanup', { graceHours: grace, ...y }),
+          { title: 'Clean up unused files', text: `Deletes ${o.count} files (${fmtSize(o.bytes)}) that nothing uses and that are older than ${grace} hours. This can\u2019t be undone.` });
+        if (x) { toast(`Removed ${x.files} files (${fmtSize(x.bytes)}).`); storageReport(box); }
+      } catch (e) { if (!e.cancelled) toast(e.message, 'error'); } finally { clean.disabled = false; }
+    };
+    const serverName = (x) => (x.server.kind === 'group' ? `${x.server.name || 'Group chat'} (group)` : x.server.name || 'Deleted server');
+    clear(box).append(...[
+      h('div', { class: 'admin-head' }, h('h3', null, 'Where the space goes')),
+      h('div', { class: 'stats' },
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'All files'), h('strong', null, fmtSize(r.total.bytes)), h('span', { class: 'stat-sub' }, `${r.total.files} files`)),
+        r.free != null ? h('div', { class: `stat${r.free < 2 * 1024 ** 3 ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Free disk space'), h('strong', null, fmtSize(r.free)), r.diskTotal ? h('span', { class: 'stat-sub' }, `of ${fmtSize(r.diskTotal)}`) : null) : null,
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Direct messages'), h('strong', null, fmtSize(r.dms.bytes)), h('span', { class: 'stat-sub' }, `${r.dms.files} files`)),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploads in progress'), h('strong', null, String(r.uploads.count)), h('span', { class: 'stat-sub' }, `${fmtSize(r.uploads.received)} of ${fmtSize(r.uploads.reserved)} received`)),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploaded, not posted yet'), h('strong', null, fmtSize(r.pending.bytes)), h('span', { class: 'stat-sub' }, `${r.pending.files} files, removed after a day`)),
+        h('div', { class: `stat${o.count ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Unused files'), h('strong', null, fmtSize(o.bytes)), h('span', { class: 'stat-sub' }, `${o.count} files`))),
+      h('p', { class: 'field-hint' }, 'Files in messages are end-to-end encrypted: the server sees only their sizes and which conversation they were posted in, never their names or contents.'),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Servers using the most space')),
+      r.topServers.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row three head' }, h('span', null, 'Server'), h('span', null, 'Files'), h('span', null, 'Size')),
+        ...r.topServers.map((x) => h('div', { class: 'adm-row three' }, h('strong', null, serverName(x)), h('span', null, String(x.files)), h('span', null, fmtSize(x.bytes)))))
+        : h('p', { class: 'field-hint' }, 'No files in servers yet.'),
+      r.uploads.list.length ? h('div', { class: 'admin-head' }, h('h3', null, 'Uploads in progress')) : null,
+      r.uploads.list.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row three head' }, h('span', null, 'Person'), h('span', null, 'Received'), h('span', null, 'Last activity')),
+        ...r.uploads.list.map((x) => h('div', { class: 'adm-row three' }, userCell(x.user, openUser), h('span', null, `${fmtSize(x.received)} of ${fmtSize(x.size)}`),
+          h('span', { class: 'stat-sub' }, `${ago(x.updatedAt)} \u00b7 expires ${fmtStamp(x.expiresAt)}`)))) : null,
+      h('div', { class: 'admin-head' }, h('h3', null, 'Unused files')),
+      h('p', { class: 'field-hint' }, 'Files nothing points at any more (left behind by crashes, older versions or removed data), plus storage records for files that are already gone. Only files older than the grace period are counted, so uploads that are just being sent are never touched.'),
+      o.unverifiable ? h('p', { class: 'key-bar bad' }, icon('ban'), `${o.unverifiable} older messages couldn\u2019t be opened with this server\u2019s key, so it can\u2019t tell which files they use. Cleanup is off until that\u2019s sorted out.`) : null,
+      o.files.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row three head' }, h('span', null, 'File'), h('span', null, 'Size'), h('span', null, 'Last changed')),
+        ...o.files.slice(0, 20).map((f) => h('div', { class: 'adm-row three' }, h('span', { class: 'mono' }, f.name), h('span', null, fmtSize(f.size)), h('span', { class: 'stat-sub' }, `${ago(f.modifiedAt)}${f.tracked ? '' : ' \u00b7 not counted to anyone'}`))),
+        o.files.length > 20 ? h('div', { class: 'adm-row' }, h('span', { class: 'stat-sub' }, `\u2026and ${o.count - 20} more`)) : null)
+        : h('p', { class: 'field-hint' }, 'No unused files. \uD83C\uDF89'),
+      (o.staleRows || o.deadBlobRows) ? h('p', { class: 'field-hint' }, `${o.staleRows} storage records (${fmtSize(o.staleBytes)}) for files already gone, and ${o.deadBlobRows} attachment records whose message was deleted.`) : null,
+      h('div', { class: 'row gap' }, h('label', { class: 'row gap tight' }, h('span', { class: 'stat-sub' }, 'Grace period'), graceIn, h('span', { class: 'stat-sub' }, 'hours')),
+        h('button', { class: 'btn ghost sm', onclick: () => { grace = Math.max(1, Math.round(+graceIn.value) || 24); storageReport(box); } }, 'Check again'), clean)].filter(Boolean));
+  }
+  let grace = 24;
 
   async function broadcast() {
     const cfg = await api('GET', '/config');
@@ -345,19 +424,19 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   async function admins() {
     const { staff, me } = await api('GET', '/admin/staff');
     const owner = me === 'owner';
-    const setRole = async (who, newRole) => {
-      const r = await api('PUT', '/admin/staff', { ...who, role: newRole });
+    const setRole = async (who, newRole, ask) => {
+      const r = await withPassword((x) => api('PUT', '/admin/staff', { ...who, role: newRole, ...x }), { title: 'Confirm the team change', text: 'Changing the team needs your password.', ...ask });
+      if (!r) return null;
       toast(newRole ? `Now ${ROLE_LABEL[newRole].toLowerCase()}.` : 'Removed from staff.');
       admins();
       return r;
     };
+    const quietErr = (x) => { if (!x.cancelled) toast(x.message, 'error'); };
     const roleMenu = (a) => h('button', { class: 'btn ghost sm', 'data-pop-anchor': '', onclick: (e) => menu(e.currentTarget, [
-      a.role !== 'admin' ? { label: 'Make admin', icon: 'star', action: () => setRole({ userId: a.id }, 'admin').catch((x) => toast(x.message, 'error')) } : null,
-      a.role !== 'moderator' ? { label: 'Make moderator', icon: 'shield', action: () => setRole({ userId: a.id }, 'moderator').catch((x) => toast(x.message, 'error')) } : null,
+      a.role !== 'admin' ? { label: 'Make admin', icon: 'star', action: () => setRole({ userId: a.id }, 'admin', { title: `Make ${a.displayName} an admin?`, text: ROLE_HINT.admin }).catch(quietErr) } : null,
+      a.role !== 'moderator' ? { label: 'Make moderator', icon: 'shield', action: () => setRole({ userId: a.id }, 'moderator', { title: `Make ${a.displayName} a moderator?`, text: ROLE_HINT.moderator }).catch(quietErr) } : null,
       { label: 'Make owner\u2026', icon: 'star', action: () => transferOwner(a) },
-      { label: 'Remove from staff', icon: 'close', danger: true, action: async () => {
-        if (await confirmDialog({ title: `Remove ${a.displayName} from staff?`, text: 'They lose access to the dashboard right away.', confirm: 'Remove', danger: true })) setRole({ userId: a.id }, null).catch((x) => toast(x.message, 'error'));
-      } },
+      { label: 'Remove from staff', icon: 'close', danger: true, action: () => setRole({ userId: a.id }, null, { title: `Remove ${a.displayName} from staff?`, text: 'They lose access to the dashboard right away.', button: 'Remove' }).catch(quietErr) },
     ]) }, 'Change role');
     const transferOwner = async (a) => {
       const typed = h('input', { class: 'input', placeholder: a.username, autocomplete: 'off' });
@@ -365,10 +444,13 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They get full control, including staff roles. You stay on as an admin, and only they can give ownership back.'), field(`Type ${a.username} to confirm`, typed)),
         actions: [{ label: 'Cancel' }, { label: 'Make owner', kind: 'danger', action: async () => {
           if (typed.value.trim().toLowerCase() !== a.username.toLowerCase()) { toast('The name doesn\u2019t match.', 'error'); return false; }
-          await api('POST', '/admin/owner', { userId: a.id }); toast(`${a.displayName} is now the owner.`); admins();
+          const r = await withPassword((x) => api('POST', '/admin/owner', { userId: a.id, ...x }), { title: 'Confirm handing over ownership', text: `${a.displayName} becomes the owner. This can\u2019t be undone from your side.` })
+            .catch((x) => { if (x.cancelled) return null; throw x; });
+          if (!r) return false;
+          toast(`${a.displayName} is now the owner.`); admins();
         } }] });
     };
-    const name = h('input', { class: 'input', placeholder: 'username' });
+    const name = h('input', { class: 'input', placeholder: 'username', 'aria-label': 'Username to add to the team' });
     let newRole = 'moderator';
     const roleChips = h('div', { class: 'chips' });
     const drawChips = () => clear(roleChips).append(...[['moderator', 'Moderator'], ['admin', 'Admin']].map(([k, l]) => h('button', { class: `chip${newRole === k ? ' active' : ''}`, onclick: () => { newRole = k; drawChips(); } }, l)));
@@ -385,13 +467,70 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('div', { class: 'row gap' }, name, h('button', { class: 'btn primary', onclick: async () => {
           const u = name.value.trim().replace(/^@/, '');
           if (!u) return toast('Type a username first.', 'error');
-          if (!(await confirmDialog({ title: `Make ${u} ${newRole === 'admin' ? 'an admin' : 'a moderator'}?`, text: ROLE_HINT[newRole], confirm: 'Add' }))) return;
-          await setRole({ username: u }, newRole).catch((x) => toast(x.message, 'error'));
+          await setRole({ username: u }, newRole, { title: `Make ${u} ${newRole === 'admin' ? 'an admin' : 'a moderator'}?`, text: ROLE_HINT[newRole], button: 'Add' }).catch(quietErr);
         } }, 'Add')))
         : h('p', { class: 'field-hint' }, 'Only the owner can change roles.'));
   }
 
   // ---------------------------------------------------------------- regions (call relays near people)
+  // Health: what /api/admin/health reports, as cards (ok / needs a look / broken), the background jobs, and alerts.
+  async function healthPage() {
+    const d = await api('GET', '/admin/health');
+    if (tab !== 'health') return;
+    const LABEL = { ok: 'OK', degraded: 'Needs a look', fail: 'Broken', unknown: 'Unknown' };
+    const tag = (st) => h('span', { class: `badge-tag ${st === 'ok' ? 'ok' : st === 'fail' ? 'bad' : st === 'degraded' ? 'warn' : ''}` }, LABEL[st] || st);
+    const card = (label, st, value, sub) => h('div', { class: `stat${st === 'fail' ? ' warn' : st === 'degraded' ? ' degraded' : ''}` },
+      h('span', { class: 'stat-label' }, label, ' ', tag(st)), h('strong', null, value), sub ? h('span', { class: 'stat-sub' }, sub) : null);
+    const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+    const B = d.backups; const N = d.newsbot; const R = d.regions; const P = d.process;
+    const backupWhy = { backups_off: 'automatic backups are off', restore_test_failed: 'the newest backup failed its restore test', no_backup_yet: 'none made yet', backup_late: 'the daily backup is late', backup_stale: 'no backup for over two days', backup_fresh: '' }[B.code];
+    const newsWhy = { worker_never_ran: 'the feed worker hasn’t run', worker_stuck: 'the feed worker stopped', worker_late: 'the feed worker is late', feeds_failing: 'most feeds are failing' }[N.code];
+    const alerts = d.alerts;
+    const saveAlerts = async (patch) => {
+      try {
+        const off = (patch.enabled === false && alerts.enabled) || (patch.email === false && alerts.email);
+        const r = off ? await withPassword((x) => api('PUT', '/admin/alerts', { ...patch, ...x }), { title: 'Confirm turning alerts off', text: 'Turning alerts off needs your password.' }) : await api('PUT', '/admin/alerts', patch);
+        if (r) toast('Saved.');
+      } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+      healthPage();
+    };
+    const cooldown = h('input', { class: 'input', type: 'number', min: '1', max: '10080', value: alerts.cooldownMin, style: { width: '90px' } });
+    clear(body).append(
+      h('div', { class: 'admin-head' }, h('h3', null, 'Health ', tag(d.status)), h('span', { class: 'field-hint' }, `Checked ${ago(d.checkedAt)} · refreshes every 15 seconds`)),
+      h('div', { class: 'stats' },
+        card('Database', d.database.status, `version ${d.database.schema ?? '?'}`, d.database.status === 'ok' ? 'answering' : `expected version ${d.database.expectedSchema}`),
+        card('Data folder', d.dataDir.status, d.dataDir.status === 'ok' ? 'writable' : 'not writable', ''),
+        card('Disk', d.disk.status, d.disk.total ? `${pct(d.disk.free, d.disk.total)}% free` : 'unknown', d.disk.total ? `${fmtSize(d.disk.free)} of ${fmtSize(d.disk.total)}` : ''),
+        card('Backups', B.status, B.newest ? ago(B.newest.at) : 'none yet', [backupWhy, B.lastRestoreTest ? `restore test ${B.lastRestoreTest.ok ? 'passed' : 'FAILED'} ${ago(B.lastRestoreTest.at)}` : 'no restore test yet', B.offsiteConfigured ? (B.offsite ? `off-site ${B.offsite.ok ? 'ok' : 'FAILED'}` : 'off-site: not yet') : 'no off-site copy'].filter(Boolean).join(' · ')),
+        card('News bot', N.status, N.worker && N.worker.lastOk ? `ran ${ago(N.worker.lastOk)}` : 'not run yet', [newsWhy, `${N.feeds} feeds${N.feedsWithErrors ? `, ${N.feedsWithErrors} failing` : ''} · ${N.trackers} trackers`].filter(Boolean).join(' · ')),
+        card('Relay regions', R.status, R.regions.length ? `${R.regions.length - R.down} of ${R.regions.length} up` : 'none', R.regions.map((r) => `${r.name}: ${r.alive ? 'up' : r.installed ? `down since ${ago(r.lastSeen)}` : 'not installed'}`).join(' · ')),
+        card('Responsiveness', P.status, `${P.lagP99Ms} ms`, `worst ${P.lagMaxMs} ms in the last minute · ${fmtSize(P.rss)} memory`),
+        card('Background jobs', d.jobs.status, d.jobs.failing.length ? `${d.jobs.failing.length} need a look` : 'all fine', d.jobs.failing.join(', ')),
+        card('Sign-in attempts', d.security.status, `${d.security.authFails10m} failed`, `in 10 minutes · ${d.security.errors10m} server errors`),
+        card('Running', 'ok', dur(P.uptime * 1000), `v${P.version} · database ${d.database.schema} · Node ${P.node}`)),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Background jobs'), h('span', { class: 'field-hint' }, 'A job failing three times in a row counts as broken')),
+      h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row head' }, h('span', null, 'Job'), h('span', null, 'Status'), h('span', null, 'Last run'), h('span', null, 'Last success'), h('span', null, 'Last error')),
+        ...d.jobList.map((j) => h('div', { class: 'adm-row' },
+          h('span', { class: 'mono' }, j.name), h('span', null, tag(j.status), j.failures ? h('span', { class: 'stat-sub' }, ` ${j.failures} in a row`) : null),
+          h('span', null, ago(j.lastRun)), h('span', null, ago(j.lastOk)),
+          h('span', { class: 'stat-sub' }, j.lastError ? `${ago(j.lastErrorAt)}: ${j.lastError}` : '')))),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Alerts'), h('span', { class: 'field-hint' }, 'Sent to the owner’s confirmed email and shown here live. Never includes messages or secrets.')),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Alerts'), h('span', { class: 'field-hint' }, 'Failed backups and restore tests, jobs that keep failing, relay outages, low disk, repeated errors and sign-in floods.')),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.enabled, onchange: (e) => saveAlerts({ enabled: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Email the owner'), h('span', { class: 'field-hint' }, 'Needs email set up in Owner → Email and a confirmed address on the owner’s account.')),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.email, onchange: (e) => saveAlerts({ email: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+      h('div', { class: 'row gap' }, h('span', null, 'The same alert at most once every'), cooldown, h('span', null, 'minutes'),
+        h('button', { class: 'btn', onclick: () => saveAlerts({ cooldownMin: +cooldown.value }) }, 'Save'),
+        h('button', { class: 'btn ghost', onclick: async () => { try { const r = await api('POST', '/admin/alerts/test'); toast(r.result === 'sent' ? 'Test alert sent.' : r.result === 'off' ? 'Alerts are off.' : 'Held back: too many alerts lately.'); healthPage(); } catch (e) { toast(e.message, 'error'); } } }, 'Send a test alert')),
+      alerts.recent.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row head' }, h('span', null, 'When'), h('span', null, 'Alert'), h('span', null, 'Details')),
+        ...alerts.recent.map((a) => h('div', { class: 'adm-row' }, h('span', null, ago(a.at)), h('span', null, h('span', { class: `badge-tag ${a.severity === 'critical' ? 'bad' : 'warn'}` }, a.severity === 'critical' ? 'Urgent' : 'Warning'), ' ', a.title),
+          h('span', { class: 'stat-sub' }, a.detail, a.held ? ` (${a.held} more held back)` : '')))) : h('p', { class: 'muted-p' }, 'No alerts yet.'));
+    clearInterval(timer);
+    timer = setInterval(() => { if (tab === 'health' && document.contains(body)) healthPage().catch(() => {}); else clearInterval(timer); }, 15000);
+  }
+
   async function regions() {
     const d = await api('GET', '/admin/regions');
     const showCommand = (title, command) => modal({
@@ -405,11 +544,15 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('p', { class: 'field-hint' }, 'The link works for 24 hours. It installs the call relay with this server\u2019s secret and a tiny check-in that reports here every minute. Within a minute of finishing, the region shows as online and calls start using it.'),
         h('p', { class: 'field-hint' }, 'If the VPS provider has a firewall in its control panel, open UDP + TCP 3478 and UDP 49160\u201349400 there.')),
     });
+    // An install command carries this server's relay secret, so making one asks for your password again.
+    const withPassword = (fn) => (confirm ? confirm(fn, { title: 'Confirm it\u2019s you', text: 'The install command carries this server\u2019s relay secret.' }) : fn({}));
     const add = () => {
       const name = h('input', { class: 'input', maxlength: '40', placeholder: 'e.g. Frankfurt, US West, Singapore' });
       modal({ title: 'Add a region', size: 'sm', body: h('div', { class: 'stack' }, field('Name', name, 'Shown to you here and to people choosing a relay.')),
         actions: [{ label: 'Cancel' }, { label: 'Get install command', kind: 'primary', action: async () => {
-          const r = await api('POST', '/admin/regions', { name: name.value.trim(), origin: location.origin });
+          if (!name.value.trim()) throw new Error('Give the region a name, like "Frankfurt" or "US West".');
+          const r = await withPassword((x) => api('POST', '/admin/regions', { name: name.value.trim(), origin: location.origin, ...x }));
+          if (!r) return false;
           regions(); setTimeout(() => showCommand(`Set up ${r.region.name}`, r.command), 150);
         } }] });
     };
@@ -438,7 +581,12 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
             !r.backup ? 'Backups: reinstall to add backup space' : !r.backup.ready ? 'Backups: no backup space (needs SSH)'
               : `Backups: ${r.backup.files} cop${r.backup.files === 1 ? 'y' : 'ies'}, ${fmtMb(r.backup.usedMb)} (${fmtMb(r.backup.freeMb)} free)${r.backup.last ? (r.backup.last.ok ? ` \u00b7 last copy ${ago(r.backup.last.at)} \u2713` : ' \u00b7 last copy FAILED') : ' \u00b7 waiting for the next backup'}`),
           h('span', { class: 'row gap tight' },
-            h('button', { class: 'btn ghost sm', onclick: async () => { const x = await api('POST', `/admin/regions/${r.id}/reinstall`, { origin: location.origin }); showCommand(`Reinstall ${r.name}`, x.command); } }, r.waitingForInstall ? 'Install command' : 'Reinstall'),
+            h('button', { class: 'btn ghost sm', onclick: async () => {
+              try {
+                const x = await withPassword((y) => api('POST', `/admin/regions/${r.id}/reinstall`, { origin: location.origin, ...y }));
+                if (x) showCommand(`Reinstall ${r.name}`, x.command);
+              } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+            } }, r.waitingForInstall ? 'Install command' : 'Reinstall'),
             h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Remove ${r.name}?`, text: 'Calls stop using it right away. The VPS keeps running until you cancel it with your provider.', confirm: 'Remove', danger: true })) { await api('DELETE', `/admin/regions/${r.id}`); regions(); } } }, 'Remove'))))),
       d.regions.length ? '' : h('p', { class: 'field-hint' }, 'No regions yet.'),
       h('div', { class: 'admin-head' }, h('h3', null, 'Which relay is nearest to me?')),
@@ -462,6 +610,10 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const c = d.config;
     const cur = (cents, code = c.currency) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: code || 'USD' }).format(cents / 100); } catch { return `${(cents / 100).toFixed(2)} ${code}`; } };
     const save = async (patch) => { try { await api('PUT', '/admin/money', patch); toast('Saved.'); money(); } catch (e) { toast(e.message, 'error'); } };
+    // Where payments go (and the secrets that prove they're real) needs the password again.
+    const saveSecure = async (patch) => {
+      try { if (await withPassword((x) => api('PUT', '/admin/money', { ...patch, ...x }), { title: 'Confirm payment settings', text: 'Changing where payments go needs your password.' })) { toast('Saved.'); money(); } } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+    };
     const hook = (p) => `${location.origin}/api/pay/${p}`;
     const f = {
       price: h('input', { class: 'input', type: 'number', min: '1', step: '0.5', value: String(c.monthlyCents / 100) }),
@@ -504,7 +656,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('li', null, 'People paste their support code into the Ko-fi message. Payments without a code wait in the list below for you to match.')),
       copyRow('Webhook URL', hook('kofi')),
       h('div', { class: 'grid-2' }, field('Your Ko-fi page', f.kofiUrl), field('Verification token', f.kofiToken)),
-      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ kofiUrl: f.kofiUrl.value, ...(f.kofiToken.value.trim() ? { kofiToken: f.kofiToken.value.trim() } : {}) }) }, 'Save Ko-fi')),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => saveSecure({ kofiUrl: f.kofiUrl.value, ...(f.kofiToken.value.trim() ? { kofiToken: f.kofiToken.value.trim() } : {}) }) }, 'Save Ko-fi')),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Stripe (cards, Apple Pay, Google Pay, monthly)')),
       h('ol', { class: 'steps' },
@@ -513,7 +665,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('li', null, 'Hearth adds each person\u2019s code to the link, so their payment matches them without typing anything.')),
       copyRow('Webhook URL', hook('stripe')),
       h('div', { class: 'grid-2' }, field('Payment Link', f.stripeLink), field('Webhook signing secret', f.stripeSecret)),
-      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ stripeLink: f.stripeLink.value, ...(f.stripeSecret.value.trim() ? { stripeSecret: f.stripeSecret.value.trim() } : {}) }) }, 'Save Stripe')),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => saveSecure({ stripeLink: f.stripeLink.value, ...(f.stripeSecret.value.trim() ? { stripeSecret: f.stripeSecret.value.trim() } : {}) }) }, 'Save Stripe')),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Payments')),
       d.payments.length ? h('div', { class: 'adm-table' }, ...d.payments.map((p) => h('div', { class: 'adm-row pay-row' },
@@ -529,7 +681,11 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const m = await api('GET', '/admin/memberships').catch(() => null);
     if (!m) return '';
     const c = m.config;
-    const save = async (patch) => { try { await api('PUT', '/admin/memberships', patch); toast('Saved.'); money(); } catch (e) { toast(e.message, 'error'); } };
+    // A new Stripe key or webhook secret decides where the money goes, so it needs the password again.
+    const save = async (patch) => {
+      const send = (x) => api('PUT', '/admin/memberships', { ...patch, ...x });
+      try { if (await (patch.key || patch.webhookSecret ? withPassword(send, { title: 'Confirm the Stripe keys', text: 'Changing the Stripe keys needs your password.' }) : send({}))) { toast('Saved.'); money(); } } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+    };
     const f = {
       key: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.keySet ? `Saved (${c.keyMode} mode, paste to replace)` : 'sk_live_\u2026 or rk_live_\u2026' }),
       secret: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.webhookSet ? 'Saved (paste to replace)' : 'whsec_\u2026' }),
@@ -545,6 +701,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Paying members'), h('strong', null, String(m.stats.members))),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Memberships a month'), h('strong', null, cur(m.stats.monthlyCents, c.currency))),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, `Your ${c.feePercent}% a month`), h('strong', null, cur(m.stats.feeCents, c.currency)))),
+      m.stats.pendingCancellations ? h('p', { class: 'warn-box' }, `${m.stats.pendingCancellations} membership${m.stats.pendingCancellations === 1 ? '' : 's'} of deleted servers still need${m.stats.pendingCancellations === 1 ? 's' : ''} cancelling in Stripe${m.stats.cancelError ? ` (last try: ${m.stats.cancelError.replace(/\.$/, '')}). Hearth tries again every hour` : ' (being cancelled now)'}. You can also cancel them in your Stripe dashboard.`) : '',
       h('ol', { class: 'steps' },
         h('li', null, 'In Stripe, turn on Connect (Connect \u2192 Get started, choose \u201cExpress\u201d accounts). Stripe handles the creators\u2019 identity checks, payouts and tax forms.'),
         h('li', null, 'Developers \u2192 API keys: paste your secret key below (or a restricted key with write access to Accounts, Account Links, Checkout Sessions and Subscriptions).'),
@@ -569,12 +726,20 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       user: h('input', { class: 'input', value: mail.user || '', autocomplete: 'off' }),
       pass: h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: mail.passSet ? 'Saved (paste to replace)' : 'SMTP password / API key' }),
       from: h('input', { class: 'input', value: mail.from || '', placeholder: 'Hearth <no-reply@yourdomain.com>' }),
-      test: h('input', { class: 'input', type: 'email', placeholder: 'you@example.com' }),
+      test: h('input', { class: 'input', type: 'email', placeholder: 'you@example.com', 'aria-label': 'Send a test email to' }),
     };
     const lastfmKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.lastfmKeySet ? 'Saved (paste to replace, or clear)' : 'Last.fm API key' });
     const rawgKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.rawgKeySet ? 'Saved (paste to replace, or clear)' : 'RAWG API key (optional)' });
     const saveKeys = async (patch) => { try { await api('PATCH', '/admin/activity', patch); toast('Saved.'); owner(); } catch (e) { toast(e.message, 'error'); } };
     const save = async (patch, msg = 'Saved.') => { try { await api('PUT', '/admin/owner', patch); toast(msg); owner(); } catch (e) { toast(e.message, 'error'); } };
+    // A new donation link, or fewer (or no) automatic backups, needs the password again. Cancelling puts the form back.
+    const saveConfirmed = async (patch, opts) => {
+      try { if (await withPassword((x) => api('PUT', '/admin/owner', { ...patch, ...x }), opts)) toast('Saved.'); } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+      owner();
+    };
+    const saveBackups = (patch) => (!patch.autoBackup.enabled && o.autoBackup.enabled) || Math.max(1, Math.min(60, Math.round(+patch.autoBackup.keep) || 7)) < o.autoBackup.keep
+      ? saveConfirmed(patch, { title: 'Confirm the backup change', text: 'Keeping fewer backups (or turning them off) deletes older ones sooner, so it needs your password.' })
+      : save(patch);
     const name = h('input', { class: 'input', maxlength: '40', value: o.brand.name });
     const tagline = h('input', { class: 'input', maxlength: '140', value: o.brand.tagline, placeholder: 'e.g. Our little corner of the internet' });
     const sw = (label, key, hint) => h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, label), hint ? h('span', { class: 'field-hint' }, hint) : null),
@@ -584,7 +749,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       raised: h('input', { class: 'input', type: 'number', min: '0', value: String(F.raised || '') }), currency: h('input', { class: 'input', maxlength: '3', value: F.currency || 'USD' }),
       note: h('input', { class: 'input', maxlength: '300', value: F.note, placeholder: 'Optional: your own message' }) };
     const supQuota = h('input', { class: 'input', type: 'number', min: '0', value: String(o.supporterQuotaMb || '') , placeholder: '0 = same as everyone' });
-    const keep = h('input', { class: 'input', type: 'number', min: '1', max: '60', value: String(o.autoBackup.keep) });
+    const keep = h('input', { class: 'input', type: 'number', min: '1', max: '60', value: String(o.autoBackup.keep), 'aria-label': 'Number of daily backups to keep' });
     const download = async (b) => {
       try {
         const r = await fetch(`/api/admin/backups/${encodeURIComponent(b.name)}`, { headers: { authorization: 'Bearer ' + localStorage.getItem('hearth.token') } });
@@ -606,6 +771,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       sw('Profile comment walls', 'comments'),
       sw('Custom CSS on profile pages', 'customCss', 'Turned off, everyone\u2019s page shows without their CSS (it\u2019s kept, not deleted).'),
       h('div', { class: 'kv' }, h('span', null, 'Who can create servers'), h('div', { class: 'chips' }, [['everyone', 'Everyone'], ['staff', 'Staff only']].map(([k, l]) => h('button', { class: `chip${o.features.createServers === k ? ' active' : ''}`, onclick: () => save({ features: { createServers: k } }) }, l)))),
+      h('div', { class: 'kv' }, h('span', null, 'Who can make bots'), h('div', { class: 'chips' }, [['admins', 'Admins'], ['staff', 'Staff'], ['everyone', 'Everyone']].map(([k, l]) => h('button', { class: `chip${(o.features.createBots || 'admins') === k ? ' active' : ''}`, onclick: () => save({ features: { createBots: k } }) }, l)))),
+      h('p', { class: 'field-hint' }, 'Bots are made in Server settings \u2192 Bots. Any server owner can add listed bots to their own server, with the access they approve.'),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Funding and supporters')),
       h('p', { class: 'field-hint' }, 'Show people what the server costs and where to chip in (Ko-fi, Patreon, Open Collective, Stripe link\u2026). It appears as a small card on everyone\u2019s Home screen that they can hide. Mark people who chip in as supporters under Users: they get a \uD83D\uDC9C badge and, if you like, more storage.'),
@@ -613,7 +780,10 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       h('div', { class: 'grid-2' }, field('Donation link', fund.url), field('Monthly cost', fund.monthly), field('Raised this month', fund.raised), field('Currency (USD, EUR\u2026)', fund.currency)),
       field('Message', fund.note),
       field('Storage for supporters (MB)', supQuota, 'More room for people who help pay. Empty or 0 = same limit as everyone. Automatic payments and other perks: the Money tab.'),
-      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => save({ funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value }) }, 'Save')),
+      h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => {
+        const patch = { funding: { url: fund.url.value.trim(), monthly: fund.monthly.value, raised: fund.raised.value, currency: fund.currency.value.toUpperCase(), note: fund.note.value }, supporterQuotaMb: supQuota.value };
+        return patch.funding.url !== (F.url || '') ? saveConfirmed(patch, { title: 'Confirm the donation link', text: 'Changing where donations go needs your password.' }) : save(patch);
+      } }, 'Save')),
       o.supporters.length ? h('div', { class: 'adm-table' }, ...o.supporters.map((u) => h('div', { class: 'adm-row three' }, userCell(u, openUser), h('span', { class: 'supporter-tag' }, '\uD83D\uDC9C Supporter'), h('button', { class: 'btn ghost sm', onclick: () => openUser(u.id) }, 'Manage')))) : h('p', { class: 'field-hint' }, 'No supporters yet.'),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Email (password resets)'), h('span', { class: `rpill ${mail.ready ? 'ok' : 'warn'}` }, mail.ready ? 'Working' : 'Not set up')),
@@ -643,8 +813,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Backing up…';
           try { const r = await api('POST', '/admin/backups'); toast(r.verified && r.verified.ok ? 'Backup made and restore-tested.' : `Backup made, but its restore test FAILED: ${(r.verified || {}).error || ''}`, r.verified && r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); btn.disabled = false; btn.textContent = 'Back up now'; }
         } }, 'Back up now'),
-        h('label', { class: 'row gap tight' }, h('input', { type: 'checkbox', checked: o.autoBackup.enabled, onchange: (e) => save({ autoBackup: { enabled: e.target.checked, keep: keep.value } }) }), 'Automatic daily backup, keep'),
-        keep, h('button', { class: 'btn ghost sm', onclick: () => save({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save'),
+        h('label', { class: 'row gap tight' }, h('input', { type: 'checkbox', checked: o.autoBackup.enabled, onchange: (e) => saveBackups({ autoBackup: { enabled: e.target.checked, keep: keep.value } }) }), 'Automatic daily backup, keep'),
+        keep, h('button', { class: 'btn ghost sm', onclick: () => saveBackups({ autoBackup: { enabled: o.autoBackup.enabled, keep: keep.value } }) }, 'Save'),
         o.keyFrom === 'file' && confirm ? h('button', { class: 'btn ghost sm', onclick: async () => {
           try {
             const r = await confirm((x) => api('POST', '/admin/backups/key', x), { title: 'Show the backup key', text: 'Save it in a password manager. Without it, no backup can be restored (for example if this server is lost).' });
@@ -662,7 +832,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         b.regions ? h('span', { class: 'stat-sub' }, Object.values(b.regions).map((x) => (x.ok ? `${x.name} \u2713` : `${x.name}: failed`)).join(' \u00b7 ')) : null,
         h('button', { class: 'btn ghost sm', onclick: async () => { try { const r = await api('POST', `/admin/backups/${encodeURIComponent(b.name)}/verify`); toast(r.verified.ok ? `Restore test passed: ${r.verified.users} accounts, ${r.verified.messages} messages, ${r.verified.files} files.` : `Restore test FAILED: ${r.verified.error}`, r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); } } }, 'Test restore'),
         h('button', { class: 'btn ghost sm', onclick: () => download(b) }, 'Download'),
-        h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: 'Delete this backup?', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`); owner(); } } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No encrypted backups yet.'),
+        h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
+          try { if (await withPassword((x) => api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`, x), { title: 'Delete this backup?', text: `${b.name} is deleted for good.`, button: 'Delete' })) owner(); } catch (x) { if (!x.cancelled) toast(x.message, 'error'); }
+        } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No encrypted backups yet.'),
       o.backups.length ? h('p', { class: 'field-hint' }, `${o.backups.length} plain database cop${o.backups.length === 1 ? 'y' : 'ies'} on the server for undoing updates (newest ${ago(o.backups[0].at)}).`) : null);
   }
 
@@ -678,8 +850,13 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       const next = await api('GET', `/admin/log?before=${oldest}`); addRows(next); if (next.length) oldest = next[next.length - 1].id; more.hidden = next.length < 200;
     } }, 'Older entries');
     clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Audit log'), h('span', { class: 'field-hint' }, 'Staff actions and account security events, newest first. Entries can\u2019t be edited or deleted.')),
-      chain ? (chain.ok ? h('div', { class: 'chain-ok' }, icon('check'), `Tamper check passed: all ${chain.entries} entries are intact and in order.`)
-        : h('div', { class: 'chain-bad' }, icon('shield'), `Tamper check FAILED at entry #${chain.brokenAt}: the log was changed outside Hearth (someone edited the database file).`)) : '',
+      chain ? (chain.ok ? h('div', { class: 'chain-ok' }, icon('check'), `Tamper check passed: all ${chain.entries} entries are intact and in order.${chain.keyedFrom > 1 && chain.keyedSince
+        ? ` Entries before #${chain.keyedFrom} were written by an older version of Hearth (this server has signed entries since ${fmtStamp(chain.keyedSince)}), so they’re checked less strictly.` : ''}`)
+        : h('div', { class: 'chain-bad' }, icon('shield'), chain.reason === 'missing'
+          ? `Tamper check FAILED: entries up to #${chain.anchoredId} were recorded on this machine, but the log now ends at #${chain.brokenAt - 1}. Entries were removed outside Hearth, or an older copy of the database was put back.`
+          : chain.reason === 'anchor' || chain.reason === 'keyed_from' ? 'Tamper check FAILED: the files Hearth uses to check the log were changed outside Hearth.'
+            : `Tamper check FAILED at entry #${chain.brokenAt}: the log was changed outside Hearth (someone edited the database file).`)) : '',
+      chain && chain.gaps && chain.gaps.length ? h('div', { class: 'chain-bad' }, icon('shield'), `Earlier problem${chain.gaps.length === 1 ? '' : 's'} found and recorded: ${chain.gaps.slice(-3).map((g) => `#${g.id} (${fmtStamp(g.at)})`).join(', ')}. See those entries below.`) : '',
       table, h('div', null, more));
   }
 
@@ -768,7 +945,8 @@ async function userModal(id, refresh, myRank = 2) {
       notesBox(u, () => { m.close(); userModal(id, refresh, myRank); }, myRank),
       u.myRole === 'owner' && u.canAct ? h('div', { class: 'row gap wrap' }, h('span', { class: 'field-label' }, 'Staff role'),
         ...[['moderator', 'Moderator'], ['admin', 'Admin'], [null, 'None']].map(([r, l]) => h('button', { class: `chip${(u.role || null) === r ? ' active' : ''}`, onclick: async () => {
-          await api('PUT', '/admin/staff', { userId: id, role: r }).then(() => { toast(r ? `Now ${l.toLowerCase()}.` : 'Removed from staff.'); m.close(); userModal(id, refresh, myRank); refresh(); }, (x) => toast(x.message, 'error'));
+          await withPassword((x) => api('PUT', '/admin/staff', { userId: id, role: r, ...x }), { title: 'Confirm the team change', text: 'Changing the team needs your password.' })
+            .then((ok) => { if (!ok) return; toast(r ? `Now ${l.toLowerCase()}.` : 'Removed from staff.'); m.close(); userModal(id, refresh, myRank); refresh(); }, (x) => { if (!x.cancelled) toast(x.message, 'error'); });
         } }, l))) : null,
       u.canAct ? null : h('p', { class: 'field-hint' }, 'You can look, but only someone ranked above this account can suspend, sign out or reset it.')),
     actions: !u.canAct ? [] : [

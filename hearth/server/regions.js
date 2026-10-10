@@ -14,10 +14,11 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
 const { execFile, execFileSync } = require('child_process');
 
 module.exports = function setupRegions(ctx) {
-  const { api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT } = ctx;
+  const { api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT, stepUp, auditLog } = ctx;
   const now = () => Date.now();
   const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
   const ALIVE_MS = 3 * 60000;
@@ -63,8 +64,12 @@ module.exports = function setupRegions(ctx) {
     res.json({ regions: rows().map(regionOut), mainTurn: String(getSetting('turnUrls') || process.env.TURN_URL || '').split(',').filter(Boolean), secretSet: !!(getSetting('turnSecret') || process.env.TURN_SECRET) });
   });
   const installCommand = (origin, id, token) => { const pin = pinFor(origin); return `curl -fsSL${pin ? `k --pinnedpubkey '${pin}'` : ''} '${origin}/regions/install/${id}?k=${token}' | sudo bash`; };
-  api.post('/admin/regions', auth, (req, res) => {
+  // An install command hands the machine it runs on this server's relay secret, and a linked region becomes a
+  // relay for everyone's calls and a place every backup is copied to. So making one needs the password again
+  // (like seeing the backup key), and adding, reinstalling, renaming or removing a region is always logged.
+  api.post('/admin/regions', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
+    await stepUp(req, req.body);
     const b = req.body || {};
     const name = String(b.name || '').trim().slice(0, 40);
     if (!name) fail(400, 'Give the region a name, like "Frankfurt" or "US West".');
@@ -76,11 +81,13 @@ module.exports = function setupRegions(ctx) {
     // Remember the address the admin uses: that's the one the region must check in at (behind a proxy, this
     // server can't always tell its own public https:// address).
     db.prepare('INSERT INTO regions (id, name, token_hash, setup_until, stats, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, name, sha(token), now() + 24 * 3600000, JSON.stringify({ origin }), now());
+    auditLog(req, 'region_added', id, `${name} (${origin})`);
     res.json({ region: regionOut(db.prepare('SELECT * FROM regions WHERE id = ?').get(id)), command: installCommand(origin, id, token) });
-  });
+  }));
   // A new install command for an existing region (new token; the old one stops working).
-  api.post('/admin/regions/:id/reinstall', auth, (req, res) => {
+  api.post('/admin/regions/:id/reinstall', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
+    await stepUp(req, req.body);
     const r = db.prepare('SELECT * FROM regions WHERE id = ?').get(req.params.id);
     if (!r) fail(404, 'No such region.');
     const origin = cleanOrigin((req.body || {}).origin);
@@ -88,18 +95,25 @@ module.exports = function setupRegions(ctx) {
     ensureSecret();
     const token = crypto.randomBytes(24).toString('hex');
     db.prepare('UPDATE regions SET token_hash = ?, setup_until = ?, stats = ? WHERE id = ?').run(sha(token), now() + 24 * 3600000, JSON.stringify({ ...parse(r.stats, {}), origin }), r.id);
+    auditLog(req, 'region_reinstalled', r.id, `${r.name} (${origin})`);
     res.json({ command: installCommand(origin, r.id, token) });
-  });
+  }));
   api.patch('/admin/regions/:id', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
     const name = String((req.body || {}).name || '').trim().slice(0, 40);
     if (!name) fail(400, 'Name required.');
-    db.prepare('UPDATE regions SET name = ? WHERE id = ?').run(name, req.params.id);
+    const r = db.prepare('SELECT * FROM regions WHERE id = ?').get(req.params.id);
+    if (!r) fail(404, 'No such region.');
+    db.prepare('UPDATE regions SET name = ? WHERE id = ?').run(name, r.id);
+    auditLog(req, 'region_renamed', r.id, `${r.name} \u2192 ${name}`);
     res.json({ ok: true });
   });
   api.delete('/admin/regions/:id', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
-    db.prepare('DELETE FROM regions WHERE id = ?').run(req.params.id);
+    const r = db.prepare('SELECT * FROM regions WHERE id = ?').get(req.params.id);
+    if (!r) fail(404, 'No such region.');
+    db.prepare('DELETE FROM regions WHERE id = ?').run(r.id);
+    auditLog(req, 'region_deleted', r.id, `${r.name}${r.ip ? ` (${r.ip})` : ''}`);
     res.json({ ok: true });
   });
 
@@ -123,11 +137,15 @@ REGION=${q(r.id)}
 TOKEN=${q(token)}
 PIN=${q(pinFor(origin))}
 
-cat > /tmp/hearth-setup-turn.sh <<'HEARTH_TURN_EOF'
+# A private folder (mktemp: only root can read or write it), not a fixed name in /tmp that another account
+# could create first and swap the script in before root runs it.
+SETUP_DIR="$(mktemp -d)"
+trap 'rm -rf "$SETUP_DIR"' EXIT
+cat > "$SETUP_DIR/setup-turn.sh" <<'HEARTH_TURN_EOF'
 ${turnScript}
 HEARTH_TURN_EOF
-bash /tmp/hearth-setup-turn.sh --relay-only --managed --secret ${q(ensureSecret())}
-rm -f /tmp/hearth-setup-turn.sh
+bash "$SETUP_DIR/setup-turn.sh" --relay-only --managed --secret ${q(ensureSecret())}
+rm -rf "$SETUP_DIR"
 
 # Off-site backups: an upload-only SFTP account that can write into one folder and nothing else. The main
 # server copies its encrypted backups here (useless without the backup key, which never leaves it).
@@ -245,15 +263,23 @@ echo "If this VPS provider has its own firewall (in their control panel), open U
   });
 
   // ------------------------------------------------------------------ check-ins from the regions
-  const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  // A region's address becomes a relay address everyone's app is given, and the place this server copies backups
+  // to over SSH, so it has to be a real public address. Addresses are parsed (not matched as text), so every way
+  // of writing an internal one is refused: "0:0:0:0:0:0:0:1" is loopback, and "::ffff:a00:1" is 10.0.0.1.
+  // (Two lists: one BlockList would also match every IPv4 address against the IPv6 rules for mapped addresses.)
+  const NOT_PUBLIC_V4 = new net.BlockList();
+  const NOT_PUBLIC_V6 = new net.BlockList();
+  for (const [a, bits] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16], ['224.0.0.0', 3]]) NOT_PUBLIC_V4.addSubnet(a, bits, 'ipv4');
+  // IPv6: unspecified, loopback and the old IPv4-compatible form (::/96), IPv4-mapped (::ffff:0:0/96), the NAT64,
+  // 6to4 and Teredo forms that carry an IPv4 address inside, unique-local, link-local, old site-local, multicast.
+  for (const [a, bits] of [['::', 96], ['::ffff:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2002::', 16], ['2001::', 32], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8]]) NOT_PUBLIC_V6.addSubnet(a, bits, 'ipv6');
   const publicIp = (ip) => {
-    const m = String(ip || '').match(IPV4);
-    if (m) {
-      const [a, b] = [+m[1], +m[2]];
-      if (m.slice(1).some((x) => +x > 255)) return false;
-      return !(a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224) || process.env.REGIONS_ALLOW_PRIVATE === '1';
-    }
-    return /^[0-9a-f:]{3,39}$/i.test(ip) && !/^(::1|fe80:|fc|fd)/i.test(ip);
+    const s = String(ip || '');
+    let ok;
+    if (net.isIPv4(s)) ok = !NOT_PUBLIC_V4.check(s, 'ipv4');
+    else if (net.isIPv6(s) && /^[0-9a-f:]{2,39}$/i.test(s)) ok = !NOT_PUBLIC_V6.check(s, 'ipv6'); // no zone ids or dotted tails
+    else return false;
+    return ok || process.env.REGIONS_ALLOW_PRIVATE === '1';
   };
   api.post('/regions/:id/heartbeat', wrap(async (req, res) => {
     rateLimit('regionbeat:' + req.ip, 30, 60000);
@@ -348,5 +374,5 @@ echo "If this VPS provider has its own firewall (in their control panel), open U
     return out;
   }
 
-  return { liveRelays, copyBackup, backupPublicKey };
+  return { liveRelays, copyBackup, backupPublicKey, isAlive };
 };

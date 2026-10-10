@@ -8,6 +8,10 @@
 #
 # Calls try every relay and use whichever works best, so people far from the main server get a
 # nearby relay. Safe to run again: it keeps the existing secret, so other relays keep working.
+#
+# Bandwidth: each relayed connection is capped at TURN_MAX_MBIT megabits a second each way (default 6: enough
+# for a camera plus a shared screen). TURN_CAPACITY_MBIT caps all calls together (default 0 = no cap; set it to
+# what your VPS plan includes), e.g.  TURN_CAPACITY_MBIT=200 bash scripts/setup-turn.sh
 set -Eeuo pipefail
 c_y=$'\033[1;33m'; c_g=$'\033[1;32m'; c_r=$'\033[1;31m'; c_0=$'\033[0m'
 step() { printf '%s▸%s %s\n' "$c_y" "$c_0" "$*"; }
@@ -25,6 +29,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+MAX_MBIT="${TURN_MAX_MBIT:-6}"; CAPACITY_MBIT="${TURN_CAPACITY_MBIT:-0}"
+[[ "$MAX_MBIT" =~ ^[0-9]+$ ]] && [[ "$CAPACITY_MBIT" =~ ^[0-9]+$ ]] || die "TURN_MAX_MBIT and TURN_CAPACITY_MBIT are whole numbers (megabits a second)."
 [ "$RELAY_ONLY" = yes ] && [ -z "$SECRET" ] && die "An extra relay needs the main server's secret: --secret <secret> (on the Hearth server: node server/cli.js get-turn-secret)"
 
 # Find Hearth on this machine (not needed for --relay-only).
@@ -72,15 +78,21 @@ fingerprint
 use-auth-secret
 static-auth-secret=$SECRET
 realm=hearth
-# Limits so nobody can use this relay as a free bandwidth pipe.
+# Limits. Quotas count relayed connections (at most 400 at once, 16 per relay login; a login is per person and
+# changes every 6 hours). max-bps caps each connection's bandwidth, bps-capacity all of them together (bytes a
+# second, each way; 0 = no cap).
 total-quota=400
 user-quota=16
+max-bps=$((MAX_MBIT * 125000))
+bps-capacity=$((CAPACITY_MBIT * 125000))
 stale-nonce=600
 no-cli
 no-tlsv1
 no-tlsv1_1
 no-multicast-peers
 no-loopback-peers
+# Calls only relay UDP; refusing TCP relays (RFC 6062) removes a way to reach TCP services through the relay.
+no-tcp-relay
 # Never relay into private or internal networks (blocks a well-known TURN abuse).
 denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255

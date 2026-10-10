@@ -3,30 +3,80 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
+const log = require('./log');
 
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+// A restore that was cut off leaves this marker (see restoreBackup in backup.js). Starting anyway
+// would run on a data folder that may be missing its database or files while looking fine, so refuse, untouched.
+if (fs.existsSync(path.join(DATA_DIR, 'RESTORE-INCOMPLETE'))) {
+  const err = new Error(`The data folder ${DATA_DIR} holds a restore that didn't finish (see ${path.join(DATA_DIR, 'RESTORE-INCOMPLETE')}). `
+    + 'Delete that folder and restore the backup again into a new, empty one (node server/cli.js restore FILE NEW_DATA_DIR).');
+  err.code = 'HEARTH_RESTORE_INCOMPLETE';
+  throw err;
+}
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'hearth.db'));
-db.pragma('journal_mode = WAL');
+const DB_FILE = path.join(DATA_DIR, 'hearth.db');
+const db = new Database(DB_FILE);
 
 // ---------- safety: back up the database before any upgrade changes its structure ----------
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 18;
 const fromVersion = db.pragma('user_version', { simple: true });
+// v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
+// restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
+// new data, so refuse to start, without touching the file, and say how to get back.
+if (fromVersion > SCHEMA_VERSION) {
+  db.close();
+  const err = new Error(`This database (${DB_FILE}) was written by a newer version of Hearth (database version ${fromVersion}; this version understands up to ${SCHEMA_VERSION}). `
+    + `Install that newer version again, or stop Hearth and restore the copy made before that upgrade (${path.join(DATA_DIR, 'backups', `hearth-before-v${fromVersion}-*.db`)}).`);
+  err.code = 'HEARTH_DB_TOO_NEW';
+  throw err;
+}
+db.pragma('journal_mode = WAL');
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
   const dir = path.join(DATA_DIR, 'backups');
   fs.mkdirSync(dir, { recursive: true });
-  db.pragma('wal_checkpoint(TRUNCATE)');
-  const file = path.join(dir, `hearth-before-v${SCHEMA_VERSION}-${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
-  fs.copyFileSync(path.join(DATA_DIR, 'hearth.db'), file);
-  console.log(`Backed up the database before upgrading: ${file}`);
+  const prefix = `hearth-before-v${SCHEMA_VERSION}-`;
+  // v17 (data): an upgrade either finishes or changes nothing (it runs as one transaction, below). So a copy made
+  // after the data last changed is still exact, and a server stuck restarting on a failing upgrade (Docker and
+  // systemd restart it) doesn't write another full copy of the database on every attempt. Writing everything
+  // into the main file first makes its timestamps say when the data last changed (the change time too, which a
+  // file put back with its old dates, e.g. from a tar archive, still updates).
+  const ck = db.pragma('wal_checkpoint(TRUNCATE)')[0] || {};
+  const wal = `${DB_FILE}-wal`;
+  const settled = ck.busy === 0 && (!fs.existsSync(wal) || fs.statSync(wal).size === 0);
+  const st = fs.statSync(DB_FILE);
+  const changedAt = Math.max(st.mtimeMs, st.ctimeMs);
+  for (const f of fs.readdirSync(dir)) if (f.startsWith('hearth-before-') && f.endsWith('.partial')) fs.rmSync(path.join(dir, f), { force: true });
+  const fresh = settled && fs.readdirSync(dir).find((f) => f.startsWith(prefix) && f.endsWith('.db') && fs.statSync(path.join(dir, f)).mtimeMs > changedAt);
+  if (fresh) log.info('db', 'upgrade_backup', { msg: `The database was already backed up before this upgrade: ${path.join(dir, fresh)}` });
+  else {
+    // VACUUM INTO makes a consistent copy through SQLite (even if something else has the file open). It's written
+    // under a temporary name first, so a copy that was cut short is never taken for a complete one.
+    const file = path.join(dir, `${prefix}${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
+    try {
+      db.prepare('VACUUM INTO ?').run(`${file}.partial`);
+      fs.renameSync(`${file}.partial`, file);
+    } catch (e) { fs.rmSync(`${file}.partial`, { force: true }); throw e; }
+    log.info('db', 'upgrade_backup', { msg: `Backed up the database before upgrading: ${file}`, outcome: 'ok' });
+  }
 }
 db.pragma('foreign_keys = ON');
+
+// v17 (data): every step from here to the version bump at the end runs in one transaction. An upgrade that's cut
+// short (killed, out of memory, power cut) then leaves the database exactly as it was and simply runs again on the
+// next start, instead of leaving it half-changed with the old version number (which could stop it ever starting).
+// So nothing below may use VACUUM or change journal_mode/foreign_keys: SQLite doesn't allow those in a transaction.
+db.exec('BEGIN IMMEDIATE');
+// While this transaction is open, files outside the database that describe it (the audit log's anchor) wait for
+// the commit: written now, a crash before COMMIT would leave them pointing at rows that were rolled back.
+let MIGRATING = true;
+let anchorAfterCommit = null;
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -309,8 +359,10 @@ if (fromVersion < 5) {
       }
       const admins = db.prepare(`SELECT user_id FROM members WHERE server_id = ? AND role = 'admin'`).all(srv.id);
       if (admins.length) {
-        const rid = newId();
-        db.prepare(`INSERT INTO roles (id, server_id, name, color, position, permissions, hoist, mentionable, created_at) VALUES (?, ?, 'Admin', '#f2a541', 1, ?, 1, 1, ?)`).run(rid, srv.id, PERMS.ADMINISTRATOR, Date.now());
+        // Run again (older releases could be stopped part-way through an upgrade)? Reuse the Admin role made last time.
+        const made = db.prepare(`SELECT id FROM roles WHERE server_id = ? AND name = 'Admin' AND position = 1 AND permissions = ?`).get(srv.id, PERMS.ADMINISTRATOR);
+        const rid = made ? made.id : newId();
+        if (!made) db.prepare(`INSERT INTO roles (id, server_id, name, color, position, permissions, hoist, mentionable, created_at) VALUES (?, ?, 'Admin', '#f2a541', 1, ?, 1, 1, ?)`).run(rid, srv.id, PERMS.ADMINISTRATOR, Date.now());
         admins.forEach((a) => db.prepare('INSERT OR IGNORE INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(srv.id, a.user_id, rid));
       }
     }
@@ -494,7 +546,9 @@ addColumn('users', 'stripe_customer', 'TEXT');
 
 // v12: sessions are stored as SHA-256 fingerprints of their tokens (see auth() in index.js). Existing raw tokens
 // are converted once, so nobody gets signed out by the upgrade.
-if (hasData && fromVersion < 12) {
+// Only while the raw-token column is still there: a database whose upgrade was cut short after v13 renamed it
+// would otherwise fail here on every start.
+if (hasData && fromVersion < 12 && db.prepare('PRAGMA table_info(sessions)').all().some((c) => c.name === 'token')) {
   const rows = db.prepare('SELECT rowid, token FROM sessions').all();
   const upd = db.prepare('UPDATE sessions SET token = ? WHERE rowid = ?');
   db.transaction(() => { for (const r of rows) upd.run(require('crypto').createHash('sha256').update(String(r.token)).digest('hex'), r.rowid); })();
@@ -580,9 +634,15 @@ addColumn('users', 'deleted_at', 'INTEGER');
 // log shows whether it's intact).
 addColumn('admin_log', 'prev_hash', 'TEXT');
 addColumn('admin_log', 'hash', 'TEXT');
-const auditHash = (prev, r) => crypto.createHash('sha256').update(JSON.stringify([prev || '', r.id, r.admin_id || '', r.action, r.target || '', r.detail || '', r.ip || '', r.created_at])).digest('hex');
+const auditFields = (prev, r) => JSON.stringify([prev || '', r.id, r.admin_id || '', r.action, r.target || '', r.detail || '', r.ip || '', r.created_at]);
+// Plain SHA-256: entries written before v17. Newer entries are keyed (auditMac, v17 below).
+const auditHash = (prev, r) => crypto.createHash('sha256').update(auditFields(prev, r)).digest('hex');
+const AUDIT_ANCHOR = path.join(DATA_DIR, 'audit-anchor.json');
 {
-  const unchained = db.prepare('SELECT * FROM admin_log WHERE hash IS NULL ORDER BY id').all();
+  // One-time upgrade of a database from before the chain existed (older than v13). It never runs on a newer one,
+  // whatever else was deleted, so a hash someone set to NULL stays a break instead of being quietly recomputed.
+  const keyed = db.prepare("SELECT 1 FROM instance_settings WHERE key = 'auditKeyedFrom'").get() || fs.existsSync(AUDIT_ANCHOR);
+  const unchained = !hasData || fromVersion >= 13 || keyed ? [] : db.prepare('SELECT * FROM admin_log WHERE hash IS NULL ORDER BY id').all();
   if (unchained.length) {
     db.exec('DROP TRIGGER IF EXISTS admin_log_no_update');
     let prev = (db.prepare('SELECT hash FROM admin_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1').get() || {}).hash || '';
@@ -689,10 +749,474 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE INDEX IF NOT EXISTS idx_memberships_server_user ON memberships(server_id, user_id);
 `);
 
+// v17 (search): message search (server/search.js) walks each conversation newest first by (created_at, id),
+// optionally only one author's messages. These indexes make every step a range scan that never reads a row.
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_author_time ON messages(channel_id, author_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_time ON dm_messages(dm_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_author_time ON dm_messages(dm_id, author_id, created_at, id);
+`);
+
+// v17 (authz): leaving, kicks and bans now take away the person's roles, per-channel overrides and event RSVPs.
+// Older versions left them behind, so someone who was removed got their roles (even Administrator) back by
+// rejoining with any invite. Clear what's left from before; it only touches rows of people no longer in the
+// server, so running it on every start is harmless.
+db.exec(`
+DELETE FROM member_roles WHERE NOT EXISTS
+  (SELECT 1 FROM members m WHERE m.server_id = member_roles.server_id AND m.user_id = member_roles.user_id);
+DELETE FROM channel_overrides WHERE target_type = 'member' AND NOT EXISTS
+  (SELECT 1 FROM channels c JOIN members m ON m.server_id = c.server_id WHERE c.id = channel_overrides.channel_id AND m.user_id = channel_overrides.target_id);
+DELETE FROM event_rsvps WHERE NOT EXISTS
+  (SELECT 1 FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE e.id = event_rsvps.event_id AND m.user_id = event_rsvps.user_id);
+`);
+
+// v17 (outbound): a push subscription remembers the session that turned it on, so signing that session out
+// (or revoking it, a password change, a suspension) stops its notifications. Older rows have none.
+addColumn('push_subs', 'session_id', 'TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
+// …and how many sends to it failed in a row (its push service timed out or couldn't be reached), and when
+// it may be tried again, so a dead or hostile push service sits out instead of holding up everyone's sends.
+addColumn('push_subs', 'fails', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('push_subs', 'retry_at', 'INTEGER');
+
+// v17 (admin): owner tools hardening.
+// Subscriptions of a deleted server that Stripe hasn't confirmed as cancelled yet. The membership rows go with the
+// server, so these are kept separately (no foreign keys) and retried until Stripe says they've ended.
+db.exec(`
+CREATE TABLE IF NOT EXISTS membership_cancellations (
+  stripe_sub TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL,
+  user_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  tried_at INTEGER
+);
+`);
+
+// v17 (admin): secrets kept in settings (GIF and activity API keys, payment webhook secrets) are sealed with
+// secret.key, like the SMTP password. Older versions stored them as plain text; those are sealed here, once.
+const SEALED = 'sealed:';
+const sealSecret = (v) => (v ? SEALED + seal({ k: String(v) }) : '');
+const openSecret = (v) => (typeof v !== 'string' ? '' : v.startsWith(SEALED) ? String((unseal(v.slice(SEALED.length)) || {}).k || '') : v);
+{
+  const get = (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value;
+  const put = (k, v) => db.prepare('UPDATE instance_settings SET value = ? WHERE key = ?').run(v, k);
+  for (const k of ['giphyKey', 'klipyKey', 'lastfmKey', 'rawgKey']) { const v = get(k); if (v && !v.startsWith(SEALED)) put(k, sealSecret(v)); }
+  for (const [k, fields] of [['payments', ['kofiToken', 'stripeSecret']], ['memberships', ['webhookSecret']]]) {
+    let v = null;
+    try { v = JSON.parse(get(k) || 'null'); } catch { /* leave it */ }
+    if (!v || typeof v !== 'object') continue;
+    const plain = fields.filter((f) => typeof v[f] === 'string' && v[f] && !v[f].startsWith(SEALED));
+    plain.forEach((f) => { v[f] = sealSecret(v[f]); });
+    if (plain.length) put(k, JSON.stringify(v));
+  }
+}
+
+// v17 (admin): the audit log's chain is keyed. New entries are HMAC-SHA256 with a key derived from secret.key, so
+// someone with only the database can't recompute the chain after editing it. The newest entry is also anchored in
+// a file outside the database (data/audit-anchor.json), so cutting entries off the end shows up too. Entries from
+// before this upgrade keep their plain SHA-256 hashes; the signed 'auditKeyedFrom' setting says where the keyed
+// part starts.
+const AUDIT_KEY = Buffer.from(crypto.hkdfSync('sha256', atRestKey, Buffer.alloc(0), 'hearth-audit-log-v1', 32));
+const auditMacOf = (s) => crypto.createHmac('sha256', AUDIT_KEY).update(s).digest('hex');
+const auditMac = (prev, r) => auditMacOf(auditFields(prev, r));
+const anchorMac = (a) => auditMacOf(`anchor|${a.keyedFrom}|${a.id}|${a.hash}`);
+const macEq = (a, b) => typeof a === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+let anchorSeen = false; // once this process has seen (or written) the anchor, its disappearing counts as tampering
+function readAnchor() {
+  let a;
+  try { a = JSON.parse(fs.readFileSync(AUDIT_ANCHOR, 'utf8')); } catch (e) { return e.code === 'ENOENT' && !anchorSeen ? null : { valid: false }; }
+  const ok = !!a && Number.isInteger(a.keyedFrom) && Number.isInteger(a.id) && typeof a.hash === 'string' && macEq(a.mac, anchorMac(a));
+  if (ok) anchorSeen = true;
+  return ok ? { keyedFrom: a.keyedFrom, id: a.id, hash: a.hash, valid: true } : { valid: false };
+}
+function writeAnchor(keyedFrom, id, hash) {
+  if (MIGRATING) { anchorAfterCommit = [keyedFrom, id, hash]; return; } // written once the upgrade is committed
+  const a = { keyedFrom, id, hash };
+  const tmp = `${AUDIT_ANCHOR}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ ...a, mac: anchorMac(a) }), { mode: 0o600 });
+  fs.renameSync(tmp, AUDIT_ANCHOR);
+  anchorSeen = true;
+}
+// "<id>.<mac>": the first keyed entry. Returns the id, or null when it's missing or wasn't written by this server.
+function keyedFromSetting() {
+  const v = (db.prepare("SELECT value FROM instance_settings WHERE key = 'auditKeyedFrom'").get() || {}).value;
+  const m = /^(\d+)\.([0-9a-f]{64})$/.exec(v || '');
+  return m && macEq(m[2], auditMacOf(`keyed-from|${m[1]}`)) ? +m[1] : null;
+}
+const auditHead = () => db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
+let AUDIT_FROM;
+function appendAuditRow(e) {
+  const last = auditHead();
+  const prev = last.hash || '';
+  const r = { id: last.id + 1, admin_id: e.admin_id || null, action: e.action, target: e.target || null, detail: String(e.detail || '').slice(0, 1000), ip: e.ip || null, created_at: Date.now() };
+  const hash = r.id >= AUDIT_FROM ? auditMac(prev, r) : auditHash(prev, r);
+  db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(r.id, r.admin_id, r.action, r.target, r.detail, r.ip, r.created_at, prev, hash);
+  return { id: r.id, hash };
+}
+// Adds an entry ({ admin_id, action, target, detail, ip }). If the newest entry the anchor remembers is missing or
+// different (entries were cut off or changed, or an older copy of the database was put back), that goes into the
+// log first, so it can't be hidden by simply carrying on.
+function auditAppend(e) {
+  const head = db.transaction(auditRows)(e);
+  // Only once the entry is committed: the anchor must never name one that could still be rolled back.
+  writeAnchor(AUDIT_FROM, head.id, head.hash);
+  return head.id;
+}
+// The database part of auditAppend, inside the caller's transaction. Returns the new entry's { id, hash }.
+function auditRows(e) {
+  const a = readAnchor();
+  if (a && !a.valid) appendAuditRow({ action: 'audit_log_gap', detail: 'The audit log’s anchor file (data/audit-anchor.json) was changed, damaged or deleted outside Hearth.' });
+  else if (a && a.id > 0) {
+    const at = db.prepare('SELECT hash FROM admin_log WHERE id = ?').get(a.id);
+    if (!at || at.hash !== a.hash) {
+      appendAuditRow({ action: 'audit_log_gap', detail: `Entry #${a.id}, the newest one recorded on this machine, is ${at ? 'different' : 'missing'}: entries were removed or changed outside Hearth, or an older copy of the database was put back.` });
+    }
+  }
+  return appendAuditRow(e);
+}
+// Walks the whole chain. { ok, entries, brokenAt, reason, keyedFrom, anchored, gaps }. reason: 'changed' (an entry
+// doesn't match its hash), 'missing' (the log ends before the newest entry the anchor remembers), 'anchor' (the
+// anchor file was edited) or 'keyed_from' (the setting saying where keyed entries start was edited or deleted).
+// gaps: entries where Hearth found and recorded such a problem earlier (the log has been intact since), including
+// signing being started over. keyedSince: when signing started (entries before keyedFrom only have plain hashes).
+function auditVerify() {
+  const a = readAnchor();
+  const out = { ok: true, entries: 0, brokenAt: null, reason: null, keyedFrom: AUDIT_FROM, keyedSince: null, anchored: !!(a && a.valid), gaps: [] };
+  const bad = (reason, brokenAt = null) => ({ ...out, ok: false, reason, brokenAt });
+  if (a && !a.valid) return bad('anchor');
+  if (keyedFromSetting() !== AUDIT_FROM || (a && a.keyedFrom !== AUDIT_FROM)) return bad('keyed_from');
+  let prev = ''; let last = 0; let seen = !a || a.id === 0; let switches = 0;
+  for (const r of db.prepare('SELECT * FROM admin_log ORDER BY id').iterate()) {
+    out.entries++;
+    const want = r.id >= AUDIT_FROM ? auditMac(prev, r) : auditHash(prev, r);
+    if (r.hash == null || (r.prev_hash || '') !== prev || r.hash !== want || (a && r.id === a.id && r.hash !== a.hash)) return bad('changed', r.id);
+    if (a && r.id === a.id) seen = true;
+    // When signing started (shown with the check). Signing only ever starts once, so a later start means the log
+    // was reset outside Hearth.
+    const restarted = r.action === 'audit_chain_keyed' && switches++ > 0;
+    if (r.action === 'audit_chain_keyed' && r.id === AUDIT_FROM) out.keyedSince = r.created_at;
+    if (r.action === 'audit_log_gap' || r.action === 'audit_anchor_reset' || restarted) out.gaps.push({ id: r.id, at: r.created_at, action: r.action, detail: r.detail });
+    prev = r.hash; last = r.id;
+  }
+  if (!seen) return { ...bad('missing', last + 1), anchoredId: a.id };
+  return out;
+}
+// (Where the keyed part starts is worked out after the upgrade has committed: see the end of this file's upgrade.)
+
+
+// v17 (data): indexes for lookups that run on every connection, start-up and server update but used to read whole
+// tables: someone's servers (and who they share one with), their DMs and friend requests, a server's channels, one
+// member's server keys, and reports about one account (the admin user list).
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id, server_id);
+CREATE INDEX IF NOT EXISTS idx_channels_server ON channels(server_id, position, created_at);
+CREATE INDEX IF NOT EXISTS idx_dm_channels_b ON dm_channels(user_b);
+CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_id);
+CREATE INDEX IF NOT EXISTS idx_server_keys_user ON server_keys(server_id, user_id, epoch);
+CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_id);
+`);
+
+// v17 (crypto): the public keys a person had before a password reset without a recovery key. Key handoffs
+// and messages they signed back then still check out against the key that was valid when they were made,
+// and the people they talked to can still open their old direct messages. Public keys only.
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_key_history (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  public_key TEXT NOT NULL,
+  sign_public_key TEXT,
+  retired_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_key_history ON user_key_history(user_id, retired_at);
+`);
+// When this Hearth started encrypting channel messages end to end: the first encrypted message, or now. No
+// member's app can write a plaintext channel message after that, so apps refuse "older" plaintext rows dated
+// later (only the server could have written them). Set once, never moved (and only looked up that once: it
+// scans every message).
+if (!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'e2eeSince'").get()) {
+  db.prepare("INSERT OR IGNORE INTO instance_settings (key, value) VALUES ('e2eeSince', ?)")
+    .run(String(db.prepare('SELECT MIN(created_at) AS t FROM messages WHERE ciphertext IS NOT NULL').get().t || Date.now()));
+}
+// v17 (crypto): who was in a server before (left, kicked, banned, deleted their account). Coming back switches
+// to a new server key, so they can't read what was said while they were away. Not cleared by a password reset
+// (which deletes their key rows, the only other trace of having been there).
+// Reports that the current server key doesn't open: enough of them from different members make the apps
+// replace it, each member's count at most a few an hour (server/index.js reportBroken).
+// server_epochs by time: rotation limits count the keys made in the last hour.
+db.exec(`
+CREATE TABLE IF NOT EXISTS former_members (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  left_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS server_key_reports (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  epoch INTEGER NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, epoch, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
+`);
+
+// v18 (observability): the health of each background job (server/jobs.js), saved so `node server/cli.js doctor`
+// can report it from another process and it survives a restart. Names and timings only, never job data.
+db.exec(`
+CREATE TABLE IF NOT EXISTS job_health (
+  name TEXT PRIMARY KEY,
+  every_ms INTEGER,
+  last_run INTEGER,
+  last_ok INTEGER,
+  last_error TEXT,
+  last_error_at INTEGER,
+  last_error_category TEXT,
+  failures INTEGER NOT NULL DEFAULT 0,
+  runs INTEGER NOT NULL DEFAULT 0,
+  total_failures INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER,
+  updated_at INTEGER NOT NULL
+);
+`);
+
+// v18 (storage): resumable uploads in progress. The bytes wait in data/upload-parts/<id>.part (never served,
+// never backed up) until the whole file is there and its SHA-256 matches; the room it needs is reserved in
+// user_files (kind 'reserved') from the start. See server/storage.js.
+db.exec(`
+CREATE TABLE IF NOT EXISTS upload_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  size INTEGER NOT NULL,
+  received INTEGER NOT NULL DEFAULT 0,
+  chunk_size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_user ON upload_sessions(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_updated ON upload_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_user_files_kind ON user_files(kind);
+`);
+
+// v18 (bots): the bot platform (server/bots.js). A bot is a users row with is_bot = 1 (it never signs in) plus a
+// bots row saying who made it. It's installed into servers one at a time, each with its own scopes and channels.
+// Tokens are stored as SHA-256 hashes only (the secret is shown once); the webhook signing secret has to be
+// usable, so it's sealed with data/secret.key instead. Deliveries hold event metadata only, never message text.
+// The news bot keeps its own tables (feeds) and shows up next to these as a built-in bot.
+db.exec(`
+CREATE TABLE IF NOT EXISTS bots (
+  id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  owner_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  description TEXT NOT NULL DEFAULT '',
+  webhook_url TEXT,
+  webhook_secret TEXT,
+  requested_scopes TEXT NOT NULL DEFAULT '[]',
+  listed INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  disabled INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_id);
+CREATE TABLE IF NOT EXISTS bot_installations (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  installed_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  scopes TEXT NOT NULL DEFAULT '[]',
+  channels TEXT NOT NULL DEFAULT '[]',
+  events TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  last_ok_at INTEGER,
+  last_error TEXT,
+  last_error_at INTEGER,
+  UNIQUE (bot_id, server_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_installations_server ON bot_installations(server_id);
+CREATE TABLE IF NOT EXISTS bot_tokens (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  installation_id TEXT REFERENCES bot_installations(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bot_tokens_bot ON bot_tokens(bot_id);
+CREATE TABLE IF NOT EXISTS bot_commands (
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  options TEXT NOT NULL DEFAULT '[]',
+  permission TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot_id, name)
+);
+CREATE TABLE IF NOT EXISTS bot_deliveries (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  installation_id TEXT,
+  server_id TEXT,
+  type TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_at INTEGER,
+  last_status INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  done_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bot_deliveries_due ON bot_deliveries(status, next_at);
+CREATE INDEX IF NOT EXISTS idx_bot_deliveries_bot ON bot_deliveries(bot_id, installation_id, created_at);
+`);
+
+// Test hook for the upgrade drill (scripts/upgrade-drill.sh, test/recovery-upgrade.test.js): the process dies here,
+// with every step above done but not committed, exactly like a crash or a power cut in the middle of an upgrade.
+// Only with NODE_ENV=test, so a stray variable on a real server does nothing.
+if (fromVersion < SCHEMA_VERSION && process.env.NODE_ENV === 'test' && process.env.HEARTH_TEST_KILL_IN_MIGRATION === '1') process.kill(process.pid, 'SIGKILL');
+
+// v18 (usability): saved messages, read state, notification preferences, pin history and member timeouts.
+// Saved messages and read state hold message ids only (a saved item's note is end-to-end encrypted, x1:, like
+// study data). mention_marks records who a message pings (the ids the sender's app already sends for push), so
+// mention counts survive a reload; user_id '*' is @everyone. Timeouts are their own table so leaving and
+// rejoining a server doesn't clear one.
+db.exec(`
+CREATE TABLE IF NOT EXISTS saved_messages (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  note TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_saved_messages_time ON saved_messages(user_id, created_at);
+CREATE TABLE IF NOT EXISTS read_states (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conv TEXT NOT NULL,
+  last_read_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, conv)
+);
+CREATE TABLE IF NOT EXISTS mention_marks (
+  message_id TEXT NOT NULL,
+  conv TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  PRIMARY KEY (message_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mention_marks_conv ON mention_marks(conv, user_id, message_id);
+CREATE TABLE IF NOT EXISTS notify_prefs (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'default',
+  mute_until INTEGER,
+  suppress_everyone INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, target)
+);
+CREATE INDEX IF NOT EXISTS idx_notify_prefs_target ON notify_prefs(target, level);
+CREATE TABLE IF NOT EXISTS user_prefs (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  data TEXT NOT NULL DEFAULT '{}',
+  read_baseline TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pin_log (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  user_id TEXT,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pin_log_channel ON pin_log(channel_id, created_at);
+CREATE TABLE IF NOT EXISTS member_timeouts (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  until INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  by_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
+`);
+
+// v18 (voice reliability): a version number for each call's region. Every change bumps it, so when two people
+// switch the region at the same moment the last write wins and every app settles on the newest one, whatever
+// order the announcements arrive in.
+addColumn('channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('dm_channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
+
+
+// v18 (quality): indexes for reads that walked a whole channel or table (numbers in docs/PERFORMANCE.md).
+//   pins          a conversation's pinned messages (a handful) without reading all its messages
+//   top-level     a channel's history without stepping over thread replies (a busy thread's replies are the
+//                 newest rows of its channel's index, so the latest page used to read past all of them)
+//   created_at    the admin activity chart (every staff member's app asks for it at start-up) counts messages per
+//                 day with a range per day instead of scanning both message tables 14 times
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_pins ON messages(channel_id, pinned_at) WHERE pinned_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dm_messages_pins ON dm_messages(dm_id, pinned_at) WHERE pinned_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_channel_top ON messages(channel_id, id) WHERE thread_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_created ON dm_messages(created_at);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
+db.exec('COMMIT');
+MIGRATING = false;
+if (anchorAfterCommit) writeAnchor(...anchorAfterCommit);
+
+// v17 (admin): where the audit log's keyed part starts, checked on every start. Only once the upgrade above has
+// committed: the anchor file is outside the database, so written during the upgrade it would outlive a rollback (a
+// later step failing, a crash, a restart) and name an entry that was never kept, which every start after that reports
+// as entries cut off the end. Everything here follows from the marker and the anchor, so after a crash it simply runs
+// again. The marker and the entry that says signing started are committed together, and the anchor written after.
+{
+  let anchorTo = null; // what the anchor file should name once this is committed
+  db.transaction(() => {
+    const anchor = readAnchor();
+    const anchored = !!(anchor && anchor.valid);
+    const marked = !!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'auditKeyedFrom'").get();
+    const set = keyedFromSetting();
+    const head = auditHead();
+    // Nothing says where the keyed entries start: either a log from before keyed hashing (this upgrade), or one whose
+    // markers were deleted outside Hearth so that entries edited and re-hashed with plain SHA-256 pass as old ones.
+    // An entry keyed with this server's key gives the second case away: the tamper check then reports 'keyed_from'.
+    let firstKeyed = null;
+    if (!marked && !anchored) {
+      for (const r of db.prepare('SELECT * FROM admin_log WHERE hash IS NOT NULL ORDER BY id').iterate()) if (r.hash === auditMac(r.prev_hash, r)) { firstKeyed = r.id; break; }
+    }
+    AUDIT_FROM = anchored ? anchor.keyedFrom : set !== null ? set : firstKeyed !== null ? firstKeyed : head.id + 1;
+    if (firstKeyed !== null) log.warn('db', 'audit_anchor', { msg: `The audit log has entries keyed by this server from #${firstKeyed}, but the record of where they start was deleted outside Hearth.` });
+    else if (!marked) db.prepare('INSERT INTO instance_settings (key, value) VALUES (?, ?)').run('auditKeyedFrom', `${AUDIT_FROM}.${auditMacOf(`keyed-from|${AUDIT_FROM}`)}`);
+    // Keyed hashing starts now, and the log says so in a keyed entry, with the date. Someone who wipes the markers to
+    // pass edited entries off as old ones can't avoid a new one of these, dated when they did it (and listed as a
+    // gap when an earlier one is still there).
+    const starting = !marked && !anchored && firstKeyed === null;
+    if (starting && (head.id > 0 || db.prepare('SELECT 1 FROM users LIMIT 1').get())) {
+      anchorTo = auditRows({ action: 'audit_chain_keyed', detail: head.id
+        ? `Entries from #${AUDIT_FROM} on are signed with this server’s secret key. The ${head.id === 1 ? 'entry before it was' : `${head.id} entries before it were`} written by an older version of Hearth and only have plain hashes. If this server was already up to date, the log was reset outside Hearth.`
+        : `Entries from #${AUDIT_FROM} on are signed with this server’s secret key.` });
+    } else if (!anchor) {
+      // A keyed log without its anchor: a restored backup or a moved data folder (or the file was deleted). Start a
+      // new anchor, and say so in the log.
+      anchorTo = marked && head.id > 0
+        ? auditRows({ action: 'audit_anchor_reset', detail: `The audit log’s anchor file was missing (a restored backup or a moved data folder?), so a new one was started at entry #${head.id + 1}. Entries cut off the end before this can’t be detected.` })
+        : head;
+    }
+  }).immediate();
+  if (anchorTo) writeAnchor(AUDIT_FROM, anchorTo.id, anchorTo.hash || '');
+}
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
-// hundreds of them, many run per message). Statements are only used with get/all/run, so sharing is safe.
+// hundreds of them, many run per message). Statements are only used with get/all/run (or an iterate() loop that
+// finishes before anything else runs), so sharing is safe.
 // Queries built with a variable number of placeholders stop being cached once the cache is full.
 const compile = db.prepare.bind(db);
 const statements = new Map();
@@ -702,4 +1226,4 @@ db.prepare = (sql) => {
   return st;
 };
 
-module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash };
+module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION };

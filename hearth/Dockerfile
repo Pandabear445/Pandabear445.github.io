@@ -41,9 +41,9 @@ RUN chmod 0755 /usr/local/bin/hearth-entrypoint \
 VOLUME /data
 EXPOSE 3000
 
-# Healthy = /api/config answers. Hearth speaks HTTPS (self-signed) unless HTTPS=false, so try both.
+# Healthy = /api/health/live answers (the liveness probe; /api/health/ready also checks the database and disk). Hearth speaks HTTPS (self-signed) unless HTTPS=false, so try both.
 HEALTHCHECK --interval=30s --timeout=6s --start-period=40s --retries=3 \
-  CMD ["node", "-e", "const p=process.env.PORT||3000,h=require('http'),s=require('https');const t=(m,u)=>new Promise((ok,no)=>{const r=m.get(u+'://127.0.0.1:'+p+'/api/config',{rejectUnauthorized:false,timeout:4000},x=>{x.resume();x.statusCode===200?ok():no()});r.on('error',no);r.on('timeout',()=>r.destroy(new Error('timeout')))});const o=String(process.env.HTTPS).toLowerCase()==='false'?[[h,'http'],[s,'https']]:[[s,'https'],[h,'http']];t(...o[0]).catch(()=>t(...o[1])).then(()=>process.exit(0),()=>process.exit(1))"]
+  CMD ["node", "-e", "const p=process.env.PORT||3000,h=require('http'),s=require('https');const t=(m,u)=>new Promise((ok,no)=>{const r=m.get(u+'://127.0.0.1:'+p+'/api/health/live',{rejectUnauthorized:false,timeout:4000},x=>{x.resume();x.statusCode===200?ok():no()});r.on('error',no);r.on('timeout',()=>r.destroy(new Error('timeout')))});const o=String(process.env.HTTPS).toLowerCase()==='false'?[[h,'http'],[s,'https']]:[[s,'https'],[h,'http']];t(...o[0]).catch(()=>t(...o[1])).then(()=>process.exit(0),()=>process.exit(1))"]
 
 # Hearth never runs as root. docker-compose.yml starts it as uid 1000 directly. If the container is started
 # as root anyway (plain `docker run`, or a docker-compose.yml from before this change, which the update tool

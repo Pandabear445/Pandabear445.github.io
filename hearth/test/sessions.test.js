@@ -128,6 +128,27 @@ test('a suspended account is cut off immediately, live connections included', as
   assert.equal((await srv.login(u)).status, 403);
 });
 
+// The app signs out (and says why) on 'session:revoked'; a connection closed without it only reconnects, gets
+// refused and lands on the sign-in screen with no explanation. So every way of cutting someone off sends it first.
+test('suspension, staff sign-out and account deletion tell open windows why before closing them', async () => {
+  const cutOff = async (u, act) => {
+    const sock = await srv.socket(u.token);
+    let why = null;
+    sock.on('session:revoked', (p) => { why = p && p.reason; });
+    assert.equal((await act()).status, 200);
+    assert.ok(await waitFor(() => sock.disconnected), 'socket closed');
+    return why;
+  };
+  const owner = { token: srv.owner.token, ip: srv.owner.ip };
+  const a = await srv.register();
+  assert.equal(await cutOff(a, () => srv.api('POST', `/admin/users/${a.id}/suspend`, { ...owner, body: { reason: 'test', hours: 1 } })), 'suspended');
+  const b = await srv.register();
+  assert.equal(await cutOff(b, () => srv.api('POST', `/admin/users/${b.id}/logout`, owner)), 'staff');
+  const c = await srv.register();
+  const laptop = (await srv.login(c)).json.token;
+  assert.equal(await cutOff({ ...c, token: laptop }, () => srv.api('DELETE', '/me', { token: c.token, ip: c.ip, body: { authKey: c.authKey, confirm: c.username } })), 'account_deleted');
+});
+
 test('restarting the server keeps everyone signed in and the database intact (twice)', async () => {
   const u = await srv.register();
   for (let i = 0; i < 2; i++) {

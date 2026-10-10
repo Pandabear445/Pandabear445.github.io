@@ -8,9 +8,9 @@
 //
 // Bot posts are public news, so they're stored like older messages (protected by the server's at-rest
 // encryption, not end-to-end) and the app labels them that way. Everything people write stays end-to-end.
-const dns = require('dns').promises;
-const net = require('net');
 const crypto = require('crypto');
+const netguard = require('./netguard');
+const jobs = require('./jobs');
 
 const BOT_ID = 'newsbot00000000000001';
 const KINDS = {
@@ -30,52 +30,21 @@ const MAX_POSTS_PER_CHECK = 3;
 
 // ------------------------------------------------------------------ fetching safely
 // Feeds are fetched by this server, so addresses inside your network (the VPS itself, the router, cloud
-// metadata) are refused, and every redirect is checked again.
-function privateIp(ip) {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split('.').map(Number);
-    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
-  }
-  const v = ip.toLowerCase();
-  return v === '::1' || v === '::' || v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb') || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('::ffff:') && privateIp(v.slice(7));
-}
-async function assertPublic(urlStr) {
-  let u;
-  try { u = new URL(urlStr); } catch { throw new Error('That isn’t a web address.'); }
-  if (!/^https?:$/.test(u.protocol)) throw new Error('Only http(s) addresses.');
-  if (process.env.FEED_ALLOW_PRIVATE === '1') return u;
-  const host = u.hostname.replace(/^\[|\]$/g, '');
-  const ips = net.isIP(host) ? [host] : (await dns.lookup(host, { all: true }).catch(() => [])).map((x) => x.address);
-  if (!ips.length) throw new Error(`Couldn’t find ${host}.`);
-  if (ips.some(privateIp)) throw new Error('That address is inside a private network.');
-  return u;
-}
+// metadata) are refused, the connection goes to the very address that was checked (no DNS rebinding), and
+// every redirect is checked again. See netguard.js.
+const allowPrivate = () => process.env.FEED_ALLOW_PRIVATE === '1'; // tests only: they serve feeds from localhost
+const privateIp = netguard.blockedIp;
+const assertPublic = (urlStr) => netguard.checkPublicUrl(urlStr, { allowPrivate: allowPrivate() });
 async function safeGet(urlStr, { accept = 'application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.5, */*;q=0.1', max = 3 * 1024 * 1024, timeout = 12000 } = {}) {
-  let url = urlStr;
-  for (let hop = 0; hop < 5; hop++) {
-    await assertPublic(url);
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), timeout);
-    try {
-      const r = await fetch(url, { redirect: 'manual', signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HearthNewsBot/1.0; +self-hosted chat)', Accept: accept } });
-      if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { url = new URL(r.headers.get('location'), url).href; continue; }
-      if (!r.ok) throw new Error(`The site answered ${r.status}.`);
-      const reader = r.body.getReader();
-      const chunks = []; let size = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.length;
-        if (size > max) { try { reader.cancel(); } catch { /* stop */ } throw new Error('The feed is too big.'); }
-        chunks.push(value);
-      }
-      return { body: Buffer.concat(chunks.map((c) => Buffer.from(c))), type: r.headers.get('content-type') || '', url };
-    } catch (e) {
-      if (e.name === 'AbortError') throw new Error('The site took too long to answer.');
-      throw e;
-    } finally { clearTimeout(t); }
+  let r;
+  try {
+    r = await netguard.request(urlStr, { allowPrivate: allowPrivate(), maxRedirects: 4, timeout, maxBytes: max, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HearthNewsBot/1.0; +self-hosted chat)', Accept: accept } });
+  } catch (e) {
+    if (e.code === 'TOO_BIG') throw new Error('The feed is too big.');
+    throw e;
   }
-  throw new Error('Too many redirects.');
+  if (!r.ok) throw new Error(`The site answered ${r.status}.`);
+  return { body: r.body, type: r.type, url: r.url };
 }
 
 // ------------------------------------------------------------------ reading RSS / Atom
@@ -317,8 +286,9 @@ module.exports = function setupNewsbot(ctx) {
       for (const f of due) await check(f);
     } finally { running = false; }
   }
-  setInterval(() => { tick().catch(() => {}); userTick().catch(() => {}); }, 60000).unref();
-  setTimeout(() => { tick().catch(() => {}); userTick().catch(() => {}); }, 20000).unref();
+  // The feed worker's health (last run, last success) is what Admin → Health checks, not just that the bot exists.
+  jobs.every('newsbot.feeds', 60000, tick, { firstDelay: 20000 });
+  jobs.every('newsbot.trackers', 60000, () => userTick(), { firstDelay: 20000 });
 
   // ------------------------------------------------------------------ personal trackers ("Updates")
   // The same feeds, followed by one person for themselves instead of posted to a server. Found items go to their

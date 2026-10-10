@@ -45,7 +45,7 @@ const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24
 module.exports = function setupAccounts(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
     tokenId, requireInstanceAdmin, requireOutranks, auditLog, secEvent, cleanIp, emitKeyState, brandName, isB64ish, isSalt, atRestKey,
-    stepUp, createSession, revokeSessions } = ctx;
+    stepUp, createSession, revokeSessions, hitsSoFar, verifyCaptcha } = ctx;
   const now = () => Date.now();
 
   // ------------------------------------------------------------------ sending email
@@ -79,9 +79,10 @@ module.exports = function setupAccounts(ctx) {
     await transport.sendMail({ from: c.from, to, subject, text });
   }
   // Security notices ("your password was changed") go to the account's confirmed email, if it has one.
-  function notify(row, what, text) {
+  // footer: the closing line (alerts to the owner, server/alerts.js, aren't about something "you" did).
+  function notify(row, what, text, { footer = 'If this wasn\'t you, reset your password right away and tell the server owner.' } = {}) {
     if (!row || !row.email || !row.email_verified || !mailReady()) return;
-    sendMail({ to: row.email, subject: `${brandName()}: ${what}`, text: `${text}\n\nIf this wasn't you, reset your password right away and tell the server owner.` }).catch(() => {});
+    sendMail({ to: row.email, subject: `${brandName()}: ${what}`, text: footer ? `${text}\n\n${footer}` : text }).catch(() => {});
   }
   const mask = (email) => { if (!email) return ''; const [u, d] = email.split('@'); return `${u.slice(0, 1)}${'•'.repeat(Math.max(1, Math.min(6, u.length - 1)))}@${d}`; };
 
@@ -132,7 +133,19 @@ module.exports = function setupAccounts(ctx) {
     const t = db.prepare('SELECT * FROM auth_tokens WHERE id = ? AND kind = ?').get(tokenId(raw), kind);
     return t && t.expires_at > now() ? t : null;
   };
-  setInterval(() => db.prepare('DELETE FROM auth_tokens WHERE expires_at < ?').run(now()), 3600000).unref();
+  // A reset link only works while the account still has the confirmed address it was sent to. So moving to a
+  // new email (say, because the old inbox was broken into) or removing it cancels links already sent there.
+  const resetLinkFor = (raw) => {
+    const t = findToken(raw, 'reset');
+    const row = t && getUserRow(t.user_id);
+    if (!row || row.deleted_at) return null;
+    let d = {};
+    try { d = JSON.parse(t.data || '{}') || {}; } catch { /* treated as not matching */ }
+    return d.email && row.email === d.email && row.email_verified ? { t, row } : null;
+  };
+  // Outstanding reset links stop working: after a password change, and when the email changes or goes away.
+  const dropResetLinks = (uid) => db.prepare("DELETE FROM auth_tokens WHERE user_id = ? AND kind = 'reset'").run(uid);
+  require('./jobs').every('accounts.token_purge', 3600000, () => db.prepare('DELETE FROM auth_tokens WHERE expires_at < ?').run(now()));
 
   // Before setting up two-factor (it isn't on yet, so the password is all there is to check).
   async function checkPassword(req, row, authKey) {
@@ -147,12 +160,14 @@ module.exports = function setupAccounts(ctx) {
     const row = await stepUp(req, req.body);
     const email = String((req.body || {}).email || '').trim().toLowerCase().slice(0, 254);
     if (!EMAIL_RE.test(email)) fail(400, 'That doesn’t look like an email address.');
-    const other = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.userId);
-    if (other) fail(409, 'That email is already used by another account.');
     if (!mailReady()) fail(503, 'Email isn’t set up on this server yet. Ask the owner.');
+    // An address another account already has gets the same answer here (otherwise this would tell anyone
+    // which emails have accounts). Only that inbox learns why no code came; the pending code can't be guessed.
+    const taken = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.userId);
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-    newToken(req.userId, 'email', { email, code: sha(code), tries: 0 }, 30 * 60000);
-    await sendMail({ to: email, subject: `${brandName()}: your confirmation code is ${code}`, text: `Your code to confirm this email for ${row.username} on ${brandName()} is:\n\n    ${code}\n\nIt works for 30 minutes. If you didn't ask for this, ignore this email.` });
+    newToken(req.userId, 'email', { email, code: sha(taken ? crypto.randomBytes(32).toString('hex') : code), tries: 0 }, 30 * 60000);
+    if (taken) await sendMail({ to: email, subject: `${brandName()}: this email already has an account`, text: `Someone asked to add this email address to an account on ${brandName()}, but it already belongs to another account there, so nothing was changed.\n\nIf that was you, sign in to the account that has this address. If not, you can ignore this email.` });
+    else await sendMail({ to: email, subject: `${brandName()}: your confirmation code is ${code}`, text: `Your code to confirm this email for ${row.username} on ${brandName()} is:\n\n    ${code}\n\nIt works for 30 minutes. If you didn't ask for this, ignore this email.` });
     res.json({ ok: true, sentTo: email });
   }));
   api.post('/me/email/verify', auth, (req, res) => {
@@ -171,6 +186,7 @@ module.exports = function setupAccounts(ctx) {
     const before = getUserRow(req.userId);
     db.prepare('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?').run(d.email, req.userId);
     db.prepare('DELETE FROM auth_tokens WHERE id = ?').run(t.id);
+    if (before.email !== d.email) dropResetLinks(req.userId); // links sent to the old address stop working
     // The old address hears about it (someone with a stolen session and password could otherwise quietly
     // move password resets to their own email).
     if (before.email && before.email !== d.email) notify(before, 'your email was changed', `The email for ${before.username} was changed to ${mask(d.email)}. Password resets now go there.`);
@@ -182,6 +198,7 @@ module.exports = function setupAccounts(ctx) {
     const row = await stepUp(req, req.body);
     notify(row, 'your email was removed', `The email was removed from ${row.username}. Password resets by email won't work until a new one is added.`);
     db.prepare('UPDATE users SET email = NULL, email_verified = 0 WHERE id = ?').run(req.userId);
+    dropResetLinks(req.userId);
     auditLog(req, 'email_removed', req.userId, row.username);
     broadcastUser(req.userId);
     res.json(selfUser(getUserRow(req.userId)));
@@ -320,18 +337,29 @@ module.exports = function setupAccounts(ctx) {
 
   // ------------------------------------------------------------------ forgot password
   // Always answers the same way, so it can't be used to find out which accounts or emails exist.
-  // Limits: per network, for everyone together, and per account — the last one quietly (refusing would
-  // tell the asker that the account exists), so an inbox can't be flooded with reset emails.
+  // The robot check (the sign-in one) comes before anything is counted. Limits: per network, per account and
+  // for everyone together. The per-account one is quiet (refusing would tell the asker that the account
+  // exists), so an inbox can't be flooded with reset emails. The one for everyone protects the mail quota: only
+  // an account's first email in the hour counts toward it, so asking about the same people again and again
+  // can't fill it, and while it's full everyone is told to try later alike, which says nothing about anyone.
+  const FORGOT_ALL = 300;
   api.post('/auth/forgot', wrap(async (req, res) => {
     limitNet(req, 'forgot', 5, 15 * 60000);
-    rateLimit('forgot:all', 300, 3600000);
     if (!mailReady()) fail(503, 'Password reset by email isn’t set up on this server. Ask the owner.');
+    verifyCaptcha((req.body || {}).captcha, 'login', req.ip);
+    if (hitsSoFar('forgot:all') >= FORGOT_ALL) {
+      secEvent('reset_capped', cleanIp(req.ip));
+      fail(429, 'Lots of password resets were asked for in the last hour. Please try again later.', 'rate_limited');
+    }
     const login = String((req.body || {}).login || '').trim().slice(0, 200);
     const row = login.includes('@')
       ? db.prepare('SELECT * FROM users WHERE email = ? AND email_verified = 1').get(login.toLowerCase())
       : db.prepare('SELECT * FROM users WHERE username = ?').get(login);
-    if (row && row.email && row.email_verified && !row.is_bot && !row.deleted_at && countHit('forgotuser:' + row.id, 3600000) <= 3) {
-      const raw = newToken(row.id, 'reset', {}, 30 * 60000);
+    const sent = row && row.email && row.email_verified && !row.is_bot && !row.deleted_at ? countHit('forgotuser:' + row.id, 3600000) : 0;
+    if (sent && sent <= 3) {
+      if (sent === 1) countHit('forgot:all', 3600000);
+      // The link only works while the account still has this address (see /auth/reset).
+      const raw = newToken(row.id, 'reset', { email: row.email }, 30 * 60000);
       const link = `${mailCfg().publicUrl}/#reset=${raw}`;
       sendMail({ to: row.email, subject: `${brandName()}: reset your password`, text:
         `Someone (hopefully you) asked to reset the password for ${row.username} on ${brandName()}.\n\nOpen this link within 30 minutes to choose a new one:\n\n${link}\n\n`
@@ -349,9 +377,9 @@ module.exports = function setupAccounts(ctx) {
   const proofKey = (shared, nonce, uid) => crypto.createHmac('sha256', shared).update(`hearth-reset-proof|${uid}|${nonce}`).digest('base64');
   api.post('/auth/reset/info', (req, res) => {
     limitNet(req, 'resetinfo', 20, 15 * 60000);
-    const t = findToken((req.body || {}).token, 'reset');
-    if (!t) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
-    const row = getUserRow(t.user_id);
+    const link = resetLinkFor((req.body || {}).token);
+    if (!link) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
+    const { t, row } = link;
     const eph = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const nonce = crypto.randomBytes(24).toString('base64url');
     db.prepare('UPDATE auth_tokens SET data = ? WHERE id = ?').run(JSON.stringify({ ...JSON.parse(t.data || '{}'), proof: { priv: seal({ k: eph.privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64') }), nonce } }), t.id);
@@ -370,11 +398,10 @@ module.exports = function setupAccounts(ctx) {
   api.post('/auth/reset', wrap(async (req, res) => {
     limitNet(req, 'reset', 10, 15 * 60000);
     const b = req.body || {};
-    const t = findToken(b.token, 'reset');
-    if (!t) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
+    const link = resetLinkFor(b.token);
+    if (!link) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
+    const { t, row } = link;
     rateLimit('resetuser:' + t.user_id, 10, 15 * 60000);
-    const row = getUserRow(t.user_id);
-    if (!row || row.deleted_at) fail(400, 'This reset link has expired or was already used. Ask for a new one.');
     if (typeof b.authKey !== 'string' || !/^[0-9a-f]{64}$/.test(b.authKey) || !isB64ish(b.encPrivateKey, 4000) || !isSalt(b.kdfSalt)) fail(400, 'Bad key material.');
     const keep = b.keepKeys === true;
     if (keep && !row.enc_private_key_recovery) fail(400, 'This account has no recovery key, so its keys can’t be kept.');
@@ -389,7 +416,10 @@ module.exports = function setupAccounts(ctx) {
       db.prepare("UPDATE users SET auth_hash = ?, kdf = 'argon2id', kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(hash, b.kdfSalt, b.encPrivateKey, row.id);
       if (!keep) {
         // New keys: the old ones are gone for good. Friends' apps see the change (and say so), and re-share
-        // every server's current key with the new one once someone verifies it.
+        // every server's current key with the new one once someone verifies it. The old PUBLIC keys are kept on
+        // record: key handoffs and posts signed with them still check out, and the people this account talked
+        // to can still open their old direct messages (they hold their own half of those keys).
+        if (row.public_key) db.prepare('INSERT INTO user_key_history (user_id, public_key, sign_public_key, retired_at) VALUES (?, ?, ?, ?)').run(row.id, row.public_key, row.sign_public_key || null, now());
         db.prepare('UPDATE users SET public_key = ?, sign_public_key = NULL, enc_sign_private_key = NULL, enc_private_key_recovery = NULL, recovery_salt = NULL WHERE id = ?').run(b.publicKey, row.id);
         db.prepare('DELETE FROM server_keys WHERE user_id = ?').run(row.id);
       }
@@ -409,5 +439,5 @@ module.exports = function setupAccounts(ctx) {
 
   // What selfUser() adds about these settings (only ever sent to the account itself).
   const selfExtras = (row) => ({ email: row.email || null, emailVerified: !!row.email_verified, emailMasked: mask(row.email), hasRecovery: !!row.enc_private_key_recovery, totpEnabled: !!row.totp_enabled, backupCodesLeft: row.totp_enabled ? JSON.parse(row.backup_codes || '[]').length : 0 });
-  return { require2fa, selfExtras, mailReady, sendMail, mask, notify };
+  return { require2fa, selfExtras, mailReady, sendMail, mask, notify, dropResetLinks };
 };

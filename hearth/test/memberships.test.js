@@ -69,7 +69,7 @@ test('memberships: off until the Hearth owner sets up Stripe; only they can', as
   const admin = srv.owner;
   assert.equal((await as(admin, 'PUT', '/admin/memberships', { key: 'pk_live_nope' })).status, 400, 'publishable keys are refused');
   assert.equal((await as(admin, 'PUT', '/admin/memberships', { feePercent: 50 })).status, 400, 'fee capped');
-  const r = await as(admin, 'PUT', '/admin/memberships', { enabled: true, key: 'sk_test_' + 'k'.repeat(24), webhookSecret: WHSEC, feePercent: 5, currency: 'usd' });
+  const r = await as(admin, 'PUT', '/admin/memberships', { enabled: true, key: 'sk_test_' + 'k'.repeat(24), webhookSecret: WHSEC, feePercent: 5, currency: 'usd', authKey: admin.authKey });
   assert.equal(r.status, 200, r.text);
   const cfg = (await as(admin, 'GET', '/admin/memberships')).json;
   assert.deepEqual([cfg.config.enabled, cfg.config.keySet, cfg.config.keyMode, cfg.config.webhookSet, cfg.config.feePercent, cfg.config.currency], [true, true, 'test', true, 5, 'USD']);
@@ -164,4 +164,33 @@ test('memberships: forged or stale webhooks are refused; leaving stops the billi
   assert.equal((await as(fan, 'POST', `/servers/${server.id}/leave`)).status, 200);
   for (let i = 0; i < 20 && !subs.get(subId).cancel_at_period_end; i++) await new Promise((r) => setTimeout(r, 50));
   assert.equal(subs.get(subId).cancel_at_period_end, true, 'Stripe was told to stop renewing');
+});
+
+test('memberships: when a membership ends, the members-only call drops that person (they don’t keep listening)', async () => {
+  const { owner, fan, server, role } = await setup();
+  await as(owner, 'POST', `/servers/${server.id}/memberships/connect`);
+  await as(owner, 'POST', `/servers/${server.id}/memberships/refresh`);
+  const tier = (await as(owner, 'POST', `/servers/${server.id}/memberships/tiers`, { name: 'Backstage', priceCents: 400, roleId: role.id })).json;
+  // A voice channel only Supporters can see and join (VIEW_CHANNEL = 1, CONNECT = 64).
+  const call = (await as(owner, 'POST', `/servers/${server.id}/channels`, { name: 'backstage', type: 'voice' })).json;
+  await as(owner, 'PUT', `/channels/${call.id}/overrides`, { overrides: [{ type: 'role', id: server.id, allow: 0, deny: 1 | 64 }, { type: 'role', id: role.id, allow: 1 | 64, deny: 0 }] });
+  const subId = 'sub_' + hex(8);
+  const meta = { kind: 'membership', server: server.id, tier: tier.id, user: fan.id };
+  subs.set(subId, { id: subId, status: 'active', customer: 'cus_3', cancel_at_period_end: false, current_period_end: Math.floor(Date.now() / 1000) + 30 * 86400, metadata: meta });
+  assert.equal(await hook({ type: 'customer.subscription.updated', data: { object: subs.get(subId) } }), 200);
+  assert.deepEqual(rolesOf(server.id, fan.id), [role.id]);
+  const so = await srv.socket(owner.token); const sf = await srv.socket(fan.token);
+  const ack = (s, ev, p) => new Promise((r) => s.emit(ev, p, r));
+  try {
+    assert.equal((await ack(so, 'voice:join', { channelId: call.id })).ok, true);
+    assert.equal((await ack(sf, 'voice:join', { channelId: call.id })).ok, true, 'a paying member joins');
+    const kicked = new Promise((r) => { sf.once('voice:kicked', r); setTimeout(() => r(null), 3000); });
+    subs.get(subId).status = 'canceled';
+    assert.equal(await hook({ type: 'customer.subscription.deleted', data: { object: subs.get(subId) } }), 200);
+    assert.ok(await kicked, 'the ended member is taken out of the call');
+    assert.ok((await ack(sf, 'voice:signal', { to: so.id, data: { x: 1 } })).error, 'and can’t signal anyone in it');
+    const inCall = (await as(owner, 'GET', '/bootstrap')).json.voice[call.id] || [];
+    assert.equal(inCall.some((x) => x.userId === fan.id), false);
+    assert.equal(inCall.some((x) => x.userId === owner.id), true, 'the owner stays');
+  } finally { so.close(); sf.close(); }
 });

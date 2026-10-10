@@ -113,6 +113,7 @@ test('every admin endpoint refuses normal users (403) and anonymous callers (401
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'accounts.js'), 'utf8')
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'activity.js'), 'utf8')
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'money.js'), 'utf8')
+    + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'memberships.js'), 'utf8')
     + require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'server', 'regions.js'), 'utf8');
   const routes = [...src.matchAll(/api\.(get|post|put|patch|delete)\('(\/admin\/[^']*)'/g)].map((m) => [m[1].toUpperCase(), m[2].replace(/:(\w+)/g, (x, k) => (k === 'id' ? alice.id : 'x'))]);
   assert.ok(routes.length > 40, `found ${routes.length} admin routes`);
@@ -126,8 +127,8 @@ test('every admin endpoint refuses normal users (403) and anonymous callers (401
 
 test('staff ranks: a moderator can’t use admin tools or act on admins; admins can’t touch the owner', async () => {
   const mod = await srv.register(); const admin = await srv.register();
-  await as(srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator' });
-  await as(srv.owner, 'PUT', '/admin/staff', { userId: admin.id, role: 'admin' });
+  await as(srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator', authKey: srv.owner.authKey });
+  await as(srv.owner, 'PUT', '/admin/staff', { userId: admin.id, role: 'admin', authKey: srv.owner.authKey });
   assert.equal((await as(mod, 'GET', '/admin/settings')).status, 403);
   assert.equal((await as(mod, 'PUT', '/admin/registration', { mode: 'open' })).status, 403);
   assert.equal((await as(mod, 'POST', `/admin/users/${admin.id}/suspend`, { reason: 'x' })).status, 403);
@@ -149,8 +150,10 @@ test('a deleted account is gone: can’t sign in, its sessions are dead, its nam
   assert.equal((await srv.api('GET', '/bootstrap', { token: u.token, ip: u.ip })).status, 401);
   assert.equal((await srv.api('GET', '/bootstrap', { token: other, ip: u.ip })).status, 401);
   assert.equal((await srv.login(u)).status, 401);
-  const row = srv.sql('SELECT username, public_key, email, totp_secret, deleted_at FROM users WHERE id = ?', u.id)[0];
-  assert.ok(row.deleted_at && row.public_key === '' && !row.email && !row.totp_secret && row.username !== u.username);
+  const row = srv.sql('SELECT username, public_key, enc_private_key, email, totp_secret, deleted_at FROM users WHERE id = ?', u.id)[0];
+  // The private key is erased; the PUBLIC key stays, so the people they talked to can still read old messages.
+  assert.ok(row.deleted_at && row.enc_private_key === '' && !row.email && !row.totp_secret && row.username !== u.username);
+  assert.equal(row.public_key, u.publicKey);
   await srv.register(u.username); // the name can be used again
   assert.equal((await as(srv.owner, 'DELETE', '/me', { authKey: srv.owner.authKey, confirm: 'owner' })).status, 400, 'the instance owner must hand over first');
   assert.equal((await as(alice, 'DELETE', '/me', { authKey: alice.authKey, confirm: 'alice' })).json.code, 'owns_servers');

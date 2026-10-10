@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hearth updater — installs an update zip on this server, safely.
 #
-#   hearth-update /tmp/hearth-update.zip     install an update
+#   hearth-update path/to/update.zip         install an update (checked against update.zip.sha256 next to it)
 #   hearth-update --rollback [backup]        go back to the version before the last update (or a chosen backup)
 #   hearth-update --status                   where Hearth is, how it runs, its version, health, backups, disk space
 #   hearth-update --logs                     Hearth's last 80 log lines (handy when reporting a problem)
@@ -16,8 +16,12 @@
 #   5. Swaps to the new version and checks it actually answers. If not, it rolls back by itself.
 set -Eeuo pipefail
 
-BACKUP_ROOT=/root/hearth-backups
-CONF=/etc/hearth-update.conf
+# Where backups, the remembered install folder, this script's installed copy and the lock live. (The variables
+# only exist so the tests can run this script in a scratch folder; sudo doesn't pass them through.)
+BACKUP_ROOT="${HEARTH_BACKUP_ROOT:-/root/hearth-backups}"
+CONF="${HEARTH_UPDATE_CONF:-/etc/hearth-update.conf}"
+BIN="${HEARTH_UPDATE_BIN:-/usr/local/bin/hearth-update}"
+LOCK="${HEARTH_UPDATE_LOCK:-/run/lock/hearth-update.lock}"
 KEEP=5
 
 c_y=$'\033[1;33m'; c_g=$'\033[1;32m'; c_r=$'\033[1;31m'; c_b=$'\033[1m'; c_0=$'\033[0m'
@@ -52,7 +56,8 @@ if [ "$ACTION" = update ] || [ "$ACTION" = rollback ]; then
   printf 'Hearth updater started %s (log: %s)\n' "$(date)" "$LOG"
   # Only one update at a time (a double-click or a second terminal can't start another one halfway through).
   if command -v flock >/dev/null 2>&1; then
-    { exec 9>/run/lock/hearth-update.lock; } 2>/dev/null || exec 9>/tmp/hearth-update.lock
+    # (Fallback: root's own backup folder, never a fixed name in /tmp that another account could plant.)
+    { exec 9>"$LOCK"; } 2>/dev/null || exec 9>"$BACKUP_ROOT/.update.lock"
     flock -n 9 || die "Another update is already running on this server. Wait for it to finish, then try again."
   fi
 fi
@@ -79,7 +84,7 @@ need unzip; need rsync; need curl
 
 # Keep a copy of this script at /usr/local/bin/hearth-update so "hearth-update --rollback" always works.
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-if [ "$SELF" != /usr/local/bin/hearth-update ] && [ -f "$SELF" ]; then cp "$SELF" /usr/local/bin/hearth-update && chmod +x /usr/local/bin/hearth-update; fi
+if [ "$SELF" != "$BIN" ] && [ -f "$SELF" ]; then cp "$SELF" "$BIN" && chmod +x "$BIN"; fi
 
 # ---------------------------------------------------------------- find the install
 find_install() {
@@ -138,6 +143,46 @@ plain_pid() {
   done
   return 0
 }
+
+# Plain mode (started by hand with npm start / node): Hearth usually runs as an ordinary user. Restart it as
+# that same user, never as root, or an update would quietly turn it into a root process (and its new files in
+# data/ would be root's). Whose it is: data/'s owner. A running process only changes that when it's root's
+# (only root can start one; Hearth then stays root, as before): any account that can enter this folder could
+# start a look-alike "node server/index.js" here, and Hearth must never come back as that account.
+# The program files keep their owner: when they're that user's (the usual case), that user also installs the
+# libraries, so their install scripts never run as root. Root-owned program files stay root's.
+RUN_AS=root; STAGE_AS=root; RUN_PFX=(); STAGE_PFX=()
+# Sets PFX to the command prefix that runs something as account $1. setpriv becomes the command itself, so
+# nothing stays behind as root; runuser where there's no setpriv.
+prefix_for() {
+  local pw gid home
+  pw="$(getent passwd "$1" || true)"
+  [ -n "$pw" ] || die "Couldn't look up the account $1 (Hearth runs as it)."
+  gid="$(cut -d: -f4 <<< "$pw")"; home="$(cut -d: -f6 <<< "$pw")"
+  if command -v setpriv >/dev/null 2>&1; then PFX=(env HOME="$home" setpriv --reuid="$1" --regid="$gid" --init-groups --)
+  else PFX=(runuser -u "$1" -- env HOME="$home"); fi
+}
+if [ "$MODE" = plain ] && { [ "$ACTION" = update ] || [ "$ACTION" = rollback ]; }; then
+  data_owner="$(stat -c %U data 2>/dev/null || echo root)"; owner="$data_owner"; others=""
+  for p in $(plain_pid); do
+    o="$(stat -c %U "/proc/$p" 2>/dev/null || true)"
+    case "$o" in
+      ""|"$data_owner") ;;
+      root) owner=root ;;
+      *) others="$others $o (PID $p)" ;;
+    esac
+  done
+  [ -z "$others" ] || warn "Ignoring node processes in this folder that run as another account than data/'s owner ($data_owner):$others. They're stopped along with the old version."
+  [ "$owner" != UNKNOWN ] || die "Hearth runs as a user ID that has no account name, so it can't be restarted as that user. Give data/ to a real account first."
+  if [ "$owner" = root ]; then
+    warn "Hearth runs as root. It will be restarted the same way; to give it its own user, see scripts/harden-vps.sh."
+  else
+    RUN_AS="$owner"; prefix_for "$RUN_AS"; RUN_PFX=("${PFX[@]}")
+    if [ "$(stat -c %U . 2>/dev/null || true)" = "$RUN_AS" ]; then STAGE_AS="$RUN_AS"; STAGE_PFX=("${PFX[@]}"); fi
+  fi
+fi
+# Runs a command as the owner of the program files (root in Docker, systemd and pm2 modes, as before).
+as_stager() { ${STAGE_PFX[@]+"${STAGE_PFX[@]}"} "$@"; }
 stop_app() {
   case $MODE in
     docker) $DC stop hearth >/dev/null 2>&1 || true ;;
@@ -151,7 +196,14 @@ start_app() {
     docker) $DC up -d --no-deps --no-build hearth >/dev/null 2>&1 ;;
     systemd) systemctl start "$UNIT" ;;
     pm2) pm2 restart hearth >/dev/null ;;
-    plain) nohup node server/index.js >> hearth.log 2>&1 < /dev/null & disown ;;
+    plain)
+      # In a folder Hearth's user owns, the log is opened as that user too, so root never writes through a
+      # hearth.log that was swapped for a link to somewhere else. (exec: nothing stays behind as root.)
+      if [ "$STAGE_AS" = "$RUN_AS" ]; then
+        ( exec ${RUN_PFX[@]+"${RUN_PFX[@]}"} sh -c 'exec nohup node server/index.js >> hearth.log 2>&1 < /dev/null' ) & disown
+      else
+        ( exec ${RUN_PFX[@]+"${RUN_PFX[@]}"} nohup node server/index.js >> hearth.log 2>&1 < /dev/null ) & disown
+      fi ;;
   esac
 } 9>&- # Hearth (or a pm2 daemon) must not inherit the update lock, or the next update would think one is still running.
 show_logs() {
@@ -176,14 +228,14 @@ healthy() { # $1 = attempts, 2 s apart (default 45 = 90 s)
   done
   return 1
 }
-install_deps() { [ "$MODE" = docker ] && return 0; npm ci --omit=dev --no-audit --no-fund >/dev/null 2>&1 || npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1; }
+install_deps() { [ "$MODE" = docker ] && return 0; as_stager npm ci --omit=dev --no-audit --no-fund >/dev/null 2>&1 || as_stager npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1; }
 # Non-Docker: build the new version's libraries in a staging folder, so the live site is untouched
 # until everything is ready. If the library list didn't change, reuse the current ones (no download).
 prepare_stage() { # $1 = staging dir, $2 = log file
   if cmp -s "$DIR/package-lock.json" "$1/package-lock.json" && [ -d "$DIR/node_modules" ]; then
-    cp -a "$DIR/node_modules" "$1/node_modules"; return 0
+    as_stager cp -a "$DIR/node_modules" "$1/node_modules"; return 0
   fi
-  (cd "$1" && npm ci --omit=dev --no-audit --no-fund) > "$2" 2>&1
+  (cd "$1" && as_stager npm ci --omit=dev --no-audit --no-fund) > "$2" 2>&1
 }
 RSYNC_EXCLUDES=(--exclude /data --exclude '/data-backup*' --exclude /.env --exclude /node_modules --exclude /hearth.log
   --exclude /docker-compose.yml --exclude /deploy/Caddyfile --exclude /desktop/hearth.config.json --exclude /.git)
@@ -223,6 +275,66 @@ patch_caddy() {
   else
     cat "$BK/Caddyfile.before" > "$cf"
     warn "Couldn't update Caddy's settings automatically, so they were left exactly as they were."
+  fi
+}
+# Who may tell Hearth a visitor's address (TRUST_PROXY). Older versions believed X-Forwarded-For from every
+# private address; from this version on only from this machine, unless TRUST_PROXY says more. The update never
+# replaces docker-compose.yml, and older ones don't name Caddy's network, so without this every visitor behind
+# Caddy would share Caddy's address: one set of login and sign-up limits for everyone, and an IP ban on that
+# address would lock everyone out.
+trust_set() { # is TRUST_PROXY set anywhere Hearth would read it?
+  grep -Eq '^[[:space:]]*(export[[:space:]]+)?TRUST_PROXY[[:space:]]*=' .env 2>/dev/null && return 0
+  [ "$MODE" = docker ] && grep -Eq '^[[:space:]]*(-[[:space:]]*)?"?TRUST_PROXY"?[[:space:]]*[:=]' docker-compose.yml 2>/dev/null && return 0
+  [ "$MODE" = systemd ] && systemctl show -p Environment --value "$UNIT" 2>/dev/null | grep -q 'TRUST_PROXY=' && return 0
+  return 1
+}
+behind_proxy() { # HTTPS=false: something in front of Hearth handles HTTPS
+  [ "$(envval HTTPS | tr '[:upper:]' '[:lower:]')" = false ] && return 0
+  [ "$MODE" = docker ] && grep -Eiq '^[[:space:]]*(-[[:space:]]*)?"?HTTPS"?[[:space:]]*[:=][[:space:]]*"?false' docker-compose.yml 2>/dev/null && return 0
+  [ "$MODE" = systemd ] && systemctl show -p Environment --value "$UNIT" 2>/dev/null | grep -Eiq '(^|[[:space:]])HTTPS=false' && return 0
+  return 1
+}
+trust_proxy_upgrade() {
+  [ -f "$NEW/server/proxytrust.js" ] || return 0 # the version being installed still has the old rule
+  if [ "$MODE" != docker ]; then
+    # Only when coming from the old rule, and only behind a proxy: a proxy on this machine needs nothing.
+    [ "$OLD_TRUST_RULE" = 1 ] && behind_proxy && ! trust_set || return 0
+    warn "Heads-up: Hearth now only believes the visitor address a reverse proxy passes on (X-Forwarded-For) when"
+    warn "  the proxy runs on this machine. If yours runs anywhere else (another server, or nginx/Caddy in a container),"
+    warn "  add TRUST_PROXY=<its address or subnet> to $DIR/.env and restart Hearth. Otherwise every visitor shares"
+    warn "  the proxy's address (one set of login limits for everyone). Hearth's log names the address once it sees it."
+    return 0
+  fi
+  # A number of proxies (the old instructions said TRUST_PROXY=1) believes whoever connects, so it's only safe
+  # while port 3000 answers on this machine alone.
+  local hops; hops="$(envval TRUST_PROXY | tr '[:upper:]' '[:lower:]')"
+  if [[ "$hops" =~ ^([1-9][0-9]*|true|yes|on)$ ]] && [[ ! "$(envval HEARTH_BIND)" =~ ^(127\.0\.0\.1|localhost|::1|\[::1\])$ ]]; then
+    warn "TRUST_PROXY=$(envval TRUST_PROXY) in .env believes any address in front of Hearth, but port 3000 isn't limited to this"
+    warn "  machine (HEARTH_BIND=127.0.0.1), so someone reaching it directly could pick their own address. With the bundled"
+    warn "  Caddy, delete the TRUST_PROXY line (docker-compose.yml already trusts Caddy's network); otherwise set HEARTH_BIND=127.0.0.1."
+  fi
+  trust_set && return 0
+  # Trust the private network Hearth shares with Caddy ("proxy" in docker-compose.yml): only those two are on it.
+  local cid net sub=""
+  cid="$($DC ps -a -q hearth 2>/dev/null | head -1 || true)"
+  net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$cid" 2>/dev/null | grep -E '(^|_)proxy$' | head -1 || true)"
+  [ -n "$net" ] && sub="$(docker network inspect -f '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' "$net" 2>/dev/null | grep -E '^[0-9A-Fa-f.:]+/[0-9]+$' | paste -sd, - || true)"
+  # (.env is passed to Hearth by docker-compose.yml's env_file. Never written through a link; a new one is private.)
+  if [ -n "$sub" ] && grep -q 'env_file' docker-compose.yml && [ ! -L .env ] \
+     && { [ -e .env ] || (umask 077 && : > .env); } \
+     && { if [ -s .env ] && [ -n "$(tail -c 1 .env)" ]; then echo; fi
+          printf '# Added by hearth-update on %s: only Caddy, on the private "%s" network, may tell Hearth\n# who a visitor is (older versions believed every private address).\nTRUST_PROXY=%s\n' "$(date +%F)" "$net" "$sub"; } >> .env; then
+    ok "Visitors' addresses: Hearth now only believes Caddy's network, $sub (added TRUST_PROXY=$sub to .env)."
+    if behind_proxy && [ -z "$($DC --profile domain ps -q caddy 2>/dev/null || true)" ]; then
+      warn "Hearth is behind a proxy, but this folder's Caddy isn't running. If your proxy is something else, add its address or"
+      warn "  subnet to TRUST_PROXY in .env (comma-separated) and run: docker compose up -d. Hearth's log names it once it sees it."
+    fi
+  else
+    warn "Heads-up: Hearth now only believes the visitor address a reverse proxy passes on (X-Forwarded-For) from the proxy"
+    warn "  named in TRUST_PROXY, none is named here, and this update couldn't add it to .env by itself. Add TRUST_PROXY=<your"
+    warn "  proxy's address or subnet> to .env (for this folder's Caddy: the subnet of its \"proxy\" network, see docker network"
+    warn "  inspect), then run: docker compose up -d. Otherwise every visitor shares the proxy's address (one set of login"
+    warn "  limits for everyone)."
   fi
 }
 wait_stopped() { # plain mode: wait (up to 6 s) for the old process to exit
@@ -318,14 +430,30 @@ if [ "$ACTION" = rollback ]; then
 fi
 
 # ---------------------------------------------------------------- update
-ZIP="${ARG:-/tmp/hearth-update.zip}"
+# Always an explicit path: a default like /tmp/hearth-update.zip could be a file another account left there.
+[ -n "$ARG" ] || die "Which update? Usage: hearth-update path/to/update.zip"
+ZIP="$ARG"
 [ -f "$ZIP" ] || die "Update file not found: $ZIP"
+# Compare the update with its SHA-256 when there's one to compare with: update.zip.sha256 next to it (made with
+# each release by scripts/make-update-zip.sh; the update tools write it from the file you confirmed on your
+# computer). A mismatch stops here, before anything is unpacked or run.
+SUM="$(sha256sum "$ZIP" | cut -d' ' -f1)"
+if [ -f "$ZIP.sha256" ]; then
+  WANT="$(tr -d '\r' < "$ZIP.sha256" | awk 'NR == 1 { print tolower($1) }')"
+  [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || die "$ZIP.sha256 doesn't contain a SHA-256 checksum."
+  [ "$WANT" = "$SUM" ] || die "$ZIP doesn't match its checksum ($ZIP.sha256): it's damaged or not the published update. Nothing was changed."
+  ok "Checksum matches ($SUM)."
+else
+  warn "No $(basename "$ZIP").sha256 next to the update, so it can't be checked. Its SHA-256 is $SUM: compare it with the one published for this release."
+fi
 unzip -Z1 "$ZIP" 'hearth/server/index.js' >/dev/null 2>&1 || die "$ZIP doesn't look like a Hearth update."
+# Is the current version still on the old "every private address is a proxy" rule? (See trust_proxy_upgrade.)
+OLD_TRUST_RULE=0; [ -f server/proxytrust.js ] || OLD_TRUST_RULE=1
 
 printf '\n%sHearth update%s\n  folder:  %s\n  runs as: %s%s\n  current: %s\n\n' "$c_b" "$c_0" "$DIR" "$MODE" "${UNIT:+ ($UNIT)}" "$(version)"
 
 # Enough room for the unpacked update, the backup and (Docker) the new image?
-NEED_MB=$(( $(du -sm --exclude=uploads --exclude=backups --exclude=downloads data 2>/dev/null | cut -f1 || echo 0) + 400 ))
+NEED_MB=$(( $(du -sm --exclude=uploads --exclude=upload-parts --exclude=backups --exclude=downloads data 2>/dev/null | cut -f1 || echo 0) + 400 ))
 [ "$MODE" = docker ] && NEED_MB=$((NEED_MB + 600))
 HAVE_MB="$(free_mb "$DIR")"
 if [ "${HAVE_MB:-0}" -lt "$NEED_MB" ]; then
@@ -338,7 +466,10 @@ unzip -q "$ZIP" -d "$WORK"
 NEW="$WORK/hearth"
 ok "New version: $(version "$NEW")"
 # Keep the updater itself up to date too (when run as "hearth-update <zip>", the old copy is what's running).
-if [ -f "$NEW/scripts/hearth-update.sh" ]; then cp "$NEW/scripts/hearth-update.sh" /usr/local/bin/hearth-update && chmod +x /usr/local/bin/hearth-update; fi
+if [ -f "$NEW/scripts/hearth-update.sh" ]; then cp "$NEW/scripts/hearth-update.sh" "$BIN" && chmod +x "$BIN"; fi
+# Plain mode with the program files owned by Hearth's user: that user prepares the new version, and the files
+# it ends up with stay that user's, as they were before the update.
+if [ "$STAGE_AS" != root ]; then chmod 711 "$WORK"; chown -R "$STAGE_AS:" "$NEW"; fi
 
 BK="$BACKUP_ROOT/$(date +%F-%H%M%S)"
 mkdir -p "$BK"
@@ -369,13 +500,14 @@ else
 fi
 ok "Ready."
 
+trust_proxy_upgrade
 patch_caddy || true
 
 step "Switching over (people with Hearth open see \"Updating…\" for a moment)…"
 T0=$(date +%s%N)
 stop_app
 mkdir -p "$BK/data"
-rsync -a --exclude uploads --exclude backups --exclude downloads data/ "$BK/data/"
+rsync -a --exclude uploads --exclude upload-parts --exclude backups --exclude downloads data/ "$BK/data/"
 if [ "$MODE" != docker ]; then
   rsync -a "${RSYNC_EXCLUDES[@]}" "$NEW/" "$DIR/"
   if [ -d node_modules ]; then mv node_modules "$BK/node_modules"; fi

@@ -5,37 +5,44 @@ import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playS
 import { api, upload, getToken, setToken } from './api.js';
 import * as E2EE from './e2ee.js';
 import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers } from './markdown.js';
-import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor } from './perms.js';
+import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor, mayMentionRole } from './perms.js';
 import { openCropper } from './cropper.js';
 import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
 import { prepareImage, makeQueue, whenVisible } from './media.js';
+import { isUploadUrl, safeDownloadHref } from './attachments.js';
+import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, mediaKind, typeLabel } from './files.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
+import { openCallDiagnostics } from './call-diagnostics.js';
 import { createSecure } from './secure.js';
 import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
-import { rankRelays, chooseIce, relayTime } from './relays.js';
+import { rankRelays, chooseIce, relayTime, iceStale } from './relays.js';
+import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
-import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
+import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn, markInvalid, clearInvalid, trapTab } from './ui.js';
 import { openSettings, applyAppearance, confirmedCall, displayNameDialog } from './settings.js';
 import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
 import { createRecall } from './recall-host.js';
 import { openMemberships, membershipsTab } from './memberships.js';
+import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
+import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, quietNow } from './usability.js';
+import { trackViewport } from './viewport.js';
 
 // ======================================================================= state
 const S = {
   watch: {}, // call room -> shared video (watch together)
+  regionWarned: new Set(), // calls already told that their pinned region is offline
   config: null,
   me: null,
   privateKey: null,
-  encPrivateKey: '',
   users: {},
   servers: [],          // includes group DMs (kind: 'group')
   dms: [],
@@ -50,6 +57,11 @@ const S = {
   previews: {},         // conversation key -> decrypted preview text
   unread: new Set(),
   mentions: new Map(),
+  lastRead: {},         // conversation key -> last message id read (kept on the server, synced across devices)
+  lastIds: {},          // conversation key -> newest message id we know of
+  notifyPrefs: {},      // 's:'|'c:'|'d:' key -> { level, muteUntil, suppressEveryone } (on the server)
+  notifySettings: { dnd: { on: false }, previews: 'hidden' },
+  savedIds: new Set(),  // saved messages (ids only; on the server)
   typing: {},
   speaking: new Set(),
 };
@@ -95,14 +107,11 @@ const P = {
   set favorites(v) { LS.set(mine('favs'), v); },
   get collapsed() { return LS.get(mine('collapsed'), {}); },
   set collapsed(v) { LS.set(mine('collapsed'), v); },
-  get notify() { return LS.get(mine('notify'), {}); },
-  set notify(v) { LS.set(mine('notify'), v); },
-  get lastRead() { return LS.get(mine('lastRead'), {}); },
-  set lastRead(v) { LS.set(mine('lastRead'), v); },
+  // Notification levels by key ('all' | 'mentions' | 'muted'), from the preferences kept on the server.
+  get notify() { const out = {}; for (const [k, v] of Object.entries(S.notifyPrefs)) if (v.level !== 'default') out[k] = v.level === 'none' ? 'muted' : v.level; return out; },
+  get lastRead() { return S.lastRead; },
   get inbox() { return LS.get(mine('inbox'), []); },
   set inbox(v) { LS.set(mine('inbox'), v.slice(0, 200)); },
-  get saved() { return LS.get(mine('saved'), []); },
-  set saved(v) { LS.set(mine('saved'), v.slice(0, 500)); },
   get lastChannel() { return LS.get(mine('lastChannel'), {}); },
   set lastChannel(v) { LS.set(mine('lastChannel'), v); },
   get chat() { return { enterToSend: true, embeds: true, markdown: true, jumbo: true, ...LS.get('hearth.chat', {}) }; },
@@ -133,6 +142,11 @@ export const app = {
   unblock: (id) => toggleBlock(id, false),
   openAdmin: () => setView({ type: 'admin', tab: 'overview' }),
   study: () => study,
+  fileInfo: (url, where) => fileInfo(url, where),
+  showMessage: (where) => (where && where.messageId ? jumpToMessage(where.type === 'dm' ? 'd:' + where.dmId : 'c:' + where.channelId, where.messageId) : null),
+  setNotify: (key, level, extra) => setNotify(key, level, extra),
+  setNotifySettings: (body) => setNotifySettings(body),
+  decryptMessage: (m) => decryptMessage(m),
 };
 
 // ======================================================================= boot
@@ -141,6 +155,10 @@ init();
 async function init() {
   applyAppearance();
   setupServiceWorker();
+  trackViewport();
+  // "Skip to conversation": the first Tab stop, so keyboard users don't have to go through the server
+  // list and channels first.
+  $('#skip-main').onclick = () => { const c = $('#composer-input') || $('#messages') || $('#main'); if (c) c.focus(); };
   const resetToken = (location.hash.match(/^#reset=([A-Za-z0-9_-]{20,100})$/) || [])[1];
   if (resetToken) { history.replaceState(null, '', '/'); sessionStorage.setItem('hearth.resetToken', resetToken); } // keep it out of the address bar
   const m = location.pathname.match(/^\/invite\/([A-Za-z0-9]+)/);
@@ -167,6 +185,27 @@ async function init() {
 }
 
 // ======================================================================= auth screen
+// "This device has signed in here before" notes from the server, one per account (see /auth/login). With one, a
+// flood of wrong passwords from somewhere else can't lock this device out of the account. Kept across log-outs.
+const DEVICE_NOTES = 'hearth.deviceNotes';
+function deviceNote(username) {
+  try { return (JSON.parse(localStorage.getItem(DEVICE_NOTES) || '{}') || {})[username.toLowerCase()] || undefined; } catch { return undefined; }
+}
+function saveDeviceNote(username, note) {
+  if (typeof note !== 'string') return;
+  try {
+    const all = JSON.parse(localStorage.getItem(DEVICE_NOTES) || '{}') || {};
+    delete all[username.toLowerCase()];
+    all[username.toLowerCase()] = note;
+    const names = Object.keys(all);
+    names.slice(0, Math.max(0, names.length - 10)).forEach((k) => delete all[k]); // the 10 most recent accounts
+    localStorage.setItem(DEVICE_NOTES, JSON.stringify(all));
+  } catch { /* storage blocked: the limit for this network still applies */ }
+}
+// While lots of people are signing in (or this network keeps getting passwords wrong), the server can ask for a
+// harder robot check: solve a new one and try once more.
+const harderOnce = (attempt) => attempt().catch((ex) => (ex.code === 'captcha_harder' ? attempt() : Promise.reject(ex)));
+
 function showAuth() {
   $('#app').hidden = true;
   $('#auth').hidden = false;
@@ -207,6 +246,7 @@ function showAuth() {
     const btn = loginForm.querySelector('button[type=submit]');
     const err = loginForm.querySelector('.form-error');
     err.textContent = '';
+    [...loginForm.elements].forEach((x) => x.name && clearInvalid(x));
     btn.disabled = true; btn.textContent = 'Unlocking…';
     try {
       const username = loginForm.username.value.trim();
@@ -218,13 +258,13 @@ function showAuth() {
       }
       const { params } = derived;
       const { authKey, wrapKey } = derived.keys;
-      const captcha = await loginCap.token();
       const second = !totpField.hidden && loginForm.totp.value.trim() ? (useBackup ? { backupCode: loginForm.totp.value.trim() } : { totp: loginForm.totp.value.trim() }) : {};
-      const res = await api('POST', '/auth/login', { username, authKey, captcha, ...second }).finally(() => loginCap.reset())
+      const res = await harderOnce(async () => api('POST', '/auth/login', { username, authKey, captcha: await loginCap.token(), device: deviceNote(username), ...second }).finally(() => loginCap.reset()))
         .catch((ex) => {
           if (ex.code === 'need_2fa' || ex.code === 'bad_2fa') { totpField.hidden = false; setTimeout(() => loginForm.totp.focus(), 30); }
           throw ex;
         });
+      saveDeviceNote(username, res.device);
       totpField.hidden = true; loginForm.totp.value = ''; derived = null;
       const priv = await E2EE.unwrapPrivateKey(wrapKey, res.encPrivateKey);
       if (params.kdf !== 'argon2id') {
@@ -239,6 +279,9 @@ function showAuth() {
       await finishLogin(res, priv);
     } catch (ex) {
       err.textContent = ex.message;
+      // Point the error at the field it's about, so screen readers read them together.
+      const bad = /2fa|code/i.test(ex.code || '') && !totpField.hidden ? loginForm.totp : /captcha/i.test(ex.code || '') ? null : loginForm.password;
+      if (bad) markInvalid(bad, err);
     } finally { btn.disabled = false; btn.textContent = 'Log in'; }
   };
 
@@ -247,23 +290,29 @@ function showAuth() {
     const btn = regForm.querySelector('button[type=submit]');
     const err = regForm.querySelector('.form-error');
     err.textContent = '';
+    [...regForm.elements].forEach((x) => x.name && clearInvalid(x));
     const username = regForm.username.value.trim();
     const pw = regForm.password.value;
-    if (pw.length < 8) { err.textContent = 'Use at least 8 characters for your password.'; return; }
-    if (pw !== regForm.confirm.value) { err.textContent = 'The passwords do not match.'; return; }
+    const fail = (input, text) => { err.textContent = text; markInvalid(input, err); input.focus(); };
+    if (pw.length < 8) return fail(regForm.password, 'Use at least 8 characters for your password.');
+    if (pw !== regForm.confirm.value) return fail(regForm.confirm, 'The passwords do not match.');
     btn.disabled = true; btn.textContent = 'Creating your keys…';
     try {
       const kdfSalt = E2EE.newKdfSalt();
       const [{ authKey, wrapKey }, captcha] = await Promise.all([E2EE.deriveKeys(username, pw, { kdf: 'argon2id', salt: kdfSalt }), regCap.token()]);
       const id = await E2EE.createIdentity(wrapKey);
-      const res = await api('POST', '/auth/register', {
-        captcha,
+      const body = {
         username, authKey, kdfSalt, publicKey: id.publicKey, encPrivateKey: id.encPrivateKey, code: regForm.code ? regForm.code.value : '',
         acceptTos: regForm.tos && regForm.tos.checked ? S.config.termsVersion || 1 : 0,
-      }).finally(() => regCap.reset());
+      };
+      const send = (c) => api('POST', '/auth/register', { captcha: c, ...body }).finally(() => regCap.reset());
+      const res = await send(captcha).catch(async (ex) => (ex.code === 'captcha_harder' ? send(await regCap.token()) : Promise.reject(ex)));
+      saveDeviceNote(username, res.device);
       await finishLogin(res, id.privateKey);
     } catch (ex) {
       err.textContent = ex.message;
+      const bad = /username|name/i.test(ex.message) ? regForm.username : /code/i.test(ex.code || ex.message) && regForm.code && !$('#reg-code-field').hidden ? regForm.code : null;
+      if (bad) markInvalid(bad, err);
     } finally { btn.disabled = false; btn.textContent = 'Create account'; }
   };
 }
@@ -271,13 +320,15 @@ function showAuth() {
 // "Forgot your password?": a reset link goes to the account's verified email.
 function openForgot(prefill) {
   const input = h('input', { class: 'input', value: prefill || '', placeholder: 'Username or email', autocomplete: 'username', autocapitalize: 'off', spellcheck: 'false' });
+  const cap = captchaWidget('login'); // the same robot check as signing in
   modal({ title: 'Reset your password', size: 'sm',
-    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'We\u2019ll email a reset link to the address on your account (if it has a confirmed one).'), field('Username or email', input)),
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'We\u2019ll email a reset link to the address on your account (if it has a confirmed one).'), field('Username or email', input), cap.el),
     actions: [{ label: 'Cancel' }, { label: 'Send reset link', kind: 'primary', action: async () => {
       if (!input.value.trim()) throw new Error('Enter your username or email.');
-      await api('POST', '/auth/forgot', { login: input.value.trim() });
+      await harderOnce(async () => api('POST', '/auth/forgot', { login: input.value.trim(), captcha: await cap.token() }).finally(() => cap.reset()));
       toast('If that account has a confirmed email, a reset link is on its way. Check your inbox (and spam).');
     } }] });
+  cap.start(); // solving starts right away, so it's usually done by the time the name is typed
 }
 // The link from that email: #reset=<token>. Recovery key → everything stays readable; without → new keys.
 async function openReset(token) {
@@ -329,11 +380,24 @@ async function finishLogin(res, privateKey) {
   startApp();
 }
 
-async function logout() {
+// Signing out runs once: the server answers our own "Log out" by also telling this device its sign-in ended
+// ('session:revoked', see watchConnection), which must not start a second sign-out or explain it as one done
+// from somewhere else.
+let loggingOut = null;
+function logout() {
+  if (!loggingOut) loggingOut = signOutHere();
+  return loggingOut;
+}
+async function signOutHere() {
+  // This browser stops getting notifications for the account (the server drops the subscription too), and
+  // doesn't pass them on to whoever signs in here next. Never holds up signing out for more than a moment.
+  if (localStorage.getItem('hearth.push') === 'on' && 'serviceWorker' in navigator) await Promise.race([disablePush().catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
   try { await api('POST', '/auth/logout'); } catch { /* ignore */ }
   if (voice) await voice.leave().catch(() => {});
   setToken('');
   localStorage.removeItem('hearth.userId');
+  fileUrls.release(); // decrypted files in memory
+  clearAllDrafts(); // unsent words stay with the account, not the next person on this browser
   sec.reset();
   await E2EE.clearKeys();
   location.href = '/';
@@ -380,11 +444,25 @@ function startApp() {
     // Lets the speaking detector ignore people whose mic is off (their state comes from the server).
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
     socket,
-    getIceServers: () => chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks, voice && voice.channelId ? callRegion(voice.channelId) : null),
+    // automatic: the call's region relay didn't answer, so this app falls back to the nearest relays (voice.js).
+    getIceServers: ({ automatic = false } = {}) => {
+      const room = voice && voice.channelId;
+      const pinned = room && !automatic ? callRegion(room) : null;
+      // Pinned to a region that's offline right now: automatic relays are used instead. Say so, once per call.
+      if (pinned && !callRegions().some((r) => r.id === pinned) && !S.regionWarned.has(room)) {
+        S.regionWarned.add(room);
+        setTimeout(() => toast(`This call\u2019s region (${regionName(pinned)}) is offline, so your connection uses automatic relays.`), 0);
+      }
+      return chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks, pinned);
+    },
+    myId: () => S.me && S.me.id,
+    onNotice: (text, kind) => toast(text, kind),
+    onRegion: (room, region, version) => applyCallRegion({ room, region, version }),
+    ensureIce: () => freshIce(),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
-    onChange: () => { shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
+    onChange: () => { if (!voice.channelId) S.regionWarned.clear(); shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
     onSpeaking: (id, on) => {
       const uid = id === 'me' ? S.me.id : id;
       // Never show someone as speaking while they're muted or deafened, whatever audio arrives.
@@ -394,6 +472,14 @@ function startApp() {
     },
   });
 
+  // Test and support hook, off unless turned on on this device: the call engine, for the voice test harness.
+  try {
+    if (localStorage.getItem('hearth.voiceDebug') === '1') {
+      window.__hearthVoice = voice;
+      window.__hearthCallRegion = (room) => { const t = room.startsWith('dm:') ? S.dms.find((x) => x.id === room.slice(3)) : channelById(room); return t ? { region: t.region || null, version: t.regionVersion || 0 } : null; };
+    }
+  } catch { /* storage off */ }
+
   socket.on('connect', async () => {
     try {
       // Back after a restart: same version → carry on; new version → switch to it.
@@ -402,6 +488,7 @@ function startApp() {
         if (cfg && cfg.version && S.config.version && cfg.version !== S.config.version) return onNewVersion(cfg.version);
       }
       await loadBootstrap();
+      if (voice.channelId && S.voice[voice.channelId]) voice.setListed(S.voice[voice.channelId].map((u) => u.userId));
       hideUpdating();
       $('#app').classList.remove('loading');
       $('#conn-banner').hidden = true;
@@ -412,19 +499,23 @@ function startApp() {
   });
   socket.on('connect_error', (e) => {
     if (e.message === 'maintenance') { api('GET', '/config').then((c) => showUpdating('Down for maintenance', c.maintenance || 'Back soon.')).catch(() => {}); return; }
-    if (e.message === 'unauthorized') logout();
-    else if (!S.restarting) $('#conn-banner').hidden = false;
+    if (e.message !== 'unauthorized' && !S.restarting) $('#conn-banner').hidden = false; // 'unauthorized': signed out (below)
   });
-  socket.on('disconnect', (reason) => {
-    if (S.restarting) return; // expected: the server is restarting for an update
-    if (reason === 'io server disconnect') return logout(); // session was revoked
-    $('#conn-banner').hidden = false;
-  });
-  // This device was signed out from somewhere else (Settings → Sessions, a password change or reset, staff).
-  socket.on('session:revoked', ({ reason } = {}) => {
-    const why = { password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on', expired: 'Your sign-in expired', account_deleted: 'This account was deleted' }[reason];
-    sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
-    logout();
+  // Signed out from somewhere else (Settings → Sessions, a password change or reset, staff), or this device isn't
+  // let back in. Any other connection the server closes (too many events at once, say) just reconnects.
+  watchConnection(socket, {
+    paused: () => !!S.restarting, // expected: the server is restarting for an update
+    onDown: () => { $('#conn-banner').hidden = false; },
+    onSignedOut: (reason) => {
+      if (loggingOut) return; // already signing out (this device's own "Log out", say): nothing more to explain
+      const why = {
+        password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on',
+        expired: 'Your sign-in expired', account_deleted: 'This account was deleted', suspended: 'This account was suspended', staff: 'A server admin signed you out',
+      }[reason];
+      // 'logged_out' is this sign-in's own "Log out", pressed in another tab of this browser: nothing to explain.
+      if (reason !== 'unauthorized' && reason !== 'logged_out') sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
+      logout();
+    },
   });
   socket.on('server:restarting', () => showUpdating());
   socket.on('server:maintenance', ({ text }) => showUpdating('Down for maintenance', text || 'Back soon.'));
@@ -440,6 +531,7 @@ function startApp() {
       $$(`[data-user-av="${id}"][data-status="1"] .status-dot`).forEach((d) => {
         d.className = d.className.replace(/\bst-\S+/, `st-${presence}`);
         d.title = STATUS_LABEL[presence] || '';
+        d.setAttribute('aria-label', STATUS_LABEL[presence] || '');
       });
     }
     if (!changed) return;
@@ -493,6 +585,11 @@ function startApp() {
     playSound('mention');
     if (S.view.type === 'admin' && S.view.tab === 'reports') renderMain();
   });
+  // Problems the server found (failed backup, a relay down, low disk...): staff see them as they happen.
+  socket.on('admin:alert', ({ title, severity }) => {
+    toast(`${severity === 'critical' ? 'Urgent: ' : ''}${title}. Open Admin \u2192 Health.`, severity === 'critical' ? 'error' : undefined);
+    if (S.view.type === 'admin' && S.view.tab === 'health') renderMain();
+  });
   socket.on('profile:comment', ({ from }) => toast(`${displayName(getUser(from))} commented on your profile.`));
   socket.on('config:update', (c) => {
     Object.assign(S.config, c);
@@ -535,7 +632,17 @@ function startApp() {
     if (!S.view.serverId) renderSidebar();
   });
   socket.on('rail:update', ({ rail }) => folders.applyRemote(rail));
-  socket.on('study:changed', () => { if (S.me.studyEnabled) study.onRemoteChange(); });
+  // Read markers, notification preferences and saved messages changed on another of your devices.
+  socket.on('read:update', (st) => onReadUpdate(st));
+  socket.on('notify:update', (r) => applyNotifyPref(r));
+  socket.on('notify:settings', (st) => { S.notifySettings = st; });
+  socket.on('saved:update', (p) => { if (p.saved) S.savedIds.add(p.messageId); else S.savedIds.delete(p.messageId); if (S.view.type === 'saved') later(renderMain); });
+  socket.on('timeout:update', ({ serverId, until }) => {
+    const sv = S.servers.find((x) => x.id === serverId);
+    if (!sv) return;
+    toast(until ? `You\u2019re timed out in ${sv.name} until ${fmtStamp(until)}. You can still read.` : `Your timeout in ${sv.name} is over.`);
+  });
+  socket.on('study:changed', (p) => { if (S.me.studyEnabled) study.onRemoteChange(p); });
   socket.on('study:enabled', ({ enabled }) => { S.me.studyEnabled = enabled; if (!S.view.serverId) renderSidebar(); });
   socket.on('updates:new', (p) => { updates.onNew(p); if (S.view.type === 'updates') renderMain(); });
   socket.on('server:update', (server) => {
@@ -557,6 +664,13 @@ function startApp() {
   socket.on('server:remove', ({ serverId }) => {
     const was = S.servers.find((s) => s.id === serverId);
     S.servers = S.servers.filter((s) => s.id !== serverId);
+    // Live updates stop while you're out, so what's loaded would be missing anything said meanwhile if you come
+    // back: load it fresh then.
+    if (was) {
+      const gone = new Set(was.channels.map((c) => c.id));
+      gone.forEach((id) => { delete S.msgs['c:' + id]; });
+      Object.entries(S.threads).forEach(([id, t]) => { if (t.root && gone.has(t.root.channelId)) delete S.threads[id]; });
+    }
     if (S.view.serverId === serverId) { toast(was && was.kind === 'group' ? 'You left the group.' : 'You are no longer in that server.'); goHome(); }
     else { renderRail(); if (!S.view.serverId) renderSidebar(); }
   });
@@ -565,11 +679,20 @@ function startApp() {
     sec.trust(user);
     const s = S.servers.find((x) => x.id === serverId);
     if (s && !s.memberIds.includes(user.id)) s.memberIds.push(user.id);
+    // Someone joining (or coming back) has no roles yet: any the server hands out follow in a server update.
+    if (s && s.memberRoles) s.memberRoles[user.id] = [];
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
   socket.on('member:remove', ({ serverId, userId }) => {
     const s = S.servers.find((x) => x.id === serverId);
-    if (s) s.memberIds = s.memberIds.filter((i) => i !== userId);
+    if (s) {
+      s.memberIds = s.memberIds.filter((i) => i !== userId);
+      // The server deleted their roles and their own channel permissions. Copies kept here would be sent back if
+      // they rejoin: the role menu sends the roles someone has plus the new one, and saving a channel's
+      // permissions sends all of its overrides.
+      if (s.memberRoles) delete s.memberRoles[userId];
+      s.channels.forEach((c) => { if (c.overrides) c.overrides = c.overrides.filter((o) => !(o.type === 'member' && o.id === userId)); });
+    }
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
   socket.on('channel:create', (ch) => {
@@ -598,7 +721,7 @@ function startApp() {
   socket.on('message:delete', ({ id, channelId, threadId }) => {
     if (threadId) {
       const t = S.threads[threadId];
-      if (t) { t.list = t.list.filter((x) => x.id !== id); if (S.thread && S.thread.rootId === threadId) renderPanel(); }
+      if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); if (S.thread && S.thread.rootId === threadId) renderPanel(); }
     } else onDeleteMessage('c:' + channelId, id);
   });
   socket.on('thread:update', ({ rootId, channelId, threadCount, threadLastAt }) => {
@@ -606,6 +729,7 @@ function startApp() {
     const m = store && store.list.find((x) => x.id === rootId);
     if (m) { m.threadCount = threadCount || 0; m.threadLastAt = threadLastAt; if (currentKey() === 'c:' + channelId) replaceMessageEl(m); }
   });
+  socket.on('bot:interaction', (x) => SLASH.onInteraction(x));
   socket.on('reaction:update', (p) => {
     const key = p.channelId ? 'c:' + p.channelId : 'd:' + p.dmId;
     const store = S.msgs[key];
@@ -655,9 +779,11 @@ function startApp() {
     if (channelId.startsWith('dm:') && voice.channelId === channelId) {
       const had = (S.voice[channelId] || []).some((u) => u.userId !== S.me.id);
       const has = users.some((u) => u.userId !== S.me.id);
-      if (had && !has) { setTimeout(() => { if (voice.channelId === channelId && !(S.voice[channelId] || []).some((u) => u.userId !== S.me.id)) { voice.leave(); playSound('selfLeave'); toast('Call ended.'); } }, 1500); }
+      // (Still connected to them: the server may just have restarted, and they'll be back in a moment.)
+      if (had && !has) { setTimeout(() => { if (voice.channelId === channelId && !(S.voice[channelId] || []).some((u) => u.userId !== S.me.id) && !voice.peers.size) { voice.leave(); playSound('selfLeave'); toast('Call ended.'); } }, 1500); }
     }
     S.voice[channelId] = users;
+    if (voice.channelId === channelId) voice.setListed(users.map((u) => u.userId));
     users.filter((u) => u.muted || u.deafened).forEach((u) => { if (S.speaking.delete(u.userId)) $$(`[data-speak="${u.userId}"]`).forEach((el) => el.classList.remove('speaking')); });
     if (voice.channelId === channelId) {
       const after = users.map((u) => u.userId);
@@ -676,21 +802,47 @@ function startApp() {
   });
 
   window.addEventListener('focus', () => { markRead(currentKey()); });
-  window.addEventListener('pagehide', () => { if (voice && voice.channelId) socket.emit('voice:leave', {}); });
+  window.addEventListener('pagehide', () => { drafts.flush(); if (voice && voice.channelId) socket.emit('voice:leave', {}); });
   window.addEventListener('hashchange', () => openLinkFromHash());
   document.addEventListener('keydown', globalKeys);
   document.querySelector('.nav-scrim').addEventListener('click', () => document.body.classList.remove('nav-open'));
   $('#sidebar').append(resizeHandle('sidebar'));
 }
 
+// Relay logins run out 12 to 18 hours after they're handed out, and an app can stay open for days without
+// reconnecting. So new ones are fetched before a call when they're about to run out, and checked every
+// 10 minutes in the background (calls in progress switch to them too).
+async function freshIce() {
+  if (!iceStale(S.iceServers)) return;
+  try {
+    S.iceServers = await api('GET', '/ice');
+    if (voice) voice.updateIceServers();
+  } catch { /* keep the old ones: the next check is soon */ }
+}
+setInterval(() => { if (S.me) freshIce(); }, 10 * 60000);
+// When this server switched on end-to-end encryption: plaintext channel messages dated later can only have come
+// from the server, so they aren't shown (secure.js). Remembered on this device, and the earliest time it was
+// ever told wins, so the server can't move it later.
+function rememberE2eeSince(t) {
+  let known = 0;
+  try { known = Number(localStorage.getItem('hearth.e2eeSince')) || 0; } catch { /* storage off */ }
+  const v = Number(t) || 0;
+  const out = known && v ? Math.min(known, v) : known || v;
+  try { if (out && out !== known) localStorage.setItem('hearth.e2eeSince', String(out)); } catch { /* storage off */ }
+  return out;
+}
+
 async function loadBootstrap() {
+  // Read markers, notification preferences and saved ids come alongside, so unread badges are right at start.
+  const extras = Promise.all(['/me/unread', '/me/notify', '/me/saved/ids'].map((p) => api('GET', p).catch(() => null)));
   const b = await api('GET', '/bootstrap');
   S.me = b.me;
+  drafts = createDrafts(S.me.id);
   S.mediaToken = b.mediaToken;
   S.iceServers = b.iceServers;
   // With relays in several regions, find the nearest ones in the background (cached for 6 hours).
   if ((b.iceServers || []).filter((e) => [].concat(e.urls || []).some((u) => /^turns?:/.test(u))).length > 2) setTimeout(() => rankRelays(b.iceServers).then((r) => { S.relayRanks = r; }).catch(() => {}), 4000);
-  S.encPrivateKey = b.encPrivateKey;
+  S.e2eeSince = rememberE2eeSince(b.e2eeSince);
   S.users = b.users;
   S.servers = b.servers;
   S.serversLoaded = true;
@@ -706,6 +858,7 @@ async function loadBootstrap() {
   if (S.view.serverId && !S.servers.find((s) => s.id === S.view.serverId)) S.view = { type: 'home' };
   if (S.view.dmId && !S.dms.find((d) => d.id === S.view.dmId)) S.view = { type: 'home' };
   if (!S.view.serverId && !S.view.dmId && !['friends', 'saved', 'people'].includes(S.view.type)) S.view = { type: 'home' };
+  applyUserState(await extras);
   renderAll();
   loadPreviews();
   if (!S.remindersOn) { S.remindersOn = true; startReminders(); }
@@ -798,11 +951,20 @@ const currentKey = () => (S.view.type === 'channel' ? 'c:' + S.view.channelId : 
 const currentServer = () => S.servers.find((s) => s.id === S.view.serverId);
 const isOwner = (server) => !!server && server.ownerId === S.me.id;
 // ---- permissions (the server sends our own, already resolved, per server and per channel)
-const myPerms = (server) => (!server ? 0 : server.kind === 'group' ? ALL_PERMS : server.myPerms || 0);
+const myPerms = (server) => (!server ? 0 : server.myPerms || 0);
 const can = (server, bit) => has(myPerms(server), bit);
 const chanPerms = (c) => (!c ? 0 : c.perms ?? ALL_PERMS);
 const canIn = (c, bit) => has(chanPerms(c), bit);
 const isAdmin = (server) => can(server, PERMS.MANAGE_CHANNELS); // can manage channels & categories
+// One channel's settings and permissions need the permission server-wide and in that channel (the server checks
+// both, so a per-channel deny hides what would only fail).
+const canEditChannel = (server, c) => isAdmin(server) && canIn(c, PERMS.MANAGE_CHANNELS);
+const canEditChannelPerms = (server, c) => can(server, PERMS.MANAGE_ROLES) && canIn(c, PERMS.MANAGE_ROLES);
+// The owner and Administrators can change anything; anyone else's changes can't take their own access away.
+const isFullAdmin = (server) => isOwner(server) || can(server, PERMS.ADMINISTRATOR);
+// You can only give a role whose permissions you have yourself (the server also checks its channel overrides,
+// which the app can't see for every channel, and explains when that's the reason).
+const mayGiveRole = (server, r) => !(r.permissions & ALL_PERMS & ~myPerms(server));
 const canManageServer = (server) => !!server && !isGroup(server) && (can(server, PERMS.MANAGE_SERVER) || can(server, PERMS.MANAGE_ROLES) || can(server, PERMS.MANAGE_EMOJIS) || can(server, PERMS.BAN_MEMBERS) || can(server, PERMS.KICK_MEMBERS));
 // Name color + badge for a member, from their roles in this server.
 function roleStyle(server, userId) {
@@ -908,14 +1070,32 @@ function regionMenuItems(room) {
 }
 function onCallRegion(p) {
   if (!p || typeof p.room !== 'string') return;
-  if (p.room.startsWith('dm:')) { const d = S.dms.find((x) => x.id === p.room.slice(3)); if (d) d.region = p.region; }
-  else { const c = channelById(p.room); if (c) c.region = p.region; }
-  if (voice && voice.channelId === p.room) {
-    voice.switchNetwork();
+  const before = S.callNet && S.callNet.room === p.room ? S.callNet.region : undefined;
+  applyCallRegion(p);
+  if (voice && voice.channelId === p.room && p.by && before !== undefined && before !== S.callNet.region) {
     const who = p.by === S.me.id ? 'You' : displayName(getUser(p.by));
     toast(`${who} moved the call to ${p.region ? regionName(p.region) : 'automatic region'}. Everyone is switching over.`);
   }
+}
+// Two people switching at once: the server keeps the last one and numbers every change, so a change older than the
+// one we have (announcements can arrive out of order) is ignored and everyone ends up on the server's choice.
+// True when it changed anything.
+function applyCallRegion({ room, region = null, version }) {
+  const target = room.startsWith('dm:') ? S.dms.find((x) => x.id === room.slice(3)) : channelById(room);
+  if (!target) return false;
+  const known = target.regionVersion || 0;
+  if (typeof version === 'number' && version < known) return false;
+  const changed = (target.region || null) !== (region || null);
+  target.region = region || null;
+  if (typeof version === 'number') target.regionVersion = version;
+  // The call's connections follow the region they were made with: rebuild them when that's no longer the one.
+  // (Compared with what they use rather than with the channel, which a server update may have changed already.)
+  if (voice && voice.channelId === room) {
+    if (!S.callNet || S.callNet.room !== room) S.callNet = { room, region: region || null };
+    else if (S.callNet.region !== (region || null)) { S.callNet.region = region || null; voice.switchNetwork(); }
+  }
   renderVoicePanel();
+  return changed;
 }
 const textChannel = (server) => server.channels.find((c) => c.type === 'text');
 
@@ -927,7 +1107,11 @@ function setView(v) {
   if (S.panel === null && P.showMembers && wideEnoughForPanel() && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
   document.body.classList.remove('nav-open');
   if (v.type === 'channel') { const lc = P.lastChannel; lc[v.serverId] = v.channelId; P.lastChannel = lc; }
-  S.unreadMarker = S.unread.has(currentKey()) ? currentKey() : null;
+  // Where "New messages" goes: the read marker as it was when you opened the conversation.
+  const ck = currentKey();
+  S.unreadMarker = ck && S.unread.has(ck) ? ck : null;
+  S.markerId = S.unreadMarker ? S.lastRead[ck] || '0' : null;
+  S.markerCount = S.unreadMarker ? S.unreadCounts && S.unreadCounts[ck] || 0 : 0;
   renderAll();
   markRead(currentKey());
 }
@@ -962,20 +1146,89 @@ function openMessages() {
 
 // ======================================================================= unread + notification levels
 // Levels: 'all' | 'mentions' | 'muted'. Channels inherit from their server unless set.
+// The preferences live on the server (so push follows them too) and sync to your other devices. 'none' there
+// is 'muted' here; "mute for a while" (muteUntil) counts as muted until it runs out.
+const mutedFor = (p) => !!(p && p.muteUntil && p.muteUntil > Date.now());
 function notifyLevel(key) {
-  const p = P.notify;
-  if (p[key] && p[key] !== 'default') return p[key];
-  if (key.startsWith('c:')) {
-    const s = serverOfChannel(key.slice(2));
-    if (s && p['s:' + s.id]) return p['s:' + s.id];
-  }
-  return 'all';
+  const own = S.notifyPrefs[key];
+  const srv = key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
+  const sp = srv ? S.notifyPrefs['s:' + srv.id] : null;
+  if (mutedFor(own) || mutedFor(sp)) return 'muted';
+  const pick = (p) => (p && p.level !== 'default' ? p.level : null);
+  const lvl = pick(own) || pick(sp) || 'all';
+  return lvl === 'none' ? 'muted' : lvl;
 }
-function setNotify(key, level) {
-  const p = P.notify;
-  if (level === 'default') delete p[key]; else p[key] = level;
-  P.notify = p;
-  renderSidebar(); renderRail(); renderHeader();
+// Does @everyone ping me here? Not when I've switched that off for the channel or its server.
+function everyoneMuted(key) {
+  const srv = key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
+  return !!((S.notifyPrefs[key] || {}).suppressEveryone || (srv && (S.notifyPrefs['s:' + srv.id] || {}).suppressEveryone));
+}
+function applyNotifyPref(r) {
+  if (!r || !r.target) return;
+  if (r.level === 'default' && !r.muteUntil && !r.suppressEveryone) delete S.notifyPrefs[r.target];
+  else S.notifyPrefs[r.target] = { level: r.level, muteUntil: r.muteUntil || null, suppressEveryone: !!r.suppressEveryone };
+  later(renderSidebar); later(renderRail); later(renderHeader);
+}
+async function setNotify(key, level, extra = {}) {
+  const body = { ...extra };
+  if (level !== undefined) body.level = level === 'muted' ? 'none' : level;
+  try { applyNotifyPref(await api('PUT', `/me/notify/${key}`, body)); } catch (e) { toast(e.message, 'error'); }
+}
+async function setNotifySettings(body) {
+  const r = await api('PUT', '/me/notify-settings', body);
+  S.notifySettings = { dnd: r.dnd, tz: r.tz, previews: r.previews };
+  return r;
+}
+// Do Not Disturb: the status, or quiet hours right now.
+const quiet = () => S.me.status === 'dnd' || quietNow(S.notifySettings);
+// Unread state, preferences and saved ids from the server, at start-up.
+function applyUserState([unread, notify, savedIds]) {
+  if (notify) { S.notifyPrefs = notify.prefs || {}; S.notifySettings = notify.settings || S.notifySettings; migrateLocalNotify(); syncTimeZone(); }
+  if (savedIds) { S.savedIds = new Set(savedIds); migrateLocalSaved(); }
+  if (unread) { S.unreadCounts = {}; for (const [conv, st] of Object.entries(unread.states || {})) applyReadState(conv, st); }
+  updateTitle();
+}
+function applyReadState(conv, st) {
+  if (!st) return;
+  if (st.lastReadId) S.lastRead[conv] = st.lastReadId;
+  if (st.lastId) S.lastIds[conv] = st.lastId;
+  (S.unreadCounts ||= {})[conv] = st.unread || 0;
+  if (st.unread > 0) S.unread.add(conv); else S.unread.delete(conv);
+  if (st.mentions > 0 && notifyLevel(conv) !== 'muted') S.mentions.set(conv, st.mentions); else S.mentions.delete(conv);
+}
+// Read on another device (or another tab): same badges here, and its notifications go away.
+function onReadUpdate(st) {
+  if (!st || !st.conv) return;
+  applyReadState(st.conv, st);
+  if (!st.unread) closeNotifications(st.conv);
+  updateTitle(); later(renderRail); later(renderSidebar);
+  if (S.view.type === 'home') later(renderMain);
+}
+// Preferences and saved messages used to be kept only in this browser. The first time this device sees the
+// server's (empty) copy, it hands its own over (ids and levels only: the saved text it kept is deleted).
+function migrateLocalNotify() {
+  const k = mine('notify');
+  let old = null;
+  try { old = JSON.parse(localStorage.getItem(k) || 'null'); } catch { /* none */ }
+  if (!old || typeof old !== 'object') return;
+  localStorage.removeItem(k); lsCache.delete(k);
+  if (Object.keys(S.notifyPrefs).length) return;
+  for (const [key, lvl] of Object.entries(old).slice(0, 100)) if (/^[scd]:/.test(key) && ['all', 'mentions', 'muted'].includes(lvl)) setNotify(key, lvl);
+}
+function migrateLocalSaved() {
+  const k = mine('saved');
+  let old = null;
+  try { old = JSON.parse(localStorage.getItem(k) || 'null'); } catch { /* none */ }
+  localStorage.removeItem(mine('lastRead')); lsCache.delete(mine('lastRead'));
+  if (!Array.isArray(old)) return;
+  localStorage.removeItem(k); lsCache.delete(k);
+  for (const it of old.slice(0, 200).reverse()) if (it && it.msgId && !S.savedIds.has(it.msgId)) api('PUT', `/me/saved/${it.msgId}`, {}).then(() => S.savedIds.add(it.msgId)).catch(() => {});
+}
+// Quiet hours follow your clock: the server needs your time zone to know when they start.
+function syncTimeZone() {
+  let tz = '';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { /* unknown */ }
+  if (tz && tz !== S.notifySettings.tz) setNotifySettings({ tz }).catch(() => {});
 }
 const isMuted = (key) => notifyLevel(key) === 'muted';
 function serverUnread(s) {
@@ -986,8 +1239,16 @@ function serverUnread(s) {
     mentions += S.mentions.get(k) || 0;
     if (S.unread.has(k) && notifyLevel(k) === 'all') unread = true;
   }
-  if (P.notify['s:' + s.id] === 'muted') unread = false;
+  if (notifyLevel('s:' + s.id) === 'muted') unread = false;
   return { unread, mentions };
+}
+// The read marker is saved on the server (a moment after it moves, so scrolling through a busy channel is one
+// request), which tells your other devices.
+const readSync = new Map(); // key -> timer
+function syncRead(key, messageId, unread = false) {
+  clearTimeout(readSync.get(key));
+  const go = () => { readSync.delete(key); api('POST', '/me/read', { conv: key, messageId, ...(unread ? { unread: true } : {}) }).catch(() => {}); };
+  if (unread) go(); else readSync.set(key, setTimeout(go, 600));
 }
 function markRead(key) {
   if (!key || document.hidden) return;
@@ -995,27 +1256,43 @@ function markRead(key) {
   const lastId = st && st.list.length && !st.hasNewer ? st.list[st.list.length - 1].id : null;
   const badges = S.unread.has(key) || S.mentions.has(key);
   // Called on every scroll near the bottom: only do the work when something actually changes.
-  if (!badges && (!lastId || P.lastRead[key] === lastId)) return;
-  if (lastId && P.lastRead[key] !== lastId) {
-    const lr = P.lastRead;
-    lr[key] = lastId;
-    P.lastRead = lr;
-  }
+  if (!badges && (!lastId || (S.lastRead[key] && S.lastRead[key] >= lastId))) return;
+  if (lastId && !(S.lastRead[key] && S.lastRead[key] >= lastId)) { S.lastRead[key] = lastId; syncRead(key, lastId); }
   // Only unread dots and mention counts show in the server bar and channel list.
   if (!badges) return;
   S.unread.delete(key);
   S.mentions.delete(key);
+  if (S.unreadCounts) S.unreadCounts[key] = 0;
+  closeNotifications(key);
   updateTitle();
   later(renderRail);
   later(renderSidebar);
 }
+// "Mark as read" from a menu: up to the newest message we know of, loaded or not.
+function markConvRead(key) {
+  const st = S.msgs[key];
+  const lastId = (st && st.list.length && !st.hasNewer && st.list[st.list.length - 1].id) || S.lastIds[key];
+  if (lastId) { S.lastRead[key] = lastId; syncRead(key, lastId); }
+  S.unread.delete(key); S.mentions.delete(key);
+  if (S.unreadCounts) S.unreadCounts[key] = 0;
+  if (S.unreadMarker === key) { S.unreadMarker = null; if (currentKey() === key) renderMessages(false); }
+  closeNotifications(key);
+  renderSidebar(); renderRail(); updateTitle();
+}
+async function markServerRead(server) {
+  server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); });
+  renderAll(); updateTitle();
+  try { (await api('POST', `/servers/${server.id}/read`)).states.forEach((st) => applyReadState(st.conv, st)); } catch (e) { toast(e.message, 'error'); }
+}
 function markUnread(key, msgId) {
-  const lr = P.lastRead;
   const store = S.msgs[key];
   const i = store ? store.list.findIndex((m) => m.id === msgId) : -1;
-  lr[key] = i > 0 ? store.list[i - 1].id : '0';
-  P.lastRead = lr;
+  const id = i > 0 ? store.list[i - 1].id : '0';
+  S.lastRead[key] = id;
   S.unread.add(key);
+  S.unreadMarker = key; S.markerId = id;
+  S.markerCount = store ? store.list.filter((m) => m.id > id && m.authorId !== S.me.id).length : 0;
+  syncRead(key, id, true);
   updateTitle(); renderRail(); renderSidebar();
   if (currentKey() === key) renderMessages(false);
 }
@@ -1094,7 +1371,9 @@ function globalKeys(e) {
   if ((e.ctrlKey || e.metaKey) && k === 'k') { e.preventDefault(); openSearch(); return; }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); stepChannel(e.key === 'ArrowUp' ? -1 : 1); }
   if (e.key === 'Escape' && !document.querySelector('.modal-backdrop, .popover')) {
-    if (S.editing) { S.editing = null; renderMessages(false); }
+    // Phones: the navigation drawer closes first, and focus goes back to the button that opened it.
+    if (document.body.classList.contains('nav-open')) { document.body.classList.remove('nav-open'); const t = $('.nav-toggle'); if (t) t.focus(); }
+    else if (S.editing) { S.editing = null; renderMessages(false); }
     else if (composers.main && composers.main.state.replyTo) composers.main.setReply(null);
     else if (S.panel === 'thread') closeThread();
   }
@@ -1181,7 +1460,7 @@ const study = createRecall({ S, onEnabled: () => { if (!S.view.serverId) renderS
 const folders = createFolders({
   S, servers: () => realServers(), favorites: () => new Set(P.favorites.filter((f) => f.startsWith('s:')).map((f) => f.slice(2))),
   rerender: () => renderRail(), serverUnread: (s) => serverUnread(s), setNotify: (k, v) => setNotify(k, v), railSide: () => railSide(),
-  markServerRead: (server) => { server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); }); renderAll(); },
+  markServerRead: (server) => markServerRead(server),
   serverIcon: (s) => serverIconEl(s),
 });
 function renderRail() {
@@ -1345,8 +1624,8 @@ function dmMenuItems(d) {
   const fav = P.favorites.includes('d:' + d.id);
   return [
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('d:' + d.id) },
-    { label: 'Mark as read', icon: 'check', action: () => { S.unread.delete('d:' + d.id); S.mentions.delete('d:' + d.id); renderSidebar(); renderRail(); updateTitle(); } },
-    notifyItem('d:' + d.id),
+    { label: 'Mark as read', icon: 'check', action: () => markConvRead('d:' + d.id) },
+    ...notifyItems('d:' + d.id),
     '-',
     { label: 'View profile', icon: 'user', action: () => openProfileModal(u.id) },
     { label: 'Verify encryption', icon: 'shield', action: () => openSafetyNumber(u) },
@@ -1357,7 +1636,7 @@ function groupMenuItems(g) {
   const fav = P.favorites.includes('g:' + g.id);
   return [
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('g:' + g.id) },
-    c ? notifyItem('c:' + c.id) : null,
+    ...(c ? [{ label: 'Mark as read', icon: 'check', action: () => markConvRead('c:' + c.id) }, ...notifyItems('c:' + c.id)] : []),
     { label: 'Rename group', icon: 'edit', action: () => renameGroup(g) },
     { label: 'Change group picture', icon: 'image', action: () => changeGroupIcon(g) },
     { label: 'Add people', icon: 'userPlus', action: () => openNewConversation(g) },
@@ -1366,9 +1645,21 @@ function groupMenuItems(g) {
     { label: 'Leave group', icon: 'logout', danger: true, action: () => leaveServer(g) },
   ];
 }
-function notifyItem(key) {
-  const muted = isMuted(key);
-  return { label: muted ? 'Unmute' : 'Mute', icon: muted ? 'bell' : 'bellOff', action: () => setNotify(key, muted ? 'default' : 'muted') };
+// Mute for a while or until turned back on; muted shows how long is left.
+const MUTE_FOR = [['For 15 minutes', 15], ['For 1 hour', 60], ['For 8 hours', 480], ['For 24 hours', 1440]];
+function muteLeft(key) {
+  const p = S.notifyPrefs[key];
+  if (p && p.muteUntil > Date.now()) return `until ${fmtStamp(p.muteUntil)}`;
+  return p && p.level === 'none' ? 'until you turn it back on' : '';
+}
+function notifyItems(key) {
+  if (isMuted(key) && S.notifyPrefs[key]) {
+    const left = muteLeft(key);
+    return [{ label: 'Unmute', icon: 'bell', hint: left, action: () => setNotify(key, S.notifyPrefs[key].level === 'none' ? 'default' : undefined, { muteUntil: null }) }];
+  }
+  return [{ header: 'Mute' },
+    ...MUTE_FOR.map(([l, min]) => ({ label: l, icon: 'bellOff', action: () => setNotify(key, undefined, { muteUntil: Date.now() + min * 60000 }) })),
+    { label: 'Until I turn it back on', icon: 'bellOff', action: () => setNotify(key, 'muted') }];
 }
 
 // ---- server sidebar with categories
@@ -1458,39 +1749,50 @@ function channelRow(c, server) {
   }, icon(mentions ? 'at' : channelIcon(c), 'ic ch-ic'), h('span', { class: 'ch-name' }, c.name),
   muted ? icon('bellOff', 'ic ch-muted') : null,
   mentions ? h('span', { class: 'badge' }, mentions) : null),
-  isAdmin(server) ? ibtn('gear', 'Edit channel', () => openEditChannel(c), { cls: 'sm ch-gear' }) : null);
+  canEditChannel(server, c) || canEditChannelPerms(server, c) ? ibtn('gear', 'Edit channel', () => openEditChannel(c), { cls: 'sm ch-gear' }) : null);
 }
 function channelMenuItems(c, server) {
   const k = 'c:' + c.id;
   const admin = isAdmin(server);
-  const roles = can(server, PERMS.MANAGE_ROLES);
-  const lvl = P.notify[k] || 'default';
+  const edit = canEditChannel(server, c);
+  const roles = canEditChannelPerms(server, c);
+  const pk = S.notifyPrefs[k];
+  const lvl = pk && pk.level !== 'default' ? (pk.level === 'none' ? 'muted' : pk.level) : 'default';
   return [
-    c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => { S.unread.delete(k); S.mentions.delete(k); renderSidebar(); renderRail(); updateTitle(); } } : null,
+    c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => markConvRead(k) } : null,
     ...(c.type === 'voice' && callRegions().length ? [...regionMenuItems(c.id), '-'] : []),
     c.type === 'text' ? { header: 'Notifications' } : null,
-    ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
+    ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
+    c.type === 'text' ? { label: 'Ignore @everyone and @here', checked: !!(pk && pk.suppressEveryone), action: () => setNotify(k, undefined, { suppressEveryone: !(pk && pk.suppressEveryone) }) } : null,
+    ...(c.type === 'text' ? notifyItems(k) : []),
     '-',
     { label: 'Copy channel link', icon: 'link', action: () => { copyText(`${location.origin}/#c/${c.id}`); toast('Link copied.'); } },
-    admin ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
+    edit ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
     roles ? { label: 'Permissions', icon: 'shield', action: () => openEditChannel(c, 'perms') } : null,
     roles && c.type === 'text' ? { label: 'Make read-only (announcements)', icon: 'megaphone', action: () => quickOverride(server, c, 'readonly') } : null,
     roles ? { label: 'Make private', icon: 'lock', action: () => quickOverride(server, c, 'private') } : null,
     admin ? { label: 'Move up', icon: 'arrowUp', action: () => moveChannel(server, c, -1) } : null,
     admin ? { label: 'Move down', icon: 'arrowDown', action: () => moveChannel(server, c, 1) } : null,
-    admin ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
+    edit ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
   ];
 }
 // One-click channel setups: read-only for @everyone, or hidden from @everyone (then pick who can see it).
 async function quickOverride(server, c, kind) {
-  const list = (c.overrides || []).filter((o) => !(o.type === 'role' && o.id === server.id));
-  const everyone = (c.overrides || []).find((o) => o.type === 'role' && o.id === server.id) || { type: 'role', id: server.id, allow: 0, deny: 0 };
-  if (kind === 'readonly') everyone.deny |= PERMS.SEND_MESSAGES | PERMS.CREATE_THREADS;
-  else everyone.deny |= PERMS.VIEW_CHANNEL;
+  const bits = kind === 'readonly' ? PERMS.SEND_MESSAGES | PERMS.CREATE_THREADS : PERMS.VIEW_CHANNEL;
+  const isEveryone = (o) => o.type === 'role' && o.id === server.id;
+  const isMe = (o) => o.type === 'member' && o.id === S.me.id;
+  const old = (c.overrides || []).find(isEveryone) || { type: 'role', id: server.id, allow: 0, deny: 0 };
+  const everyone = { ...old, allow: old.allow & ~bits, deny: old.deny | bits };
+  // Unless you're the owner or an Administrator, the @everyone deny reaches you too, and the server refuses a
+  // change that takes your own access away (you couldn't undo it), so keep yours with an override for yourself.
+  const keep = isFullAdmin(server) ? 0 : bits & chanPerms(c);
+  const meOld = (c.overrides || []).find(isMe);
+  const me = keep ? { type: 'member', id: S.me.id, allow: ((meOld && meOld.allow) || 0) | keep, deny: ((meOld && meOld.deny) || 0) & ~keep } : meOld;
+  const overrides = [...(c.overrides || []).filter((o) => !isEveryone(o) && !isMe(o)), everyone, ...(me ? [me] : [])];
   try {
-    await api('PUT', `/channels/${c.id}/overrides`, { overrides: [...list, { ...everyone, allow: everyone.allow & ~everyone.deny }] });
+    await api('PUT', `/channels/${c.id}/overrides`, { overrides });
     toast(kind === 'readonly' ? `#${c.name} is now read-only. Give roles "Send messages" in its permissions to let them post.` : `#${c.name} is now private. Add roles or people who should see it.`);
-    if (kind === 'private') openEditChannel({ ...c, overrides: [...list, everyone] }, 'perms');
+    if (kind === 'private') openEditChannel(c, 'perms', { overrides });
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -1572,20 +1874,25 @@ function renderVoicePanel() {
   if (!voice || !voice.channelId) { el.hidden = true; return; }
   el.hidden = false;
   const room = voice.channelId;
-  const q = voice.connectionQuality();
+  // What the call engine says, never a guess: "Connected" only while every connection's media is up.
+  const st = voice.status();
   const others = (S.voice[room] || []).filter((x) => x.userId !== S.me.id).length;
-  const label = q === 'failed' ? 'Connection trouble' : q === 'connecting' ? 'Connecting\u2026' : room.startsWith('dm:') && !others ? 'Calling\u2026' : 'In call';
+  const label = st.state === 'connected' && room.startsWith('dm:') && !others ? 'Calling\u2026' : st.label;
+  const q = { ok: 'connected', bad: 'failed', warn: 'warn' }[st.tone] || 'connecting';
   const ch = !room.startsWith('dm:') && channelById(room);
   const srv = ch && serverOfChannel(ch.id);
   const where = room.startsWith('dm:') ? `Call with ${roomTitle(room)}` : srv ? (isGroup(srv) ? groupName(srv) : `${ch.name} \u00b7 ${srv.name}`) : '';
   const go = () => goToCall(room);
   el.append(
     h('div', { class: 'vp-top' },
-      h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}` }, label), h('button', { class: 'vp-where', onclick: go }, where)),
+      h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}`, role: 'status', 'aria-live': 'polite', 'data-tip': st.detail, dataset: { callState: st.state } }, label), h('button', { class: 'vp-where', onclick: go }, where)),
       callRegions().length ? h('button', {
         class: `vp-region${callRegion(room) ? ' pinned' : ''}`, 'data-pop-anchor': '', 'data-tip': 'Call region: everyone in the call switches together',
         onclick: (e) => menu(e.currentTarget, regionMenuItems(room), { align: 'end' }),
       }, icon('globe'), h('span', null, callRegion(room) ? regionName(callRegion(room)) : 'Auto')) : null),
+    // Anything but a healthy call says what's going on, and a call that couldn't be restored can be retried.
+    st.tone === 'warn' || st.tone === 'bad' ? h('div', { class: `vp-detail ${st.tone}` }, h('span', null, st.detail),
+      st.state === 'failed' ? h('button', { class: 'btn sm primary', onclick: () => voice.retry().catch((e) => toast(e.name === 'NotAllowedError' ? 'Allow microphone access in your browser to join.' : e.message, 'error')) }, 'Retry') : null) : '',
     h('div', { class: 'vp-controls' },
       ibtn(voice.muted ? 'micOff' : 'mic', voice.muted ? 'Unmute' : 'Mute', toggleMute, { cls: voice.muted ? 'off' : '' }),
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),
@@ -1616,7 +1923,7 @@ function statusMenu(anchor) {
         closePopover();
         try { await api('PATCH', '/me/status', { status: s }); S.me.status = s; S.users[S.me.id].status = s; renderUserPanel(); } catch (e) { toast(e.message, 'error'); }
       },
-    }, h('span', { class: `status-dot inline st-${s}` }), h('span', { class: 'menu-col' }, s === 'idle' ? 'Away' : STATUS_LABEL[s], desc[s] ? h('span', { class: 'menu-desc' }, desc[s]) : null))),
+    }, h('span', { class: `status-dot inline st-${s}`, 'aria-hidden': 'true' }), h('span', { class: 'menu-col' }, s === 'idle' ? 'Away' : STATUS_LABEL[s], desc[s] ? h('span', { class: 'menu-desc' }, desc[s]) : null))),
     h('div', { class: 'menu-sep' }),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openCustomStatus(); } }, icon('smile', 'ic menu-ic'), 'Set a custom status'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openActivityPicker(S.me.activity); } }, icon('gamepad', 'ic menu-ic'), 'Set what I\u2019m playing or listening to'),
@@ -1685,7 +1992,14 @@ function togglePanel(mode) {
 function renderHeader() {
   const head = $('#main-head');
   if (!head || !S.me) return;
+  // Redrawing replaces the buttons: keep keyboard focus on the same one ("Show members" becomes "Hide members").
+  const buttons = () => [...head.querySelectorAll('button')];
+  const at = buttons().indexOf(document.activeElement);
   clear(head);
+  drawHeader(head);
+  if (at >= 0 && buttons()[at]) buttons()[at].focus({ preventScroll: true });
+}
+function drawHeader(head) {
   head.append(navToggle());
   const v = S.view;
   const key = currentKey();
@@ -1766,7 +2080,7 @@ function renderHeader() {
       headTools(h('button', { class: 'btn ghost sm', onclick: () => updates.trackDialog(() => renderMain()) }, icon('plus'), 'Track something')));
   } else if (v.type === 'saved') {
     head.append(h('div', { class: 'head-title' }, icon('bookmark', 'ic head-ic'), h('h1', null, 'Saved messages')),
-      headTools(h('span', { class: 'head-note' }, 'Saved on this device only')));
+      headTools(h('span', { class: 'head-note' }, 'Synced to your devices. Only you can see them.')));
   } else if (server) {
     head.append(h('div', { class: 'head-title' }, h('h1', null, server.name)));
   }
@@ -1775,9 +2089,11 @@ function encBadge(onclick, tip = 'End-to-end encrypted. Click for details.') {
   return h('button', { class: 'head-badge e2ee', 'data-tip': tip, 'aria-label': tip, onclick }, icon('lock'));
 }
 function notifyMenu(key) {
-  const lvl = P.notify[key] || 'default';
+  const pk = S.notifyPrefs[key];
+  const lvl = pk && pk.level !== 'default' ? (pk.level === 'none' ? 'muted' : pk.level) : 'default';
   return [{ header: 'Notify me about' },
-    ...[['default', 'Server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing (mute)']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(key, v) }))];
+    ...[['default', 'Server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing (mute)']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(key, v) })),
+    ...(pk && pk.muteUntil > Date.now() ? [{ label: 'Unmute', icon: 'bell', hint: muteLeft(key), action: () => setNotify(key, undefined, { muteUntil: null }) }] : [])];
 }
 
 // ---- Home: a quick launchpad, not a wall of content
@@ -1965,26 +2281,77 @@ function friendsView() {
   return wrap;
 }
 
+// Saved messages: kept on the server as message ids (plus a note encrypted with your own key), so they follow
+// you to every device. Each one is fetched and decrypted here; one you can't see anymore says so.
+let vaultKeyP = null;
+const myVaultKey = () => (vaultKeyP ||= E2EE.vaultKey(S.privateKey, S.me.publicKey));
+async function openNote(it) {
+  if (!it.note) return '';
+  try { return (await E2EE.openVault(await myVaultKey(), 'saved', it.messageId, it.note)).n || ''; } catch { return ''; }
+}
 function savedView() {
-  const wrap = h('div', { class: 'saved' });
-  const list = P.saved;
-  if (!list.length) {
-    wrap.append(h('div', { class: 'empty-state' }, h('h3', null, 'Nothing saved yet'),
-      h('p', null, 'Hover a message and choose More \u2192 Save message to keep it here. Saved messages stay on this device.')));
-    return wrap;
-  }
-  for (const it of list) {
-    const u = getUser(it.authorId);
-    wrap.append(h('div', { class: 'saved-row' },
-      avatarEl(u, 36),
-      h('div', { class: 'saved-body' },
-        h('div', { class: 'saved-meta' }, nameEl(u), h('span', null, `${it.where} \u00b7 ${fmtStamp(it.createdAt)}`)),
-        h('div', { class: 'saved-text md' , html: md(it.text || (it.files ? 'Attachment' : ''), { mentionName: S.me.username }) })),
-      h('div', { class: 'saved-actions' },
-        ibtn('arrowUp', 'Jump to message', () => jumpToMessageId(it.msgId)),
-        ibtn('trash', 'Remove from saved', () => { P.saved = P.saved.filter((x) => x.msgId !== it.msgId); renderMain(); }))));
-  }
+  const wrap = h('div', { class: 'saved', 'aria-busy': 'true' }, h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
+  const state = { items: [], hasMore: false };
+  const draw = () => {
+    wrap.removeAttribute('aria-busy');
+    clear(wrap);
+    if (!state.items.length) {
+      wrap.append(h('div', { class: 'empty-state' }, h('h3', null, 'Nothing saved yet'),
+        h('p', null, 'Hover a message and choose More \u2192 Save message to keep it here. Saved messages follow you to all your devices.')));
+      return;
+    }
+    for (const it of state.items) {
+      const m = it.message;
+      if (!m) {
+        wrap.append(h('div', { class: 'saved-row unavailable' }, h('div', { class: 'saved-av-empty' }, icon('bookmark')),
+          h('div', { class: 'saved-body' }, h('div', { class: 'saved-meta' }, h('span', null, `Saved ${fmtStamp(it.savedAt)}`)),
+            h('div', { class: 'saved-text muted-p' }, 'This message is no longer available. It was deleted, or you can\u2019t see that conversation anymore.'),
+            it.noteText ? h('div', { class: 'saved-note' }, icon('edit'), it.noteText) : null),
+          h('div', { class: 'saved-actions' }, ibtn('trash', 'Remove from saved', () => unsave(it.messageId)))));
+        continue;
+      }
+      const u = getUser(m.authorId);
+      const text = readable(m) ? textOf(m) || (filesOf(m).length ? '_Attachment_' : m.dec && m.dec.p ? `\uD83D\uDCCA ${m.dec.p.q}` : '') : '';
+      wrap.append(h('div', { class: 'saved-row', dataset: { saved: it.messageId } },
+        avatarEl(u, 36),
+        h('div', { class: 'saved-body' },
+          h('div', { class: 'saved-meta' }, nameEl(u), h('span', null, `${whereLabel(m)} \u00b7 ${fmtStamp(m.createdAt)}`)),
+          readable(m) ? h('div', { class: 'saved-text md', html: md(text, { mentionName: S.me.username }) }) : h('div', { class: 'saved-text muted-p' }, 'Can\u2019t decrypt this message on this device yet.'),
+          it.noteText ? h('div', { class: 'saved-note' }, icon('edit'), it.noteText) : null),
+        h('div', { class: 'saved-actions' },
+          ibtn('arrowUp', 'Jump to message', () => jumpToMessageId(it.messageId)),
+          ibtn('edit', it.noteText ? 'Edit note' : 'Add a note', () => editSavedNote(it)),
+          ibtn('trash', 'Remove from saved', () => unsave(it.messageId)))));
+    }
+    if (state.hasMore) wrap.append(h('div', { class: 'saved-more' }, h('button', { class: 'btn ghost', onclick: () => load(state.items[state.items.length - 1].savedAt) }, 'Show older')));
+  };
+  const load = async (before) => {
+    try {
+      const res = await api('GET', `/me/saved?limit=50${before ? `&before=${before}` : ''}`);
+      await Promise.all(res.items.map(async (it) => { if (it.message) await decryptMessage(it.message); it.noteText = await openNote(it); }));
+      state.items = before ? [...state.items, ...res.items] : res.items;
+      state.hasMore = res.hasMore;
+      if (S.view.type === 'saved') draw();
+    } catch (e) { clear(wrap).append(h('p', { class: 'sidebar-empty' }, e.message)); }
+  };
+  load();
   return wrap;
+}
+async function unsave(id) {
+  try { await api('DELETE', `/me/saved/${id}`); S.savedIds.delete(id); toast('Removed from saved.'); if (S.view.type === 'saved') renderMain(); } catch (e) { toast(e.message, 'error'); }
+}
+function editSavedNote(it) {
+  const inp = h('textarea', { class: 'input', rows: '3', maxlength: '500', placeholder: 'Why you saved it, a to-do\u2026' });
+  inp.value = it.noteText || '';
+  modal({ title: it.noteText ? 'Edit note' : 'Add a note', size: 'sm',
+    body: h('div', { class: 'stack' }, field('Note', inp, 'Only you can read it: it\u2019s encrypted on this device before it\u2019s saved.')),
+    actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: async () => {
+      const n = inp.value.trim();
+      const note = n ? await E2EE.sealVault(await myVaultKey(), 'saved', it.messageId, { n }) : null;
+      await api('PUT', `/me/saved/${it.messageId}`, { note });
+      toast('Note saved.');
+      if (S.view.type === 'saved') renderMain();
+    } }] });
 }
 
 // ======================================================================= conversation view
@@ -1993,13 +2360,15 @@ function chatView() {
   const scroller = h('div', { class: 'messages', id: 'messages', tabindex: '0', 'aria-label': 'Messages', role: 'log' });
   scroller.addEventListener('scroll', onMessagesScroll);
   scroller.addEventListener('click', onMessageAreaClick);
+  messageListKeys(scroller);
   const jump = h('button', { class: 'jump-latest', id: 'jump-latest', hidden: true, onclick: () => jumpToLatest() }, icon('arrowDown'), 'Jump to latest');
+  const unreadBar = h('div', { class: 'unread-bar', id: 'unread-bar', role: 'status', hidden: true });
   const key = currentKey();
   const comp = createComposer({ id: 'main', key: () => currentKey(), threadId: () => null });
   composers.main = comp;
   const room = S.view.type === 'dm' ? dmRoom(S.view.dmId) : callRoomFor(currentServer());
   if (room && ((S.voice[room] || []).length || (voice && voice.channelId === room))) wrap.append(callStage(room, { compact: true }));
-  wrap.append(scroller, jump, comp.el);
+  wrap.append(unreadBar, scroller, jump, comp.el);
   wrap.addEventListener('dragover', (e) => { e.preventDefault(); wrap.classList.add('dropping'); });
   wrap.addEventListener('dragleave', (e) => { if (!wrap.contains(e.relatedTarget)) wrap.classList.remove('dropping'); });
   wrap.addEventListener('drop', (e) => { e.preventDefault(); wrap.classList.remove('dropping'); comp.addFiles(e.dataTransfer.files); });
@@ -2045,10 +2414,11 @@ async function loadMessages(key, mode = 'latest') {
       const prevTop = sc.scrollTop;
       if (!prependOlder(sc, store, fresh)) renderMessages(false);
       sc.scrollTop = sc.scrollHeight - prevH + prevTop;
+      dropNewest(sc, store);
     } else if (mode === 'newer') {
-      const top = sc.scrollTop;
-      renderMessages(false);
-      sc.scrollTop = top;
+      // Coming back down: let go of the oldest ones instead, and keep what you're reading where it is.
+      if (store.list.length > HISTORY_WINDOW) { store.list.splice(0, store.list.length - HISTORY_WINDOW); store.hasMore = true; }
+      keepAnchor(sc, () => renderMessages(false));
     } else renderMessages(typeof mode !== 'object');
     if (!store.hasNewer) markRead(key);
   } catch (e) {
@@ -2062,6 +2432,38 @@ function trimStore(store, keep) {
   store.list.splice(0, store.list.length - keep);
   store.hasMore = true;
   return true;
+}
+// Reading far back: at most this many messages stay loaded and on screen. Scrolling up lets go of the newest
+// ones (they load again on the way down), so a long read back through history doesn't keep growing the page.
+const HISTORY_WINDOW = 300;
+function dropNewest(sc, store) {
+  if (store.list.length <= HISTORY_WINDOW) return false;
+  const gone = new Set(store.list.splice(HISTORY_WINDOW).map((m) => m.id));
+  store.hasNewer = true;
+  for (const el of sc.querySelectorAll(':scope > .msg[data-mid]')) if (gone.has(el.dataset.mid)) el.remove();
+  // Your own unsent messages and dividers left dangling at the bottom go too (they come back with the latest).
+  for (let el = sc.lastElementChild; el && !el.matches('.msg[data-mid]');) {
+    const prev = el.previousElementSibling;
+    if (el.matches('.day-div, .new-div, .msg.sending')) el.remove();
+    el = prev;
+  }
+  // The message keyboard focus was on may be gone: give the Tab order a current one again.
+  ensureCurrentMessage(sc);
+  const jl = $('#jump-latest');
+  if (jl) jl.hidden = false;
+  return true;
+}
+// Redraws with `fn` and keeps the first message in view at the same spot on screen.
+function keepAnchor(sc, fn) {
+  const top = sc.getBoundingClientRect().top;
+  const anchor = [...sc.querySelectorAll(':scope > .msg[data-mid]')].find((el) => el.getBoundingClientRect().bottom > top);
+  const id = anchor && anchor.dataset.mid;
+  const offset = anchor ? anchor.getBoundingClientRect().top - top : 0;
+  const before = sc.scrollTop;
+  fn();
+  const again = id && sc.querySelector(`.msg[data-mid="${id}"]`);
+  if (again) sc.scrollTop += again.getBoundingClientRect().top - top - offset;
+  else sc.scrollTop = before;
 }
 // Scrolling up: add just the older messages at the top instead of redrawing everything.
 function prependOlder(sc, store, fresh) {
@@ -2135,7 +2537,7 @@ function mentionKind(m) {
   if (m.dmId) return null;
   const server = S.servers.find((x) => x.id === m.serverId);
   const mine = server ? (server.memberRoles || {})[S.me.id] || [] : [];
-  for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id)) return 'roleMention';
+  for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id) && mayMentionRole(server, id, m.authorId)) return 'roleMention';
   if (/(^|\s)@(everyone|channel|here)\b/i.test(t) && authorMayPingEveryone(m)) return 'everyone';
   return null;
 }
@@ -2198,7 +2600,7 @@ function renderMessages(stick) {
     return;
   }
   if (!store.hasMore) sc.append(welcomeBlock());
-  const lastRead = P.lastRead[key];
+  const lastRead = S.unreadMarker === key ? S.markerId : null;
   let newShown = false;
   let prev = null;
   for (const m of store.list) {
@@ -2206,8 +2608,8 @@ function renderMessages(stick) {
       sc.append(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
       prev = null;
     }
-    if (!newShown && lastRead && m.id > lastRead && m.authorId !== S.me.id && S.unreadMarker === key) {
-      sc.append(h('div', { class: 'new-div', role: 'separator', 'aria-label': 'New messages' }, h('span', null, 'New')));
+    if (!newShown && lastRead && m.id > lastRead && m.authorId !== S.me.id) {
+      sc.append(h('div', { class: 'new-div', role: 'separator', 'aria-label': 'New messages', id: 'new-div' }, h('span', null, 'New messages')));
       newShown = true;
       prev = null;
     }
@@ -2222,7 +2624,35 @@ function renderMessages(stick) {
   if (!store.hasNewer) redrawPendingSends(key);
   const jl = $('#jump-latest');
   if (jl) jl.hidden = !store.hasNewer;
+  renderUnreadBar();
+  ensureCurrentMessage(sc);
   renderTyping();
+}
+// "12 new messages since 3:04 PM · Jump to first unread · Mark as read", above the messages while there's a
+// "New messages" line in this conversation.
+function renderUnreadBar() {
+  const bar = $('#unread-bar');
+  if (!bar) return;
+  const key = currentKey();
+  clear(bar);
+  const store = S.msgs[key];
+  const n = S.unreadMarker === key ? Math.max(S.markerCount || 0, store ? store.list.filter((m) => m.id > S.markerId && m.authorId !== S.me.id).length : 0) : 0;
+  bar.hidden = !n;
+  if (!n) return;
+  const first = store && store.list.find((m) => m.id > S.markerId && m.authorId !== S.me.id);
+  bar.append(h('button', { class: 'unread-jump', onclick: () => jumpToFirstUnread() }, icon('arrowUp'),
+    h('span', null, `${n >= 100 ? '99+' : n} new message${n === 1 ? '' : 's'}${first ? ` since ${fmtTime(first.createdAt)}` : ''}`), h('strong', null, 'Jump to first unread')),
+  h('button', { class: 'unread-mark', onclick: () => markConvRead(key) }, 'Mark as read', icon('check')));
+}
+async function jumpToFirstUnread() {
+  const key = currentKey();
+  if (S.unreadMarker !== key) return;
+  const store = S.msgs[key];
+  const loadedFrom = store && store.list.length ? store.list[0].id : null;
+  // The first unread message isn't loaded yet (lots of new messages): load the page around the marker.
+  if (!loadedFrom || loadedFrom > S.markerId) await loadMessages(key, { around: S.markerId });
+  const div = $('#new-div');
+  if (div) div.scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
 }
 function welcomeBlock() {
   if (S.view.type === 'dm') {
@@ -2298,6 +2728,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       m.pinnedAt ? h('span', { class: 'msg-pin', 'data-tip': 'Pinned' }, icon('pin')) : null));
   }
   if (S.editing === m.id) body.append(editBox(m, ctx));
+  else if (m.dec && m.dec.forged) body.append(h('div', { class: 'msg-text undecryptable', 'data-tip': 'Members\u2019 apps can\u2019t send messages without end-to-end encryption, so only the server could have written this one.' }, icon('shield'), 'Hidden: a message without end-to-end encryption, dated after this server turned it on.'));
   else if (m.dec && m.dec.error) body.append(h('div', { class: 'msg-text undecryptable' }, icon('lock'), 'This message could not be decrypted on this device.'));
   else if (m.dec && m.dec.pending) {
     body.append(h('div', { class: 'msg-text undecryptable' }, icon('lock'), m.dec.before
@@ -2321,8 +2752,13 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const wc = watchChips(text);
     if (wc) body.append(wc);
     if (embed) body.append(newsCard(embed));
-    if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
-    else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only.' }, 'Older message \u2014 not end-to-end encrypted'));
+    if (m.dec && m.dec.bot && m.authorId === NEWS_BOT_ID) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
+    else if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by a bot this server added. Bot messages aren\u2019t end-to-end encrypted. Everything people write still is.' }, 'Bot \u00b7 not end-to-end encrypted'));
+    else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only, and nothing proves who wrote it: the server could have.' }, 'Older message \u2014 not end-to-end encrypted, sender not verified'));
+    // Opened or signed with a key that isn't the person's current, trusted one (secure.js keysOf).
+    else if (m.dec && m.dec.keyNote === 'listed') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'Written with a key the server says this person had before they reset their password. This device never saw that key as theirs and it can\u2019t be checked with safety numbers, so the server could have written this.' }, '\u26a0 Older key \u2014 not verified'));
+    else if (m.dec && m.dec.keyNote === 'new') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'This person\u2019s security key changed and you haven\u2019t verified the new one yet. Compare safety numbers from their profile.' }, '\u26a0 New key \u2014 not verified yet'));
+    else if (m.dec && m.dec.keyNote === 'pinned') body.append(h('div', { class: 'msg-flag', 'data-tip': 'Written with a key this person had before they changed keys. This device trusted that key back then.' }, 'Written with an older key'));
     else if (m.dec && m.dec.verified === false && !m.dmId) body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'The signature on this message does not match the sender\u2019s key.' }, '\u26a0 Sender could not be verified'));
   }
   if (m.reactions && m.reactions.length) {
@@ -2340,7 +2776,60 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       m.threadLastAt ? h('span', null, `Last reply ${relTime(m.threadLastAt)}`) : null, icon('chevronRight')));
   }
   el.append(gutter, body, messageTools(m, ctx));
+  roveMessage(el, false);
   return el;
+}
+
+// ---- keyboard in message lists
+// One message at a time is in the Tab order, together with its links and buttons; ↑/↓, Home and End
+// move between messages. Otherwise Tab would walk through every message's toolbar to reach the composer.
+const ROVABLE = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
+function roveMessage(el, on) {
+  el.tabIndex = on ? 0 : -1;
+  if (on) {
+    for (const x of el.querySelectorAll('[data-roved]')) {
+      if (x.dataset.roved) x.setAttribute('tabindex', x.dataset.roved); else x.removeAttribute('tabindex');
+      delete x.dataset.roved;
+    }
+  } else {
+    for (const x of el.querySelectorAll(ROVABLE)) {
+      if (x.dataset.roved !== undefined) continue;
+      x.dataset.roved = x.getAttribute('tabindex') || '';
+      x.tabIndex = -1;
+    }
+  }
+}
+// Makes `msg` the list's current message (the one Tab reaches).
+function setCurrentMessage(list, msg) {
+  const cur = list.querySelector(':scope > .msg[tabindex="0"]');
+  if (cur === msg) return;
+  if (cur) roveMessage(cur, false);
+  if (msg) roveMessage(msg, true);
+}
+// After a redraw: keep the current message if it's still there, else the newest one.
+function ensureCurrentMessage(list) {
+  if (!list || list.querySelector(':scope > .msg[tabindex="0"]')) return;
+  const all = list.querySelectorAll(':scope > .msg[data-mid]');
+  if (all.length) setCurrentMessage(list, all[all.length - 1]);
+}
+function messageListKeys(list) {
+  list.addEventListener('focusin', (e) => {
+    const msg = e.target.closest('.msg[data-mid]');
+    if (msg && msg.parentElement === list) setCurrentMessage(list, msg);
+  });
+  list.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey || !['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    const msg = e.target.closest('.msg[data-mid]');
+    // Only from the message itself: arrows inside an edit box or a slider keep their usual meaning.
+    if (!msg || e.target !== msg) return;
+    const all = [...list.querySelectorAll(':scope > .msg[data-mid]')];
+    const i = all.indexOf(msg);
+    const next = e.key === 'Home' ? all[0] : e.key === 'End' ? all[all.length - 1] : all[i + (e.key === 'ArrowDown' ? 1 : -1)];
+    if (!next) return;
+    e.preventDefault();
+    next.focus({ preventScroll: true });
+    next.scrollIntoView({ block: 'nearest' });
+  });
 }
 // GIPHY media goes through our server (if the admin left the privacy proxy on), so GIPHY never sees viewers' IPs.
 const isGiphy = (u) => /^https:\/\/(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)\//i.test(u);
@@ -2374,9 +2863,10 @@ function authorMayPingEveryone(m) {
 function messageMenuItems(m, ctx) {
   const mine = m.authorId === S.me.id;
   const ok = readable(m);
-  const saved = P.saved.some((x) => x.msgId === m.id);
+  const saved = S.savedIds.has(m.id);
   const server = m.serverId && S.servers.find((s) => s.id === m.serverId);
-  const canPin = m.dmId || isGroup(server) || mine || canModerate(m);
+  // Pins are the channel's notice board: in servers they need Manage Messages, even for your own messages.
+  const canPin = m.dmId || isGroup(server) || canModerate(m);
   return [
     { label: 'Add reaction', icon: 'smile', action: () => { const el = $(`[data-mid="${m.id}"] .msg-tools .tool:nth-child(2)`); emojiPicker(el || $('#main'), (em) => react(m, em)); } },
     ok ? { label: 'Reply', icon: 'reply', action: () => startReply(m, ctx) } : null,
@@ -2403,7 +2893,11 @@ function replaceMessageEl(m) {
     const list = ctx === 'thread' ? threadList() : (S.msgs[keyOfMessage(m)] || { list: [] }).list;
     const i = list.findIndex((x) => x.id === m.id);
     const fresh = messageEl(m, i > 0 ? list[i - 1] : null, ctx);
+    const wasCurrent = el.tabIndex === 0;
+    const hadFocus = el.contains(document.activeElement);
     el.replaceWith(fresh);
+    if (wasCurrent) setCurrentMessage(fresh.parentElement, fresh);
+    if (hadFocus) fresh.focus({ preventScroll: true });
     if (S.editing === m.id) { const ta = fresh.querySelector('textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }
   });
 }
@@ -2425,6 +2919,22 @@ async function jumpToMessage(key, id) {
   await loadMessages(key, { around: id });
   const again = $(`#messages [data-mid="${id}"]`);
   if (again) flash(again); else toast('That message was deleted.');
+}
+// Settings → Storage: the name and type of one of your files. The server only knows sizes and where it was posted;
+// the name is inside the encrypted message, so it comes from a message this app has open, or fetches and opens now.
+async function fileInfo(url, where) {
+  const look = (list) => {
+    for (const m of list || []) for (const f of filesOf(m)) { if (f.url === url) return f; if (f.th && f.th.url === url) return { ...f, preview: true }; }
+    return null;
+  };
+  for (const st of Object.values(S.msgs)) { const f = look(st.list); if (f) return f; }
+  const key = where && where.messageId ? (where.type === 'dm' ? 'd:' + where.dmId : where.type === 'channel' ? 'c:' + where.channelId : null) : null;
+  if (!key) return null;
+  const res = await api('GET', `${msgUrl(key)}?around=${encodeURIComponent(where.messageId)}`);
+  const m = (res.messages || []).find((x) => x.id === where.messageId);
+  if (!m) return null;
+  await decryptMessage(m);
+  return look([m]);
 }
 async function jumpToMessageId(id) {
   try {
@@ -2505,14 +3015,12 @@ function whereLabel(m) {
   const c = channelById(m.channelId);
   return s && c ? `#${c.name} \u00b7 ${s.name}` : 'Channel';
 }
-function toggleSaved(m) {
-  const list = P.saved;
-  if (list.some((x) => x.msgId === m.id)) { P.saved = list.filter((x) => x.msgId !== m.id); toast('Removed from saved.'); }
-  else {
-    list.unshift({ msgId: m.id, authorId: m.authorId, text: textOf(m), files: filesOf(m).length, createdAt: m.createdAt, where: whereLabel(m), savedAt: Date.now() });
-    P.saved = list;
-    toast('Saved. Find it under Home \u2192 Saved messages.');
-  }
+async function toggleSaved(m) {
+  const was = S.savedIds.has(m.id);
+  try {
+    if (was) { await api('DELETE', `/me/saved/${m.id}`); S.savedIds.delete(m.id); toast('Removed from saved.'); }
+    else { await api('PUT', `/me/saved/${m.id}`, {}); S.savedIds.add(m.id); toast('Saved. Find it under Home \u2192 Saved messages.'); }
+  } catch (e) { toast(e.message, 'error'); }
   if (S.view.type === 'saved') renderMain();
 }
 function startReply(m, ctx = 'main') {
@@ -2549,38 +3057,75 @@ function openForward(m) {
 }
 
 // ======================================================================= attachments + media viewer
-const blobCache = new Map();
+// Decrypted files are blob: URLs, kept in a bounded cache (files.js makeUrlCache) so a long session full of
+// photos and videos doesn't keep every one in memory: the least recently used are revoked once they're off screen.
+const fileUrls = makeUrlCache();
+const fileJobs = new Map(); // url -> { job, listeners }: downloads in progress, shared by everyone asking
+const AUTOLOAD_MAX = 20 * 1024 * 1024; // bigger videos and songs wait for a click instead of downloading by themselves
 function decryptedUrl(m, f) {
-  if (!blobCache.has(f.url)) {
+  if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn\u2019t on this server.'));
+  const ready = fileUrls.get(f.url);
+  if (ready) return Promise.resolve(ready);
+  if (!fileJobs.has(f.url)) {
+    const listeners = new Set();
     const job = (async () => {
-      const res = await fetch(f.url).catch(() => { throw new Error('Couldn\u2019t reach the server. Check your connection and try again.'); });
-      if (res.status === 404) throw new Error('This file was deleted.');
-      if (!res.ok) throw new Error(`The server couldn\u2019t send this file (${res.status}). Try again in a moment.`);
-      const plain = await sec.decryptAttachment(m, f, await res.arrayBuffer());
-      return URL.createObjectURL(new Blob([plain], { type: f.type || 'application/octet-stream' }));
+      // f.size is the plain size; the ciphertext adds a 12-byte IV and a 16-byte tag.
+      const buf = await download(f.url, { expected: f.size ? f.size + 28 : 0, onProgress: (x) => listeners.forEach((fn) => fn(x)) });
+      const plain = await sec.decryptAttachment(m, f, buf);
+      return fileUrls.put(f.url, new Blob([plain], { type: f.type || 'application/octet-stream' }));
     })();
-    blobCache.set(f.url, job);
+    fileJobs.set(f.url, { job, listeners });
     // A failed try isn't remembered: the next click fetches again instead of failing straight away.
-    job.catch(() => { if (blobCache.get(f.url) === job) blobCache.delete(f.url); });
+    job.then(() => fileJobs.delete(f.url), () => fileJobs.delete(f.url));
   }
-  return blobCache.get(f.url);
+  return fileJobs.get(f.url).job;
 }
+// Download progress (0–1) of a file decryptedUrl is fetching right now, if it is.
+function watchFile(url, fn) { const entry = fileJobs.get(url); if (entry && fn) entry.listeners.add(fn); }
 function fileIcon(type, name) {
   if (/^image\//.test(type)) return 'image';
   if (/pdf|text|document|msword|sheet|presentation/.test(type) || /\.(pdf|txt|md|docx?|xlsx?|pptx?|csv)$/i.test(name)) return 'file';
   return 'file';
 }
+const goneText = 'This file is no longer available';
 async function downloadAttachment(m, f, btn) {
   if (btn && btn.disabled) return;
+  const label = btn && !btn.classList.contains('att-dl') ? btn.lastChild : null;
+  const before = label && label.nodeType === 3 ? label.textContent : null;
   if (btn) { btn.disabled = true; btn.classList.add('busy'); }
   try {
     const enc = !!f.k || !!m.dmId;
-    const href = enc ? await decryptedUrl(m, f) : f.url;
+    // Big files show how far the download has got on the button.
+    const onProgress = before != null && (f.size || 0) > 2 * 1024 * 1024 ? (x) => { label.textContent = `${Math.round(x * 100)}%`; } : null;
+    // Only ever a decrypted copy or a file on this server: never a jump to another site.
+    const copy = enc ? decryptedUrl(m, f) : null;
+    if (copy) watchFile(f.url, onProgress);
+    const href = safeDownloadHref(enc ? await copy : f.url, location.origin);
+    if (!href) throw new Error('This file isn\u2019t on this server.');
     const a = h('a', { href, download: f.name || 'file' });
     document.body.append(a); a.click(); a.remove();
   } catch (e) {
-    toast(`Couldn\u2019t download ${f.name || 'the file'}: ${e.message}`, 'error');
-  } finally { if (btn) { btn.disabled = false; btn.classList.remove('busy'); } }
+    if (e.code === 'gone') {
+      const card = btn && btn.closest('.att-file, .att-media');
+      if (card) markGone(card);
+      toast(`${f.name || 'This file'} is no longer available.`, 'error');
+    } else toast(`Couldn\u2019t download ${f.name || 'the file'}: ${e.message}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
+    if (before != null) label.textContent = before;
+  }
+}
+// A file that was deleted (with its message, its server, or by an admin) says so plainly, instead of a retry
+// button that can never work.
+function markGone(card) {
+  card.classList.remove('loading', 'locked', 'failed');
+  card.classList.add('gone');
+  card.querySelectorAll('.att-retry, .att-dl, .att-play, img, video, audio').forEach((x) => x.remove());
+  const btn = card.querySelector('.btn');
+  if (btn) btn.remove();
+  if (card.querySelector('.att-gone')) return;
+  const text = card.querySelector('.att-file-text');
+  if (text) text.append(h('span', { class: 'att-gone' }, goneText)); else card.append(h('div', { class: 'att-gone' }, icon('file', 'ic'), goneText));
 }
 // A small "Download" button on photos, videos and audio, which otherwise have no way to save them.
 function mediaDownloadBtn(m, f) {
@@ -2590,10 +3135,13 @@ function mediaDownloadBtn(m, f) {
 }
 const loadQueue = makeQueue(3);
 function attachmentEl(f, m) {
-  if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : Promise.resolve(f.url)));
+  // Unencrypted entries (older messages) load straight from this server; anything else was dropped when the
+  // message was decrypted (see attachments.js), and is refused here too.
+  const direct = () => (isUploadUrl(f.url) ? Promise.resolve(f.url) : Promise.reject(new Error('This file isn\u2019t on this server.')));
+  if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : direct()));
   const enc = !!f.k || !!m.dmId;
   const type = f.type || '';
-  const media = /^image\//.test(type) ? 'img' : /^video\//.test(type) ? 'video' : /^audio\//.test(type) ? 'audio' : null;
+  const media = mediaKind(type, f.name);
   if (media) {
     const el = media === 'img'
       ? h('img', { class: 'att-img', alt: f.name || 'Image', tabindex: '0', role: 'button', 'aria-label': `Open ${f.name || 'image'}` })
@@ -2606,38 +3154,64 @@ function attachmentEl(f, m) {
       holder.style.aspectRatio = `${f.w} / ${f.h}`;
       holder.classList.add('sized');
     }
-    const full = () => (enc ? decryptedUrl(m, f) : Promise.resolve(f.url));
+    const meter = h('div', { class: 'att-meter', hidden: true }, h('i'));
+    const onProgress = (x) => { meter.hidden = x >= 1; meter.firstChild.style.width = `${Math.round(x * 100)}%`; };
+    const full = () => (enc ? decryptedUrl(m, f) : direct());
+    const fullWatched = () => { const p = full(); watchFile(f.url, onProgress); return p; };
     if (media === 'img') {
-      el._full = full;
+      el._full = fullWatched;
       el.addEventListener('click', () => openViewer(el, { name: f.name, download: () => downloadAttachment(m, f) }));
-      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.click(); });
+      // It's a button for screen readers and keyboards, so Enter and Space open it too.
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); } });
     }
-    if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
-    holder.append(mediaDownloadBtn(m, f));
+    if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name, h('span', { class: 'att-size' }, fmtSize(f.size || 0))));
+    holder.append(meter, mediaDownloadBtn(m, f));
     // Load only when it scrolls near the screen, a few at a time; images show the small thumbnail first.
     const load = () => {
       holder.classList.add('loading');
-      const want = media === 'img' && f.th ? () => decryptedUrl(m, { ...f.th, type: 'image/webp' }) : full;
+      const want = media === 'img' && f.th ? () => decryptedUrl(m, { ...f.th, type: 'image/webp' }) : fullWatched;
       loadQueue(want).then((u) => { el.src = u; holder.classList.remove('locked', 'loading', 'failed'); })
-        .catch(() => {
-          holder.classList.remove('loading'); holder.classList.add('failed');
-          const again = h('button', { class: 'att-retry', onclick: (e) => { e.stopPropagation(); again.remove(); blobCache.delete(f.url); if (f.th) blobCache.delete(f.th.url); load(); } }, icon('arrowDown'), 'Couldn\u2019t load \u2014 tap to retry');
+        .catch((e) => {
+          holder.classList.remove('loading');
+          if (e && e.code === 'gone') return markGone(holder);
+          holder.classList.add('failed');
+          const again = h('button', { class: 'att-retry', onclick: (ev) => { ev.stopPropagation(); again.remove(); load(); } }, icon('arrowDown'), 'Couldn\u2019t load \u2014 tap to retry');
           holder.append(again);
         });
     };
-    if (enc || f.th) whenVisible(holder, load); else el.src = f.url;
+    // Big videos and songs wait for a click (with the size on the button), then download with a progress bar.
+    if (enc && media !== 'img' && (f.size || 0) > AUTOLOAD_MAX) {
+      holder.classList.remove('locked');
+      holder.classList.add('click-to-load');
+      el.hidden = true;
+      const play = h('button', { class: 'att-play', type: 'button', onclick: (e) => {
+        e.stopPropagation(); play.remove(); el.hidden = false; holder.classList.remove('click-to-load');
+        loadQueue(fullWatched, { front: true }).then((u) => { el.src = u; if (media === 'video') el.play().catch(() => {}); })
+          .catch((err) => { if (err && err.code === 'gone') markGone(holder); else { toast(err.message, 'error'); holder.append(play); el.hidden = true; holder.classList.add('click-to-load'); } });
+      } }, icon(media === 'video' ? 'play' : 'music'), h('span', null, `${media === 'video' ? 'Play video' : 'Play audio'} · ${fmtSize(f.size)}`));
+      holder.append(play);
+      if (media === 'video') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
+    } else if (enc || f.th || !isUploadUrl(f.url)) whenVisible(holder, load); else el.src = f.url;
     return holder;
   }
-  // The whole card downloads the file, not just the button.
+  // Anything the app can't show: a card with the name, size and kind of file. The whole card downloads it.
   const btn = h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => { e.stopPropagation(); downloadAttachment(m, f, btn); } }, icon('download'), 'Download');
+  // Only files stored as they are (older, unencrypted messages) have a link worth sharing: an encrypted file's
+  // address leads to scrambled bytes, and its key is only in the message.
+  const link = !enc && isUploadUrl(f.url)
+    ? h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => { e.stopPropagation(); copyText(new URL(f.url, location.origin).href); toast('Link copied.'); } }, icon('link'), 'Copy link') : null;
   return h('div', { class: 'att-file', title: `Download ${f.name || 'file'}`, onclick: () => downloadAttachment(m, f, btn) },
     h('span', { class: 'att-file-badge' }, icon(fileIcon(type, f.name || ''), 'ic'), h('span', null, ((f.name || '').split('.').pop() || 'file').slice(0, 4).toUpperCase())),
-    h('div', { class: 'att-file-text' }, h('span', { class: 'att-name', title: f.name }, f.name || 'file'), h('span', { class: 'att-size' }, fmtSize(f.size || 0), enc ? h('span', { class: 'att-enc' }, icon('lock', 'ic'), 'Encrypted') : null)),
-    btn);
+    h('div', { class: 'att-file-text' }, h('span', { class: 'att-name', title: f.name }, f.name || 'file'),
+      h('span', { class: 'att-size' }, fmtSize(f.size || 0), h('span', { class: 'att-kind' }, typeLabel(type, f.name || '')), enc ? h('span', { class: 'att-enc' }, icon('lock', 'ic'), 'Encrypted') : null)),
+    link, btn);
 }
 
 function openViewer(fromImg, { name, download } = {}) {
-  const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src);
+  const opener = document.activeElement;
+  // Every picture in the conversation loaded so far, including those not scrolled into view yet (they load as
+  // you reach them here).
+  const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src || i._full);
   let idx = Math.max(0, imgs.indexOf(fromImg));
   let scale = 1; let tx = 0; let ty = 0;
   const img = h('img', { class: 'viewer-img', alt: '' });
@@ -2648,9 +3222,14 @@ function openViewer(fromImg, { name, download } = {}) {
   const show = (i) => {
     idx = (i + imgs.length) % imgs.length;
     const src = imgs[idx];
-    img.src = src.src; // thumbnail (instant)…
+    if (src.src) img.src = src.src; // thumbnail (instant)…
+    else img.removeAttribute('src');
     stage.classList.add('loading-full');
-    if (src._full) src._full().then((u) => { if (imgs[idx] === src) { img.src = u; } }).catch(() => {}).finally(() => stage.classList.remove('loading-full'));
+    if (src._full) {
+      src._full().then((u) => { if (imgs[idx] === src) { img.src = u; } })
+        .catch((e) => { if (imgs[idx] === src && e && e.code === 'gone') caption.textContent = `${caption.textContent} \u2014 no longer available`; })
+        .finally(() => { if (imgs[idx] === src) stage.classList.remove('loading-full'); });
+    }
     else stage.classList.remove('loading-full');
     const nm = src.closest('.att-media') ? src.closest('.att-media').dataset.name : src.alt;
     caption.textContent = nm || 'Image';
@@ -2658,9 +3237,14 @@ function openViewer(fromImg, { name, download } = {}) {
     scale = 1; tx = 0; ty = 0; apply();
   };
   const zoom = (f) => { scale = Math.min(6, Math.max(1, scale * f)); if (scale === 1) { tx = 0; ty = 0; } apply(); };
-  const close = () => { overlay.classList.add('closing'); setTimeout(() => overlay.remove(), 140); document.removeEventListener('keydown', keys, true); };
+  const close = () => {
+    overlay.classList.add('closing'); setTimeout(() => overlay.remove(), 140); document.removeEventListener('keydown', keys, true);
+    // Back to whatever opened it (the picture in the chat), like other dialogs.
+    if (opener && opener.isConnected && opener !== document.body) opener.focus({ preventScroll: true });
+  };
   const keys = (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    if (e.key === 'Tab') trapTab(e, overlay);
     if (e.key === 'ArrowRight') show(idx + 1);
     if (e.key === 'ArrowLeft') show(idx - 1);
     if (e.key === '+' || e.key === '=') zoom(1.4);
@@ -2733,24 +3317,39 @@ async function onNewMessage(key, m) {
         const put = (node) => (firstPending ? sc.insertBefore(node, firstPending) : sc.append(node));
         if (newDay) put(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
         put(messageEl(m, newDay ? null : prev, 'main'));
+        ensureCurrentMessage(sc);
         if (near || m.authorId === S.me.id) sc.scrollTop = sc.scrollHeight;
       }
     }
   }
   const t = S.typing[key];
   if (t && t.has(m.authorId)) { clearTimeout(t.get(m.authorId)); t.delete(m.authorId); if (currentKey() === key) renderTyping(); }
-  if (m.authorId === S.me.id) { if (!S.view.serverId) later(renderSidebar); return; }
+  if (!m.threadId && !(S.lastIds[key] && S.lastIds[key] >= m.id)) S.lastIds[key] = m.id;
+  // Your own message (from here or another device) means you've read the conversation up to it.
+  if (m.authorId === S.me.id) {
+    S.lastRead[key] = m.id;
+    if (S.unread.delete(key) | S.mentions.delete(key)) { closeNotifications(key); updateTitle(); later(renderRail); }
+    if (!S.view.serverId || S.view.serverId === m.serverId) later(renderSidebar);
+    return;
+  }
   const viewing = currentKey() === key && !document.hidden;
   const level = notifyLevel(key);
   const isDm = key.startsWith('d:') || isGroup(S.servers.find((x) => x.id === m.serverId));
-  const mentioned = mentionsMe(m);
+  const kind = mentionKind(m);
+  // @everyone you've chosen to ignore here isn't a ping.
+  const mentioned = !!kind && !(kind === 'everyone' && everyoneMuted(key));
   const repliedToMe = m.reply && m.reply.authorId === S.me.id;
   if (!viewing) {
     S.unread.add(key);
+    if (S.unreadCounts) S.unreadCounts[key] = (S.unreadCounts[key] || 0) + 1;
     if ((isDm || mentioned || repliedToMe) && level !== 'muted' && !S.blocked.has(m.authorId)) {
       S.mentions.set(key, (S.mentions.get(key) || 0) + 1);
-      if (S.me.status !== 'dnd') { playSound(mentionKind(m) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); if (!document.hasFocus()) flashTaskbar(); }
-    } else if (level === 'all' && !S.blocked.has(m.authorId) && S.me.status !== 'dnd') playSound('message');
+      // Several tabs open: only the first to claim this message makes a sound and shows it.
+      if (!quiet()) claimOnce(m.id).then((mineToShow) => { if (!mineToShow) return; playSound((mentioned && kind) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); if (!document.hasFocus()) flashTaskbar(); });
+    } else if (level === 'all' && !S.blocked.has(m.authorId) && !quiet()) claimOnce(m.id).then((ok) => { if (ok) playSound('message'); });
+  } else {
+    // Reading along at the bottom: the marker follows (and your other devices clear their badge).
+    later(() => { const sc = currentKey() === key && $('#messages'); if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160) markRead(key); });
   }
   if ((mentioned || repliedToMe) && !S.blocked.has(m.authorId)) {
     addInbox({
@@ -2773,6 +3372,7 @@ function notify(author, body, key) {
     const priv = key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)));
     const shown = priv && isSharing() && !shareAllowed.has(key) ? 'New message (hidden while you share your screen)' : body.slice(0, 140);
     const n = new Notification(displayName(author), { body: shown, icon: author.avatar || undefined, tag: key });
+    rememberNotification(key, n);
     n.onclick = () => { window.focus(); if (window.hearthDesktop) window.hearthDesktop.focus(); if (key.startsWith('d:')) openDm(key.slice(2)); else { const s = serverOfChannel(key.slice(2)); if (s) openChannel(key.slice(2), s.id); } n.close(); };
   } catch { /* ignore */ }
 }
@@ -2832,8 +3432,10 @@ async function openThread(root, focusId) {
   document.body.classList.add('panel-open');
   renderPanel(); renderHeader();
   try {
-    const res = await api('GET', `/messages/${root.id}/thread`);
-    const t = { root: res.root, list: res.messages, loaded: true };
+    // Threads come a page at a time, newest replies first. Opening one at a linked reply asks for the page around it
+    // instead (there may be newer replies after that page: see loadNewerReplies).
+    const res = await api('GET', `/messages/${root.id}/thread?${focusId ? `around=${encodeURIComponent(focusId)}` : 'limit=100'}`);
+    const t = { root: res.root, list: res.messages, loaded: true, hasMore: !!res.hasMore, hasNewer: !!res.hasNewer, total: Math.max(res.messages.length, res.root.threadCount || 0) };
     await Promise.all([t.root, ...t.list].map(decryptMessage));
     S.threads[root.id] = t;
     if (S.thread && S.thread.rootId === root.id) renderPanel();
@@ -2849,21 +3451,30 @@ function closeThread() {
 async function onThreadMessage(m) {
   await decryptMessage(m);
   const t = S.threads[m.threadId];
-  if (t && !t.list.find((x) => x.id === m.id)) {
+  if (t && t.hasNewer && !t.list.find((x) => x.id === m.id)) {
+    // Showing an older part of the thread: a new reply doesn't belong right after it. Your own reply takes you to
+    // the newest replies (where it is); anyone else's just counts.
+    t.total = (t.total || 0) + 1;
+    if (S.thread && S.thread.rootId === m.threadId) {
+      if (m.authorId === S.me.id && !t.jumping) loadNewestReplies();
+      else { const div = $('.thread-list .thread-divider span'); if (div) div.textContent = threadCountLabel(t); }
+    }
+  } else if (t && !t.list.find((x) => x.id === m.id)) {
     t.list.push(m);
+    t.total = (t.total || 0) + 1;
     if (S.thread && S.thread.rootId === m.threadId) {
       const list = $('.thread-list');
       if (list) {
         list.append(messageEl(m, t.list[t.list.length - 2] || null, 'thread'));
         const div = list.querySelector('.thread-divider span');
-        if (div) div.textContent = `${t.list.length} ${t.list.length === 1 ? 'reply' : 'replies'}`;
+        if (div) div.textContent = threadCountLabel(t);
         list.scrollTop = list.scrollHeight;
       }
     }
   }
   if (m.authorId !== S.me.id && (mentionsMe(m) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId)) {
     addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${displayName(getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140) });
-    if (S.me.status !== 'dnd' && notifyLevel('c:' + m.channelId) !== 'muted') playSound(mentionKind(m) || 'reply');
+    if (!quiet() && notifyLevel('c:' + m.channelId) !== 'muted') claimOnce(m.id).then((ok) => { if (ok) playSound(mentionKind(m) || 'reply'); });
   }
 }
 async function onThreadUpdate(m) {
@@ -2909,6 +3520,7 @@ function membersPanel(el) {
     clear(list);
     const q = search.value.trim().toLowerCase();
     const users = server.memberIds.map(getUser).filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q));
+    const changedKeys = sec.keysChanged(users);
     // Like Discord: online people grouped under their highest "show separately" role, then Online, then Offline.
     const hoisted = (server.roleDefs || []).filter((r) => r.hoist && !r.everyone).sort((a, b) => b.position - a.position);
     const sections = new Map(hoisted.map((r) => [r.id, []]));
@@ -2932,7 +3544,7 @@ function membersPanel(el) {
         h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color }),
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
-          sec.keyChanged(u) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
+          changedKeys.has(u.id) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
         activityLine(u) ? h('span', { class: 'member-status' }, activityLine(u)) : cs ? h('span', { class: 'member-status' }, cs) : null));
     };
     for (const r of hoisted) {
@@ -2946,7 +3558,7 @@ function membersPanel(el) {
       class: 'member', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'left'),
     }, avatarEl(u, 34, { status: true, meId: S.me.id }),
     h('span', { class: 'member-text' }, h('span', { class: 'member-name' }, nameEl(u), h('span', { class: 'bot-tag' }, 'BOT')),
-      h('span', { class: 'member-status' }, 'Posting news from the feeds this server follows')))));
+      h('span', { class: 'member-status' }, u.id === NEWS_BOT_ID ? 'Posting news from the feeds this server follows' : ((u.profile || {}).bio || 'A bot added to this server'))))));
     if (offline.length) list.append(h('div', { class: 'group-label' }, h('span', null, `Offline \u2014 ${offline.length}`)), ...offline.sort(byName).map(row));
     if (!users.length && !bots.length) list.append(h('p', { class: 'sidebar-empty' }, 'No one matches.'));
   };
@@ -2969,10 +3581,11 @@ function memberMenuItems(server, u) {
   const myTop = server.ownerId === S.me.id ? Infinity : Math.max(0, ...memberRoles(server, S.me.id).map((r) => r.position));
   const theirTop = isOwnerTarget ? Infinity : Math.max(0, ...memberRoles(server, u.id).map((r) => r.position));
   if (can(server, PERMS.MANAGE_ROLES)) {
-    const assignable = (server.roleDefs || []).filter((r) => !r.everyone && r.position < myTop);
+    const current = (server.memberRoles || {})[u.id] || [];
+    // Roles below yours: ones they have (taking one away is fine) and ones you could give.
+    const assignable = (server.roleDefs || []).filter((r) => !r.everyone && r.position < myTop && (current.includes(r.id) || mayGiveRole(server, r)));
     if (assignable.length && (me || theirTop < myTop)) {
       items.push('-', { header: 'Roles' });
-      const current = (server.memberRoles || {})[u.id] || [];
       assignable.forEach((r) => items.push({
         label: `${r.icon ? r.icon + ' ' : ''}${r.name}`, checked: current.includes(r.id),
         action: () => api('PUT', `/servers/${server.id}/members/${u.id}/roles`, { roleIds: current.includes(r.id) ? current.filter((x) => x !== r.id) : [...current, r.id] }).catch((e) => toast(e.message, 'error')),
@@ -2981,12 +3594,27 @@ function memberMenuItems(server, u) {
   }
   if (!me && !isOwnerTarget && theirTop < myTop) {
     if (can(server, PERMS.KICK_MEMBERS) || can(server, PERMS.BAN_MEMBERS)) items.push('-');
+    if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Time out ${displayName(u)}\u2026`, icon: 'timer', action: () => openTimeout(server, u) });
     if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Kick ${displayName(u)}`, icon: 'logout', danger: true, action: async () => {
       if (await confirmDialog({ title: `Kick ${displayName(u)}?`, text: 'They can rejoin with an invite. The server\u2019s encryption key is replaced automatically so they can\u2019t read new messages.', confirm: 'Kick', danger: true })) api('DELETE', `/servers/${server.id}/members/${u.id}`).catch((e) => toast(e.message, 'error'));
     } });
     if (can(server, PERMS.BAN_MEMBERS)) items.push({ label: `Ban ${displayName(u)}`, icon: 'ban', danger: true, action: () => openBan(server, u) });
   }
   return items;
+}
+// Timeouts: they keep reading but can't post, react or talk until it ends. The server checks permissions and
+// role order again, and logs it.
+function openTimeout(server, u) {
+  const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional \u2014 they\u2019re told the reason' });
+  const len = h('select', { class: 'input', 'aria-label': 'How long' },
+    [[5, '5 minutes'], [10, '10 minutes'], [60, '1 hour'], [1440, '1 day'], [10080, '1 week'], [40320, '28 days']].map(([v, l]) => h('option', { value: String(v) }, l)));
+  len.value = '60';
+  modal({ title: `Time out ${displayName(u)}?`, size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They can still read, but can\u2019t send messages, react, start threads or talk in calls until it ends.'), field('For', len), field('Reason', reason)),
+    actions: [
+      { label: 'Remove timeout', action: () => api('DELETE', `/servers/${server.id}/members/${u.id}/timeout`).then(() => toast('Timeout removed.')) },
+      { label: 'Cancel' },
+      { label: 'Time out', kind: 'danger', action: () => api('POST', `/servers/${server.id}/members/${u.id}/timeout`, { minutes: Number(len.value), reason: reason.value }).then((r) => toast(`${displayName(u)} is timed out until ${fmtStamp(r.until)}.`)) }] });
 }
 function openBan(server, u) {
   const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional — only moderators see it' });
@@ -3016,6 +3644,7 @@ async function pinsPanel(el) {
     await Promise.all(pins.map(decryptMessage));
     if (currentKey() !== key || panelMode() !== 'pins') return;
     clear(list);
+    if (key.startsWith('c:')) pinHistory(el, key.slice(2));
     if (!pins.length) { list.append(h('div', { class: 'panel-empty' }, icon('pin'), h('p', null, 'No pinned messages yet. Pin important messages from the \u22ef menu so everyone can find them.'))); return; }
     pins.forEach((m) => {
       const u = getUser(m.authorId);
@@ -3028,6 +3657,16 @@ async function pinsPanel(el) {
     });
   } catch (e) { clear(list).append(h('p', { class: 'sidebar-empty' }, e.message)); }
 }
+// Who pinned and unpinned what in this channel, newest first (kept by the server).
+async function pinHistory(el, channelId) {
+  try {
+    const log = await api('GET', `/channels/${channelId}/pins/log`);
+    if (!log.length || currentKey() !== 'c:' + channelId || panelMode() !== 'pins') return;
+    el.append(h('details', { class: 'pin-history' }, h('summary', null, 'Pin history'),
+      h('ul', null, log.slice(0, 20).map((x) => h('li', null, nameEl(getUser(x.userId)), ` ${x.action === 'pin' ? 'pinned' : 'unpinned'} a message \u00b7 ${fmtStamp(x.at)} `,
+        h('button', { class: 'link-btn', onclick: () => jumpToMessage('c:' + channelId, x.messageId) }, 'Jump'))))));
+  } catch { /* the pins still show */ }
+}
 function threadPanel(el) {
   const t = S.threads[S.thread.rootId];
   const c = channelById(S.thread.channelId);
@@ -3035,24 +3674,85 @@ function threadPanel(el) {
   if (!t) { el.append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' }))); return; }
   const list = h('div', { class: 'thread-list', role: 'log', 'aria-label': 'Thread messages' });
   list.addEventListener('click', onMessageAreaClick);
+  messageListKeys(list);
   list.append(messageEl(t.root, null, 'thread'));
-  list.append(h('div', { class: 'thread-divider' }, h('span', null, t.list.length ? `${t.list.length} ${t.list.length === 1 ? 'reply' : 'replies'}` : 'No replies yet')));
+  list.append(h('div', { class: 'thread-divider' }, h('span', null, threadCountLabel(t))));
+  if (t.hasMore) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadOlderReplies(e.currentTarget) }, 'Show earlier replies'));
   let prev = null;
   t.list.forEach((m) => { list.append(messageEl(m, prev, 'thread')); prev = m; });
+  if (t.hasNewer) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadNewerReplies(e.currentTarget) }, 'Show newer replies'));
+  ensureCurrentMessage(list);
   const comp = createComposer({ id: 'thread', key: () => 'c:' + S.thread.channelId, threadId: () => S.thread.rootId, placeholder: 'Reply in thread\u2026' });
   composers.thread = comp;
   el.append(list, comp.el);
   comp.renderExtras();
   requestAnimationFrame(() => {
-    list.scrollTop = list.scrollHeight;
+    // After "Show earlier replies", stay where the reader was instead of jumping to the newest reply.
+    const keep = S.thread && S.thread.keepId && list.querySelector(`[data-mid="${S.thread.keepId}"]`);
+    if (keep) { keep.scrollIntoView({ block: 'start' }); S.thread.keepId = null; } else list.scrollTop = list.scrollHeight;
     if (S.thread && S.thread.focusId) { const f = list.querySelector(`[data-mid="${S.thread.focusId}"]`); if (f) flash(f); S.thread.focusId = null; }
-    comp.focus();
+    if (!keep) comp.focus();
   });
+}
+// "12 replies": with only part of the thread loaded, the count comes from the server.
+function threadCountLabel(t) {
+  const n = t.hasMore || t.hasNewer ? Math.max(t.list.length, t.total || 0) : t.list.length;
+  return n ? `${n} ${n === 1 ? 'reply' : 'replies'}` : 'No replies yet';
+}
+async function loadOlderReplies(btn) {
+  const t = S.thread && S.threads[S.thread.rootId];
+  if (!t || !t.hasMore || !t.list.length) return;
+  btn.disabled = true;
+  try {
+    const rootId = S.thread.rootId;
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100&before=${encodeURIComponent(t.list[0].id)}`);
+    await Promise.all(res.messages.map(decryptMessage));
+    const have = new Set(t.list.map((m) => m.id));
+    t.list = [...res.messages.filter((m) => !have.has(m.id)), ...t.list];
+    t.hasMore = !!res.hasMore;
+    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = [...have][0]; renderPanel(); }
+  } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+}
+// After opening a thread at an older reply: the next page of newer ones.
+async function loadNewerReplies(btn) {
+  const t = S.thread && S.threads[S.thread.rootId];
+  if (!t || !t.hasNewer || !t.list.length) return;
+  btn.disabled = true;
+  try {
+    const rootId = S.thread.rootId;
+    const last = t.list[t.list.length - 1].id;
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100&after=${encodeURIComponent(last)}`);
+    await Promise.all(res.messages.map(decryptMessage));
+    const have = new Set(t.list.map((m) => m.id));
+    t.list = [...t.list, ...res.messages.filter((m) => !have.has(m.id))];
+    t.hasNewer = !!res.hasNewer;
+    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = last; renderPanel(); }
+  } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+}
+// Straight to the newest replies (after you reply while an older part of the thread is showing).
+async function loadNewestReplies() {
+  const rootId = S.thread && S.thread.rootId;
+  const t = rootId && S.threads[rootId];
+  if (!t) return;
+  t.jumping = true; // your reply arrives twice (the answer and the socket): one reload is enough
+  try {
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100`);
+    await Promise.all(res.messages.map(decryptMessage));
+    Object.assign(t, { list: res.messages, hasMore: !!res.hasMore, hasNewer: false, total: Math.max(res.messages.length, res.root.threadCount || 0) });
+    if (S.thread && S.thread.rootId === rootId) renderPanel();
+  } catch (e) { toast(e.message, 'error'); } finally { t.jumping = false; }
 }
 
 // ======================================================================= composer
 const composers = {};
-const drafts = new Map();
+// Bots' slash commands (bots.js). Answers only you can see live in memory and show above the main composer.
+const SLASH = createSlash({
+  getSocketId: () => (socket && socket.id) || null,
+  members: (s) => (s.memberIds || []).map(getUser),
+  onEphemeral: () => { if (composers.main) composers.main.renderEph(); },
+});
+// What you were typing, per conversation (and thread): kept on this device across reloads (see usability.js).
+let drafts = createDrafts('signed-out');
 let lastTypingSent = 0;
 function createComposer({ id, key, threadId, placeholder }) {
   const state = { replyTo: null, pending: [] };
@@ -3061,6 +3761,13 @@ function createComposer({ id, key, threadId, placeholder }) {
   ta.placeholder = placeholder || placeholderFor(k);
   ta.value = drafts.get(k + (threadId() || '')) || '';
   const extras = h('div', { class: 'composer-extras' });
+  // Upload progress for the message being sent: kept across redraws of the extras, with a Cancel button.
+  const upText = h('span', { class: 'upload-text' });
+  const upCancel = h('button', { class: 'btn ghost sm upload-cancel', type: 'button' }, 'Cancel');
+  const upStatus = h('div', { class: 'upload-status', hidden: true, role: 'status', 'aria-live': 'polite' },
+    h('div', { class: 'upload-progress' }, h('div', { class: 'bar' })), h('div', { class: 'upload-line' }, upText, upCancel));
+  let uploading = null; // the AbortController of the upload in progress
+  upCancel.addEventListener('click', () => { if (uploading) uploading.abort(); });
   const typing = h('div', { class: 'typing', 'aria-live': 'polite', dataset: { key: k } });
   const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: () => { addFiles(fileIn.files); fileIn.value = ''; } });
   const sendBtn = h('button', { class: 'send-btn', 'data-tip': P.chat.enterToSend ? 'Send (Enter)' : 'Send (Ctrl+Enter)', 'aria-label': 'Send message', onclick: () => send() }, icon('send'));
@@ -3091,7 +3798,28 @@ function createComposer({ id, key, threadId, placeholder }) {
     };
     tick();
   };
-  const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, extras, box, slowNote, typing);
+  // Slash commands (bots.js): the bar with usage and the encryption warning, and bot answers only you can see.
+  const cmdBar = h('div', { class: 'cmd-bar', hidden: true });
+  const ephBox = h('div', { class: 'eph-list' });
+  const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, ephBox, cmdBar, extras, box, slowNote, typing);
+  const slashChannel = () => { const kk = key(); if (id !== 'main' || !kk || !kk.startsWith('c:')) return null; const s = serverOfChannel(kk.slice(2)); return s && !isGroup(s) ? kk.slice(2) : null; };
+  const renderCmdBar = () => {
+    const ch = slashChannel();
+    const cmd = ch && SLASH.match(ch, ta.value);
+    clear(cmdBar).hidden = !cmd;
+    if (cmd) cmdBar.append(SLASH.hint(cmd, ta.value, serverOfChannel(ch)));
+  };
+  const renderEph = () => {
+    clear(ephBox);
+    const ch = slashChannel();
+    if (!ch) return;
+    for (const e of SLASH.ephemeralFor(ch)) {
+      ephBox.append(h('div', { class: 'eph-msg' },
+        h('div', { class: 'eph-head' }, icon('bot'), h('b', null, e.botName), h('span', { class: 'bot-tag' }, 'BOT'), h('span', { class: 'field-hint' }, 'Only you can see this \u00b7 not end-to-end encrypted \u00b7 not saved'),
+          ibtn('close', 'Dismiss', () => SLASH.dismiss(e), { cls: 'sm' })),
+        h('div', { class: 'msg-text', html: md(e.content, { mentionName: S.me.username }) })));
+    }
+  };
 
   // ---- @mention autocomplete
   let sugg = { items: [], i: 0, start: -1 };
@@ -3104,7 +3832,10 @@ function createComposer({ id, key, threadId, placeholder }) {
     const people = s.memberIds.filter((x) => x !== S.me.id).map(getUser);
     if (isGroup(s)) return people;
     const ch = channelById(kk.slice(2));
-    const pingAll = canIn(ch, PERMS.MENTION_EVERYONE);
+    // Other people's apps decide whether @everyone or a role mention pings them from the sender's server-wide
+    // permission (they can't see channel overrides), so only suggest them when the sender has that and this
+    // channel doesn't deny it. A per-channel allow alone would offer pings that never arrive.
+    const pingAll = can(s, PERMS.MENTION_EVERYONE) && canIn(ch, PERMS.MENTION_EVERYONE);
     const roles = (s.roleDefs || []).filter((r) => !r.everyone && (r.mentionable || pingAll)).map((r) => ({ role: r }));
     return [...people, ...roles, ...(pingAll ? [{ special: 'everyone', hint: 'Notify everyone in this server' }, { special: 'channel', hint: 'Notify everyone in this channel' }] : [])];
   };
@@ -3115,18 +3846,28 @@ function createComposer({ id, key, threadId, placeholder }) {
       class: `suggest-item${i === sugg.i ? ' active' : ''}`, role: 'option', 'aria-selected': String(i === sugg.i),
       onmousedown: (e) => { e.preventDefault(); pick(i); },
     },
-    c.emoji ? h('span', { class: 'suggest-emoji' }, c.custom ? h('img', { class: 'cemoji', src: c.custom.url, alt: '' }) : c.emoji)
+    c.cmd ? h('span', { class: 'suggest-at' }, icon('bot'))
+      : c.emoji ? h('span', { class: 'suggest-emoji' }, c.custom ? h('img', { class: 'cemoji', src: c.custom.url, alt: '' }) : c.emoji)
       : c.special ? h('span', { class: 'suggest-at' }, icon('at'))
         : c.role ? h('span', { class: 'suggest-at role', style: c.role.color ? { color: c.role.color } : null }, c.role.icon || icon('shield'))
           : avatarEl(c, 24),
     h('span', { class: 'suggest-name', style: c.role && c.role.color ? { color: c.role.color } : null },
-      c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : displayName(c)),
-    h('span', { class: 'suggest-hint' }, c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
+      c.cmd ? SLASH.usage(c.cmd) : c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : displayName(c)),
+    h('span', { class: 'suggest-hint' }, c.cmd ? `${c.cmd.botName} \u00b7 ${c.cmd.description}` : c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
     suggest.hidden = !sugg.items.length;
   };
   const checkSuggest = () => {
     const pos = ta.selectionStart;
     const before = ta.value.slice(0, pos);
+    const slashIn = slashChannel();
+    const sm = slashIn && /^\/([a-z0-9_-]{0,32})$/i.exec(before);
+    if (sm) {
+      const list = SLASH.cached(slashIn);
+      if (!list) { SLASH.load(slashIn).then(() => { if (ta.value.startsWith('/')) { checkSuggest(); renderCmdBar(); } }); return closeSuggest(); }
+      const items = list.filter((c) => c.name.startsWith(sm[1].toLowerCase())).slice(0, 8).map((c) => ({ cmd: c }));
+      sugg = { items, i: 0, start: 0, kind: 'cmd' };
+      return drawSuggest();
+    }
     const em = before.match(/(^|\s):([A-Za-z0-9_]{2,32})$/);
     if (em) {
       const q = em[2].toLowerCase();
@@ -3145,6 +3886,13 @@ function createComposer({ id, key, threadId, placeholder }) {
   const pick = (i) => {
     const c = sugg.items[i];
     if (!c) return;
+    if (c.cmd) {
+      ta.value = `/${c.cmd.name} ` + ta.value.slice(ta.selectionStart).trimStart();
+      const at = c.cmd.name.length + 2;
+      ta.setSelectionRange(at, at);
+      closeSuggest(); update(); renderCmdBar(); ta.focus();
+      return;
+    }
     const insert = c.emoji ? (c.custom ? emojiToken(c.custom) : c.emoji) : c.role ? `<@&${c.role.id}>` : '@' + (c.special || c.username);
     if (c.emoji) pushRecentEmoji(c.custom ? emojiToken(c.custom) : c.emoji);
     ta.value = ta.value.slice(0, sugg.start) + insert + ' ' + ta.value.slice(ta.selectionStart);
@@ -3154,7 +3902,7 @@ function createComposer({ id, key, threadId, placeholder }) {
   };
 
   ta.addEventListener('input', () => {
-    autosize(); update(); checkSuggest();
+    autosize(); update(); checkSuggest(); renderCmdBar();
     drafts.set(key() + (threadId() || ''), ta.value);
     const kk = key();
     if (ta.value && Date.now() - lastTypingSent > 3000 && !threadId()) {
@@ -3217,7 +3965,7 @@ function createComposer({ id, key, threadId, placeholder }) {
         h('span', { class: 'pending-size' }, fmtSize(p.file.size)),
         h('button', { class: 'pending-x', 'aria-label': `Remove ${p.file.name}`, 'data-tip': 'Remove', onclick: () => { if (p.url) URL.revokeObjectURL(p.url); state.pending.splice(i, 1); renderExtras(); update(); } }, icon('close'))))));
     }
-    extras.append(h('div', { class: 'upload-progress', hidden: true }, h('div', { class: 'bar' })));
+    extras.append(upStatus);
     const blockedNote = blockedDmNotice();
     const kk = key();
     const ch = kk && kk.startsWith('c:') ? channelById(kk.slice(2)) : null;
@@ -3225,7 +3973,9 @@ function createComposer({ id, key, threadId, placeholder }) {
     ta.disabled = !!blockedNote || !!noSend;
     box.querySelector('.attach').hidden = !!ch && !canIn(ch, PERMS.ATTACH_FILES);
     if (blockedNote) extras.append(blockedNote);
-    if (noSend) extras.append(h('div', { class: 'key-bar' }, icon('lock'), h('span', null, threadId() ? 'You can read this thread but not reply.' : `You can read #${ch.name} but you don\u2019t have permission to send messages here.`)));
+    const to = ch && (serverOfChannel(ch.id) || {}).timeout;
+    if (noSend && to && to.until > Date.now()) extras.append(h('div', { class: 'key-bar' }, icon('timer'), h('span', null, `You\u2019re timed out until ${fmtStamp(to.until)}${to.reason ? ` (${to.reason})` : ''}. You can still read.`)));
+    else if (noSend) extras.append(h('div', { class: 'key-bar' }, icon('lock'), h('span', null, threadId() ? 'You can read this thread but not reply.' : `You can read #${ch.name} but you don\u2019t have permission to send messages here.`)));
     ta.placeholder = noSend ? 'Read only' : placeholder || placeholderFor(kk);
     slowNote.hidden = !(ch && ch.slowmode > 0 && !canIn(ch, PERMS.MANAGE_MESSAGES));
     if (!slowNote.hidden && !slowUntil) slowNote.textContent = `Slowmode is on: one message every ${fmtDuration(ch.slowmode)}`;
@@ -3240,6 +3990,16 @@ function createComposer({ id, key, threadId, placeholder }) {
     const files = extra.files || (overrideText != null ? [] : state.pending.slice());
     const poll = extra.poll || null;
     if (!text.trim() && !files.length && !poll) return;
+    // A bot's slash command goes to the bot (after the warning), not into the channel.
+    const slashIn = overrideText == null && !poll && slashChannel();
+    const cmd = slashIn && SLASH.match(slashIn, text.trim());
+    if (cmd) {
+      SLASH.run(slashIn, cmd, text.trim(), serverOfChannel(slashIn)).then((sent) => {
+        if (!sent || ta.value.trim() !== text.trim()) return;
+        ta.value = ''; drafts.delete(key()); autosize(); update(); renderCmdBar();
+      });
+      return;
+    }
     const kk = key();
     const tid = threadId();
     const replyTo = state.replyTo ? state.replyTo.id : null;
@@ -3258,10 +4018,23 @@ function createComposer({ id, key, threadId, placeholder }) {
     return queue;
   }
   async function deliver({ kk, tid, text, files, replyTo, nonce, poll }) {
-    const bar = extras.querySelector('.upload-progress');
-    const setProgress = (f) => { if (!bar) return; bar.hidden = f >= 1; bar.firstChild.style.width = Math.round(f * 100) + '%'; };
+    const bar = upStatus.querySelector('.bar');
+    const totalBytes = files.reduce((a, p) => a + (p.file ? p.file.size : 0), 0);
+    let retrying = null;
+    const setProgress = (f) => {
+      upStatus.hidden = !files.length || f >= 1;
+      bar.style.width = Math.round(f * 100) + '%';
+      if (!retrying) upText.textContent = `Uploading ${files.length === 1 ? files[0].file.name : `${files.length} files`} — ${fmtSize(Math.round(f * totalBytes))} of ${fmtSize(totalBytes)} (${Math.round(f * 100)}%)`;
+    };
+    const onStatus = ({ retrying: r, wait }) => {
+      retrying = r ? wait : null;
+      upStatus.classList.toggle('retrying', !!r);
+      if (r) upText.textContent = `Connection lost. Trying again in ${Math.max(1, Math.round(wait / 1000))} s… (nothing sent so far is lost)`;
+    };
+    const ctl = files.length ? new AbortController() : null;
+    uploading = ctl;
     try {
-      const f = await uploadEncryptedFiles(kk, files, setProgress);
+      const f = await uploadEncryptedFiles(kk, files, setProgress, { signal: ctl && ctl.signal, onStatus });
       const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}) }, replyTo, nonce);
       files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
       playSound('sent');
@@ -3274,13 +4047,17 @@ function createComposer({ id, key, threadId, placeholder }) {
       dropPendingSend(nonce);
       const wait = /in (\d+)s/.exec(e.message || '');
       if (e.code === 'slowmode' && wait) startSlow(+wait[1]);
-      toast(e.message, 'error');
+      if (e.cancelled) toast('Upload cancelled. Your message and files are back in the box.');
+      else toast(e.message, 'error');
       // Give the words back so nothing is lost (unless they've already typed something new).
       if (!poll && !files.some((f) => f.voice) && !ta.value.trim() && key() === kk) { ta.value = text; if (!state.pending.length) state.pending = files; renderExtras(); autosize(); update(); }
-    } finally { setProgress(1); }
+    } finally {
+      if (uploading === ctl) uploading = null;
+      setProgress(1);
+    }
   }
-  setTimeout(() => { autosize(); update(); }, 0);
-  return { el, state, focus: () => ta.focus(), addFiles, setReply, renderExtras, send };
+  setTimeout(() => { autosize(); update(); renderEph(); }, 0);
+  return { el, state, focus: () => ta.focus(), addFiles, setReply, renderExtras, send, renderEph };
 }
 const fmtDuration = (sec) => (sec >= 3600 ? `${Math.round(sec / 3600)}h` : sec >= 60 ? `${Math.round(sec / 60)}m` : `${sec}s`);
 function placeholderFor(k) {
@@ -3325,7 +4102,9 @@ function blockedDmNotice() {
 }
 
 // ---- sending (every file gets its own random key, carried inside the encrypted message)
-async function uploadEncryptedFiles(key, files, onProgress) {
+// Small files go up in one request; bigger ones (CHUNKED_ABOVE) in resumable chunks that survive a dropped
+// connection (files.js). onStatus reports "connection lost, retrying"; signal cancels.
+async function uploadEncryptedFiles(key, files, onProgress, { signal, onStatus } = {}) {
   if (!files.length) return [];
   if (key.startsWith('c:')) await sec.ready(serverOfChannel(key.slice(2)).id);
   const compress = P.chat.compressImages !== false;
@@ -3336,12 +4115,12 @@ async function uploadEncryptedFiles(key, files, onProgress) {
   let done = 0;
   onProgress(0);
   const send = async (blobLike, weight) => {
+    if (signal && signal.aborted) throw Object.assign(new Error('Upload cancelled.'), { cancelled: true });
     const { blob, k } = await E2EE.encryptFile(await blobLike.arrayBuffer());
-    const fd = new FormData();
-    fd.append('file', new Blob([blob]), 'blob.bin');
-    const res = await upload('/upload/encrypted', fd, (x) => onProgress((done + x * weight) / total));
+    const progress = (x) => onProgress((done + x * weight) / total);
+    const url = blob.byteLength > CHUNKED_ABOVE ? await uploadResumable(blob, { onProgress: progress, onStatus, signal }) : await uploadSimple(blob, { onProgress: progress, signal });
     done += weight;
-    return { url: res.url, k };
+    return { url, k };
   };
   const out = [];
   for (const p of prepared) {
@@ -3356,7 +4135,7 @@ async function uploadEncryptedFiles(key, files, onProgress) {
 function mentionedIds(server, text) {
   const t = String(text || '');
   const names = new Set([...t.matchAll(/(?:^|\s)@([\w.]{2,24})/g)].map((m) => m[1].toLowerCase()));
-  const roleIds = new Set([...t.matchAll(/<@&([a-z0-9]{6,40})>/g)].map((m) => m[1]));
+  const roleIds = new Set([...t.matchAll(/<@&([a-z0-9]{6,40})>/g)].map((m) => m[1]).filter((id) => mayMentionRole(server, id, S.me.id)));
   if (!names.size && !roleIds.size) return [];
   return server.memberIds.filter((id) => id !== S.me.id && (names.has((getUser(id).username || '').toLowerCase())
     || ((server.memberRoles || {})[id] || []).some((r) => roleIds.has(r))));
@@ -3370,7 +4149,9 @@ async function sendTo(key, threadId, payload, replyTo, nonce) {
     if (!server) throw new Error('Channel not found.');
     return withKeyRetry(server.id, async () => {
       const { ciphertext, epoch } = await sec.encryptChannel(server.id, channelId, payload);
-      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), nonce });
+      // @everyone / @here: the server checks the sender may use it, then counts and pushes it as a ping.
+      const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || '')) ? true : undefined;
+      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), everyone, nonce });
     });
   }
   const ciphertext = await sec.encryptDm(key.slice(2), payload);
@@ -3415,7 +4196,8 @@ function emojiPicker(anchor, onPick, { keepOpen = false } = {}) {
 function emojiPanel(onPick, { keepOpen = false } = {}) {
   const search = h('input', { class: 'input emoji-search', placeholder: 'Search emoji', 'aria-label': 'Search emoji' });
   const grid = h('div', { class: 'emoji-grid', role: 'listbox' });
-  const tabs = h('div', { class: 'emoji-tabs', role: 'tablist' });
+  // The category buttons jump within one scrolling grid, so they're a toolbar rather than tabs.
+  const tabs = h('div', { class: 'emoji-tabs', role: 'toolbar', 'aria-label': 'Emoji categories' });
   const preview = h('div', { class: 'emoji-preview' });
   const custom = allEmojis();
   // Custom emoji from every server you're in can be used anywhere.
@@ -3438,7 +4220,7 @@ function emojiPanel(onPick, { keepOpen = false } = {}) {
     sections.forEach(([name, list]) => grid.append(h('div', { class: 'emoji-cat', id: slug(name) }, name), ...list.map(btn)));
   };
   sections.forEach(([name, , sv]) => tabs.append(h('button', {
-    class: 'emoji-tab', role: 'tab', 'data-tip': name, 'aria-label': name,
+    class: 'emoji-tab', 'data-tip': name, 'aria-label': name,
     onclick: () => { search.value = ''; drawAll(); const t = grid.querySelector('#' + slug(name)); if (t) grid.scrollTop = t.offsetTop - grid.offsetTop; },
   }, name === 'Frequently used' ? icon('star') : sv ? (sv.icon ? h('img', { class: 'emoji-tab-img', src: sv.icon, alt: '' }) : h('span', { class: 'emoji-tab-txt' }, sv.name.slice(0, 2))) : CATEGORY_ICONS[name])));
   search.addEventListener('input', () => {
@@ -3672,136 +4454,372 @@ function gifPicker(anchor, onPick, { onEmoji = null } = {}) {
 }
 
 // ======================================================================= global search (Ctrl+K)
-// Messages are end-to-end encrypted, so the server can't search them. Search runs here, over messages
-// this browser has decrypted, and can dig further back through a conversation on request.
+// Messages are end-to-end encrypted, so the server can't read them, and the words you search for never leave
+// this device. The server is only asked for messages by where, who and when (server/search.js); each page is
+// decrypted here and matched against the words, together with the messages already loaded on this device.
+// The filter syntax (from:, in:, has:, dates, "phrases") is parsed by search-query.js. Imports are hoisted,
+// so this one sits next to the only code that uses it.
+import * as SQ from './search-query.js';
+
+const SEARCH_RUN = 1000; // messages checked per click, so one search never runs on for long
+const SEARCH_PAGE = 200; // the server's largest page
+const SEARCH_ENOUGH = 50; // a run also stops early once this many results are showing
+const SEARCH_SHOWN = 200; // results drawn at most
+// Recent searches are kept only in this browser, and only while "Remember my searches" is on.
+const searchHistory = {
+  get on() { return LS.get(mine('searchHistoryOn'), true) !== false; },
+  set on(v) { LS.set(mine('searchHistoryOn'), !!v); if (!v) this.clear(); },
+  get list() { return this.on ? LS.get(mine('searchHistory'), []) : []; },
+  add(text) {
+    const t = String(text || '').trim();
+    if (t && this.on) LS.set(mine('searchHistory'), [t, ...this.list.filter((x) => x !== t)].slice(0, 15));
+  },
+  clear() { LS.set(mine('searchHistory'), []); },
+};
+const SEARCH_HINTS = {
+  from: 'Type a name: from:@username, from:name or from:me',
+  in: 'Type a channel: in:#general (or in:@username for a DM)',
+  has: 'has:file, has:image or has:link',
+  is: 'is:edited or is:pinned',
+  before: 'A date: 2025-05-31, or a month (2025-05) or a year (2025)',
+};
+SEARCH_HINTS.after = SEARCH_HINTS.before;
+SEARCH_HINTS.during = SEARCH_HINTS.before;
+
 function openSearch({ scope = null } = {}) {
   let tab = scope ? 'messages' : 'all';
-  let scopeKey = scope;
-  const input = h('input', { class: 'search-main', placeholder: scope ? 'Search this conversation' : 'Search messages, people, channels, servers', 'aria-label': 'Search' });
-  const tabsEl = h('div', { class: 'seg' });
-  const results = h('div', { class: 'search-results', role: 'listbox' });
-  const scopeChip = h('div', { class: 'search-scope' });
+  let scopeKey = scope; // 'c:<channel>' | 'd:<dm>' | 's:<server>' | null (everywhere)
+  let q = SQ.parseQuery('');
+  let scan = null; // the server-side part of the current search (see runScan)
+  const scans = new Map(); // recent ones by filters, while this search is open
+  let rows = []; // what the arrow keys move through: { id, action, build }
   let sel = 0;
-  let rows = [];
-  let deepRunning = false;
+  let selId = null;
+  let lastHits = 0;
+  let closed = false;
+  const gone = new Set(); // results deleted (or hidden from us) since the search found them
+  const input = h('input', { class: 'search-main', placeholder: scope ? 'Search this conversation' : 'Search messages, people, channels, servers', 'aria-label': 'Search', autocomplete: 'off', spellcheck: 'false', 'aria-controls': 'search-results', 'aria-autocomplete': 'list' });
+  const chipsEl = h('div', { class: 'search-chips' });
+  const noteEl = h('div', { class: 'search-note', 'aria-live': 'polite' });
+  const tabsEl = h('div', { class: 'seg', role: 'tablist' });
+  const results = h('div', { class: 'search-results', id: 'search-results', role: 'listbox', 'aria-label': 'Search results' });
   const go = (fn) => () => { mdl.close(); fn(); };
+  const refocus = () => { selId = null; draw(); input.focus(); };
 
-  const convoMessages = (key) => (S.msgs[key] ? S.msgs[key].list.filter(readable) : []);
-  const allLoaded = () => Object.keys(S.msgs).flatMap((k) => convoMessages(k).map((m) => ({ m, key: k })));
-  const matchMsg = (m, q, kind) => {
-    const t = textOf(m).toLowerCase();
-    const files = filesOf(m);
-    if (kind === 'files') return files.length && (!q || files.some((f) => (f.name || '').toLowerCase().includes(q)));
-    if (kind === 'links') return /https?:\/\//i.test(t) && (!q || t.includes(q));
-    return q && (t.includes(q) || files.some((f) => (f.name || '').toLowerCase().includes(q)));
-  };
-  const snippet = (t, q) => {
-    const i = q ? t.toLowerCase().indexOf(q) : -1;
-    const s = i > 40 ? '\u2026' + t.slice(i - 40) : t;
-    return s.slice(0, 180);
-  };
-  const highlight = (text, q) => {
-    if (!q) return document.createTextNode(text);
-    const frag = document.createDocumentFragment();
-    const lower = text.toLowerCase();
-    let i = 0;
-    for (;;) {
-      const j = lower.indexOf(q, i);
-      if (j < 0) { frag.append(text.slice(i)); break; }
-      frag.append(text.slice(i, j), h('mark', null, text.slice(j, j + q.length)));
-      i = j + q.length;
+  // ---- where and who: from: and in: name people and places, the server wants ids
+  const serverOfScope = (key) => (!key ? null : key.startsWith('s:') ? S.servers.find((s) => s.id === key.slice(2)) : key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null);
+  function scopeLabel(key) {
+    if (key.startsWith('d:')) return `In DM with ${displayName(getUser((S.dms.find((d) => d.id === key.slice(2)) || {}).userId))}`;
+    const s = serverOfScope(key);
+    if (key.startsWith('s:')) return `In ${s ? s.name : 'this server'}`;
+    return isGroup(s) ? `In ${groupName(s)}` : `In #${(channelById(key.slice(2)) || {}).name || 'channel'}`;
+  }
+  const handles = (list) => list.slice(0, 4).map((u) => '@' + u.username).join(', ') + (list.length > 4 ? '…' : '');
+  function findPerson(f) {
+    if (f.me) return { id: S.me.id, user: S.me };
+    const n = f.name.toLowerCase();
+    const users = Object.values(S.users).filter((u) => u && u.username);
+    const exact = users.find((u) => u.username.toLowerCase() === n);
+    if (exact) return { id: exact.id, user: exact };
+    if (f.exact) return { error: `No one with the username @${f.name} in your servers or DMs.` };
+    const named = users.filter((u) => displayName(u).toLowerCase() === n);
+    if (named.length > 1) return { error: `Several people are called “${f.name}” (${handles(named)}). Use from:@username.` };
+    const near = named.length ? named : users.filter((u) => u.username.toLowerCase().startsWith(n) || displayName(u).toLowerCase().startsWith(n));
+    if (near.length === 1) return { id: near[0].id, user: near[0] };
+    return { error: near.length ? `“${f.name}” could be ${handles(near)}. Type more, or use from:@username.` : `No one called “${f.name}” in your servers or DMs. Try from:@username.` };
+  }
+  function findPlace(f) {
+    if (f.kind === 'user') {
+      const p = findPerson({ name: f.name });
+      if (p.error) return p;
+      const d = S.dms.find((x) => x.userId === p.id);
+      return d ? { key: 'd:' + d.id } : { error: `You don’t have a DM with @${p.user.username}.` };
     }
-    return frag;
+    const n = f.name.toLowerCase();
+    const hits = realServers().flatMap((s) => s.channels.filter((c) => c.type === 'text' && c.name.toLowerCase() === n).map((c) => ({ c, s })));
+    if (!hits.length) return { error: `No channel called #${f.name} that you can see.` };
+    // Several servers have one: take the one being searched or looked at.
+    const here = (serverOfScope(scopeKey) || {}).id || S.view.serverId;
+    const pick = hits.length === 1 ? hits[0] : hits.find((x) => x.s.id === here);
+    if (!pick) return { error: `#${f.name} is in ${hits.length} servers (${hits.slice(0, 3).map((x) => x.s.name).join(', ')}). Search from inside the one you mean.` };
+    return { key: 'c:' + pick.c.id };
+  }
+  // What to ask the server for. Only these metadata filters are sent; the words stay here.
+  function plan() {
+    const p = { errors: [...q.errors], fromId: null, where: scopeKey, badFrom: false, badIn: false };
+    if (q.from) { const r = findPerson(q.from); if (r.error) { p.errors.push(r.error); p.badFrom = true; } else p.fromId = r.id; }
+    if (q.in) { const r = findPlace(q.in); if (r.error) { p.errors.push(r.error); p.badIn = true; } else p.where = r.key; }
+    p.params = { scope: p.where || 'all', limit: String(SEARCH_PAGE) };
+    if (p.fromId) p.params.from = p.fromId;
+    if (q.after !== null) p.params.after = String(q.after);
+    if (q.before !== null) p.params.before = String(q.before);
+    p.sig = JSON.stringify([p.params.scope, p.fromId, q.after, q.before]);
+    return p;
+  }
+
+  // ---- the server part: ciphertext pages, newest first. Each click checks up to SEARCH_RUN messages, and
+  // "Search further back" carries on from the cursor. Typing more words reuses what's already decrypted.
+  function startScan(p) {
+    if (scan && scan.sig === p.sig) return;
+    // Going back to filters used a moment ago picks up where that search was (draw() continues it if needed).
+    scan = scans.get(p.sig);
+    if (scan) return;
+    scan = { sig: p.sig, params: p.params, items: new Map(), cursor: null, done: false, checked: 0, unreadable: 0, goal: SEARCH_RUN, running: false, error: null, oldest: null };
+    scans.set(p.sig, scan);
+    if (scans.size > 8) scans.delete(scans.keys().next().value);
+    runScan(scan);
+  }
+  async function runScan(sc, further = false) {
+    if (further) sc.goal = sc.checked + SEARCH_RUN;
+    if (sc.running || sc.done || closed || sc.checked >= sc.goal) return;
+    sc.running = true;
+    sc.error = null;
+    const stale = () => closed || scan !== sc;
+    try {
+      while (!sc.done && sc.checked < sc.goal && !stale()) {
+        const res = await api('GET', '/search/messages?' + new URLSearchParams({ ...sc.params, ...(sc.cursor ? { cursor: sc.cursor } : {}) }));
+        await Promise.all(res.messages.map((m) => decryptMessage(m).catch(() => {})));
+        if (stale()) return;
+        for (const m of res.messages) {
+          if (readable(m)) sc.items.set(m.id, { m, key: keyOfMessage(m) });
+          else sc.unreadable++;
+        }
+        sc.checked += res.messages.length;
+        if (res.messages.length) sc.oldest = res.messages[res.messages.length - 1].createdAt;
+        sc.cursor = res.nextCursor;
+        sc.done = !res.nextCursor;
+        draw();
+        if (lastHits >= SEARCH_ENOUGH) break;
+      }
+    } catch (e) {
+      if (!stale()) sc.error = e.message;
+    } finally {
+      sc.running = false;
+      if (!stale()) draw();
+    }
+  }
+
+  // ---- matching, on this device
+  // While you share your screen, DMs and group chats stay out of the results (see shareCover).
+  const privateHidden = (key) => (key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)))) && hiddenWhileSharing(key);
+  const inPlace = (key, m, where) => !where || (where.startsWith('s:') ? !m.dmId && m.serverId === where.slice(2) : key === where);
+  const viewOf = (m) => ({ text: textOf(m), files: filesOf(m), edited: !!m.editedAt, pinned: !!m.pinnedAt, createdAt: m.createdAt, get imageLinks() { return extractImageUrls(textOf(m)).length; } });
+  function messageHits(p) {
+    const found = new Map();
+    const consider = (m, key) => {
+      if (found.has(m.id) || !readable(m) || !inPlace(key, m, p.where) || (p.fromId && m.authorId !== p.fromId)) return;
+      if (privateHidden(key) || S.blocked.has(m.authorId)) return;
+      if (tab === 'files' && !filesOf(m).length) return;
+      if (tab === 'links' && !/https?:\/\//i.test(textOf(m))) return;
+      if (SQ.matchMessage(q, viewOf(m))) found.set(m.id, { m, key });
+    };
+    // Loaded on this device first (kept up to date live), then what the server search turned up.
+    for (const [key, store] of Object.entries(S.msgs)) store.list.forEach((m) => consider(m, key));
+    for (const t of Object.values(S.threads)) (t.list || []).forEach((m) => consider(m, 'c:' + m.channelId));
+    if (scan && scan.sig === p.sig) scan.items.forEach(({ m, key }) => consider(m, key));
+    return [...found.values()].sort((a, b) => b.m.createdAt - a.m.createdAt || (a.m.id < b.m.id ? 1 : -1));
+  }
+  // Matches are highlighted with real text nodes and <mark> elements, never HTML.
+  const marked = (text) => SQ.segments(text, q).map((s) => (s.hit ? h('mark', null, s.text) : s.text));
+
+  async function openResult(m, key) {
+    if (gone.has(m.id)) return;
+    searchHistory.add(input.value);
+    let loc;
+    try { loc = await api('GET', `/messages/${m.id}/locate`); } catch (e) {
+      if (e.status === 404) { gone.add(m.id); draw(); return; }
+      toast(e.message, 'error');
+      return;
+    }
+    if (closed) return;
+    mdl.close();
+    if (loc.threadId) {
+      // A reply in a thread: open its channel at the thread's first message, then the thread itself.
+      await jumpToMessage('c:' + loc.channelId, loc.threadId);
+      openThread({ id: loc.threadId, channelId: loc.channelId, serverId: loc.serverId }, m.id);
+    } else jumpToMessage(key, m.id);
+  }
+
+  // ---- drawing
+  const item = (id, o) => ({ id, action: o.action, build: (i) => h('button', {
+    class: `search-item${o.cls ? ' ' + o.cls : ''}`, id: 'sr-' + i, role: 'option', 'aria-selected': 'false', 'aria-disabled': o.disabled ? 'true' : null,
+    onclick: o.action, onmouseenter: () => select(i),
+  }, o.av, h('span', { class: 'search-item-text' }, h('span', { class: 'search-item-title' }, o.title), o.sub ? h('span', { class: 'search-item-sub' }, o.sub) : null,
+    o.badges && o.badges.length ? h('span', { class: 'search-badges' }, o.badges) : null), o.meta ? h('span', { class: 'search-item-meta' }, o.meta) : null) });
+  function messageItem({ m, key }) {
+    const u = getUser(m.authorId);
+    const files = filesOf(m);
+    const deleted = gone.has(m.id);
+    const body = tab === 'files' ? files.map((f) => f.name).join(', ') : SQ.excerpt(textOf(m), q);
+    const badges = [];
+    if (files.length) {
+      const img = files.some(SQ.isImageFile);
+      const what = `${files.length} ${img ? 'image' : 'file'}${files.length > 1 ? 's' : ''}`;
+      badges.push(h('span', { class: 'search-badge', title: what, 'aria-label': what }, icon(img ? 'image' : 'file'), String(files.length)));
+    }
+    if (m.threadId) badges.push(h('span', { class: 'search-badge' }, icon('thread'), 'In a thread'));
+    if (m.editedAt) badges.push(h('span', { class: 'search-badge' }, 'Edited'));
+    return item('m:' + m.id, {
+      cls: `search-msg${deleted ? ' gone' : ''}`, disabled: deleted, av: avatarEl(u, 30),
+      title: h('span', null, h('strong', null, displayName(u)), h('span', { class: 'search-where' }, ` · ${whereLabel(m)}`)),
+      sub: deleted ? h('span', { class: 'search-gone' }, 'This message was deleted after the search found it, or you can’t see it any more.')
+        : body ? marked(body) : h('em', null, files.length ? 'Only attachments' : 'No text'),
+      badges: deleted ? [] : badges,
+      meta: h('time', { datetime: new Date(m.createdAt).toISOString(), title: new Date(m.createdAt).toLocaleString() }, fmtStamp(m.createdAt)),
+      action: () => openResult(m, key),
+    });
+  }
+  function chipLabel(f, p) {
+    if (SQ.parseQuery(f.raw).errors.length) return f.raw;
+    if (f.key === 'from') return p.fromId ? `From ${displayName(getUser(p.fromId))}` : f.raw;
+    if (f.key === 'in') return p.where && !p.badIn ? scopeLabel(p.where) : f.raw;
+    if (f.key === 'has') return { file: 'Has a file', image: 'Has an image', link: 'Has a link' }[SQ.parseQuery(f.raw).has[0]];
+    if (f.key === 'is') return f.value.toLowerCase() === 'edited' ? 'Edited' : 'Pinned';
+    return `${f.key[0].toUpperCase()}${f.key.slice(1)} ${f.value}`;
+  }
+  function statusEl(p, n) {
+    const sc = scan;
+    if (!sc || sc.sig !== p.sig) return null;
+    const count = (x) => x.toLocaleString();
+    const lost = sc.unreadable ? ` ${count(sc.unreadable)} couldn’t be decrypted on this device.` : '';
+    if (sc.running) return h('div', { class: 'search-status' }, h('span', { class: 'spinner' }), h('span', null, `Searching… ${count(sc.checked)} messages checked`));
+    if (sc.error) {
+      return h('div', { class: 'search-status bad' }, h('span', null, `Couldn’t search further: ${sc.error}`),
+        h('button', { class: 'btn ghost sm', onclick: () => { runScan(sc, true); draw(); } }, 'Try again'));
+    }
+    if (sc.done) return h('div', { class: 'search-status' }, h('span', null, `${n ? '' : 'No messages match. '}Checked all ${count(sc.checked)} messages that fit the filters.${lost}`));
+    return h('div', { class: 'search-status' },
+      h('span', null, `${n ? '' : 'No matches yet. '}Checked ${count(sc.checked)} messages, back to ${fmtDay(sc.oldest)}.${lost}`),
+      h('button', { class: 'btn ghost sm', onclick: () => { searchHistory.add(input.value); runScan(sc, true); draw(); } }, 'Search further back'));
+  }
+  function select(i, scroll = false) {
+    if (!rows.length) { input.removeAttribute('aria-activedescendant'); return; }
+    sel = Math.max(0, Math.min(rows.length - 1, i));
+    selId = rows[sel].id;
+    results.querySelectorAll('.search-item').forEach((b, n) => { b.classList.toggle('active', n === sel); b.setAttribute('aria-selected', String(n === sel)); });
+    const el = results.querySelector('#sr-' + sel);
+    if (el) { input.setAttribute('aria-activedescendant', el.id); if (scroll) el.scrollIntoView({ block: 'nearest' }); }
+  }
+  const insert = (token) => {
+    const v = input.value.replace(/\s+$/, '');
+    input.value = (v ? v + ' ' : '') + token;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    refocus();
   };
 
-  const draw = () => {
+  function draw() {
+    if (closed) return;
+    q = SQ.parseQuery(input.value);
+    const p = plan();
+    const empty = !input.value.trim();
+    const words = q.terms.join(' ').toLowerCase();
+    // A filter still being typed ("from:" at the end) gets a hint, not an error, and doesn't search yet.
+    const typing = /(?:^|\s)(from|in|before|after|during|has|is):[#@"]?$/i.exec(input.value);
+    const wantsMessages = ['all', 'messages', 'files', 'links'].includes(tab);
+    const messageQuery = !typing && !p.errors.length && (q.filters.length > 0 || tab === 'files' || tab === 'links' || q.terms.join('').length >= (scopeKey ? 1 : 2));
+    if (wantsMessages && messageQuery) startScan(p);
+
     clear(tabsEl);
     [['all', 'All'], ['messages', 'Messages'], ['people', 'People'], ['places', 'Channels & servers'], ['files', 'Files'], ['links', 'Links']].forEach(([k, l]) => tabsEl.append(
-      h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; sel = 0; draw(); input.focus(); } }, l)));
-    clear(scopeChip);
-    if (scopeKey) {
-      const label = scopeKey.startsWith('d:') ? `In DM with ${displayName(getUser((S.dms.find((d) => d.id === scopeKey.slice(2)) || {}).userId))}` : (() => { const s = serverOfChannel(scopeKey.slice(2)); return isGroup(s) ? `In ${groupName(s)}` : `In #${(channelById(scopeKey.slice(2)) || {}).name}`; })();
-      scopeChip.append(h('span', { class: 'chip active' }, label, h('button', { class: 'chip-x', 'aria-label': 'Search everywhere', onclick: () => { scopeKey = null; draw(); } }, icon('close'))));
+      h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(tab === k), onclick: () => { tab = k; refocus(); } }, l)));
+
+    // Chips: where the search is limited to, then each filter (× removes it from the box).
+    clear(chipsEl);
+    if (scopeKey && !q.in) {
+      chipsEl.append(h('span', { class: 'chip active search-chip' }, scopeLabel(scopeKey), h('button', { class: 'chip-x', 'aria-label': 'Search everywhere', onclick: () => { scopeKey = null; refocus(); } }, icon('close'))));
+      const s = serverOfScope(scopeKey);
+      if (scopeKey.startsWith('c:') && s && !isGroup(s)) chipsEl.append(h('button', { class: 'chip search-chip', onclick: () => { scopeKey = 's:' + s.id; refocus(); } }, `All of ${s.name}`));
     }
-    const q = input.value.trim().toLowerCase();
+    q.filters.forEach((f) => {
+      const bad = SQ.parseQuery(f.raw).errors.length > 0 || (f.key === 'from' && p.badFrom) || (f.key === 'in' && p.badIn);
+      chipsEl.append(h('span', { class: `chip active search-chip${bad ? ' bad' : ''}`, title: f.raw }, chipLabel(f, p),
+        h('button', { class: 'chip-x', 'aria-label': `Remove ${f.raw}`, onclick: () => { input.value = SQ.removeFilter(input.value, f); refocus(); } }, icon('close'))));
+    });
+    if (q.filters.length || scopeKey) chipsEl.append(h('button', { class: 'link-btn search-clear', onclick: () => { input.value = SQ.clearFilters(input.value); scopeKey = null; refocus(); } }, 'Clear filters'));
+
+    clear(noteEl);
+    noteEl.className = 'search-note';
+    if (typing) { noteEl.classList.add('hint'); noteEl.append(icon('info'), h('span', null, SEARCH_HINTS[typing[1].toLowerCase()])); }
+    else if (p.errors.length) { noteEl.classList.add('bad'); noteEl.append(icon('info'), h('span', null, p.errors.join(' '))); }
+
     clear(results);
     rows = [];
-    const add = (section, items) => {
+    const add = (title, items) => {
       if (!items.length) return;
-      results.append(h('div', { class: 'search-sec' }, section));
-      items.forEach((it) => { const i = rows.length; rows.push(it); results.append(it.el(i)); });
+      if (title) results.append(h('div', { class: 'search-sec' }, title));
+      items.forEach((it) => { const i = rows.length; rows.push(it); results.append(it.build(i)); });
     };
-    const item = (opts) => (i) => h('button', {
-      class: `search-item${i === sel ? ' active' : ''}`, role: 'option', 'aria-selected': String(i === sel),
-      onclick: opts.action, onmouseenter: () => { sel = i; [...results.querySelectorAll('.search-item')].forEach((b, n) => b.classList.toggle('active', n === sel)); },
-    }, opts.av, h('span', { class: 'search-item-text' }, h('span', { class: 'search-item-title' }, opts.title), opts.sub ? h('span', { class: 'search-item-sub' }, opts.sub) : null), opts.meta ? h('span', { class: 'search-item-meta' }, opts.meta) : null);
 
-    if (!scopeKey && (tab === 'all' || tab === 'people')) {
-      const people = Object.values(S.users).filter((u) => u.id !== S.me.id && (!q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q)))
-        .sort((a, b) => displayName(a).localeCompare(displayName(b))).slice(0, tab === 'all' ? 5 : 30);
-      add('People', people.map((u) => ({ el: item({ av: avatarEl(u, 30, { status: true, meId: S.me.id }), title: displayName(u), sub: u.username, action: go(() => openDmWith(u.id)) }), action: go(() => openDmWith(u.id)) })));
+    if (empty && (tab === 'all' || tab === 'messages')) {
+      results.append(h('div', { class: 'search-suggest' }, h('span', { class: 'search-sec' }, 'Filters'),
+        h('div', { class: 'search-suggest-list' }, SQ.SUGGESTIONS.map((s) => h('button', { class: 'chip search-chip', title: s.hint, onclick: () => insert(s.insert) }, s.insert)))));
+      const hist = searchHistory.list;
+      if (hist.length && isSharing()) results.append(h('div', { class: 'search-empty' }, 'Recent searches are hidden while you share your screen.'));
+      else if (hist.length) {
+        add('Recent searches', hist.map((t) => item('h:' + t, { av: h('span', { class: 'search-ic' }, icon('search')), title: t, action: () => { input.value = t; refocus(); } })));
+        results.append(h('div', { class: 'search-hist-actions' }, h('button', { class: 'link-btn', onclick: () => { searchHistory.clear(); refocus(); } }, 'Clear history')));
+      }
+      results.append(h('div', { class: 'search-privacy' }, icon('lock'), h('div', { class: 'stack' },
+        h('p', null, 'Search runs on this device. Messages are decrypted here, and your search words never leave it: the server only learns which conversation, person and dates you filter by.'),
+        h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Remember my searches on this device'), h('span', { class: 'field-hint' }, 'Kept only in this browser.')),
+          h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: searchHistory.on, onchange: (e) => { searchHistory.on = e.target.checked; refocus(); } }), h('span', { class: 'switch-track' }))))));
     }
-    if (!scopeKey && (tab === 'all' || tab === 'places')) {
+    // People and places only for plain words (filters are about messages).
+    if (!scopeKey && !q.filters.length && (tab === 'people' || (tab === 'all' && !empty))) {
+      const people = Object.values(S.users).filter((u) => u.id !== S.me.id && (!words || u.username.toLowerCase().includes(words) || displayName(u).toLowerCase().includes(words)))
+        .sort((a, b) => displayName(a).localeCompare(displayName(b))).slice(0, tab === 'all' ? 5 : 30);
+      add('People', people.map((u) => item('u:' + u.id, { av: avatarEl(u, 30, { status: true, meId: S.me.id }), title: displayName(u), sub: u.username, action: go(() => openDmWith(u.id)) })));
+    }
+    if (!scopeKey && !q.filters.length && (tab === 'places' || (tab === 'all' && !empty))) {
       const places = [];
       realServers().forEach((s) => {
-        if (!q || s.name.toLowerCase().includes(q)) places.push({ av: s.icon ? h('img', { class: 'search-img', src: s.icon, alt: '' }) : h('span', { class: 'search-ic' }, s.name.slice(0, 2)), title: s.name, sub: 'Server', action: go(() => openServer(s.id)) });
-        s.channels.forEach((c) => { if (!q || c.name.toLowerCase().includes(q)) places.push({ av: h('span', { class: 'search-ic' }, icon(channelIcon(c))), title: c.name, sub: s.name, action: go(() => (c.type === 'voice' ? joinVoice(c, s) : openChannel(c.id, s.id))) }); });
+        if (!words || s.name.toLowerCase().includes(words)) places.push({ id: 's:' + s.id, av: s.icon ? h('img', { class: 'search-img', src: s.icon, alt: '' }) : h('span', { class: 'search-ic' }, s.name.slice(0, 2)), title: s.name, sub: 'Server', action: go(() => openServer(s.id)) });
+        s.channels.forEach((c) => { if (!words || c.name.toLowerCase().includes(words)) places.push({ id: 'c:' + c.id, av: h('span', { class: 'search-ic' }, icon(channelIcon(c))), title: c.name, sub: s.name, action: go(() => (c.type === 'voice' ? joinVoice(c, s) : openChannel(c.id, s.id))) }); });
       });
-      groups().forEach((g) => { if (!q || groupName(g).toLowerCase().includes(q)) places.push({ av: groupAvatar(g, 30), title: groupName(g), sub: 'Group', action: go(() => openGroup(g.id)) }); });
-      add('Channels & servers', places.slice(0, tab === 'all' ? 6 : 50).map((p) => ({ el: item(p), action: p.action })));
+      groups().forEach((g) => { if (!words || groupName(g).toLowerCase().includes(words)) places.push({ id: 'g:' + g.id, av: groupAvatar(g, 30), title: groupName(g), sub: 'Group', action: go(() => openGroup(g.id)) }); });
+      add('Channels & servers', places.slice(0, tab === 'all' ? 6 : 50).map((x) => item(x.id, x)));
     }
-    if (['all', 'messages', 'files', 'links'].includes(tab) && (q || tab === 'files' || tab === 'links')) {
-      const kind = tab === 'files' ? 'files' : tab === 'links' ? 'links' : 'text';
-      // While you share your screen, messages from DMs and group chats stay out of the results (see shareCover).
-      const privateHidden = (key) => (key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)))) && hiddenWhileSharing(key);
-      const pool = (scopeKey ? convoMessages(scopeKey).map((m) => ({ m, key: scopeKey })) : allLoaded()).filter(({ key }) => !privateHidden(key));
-      const hits = pool.filter(({ m }) => matchMsg(m, q, kind)).sort((a, b) => b.m.createdAt - a.m.createdAt).slice(0, tab === 'all' ? 8 : 60);
-      add(tab === 'files' ? 'Files' : tab === 'links' ? 'Links' : 'Messages', hits.map(({ m, key }) => {
-        const u = getUser(m.authorId);
-        const files = filesOf(m);
-        const t = kind === 'files' ? files.map((f) => f.name).join(', ') : snippet(textOf(m), q);
-        const action = go(() => jumpToMessage(key, m.id));
-        return { el: item({ av: avatarEl(u, 30), title: h('span', null, h('strong', null, displayName(u)), h('span', { class: 'search-where' }, ` \u00b7 ${whereLabel(m)}`)), sub: highlight(t, kind === 'files' ? '' : q), meta: fmtDay(m.createdAt), action }), action };
-      }));
-      if (!hits.length && q) results.append(h('div', { class: 'search-empty' }, 'No loaded messages match.'));
+    lastHits = 0;
+    if (wantsMessages && messageQuery) {
+      const hits = messageHits(p);
+      lastHits = hits.length;
+      // Fewer results than a run aims for (say, after adding a word): use the rest of this click's budget.
+      if (scan && scan.sig === p.sig && !scan.running && !scan.error && hits.length < SEARCH_ENOUGH) runScan(scan);
+      const shown = hits.slice(0, tab === 'all' ? 8 : SEARCH_SHOWN);
+      add(tab === 'files' ? 'Files' : tab === 'links' ? 'Links' : 'Messages', shown.map(messageItem));
+      if (tab === 'all' && hits.length > shown.length) {
+        add('', [item('more', { av: h('span', { class: 'search-ic' }, icon('message')), title: `Show all ${hits.length.toLocaleString()} message results`, action: () => { tab = 'messages'; refocus(); } })]);
+      } else if (hits.length > shown.length) results.append(h('div', { class: 'search-empty' }, `Showing the newest ${SEARCH_SHOWN} of ${hits.length.toLocaleString()} results. Add words or filters to narrow them down.`));
+      const st = statusEl(p, hits.length);
+      if (st) results.append(st);
+      else if (!hits.length) results.append(h('div', { class: 'search-empty' }, 'No messages match.'));
+    } else if (!empty && !rows.length && !typing && !p.errors.length) {
+      results.append(h('div', { class: 'search-empty' }, wantsMessages ? 'Keep typing to search messages.' : 'Nothing matches.'));
     }
-    if (scopeKey && (tab === 'messages' || tab === 'files' || tab === 'links')) {
-      const store = S.msgs[scopeKey];
-      if (store && store.hasMore) {
-        results.append(h('div', { class: 'search-deep' },
-          h('span', null, `Searched ${store.list.length} messages decrypted on this device.`),
-          h('button', { class: 'btn ghost sm', disabled: deepRunning, onclick: async (e) => {
-            deepRunning = true; e.target.textContent = 'Decrypting older messages\u2026';
-            for (let i = 0; i < 20 && S.msgs[scopeKey].hasMore; i++) await loadOlderQuiet(scopeKey);
-            deepRunning = false; draw();
-          } }, 'Search older history')));
-      }
-    }
-    if (!rows.length && !q && tab === 'all') results.append(h('div', { class: 'search-empty' }, 'Type to search. Messages are searched on this device because the server can\u2019t read them.'));
-    sel = Math.min(sel, Math.max(0, rows.length - 1));
-  };
-  input.addEventListener('input', debounce(() => { sel = 0; draw(); }, 120));
+    const keep = selId ? rows.findIndex((r) => r.id === selId) : -1;
+    select(keep >= 0 ? keep : 0);
+  }
+
+  input.addEventListener('input', debounce(() => { selId = null; draw(); }, 150));
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(rows.length - 1, sel + 1); draw(); results.querySelector('.search-item.active')?.scrollIntoView({ block: 'nearest' }); }
-    if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(0, sel - 1); draw(); results.querySelector('.search-item.active')?.scrollIntoView({ block: 'nearest' }); }
-    if (e.key === 'Enter' && rows[sel]) { e.preventDefault(); rows[sel].action(); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); select(sel + 1, true); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); select(sel - 1, true); }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (input.value !== q.text) { selId = null; draw(); } // don't act on results from before the last keystroke
+      if (rows[sel]) rows[sel].action(); else searchHistory.add(input.value);
+    }
   });
-  const mdl = modal({ size: 'search', className: 'search-modal', body: h('div', { class: 'search' },
-    h('div', { class: 'search-bar' }, icon('search'), input, h('kbd', null, 'Esc')), scopeChip, tabsEl, results,
-    h('div', { class: 'search-foot' }, h('span', null, h('kbd', null, '\u2191'), h('kbd', null, '\u2193'), ' to move'), h('span', null, h('kbd', null, 'Enter'), ' to open'), h('span', null, icon('lock', 'ic'), 'Searched privately on this device'))) });
+  const mdl = modal({ size: 'search', className: 'search-modal', label: 'Search', onClose: () => { closed = true; }, body: h('div', { class: 'search' },
+    h('div', { class: 'search-bar' }, icon('search'), input, h('kbd', null, 'Esc'), h('button', { class: 'icon-btn search-close', 'aria-label': 'Close search', onclick: () => mdl.close() }, icon('close'))),
+    chipsEl, noteEl, tabsEl, results,
+    h('div', { class: 'search-foot' }, h('span', { class: 'search-keys' }, h('kbd', null, '↑'), h('kbd', null, '↓'), ' to move'), h('span', { class: 'search-keys' }, h('kbd', null, 'Enter'), ' to open'),
+      h('span', null, icon('lock', 'ic'), 'Search words stay on this device'))) });
+  mdl.box.setAttribute('aria-label', 'Search');
   draw();
   input.focus();
   requestAnimationFrame(() => { if (document.activeElement !== input) input.focus(); });
-}
-// Load one older page into a store without touching the screen (for deep search).
-async function loadOlderQuiet(key) {
-  const store = S.msgs[key];
-  if (!store || !store.hasMore || !store.list.length) return;
-  const res = await api('GET', msgUrl(key) + `?before=${store.list[0].id}`);
-  await Promise.all(res.messages.map(decryptMessage));
-  store.list = [...res.messages, ...store.list];
-  store.hasMore = res.hasMore;
-  if (currentKey() === key) { const sc = $('#messages'); const prevH = sc.scrollHeight; const top = sc.scrollTop; renderMessages(false); sc.scrollTop = sc.scrollHeight - prevH + top; }
 }
 
 // ======================================================================= voice room
@@ -3976,6 +4994,7 @@ function openServerSecurity(server) {
       h('p', { class: 'muted-p' }, `Messages and files in ${label} are encrypted on your device with a key that only members have. The server stores scrambled data it can\u2019t read, and every message is signed by its sender.`),
       h('p', { class: 'muted-p' }, 'When someone leaves or is removed, the key is replaced automatically so they can\u2019t read anything new.'),
       h('div', { class: 'kv' }, h('span', null, 'Key version'), h('strong', null, st.keyEpoch ? `#${st.keyEpoch}` : 'Not set up yet')),
+      st.keyCreatorId ? h('div', { class: 'kv' }, h('span', null, 'Made by'), h('strong', null, `${displayName(getUser(st.keyCreatorId))}${st.keyCreatedAt ? `, ${new Date(st.keyCreatedAt).toLocaleString()}` : ''}`)) : null,
       h('div', { class: 'kv' }, h('span', null, 'Members with the current key'), h('strong', null, `${Math.max(0, holders)} of ${server.memberIds.length}`)),
       changed.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `Security key changed for ${changed.map(displayName).join(', ')}. Verify them from their profile before the key can be shared.`)) : null,
       h('p', { class: 'field-hint' }, 'To make sure nobody is impersonating a member, compare safety numbers with them from their profile (\u22ef \u2192 Verify encryption).')),
@@ -4005,7 +5024,8 @@ function backFromStripe() {
 function serverMenuItems(server) {
   const admin = isAdmin(server);
   const fav = P.favorites.includes('s:' + server.id);
-  const lvl = P.notify['s:' + server.id] || 'all';
+  const sp = S.notifyPrefs['s:' + server.id];
+  const lvl = sp && sp.level !== 'default' ? (sp.level === 'none' ? 'muted' : sp.level) : 'all';
   return [
     can(server, PERMS.CREATE_INVITE) ? { label: 'Invite people', icon: 'userPlus', action: () => openInvite(server) } : null,
     canManageServer(server) ? { label: 'Server settings', icon: 'gear', action: () => openServerSettings(server) } : null,
@@ -4016,12 +5036,14 @@ function serverMenuItems(server) {
     ...folders.serverMenuExtras(server),
     '-',
     { header: 'Notifications' },
-    ...[['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify('s:' + server.id, v === 'all' ? 'default' : v) })),
+    ...[['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify('s:' + server.id, v === 'all' ? 'default' : v) })),
+    { label: 'Ignore @everyone and @here', checked: !!(sp && sp.suppressEveryone), action: () => setNotify('s:' + server.id, undefined, { suppressEveryone: !(sp && sp.suppressEveryone) }) },
+    ...notifyItems('s:' + server.id),
     '-',
     admin ? { label: 'Create channel', icon: 'plus', action: () => openCreateChannel(server, 'text') } : null,
     admin ? { label: 'Create category', icon: 'folderPlus', action: () => openCreateCategory(server) } : null,
     { label: 'Encryption details', icon: 'lock', action: () => openServerSecurity(server) },
-    { label: 'Mark server as read', icon: 'check', action: () => { server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); }); renderAll(); } },
+    { label: 'Mark server as read', icon: 'check', action: () => markServerRead(server) },
     !isOwner(server) ? '-' : null,
     !isOwner(server) ? { label: 'Leave server', icon: 'logout', danger: true, action: () => leaveServer(server) } : null,
   ];
@@ -4106,7 +5128,9 @@ function openJoinModal(code) {
 }
 function openInvite(server) {
   const out = h('input', { class: 'input mono', readonly: true, value: 'Creating\u2026', 'aria-label': 'Invite link' });
-  const expires = h('select', { class: 'input' }, [['0', 'Never'], ['1', '1 hour'], ['24', '1 day'], ['168', '7 days']].map(([v, l]) => h('option', { value: v }, l)));
+  // Links expire after 7 days unless you choose otherwise, so one that leaks or gets forgotten stops working.
+  const expires = h('select', { class: 'input' }, [['1', '1 hour'], ['24', '1 day'], ['168', '7 days'], ['720', '30 days'], ['0', 'Never']].map(([v, l]) => h('option', { value: v }, l)));
+  expires.value = '168';
   const uses = h('select', { class: 'input' }, [['0', 'No limit'], ['1', '1 use'], ['5', '5 uses'], ['10', '10 uses'], ['25', '25 uses']].map(([v, l]) => h('option', { value: v }, l)));
   const make = async () => {
     try {
@@ -4120,7 +5144,8 @@ function openInvite(server) {
     body: h('div', { class: 'stack' },
       h('p', { class: 'muted-p' }, 'Send this link to people. They need to be able to reach this computer or VPS.'),
       h('div', { class: 'row gap' }, out, h('button', { class: 'btn primary', onclick: async (e) => { await copyText(out.value); e.target.textContent = 'Copied'; setTimeout(() => { e.target.textContent = 'Copy'; }, 1500); } }, 'Copy')),
-      h('div', { class: 'row gap' }, field('Expires after', expires), field('Max uses', uses))),
+      h('div', { class: 'row gap' }, field('Expires after', expires), field('Max uses', uses)),
+      can(server, PERMS.MANAGE_SERVER) ? h('p', { class: 'field-hint' }, 'See or revoke invite links in Server settings \u2192 Invites.') : null),
   });
   make();
 }
@@ -4187,7 +5212,7 @@ async function newsBotTab(s, body) {
     feeds.length ? list : h('p', { class: 'field-hint' }, 'Not following anything yet.'),
     h('h4', null, 'Follow something new'),
     kindChips,
-    h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'What to follow'), query, hint),
+    h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'What to follow'), query, hint),
     h('div', { class: 'grid-2' }, field('Post into', channel), field('Only posts mentioning (optional)', keywords, 'Comma-separated words. Leave empty for everything.')),
     h('label', { class: 'row gap tight' }, postNow, h('span', null, 'Post the newest item right now, so you can see it working')),
     h('div', { class: 'row gap' },
@@ -4227,7 +5252,9 @@ function openServerSettings(server, startTab = 'overview') {
     ['members', 'Members', 'people', (s) => can(s, PERMS.MANAGE_ROLES) || can(s, PERMS.KICK_MEMBERS) || can(s, PERMS.BAN_MEMBERS)],
     ['emoji', 'Emoji', 'smile', (s) => can(s, PERMS.MANAGE_EMOJIS)],
     ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
+    ['bots', 'Bots', 'bot', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bans', 'Bans', 'ban', (s) => can(s, PERMS.BAN_MEMBERS)],
+    ['invites', 'Invites', 'link', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
   ];
@@ -4242,10 +5269,13 @@ function openServerSettings(server, startTab = 'overview') {
   const draw = () => {
     const s = live();
     const allowed = TABS.filter(([, , , ok]) => ok(s));
-    if (!allowed.some(([k]) => k === tab)) tab = allowed[0] ? allowed[0][0] : 'overview';
+    // Nothing left that's yours to change here (say, right after handing the server to someone else): close
+    // instead of showing forms the server would refuse.
+    if (!allowed.length) { mdl.close(); return; }
+    if (!allowed.some(([k]) => k === tab)) tab = allowed[0][0];
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
-    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, danger })[tab](s);
+    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bots: (sv) => botsTab(sv, body, { confirm: (fn, opts) => confirmedCall(app, fn, opts) }), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger })[tab](s);
   };
 
   function overview(s) {
@@ -4365,7 +5395,7 @@ function openServerSettings(server, startTab = 'overview') {
         sel.everyone ? null : h('h3', null, `Members \u2014 ${holders.length}`),
         sel.everyone ? null : h('div', { class: 'role-members' },
           ...holders.map((id) => { const u = getUser(id); return h('span', { class: 'chip active' }, avatarEl(u, 20), displayName(u), locked ? null : h('button', { class: 'chip-x', 'aria-label': `Remove ${displayName(u)} from role`, onclick: () => run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { roleIds: ((s.memberRoles || {})[id] || []).filter((x) => x !== sel.id) })) }, icon('close'))); }),
-          locked ? null : addSel),
+          locked ? null : mayGiveRole(s, sel) ? addSel : h('span', { class: 'field-hint' }, 'It has permissions you don\u2019t have, so you can\u2019t give it (you can take it away).')),
         locked ? null : h('div', { class: 'role-actions' },
           !sel.everyone ? h('button', { class: 'btn danger-ghost', onclick: async () => { if (await confirmDialog({ title: `Delete ${sel.name}?`, text: 'Everyone loses this role. This can\u2019t be undone.', confirm: 'Delete role', danger: true })) run(() => api('DELETE', `/roles/${sel.id}`), 'Role deleted.'); } }, 'Delete role') : h('span'),
           h('button', { class: 'btn primary', onclick: () => run(() => api('PATCH', `/roles/${sel.id}`, d), 'Role saved.') }, 'Save changes')));
@@ -4374,7 +5404,7 @@ function openServerSettings(server, startTab = 'overview') {
   }
 
   function members(s) {
-    const q = h('input', { class: 'input search-input', placeholder: 'Search members' });
+    const q = h('input', { class: 'input search-input', placeholder: 'Search members', 'aria-label': 'Search members' });
     const listEl = h('div', { class: 'stack tight' });
     const drawList = () => {
       clear(listEl);
@@ -4463,14 +5493,40 @@ function openServerSettings(server, startTab = 'overview') {
     } catch (e) { clear(host).append(h('p', { class: 'form-error' }, e.message)); }
   }
 
+  // Invite links that still work, newest first, with who made them; a leaked or old one can be revoked here.
+  async function invites(s) {
+    add(body, h('h3', null, 'Invites'));
+    const host = h('div', { class: 'stack tight' }, h('span', { class: 'spinner' }));
+    add(body, host);
+    try {
+      const list = await api('GET', `/servers/${s.id}/invites`);
+      clear(host);
+      if (!list.length) add(host, h('p', { class: 'muted-p' }, 'No invite links are active.'));
+      list.forEach((i) => add(host, h('div', { class: 'ss-row' }, avatarEl(getUser(i.creatorId), 30),
+        h('span', { class: 'ss-row-name' }, h('span', { class: 'mono' }, i.code),
+          h('span', null, [`by ${displayName(getUser(i.creatorId))}`, `${i.uses}${i.maxUses ? ` of ${i.maxUses}` : ''} use${i.uses === 1 && !i.maxUses ? '' : 's'}`,
+            i.expiresAt ? `expires ${fmtStamp(i.expiresAt)}` : 'never expires'].join(' \u00b7 '))),
+        h('button', { class: 'btn ghost sm danger-text', onclick: () => api('DELETE', `/invites/${encodeURIComponent(i.code)}`).then(() => { toast('Invite revoked.'); draw(); }).catch((e) => toast(e.message, 'error')) }, 'Revoke'))));
+    } catch (e) { clear(host).append(h('p', { class: 'form-error' }, e.message)); }
+  }
+
   function danger(s) {
-    const transfer = h('select', { class: 'input' }, h('option', { value: '' }, 'Choose a member'),
+    const transfer = h('select', { class: 'input', 'aria-label': 'New owner' }, h('option', { value: '' }, 'Choose a member'),
       s.memberIds.filter((id) => id !== S.me.id).map((id) => h('option', { value: id }, `${displayName(getUser(id))} (${getUser(id).username})`)));
     add(body, h('h3', null, 'Danger zone'),
       h('div', { class: 'danger-zone' }, h('strong', null, 'Transfer ownership'), h('p', { class: 'muted-p' }, 'You\u2019ll keep your roles but lose owner powers.'),
         h('div', { class: 'row gap' }, transfer, h('button', { class: 'btn ghost', onclick: async () => {
           if (!transfer.value) return;
-          if (await confirmDialog({ title: 'Transfer ownership?', text: 'You will lose owner controls for this server.', confirm: 'Transfer', danger: true })) run(() => api('POST', `/servers/${s.id}/transfer`, { userId: transfer.value }), 'Ownership transferred.');
+          // Needs your password (and a two-factor code when it's on): it can't be undone.
+          try {
+            // Start waiting for the live update only as the request goes out (typing the password can take longer
+            // than the wait lasts, and then the tabs would redraw from the old data, still showing owner controls).
+            let wait = null;
+            const done = await confirmedCall(app, (x) => { wait = nextServerUpdate(s.id); return api('POST', `/servers/${s.id}/transfer`, { userId: transfer.value, ...x }); },
+              { title: 'Transfer ownership?', text: `You will lose owner controls for ${s.name}. Enter your password to confirm.`, button: 'Transfer' });
+            if (!done) return;
+            await wait; toast('Ownership transferred.'); draw();
+          } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
         } }, 'Transfer'))),
       h('div', { class: 'danger-zone' }, h('strong', null, 'Delete server'), h('p', { class: 'muted-p' }, 'Deletes every channel, message and file. This can\u2019t be undone.'),
         h('div', null, h('button', { class: 'btn danger', onclick: async () => { if (await deleteServer(s)) mdl.close(); } }, 'Delete server'))));
@@ -4480,9 +5536,13 @@ function openServerSettings(server, startTab = 'overview') {
   draw();
 }
 
+// Needs your password (and a two-factor code when it's on), like other changes that can't be undone.
 async function deleteServer(server) {
-  if (!(await confirmDialog({ title: `Delete ${server.name}?`, text: 'This deletes every channel and message in it. This cannot be undone.', confirm: 'Delete server', danger: true }))) return false;
-  try { await api('DELETE', `/servers/${server.id}`); return true; } catch (e) { toast(e.message, 'error'); return false; }
+  try {
+    const done = await confirmedCall(app, (x) => api('DELETE', `/servers/${server.id}`, x).then(() => true),
+      { title: `Delete ${server.name}?`, text: 'This deletes every channel and message in it. This cannot be undone. Enter your password to confirm.', button: 'Delete server' });
+    return !!done;
+  } catch (e) { if (!e.cancelled) toast(e.message, 'error'); return false; }
 }
 function categoryField(server, value) {
   const cats = orderedCategories(server);
@@ -4523,14 +5583,16 @@ function openCreateCategory(server) {
     } }],
   });
 }
-function openEditChannel(c, startTab = 'overview') {
+// overrides: what was just saved, when the live update with it may not have arrived yet.
+function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   const server = serverOfChannel(c.id) || S.servers.find((s) => s.id === c.serverId);
   if (!server) return;
-  let tab = can(server, PERMS.MANAGE_CHANNELS) ? startTab : 'perms';
   const fresh = () => (serverOfChannel(c.id) || server).channels.find((x) => x.id === c.id) || c;
   const ch0 = fresh();
+  const mayEdit = canEditChannel(server, ch0); const mayPerms = canEditChannelPerms(server, ch0);
+  let tab = mayEdit ? startTab : 'perms';
   // Overrides being edited: [{ type, id, allow, deny }]; @everyone always listed first.
-  let ovs = (ch0.overrides || []).map((o) => ({ ...o }));
+  let ovs = (overrides || ch0.overrides || []).map((o) => ({ ...o }));
   if (!ovs.some((o) => o.type === 'role' && o.id === server.id)) ovs.unshift({ type: 'role', id: server.id, allow: 0, deny: 0 });
   let selKey = `role:${server.id}`;
   const name = h('input', { class: 'input', maxlength: '48', value: ch0.name });
@@ -4542,8 +5604,8 @@ function openEditChannel(c, startTab = 'overview') {
   const tabs = h('div', { class: 'seg' });
   const body = h('div', { class: 'stack' });
   const scoped = PERM_GROUPS.flatMap(([, l]) => l).filter(([k]) => (c.type === 'voice'
-    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MANAGE_CHANNELS', 'MANAGE_ROLES', 'CREATE_INVITE']
-    : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES', 'CREATE_INVITE']).includes(k));
+    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MANAGE_CHANNELS', 'MANAGE_ROLES']
+    : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES']).includes(k));
   const label = (o) => {
     if (o.type === 'member') return displayName(getUser(o.id));
     const r = (server.roleDefs || []).find((x) => x.id === o.id);
@@ -4551,7 +5613,7 @@ function openEditChannel(c, startTab = 'overview') {
   };
   const draw = () => {
     clear(tabs);
-    [['overview', 'Overview'], ['perms', 'Permissions']].filter(([k]) => k === 'perms' ? can(server, PERMS.MANAGE_ROLES) : can(server, PERMS.MANAGE_CHANNELS))
+    [['overview', 'Overview'], ['perms', 'Permissions']].filter(([k]) => (k === 'perms' ? mayPerms : mayEdit))
       .forEach(([k, l]) => tabs.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
     clear(body);
     if (tab === 'overview') {
@@ -4577,8 +5639,10 @@ function openEditChannel(c, startTab = 'overview') {
             h('span', { class: 'role-name' }, label(o))),
           o.type === 'role' && o.id === server.id ? null : ibtn('close', 'Remove override', () => { ovs = ovs.filter((x) => x !== o); selKey = `role:${server.id}`; draw(); }, { cls: 'sm' }))), addSel),
         h('div', { class: 'ov-perms' }, h('div', { class: 'perm-group-label' }, label(sel)),
-          ...scoped.map(([k, l, hint]) => {
+          ...scoped.map(([k, l, hint0]) => {
             const bit = PERMS[k]; const st = state(sel, bit);
+            // Pings are checked by each reader's app against the server-wide permission (see mayMentionRole).
+            const hint = k === 'MENTION_EVERYONE' ? 'Needs the permission server-wide too: allowing it only here doesn\u2019t make pings work. Denying it here hides the suggestions.' : hint0;
             return h('div', { class: 'ov-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, l), hint ? h('span', { class: 'field-hint' }, hint) : null),
               h('div', { class: 'tri', role: 'radiogroup', 'aria-label': l },
                 h('button', { class: `tri-btn deny${st === 'deny' ? ' on' : ''}`, 'aria-label': 'Deny', 'data-tip': 'Deny', onclick: () => setState(sel, bit, 'deny') }, icon('close')),
@@ -4590,11 +5654,12 @@ function openEditChannel(c, startTab = 'overview') {
     title: `${c.type === 'voice' ? '\uD83D\uDD0A' : '#'} ${ch0.name} \u2014 settings`, size: 'lg', className: 'channel-settings',
     body: h('div', { class: 'stack' }, tabs, body),
     actions: [
-      can(server, PERMS.MANAGE_CHANNELS) ? { label: 'Delete channel', kind: 'danger-ghost', action: () => deleteChannel(c) } : null,
+      mayEdit ? { label: 'Delete channel', kind: 'danger-ghost', action: () => deleteChannel(c) } : null,
       { label: 'Cancel' },
       { label: 'Save', kind: 'primary', action: async () => {
-        if (can(server, PERMS.MANAGE_CHANNELS)) await api('PATCH', `/channels/${c.id}`, { name: name.value, topic: topic.value, category: cat.input.value.trim(), slowmode: +slow.value });
-        if (can(server, PERMS.MANAGE_ROLES)) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
+        // Each part only when it's yours to change here, so one refusal doesn't stop the other from saving.
+        if (mayEdit) await api('PATCH', `/channels/${c.id}`, { name: name.value, topic: topic.value, category: cat.input.value.trim(), slowmode: +slow.value });
+        if (mayPerms) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
         toast('Channel saved.');
       } },
     ].filter(Boolean),
@@ -4722,7 +5787,7 @@ function showAppUpdate(version) {
   const bar = h('div', { class: 'update-bar app-update', role: 'status' }, icon('download'),
     h('span', null, `The ${S.config.name || 'Hearth'} app ${version ? `${version} ` : ''}is ready to install.`),
     h('button', { class: 'btn primary sm', onclick: async () => { if (voice && voice.channelId && !(await confirmDialog({ title: 'Restart now?', text: 'Restarting leaves your call. It takes a few seconds.', confirm: 'Restart' }))) return; installUpdate(); } }, 'Restart now'),
-    ibtn('close', 'Later (it installs when you quit)', () => bar.remove(), { cls: 'sm' }));
+    ibtn('close', 'Later (restart from Settings \u2192 Apps & devices when you\u2019re ready)', () => bar.remove(), { cls: 'sm' }));
   document.body.append(bar);
 }
 function setupServiceWorker() {
@@ -4913,8 +5978,14 @@ function tileEl(room, t, big) {
       ibtn('maximize', 'Fullscreen', () => (document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen().catch(() => {})), { cls: 'sm' })));
   }
   const ps = !t.me && t.kind !== 'screen' && voice && voice.channelId === room ? voice.peerState(t.u.id) : null;
-  if (ps === 'connecting') el.append(h('div', { class: 'cs-conn' }, h('span', { class: 'spinner' }), 'Connecting\u2026'));
-  if (ps === 'failed') el.append(h('div', { class: 'cs-conn bad', 'data-tip': 'Their network or yours blocks direct calls. The server admin can fix this by setting up the call relay (scripts/setup-turn.sh).' }, icon('shield'), 'Can\u2019t connect'));
+  // Their app lost the server (the server keeps their place for a few seconds): say so rather than "connected".
+  if (t.kind !== 'screen' && t.st.reconnecting && ps !== 'failed') el.append(h('div', { class: 'cs-conn warn' }, h('span', { class: 'spinner' }), 'Reconnecting\u2026'));
+  else if (ps === 'connecting') el.append(h('div', { class: 'cs-conn' }, h('span', { class: 'spinner' }), 'Connecting\u2026'));
+  else if (ps === 'reconnecting') el.append(h('div', { class: 'cs-conn warn' }, h('span', { class: 'spinner' }), 'Reconnecting\u2026'));
+  if (ps === 'failed') {
+    el.append(h('div', { class: 'cs-conn bad', 'data-tip': 'Their network or yours blocks direct calls. The server admin can fix this by setting up the call relay (scripts/setup-turn.sh).' }, icon('shield'), 'Can\u2019t connect',
+      h('button', { class: 'link-btn', onclick: () => { voice.retryPeer(t.u.id).catch(() => {}); renderCallStages(); } }, 'Retry')));
+  }
   el.append(h('div', { class: 'cs-name' }, t.kind === 'screen' ? icon('monitor', 'ic') : null, h('span', null, name),
     t.kind !== 'screen' && t.st.deafened ? icon('headphonesOff', 'ic flag') : t.kind !== 'screen' && t.st.muted ? icon('micOff', 'ic flag') : null));
   if (!t.me && t.kind !== 'screen' && voice && voice.channelId === room) {
@@ -4956,8 +6027,16 @@ function fillStage(el) {
   let spot = stageSpotlight.get(room);
   if (!tiles.some((t) => t.key === spot)) spot = (tiles.find((t) => t.kind === 'screen') || {}).key || null;
   const people = (S.voice[room] || []).length;
-  const head = h('div', { class: 'cs-head' }, h('span', { class: 'cs-live' }, people ? `${people} in call` : 'Call'),
-    el.classList.contains('compact') ? ibtn(el.classList.contains('tall') ? 'chevron' : 'maximize', el.classList.contains('tall') ? 'Smaller' : 'Bigger', () => { el.classList.toggle('tall'); fillStage(el); }, { cls: 'sm' }) : null);
+  const mine = voice && voice.channelId === room;
+  // In the call: its real state (never "connected" while the media isn't). Otherwise just who's there.
+  const st = mine ? voice.status() : null;
+  const live = st && st.state !== 'connected' ? `${st.label}${people ? ` \u00b7 ${people} in call` : ''}` : people ? `${people} in call` : 'Call';
+  const head = h('div', { class: 'cs-head' }, h('span', { class: `cs-live${st ? ` st-${st.tone}` : ''}`, role: mine ? 'status' : null, 'data-tip': st ? st.detail : null, dataset: { callState: st ? st.state : '' } }, live),
+    h('span', { class: 'cs-head-tools' },
+      mine ? ibtn('info', 'Call diagnostics', () => openCallDiagnostics(diagCtx()), { cls: 'sm' }) : null,
+      el.classList.contains('compact') ? ibtn(el.classList.contains('tall') ? 'chevron' : 'maximize', el.classList.contains('tall') ? 'Smaller' : 'Bigger', () => { el.classList.toggle('tall'); fillStage(el); }, { cls: 'sm' }) : null));
+  // Connections the server never listed in this call: someone may be listening in without showing up.
+  const hidden = mine ? voice.unlistedPeers().filter((p) => p.neverListed) : [];
   const body = spot
     ? h('div', { class: 'cs-spot' }, tileEl(room, tiles.find((t) => t.key === spot), true), h('div', { class: 'cs-strip' }, tiles.filter((t) => t.key !== spot).map((t) => tileEl(room, t, false))))
     : h('div', { class: `cs-grid n${Math.min(tiles.length, 9)}` }, tiles.map((t) => tileEl(room, t, false)));
@@ -4970,7 +6049,8 @@ function fillStage(el) {
   } else if (host) { host.remove(); host = null; }
   syncWatchDock();
   [...el.children].forEach((c) => { if (c !== host) c.remove(); });
-  const rest = [tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)];
+  const warn = hidden.length ? h('p', { class: 'cs-hidden-peers', role: 'alert' }, `Warning: you\u2019re connected to ${hidden.map((p) => displayName(getUser(p.userId))).join(', ')}, who the server doesn\u2019t list in this call. Leave the call if you didn\u2019t expect them.`) : null;
+  const rest = [warn, tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)].filter(Boolean);
   if (host) { if (!host.parentNode) el.append(host); el.insertBefore(head, host); el.append(...rest); el.classList.add('watching'); }
   else { el.append(head, ...rest); el.classList.remove('watching'); }
 }
@@ -5142,6 +6222,8 @@ function watchChips(text) {
   }, icon('play'), `Watch together${links.length > 1 ? ` · ${watchKind(link) || 'video'}` : ''}`)));
 }
 function renderCallStages() { $$('.call-stage').forEach(fillStage); }
+// What the diagnostics panel needs: names, and the relays' region names (never their addresses).
+const diagCtx = () => ({ voice, name: (id) => displayName(getUser(id)), relays: (S.iceServers || []).filter((e) => e.region).map((e) => ({ urls: e.urls, region: e.region })), region: () => (voice && voice.channelId ? regionName(callRegion(voice.channelId)) : '') });
 
 async function joinRoom(room, { video = false } = {}) {
   try {
@@ -5203,7 +6285,8 @@ async function acceptRing(room, video = false) {
   await joinRoom(room, { video });
 }
 
-// Desktop app: "Choose what to share" picker for screen sharing (Electron has none built in).
+// Older desktop apps: "Choose what to share" picker for screen sharing (Electron has none built in). Current
+// ones show their own picker window instead and don't offer onPickScreen, so the page never sees your windows.
 if (window.hearthDesktop && window.hearthDesktop.onPickScreen) {
   window.hearthDesktop.onPickScreen((sources) => {
     let answered = false;

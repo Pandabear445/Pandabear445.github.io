@@ -1,9 +1,10 @@
 # Quick start:   docker compose up -d            -> https://<this-machine>:3000 (self-signed)
 # With a domain: edit deploy/Caddyfile, and in .env set
 #                  HTTPS=false
-#                  TRUST_PROXY=1
 #                  HEARTH_BIND=127.0.0.1     <- port 3000 then only answers on this machine itself
 #                then: docker compose --profile domain up -d
+#                (Visitors' real addresses reach Hearth through Caddy: see TRUST_PROXY below. Nothing to set,
+#                unless your proxy isn't this file's Caddy: then set TRUST_PROXY in .env to its address or subnet.)
 #
 # How it's locked down:
 #  - Hearth runs as uid 1000 (not root), on a read-only filesystem: it can only write ./data and a small /tmp.
@@ -12,6 +13,10 @@
 #  - Port 3000: Docker publishes ports straight past the server's firewall (ufw can't block them), so with a
 #    domain set HEARTH_BIND=127.0.0.1. Caddy reaches Hearth over a private network ("proxy") that has no
 #    route to the internet; only Caddy's ports 80/443 face the internet.
+#  - Visitors' addresses (IP bans, per-network limits, the audit log): Hearth only believes the X-Forwarded-For
+#    header when it comes from the private "proxy" network, where only Caddy and Hearth live. Someone reaching
+#    port 3000 directly (LAN, Docker's port forwarding) can't claim to be someone else. Never set TRUST_PROXY to
+#    a number or to Docker's gateway (x.x.x.1) while port 3000 is reachable from other machines.
 #  - hearth-perms runs once at start-up: older images wrote ./data as root, so it hands the folder to uid 1000
 #    (only what isn't already) and exits. It can change file owners and nothing else.
 #  - Logs are rotated (3 x 10 MB per container), so a flood of requests can't fill the disk.
@@ -52,7 +57,10 @@ services:
     environment:
       DATA_DIR: /data
       # HTTPS: "false"
-      # TRUST_PROXY: "1"
+      # Who may tell Hearth a visitor's address: by default only Caddy, on the "proxy" network below (keep the
+      # default equal to that network's subnet). A proxy of your own instead (nginx on this machine, Traefik, a
+      # tunnel): put TRUST_PROXY=<its address or subnet> in .env, which replaces this default.
+      TRUST_PROXY: "${TRUST_PROXY:-10.231.47.0/28}"
     ports:
       # Quick start: reachable on every interface (LAN, or the internet if you forward the port).
       # Behind Caddy: put HEARTH_BIND=127.0.0.1 in .env so only this machine can reach it directly.
@@ -105,8 +113,13 @@ networks:
   # Caddy's own network: getting certificates and the published ports 80/443.
   edge: {}
   # Private link between Caddy and Hearth. internal = no route in or out of the server.
+  # A fixed, unusual subnet, so TRUST_PROXY above can name it. If Docker says it overlaps another network,
+  # pick another private /28 (10.x, 172.16-31.x or 192.168.x) and change it in both places.
   proxy:
     internal: true
+    ipam:
+      config:
+        - subnet: 10.231.47.0/28
 
 volumes:
   caddy_data:

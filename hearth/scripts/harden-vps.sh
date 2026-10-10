@@ -295,19 +295,19 @@ PermitEmptyPasswords no
 PermitRootLogin $root_val
 CONF
     then
+      # sshd's complaint is kept in a variable, not in a fixed file in /tmp that another account could plant.
       if [ "$DRY" = 1 ]; then run sshd -t; run systemctl reload ssh
-      elif sshd -t 2>/tmp/hearth-sshd-check.txt; then
+      elif sshd_check="$(sshd -t 2>&1)"; then
         if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then ok "SSH reloaded."
         else say "(SSH will use the new settings for the next login.)"; fi
         CHANGED+=("SSH: password and keyboard-interactive logins off, PermitRootLogin $root_val ($SSH_DROPIN)")
         loud "Keep this window open and check that you can still log in from a NEW terminal window (ssh ${ME}@<this server>). If not, in this window run: sudo rm $SSH_DROPIN && sudo systemctl reload ssh"
       else
-        cat /tmp/hearth-sshd-check.txt >&2 || true
+        printf '%s\n' "$sshd_check" >&2
         if [ -n "$prev" ]; then printf '%s\n' "$prev" > "$SSH_DROPIN"; else rm -f "$SSH_DROPIN"; fi
         loud "SSH didn't accept the new settings, so they were removed again and nothing changed."
         SKIPPED+=("SSH hardening (sshd -t failed; rolled back)")
       fi
-      rm -f /tmp/hearth-sshd-check.txt
     else ok "SSH was already set up this way."; fi
     # Another file may still win (for SSH, the first value found counts). Check what's actually in effect.
     if [ "$DRY" = 0 ] && has sshd; then

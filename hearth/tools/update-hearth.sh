@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hearth updater for Mac/Linux:  ./update-hearth.sh [update.zip]  |  --rollback  |  --status  |  --logs  |  --setup
 # Uploads the update to your server and runs the safe updater there (backups + automatic rollback).
+# With no zip given it offers the newest Hearth zip in Downloads, and only installs it once you say yes.
 set -euo pipefail
 CFG="$HOME/.hearth-update"
 if [ ! -f "$CFG" ] || [ "${1:-}" = "--setup" ]; then
@@ -31,13 +32,47 @@ case "${1:-}" in
   --status) exec ssh "${OPTS[@]}" -t -p "$PORT" "$T" "${SUDO}hearth-update --status" ;;
   --logs) exec ssh "${OPTS[@]}" -t -p "$PORT" "$T" "${SUDO}hearth-update --logs" ;;
 esac
-ZIP="${1:-$(ls -t "$HOME"/Downloads/*hearth*.zip "$HOME"/Downloads/*update*.zip 2>/dev/null | head -1 || true)}"
-[ -n "$ZIP" ] && [ -f "$ZIP" ] || { echo "Usage: $0 path/to/update.zip"; exit 1; }
+ZIP="${1:-}"
+if [ -z "$ZIP" ]; then
+  # No file given: offer the newest Hearth zip in Downloads, but only once you've said yes to that exact file.
+  # (Any download named like an update would otherwise be installed on the server as root.)
+  ZIP="$(ls -t "$HOME"/Downloads/*hearth*.zip "$HOME"/Downloads/*update*.zip 2>/dev/null | head -1 || true)"
+  [ -n "$ZIP" ] || { echo "Usage: $0 path/to/update.zip"; exit 1; }
+  [ -t 0 ] || { echo "Found $ZIP, but won't install a file nobody picked. Run: $0 path/to/update.zip"; exit 1; }
+  read -rp "Install $(basename "$ZIP") from $(dirname "$ZIP")? [Y/n] " a
+  [[ ! "$a" =~ ^[Nn] ]] || { echo "Cancelled. Run: $0 path/to/update.zip"; exit 1; }
+fi
+[ -f "$ZIP" ] || { echo "Usage: $0 path/to/update.zip"; exit 1; }
 unzip -Z1 "$ZIP" hearth/server/index.js >/dev/null 2>&1 || { echo "$ZIP doesn't look like a Hearth update."; exit 1; }
+# Its SHA-256: compared with update.zip.sha256 when that file is next to it (published with each release), and
+# handed to the server, which checks the upload against it before unpacking or running anything from it.
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{ print tolower($1) }'; }
+SUM="$(sha256 "$ZIP")"
+if [ -f "$ZIP.sha256" ]; then
+  WANT="$(tr -d '\r' < "$ZIP.sha256" | awk 'NR == 1 { print tolower($1) }')"
+  [ "$WANT" = "$SUM" ] || { echo "$ZIP doesn't match $(basename "$ZIP").sha256: it's damaged or not the published update. Nothing was uploaded."; exit 1; }
+  echo "Checksum matches ($SUM)."
+else
+  echo "SHA-256 of this update: $SUM (no $(basename "$ZIP").sha256 next to it to compare with)."
+fi
+# Upload under a random name into the server account's home folder (no other account can write there), never a
+# fixed /tmp name that another account could create first and swap before it runs as root. The install login
+# then moves it into a private mktemp folder and checks it against the SHA-256 above before anything is unpacked
+# or run. Two logins in all (with a password, you type it twice).
+UP=".hearth-upload-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').zip"
+[[ "$UP" =~ ^\.hearth-upload-[0-9a-f]{16}\.zip$ ]] || { echo "Couldn't pick a name for the upload."; exit 1; }
 echo "Uploading $(basename "$ZIP")…"
-scp "${OPTS[@]}" -P "$PORT" "$ZIP" "$T:/tmp/hearth-update.zip"
+scp "${OPTS[@]}" -P "$PORT" "$ZIP" "$T:$UP" || { echo "The upload failed. Check the server address and your connection."; exit 1; }
 code=0
-ssh "${OPTS[@]}" -t -p "$PORT" "$T" "command -v unzip >/dev/null 2>&1 || { ${SUDO}apt-get update -qq && ${SUDO}apt-get install -y -qq unzip; } >/dev/null 2>&1; unzip -p /tmp/hearth-update.zip hearth/scripts/hearth-update.sh > /tmp/hearth-update.sh && ${SUDO}bash /tmp/hearth-update.sh /tmp/hearth-update.zip" || code=$?
+# On the server. 90-92 mean the updater never started: 90 = the upload isn't the file checked above, 91 = no
+# updater in the zip, 92 = no private folder. The updater's own exit codes in that range are passed on as 1.
+ssh "${OPTS[@]}" -t -p "$PORT" "$T" "D=\$(mktemp -d) || exit 92; trap 'rm -rf \$D' EXIT; mv ~/$UP \$D/update.zip || exit 92; cd \$D || exit 92; command -v unzip >/dev/null 2>&1 || { ${SUDO}apt-get update -qq && ${SUDO}apt-get install -y -qq unzip; } >/dev/null 2>&1; echo '$SUM  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 90; unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 91; ${SUDO}bash hearth-update.sh \$D/update.zip; c=\$?; case \$c in 9[0-2]) c=1 ;; esac; exit \$c" || code=$?
+case "$code" in
+  90) echo "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again."; exit 90 ;;
+  91) echo "$(basename "$ZIP") doesn't contain the updater (hearth/scripts/hearth-update.sh). Nothing was installed; use the newest Hearth update."; exit 91 ;;
+  92) echo "Couldn't set the upload aside in a private folder on the server (is its disk full?). Nothing was installed."; exit 92 ;;
+esac
+# Anything else came from the updater (or the connection): its log says what happened.
 if [ "$code" -ne 0 ]; then
   LOGF="$(dirname "$0")/last-update-log.txt"
   ssh "${OPTS[@]}" -p "$PORT" "$T" "${SUDO}cat /root/hearth-backups/last-update.log 2>/dev/null || echo '(no log on the server - the updater never started)'" > "$LOGF" || true

@@ -24,3 +24,12 @@ data-backup*/
 *.sqlite3
 *.hbk
 *.bak
+
+# Server update zips made by scripts/make-update-zip.sh (published with releases, never committed).
+/dist/
+hearth-update-*.zip
+hearth-update-*.zip.sha256
+
+# Visual regression screenshots: made on the machine that checks them (see docs/ACCESSIBILITY.md).
+/test/visual/baseline/
+/test/visual/output/

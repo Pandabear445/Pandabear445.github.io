@@ -67,44 +67,145 @@ class Sealer {
 }
 
 // Archive entries inside the encrypted stream: [1][u16 name length][name][u64 size][bytes] … [0].
-async function addEntry(sealer, name, file) {
-  const st = await fs.promises.stat(file);
-  const nameBuf = Buffer.from(name);
-  const head = Buffer.alloc(1 + 2 + nameBuf.length + 8);
-  head[0] = 1; head.writeUInt16BE(nameBuf.length, 1); nameBuf.copy(head, 3); head.writeBigUInt64BE(BigInt(st.size), 3 + nameBuf.length);
-  await sealer.write(head);
-  let sent = 0;
-  for await (const part of fs.createReadStream(file, { highWaterMark: CHUNK })) {
-    const p = part.subarray(0, Math.max(0, st.size - sent)); // a file that grew while reading is cut at its old size
-    sent += p.length; if (p.length) await sealer.write(p);
-  }
-  if (sent < st.size) await sealer.write(Buffer.alloc(st.size - sent)); // shrank while reading: keep the format consistent
+// The file is opened first and read through that handle, so it can be deleted meanwhile (the app keeps running:
+// a message with an attachment can be deleted while a backup streams). With `optional`, a file that's already
+// gone is simply left out (returns false) instead of failing the whole backup.
+async function addEntry(sealer, name, file, { optional = false } = {}) {
+  let fh;
+  try { fh = await fs.promises.open(file, 'r'); } catch (e) { if (optional && e.code === 'ENOENT') return false; throw e; }
+  try {
+    const st = await fh.stat();
+    const nameBuf = Buffer.from(name);
+    const head = Buffer.alloc(1 + 2 + nameBuf.length + 8);
+    head[0] = 1; head.writeUInt16BE(nameBuf.length, 1); nameBuf.copy(head, 3); head.writeBigUInt64BE(BigInt(st.size), 3 + nameBuf.length);
+    await sealer.write(head);
+    let sent = 0;
+    for await (const part of fh.createReadStream({ highWaterMark: CHUNK, autoClose: false })) {
+      const p = part.subarray(0, Math.max(0, st.size - sent)); // a file that grew while reading is cut at its old size
+      sent += p.length; if (p.length) await sealer.write(p);
+    }
+    if (sent < st.size) await sealer.write(Buffer.alloc(st.size - sent)); // shrank while reading: keep the format consistent
+  } finally { await fh.close(); }
+  return true;
 }
 
-async function createBackup({ db, dataDir, uploadDir, outDir }) {
+// Files a backup (or restore test) in progress is writing: a plaintext database snapshot, a half-written .part,
+// a decrypted restore test. Removed if the process is stopped mid-way (see removeInFlight), and at startup.
+const inFlight = new Set();
+// The plaintext snapshot never goes near outDir (the folder people copy off-site, e.g. with rclone): it's made in
+// a private folder of its own, data/backups/.tmp by default.
+const defaultTmpDir = (dataDir) => path.join(dataDir, 'backups', '.tmp');
+function privateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch { /* not ours to change */ }
+}
+
+async function createBackup({ db, dataDir, uploadDir, outDir, tmpDir = defaultTmpDir(dataDir) }) {
   fs.mkdirSync(outDir, { recursive: true });
+  privateDir(tmpDir);
   const master = loadKey(dataDir);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const name = `hearth-${stamp}.hbk`;
-  const tmpDb = path.join(outDir, `.snapshot-${stamp}.db`);
+  const tmpDb = path.join(tmpDir, `.snapshot-${stamp}.db`);
   const out = path.join(outDir, name);
   const part = out + '.part';
-  await db.backup(tmpDb);
-  const fh = await fs.promises.open(part, 'w', 0o600);
+  inFlight.add(tmpDb); inFlight.add(part);
+  let fh = null; let ok = false; let skipped = 0; let referenced = new Set(); const added = new Set();
   try {
+    fs.writeFileSync(tmpDb, '', { mode: 0o600 }); // created private, so the copy is never readable by others
+    await db.backup(tmpDb);
+    fs.chmodSync(tmpDb, 0o600);
+    // What the database refers to, read before the folder is listed: a file uploaded meanwhile is then still
+    // found, and one deleted meanwhile is no longer referred to.
+    referenced = referencedFiles(db);
+    fh = await fs.promises.open(part, 'w', 0o600);
     const s = new Sealer(fh, master);
     await s.start();
     await addEntry(s, 'hearth.db', tmpDb);
     for (const f of ['secret.key', 'vapid.json']) if (fs.existsSync(path.join(dataDir, f))) await addEntry(s, f, path.join(dataDir, f));
     for (const f of fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir) : []) {
+      if (!/^[\w.-]+$/.test(f)) continue;
       const full = path.join(uploadDir, f);
-      if (/^[\w.-]+$/.test(f) && fs.statSync(full).isFile()) await addEntry(s, `uploads/${f}`, full);
+      let st;
+      try { st = fs.statSync(full); } catch (e) { if (e.code === 'ENOENT') { skipped++; continue; } throw e; }
+      if (!st.isFile()) continue;
+      if (await addEntry(s, `uploads/${f}`, full, { optional: true })) added.add(f); else skipped++;
     }
     await s.write(Buffer.from([0]));
     await s.end();
-  } finally { await fh.close(); fs.rmSync(tmpDb, { force: true }); }
-  fs.renameSync(part, out);
-  return { name, file: out, size: fs.statSync(out).size };
+    await fh.close(); fh = null;
+    fs.renameSync(part, out);
+    ok = true;
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+    fs.rmSync(tmpDb, { force: true }); fs.rmSync(`${tmpDb}-journal`, { force: true });
+    if (!ok) fs.rmSync(part, { force: true }); // a failed backup leaves nothing behind
+    inFlight.delete(tmpDb); inFlight.delete(part);
+  }
+  // A file the database still refers to but that wasn't on disk (lost or deleted by hand) can't be put back by
+  // refusing to back up everything else, so the backup is kept and the gap is reported (see docs/RECOVERY.md).
+  const missing = [...referenced].filter((f) => !added.has(f)).sort();
+  return { name, file: out, size: fs.statSync(out).size, skipped, missing };
+}
+
+// The upload files a database refers to: encrypted attachments (blobs), everything counted towards someone's
+// storage (user_files: pictures, songs, emoji…) and the GIF library. Tables an older database doesn't have yet
+// are skipped. `source` is a path (opened read-only) or an open database.
+function referencedFiles(source) {
+  const Database = require('better-sqlite3');
+  const d = typeof source === 'string' ? new Database(source, { readonly: true }) : source;
+  try {
+    const out = new Set();
+    const has = (t) => !!d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    // user_files rows of kind 'reserved' hold room for an upload still in progress (server/storage.js); there's no
+    // file for them in uploads/ yet, so they aren't missing files.
+    const hasKind = has('user_files') && d.prepare('PRAGMA table_info(user_files)').all().some((c) => c.name === 'kind');
+    for (const [t, col, where] of [['blobs', 'name', ''], ['user_files', 'name', hasKind ? " WHERE kind IS NOT 'reserved'" : ''], ['gif_library', 'file', '']]) {
+      if (!has(t)) continue;
+      for (const r of d.prepare(`SELECT ${col} AS f FROM ${t}${where}`).iterate()) if (typeof r.f === 'string' && /^[\w.-]+$/.test(r.f)) out.add(r.f);
+    }
+    return out;
+  } finally { if (typeof source === 'string') d.close(); }
+}
+
+// Database against upload folder: files it refers to that aren't there (lost: those attachments can't be opened)
+// and files nobody refers to (harmless leftovers). Names are sorted; lists are capped, counts aren't. dbSource is a
+// path or an open database.
+function uploadReport(dbSource, uploadDir, { cap = 50 } = {}) {
+  const referenced = referencedFiles(dbSource);
+  const present = new Set(fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir).filter((f) => { try { return fs.statSync(path.join(uploadDir, f)).isFile(); } catch { return false; } }) : []);
+  const missing = [...referenced].filter((f) => !present.has(f)).sort();
+  const unreferenced = [...present].filter((f) => !referenced.has(f)).sort();
+  return { referenced: referenced.size, present: present.size, missingCount: missing.length, missing: missing.slice(0, cap), unreferencedCount: unreferenced.length, unreferenced: unreferenced.slice(0, cap) };
+}
+
+// Called when the process is about to stop: a backup cut off now can't finish, so its plaintext snapshot,
+// half-written file or decrypted restore test is removed right away.
+function removeInFlight() {
+  for (const p of inFlight) { try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* best effort */ } }
+  inFlight.clear();
+}
+
+// Leftovers of a backup or restore test that was cut off by a crash or a forced stop: plaintext snapshots
+// (older versions made them inside outDir), decrypted restore tests and half-written .part files. Run at startup
+// and before each new backup, for things untouched for olderThanMs: a backup still running (from the command line,
+// say, while the server restarts) keeps writing to its files, so it's left alone. Returns the names removed.
+function cleanStale({ outDir, tmpDir, scratchDir, olderThanMs = 0 }) {
+  const removed = [];
+  const list = (d) => { try { return d ? fs.readdirSync(d) : []; } catch { return []; } };
+  // The last change to a file, or to anything in a folder (a restore test writes into uploads/ inside it).
+  const touched = (p, depth = 0) => {
+    const st = fs.statSync(p);
+    let t = st.mtimeMs;
+    if (st.isDirectory() && depth < 3) for (const f of fs.readdirSync(p)) { try { t = Math.max(t, touched(path.join(p, f), depth + 1)); } catch { /* gone meanwhile */ } }
+    return t;
+  };
+  const old = (p) => { if (olderThanMs <= 0) return true; try { return Date.now() - touched(p) >= olderThanMs; } catch { return false; } };
+  const rm = (dir, f) => { const p = path.join(dir, f); if (inFlight.has(p) || !old(p)) return; try { fs.rmSync(p, { recursive: true, force: true }); removed.push(f); } catch { /* next time */ } };
+  for (const f of list(outDir)) if (f.startsWith('.snapshot-') || f.endsWith('.hbk.part')) rm(outDir, f);
+  for (const f of list(tmpDir)) rm(tmpDir, f);
+  for (const f of list(scratchDir)) if (f.startsWith('.verify-')) rm(scratchDir, f);
+  return removed;
 }
 
 // Decrypts a backup. onEntry(name, size) returns a writable path (or null to skip); returns the list of entries.
@@ -173,7 +274,8 @@ async function openBackup(file, master, onEntry) {
 
 // The restore test: decrypt into a scratch folder, open the database and check it.
 async function verifyBackup(file, master, scratchDir) {
-  const dir = fs.mkdtempSync(path.join(scratchDir, '.verify-'));
+  const dir = fs.mkdtempSync(path.join(scratchDir, '.verify-')); // private (0700): it holds the decrypted backup
+  inFlight.add(dir);
   try {
     fs.mkdirSync(path.join(dir, 'uploads'));
     const entries = await openBackup(file, master, (name) => path.join(dir, name));
@@ -186,15 +288,69 @@ async function verifyBackup(file, master, scratchDir) {
       const count = (t) => { try { return d.prepare(`SELECT COUNT(*) n FROM ${t}`).get().n; } catch { return 0; } };
       return { ok: true, users: count('users'), messages: count('messages') + count('dm_messages'), files: entries.filter((e) => e.name.startsWith('uploads/')).length, hasSecretKey: entries.some((e) => e.name === 'secret.key'), schema: d.pragma('user_version', { simple: true }) };
     } finally { d.close(); }
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); inFlight.delete(dir); }
 }
 
-// Restores into an empty folder (a new data/ directory).
-async function restoreBackup(file, master, targetDir) {
+// The database version (PRAGMA user_version) of a restored database file: 4 bytes at offset 60 of its header, read
+// straight from the file. Opening it with SQLite instead would leave -wal and -shm files next to it (it's in WAL mode).
+function schemaOf(file) {
+  const head = Buffer.alloc(100);
+  const fd = fs.openSync(file, 'r');
+  try { fs.readSync(fd, head, 0, 100, 0); } finally { fs.closeSync(fd); }
+  if (head.toString('latin1', 0, 16) !== 'SQLite format 3\0') throw new Error(`${file} isn't a SQLite database.`);
+  return head.readInt32BE(60);
+}
+
+// While a restore is unpacking, this file sits in the new data folder. Hearth refuses to start on a folder that
+// has it (see db.js), so a restore that was cut off (killed, disk full, power cut) can never pass for a complete
+// data folder that's quietly missing files. It's removed only once everything is in place and checked.
+const RESTORE_MARKER = 'RESTORE-INCOMPLETE';
+
+// Restores into an empty folder (a new data/ directory). Refuses a database newer than maxSchema (the code that
+// would run on it can't), and checks what it unpacked: the database's integrity, and its files against uploads/.
+// signOutEveryone revokes every session in the restored copy (after a break-in: sessions revoked after the backup
+// was made would otherwise work again).
+async function restoreBackup(file, master, targetDir, { maxSchema = 0, signOutEveryone = false } = {}) {
   fs.mkdirSync(targetDir, { recursive: true });
-  if (fs.readdirSync(targetDir).length) throw new Error(`${targetDir} isn't empty. Restore into a new, empty folder.`);
-  fs.mkdirSync(path.join(targetDir, 'uploads'));
-  return openBackup(file, master, (name) => path.join(targetDir, name));
+  const there = fs.readdirSync(targetDir);
+  if (there.includes(RESTORE_MARKER)) throw new Error(`${targetDir} holds an earlier restore that didn't finish. Delete that folder and restore again into a new, empty one.`);
+  if (there.length) throw new Error(`${targetDir} isn't empty. Restore into a new, empty folder.`);
+  const marker = path.join(targetDir, RESTORE_MARKER);
+  fs.writeFileSync(marker, `A restore of ${path.basename(file)} into this folder started ${new Date().toISOString()} and hasn't finished.\n`
+    + 'Hearth won\'t start here until it has. If the restore was interrupted, delete this folder and restore again.\n', { mode: 0o600 });
+  try {
+    fs.mkdirSync(path.join(targetDir, 'uploads'));
+    const entries = await openBackup(file, master, (name) => path.join(targetDir, name));
+    const dbFile = path.join(targetDir, 'hearth.db');
+    if (!entries.some((e) => e.name === 'hearth.db')) throw new Error('There is no database in this backup.');
+    const schema = schemaOf(dbFile);
+    if (maxSchema && schema > maxSchema) {
+      const err = new Error(`This backup is from a newer version of Hearth (database version ${schema}; this version understands up to ${maxSchema}). Nothing was restored. Install that version (or newer) and restore with its server/cli.js.`);
+      err.code = 'HEARTH_BACKUP_TOO_NEW'; err.schema = schema;
+      throw err;
+    }
+    const Database = require('better-sqlite3');
+    // Opened read-write so closing it tidies up after itself (no -wal or -shm files left next to it).
+    const d = new Database(dbFile);
+    let sessionsRevoked = 0; let files;
+    try {
+      const check = d.pragma('integrity_check', { simple: true });
+      if (check !== 'ok') throw new Error(`The restored database failed its check: ${check}`);
+      const cols = d.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name);
+      if (signOutEveryone && cols.includes('revoked_at')) {
+        sessionsRevoked = d.prepare(`UPDATE sessions SET revoked_at = ?${cols.includes('revoke_reason') ? ", revoke_reason = 'restored'" : ''} WHERE revoked_at IS NULL`).run(Date.now()).changes;
+      }
+      files = uploadReport(d, path.join(targetDir, 'uploads'));
+    } finally { d.close(); }
+    fs.rmSync(marker); // the last step: from here on, this is a complete data folder
+    return { entries, schema, files, sessionsRevoked };
+  } catch (e) {
+    // A damaged or refused backup: take back out everything it wrote (the folder was empty), but keep the marker,
+    // with the reason, so the folder can't be mistaken for a fresh, empty one.
+    for (const f of fs.readdirSync(targetDir)) if (f !== RESTORE_MARKER) fs.rmSync(path.join(targetDir, f), { recursive: true, force: true });
+    fs.appendFileSync(marker, `The restore stopped: ${e.message}\n`);
+    throw e;
+  }
 }
 
 // Copies a backup off-site with rclone, if BACKUP_RCLONE_REMOTE is set.
@@ -208,4 +364,4 @@ function uploadOffsite(file) {
   });
 }
 
-module.exports = { createBackup, openBackup, verifyBackup, restoreBackup, uploadOffsite, loadKey };
+module.exports = { createBackup, openBackup, verifyBackup, restoreBackup, uploadOffsite, loadKey, cleanStale, removeInFlight, defaultTmpDir, schemaOf, referencedFiles, uploadReport, RESTORE_MARKER };

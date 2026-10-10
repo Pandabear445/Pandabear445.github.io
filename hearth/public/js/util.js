@@ -19,6 +19,12 @@ export function h(tag, props, ...kids) {
       else if (k === 'checked') el.checked = !!v;
       else el.setAttribute(k, v === true ? '' : v);
     }
+    // Buttons that open a popup (data-pop-anchor, see ui.js) tell screen readers so; popover() keeps
+    // aria-expanded up to date.
+    if (props['data-pop-anchor'] != null && props['data-pop-anchor'] !== false && tag === 'button') {
+      if (!el.hasAttribute('aria-haspopup')) el.setAttribute('aria-haspopup', 'true');
+      if (!el.hasAttribute('aria-expanded')) el.setAttribute('aria-expanded', 'false');
+    }
   }
   for (const c of kids.flat(Infinity)) {
     if (c == null || c === false) continue;
@@ -76,12 +82,18 @@ export function fmtSize(n) {
 }
 
 // ------------------------------------------------------------ toasts
+// #toasts is a polite live region, so screen readers read each toast once; errors use role=alert so
+// they're read straight away. Pointing at or focusing a toast keeps it up until you move away.
 export function toast(message, kind = 'info') {
   const host = document.getElementById('toasts');
-  const el = h('div', { class: `toast toast-${kind}`, role: 'status' }, message);
+  const el = h('div', { class: `toast toast-${kind}`, role: kind === 'error' ? 'alert' : null }, message);
   host.append(el);
-  setTimeout(() => el.classList.add('out'), 3800);
-  setTimeout(() => el.remove(), 4300);
+  let timers = [];
+  const schedule = (ms) => { timers = [setTimeout(() => el.classList.add('out'), ms), setTimeout(() => el.remove(), ms + 500)]; };
+  const hold = () => { timers.forEach(clearTimeout); el.classList.remove('out'); };
+  el.addEventListener('mouseenter', hold);
+  el.addEventListener('mouseleave', () => schedule(1500));
+  schedule(kind === 'error' ? 6000 : 3800);
 }
 
 // Sounds live in sounds.js (distinct, meaningful sounds with per-sound settings).
@@ -151,6 +163,7 @@ export const icons = {
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>',
   zoomIn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M11 8v6M8 11h6"/></svg>',
   zoomOut: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M8 11h6"/></svg>',
+  bot: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9 17h6M2 13v3M22 13v3"/></svg>',
   megaphone: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg>',
   info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>',
   book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>',

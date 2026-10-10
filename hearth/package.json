@@ -1,13 +1,19 @@
 {
   "name": "hearth",
-  "version": "1.27.1",
+  "version": "1.28.0",
   "description": "Self-hostable chat with voice, end-to-end encrypted DMs and free profile customization",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
+    "bench": "node scripts/bench.js",
     "dev": "node --watch server/index.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
-    "test:security": "node --test --test-concurrency=1 test/*.test.js"
+    "test:security": "node --test --test-concurrency=1 test/*.test.js",
+    "test:e2e": "node test/e2e/run.mjs",
+    "test:voice": "node test/e2e-voice/run.mjs",
+    "test:a11y": "node test/a11y/run.mjs",
+    "test:visual": "node test/visual/run.mjs",
+    "bench:client": "node scripts/bench-client.mjs"
   },
   "license": "MIT",
   "dependencies": {

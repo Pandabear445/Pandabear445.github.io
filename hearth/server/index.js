@@ -1,4 +1,9 @@
 require('dotenv').config({ quiet: true });
+// Logging and safe background jobs come first, so even a failure while opening the database is logged
+// (server/log.js, server/jobs.js). An exception nobody caught is logged, then the process exits for a clean restart.
+const log = require('./log');
+const jobs = require('./jobs');
+log.installProcessHandlers({ beforeExit: () => jobs.saveAll() });
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -9,10 +14,21 @@ const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
-const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash } = require('./db');
+const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION } = require('./db');
+// User ids in the access log are keyed hashes: groupable, but not checkable against a list of ids.
+log.setUserHashKey(atRestKey);
+// Job health is saved (at most once a minute per job, right away when one starts or stops failing) for the
+// admin dashboard after a restart and for `node server/cli.js doctor`.
+jobs.setStore((r) => db.prepare(`INSERT INTO job_health (name, every_ms, last_run, last_ok, last_error, last_error_at, last_error_category, failures, runs, total_failures, duration_ms, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET every_ms = excluded.every_ms, last_run = excluded.last_run, last_ok = excluded.last_ok,
+  last_error = excluded.last_error, last_error_at = excluded.last_error_at, last_error_category = excluded.last_error_category, failures = excluded.failures,
+  runs = excluded.runs, total_failures = excluded.total_failures, duration_ms = excluded.duration_ms, updated_at = excluded.updated_at`)
+  .run(r.name, r.everyMs, r.lastRun, r.lastOk, r.lastError, r.lastErrorAt, r.lastErrorCategory, r.failures, r.runs, r.totalFailures, r.durationMs, Date.now()));
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
+const { stripFile, ImageRejected } = require('./imagemeta');
+const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 const perms = makePerms(db);
 
 // ---------------------------------------------------------------- config
@@ -24,6 +40,7 @@ const REGISTRATION_CODE = process.env.REGISTRATION_CODE || '';
 const REGISTRATION_OPEN = (process.env.REGISTRATION_OPEN || 'true').toLowerCase() !== 'false';
 const GIPHY_API_KEY = process.env.GIPHY_API_KEY || '';
 const INSTANCE_NAME = process.env.INSTANCE_NAME || 'Hearth';
+const VERSION = require('../package.json').version;
 
 const iceServers = [{ urls: (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302').split(',') }];
 if (process.env.TURN_URL) {
@@ -57,12 +74,13 @@ const wrap = (fn) => (req, res, next) => {
 // Small in-memory rate limiter: at most `max` hits per key per window. Sensitive routes check several keys at
 // once (the network it comes from, the account it targets, the session using it, and everyone together), so
 // switching IP addresses doesn't get around the account's limit and one account can't use up another's.
+// `cost` lets a limit count something other than requests (bytes sent, say); a cost of 0 only checks it.
 const buckets = new Map();
-function rateLimit(key, max, windowMs) {
+function rateLimit(key, max, windowMs, cost = 1) {
   const t = now();
   let b = buckets.get(key);
   if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
-  b.count += 1;
+  b.count += cost;
   if (b.count > max) {
     const wait = Math.ceil((b.reset - t) / 1000);
     fail(429, `Too many attempts. Try again in ${wait < 90 ? `${wait} seconds` : `${Math.ceil(wait / 60)} minutes`}.`, 'rate_limited', wait);
@@ -75,6 +93,8 @@ function countHit(key, windowMs) {
   if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
   return ++b.count;
 }
+// How many hits a key has in its current window, without counting one.
+const hitsSoFar = (key) => { const b = buckets.get(key); return b && b.reset >= now() ? b.count : 0; };
 // The "network" an address belongs to for rate limits: the address itself for IPv4, its /64 for IPv6 (a home
 // connection or a VPS usually gets a whole /64, so rotating addresses inside it changes nothing).
 function netOf(ip) {
@@ -93,20 +113,51 @@ function limitMessages(req) {
   if (req.session) rateLimit('msgs:' + req.session.id, 25, 10000);
   limitNet(req, 'msg', 120, 10000);
 }
-setInterval(() => { const t = now(); for (const [k, b] of buckets) if (b.reset < t) buckets.delete(k); }, 60000).unref();
+jobs.every('ratelimit.sweep', 60000, () => { const t = now(); for (const [k, b] of buckets) if (b.reset < t) buckets.delete(k); });
 
 // ---------------------------------------------------------------- presence + voice state
 const onlineSockets = new Map(); // userId -> Set(socketId)
-const voiceChannels = new Map(); // channelId -> Map(userId -> { socketId, muted, deafened })
+const voiceChannels = new Map(); // channelId -> Map(userId -> { socketId, sid, muted, deafened, reconnecting, grace })
+// How long someone whose connection dropped keeps their place in a call (shown as "reconnecting" to the others).
+// Coming back with the same sign-in within it resumes the call where it was; after it, they've left.
+const VOICE_GRACE_MS = Math.max(1000, Math.min(60000, Number(process.env.VOICE_GRACE_MS) || 18000));
 const userVoice = new Map(); // userId -> channelId
 
 const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(userId).size > 0;
 // Games/music people are playing (server/activity.js fills these in once everything it needs exists).
 let ACT = { activityFor: () => null, recentFor: () => undefined };
 let ACCT = null; // server/accounts.js: email, recovery key, two-factor
+let STORE = null; // server/storage.js: resumable uploads, storage reports
+let BOTS = null; // server/bots.js: installed bots, their API and webhooks
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+// Many accounts at once (a big server's member list): one query instead of one per person. id -> row.
+function userRows(ids) {
+  const out = new Map();
+  const list = [...ids];
+  for (let i = 0; i < list.length; i += 5000) {
+    for (const r of db.prepare('SELECT * FROM users WHERE id IN (SELECT value FROM json_each(?))').all(JSON.stringify(list.slice(i, i + 5000)))) out.set(r.id, r);
+  }
+  return out;
+}
+// Public keys people had before a reset without a recovery key (newest first, up to 10 each), added to a
+// { id: user } map. Apps may open old direct messages and old server keys with them, shown as not verified
+// (nothing vouches for them: see public/js/secure.js keysOf). Only GET /users/:id and the start-up users list
+// carry them, in one query, rather than every member list and broadcast.
+function withPastKeys(users) {
+  const ids = Object.keys(users || {});
+  if (!ids.length) return users;
+  const rows = db.prepare(`SELECT user_id, public_key, sign_public_key, retired_at FROM user_key_history
+      WHERE user_id IN (SELECT value FROM json_each(?)) ORDER BY retired_at DESC`).all(JSON.stringify(ids));
+  for (const k of rows) {
+    const u = users[k.user_id];
+    if (!u) continue;
+    u.pastKeys = u.pastKeys || [];
+    if (u.pastKeys.length < 10) u.pastKeys.push({ publicKey: k.public_key, signPublicKey: k.sign_public_key || null, retiredAt: k.retired_at });
+  }
+  return users;
+}
 
 function publicUser(row) {
   if (!row) return null;
@@ -153,82 +204,165 @@ function selfUser(row) {
 // ---------------------------------------------------------------- end-to-end key state for a server
 // What one member needs to know: the current key epoch, their own wrapped keys, and who still
 // needs the current key. The server never sees the keys themselves.
-function keyState(serverId, userId) {
+// The part that's the same for every member (worked out once when it goes to everyone, see emitKeyState).
+function serverKeyInfo(serverId) {
   const s = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(serverId);
   if (!s) return null;
-  const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, e.key_check FROM server_keys k
-      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
-      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId)
-    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check }));
   const missing = s.key_epoch
     ? db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND NOT EXISTS
         (SELECT 1 FROM server_keys k WHERE k.server_id = m.server_id AND k.user_id = m.user_id AND k.epoch = ?)`)
       .all(serverId, s.key_epoch).map((r) => r.user_id)
     : [];
-  return { serverId, keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, keys, missing };
+  // Who made the current key, so members (and moderators) can see who replaced it.
+  const cur = s.key_epoch ? db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, s.key_epoch) : null;
+  return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
 }
+// createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
+const keyOut = (k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at });
+const keyStateFrom = (serverId, info, keys) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt });
+function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
+  if (!info) return null;
+  const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
+      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
+      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId).map(keyOut);
+  return keyStateFrom(serverId, info, keys);
+}
+// Is this person connected right now? Updates for anyone who isn't would go nowhere (they get the current state
+// when their app starts), so a big server's fan-out only does work for the people actually online.
+const connected = (userId) => io.sockets.adapter.rooms.has(`user:${userId}`);
 function emitKeyState(serverId) {
-  db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
-    .forEach((m) => io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id)));
+  const info = serverKeyInfo(serverId);
+  if (!info) return;
+  const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
+  if (!online.length) return;
+  // Everyone's own wrapped keys in one query (the same rows keyState reads one person at a time).
+  const keys = new Map(online.map((u) => [u, []]));
+  for (const k of db.prepare(`SELECT k.user_id, k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
+      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
+      WHERE k.server_id = ? AND k.user_id IN (SELECT value FROM json_each(?)) ORDER BY k.user_id, k.epoch`).iterate(serverId, JSON.stringify(online))) keys.get(k.user_id).push(keyOut(k));
+  for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list));
 }
 
-const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined });
+const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
 const THEME_DEFAULT = { accent: '', banner: '', bannerCrop: null, background: { kind: 'none' }, welcome: '', roleColors: true, iconShape: 'rounded' };
 const themeOf = (s) => { try { return { ...THEME_DEFAULT, ...JSON.parse(s.theme || '{}') }; } catch { return { ...THEME_DEFAULT }; } };
-// What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
 const NEWS_BOT_ID = require('./newsbot').BOT_ID;
-function serializeServer(s, uid) {
-  const myBase = perms.base(s, uid);
-  const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
-  const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id)
-    .map((c) => ({ c, p: perms.channel(s, c, uid) }))
-    .filter(({ p }) => p & PM.VIEW_CHANNEL)
-    .map(({ c, p }) => ({
-      ...serializeChannel(c), perms: p,
-      overrides: manage ? db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?').all(c.id) : undefined,
-    }));
-  const mrows = db.prepare('SELECT user_id FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id);
+// The parts of a server that look the same to every member. Sending an update to everyone reads these once,
+// not once per member (that made a big server's updates cost members × members).
+function serverCommon(s) {
+  const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id);
+  const memberIds = db.prepare('SELECT user_id FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id).map((r) => r.user_id);
   const memberRoles = {};
-  db.prepare('SELECT user_id, role_id FROM member_roles WHERE server_id = ?').all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
+  db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
+    WHERE mr.server_id = ?`).all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
   const roleDefs = db.prepare('SELECT * FROM roles WHERE server_id = ? ORDER BY position DESC').all(s.id)
     .map((r) => ({ id: r.id, name: r.name, color: r.color, icon: r.icon, position: r.position, permissions: r.permissions, hoist: !!r.hoist, mentionable: !!r.mentionable, everyone: r.id === s.id }));
   const emojis = db.prepare('SELECT id, name, url, animated FROM emojis WHERE server_id = ? ORDER BY name').all(s.id).map((e) => ({ ...e, animated: !!e.animated }));
   let categoryOrder = [];
   try { categoryOrder = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
   const out = {
-    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: mrows.map((r) => r.user_id),
-    roleDefs, memberRoles, myPerms: myBase, emojis, theme: themeOf(s), description: s.description || '', categoryOrder,
-    // Bots working for this server (shown in the member list like on Discord): the news bot while it follows something.
-    bots: db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : [],
+    channels, memberIds, memberRoles, roleDefs, emojis, categoryOrder,
+    // Bots working for this server (shown in the member list like on Discord): the news bot while it follows
+    // something, and the bots installed here (server/bots.js).
+    bots: [...(db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : []), ...(BOTS ? BOTS.serverBots(s.id) : [])],
     // This server sells memberships (the app shows "Memberships" in its menu); owners see the tab either way.
     memberships: s.kind !== 'group' && MEMB.offers(s.id),
     membershipsOn: s.kind !== 'group' && MEMB.usable(),
   };
-  if (out.kind === 'group') {
-    const last = db.prepare(`SELECT m.* FROM messages m JOIN channels c ON c.id = m.channel_id
-      WHERE c.server_id = ? AND m.thread_id IS NULL ORDER BY m.id DESC LIMIT 1`).get(s.id);
+  if ((s.kind || 'server') === 'group') {
+    // The newest message, looked up channel by channel (the channel index). Joining on the group's id instead made
+    // SQLite walk every top-level message on the whole instance until it reached one from this group.
+    let last = null;
+    for (const c of channels) {
+      const m = db.prepare('SELECT * FROM messages WHERE channel_id = ? AND thread_id IS NULL ORDER BY id DESC LIMIT 1').get(c.id);
+      if (m && (!last || m.id > last.id)) last = m;
+    }
     out.last = last ? { id: last.id, authorId: last.author_id, channelId: last.channel_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null;
     out.lastMessageAt = last ? last.created_at : s.created_at;
   }
   return out;
 }
-// Everyone gets their own view (private channels and permissions differ per person).
+// What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
+// ev: permissions already worked out for many members at once (perms.forServer), when there is one.
+function serializeServer(s, uid, common = serverCommon(s), ev = null) {
+  const myBase = ev ? ev.base(uid) : perms.base(s, uid);
+  const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
+  const channels = common.channels
+    .map((c) => ({ c, p: ev ? ev.channel(c, uid) : perms.channel(s, c, uid) }))
+    .filter(({ p }) => p & PM.VIEW_CHANNEL)
+    .map(({ c, p }) => ({
+      ...serializeChannel(c), perms: p,
+      overrides: manage ? db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?').all(c.id) : undefined,
+    }));
+  const out = {
+    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: common.memberIds,
+    roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder,
+    bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
+  };
+  if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
+  const to = USE && out.kind !== 'group' ? USE.timeoutOf(s.id, uid) : null;
+  if (to) out.timeout = { until: to.until, reason: to.reason };
+  return out;
+}
+// Everyone gets their own view (private channels and permissions differ per person). Every change to roles,
+// role permissions, channel overrides or ownership ends here, so this is also where people already in a voice
+// channel are checked again (recheckVoice).
 const emitServer = (serverId) => {
   const row = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
   if (!row) return;
-  db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
-    .forEach((m) => io.to(`user:${m.user_id}`).emit('server:update', serializeServer(row, m.user_id)));
+  recheckVoice(row);
+  const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
+  if (!online.length) return;
+  const common = serverCommon(row);
+  // What a member sees depends only on their permissions (server-wide and in each channel), so everyone whose
+  // permissions come out the same gets the same update: it's built and encoded once per group, not once per
+  // member (in a big server that was most of the work, for the same few variants over and over).
+  const ev = perms.forServer(row, online);
+  // A timed-out member's update also carries their own timeout (when it ends, why), so each of them is a group of one.
+  const timedOut = new Set(db.prepare('SELECT user_id FROM member_timeouts WHERE server_id = ? AND until > ?').all(row.id, now()).map((r) => r.user_id));
+  const groups = new Map();
+  for (const uid of online) {
+    const key = [ev.base(uid), ...common.channels.map((c) => ev.channel(c, uid))].join(',') + (timedOut.has(uid) ? `|${uid}` : '');
+    if (!groups.has(key)) groups.set(key, { uid, rooms: [] });
+    groups.get(key).rooms.push(`user:${uid}`);
+  }
+  for (const g of groups.values()) io.to(g.rooms).emit('server:update', serializeServer(row, g.uid, common, ev));
 };
+// Permissions are checked when someone joins a call, and again here after anything that can change them: whoever
+// can no longer see the channel or connect to it (or is no longer a member) leaves the call, and anyone whose
+// permission to talk changed is told, so their app turns the mic off (or allows it again).
+function recheckVoice(srv) {
+  if (!voiceChannels.size) return;
+  for (const c of db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'voice'").all(srv.id)) {
+    const m = voiceChannels.get(c.id);
+    if (!m) continue;
+    for (const [uid, st] of [...m]) {
+      const p = isMember(srv.id, uid) ? perms.channel(srv, c, uid) : 0;
+      if (!(p & PM.CONNECT)) { leaveVoice(uid, true); continue; }
+      const speak = !!(p & PM.SPEAK);
+      if (speak === st.speak) continue;
+      st.speak = speak;
+      if (!speak) st.muted = true;
+      io.to(st.socketId).emit('voice:perms', { channelId: c.id, canSpeak: speak });
+      emitVoiceState(c.id);
+    }
+  }
+}
 
 function reactionsFor(ids) {
   const map = {};
   if (!ids.length) return map;
-  const rows = db.prepare(`SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at`).all(...ids);
-  for (const r of rows) {
-    const list = (map[r.message_id] ||= []);
-    let entry = list.find((e) => e.emoji === r.emoji);
-    if (!entry) { entry = { emoji: r.emoji, userIds: [] }; list.push(entry); }
-    entry.userIds.push(r.user_id);
+  // In slices: SQLite refuses a query with more than 32766 placeholders. All of a message's reactions are in one
+  // slice, so sorting each slice keeps them in the order they were added. Rows are taken one at a time: a page can
+  // have hundreds of thousands, and spreading that many into one call overflows the stack.
+  for (let i = 0; i < ids.length; i += 500) {
+    const part = ids.slice(i, i + 500);
+    for (const r of db.prepare(`SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${part.map(() => '?').join(',')}) ORDER BY created_at`).iterate(...part)) {
+      const list = (map[r.message_id] ||= []);
+      let entry = list.find((e) => e.emoji === r.emoji);
+      if (!entry) { entry = { emoji: r.emoji, userIds: [] }; list.push(entry); }
+      entry.userIds.push(r.user_id);
+    }
   }
   return map;
 }
@@ -237,10 +371,11 @@ function serializeMessage(row, channel, reactions) {
   let reply = null;
   if (row.reply_to) {
     const r = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.reply_to);
-    if (r && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch };
+    // createdAt: apps only check a reply against keys its author had when it was written.
+    if (r && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch, createdAt: r.created_at };
     else if (r) {
       const rd = unseal(r.body);
-      reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0 };
+      reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0, createdAt: r.created_at, ...(rd.bot ? { bot: true } : {}) };
     }
   }
   // End-to-end encrypted message: the server only has ciphertext.
@@ -271,8 +406,8 @@ function threadInfo(row) {
 function serializeDmMessage(row, reactions) {
   let reply = null;
   if (row.reply_to) {
-    const r = db.prepare('SELECT id, author_id, ciphertext FROM dm_messages WHERE id = ?').get(row.reply_to);
-    if (r) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext };
+    const r = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE id = ?').get(row.reply_to);
+    if (r) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, createdAt: r.created_at };
   }
   return {
     id: row.id,
@@ -291,7 +426,7 @@ function serializeDmMessage(row, reactions) {
 function serializeDm(row, userId) {
   const last = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE dm_id = ? ORDER BY id DESC LIMIT 1').get(row.id);
   return {
-    id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at, region: row.rtc_region || null,
+    id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at, region: row.rtc_region || null, regionVersion: row.rtc_region_v || 0,
     last: last ? { id: last.id, authorId: last.author_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null,
   };
 }
@@ -308,7 +443,7 @@ function relationshipFor(row, userId) {
 function voiceStateList(channelId) {
   const m = voiceChannels.get(channelId);
   if (!m) return [];
-  return [...m.entries()].map(([userId, s]) => ({ userId, muted: s.muted, deafened: s.deafened, video: !!s.video, screen: !!s.screen }));
+  return [...m.entries()].map(([userId, s]) => ({ userId, muted: s.muted, deafened: s.deafened, video: !!s.video, screen: !!s.screen, reconnecting: !!s.reconnecting }));
 }
 
 // ---------------------------------------------------------------- access checks
@@ -337,8 +472,9 @@ const serverOf = (c) => db.prepare('SELECT * FROM servers WHERE id = ?').get(c.s
 function toChannel(c, except) {
   const srv = serverOf(c);
   if (!srv || !perms.restricted(srv, c)) return except ? except.to(`server:${c.server_id}`) : io.to(`server:${c.server_id}`);
+  const ev = perms.forServer(srv); // every member's permissions in one go, not three queries per member
   const rooms = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id)
-    .filter((u) => perms.channel(srv, c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
+    .filter((u) => ev.channel(c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
   return rooms.length ? (except ? except.to(rooms) : io.to(rooms)) : { emit() {} };
 }
 const isBlocked = (a, b) => !!db.prepare('SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)').get(a, b, b, a);
@@ -363,25 +499,48 @@ function areFriends(a, b) {
 
 // ---------------------------------------------------------------- app + uploads
 const app = express();
-// Real client IPs: by default we trust X-Forwarded-For only when the request comes from a local/private
-// address (Caddy/nginx on this machine or in Docker). Set TRUST_PROXY to override.
-const TRUSTED_PROXY = process.env.TRUST_PROXY || 'loopback, linklocal, uniquelocal';
-app.set('trust proxy', TRUSTED_PROXY);
+// Real client IPs: X-Forwarded-For only counts when the request comes from a proxy we trust. By default that's
+// this machine only (Caddy/nginx on the same host); docker-compose.yml names its own Caddy. See proxytrust.js.
+const { trustProxySetting, clientIp, ignoredXffHint, netContext } = require('./proxytrust');
+try {
+  app.set('trust proxy', trustProxySetting(process.env.TRUST_PROXY));
+} catch (e) {
+  throw new Error(`TRUST_PROXY=${process.env.TRUST_PROXY} isn't valid (${e.message}). Use your proxy's addresses or subnets, a number of proxies, or false.`);
+}
 app.disable('x-powered-by');
+// Request ids (X-Request-Id, echoed or made up) and the access log: route templates, never full URLs.
+app.use(log.requestLogger());
 const PRIVATE_IP = /^(::1|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|f[cd][0-9a-f]{2}:|fe80:|::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.))/i;
 const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/, '').slice(0, 64);
+// Behind a proxy (HTTPS=false) on another address (an older docker-compose.yml, nginx in its own container)
+// whose header we now ignore: say so in the log, so a site where everyone suddenly shares one address is
+// easy to fix. (Not with HTTPS on: there's no proxy then, and the header can only come from a visitor.) The
+// advice never suggests trusting Docker's gateway on its own, which every visitor to port 3000 can come from.
+// Once per address (a few at most), so a direct visitor arriving first can't hide the line about the real proxy.
+const xffIgnoredNoted = new Set();
+function noteIgnoredXff(remote, xff) {
+  if (USE_HTTPS || !xff || !PRIVATE_IP.test(String(remote || ''))) return;
+  const ip = cleanIp(remote);
+  if (xffIgnoredNoted.has(ip) || xffIgnoredNoted.size >= 5) return;
+  if (app.get('trust proxy fn')(String(remote), 0)) return;
+  xffIgnoredNoted.add(ip);
+  log.warn('http', 'proxy_header_ignored', { msg: ignoredXffHint(ip, netContext()) });
+}
 // Behind a proxy (HTTPS=false), refuse plain-HTTP requests that come straight from the internet, so nobody
 // can bypass the proxy's HTTPS and send login tokens unencrypted. ALLOW_DIRECT_HTTP=true turns this off.
 const directGuard = (remote) => USE_HTTPS || process.env.ALLOW_DIRECT_HTTP === 'true' || PRIVATE_IP.test(String(remote || ''));
 app.use((req, res, next) => {
   if (!directGuard(req.socket.remoteAddress)) return res.status(403).type('text').send('Please use the https:// address of this server.');
+  noteIgnoredXff(req.socket.remoteAddress, req.headers['x-forwarded-for']);
   next();
 });
 // Stripe signs the exact bytes it sends, so keep them for that one route.
 app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
 // Strict browser security policy for the app's own pages:
 //   scripts       only files from this server (+ WebAssembly for password hashing) — no inline or injected code
-//   connections   only back to this server (its API and live connection), so a bug can't send data elsewhere
+//   connections   fetch/XHR/WebSocket only back to this server (its API and live connection). This isn't a complete
+//                 barrier: injected markup could still leak data through https: image/media URLs, the allowed video
+//                 frames or navigation, so it limits what an XSS bug can do rather than making leaks impossible.
 //   framing       nobody can put Hearth inside their page (clickjacking); no plugins; forms only post here
 //   styles        inline style attributes are allowed (the UI sets colours and sizes that way); CSS can't run code
 //   images/media  any https: source, for link previews and profile songs people choose (and blob: for decrypted files)
@@ -486,11 +645,46 @@ function quotaOf(uid) {
   return { ...lim, quotaMb, dailyMb: exempt ? 0 : lim.dailyMb, used: usedBytes(uid), today: dayBytes(uid), blocked: !!(row && row.uploads_blocked), exempt };
 }
 const fmtMb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
+// The final word on quota and daily allowance, once the file's real size is known. Uploads that ran at the same
+// time all started from the same "used" figure; this runs (with recordFile right after it) without any await in
+// between, so whichever finishes first takes the room and the others are refused.
+function overLimit(uid, q, size) {
+  if (q.quotaMb) {
+    const used = usedBytes(uid);
+    if (used + size > q.quotaMb * MB) return new HttpError(413, `That would go over your storage limit. You have ${fmtMb(Math.max(0, q.quotaMb * MB - used))} left of ${q.quotaMb} MB.`, 'quota');
+  }
+  if (q.dailyMb) {
+    const today = dayBytes(uid);
+    if (today + size > q.dailyMb * MB) return new HttpError(413, `That would go over today\u2019s upload limit. You have ${fmtMb(Math.max(0, q.dailyMb * MB - today))} left today.`, 'quota');
+  }
+  return null;
+}
+// Public pictures lose their hidden metadata (EXIF, GPS position, XMP…) before anyone can download them;
+// see server/imagemeta.js. That runs in a worker thread, so a big (or hostile) picture can't hold up the server.
+// A picture that can't be cleaned is refused rather than kept with its metadata.
+async function stripUploadedImage(file) {
+  try {
+    const size = await stripFile(file.path);
+    if (size != null) file.size = size;
+  } catch (e) {
+    if (e instanceof ImageRejected) throw new HttpError(400, 'That picture couldn\u2019t be checked for hidden data (like a GPS position), so it wasn\u2019t saved. Save it again as a normal JPG or PNG and try once more.', 'bad_image');
+    throw new HttpError(503, 'Pictures can\u2019t be saved right now. Try again in a moment.');
+  }
+}
+// Text fields that come with an upload (a name, a crop, a title…). Without these limits multer keeps any number
+// of fields of up to 1 MB each in memory, so a single request could use up the server's memory.
+const FORM_LIMITS = { fields: 8, fieldSize: 16 * 1024, parts: 10 };
+const FORM_ERRORS = new Set(['LIMIT_FIELD_COUNT', 'LIMIT_FIELD_VALUE', 'LIMIT_FIELD_KEY', 'LIMIT_PART_COUNT']);
+const MAX_PARALLEL_UPLOADS = 4; // per person; the app sends files one after another
+const uploading = new Map(); // userId -> uploads in progress
+const PUBLIC_KINDS = new Set(['image', 'gif']); // pictures anyone can download: their metadata is removed
 // Wraps multer: refuses blocked accounts, caps the size at whatever is smallest of the per-file limit,
 // the space left in the person's quota and what's left of today's allowance, and records the file.
 // If the request then fails, the file is removed again so it doesn't count against anyone.
+// kind: file (encrypted attachments), image, song, or gif (the server's GIF library, LIB_MAX_MB each).
 function limited(kind, base, field) {
   const perFile = { file: 'fileMb', image: 'imageMb', song: 'songMb' }[kind];
+  const label = { file: 'Files', image: 'Images', song: 'Songs', gif: 'GIFs for the library' }[kind];
   return (req, res, next) => {
     // Counted before the file is received, so a flood never reaches the disk.
     try {
@@ -501,24 +695,59 @@ function limited(kind, base, field) {
     } catch (e) { return next(e); }
     const q = quotaOf(req.userId);
     if (q.blocked) return next(new HttpError(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.'));
-    const fileCap = q[perFile] * MB + (kind === 'file' ? MB : 0); // encrypted attachments carry a little overhead
+    const perFileMb = kind === 'gif' ? LIB_MAX_MB : q[perFile];
+    const fileCap = perFileMb * MB + (kind === 'file' ? MB : 0); // encrypted attachments carry a little overhead
     const quotaLeft = q.quotaMb ? q.quotaMb * MB - q.used : Infinity;
     const dayLeft = q.dailyMb ? q.dailyMb * MB - q.today : Infinity;
     if (quotaLeft <= 0) return next(new HttpError(413, `You\u2019ve used all ${q.quotaMb} MB of your storage. Delete some old files or ask an admin for more room.`, 'quota'));
     if (dayLeft <= 0) return next(new HttpError(413, `You\u2019ve reached today\u2019s upload limit (${q.dailyMb} MB per day). Try again tomorrow.`, 'quota'));
+    // A few uploads at a time per person, so parallel requests can't fill the disk before the quota check below.
+    const busy = uploading.get(req.userId) || 0;
+    if (busy >= MAX_PARALLEL_UPLOADS) return next(new HttpError(429, 'Wait for your other uploads to finish, then try again.', 'busy'));
+    uploading.set(req.userId, busy + 1);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      const n = (uploading.get(req.userId) || 1) - 1;
+      if (n > 0) uploading.set(req.userId, n); else uploading.delete(req.userId);
+    };
+    res.once('close', release); // also when the sender hangs up halfway
     const cap = Math.max(1, Math.floor(Math.min(fileCap, quotaLeft, dayLeft)));
-    multer({ ...base, limits: { fileSize: cap, files: 1 } }).single(field)(req, res, (err) => {
+    multer({ ...base, limits: { ...FORM_LIMITS, fileSize: cap, files: 1 } }).single(field)(req, res, (err) => {
+      if (err) release();
       if (err && err.code === 'LIMIT_FILE_SIZE') {
-        if (cap >= fileCap) return next(new HttpError(413, `That file is too big. ${{ file: 'Files', image: 'Images', song: 'Songs' }[kind]} can be up to ${q[perFile]} MB.`));
+        if (cap >= fileCap) return next(new HttpError(413, `That file is too big. ${label} can be up to ${perFileMb} MB.`));
         if (cap >= dayLeft) return next(new HttpError(413, `That would go over today\u2019s upload limit. You have ${fmtMb(dayLeft)} left today.`, 'quota'));
         return next(new HttpError(413, `That would go over your storage limit. You have ${fmtMb(quotaLeft)} left of ${q.quotaMb} MB.`, 'quota'));
       }
+      if (err && FORM_ERRORS.has(err.code)) return next(new HttpError(400, 'That upload has more (or longer) form fields than this server accepts.', 'form_limit'));
       if (err) return next(err);
-      if (req.file) {
-        recordFile(req.userId, req.file.filename, kind === 'file' ? 'attachment' : kind, req.file.size);
-        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + req.file.filename); });
-      }
-      next();
+      const file = req.file;
+      if (!file) { release(); return next(); }
+      // Still counted as in progress while the picture is cleaned, so the disk can't fill up meanwhile.
+      const cleaned = PUBLIC_KINDS.has(kind) && file.path ? stripUploadedImage(file) : Promise.resolve();
+      cleaned.then(() => {
+        release();
+        try {
+          // No await from here to recordFile(): see overLimit().
+          const over = overLimit(req.userId, q, file.size);
+          if (over) {
+            if (file.path) fs.promises.unlink(file.path).catch(() => {});
+            return next(over);
+          }
+          recordFile(req.userId, file.filename, kind === 'file' ? 'attachment' : kind, file.size);
+        } catch (e) {
+          if (file.path) fs.promises.unlink(file.path).catch(() => {});
+          return next(e);
+        }
+        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + file.filename); });
+        next();
+      }, (e) => {
+        release();
+        if (file.path) fs.promises.unlink(file.path).catch(() => {});
+        next(e);
+      });
     });
   };
 }
@@ -561,12 +790,59 @@ function removeMessageFiles(messageIds) {
       .forEach((m) => (unseal(m.body).attachments || []).forEach((a) => removeUpload(a.url)));
   }
 }
+// Everything that hangs off messages: their files, reactions and poll votes. These tables have no foreign key to
+// the messages (channel and DM messages share them), so every way of deleting messages calls this first.
+function forgetMessages(messageIds) {
+  if (!messageIds.length) return;
+  removeMessageFiles(messageIds);
+  for (let i = 0; i < messageIds.length; i += 500) {
+    const ids = messageIds.slice(i, i + 500);
+    const q = ids.map(() => '?').join(',');
+    for (const t of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${t} WHERE message_id IN (${q})`).run(...ids);
+  }
+}
+// Before a server or group is deleted: its messages' files, reactions and votes, and its own pictures (icon,
+// banner, background, emoji). The database cascade removes the rows, but not files or quota bookkeeping.
+function purgeServerContent(s) {
+  forgetMessages(db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(s.id).map((r) => r.id));
+  const th = themeOf(s);
+  [s.icon, th.banner, th.background && th.background.image, ...db.prepare('SELECT url FROM emojis WHERE server_id = ?').all(s.id).map((e) => e.url)]
+    .forEach((u) => { if (typeof u === 'string') removeUpload(u); });
+}
+// Deletes a channel message, with its thread's replies if it starts one, their reactions, poll votes and files. The rows
+// are picked with subqueries (a thread can have more replies than SQLite allows placeholders in one query) and go in
+// one transaction; the files are removed only once that has committed, so a failure can't leave a message behind
+// whose attachments are already gone.
+function deleteMessageTree(id) {
+  const tree = 'SELECT id FROM messages WHERE id = ? OR thread_id = ?';
+  const files = db.prepare(`SELECT name FROM blobs WHERE message_id IN (${tree})`).all(id, id).map((b) => '/uploads/' + b.name);
+  // Older, server-encrypted messages keep their attachment list in the sealed body.
+  db.prepare('SELECT body FROM messages WHERE (id = ? OR thread_id = ?) AND ciphertext IS NULL').all(id, id)
+    .forEach((m) => (unseal(m.body).attachments || []).forEach((a) => files.push(a.url)));
+  db.transaction(() => {
+    db.prepare(`DELETE FROM blobs WHERE message_id IN (${tree})`).run(id, id);
+    for (const x of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${x} WHERE message_id IN (${tree})`).run(id, id);
+    db.prepare('DELETE FROM messages WHERE id = ? OR thread_id = ?').run(id, id);
+  })();
+  files.forEach((u) => removeUpload(u));
+}
 // Blobs uploaded but never attached to a message (abandoned sends) are removed after a day.
-setInterval(() => {
+jobs.every('uploads.unlinked_cleanup', 3600 * 1000, () => {
   const old = db.prepare('SELECT name FROM blobs WHERE message_id IS NULL AND created_at < ?').all(Date.now() - 24 * 3600 * 1000);
   old.forEach((b) => removeUpload('/uploads/' + b.name));
   if (old.length) db.prepare('DELETE FROM blobs WHERE message_id IS NULL AND created_at < ?').run(Date.now() - 24 * 3600 * 1000);
-}, 3600 * 1000).unref();
+});
+// Leftovers whose message is gone: from before the cleanup above existed (groups that emptied out, for example).
+// Once shortly after start, then daily.
+function sweepOrphans() {
+  const gone = (t) => `${t}.message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages WHERE id = ${t}.message_id) AND NOT EXISTS (SELECT 1 FROM dm_messages WHERE id = ${t}.message_id)`;
+  const blobs = db.prepare(`SELECT name FROM blobs WHERE ${gone('blobs')}`).all();
+  blobs.forEach((b) => removeUpload('/uploads/' + b.name));
+  if (blobs.length) db.prepare(`DELETE FROM blobs WHERE ${gone('blobs')}`).run();
+  for (const t of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${t} WHERE ${gone(t)}`).run();
+  return blobs.length;
+}
+jobs.every('uploads.orphan_sweep', 24 * 3600 * 1000, sweepOrphans, { firstDelay: +(process.env.ORPHAN_SWEEP_DELAY_MS || 2 * 60 * 1000) });
 
 app.get('/uploads/:file', (req, res) => {
   const f = req.params.file;
@@ -580,9 +856,23 @@ app.get('/uploads/:file', (req, res) => {
     res.type('application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment');
   }
-  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  // Encrypted blobs (.bin) are checked with the server every time (a cheap 304 while the file is there), so a
+  // deleted attachment stops loading at once instead of living on in caches. Other uploads (avatars, icons,
+  // emoji…) get a new name whenever they change, so they can be cached for good. Either way only the browser
+  // keeps a copy (private), never a shared proxy.
+  res.setHeader('Cache-Control', path.extname(f).toLowerCase() === '.bin' ? 'private, no-cache' : 'private, max-age=31536000, immutable');
   res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
-  res.sendFile(p);
+  // Range requests (206, 416) come from sendFile, so long videos and songs can seek without downloading it all.
+  res.sendFile(p, { acceptRanges: true }, (err) => {
+    if (!err || res.headersSent) return;
+    if (err.status === 416) {
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch { /* deleted meanwhile */ }
+      res.setHeader('Content-Range', `bytes */${size}`);
+      return res.sendStatus(416);
+    }
+    res.sendStatus(404);
+  });
 });
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -619,13 +909,15 @@ app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
 // The desktop app's self-updater reads latest.yml (latest-linux.yml…) here, then downloads the installer it
 // names. electron-builder writes these next to the installers; GitHub Actions copies them to data/downloads.
-const UPDATE_FILE = /^(latest(-mac|-linux)?\.yml|[\w.-]+\.(exe|blockmap|AppImage|zip|dmg))$/;
+// latest*.yml.sig is the publisher's signature over latest*.yml (desktop/build/sign-update.js): apps built
+// with a signing key refuse an update without it, whatever this server serves.
+const UPDATE_FILE = /^(latest(-mac|-linux)?\.yml(\.sig)?|[\w.-]+\.(exe|blockmap|AppImage|zip|dmg))$/;
 app.get('/updates/:file', (req, res) => {
   const name = String(req.params.file);
   if (!UPDATE_FILE.test(name) || name.includes('..')) return res.status(404).send('Not found');
   const file = path.join(DOWNLOADS_DIR, name);
   if (!fs.existsSync(file)) return res.status(404).send('Not found');
-  if (name.endsWith('.yml')) res.setHeader('Cache-Control', 'no-cache');
+  if (/\.yml(\.sig)?$/.test(name)) res.setHeader('Cache-Control', 'no-cache');
   res.sendFile(file);
 });
 app.get('/downloads/:file', (req, res) => {
@@ -700,8 +992,15 @@ function recordIp(userId, ip, token) {
   db.prepare('INSERT INTO user_ips (user_id, ip, first_seen, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, ip) DO UPDATE SET last_seen = excluded.last_seen').run(userId, ip, t, t);
   if (token) db.prepare('UPDATE sessions SET ip = ? WHERE token_hash = ?').run(ip, tokenId(token));
 }
-// IP bans: single addresses or IPv4 ranges (CIDR), checked on sign-up, login and live connections.
-const ipBans = () => { try { return JSON.parse(getSetting('ipBans') || '[]'); } catch { return []; } };
+// IP bans: single addresses or IPv4 ranges (CIDR), checked on sign-up, login, password resets, every signed-in
+// request (staff excepted) and live connections. The parsed list is kept until the setting changes.
+let banCache = { raw: null, list: [] };
+const ipBans = () => {
+  const raw = getSetting('ipBans') || '[]';
+  if (raw !== banCache.raw) { let list = []; try { list = JSON.parse(raw); } catch { /* none */ } banCache = { raw, list: Array.isArray(list) ? list : [] }; }
+  return banCache.list;
+};
+const BANNED_MSG = 'Access from your network has been blocked by this server\u2019s administrators.';
 const ip4num = (ip) => { const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip); return m ? ((+m[1] << 24) >>> 0) + (+m[2] << 16) + (+m[3] << 8) + +m[4] : null; };
 function ipBanned(ip) {
   ip = cleanIp(ip);
@@ -713,11 +1012,15 @@ function ipBanned(ip) {
   }
   return null;
 }
-// Security log: recent failed logins, captcha failures and blocked IPs (kept in memory, newest first).
+// Security log: recent failed logins, captcha failures and blocked IPs (kept in memory, newest first). Each event
+// also goes to the server log (address cut to its network there) and counts toward the sign-in abuse alert.
 const securityLog = [];
+let ALERTS = null; // server/alerts.js, set up once email and sockets exist
 function secEvent(type, ip, detail = '') {
   securityLog.unshift({ type, ip: cleanIp(ip), detail: String(detail).slice(0, 120), at: Date.now() });
   if (securityLog.length > 500) securityLog.length = 500;
+  log.info('security', type, { ip: cleanIp(ip), outcome: 'denied' });
+  if (ALERTS) ALERTS.countSecurity(type);
 }
 const maintenance = () => getSetting('maintenance') || '';
 const suspendedMsg = (row) => `This account is suspended${row.suspended_until ? ` until ${new Date(row.suspended_until).toUTCString().replace(/:\d\d GMT$/, ' UTC')}` : ''}${row.suspend_reason ? `: ${row.suspend_reason}` : '.'}`;
@@ -764,16 +1067,31 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   const ids = db.prepare(`SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL ${where}`).all(userId, ...args).map((r) => r.id);
   if (!ids.length) return 0;
   db.prepare(`UPDATE sessions SET revoked_at = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL ${where}`).run(t, reason, userId, ...args);
+  // Their push notifications stop too (a signed-out laptop shouldn't keep showing who messaged you). Ones
+  // saved before subscriptions recorded their session can't be told apart, so they go as well; the app
+  // turns push back on for the sessions still signed in the next time it starts.
+  const dropPush = db.prepare('DELETE FROM push_subs WHERE user_id = ? AND session_id = ?');
+  ids.forEach((sid) => dropPush.run(userId, sid));
+  db.prepare('DELETE FROM push_subs WHERE user_id = ? AND session_id IS NULL').run(userId);
   const gone = new Set(ids);
+  // A call kept open for one of these sessions while its connection was down can't be resumed: it ends now.
+  const inCall = voiceChannels.get(userVoice.get(userId))?.get(userId);
+  if (inCall && gone.has(inCall.sid)) leaveVoice(userId);
   if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { if (gone.has(x.data.sid)) { x.emit('session:revoked', { reason }); x.disconnect(true); } })).catch(() => {});
   return ids.length;
 }
+// Closes every open app window of an account that can't be used any more (suspended, deleted, signed out by
+// staff), saying why first, like revokeSessions. Closing them straight away instead (disconnectSockets) would
+// overtake that notice, and the app would land on the sign-in screen without telling the person why.
+function closeWindows(userId, reason) {
+  if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { x.emit('session:revoked', { reason }); x.disconnect(true); })).catch(() => {});
+}
 // Revoked and expired sessions are kept 30 days (so Settings → Sessions can say what happened), then deleted.
-setInterval(() => {
+jobs.every('sessions.purge', 3600000, () => {
   const t = now();
   db.prepare('DELETE FROM sessions WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ? OR COALESCE(last_used_at, created_at) < ?')
     .run(t - 30 * 86400000, t - 30 * 86400000, t - SESSION_IDLE_MS - 30 * 86400000);
-}, 3600000).unref();
+});
 function auth(req, res, next) {
   const token = tokenFrom(req);
   const s = sessionFor(token);
@@ -781,7 +1099,12 @@ function auth(req, res, next) {
   const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
   if (!u || u.deleted_at) return res.status(401).json({ error: 'Not signed in.', code: 'signed_out' });
   if (stillSuspended(u)) return res.status(403).json({ error: suspendedMsg(u), code: 'suspended' });
-  if (maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
+  // Logging out always works: it only takes access away, and an app turned away here would drop its copy of the
+  // token while the session stayed live on the server.
+  const loggingOut = req.path === '/auth/logout';
+  // A ban covers people who were already signed in, too (staff excepted, so nobody locks the admins out).
+  if (!loggingOut && ipBanned(req.ip) && !isStaff(s.user_id)) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
+  if (!loggingOut && maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
   req.userId = s.user_id;
   req.token = token;
   req.session = s;
@@ -799,10 +1122,20 @@ api.use((req, res, next) => {
     if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return json(body);
     const text = JSON.stringify(body);
     if (text === undefined || text.length < 4096) return json(body);
-    res.setHeader('Content-Encoding', 'gzip');
-    res.setHeader('Vary', 'Accept-Encoding');
-    res.type('application/json');
-    return res.end(zlib.gzipSync(text, { level: 4 }));
+    const send = (buf) => {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.type('application/json');
+      res.end(buf);
+    };
+    if (text.length < 256 * 1024) return send(zlib.gzipSync(text, { level: 4 }));
+    // Big answers are compressed off the main thread, so everyone else's requests don't wait for it.
+    zlib.gzip(text, { level: 4 }, (err, buf) => {
+      if (res.headersSent) return;
+      if (err) { res.type('application/json'); return res.end(text); }
+      send(buf);
+    });
+    return res;
   };
   next();
 });
@@ -810,6 +1143,7 @@ api.use((req, res, next) => {
 // ---------------------------------------------------------------- public config
 // ---------------------------------------------------------------- installable app: push, manifest, service worker, downloads
 const webpush = require('web-push');
+const netguard = require('./netguard');
 let vapid = null;
 try {
   const VAPID_FILE = path.join(DATA_DIR, 'vapid.json');
@@ -817,33 +1151,158 @@ try {
   else if (fs.existsSync(VAPID_FILE)) vapid = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8'));
   else { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(VAPID_FILE, JSON.stringify(vapid), { mode: 0o600 }); }
   webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
-} catch (e) { console.warn('Push notifications are off:', e.message); vapid = null; }
+} catch (e) { log.warn('push', 'disabled', { err: e, msg: 'Push notifications are off.' }); vapid = null; }
 
 const nameOf = (uid) => { const r = getUserRow(uid); return r ? (parseProfile(r).displayName || r.username) : 'Someone'; };
-// Notify people who have no Hearth window open. Message contents are end-to-end encrypted, so the
-// notification only says who and where — never what.
-function pushTo(userIds, payload) {
-  if (!vapid) return;
-  for (const uid of new Set(userIds)) {
-    if ((onlineSockets.get(uid) || new Set()).size) continue;
-    const row = getUserRow(uid);
-    if (!row || row.status === 'dnd') continue;
-    for (const sub of db.prepare('SELECT * FROM push_subs WHERE user_id = ?').all(uid)) {
-      webpush.sendNotification({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys) }, JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' })
-        .catch((err) => { if (err.statusCode === 404 || err.statusCode === 410) db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(sub.endpoint); });
+// A push endpoint is a web address the app hands us, so sending to it is an outbound request like a feed and
+// goes through netguard (public addresses only, pinned, with a deadline and a cap on the answer).
+// PUSH_ALLOW_PRIVATE=1 is for tests, or a push service on your own network.
+const PUSH_ALLOW_PRIVATE = process.env.PUSH_ALLOW_PRIVATE === '1';
+const PUSH_MAX_PER_USER = 10; // phones, browsers, desktop apps; turning push on somewhere new drops the oldest
+const PUSH_TIMEOUT_MS = 10000;
+// Sending is shared out fairly, so an account whose push services never answer can't hold up everyone else's
+// notifications: the people with something waiting take turns, and only so many sends are in flight at once
+// for the whole server, for one person's devices, and to one push service.
+const PUSH_CONCURRENCY = 16;
+const PUSH_PER_USER = 2;
+const PUSH_PER_HOST = 8;
+const PUSH_WAITING_PER_USER = 30; // past this, the oldest notification still waiting for that person goes
+const PUSH_QUEUE_MAX = 5000; // for everyone together (a push service that's down, a flood)
+// A push service that times out or can't be reached sits out a while after each failure in a row (1, 2, 4…
+// minutes, at most an hour) and is dropped after this many. The app turns push on again when it next starts.
+const PUSH_MAX_FAILS = 8;
+const pushWaiting = new Map(); // user id → jobs waiting, oldest first; the Map's order is whose turn is next
+const pushBusy = { total: 0, user: new Map(), host: new Map() };
+let pushWaitingCount = 0;
+const bump = (m, k, d) => { const n = (m.get(k) || 0) + d; if (n > 0) m.set(k, n); else m.delete(k); };
+const pushHost = (endpoint) => { try { return new URL(endpoint).hostname.toLowerCase(); } catch { return ''; } };
+const dropPushSub = (endpoint) => db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(endpoint);
+const pushUserOk = (row) => !!row && !row.deleted_at && !stillSuspended(row);
+// A subscription belongs to the session that turned it on: once that session is signed out, revoked or
+// expired, the device gets nothing more. Subscriptions saved before sessions were recorded go along with the
+// account's sessions as a whole (and are dropped when any of them is signed out; the app re-subscribes).
+function pushSubLive(uid, sub, t = now()) {
+  if (sub.session_id) return sessionLive(db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(sub.session_id, uid), t);
+  return db.prepare('SELECT * FROM sessions WHERE user_id = ? AND revoked_at IS NULL').all(uid).some((x) => sessionLive(x, t));
+}
+function pushSubsFor(uid) {
+  const t = now();
+  return db.prepare('SELECT * FROM push_subs WHERE user_id = ? ORDER BY created_at DESC').all(uid).filter((sub) => {
+    if (!pushSubLive(uid, sub, t)) { dropPushSub(sub.endpoint); return false; }
+    return !(sub.retry_at > t); // sitting out after failed sends
+  }).slice(0, PUSH_MAX_PER_USER);
+}
+function queuePush(uid, sub, payload) {
+  let jobs = pushWaiting.get(uid);
+  // A newer notification for the same device and conversation takes the place of one still waiting (the
+  // device would replace it on screen anyway), so a flood of messages is still one send per device.
+  const same = jobs && jobs.find((j) => j.endpoint === sub.endpoint && j.payload.tag === payload.tag);
+  if (same) { same.payload = payload; return; }
+  if (!jobs) {
+    if (pushWaitingCount >= PUSH_QUEUE_MAX) return;
+    jobs = []; pushWaiting.set(uid, jobs);
+  } else if (jobs.length >= PUSH_WAITING_PER_USER) { jobs.shift(); pushWaitingCount--; } else if (pushWaitingCount >= PUSH_QUEUE_MAX) return;
+  jobs.push({ uid, endpoint: sub.endpoint, host: pushHost(sub.endpoint), payload });
+  pushWaitingCount++;
+}
+function pumpPush() {
+  for (let started = true; started && pushBusy.total < PUSH_CONCURRENCY;) {
+    started = false;
+    // One send per person per round, in turn.
+    for (const [uid, jobs] of [...pushWaiting]) {
+      if (pushBusy.total >= PUSH_CONCURRENCY) break;
+      if ((pushBusy.user.get(uid) || 0) >= PUSH_PER_USER) continue;
+      const i = jobs.findIndex((j) => (pushBusy.host.get(j.host) || 0) < PUSH_PER_HOST);
+      if (i < 0) continue;
+      const [job] = jobs.splice(i, 1);
+      pushWaitingCount--;
+      pushWaiting.delete(uid);
+      if (jobs.length) pushWaiting.set(uid, jobs); // back of the line
+      pushBusy.total++; bump(pushBusy.user, uid, 1); bump(pushBusy.host, job.host, 1);
+      started = true;
+      sendPush(job).catch(() => {}).finally(() => {
+        pushBusy.total--; bump(pushBusy.user, uid, -1); bump(pushBusy.host, job.host, -1);
+        setImmediate(pumpPush);
+      });
     }
   }
 }
+async function sendPush({ uid, endpoint, payload }) {
+  // Checked again now, not only when it was queued: a device signed out (or an account suspended) while this
+  // waited gets nothing.
+  const sub = db.prepare('SELECT * FROM push_subs WHERE endpoint = ? AND user_id = ?').get(endpoint, uid);
+  if (!sub || !pushUserOk(getUserRow(uid)) || sub.retry_at > now()) return;
+  if (!pushSubLive(uid, sub)) { dropPushSub(endpoint); return; }
+  let details;
+  // web-push only encrypts the payload and signs the VAPID header here; the request itself goes through
+  // netguard, never through web-push's own (unguarded, unbounded) https.request.
+  try {
+    details = webpush.generateRequestDetails({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys) }, JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' });
+  } catch { dropPushSub(sub.endpoint); return; } // keys that can never work
+  try {
+    const r = await netguard.request(details.endpoint, { method: details.method, headers: details.headers, body: details.body, protocols: ['https:'], allowPrivate: PUSH_ALLOW_PRIVATE,
+      maxRedirects: 0, timeout: PUSH_TIMEOUT_MS, maxBytes: 64 * 1024, truncate: true, decompress: false });
+    if (r.status === 404 || r.status === 410) dropPushSub(sub.endpoint); // the browser unsubscribed
+    else if (sub.fails) db.prepare('UPDATE push_subs SET fails = 0, retry_at = NULL WHERE endpoint = ?').run(sub.endpoint);
+  } catch (e) {
+    // Its host now points inside a private network (or it was never a usable address): stop trying it.
+    if (['PRIVATE', 'BAD_URL', 'BAD_PROTOCOL'].includes(e.code)) dropPushSub(sub.endpoint);
+    else if (e.code === 'TIMEOUT' || e.code === 'NETWORK') pushFailed(sub.endpoint);
+  }
+}
+function pushFailed(endpoint) {
+  db.prepare('UPDATE push_subs SET fails = fails + 1 WHERE endpoint = ?').run(endpoint);
+  const row = db.prepare('SELECT fails FROM push_subs WHERE endpoint = ?').get(endpoint);
+  if (!row) return;
+  if (row.fails >= PUSH_MAX_FAILS) { dropPushSub(endpoint); return; }
+  db.prepare('UPDATE push_subs SET retry_at = ? WHERE endpoint = ?').run(now() + Math.min(60000 * 2 ** (row.fails - 1), 3600000), endpoint);
+}
+// Notify people who have no Hearth window open. Message contents are end-to-end encrypted, so the
+// notification only says who and where — never what. It's worked out after the request that caused it has
+// been answered and sent a few at a time, so a big group or a slow push service never holds anyone up.
+// what: { kind, serverId, channelId, dmId } — checked against each person's notification preferences and Do Not
+// Disturb schedule (server/usability.js), which also decides how much the lock screen shows.
+let USE = null; // server/usability.js
+function pushTo(userIds, payload, what = { kind: 'other' }) {
+  if (!vapid) return;
+  const ids = [...new Set(userIds)];
+  setImmediate(() => {
+    for (const uid of ids) {
+      if ((onlineSockets.get(uid) || new Set()).size) continue;
+      const row = getUserRow(uid);
+      if (!row || row.status === 'dnd' || !pushUserOk(row)) continue;
+      if (USE && !USE.pushAllowed(uid, what)) continue;
+      const shaped = USE ? USE.shapePush(uid, payload) : payload;
+      for (const sub of pushSubsFor(uid)) queuePush(uid, sub, shaped);
+    }
+    pumpPush();
+  });
+}
 api.get('/push/key', (req, res) => res.json({ publicKey: vapid ? vapid.publicKey : null }));
-api.post('/push/subscribe', auth, (req, res) => {
+api.post('/push/subscribe', auth, wrap(async (req, res) => {
   const sub = (req.body || {}).subscription || {};
   if (!vapid) fail(400, 'Push notifications are turned off on this server.');
-  if (typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || sub.endpoint.length > 1000) fail(400, 'Bad subscription.');
+  if (typeof sub.endpoint !== 'string' || sub.endpoint.length > 1000) fail(400, 'Bad subscription.');
   if (!sub.keys || typeof sub.keys.p256dh !== 'string' || typeof sub.keys.auth !== 'string') fail(400, 'Bad subscription.');
-  db.prepare('INSERT OR REPLACE INTO push_subs (endpoint, user_id, keys, ua, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh.slice(0, 200), auth: sub.keys.auth.slice(0, 100) }), String(req.headers['user-agent'] || '').slice(0, 300), now());
+  rateLimit('pushsub-any:' + req.userId, 60, 3600000);
+  // The app turns push on again each time it starts. An endpoint this account already has was checked when it
+  // was saved (and every send checks it again), so only new ones are looked up and count toward this limit.
+  if (!db.prepare('SELECT 1 FROM push_subs WHERE endpoint = ? AND user_id = ?').get(sub.endpoint, req.userId)) {
+    rateLimit('pushsub:' + req.userId, 10, 3600000);
+    // Push services are public https sites. (Each send checks again, pinned, since DNS answers can change.)
+    try { await netguard.checkPublicUrl(sub.endpoint, { protocols: ['https:'], allowPrivate: PUSH_ALLOW_PRIVATE }); } catch (e) { fail(400, e.code === 'NOT_FOUND' ? 'Bad subscription: its push service couldn’t be found.' : 'Bad subscription.'); }
+  }
+  db.transaction(() => {
+    // Saving it again keeps its count of failed sends: subscribing again doesn't restart a dead push service's back-off.
+    db.prepare(`INSERT INTO push_subs (endpoint, user_id, keys, ua, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, keys = excluded.keys, ua = excluded.ua, created_at = excluded.created_at, session_id = excluded.session_id`)
+      .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh.slice(0, 200), auth: sub.keys.auth.slice(0, 100) }), String(req.headers['user-agent'] || '').slice(0, 300), now(), req.session.id);
+    // Only the newest few per account are kept.
+    db.prepare('DELETE FROM push_subs WHERE user_id = ? AND endpoint NOT IN (SELECT endpoint FROM push_subs WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)')
+      .run(req.userId, req.userId, PUSH_MAX_PER_USER);
+  })();
   res.json({ ok: true });
-});
+}));
 api.post('/push/unsubscribe', auth, (req, res) => {
   db.prepare('DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?').run(String((req.body || {}).endpoint || ''), req.userId);
   res.json({ ok: true });
@@ -903,7 +1362,7 @@ const isSalt = (s) => typeof s === 'string' && /^[A-Za-z0-9+/=]{20,64}$/.test(s)
 // Which password-hashing scheme and salt to use for a username. For unknown usernames we return a
 // stable fake salt so this endpoint doesn't reveal which accounts exist.
 api.get('/auth/params', (req, res) => {
-  rateLimit('params:' + req.ip, 60, 60 * 1000);
+  limitNet(req, 'params', 60, 60 * 1000); // per network: rotating addresses inside one IPv6 /64 doesn't get around it
   const username = String(req.query.username || '').slice(0, 24);
   const row = db.prepare('SELECT kdf, kdf_salt FROM users WHERE username = ?').get(username);
   if (row && row.kdf === 'argon2id') return res.json({ kdf: 'argon2id', salt: row.kdf_salt });
@@ -912,28 +1371,33 @@ api.get('/auth/params', (req, res) => {
   res.json({ kdf: 'argon2id', salt });
 });
 
-// Banned IPs can't sign up, log in or connect.
-api.use(['/auth/register', '/auth/login'], (req, res, next) => {
+// Banned IPs can't sign up, log in, reset a password (which hands out a new session) or connect.
+api.use(['/auth/register', '/auth/login', '/auth/forgot', '/auth/reset'], (req, res, next) => {
   const b = ipBanned(req.ip);
-  if (b) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: 'Access from your network has been blocked by this server\u2019s administrators.', code: 'ip_banned' }); }
+  if (b) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
   next();
 });
 api.post('/auth/register', wrap(async (req, res) => {
   limitNet(req, 'reg', 5, 60 * 60 * 1000);
   rateLimit('reg:day:' + netOf(req.ip), 10, 24 * 60 * 60 * 1000);
-  rateLimit('reg:all', 120, 60 * 60 * 1000); // slows bot floods across many IPs
   const mode = regMode();
   if (mode === 'closed') fail(403, 'Registration is closed on this server.');
   const { username, authKey, publicKey, encPrivateKey, code, kdfSalt, acceptTos } = req.body || {};
   if (mode === 'code' && (!regCode() || typeof code !== 'string' || !safeEqual(code, regCode()))) fail(403, 'That registration code is not right.');
   const tos = termsInfo();
   if (tos.version && +acceptTos !== tos.version) fail(400, 'Please read and accept the Terms of Service to create an account.');
-  verifyCaptcha((req.body || {}).captcha, 'register');
+  verifyCaptcha((req.body || {}).captcha, 'register', req.ip);
+  // Slows bot floods across many IPs: past the instance-wide limit the robot check gets harder for everyone,
+  // rather than turning everyone away (see busyBits). Counted only after the check, so requests without a
+  // solved one don't count at all.
+  countInstanceWide('register');
   if (typeof username !== 'string' || !USERNAME_RE.test(username)) fail(400, 'Usernames are 2–24 characters: letters, numbers, _ and . only.');
   if (typeof authKey !== 'string' || !/^[0-9a-f]{64}$/.test(authKey)) fail(400, 'Bad auth key.');
   if (!isB64ish(publicKey, 2000) || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
   if (!isSalt(kdfSalt)) fail(400, 'This page is out of date. Reload and try again.');
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) fail(409, 'That username is taken.');
+  // An ADMIN_USERS name its account renamed away from (or deleted) is still that account's: it brings admin powers.
+  if (envAdmins().includes(username.toLowerCase()) && envClaims()[username.toLowerCase()]) fail(409, 'That username is reserved.');
   const id = newId();
   const hash = await bcrypt.hash(authKey, 11);
   const profile = sanitizeProfile({ displayName: username });
@@ -945,27 +1409,62 @@ api.post('/auth/register', wrap(async (req, res) => {
     if (String(e.code).startsWith('SQLITE_CONSTRAINT')) fail(409, 'That username is taken.');
     throw e;
   }
+  // The first account to take a free ADMIN_USERS name keeps it for good; and the very first account settles who
+  // owns the server (nothing awaits between the insert and here, so two sign-ups can't both claim).
+  claimEnvAdmin(getUserRow(id));
+  settleOwnerAtFirstSignUp();
   const token = createSession(req, id);
   addSupportFriend(id);
-  res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey });
+  res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey, device: deviceNote(getUserRow(id)) });
 }));
 
 // Compared against when the username doesn't exist, so a wrong username takes as long as a wrong password
 // (otherwise the response time would tell which accounts exist).
 const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 11);
+// "This device has signed in to this account before": a note the app keeps after signing in and shows again
+// next time, so an account's own devices get their own sign-in limit wherever they are (a phone's address
+// changes all the time). It's signed with the server's key over the account and its current password hash, so
+// it can't be made up, works for no other account, and stops counting once the password changes.
+const deviceSig = (row, n) => crypto.createHmac('sha256', atRestKey).update(`login-device|${row.id}|${n}|${row.auth_hash}`).digest('base64url').slice(0, 22);
+function deviceKnown(row, note) {
+  const [n, sig, extra] = String(note || '').split('.');
+  if (!/^[\w-]{22}$/.test(n || '') || !/^[\w-]{22}$/.test(sig || '') || extra !== undefined) return null;
+  return safeEqual(sig, deviceSig(row, n)) ? n : null;
+}
+function deviceNote(row, keep = null) {
+  const n = keep || crypto.randomBytes(16).toString('base64url');
+  return `${n}.${deviceSig(row, n)}`;
+}
+// A network this account has been used from (IPv6: the same /64, since devices pick a new address in it
+// every day or so).
+function knownNetwork(uid, ip) {
+  const net = netOf(ip);
+  if (!net.includes(':')) return !!db.prepare('SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?').get(uid, net);
+  return db.prepare("SELECT ip FROM user_ips WHERE user_id = ? AND ip LIKE '%:%' ORDER BY last_seen DESC LIMIT 1000").all(uid).some((r) => netOf(r.ip) === net);
+}
 api.post('/auth/login', wrap(async (req, res) => {
   limitNet(req, 'login', 20, 10 * 60 * 1000);
-  rateLimit('login:all', 3000, 10 * 60 * 1000); // password checks are slow on purpose; this keeps a flood from using all the CPU
+  // The robot check comes before every shared limit: a request without a solved one is turned away here, so
+  // junk can't use up the instance-wide limit or an account's own (which would lock real people out).
+  verifyCaptcha((req.body || {}).captcha, 'login', req.ip);
   const { username, authKey } = req.body || {};
   const name = typeof username === 'string' ? username.slice(0, 40) : '';
   const row = name ? db.prepare('SELECT * FROM users WHERE username = ?').get(name) : null;
-  // Per-account limits too, so guessing one person's password from many IPs is slowed down. The short one
-  // doesn't apply from networks this account has signed in from before, so nobody can lock a person out of
-  // their usual devices by spamming; the daily one counts every network.
-  const knownIp = row && db.prepare('SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?').get(row.id, cleanIp(req.ip));
-  if (!knownIp) rateLimit('loginuser:' + name.toLowerCase(), 10, 15 * 60 * 1000);
-  rateLimit('loginuser:day:' + name.toLowerCase(), 100, 24 * 60 * 60 * 1000);
-  verifyCaptcha((req.body || {}).captcha, 'login');
+  // Per-account limits too, so guessing one person's password from many IPs is slowed down. Attempts from the
+  // account's own devices and from networks it has been used from are counted apart (per device or network,
+  // per day), so nobody can lock a person out of their usual devices by spamming from somewhere else.
+  // (The name is encoded so a made-up one like "day:alice" can't land in alice's buckets.)
+  const lname = Buffer.from(name.toLowerCase()).toString('base64url');
+  const device = row && deviceKnown(row, (req.body || {}).device);
+  const known = device ? 'd:' + device : row && knownNetwork(row.id, req.ip) ? netOf(req.ip) : null;
+  if (known) rateLimit(`loginuser:known:${lname}:${known}`, 100, 24 * 60 * 60 * 1000);
+  else {
+    // Password checks are slow on purpose; this keeps a flood from using all the CPU. An account's own devices
+    // and networks don't count (there are only so many of those), so a flood never stands in their way.
+    countInstanceWide('login');
+    rateLimit('loginuser:' + lname, 10, 15 * 60 * 1000);
+    rateLimit('loginuser:day:' + lname, 100, 24 * 60 * 60 * 1000);
+  }
   const key = typeof authKey === 'string' ? authKey.slice(0, 128) : '';
   const ok = await bcrypt.compare(key, row ? row.auth_hash : DUMMY_HASH);
   if (!ok || !row || row.is_bot || row.deleted_at) { noteAuthFailure(req.ip); secEvent('failed_login', req.ip, name); fail(401, 'Wrong username or password.'); }
@@ -974,7 +1473,7 @@ api.post('/auth/login', wrap(async (req, res) => {
   // Two-factor sign-in: the right password isn't enough on its own.
   ACCT.require2fa(row, req.body, req);
   const token = createSession(req, row.id, { mfa: !!row.totp_enabled });
-  res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key });
+  res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key, device: deviceNote(row, device) });
 }));
 
 api.post('/auth/logout', auth, (req, res) => {
@@ -987,9 +1486,14 @@ api.post('/auth/logout', auth, (req, res) => {
 async function stepUp(req, body, authKeyField = 'authKey') {
   const row = getUserRow(req.userId);
   const b = body || {};
-  rateLimit('stepup:' + req.userId, 10, 10 * 60 * 1000);
+  // 10 tries per 10 minutes, counted before the (slow) check so guesses sent in parallel are limited too. A right
+  // password gives its try back, so an owner confirming a run of team or backup changes isn't locked out.
+  const limitKey = 'stepup:' + req.userId;
+  rateLimit(limitKey, 10, 10 * 60 * 1000);
   const key = b[authKeyField];
   if (typeof key !== 'string' || !(await bcrypt.compare(key.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
+  const tries = buckets.get(limitKey);
+  if (tries && tries.count > 0) tries.count -= 1;
   if (row.totp_enabled && !(req.session.mfa_at && now() - req.session.mfa_at < 10 * 60000)) {
     ACCT.require2fa(row, b, req);
     db.prepare('UPDATE sessions SET mfa_at = ? WHERE id = ?').run(now(), req.session.id);
@@ -1000,8 +1504,8 @@ async function stepUp(req, body, authKeyField = 'authKey') {
 // ---------------------------------------------------------------- changing a username
 // The old name is free for anyone the moment it changes. Passwords don't depend on the username (the password
 // salt is stored per account), except for accounts still on the old pbkdf2 format: those are upgraded at their
-// next sign-in and only then can be renamed. Staff powers that come from ADMIN_USERS (matched by name) are
-// pinned to the account first, so a rename can't take them away or hand them to someone else.
+// next sign-in and only then can be renamed. Staff powers that come from ADMIN_USERS are tied to the account
+// that first held the name, so a rename can't take them away or hand them to someone else.
 function renameUser(uid, wanted, beforeWrite) {
   const row = getUserRow(uid);
   if (!row) fail(404, 'User not found.');
@@ -1011,12 +1515,11 @@ function renameUser(uid, wanted, beforeWrite) {
   if (row.kdf !== 'argon2id') fail(400, 'This account still uses the old password format. Sign out and back in once (it upgrades by itself), then try again.');
   const taken = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(name, uid);
   if (taken) fail(409, 'That username is taken.');
-  if (envAdmins().includes(name.toLowerCase()) && name.toLowerCase() !== row.username.toLowerCase()) fail(409, 'That username is reserved.');
-  // Keep staff powers with the account, not the name.
-  if (ownerId() === uid && !getSetting('owner')) setSetting('owner', uid);
-  if (envAdmins().includes(row.username.toLowerCase()) && staffRole(uid) === 'admin') {
-    const roles = staffRoles(); if (!roles[uid]) { roles[uid] = 'admin'; saveStaffRoles(roles); }
-  }
+  // ADMIN_USERS names: only the account that holds one may take it back (an unclaimed one would bring powers).
+  if (name.toLowerCase() !== row.username.toLowerCase() && envNameReserved(name, uid)) fail(409, 'That username is reserved.');
+  // Staff powers already belong to the account, not the name: the owner is written down (ownerId) and
+  // ADMIN_USERS names are claimed by account id (claimEnvAdmin), so a rename can't move them.
+  ownerId();
   if (beforeWrite) beforeWrite();
   try {
     db.prepare('UPDATE users SET username = ? WHERE id = ?').run(name, uid);
@@ -1048,10 +1551,16 @@ api.post('/me/password', auth, wrap(async (req, res) => {
   if (!isSalt(salt)) fail(400, 'This page is out of date. Reload and try again.');
   db.prepare(`UPDATE users SET auth_hash = ?, enc_private_key = ?, kdf = 'argon2id', kdf_salt = ? WHERE id = ?`)
     .run(await bcrypt.hash(newAuthKey, 11), encPrivateKey, salt, req.userId);
-  // Every other device is signed out — except for the automatic hashing upgrade at sign-in (same password).
-  const kept = keepSessions === true && row.kdf !== 'argon2id';
-  if (!kept) revokeSessions(req.userId, { except: req.session.id, reason: 'password_changed' });
-  if (!kept) {
+  ACCT.dropResetLinks(req.userId); // a reset link sent before the change can't be used to undo it
+  // Every other device is signed out — except for the automatic hashing upgrade the app does right after
+  // signing in to an old-format account (same password). Only a session that has just signed in can ask for
+  // that, and it's still logged and emailed: the server can't tell it from a change to a new password.
+  const kept = keepSessions === true && row.kdf !== 'argon2id' && now() - req.session.created_at < 10 * 60000;
+  if (kept) {
+    auditLog(req, 'password_upgraded', req.userId, row.username);
+    ACCT.notify(row, 'your password was re-saved', `Someone signed in to ${row.username} and the app re-saved its password in the newer, stronger format (this happens once, at the first sign-in after an update). Other devices stay signed in.`);
+  } else {
+    revokeSessions(req.userId, { except: req.session.id, reason: 'password_changed' });
     auditLog(req, 'password_changed', req.userId, row.username);
     ACCT.notify(row, 'your password was changed', `The password for ${row.username} was just changed, and every other device was signed out.`);
   }
@@ -1060,7 +1569,9 @@ api.post('/me/password', auth, wrap(async (req, res) => {
 
 // Deleting your account. Needs your password (and a two-factor code when it's on). What happens:
 //   - you're signed out everywhere, and the account can never sign in again; the username is freed
-//   - your keys, email, two-factor, recovery key, profile, pictures, friends, blocks and push devices are erased
+//   - your private keys, email, two-factor, recovery key, profile, pictures, friends, blocks and push devices are
+//     erased. Your PUBLIC keys stay: the people you talked to need them to keep reading your old direct
+//     messages, to check the signatures on your old posts and to unlock server keys you handed out.
 //   - you leave every server and group (the others switch to a new server key, as when anyone leaves)
 //   - messages you sent stay where they are (still end-to-end encrypted) and show "Deleted user"
 // Owners first hand over or delete their servers; the instance owner first hands over ownership.
@@ -1071,34 +1582,39 @@ api.delete('/me', auth, wrap(async (req, res) => {
   if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
   const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
   if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
+  // Who has them on screen, worked out before their servers and friendships go: they all see "Deleted user".
+  const audience = userAudience(row.id);
   revokeSessions(row.id, { reason: 'account_deleted' });
+  STORE.cancelUserSessions(row.id); // unfinished uploads go at once, with their reserved room
   for (const m of db.prepare('SELECT s.id, s.kind, s.owner_id FROM members m JOIN servers s ON s.id = m.server_id WHERE m.user_id = ?').all(row.id)) {
     if (m.kind === 'group' && m.owner_id === row.id) {
       const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(m.id, row.id);
       if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, m.id);
     }
     removeMember(m.id, row.id);
-    if (m.kind === 'group' && !db.prepare('SELECT 1 FROM members WHERE server_id = ?').get(m.id)) db.prepare('DELETE FROM servers WHERE id = ?').run(m.id);
-    else emitServer(m.id);
+    if (m.kind === 'group' && !db.prepare('SELECT 1 FROM members WHERE server_id = ?').get(m.id)) {
+      purgeServerContent(db.prepare('SELECT * FROM servers WHERE id = ?').get(m.id));
+      db.prepare('DELETE FROM servers WHERE id = ?').run(m.id);
+    } else emitServer(m.id);
   }
   const files = [row.avatar, row.banner, row.background, row.song, row.page_bg];
   const friends = db.prepare('SELECT requester_id, addressee_id FROM friendships WHERE requester_id = ? OR addressee_id = ?').all(row.id, row.id);
   db.transaction(() => {
-    db.prepare(`UPDATE users SET username = ?, auth_hash = '!', public_key = '', enc_private_key = '', sign_public_key = NULL, enc_sign_private_key = NULL,
+    db.prepare(`UPDATE users SET username = ?, auth_hash = '!', enc_private_key = '', enc_sign_private_key = NULL,
       enc_private_key_recovery = NULL, recovery_salt = NULL, email = NULL, email_verified = 0, totp_enabled = 0, totp_secret = NULL, backup_codes = '[]',
       avatar = NULL, banner = NULL, background = NULL, song = NULL, page = NULL, page_bg = NULL, profile = ?, status = 'offline', activity_cfg = '{}',
       last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
-    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
     db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0 WHERE id = ?").run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
   })();
   files.forEach((f) => removeUpload(f));
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
-  broadcastUser(row.id);
-  io.in(`user:${row.id}`).disconnectSockets(true);
+  broadcastUser(row.id, audience);
+  closeWindows(row.id, 'account_deleted');
   auditLog(req, 'account_deleted', row.id, row.username);
   ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
   res.json({ ok: true });
@@ -1106,14 +1622,65 @@ api.delete('/me', auth, wrap(async (req, res) => {
 
 // One-time upload of the user's message-signing key. Its private half is encrypted by the
 // browser with a key only the account's own identity key can derive.
+// The upload has to prove two things, so a stolen session alone can't plant a signing key that contacts would
+// then trust: that this device holds the account's identity key (an HMAC keyed by ECDH between it and a
+// one-off server key, as for a password reset that keeps the keys), and that it holds the new signing key
+// (a signature over the challenge). Challenges live in memory for a few minutes and work once.
+const signKeyChallenges = new Map(); // nonce -> { userId, priv, expires }
+const SIGN_CHALLENGE_MS = 5 * 60 * 1000;
+api.post('/me/sign-key/challenge', auth, (req, res) => {
+  rateLimit('signkeychal:' + req.userId, 20, 10 * 60 * 1000);
+  const t = now();
+  for (const [k, c] of signKeyChallenges) if (c.expires < t) signKeyChallenges.delete(k);
+  if (signKeyChallenges.size > 5000) fail(429, 'Too many attempts. Try again in a minute.', 'rate_limited', 60);
+  const eph = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const nonce = crypto.randomBytes(24).toString('base64url');
+  signKeyChallenges.set(nonce, { userId: req.userId, priv: eph.privateKey, expires: t + SIGN_CHALLENGE_MS });
+  res.json({ serverPublicKey: eph.publicKey.export({ type: 'spki', format: 'der' }).toString('base64'), nonce });
+});
+// P-256 public key (SPKI, base64) or null.
+function p256Key(b64) {
+  try {
+    const k = crypto.createPublicKey({ key: Buffer.from(b64, 'base64'), format: 'der', type: 'spki' });
+    return k.asymmetricKeyType === 'ec' && k.asymmetricKeyDetails.namedCurve === 'prime256v1' ? k : null;
+  } catch { return null; }
+}
+function signKeyProofOk(row, b) {
+  const c = typeof b.nonce === 'string' && signKeyChallenges.get(b.nonce);
+  if (!c || c.userId !== row.id || c.expires < now()) return false;
+  signKeyChallenges.delete(b.nonce);
+  if (typeof b.keyProof !== 'string' || typeof b.signature !== 'string' || b.signature.length > 200) return false;
+  const identity = p256Key(row.public_key);
+  const signing = p256Key(b.signPublicKey);
+  if (!identity || !signing) return false;
+  try {
+    const shared = crypto.diffieHellman({ privateKey: c.priv, publicKey: identity });
+    const mac = crypto.createHmac('sha256', shared).update(`hearth-sign-key-proof|${row.id}|${b.nonce}|${b.signPublicKey}`).digest('base64');
+    if (!safeEqual(mac, b.keyProof)) return false;
+    return crypto.verify('sha256', Buffer.from(`hearth-sign-key|${row.id}|${row.public_key}|${b.nonce}`), { key: signing, dsaEncoding: 'ieee-p1363' }, Buffer.from(b.signature, 'base64'));
+  } catch { return false; }
+}
 api.post('/me/sign-key', auth, wrap(async (req, res) => {
-  const { signPublicKey, encSignPrivateKey } = req.body || {};
+  rateLimit('signkey:' + req.userId, 20, 10 * 60 * 1000);
+  const b = req.body || {};
+  const { signPublicKey, encSignPrivateKey } = b;
   if (!isB64ish(signPublicKey, 2000) || !isB64ish(encSignPrivateKey, 4000)) fail(400, 'Bad key material.');
   const row = getUserRow(req.userId);
   if (row.sign_public_key) fail(409, 'You already have a signing key.');
-  db.prepare('UPDATE users SET sign_public_key = ?, enc_sign_private_key = ? WHERE id = ?').run(signPublicKey, encSignPrivateKey, req.userId);
+  if (!b.nonce && !b.keyProof) fail(400, 'This page is out of date. Reload and try again.', 'need_proof');
+  if (!signKeyProofOk(row, b)) { secEvent('sign_key_bad_proof', req.ip, row.username); fail(403, 'That signing key couldn\u2019t be confirmed. Reload the page and try again.', 'bad_key_proof'); }
+  if (db.prepare('UPDATE users SET sign_public_key = ?, enc_sign_private_key = ? WHERE id = ? AND sign_public_key IS NULL').run(signPublicKey, encSignPrivateKey, req.userId).changes !== 1) fail(409, 'You already have a signing key.');
   broadcastUser(req.userId);
   res.json(selfUser(getUserRow(req.userId)));
+}));
+
+// Your password-locked private key, for changing the password or making a recovery key on this device.
+// It needs the password (not just a session): with only a stolen session, someone could otherwise take the
+// locked key away and guess the password offline, as fast as they like. Checked like any other sensitive
+// change (stepUp): the same guess limit, and a two-factor code when that's on, as signing in would need.
+api.post('/me/keys/wrapped', auth, wrap(async (req, res) => {
+  const row = await stepUp(req, req.body);
+  res.json({ encPrivateKey: row.enc_private_key, kdf: row.kdf, kdfSalt: row.kdf_salt });
 }));
 
 // ---------------------------------------------------------------- bootstrap
@@ -1129,7 +1696,9 @@ api.get('/bootstrap', auth, (req, res) => {
   dms.forEach((d) => ids.add(d.userId));
   relationships.forEach((r) => ids.add(r.userId));
   const users = {};
-  for (const id of ids) { const u = publicUser(getUserRow(id)); if (u) users[id] = u; }
+  const rows = userRows(ids);
+  for (const id of ids) { const u = publicUser(rows.get(id)); if (u) users[id] = u; }
+  withPastKeys(users);
   users[uid] = selfUser(me);
   const voice = {};
   servers.forEach((s) => s.channels.filter((c) => c.type === 'voice').forEach((c) => { voice[c.id] = voiceStateList(c.id); }));
@@ -1137,7 +1706,10 @@ api.get('/bootstrap', auth, (req, res) => {
   const keyStates = {};
   servers.forEach((s) => { keyStates[s.id] = keyState(s.id, uid); });
   const blocked = db.prepare('SELECT blocked_id FROM blocks WHERE blocker_id = ?').all(uid).map((r) => r.blocked_id);
-  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid), me: selfUser(me), encPrivateKey: me.enc_private_key, encSignPrivateKey: me.enc_sign_private_key, servers, dms, relationships, users, voice, keyStates, blocked });
+  // No password-locked private key here: a session alone must not be enough to take it away and guess the
+  // password offline (POST /me/keys/wrapped hands it out with the password). The signing key's private half
+  // is locked with the identity key, not the password, so it can't be guessed at and stays.
+  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid, req.session.id), me: selfUser(me), encSignPrivateKey: me.enc_sign_private_key, e2eeSince: Number(getSetting('e2eeSince')) || 0, servers, dms, relationships, users, voice, keyStates, blocked });
 });
 
 // ---------------------------------------------------------------- profile
@@ -1157,25 +1729,62 @@ function broadcastPresence(userId) {
   const row = getUserRow(userId);
   if (!row) return;
   presenceQueue.set(userId, isOnline(row.id) && row.status !== 'invisible' ? row.status : 'offline');
-  if (!presenceTimer) presenceTimer = setTimeout(flushPresence, 1000);
+  if (!presenceTimer) presenceTimer = setTimeout(jobs.job('presence.flush', flushPresence), 1000);
   io.to(`user:${userId}`).emit('user:update', selfUser(row));
 }
-function broadcastUser(userId) {
+// Who sees a person in their app: everyone in a server with them, friends and friend requests, and DM partners.
+// Profile changes go only there (not to every socket on the instance), and a burst of changes becomes one
+// update a second, so one account editing in a loop can't make every open app redraw.
+function userAudience(userId) {
+  const rooms = db.prepare('SELECT server_id FROM members WHERE user_id = ?').all(userId).map((r) => `server:${r.server_id}`);
+  const peers = db.prepare(`SELECT CASE WHEN requester_id = ? THEN addressee_id ELSE requester_id END AS id FROM friendships WHERE requester_id = ? OR addressee_id = ?
+    UNION SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END FROM dm_channels WHERE user_a = ? OR user_b = ?`).all(userId, userId, userId, userId, userId, userId);
+  return [...rooms, ...peers.map((p) => `user:${p.id}`)];
+}
+const userUpdateQueue = new Map(); // user id -> rooms told on top of whoever shares something with them then
+let userUpdateTimer = null;
+function flushUserUpdates() {
+  userUpdateTimer = null;
+  const queued = [...userUpdateQueue];
+  userUpdateQueue.clear();
+  for (const [id, extra] of queued) {
+    const row = getUserRow(id);
+    const rooms = row ? [...new Set([...extra, ...userAudience(id)])] : [];
+    if (rooms.length) io.to(rooms).except(`user:${id}`).emit('user:update', publicUser(row));
+  }
+}
+// audience: rooms worked out before a change that also ends what they shared (deleting an account leaves every
+// server and friendship first), so the people who still have that person on screen hear about it too.
+function broadcastUser(userId, audience) {
   const row = getUserRow(userId);
-  io.except(`user:${userId}`).emit('user:update', publicUser(row));
-  io.to(`user:${userId}`).emit('user:update', selfUser(row));
+  if (!row) return;
+  io.to(`user:${userId}`).emit('user:update', selfUser(row)); // their own apps: right away
+  const rooms = userUpdateQueue.get(userId) || new Set();
+  if (Array.isArray(audience)) audience.forEach((r) => rooms.add(r));
+  userUpdateQueue.set(userId, rooms);
+  if (!userUpdateTimer) userUpdateTimer = setTimeout(jobs.job('users.flush_updates', flushUserUpdates), 1000);
+}
+// Profile edits: plenty for a person saving changes, not enough to flood the instance from a script.
+function limitProfileWrites(req) {
+  rateLimit('profile:' + req.userId, 30, 60000);
+  rateLimit('profileh:' + req.userId, 300, 3600000);
+  limitNet(req, 'profile', 120, 60000);
 }
 
 api.patch('/me/profile', auth, (req, res) => {
   requireUnlocked(req.userId);
+  limitProfileWrites(req);
   const row = getUserRow(req.userId);
   const profile = sanitizeProfile(req.body || {}, parseProfile(row));
   checkWords(profile.displayName, profile.pronouns, profile.bio, profile.aboutMe, profile.headline, profile.mood.text, profile.customStatus.text, profile.interests, profile.songTitle, profile.links.map((l) => l.label));
   if (!profile.displayName) profile.displayName = row.username;
   // Top friends must actually be friends.
   profile.topFriends = profile.topFriends.filter((id) => areFriends(req.userId, id));
-  db.prepare('UPDATE users SET profile = ? WHERE id = ?').run(JSON.stringify(profile), req.userId);
-  broadcastUser(req.userId);
+  const json = JSON.stringify(profile);
+  if (json !== row.profile) { // saving the same thing again changes nothing, so nobody needs telling
+    db.prepare('UPDATE users SET profile = ? WHERE id = ?').run(json, req.userId);
+    broadcastUser(req.userId);
+  }
   res.json(selfUser(getUserRow(req.userId)));
 });
 
@@ -1212,10 +1821,13 @@ api.post('/me/song', auth, (req, res, next) => { try { requireUnlocked(req.userI
   res.json(selfUser(getUserRow(req.userId)));
 });
 api.delete('/me/song', auth, (req, res) => {
+  limitProfileWrites(req);
   const row = getUserRow(req.userId);
-  db.prepare('UPDATE users SET song = NULL WHERE id = ?').run(req.userId);
-  removeUpload(row.song);
-  broadcastUser(req.userId);
+  if (row.song) {
+    db.prepare('UPDATE users SET song = NULL WHERE id = ?').run(req.userId);
+    removeUpload(row.song);
+    broadcastUser(req.userId);
+  }
   res.json(selfUser(getUserRow(req.userId)));
 });
 api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(req.userId); next(); } catch (e) { next(e); } }, limited('image', uploadImage, 'file'), (req, res) => {
@@ -1234,18 +1846,21 @@ api.post('/me/media/:kind', auth, (req, res, next) => { try { requireUnlocked(re
 api.delete('/me/media/:kind', auth, (req, res) => {
   const col = Object.hasOwn(MEDIA_KINDS, req.params.kind) ? MEDIA_KINDS[req.params.kind] : null;
   if (!col) fail(404, 'Unknown media type.');
+  limitProfileWrites(req);
   const old = getUserRow(req.userId)[col];
-  db.prepare(`UPDATE users SET ${col} = NULL WHERE id = ?`).run(req.userId);
-  setMediaCrop(req.userId, req.params.kind, {});
-  removeUpload(old);
-  broadcastUser(req.userId);
+  if (old) {
+    db.prepare(`UPDATE users SET ${col} = NULL WHERE id = ?`).run(req.userId);
+    setMediaCrop(req.userId, req.params.kind, {});
+    removeUpload(old);
+    broadcastUser(req.userId);
+  }
   res.json(selfUser(getUserRow(req.userId)));
 });
 
 api.get('/users/:id', auth, (req, res) => {
   const u = publicUser(getUserRow(req.params.id));
   if (!u) fail(404, 'User not found.');
-  res.json(u);
+  res.json(withPastKeys({ [u.id]: u })[u.id]);
 });
 
 // ---------------------------------------------------------------- friends
@@ -1320,7 +1935,14 @@ api.patch('/servers/:id', auth, (req, res) => {
   const onlyOrder = Object.keys(body).every((k) => k === 'categoryOrder');
   if (srv.kind !== 'group' && !can(srv, req.userId, onlyOrder ? PM.MANAGE_CHANNELS : PM.MANAGE_SERVER)) fail(403, 'You need the Manage Server permission.');
   if (body.description !== undefined) db.prepare('UPDATE servers SET description = ? WHERE id = ?').run(String(body.description || '').slice(0, 300), srv.id);
-  if (body.theme && typeof body.theme === 'object') db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(cleanTheme(body.theme, themeOf(srv))), srv.id);
+  if (body.theme && typeof body.theme === 'object') {
+    const cur = themeOf(srv);
+    const next = cleanTheme(body.theme, cur);
+    db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(next), srv.id);
+    // Switching the background from a picture to colours drops the picture: remove its file too.
+    const oldImage = cur.background && cur.background.image;
+    if (oldImage && oldImage !== (next.background && next.background.image)) removeUpload(oldImage);
+  }
   if (Array.isArray(body.categoryOrder)) {
     const order = [...new Set(body.categoryOrder.map((c) => String(c).trim().slice(0, 32)).filter(Boolean))].slice(0, 50);
     db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify(order), srv.id);
@@ -1335,7 +1957,9 @@ api.patch('/servers/:id', auth, (req, res) => {
 });
 
 api.post('/servers/:id/icon', auth, limited('image', uploadImage, 'icon'), (req, res) => {
-  const srv = requirePerm(req.params.id, req.userId, PM.MANAGE_SERVER);
+  const srv = requireServer(req.params.id, req.userId);
+  // Anyone in a group chat can change its picture (like its name); servers need Manage Server.
+  if (srv.kind !== 'group' && !can(srv, req.userId, PM.MANAGE_SERVER)) fail(403, 'You don’t have permission to do that.');
   if (!req.file) fail(400, 'Choose an image.');
   db.prepare('UPDATE servers SET icon = ? WHERE id = ?').run('/uploads/' + req.file.filename, srv.id);
   removeUpload(srv.icon);
@@ -1350,45 +1974,74 @@ function kickFromVoiceInServer(serverId, userId) {
   if (!c || c.server_id === serverId) leaveVoice(userId, true);
 }
 
-api.delete('/servers/:id', auth, (req, res) => {
-  const s = requireOwner(req.params.id, req.userId);
+// Deleting a server or handing it to someone else can't be undone, so like other sensitive changes it needs your
+// password (and a two-factor code when that's on): a stolen sign-in alone can't wipe or take your servers.
+api.delete('/servers/:id', auth, wrap(async (req, res) => {
+  requireOwner(req.params.id, req.userId);
+  const row = await stepUp(req, req.body);
+  const s = requireOwner(req.params.id, req.userId); // checked again: the password check took a moment
   db.prepare('SELECT id FROM channels WHERE server_id = ?').all(s.id).forEach((c) => {
     const m = voiceChannels.get(c.id);
     if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
   });
-  removeMessageFiles(db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(s.id).map((r) => r.id));
-  db.prepare('DELETE FROM reactions WHERE message_id IN (SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?)').run(s.id);
+  purgeServerContent(s);
   MEMB.onServerDeleted(s.id);
   db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
-  removeUpload(s.icon);
   io.to(`server:${s.id}`).emit('server:remove', { serverId: s.id });
   io.in(`server:${s.id}`).socketsLeave(`server:${s.id}`);
+  auditLog(req, 'server_deleted', s.id, s.name);
+  ACCT.notify(row, 'a server was deleted', `${row.username} deleted the server "${s.name}" with all its channels, messages and files.`);
   res.json({ ok: true });
-});
+}));
 
+// Leaving is never rate limited. Every leave needs a membership, which for a server takes a join (limited below), and
+// a group never has more than GROUP_MAX people to tell. A limit here would also trap people: anyone in a group can
+// add you back, so someone could re-add you faster than you were allowed to leave.
 api.post('/servers/:id/leave', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   if (s.kind === 'group' && s.owner_id === req.userId) {
     const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(s.id, req.userId);
     if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, s.id);
   } else if (s.owner_id === req.userId) fail(400, 'Owners cannot leave their own server. Delete it or hand it off first.');
-  removeMember(s.id, req.userId);
+  const held = removeMember(s.id, req.userId);
   const left = db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n;
-  if (s.kind === 'group' && !left) db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
-  else emitServer(s.id);
+  if (s.kind === 'group' && !left) {
+    purgeServerContent(s);
+    db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
+  }
+  // A server's members already got member:remove (their apps drop the person from the list). A group may also
+  // have a new owner, so its members get the whole group again. So does a server where the person had roles or
+  // their own channel permissions: apps that stay open would otherwise keep those and send them back when the
+  // person rejoins (ticking another role sends the roles they had; saving a channel sends its permissions).
+  else if (s.kind === 'group' || held) emitServer(s.id);
   res.json({ ok: true });
 });
 
 function removeMember(serverId, userId) {
   MEMB.onLeave(serverId, userId);
   kickFromVoiceInServer(serverId, userId);
-  db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
+  // Everything that was theirs as a member goes too: roles and per-channel overrides (or rejoining with any
+  // invite, even after an unban, would hand back Administrator and private channels) and event RSVPs (or
+  // they'd keep getting reminders about events they can no longer see). Returns how many roles and channel
+  // overrides went, so callers know whether the other members' copies of the server are out of date.
+  let held = 0;
+  db.transaction(() => {
+    db.prepare('DELETE FROM members WHERE server_id = ? AND user_id = ?').run(serverId, userId);
+    held = db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ?').run(serverId, userId).changes
+      + db.prepare("DELETE FROM channel_overrides WHERE target_type = 'member' AND target_id = ? AND channel_id IN (SELECT id FROM channels WHERE server_id = ?)").run(userId, serverId).changes;
+    db.prepare('DELETE FROM event_rsvps WHERE user_id = ? AND event_id IN (SELECT id FROM server_events WHERE server_id = ?)').run(userId, serverId);
+    // Remembered on its own (not just through their key rows, which a password reset deletes), so coming back
+    // switches keys again.
+    db.prepare('INSERT OR REPLACE INTO former_members (server_id, user_id, left_at) VALUES (?, ?, ?)').run(serverId, userId, now());
+  })();
   // They still hold old keys, so the remaining members must switch to a fresh key.
   db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ?').run(serverId);
   io.in(`user:${userId}`).socketsLeave(`server:${serverId}`);
   io.to(`user:${userId}`).emit('server:remove', { serverId });
   io.to(`server:${serverId}`).emit('member:remove', { serverId, userId });
   emitKeyState(serverId);
+  if (BOTS) BOTS.event('member.left', serverId, { serverId, userId }, { actorId: userId });
+  return held;
 }
 
 api.delete('/servers/:id/members/:uid', auth, (req, res) => {
@@ -1401,51 +2054,98 @@ api.delete('/servers/:id/members/:uid', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Give/take roles. You can only hand out roles below your own highest role.
+// Give/take roles. You can only hand out roles below your own highest role, and only roles whose permissions
+// you have yourself (or a Manage Roles holder could give anyone, themselves included, an Administrator role
+// that happens to sit lower in the list). A role's per-channel overrides count too: giving it can't allow, and
+// taking it away can't lift a deny on, anything you don't have in that channel yourself (or a lower role that
+// can see a private channel, or one that keeps someone out of it, would be a way in).
 api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.MANAGE_ROLES, 'You need the Manage Roles permission.');
   const uid = req.params.uid;
   if (!isMember(s.id, uid)) fail(404, 'That person is not in this server.');
   const myTop = perms.top(s, req.userId);
+  const mine = perms.base(s, req.userId);
   if (uid === s.owner_id && req.userId !== s.owner_id) fail(403, 'Only the owner can change the owner\u2019s roles.');
   if (uid !== req.userId && uid !== s.owner_id && perms.top(s, uid) >= myTop) fail(403, 'You can only change roles for people below you.');
   const wanted = new Set((Array.isArray((req.body || {}).roleIds) ? req.body.roleIds : []).map(String));
   const all = db.prepare('SELECT * FROM roles WHERE server_id = ? AND id != ?').all(s.id, s.id);
   const current = new Set(db.prepare('SELECT role_id FROM member_roles WHERE server_id = ? AND user_id = ?').all(s.id, uid).map((r) => r.role_id));
+  const changed = all.filter((r) => current.has(r.id) !== wanted.has(r.id));
+  const lifted = new Map(); // channel id -> deny bits of roles being taken away there
+  const myIn = (chId) => perms.channel(s, { id: chId }, req.userId);
+  for (const r of changed) {
+    const want = wanted.has(r.id);
+    if (r.position >= myTop) fail(403, `You can't assign or remove "${r.name}" — it's not below your highest role.`);
+    if (want && (r.permissions & ALL_PERMS & ~mine)) fail(403, `You can't give "${r.name}": it has permissions you don't have.`);
+    for (const o of db.prepare("SELECT channel_id, allow, deny FROM channel_overrides WHERE target_type = 'role' AND target_id = ?").all(r.id)) {
+      if (want && (o.allow & CHANNEL_SCOPED & ~myIn(o.channel_id))) fail(403, `You can't give "${r.name}": it has channel permissions you don't have.`);
+      if (!want && o.deny) lifted.set(o.channel_id, (lifted.get(o.channel_id) || 0) | o.deny);
+    }
+  }
+  // Only what the person really gets back counts (unmuting someone in a channel where everyone is muted anyway is fine).
+  const was = [...lifted.keys()].map((chId) => [chId, perms.channel(s, { id: chId }, uid), myIn(chId)]);
   db.transaction(() => {
-    for (const r of all) {
-      const has = current.has(r.id); const want = wanted.has(r.id);
-      if (has === want) continue;
-      if (r.position >= myTop) fail(403, `You can't assign or remove "${r.name}" — it's not below your highest role.`);
-      if (want) db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(s.id, uid, r.id);
+    for (const r of changed) {
+      if (wanted.has(r.id)) db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(s.id, uid, r.id);
       else db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(s.id, uid, r.id);
+    }
+    for (const [chId, before, my] of was) {
+      if ((perms.channel(s, { id: chId }, uid) & ~before) & lifted.get(chId) & ~my) fail(403, 'You can\u2019t take that role away: it limits them in a channel where you don\u2019t have that permission yourself.');
     }
   })();
   emitServer(s.id);
   res.json({ ok: true });
 });
 
-api.post('/servers/:id/transfer', auth, (req, res) => {
-  const s = requireOwner(req.params.id, req.userId);
+api.post('/servers/:id/transfer', auth, wrap(async (req, res) => {
   const to = String((req.body || {}).userId || '');
+  if (!isMember(requireOwner(req.params.id, req.userId).id, to)) fail(404, 'That person is not in this server.');
+  const row = await stepUp(req, req.body); // see DELETE /servers/:id
+  const s = requireOwner(req.params.id, req.userId);
   if (!isMember(s.id, to)) fail(404, 'That person is not in this server.');
   db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(to, s.id);
   emitServer(s.id);
+  const toName = (getUserRow(to) || {}).username || to;
+  auditLog(req, 'server_transferred', s.id, `${s.name} \u2192 ${toName}`);
+  ACCT.notify(row, 'you handed over a server', `${row.username} made ${toName} the owner of the server "${s.name}".`);
   const out = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(s.id), req.userId);
   res.json(out);
-});
+}));
 
 // ---------------------------------------------------------------- invites
 api.post('/servers/:id/invites', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   if (s.kind === 'group') fail(400, 'Add people to a group from its member list.');
   if (!can(s, req.userId, PM.CREATE_INVITE)) fail(403, 'You don\u2019t have permission to create invites.');
-  const maxUses = Math.max(0, Math.min(1000, parseInt((req.body || {}).maxUses || '0', 10) || 0));
-  const hours = Math.max(0, Math.min(24 * 30, parseInt((req.body || {}).expiresHours || '0', 10) || 0));
+  const b = req.body || {};
+  const maxUses = Math.max(0, Math.min(1000, parseInt(b.maxUses || '0', 10) || 0));
+  // A link expires after 7 days unless the request picks something else (0 = never), so API clients and older
+  // apps that leave it out don't make permanent links by accident.
+  const hours = b.expiresHours === undefined || b.expiresHours === null || b.expiresHours === '' ? 168
+    : Math.max(0, Math.min(24 * 30, parseInt(b.expiresHours, 10) || 0));
   const code = randomCode(8);
   db.prepare('INSERT INTO invites (code, server_id, creator_id, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(code, s.id, req.userId, maxUses, hours ? now() + hours * 3600000 : null, now());
   res.json({ code });
+});
+
+// The invites that still work. People with Manage Server see them all (to revoke a leaked one); anyone else
+// sees only the ones they made.
+const inviteOut = (i) => ({ code: i.code, creatorId: i.creator_id, uses: i.uses, maxUses: i.max_uses, expiresAt: i.expires_at, createdAt: i.created_at });
+api.get('/servers/:id/invites', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  const all = can(s, req.userId, PM.MANAGE_SERVER);
+  res.json(db.prepare(`SELECT * FROM invites WHERE server_id = ? AND (? OR creator_id = ?) AND (expires_at IS NULL OR expires_at > ?)
+      AND (max_uses = 0 OR uses < max_uses) ORDER BY created_at DESC LIMIT 200`).all(s.id, all ? 1 : 0, req.userId, now()).map(inviteOut));
+});
+// Revoke an invite: whoever made it, or anyone with Manage Server in the invite's own server.
+api.delete('/invites/:code', auth, (req, res) => {
+  const inv = db.prepare('SELECT * FROM invites WHERE code = ?').get(String(req.params.code));
+  if (!inv) fail(404, 'That invite does not exist.');
+  const s = requireServer(inv.server_id, req.userId);
+  if (inv.creator_id !== req.userId && !can(s, req.userId, PM.MANAGE_SERVER)) fail(403, 'Only the person who made this invite (or someone with Manage Server) can revoke it.');
+  db.prepare('DELETE FROM invites WHERE code = ?').run(inv.code);
+  res.json({ ok: true });
 });
 
 function validInvite(code) {
@@ -1463,29 +2163,50 @@ api.get('/invites/:code', auth, (req, res) => {
   res.json({ serverId: s.id, name: s.name, icon: s.icon, memberCount: count, alreadyMember: isMember(s.id, req.userId) });
 });
 
+// Joining updates everyone in the server (and their keys), so it's limited: a script that joins and leaves a big
+// community in a loop would otherwise keep the whole instance busy.
 api.post('/invites/:code/join', auth, (req, res) => {
+  rateLimit('join:' + req.userId, 20, 3600000);
+  limitNet(req, 'join', 60, 3600000);
   const inv = validInvite(req.params.code);
   const sid = inv.server_id;
   if (db.prepare('SELECT 1 FROM bans WHERE server_id = ? AND user_id = ?').get(sid, req.userId)) fail(403, 'You are banned from this server.');
-  if (!isMember(sid, req.userId)) {
+  const joined = !isMember(sid, req.userId);
+  if (joined) {
+    keyOnRejoin(sid, req.userId);
     db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(sid, req.userId, now());
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(inv.code);
     io.to(`server:${sid}`).emit('member:add', { serverId: sid, user: publicUser(getUserRow(req.userId)) });
     io.in(`user:${req.userId}`).socketsJoin(`server:${sid}`);
+    BOTS.event('member.joined', sid, { serverId: sid, userId: req.userId, joinedAt: now() }, { actorId: req.userId });
     MEMB.syncRoles(sid, req.userId); // back with a membership they still pay for: their role comes back too
   }
   const server = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(sid), req.userId);
   const users = {};
-  server.memberIds.forEach((id) => { users[id] = publicUser(getUserRow(id)); });
+  const rows = userRows(server.memberIds);
+  server.memberIds.forEach((id) => { users[id] = publicUser(rows.get(id)); });
   const voice = {};
   server.channels.filter((c) => c.type === 'voice').forEach((c) => { voice[c.id] = voiceStateList(c.id); });
   io.to(`user:${req.userId}`).emit('server:add', { server, users, voice, keyState: keyState(sid, req.userId) });
-  emitKeyState(sid);
+  // Someone new needs the server key, so the members holding it hear about that (nothing changed if they were in already).
+  if (joined) emitKeyState(sid);
   res.json({ ...server, keyState: keyState(sid, req.userId) });
 });
 
 // ---------------------------------------------------------------- server encryption keys
-const isWrapped = (s) => typeof s === 'string' && s.length > 40 && s.length < 2000;
+// A wrapped server key exactly as the apps make it (e2ee.js wrapGroupKey): w1:<ephemeral P-256 public key>:
+// <12-byte iv>:<32-byte key + 16-byte tag>:<64-byte signature>, all base64. Checked strictly, so a member can't
+// fill the database (and every member's start-up) with junk "keys".
+const B64_FIELD = /^[A-Za-z0-9+/]+={0,2}$/;
+const b64Len = (x) => (B64_FIELD.test(x) && x.length % 4 === 0 ? Buffer.from(x, 'base64').length : -1);
+function isWrapped(w) {
+  if (typeof w !== 'string' || w.length > 600) return false;
+  const p = w.split(':');
+  if (p.length !== 5 || p[0] !== 'w1') return false;
+  const eph = b64Len(p[1]);
+  const sig = b64Len(p[4]);
+  return eph >= 60 && eph <= 120 && b64Len(p[2]) === 12 && b64Len(p[3]) === 48 && sig >= 64 && sig <= 72;
+}
 // Which wrapped keys were made for a public key the person no longer has (the sharer's app had stale info).
 // Apps send the public key they wrapped for; older apps that don't are trusted as before.
 function staleWraps(pubs, ids) {
@@ -1493,45 +2214,104 @@ function staleWraps(pubs, ids) {
   const get = db.prepare('SELECT public_key FROM users WHERE id = ?');
   return ids.filter((uid) => typeof pubs[uid] === 'string' && (get.get(uid) || {}).public_key !== pubs[uid]);
 }
+// Someone who was in this server before is back, e.g. after a kick with an invite they kept: switch to a new key,
+// so they can't read what was said while they were away. Known from former_members (kept through a password
+// reset, which deletes their key rows), or from key rows of theirs (people who left before that was recorded).
+function keyOnRejoin(serverId, userId) {
+  if (db.prepare('SELECT 1 FROM former_members WHERE server_id = ? AND user_id = ?').get(serverId, userId)
+    || db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ? LIMIT 1').get(serverId, userId)) {
+    db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ? AND key_epoch > 0').run(serverId);
+  }
+}
 
 api.get('/servers/:id/keys', auth, (req, res) => {
   requireServer(req.params.id, req.userId);
   res.json(keyState(req.params.id, req.userId));
 });
 
-// Start a new key epoch. The client generated a fresh random key and wrapped it to every member.
+const HOUR_MS = 60 * 60 * 1000;
+const VOLUNTARY_ROTATE_MS = 10 * 60 * 1000;
+const reportersOf = (serverId, epoch) => db.prepare(`SELECT COUNT(*) AS n FROM server_key_reports r JOIN members m
+    ON m.server_id = r.server_id AND m.user_id = r.user_id WHERE r.server_id = ? AND r.epoch = ?`).get(serverId, epoch).n;
+const membersBut = (serverId, userId) => db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ? AND user_id != ?').get(serverId, userId).n;
+// Whether this member is behind the current key needing replacing, in a way they could arrange on purpose. Their
+// own rotation then counts as voluntary (limitVoluntary), so nobody can skip the limits by asking for a new key
+// and then making it themselves, e.g. one nobody else can open:
+//   - they came back after this key was made (a kicked member with an old invite);
+//   - members reported this key broken, and they made it;
+//   - they reported it broken, while another member is online who neither made nor reported it (that member's
+//     app opened it fine, so it can make the next one). When everyone online reported it, it really is broken
+//     for them, and any of them may replace it at once.
+function causedRotation(serverId, epoch, userId) {
+  const ep = db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, epoch);
+  if (!ep) return false;
+  if (db.prepare(`SELECT 1 FROM former_members f JOIN members m ON m.server_id = f.server_id AND m.user_id = f.user_id
+      WHERE f.server_id = ? AND f.user_id = ? AND m.joined_at > ?`).get(serverId, userId, ep.created_at)) return true;
+  const reporters = db.prepare('SELECT user_id FROM server_key_reports WHERE server_id = ? AND epoch = ?').all(serverId, epoch).map((r) => r.user_id);
+  if (!reporters.length) return false;
+  if (userId === ep.creator_id) return true;
+  if (!reporters.includes(userId)) return false;
+  return db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
+    .some((m) => m.user_id !== userId && m.user_id !== ep.creator_id && !reporters.includes(m.user_id) && isOnline(m.user_id));
+}
+// Replacing a key nobody needs replaced: every rotation adds a row per member, every app unlocks every key it
+// holds at start-up, and a member could otherwise keep swapping in keys the others can't open. People who manage
+// the server have an allowance of their own (30 an hour), so nobody else's rotations can use it up; others wait
+// until the current key is 10 minutes old, and at most 12 keys an hour are made per server. Only keys actually
+// made count, never refused attempts, so sending bad ones can't hold anyone up.
+function limitVoluntary(s, epoch, userId) {
+  const t = now();
+  if (s.kind !== 'group' && can(s, userId, PM.MANAGE_SERVER)) {
+    const mine = db.prepare('SELECT COUNT(*) AS n, MIN(created_at) AS first FROM server_epochs WHERE server_id = ? AND creator_id = ? AND created_at > ?').get(s.id, userId, t - HOUR_MS);
+    if (mine.n >= 30) fail(429, 'You\u2019ve replaced this key many times in the last hour. Try again later.', 'rate_limited', Math.max(1, Math.ceil((mine.first + HOUR_MS - t) / 1000)));
+    return;
+  }
+  const last = db.prepare('SELECT created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, epoch);
+  const wait = last ? last.created_at + VOLUNTARY_ROTATE_MS - t : 0;
+  if (wait > 0) fail(429, `This key was replaced less than 10 minutes ago. Try again in ${Math.ceil(wait / 60000)} min, or ask someone who manages the server.`, 'rotate_too_soon', Math.ceil(wait / 1000));
+  const all = db.prepare('SELECT COUNT(*) AS n, MIN(created_at) AS first FROM server_epochs WHERE server_id = ? AND created_at > ?').get(s.id, t - HOUR_MS);
+  if (all.n >= 12) fail(429, 'This key was replaced many times in the last hour. Try again later, or ask someone who manages the server.', 'rate_limited', Math.max(1, Math.ceil((all.first + HOUR_MS - t) / 1000)));
+}
+
+// Start a new key epoch. The client generated a fresh random key and wrapped it to every member. A key that's
+// needed (someone left or came back, or members reported the current one broken) is never held up, except for
+// whoever caused that (causedRotation); any other new key is limited (limitVoluntary).
 api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('rotate:' + req.userId, 30, 60 * 1000);
   const { epoch, check, wraps, pubs } = req.body || {};
   if (typeof check !== 'string' || !/^[A-Za-z0-9+/=]{16,64}$/.test(check)) fail(400, 'Bad key check.');
-  if (!wraps || typeof wraps !== 'object') fail(400, 'Missing wrapped keys.');
+  if (!wraps || typeof wraps !== 'object' || Array.isArray(wraps)) fail(400, 'Missing wrapped keys.');
+  if (!Object.values(wraps).every(isWrapped)) fail(400, 'Those wrapped keys aren\u2019t in the right format.', 'bad_wraps');
   const tx = db.transaction(() => {
-    const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
-    if (Number(epoch) !== cur + 1) fail(409, 'Someone else just refreshed the key.', 'epoch');
+    const cur = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(s.id);
+    if (Number(epoch) !== cur.key_epoch + 1) fail(409, 'Someone else just refreshed the key.', 'epoch');
+    if (cur.key_epoch && !(cur.needs_rotation && !causedRotation(s.id, cur.key_epoch, req.userId))) limitVoluntary(s, cur.key_epoch, req.userId);
     const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(s.id).map((r) => r.user_id);
     const ids = Object.keys(wraps);
     if (ids.length !== members.length || !members.every((m) => isWrapped(wraps[m]))) fail(409, 'The member list changed. Try again.', 'members');
     const stale = staleWraps(pubs, members);
     if (stale.length) fail(409, 'A member\u2019s keys just changed. Try again.', 'stale_keys');
     const t = now();
-    db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur + 1, check, req.userId, t);
+    db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur.key_epoch + 1, check, req.userId, t);
     const ins = db.prepare('INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
-    members.forEach((m) => ins.run(s.id, cur + 1, m, wraps[m], req.userId, t));
-    db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0 WHERE id = ?').run(cur + 1, s.id);
+    members.forEach((m) => ins.run(s.id, cur.key_epoch + 1, m, wraps[m], req.userId, t));
+    db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0 WHERE id = ?').run(cur.key_epoch + 1, s.id);
   });
   tx();
   emitKeyState(s.id);
   res.json(keyState(s.id, req.userId));
 });
 
-// Give the current key to members who don't have it yet (new joiners).
+// Give the current key to members who don't have it yet (new joiners). Not while the key needs replacing:
+// whoever just came back must get the next key, not this one.
 api.post('/servers/:id/keys/share', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('share:' + req.userId, 60, 60 * 1000);
   const { epoch, wraps, pubs } = req.body || {};
-  const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
-  if (!cur || Number(epoch) !== cur) fail(409, 'That key is out of date.', 'epoch');
+  const st = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(s.id);
+  const cur = st.key_epoch;
+  if (!cur || Number(epoch) !== cur || st.needs_rotation) fail(409, 'That key is out of date.', 'epoch');
   if (!db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND epoch = ? AND user_id = ?').get(s.id, cur, req.userId)) fail(403, 'You do not have this key.');
   const ins = db.prepare('INSERT OR IGNORE INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
   let n = 0;
@@ -1543,15 +2323,57 @@ api.post('/servers/:id/keys/share', auth, (req, res) => {
   if (n) emitKeyState(s.id);
   res.json({ shared: n, stale });
 });
-// A member's app couldn't unlock the key it was given (wrapped for keys it no longer has, e.g. right after
-// a password reset): drop it so the others share it again.
+// A member's app couldn't unlock the CURRENT key it was given (wrapped for keys it no longer has, e.g. right
+// after a password reset): drop it so the others share it again. Older keys are never dropped: nobody can
+// share them again, so dropping one would lose that part of the history for good (and the app may only have
+// failed because whoever handed it out has changed keys since).
 api.post('/servers/:id/keys/bad', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('badkey:' + req.userId, 20, 60 * 60 * 1000);
   const epoch = Number((req.body || {}).epoch);
-  const n = db.prepare('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').run(s.id, req.userId, epoch).changes;
-  if (n) emitKeyState(s.id);
+  const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
+  if (!cur || epoch !== cur) return res.json({ removed: 0 });
+  const row = db.prepare('SELECT wrapper_id FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').get(s.id, req.userId, cur);
+  const n = db.prepare('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').run(s.id, req.userId, cur).changes;
+  if (n) {
+    const ep = db.prepare('SELECT creator_id FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, cur);
+    if (row && ep && row.wrapper_id === ep.creator_id && ep.creator_id !== req.userId) reportBroken(s, cur, ep.creator_id, req.userId);
+    emitKeyState(s.id);
+  }
   res.json({ removed: n });
+});
+// The copy the rotation itself handed out doesn't open for this member: the key may be broken, or made so that
+// others can't open it, and sharing can't fix that. Once enough members say so, the apps make a fresh key: two of
+// them (or the only other member), or one who manages the server (they could replace it any time anyway). One
+// member's reports count at most 12 times an hour per server (twice what the 10-minute rule lets anyone break),
+// and neither the key's maker nor a reporter makes the next key without the usual limits while someone else
+// can (causedRotation): nobody can use reports to keep the key churning or to skip the limits.
+const REPORTS_PER_HOUR = 12;
+function reportBroken(s, epoch, creatorId, userId) {
+  const t = now();
+  db.prepare('DELETE FROM server_key_reports WHERE server_id = ? AND epoch < ? AND created_at < ?').run(s.id, epoch, t - HOUR_MS);
+  if (db.prepare('SELECT COUNT(*) AS n FROM server_key_reports WHERE server_id = ? AND user_id = ? AND created_at > ?').get(s.id, userId, t - HOUR_MS).n >= REPORTS_PER_HOUR) return;
+  db.prepare('INSERT OR IGNORE INTO server_key_reports (server_id, epoch, user_id, created_at) VALUES (?, ?, ?, ?)').run(s.id, epoch, userId, t);
+  const enough = (s.kind !== 'group' && can(s, userId, PM.MANAGE_SERVER))
+    || reportersOf(s.id, epoch) >= Math.min(2, Math.max(1, membersBut(s.id, creatorId)));
+  if (enough) db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ? AND key_epoch = ?').run(s.id, epoch);
+}
+// Your app re-wraps the keys it was handed to yourself (signed by you), so your own history no longer depends
+// on whoever shared them keeping their keys. Only your own rows, and only keys you already have.
+api.post('/servers/:id/keys/self', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  rateLimit('selfkeys:' + req.userId, 30, 60 * 1000);
+  const wraps = (req.body || {}).wraps;
+  if (!wraps || typeof wraps !== 'object' || Array.isArray(wraps)) fail(400, 'Missing wrapped keys.');
+  const upd = db.prepare('UPDATE server_keys SET wrapped = ?, wrapper_id = ? WHERE server_id = ? AND user_id = ? AND epoch = ?');
+  let n = 0;
+  db.transaction(() => {
+    for (const [e, w] of Object.entries(wraps).slice(0, 500)) {
+      const ep = Number(e);
+      if (Number.isInteger(ep) && ep > 0 && isWrapped(w)) n += upd.run(w, req.userId, s.id, req.userId, ep).changes;
+    }
+  })();
+  res.json({ updated: n });
 });
 
 // ---------------------------------------------------------------- channels
@@ -1594,15 +2416,23 @@ api.post('/servers/:id/channels', auth, (req, res) => {
   const pos = (db.prepare('SELECT MAX(position) AS p FROM channels WHERE server_id = ?').get(s.id).p ?? -1) + 1;
   const id = newId();
   db.prepare('INSERT INTO channels (id, server_id, name, type, position, created_at, category) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, type, pos, now(), category);
-  const ch = serializeChannel(db.prepare('SELECT * FROM channels WHERE id = ?').get(id));
+  const row = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  const ch = serializeChannel(row);
   emitServer(s.id);
+  BOTS.event('channel.created', s.id, { channelId: id, name: row.name, type: row.type, category: row.category }, { channel: row, actorId: req.userId });
   res.json(ch);
 });
 
+// Editing or deleting a channel needs Manage Channels in that channel: a channel you can't see stays "not found",
+// and a per-channel deny of Manage Channels is respected.
+function requireManageableChannel(channelId, userId) {
+  const c = requireChannel(channelId, userId);
+  const s = requireAdmin(c.server_id, userId);
+  if (!canIn(s, c, userId, PM.MANAGE_CHANNELS)) fail(403, 'You don\u2019t have permission to manage this channel.');
+  return c;
+}
 api.patch('/channels/:id', auth, (req, res) => {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!c) fail(404, 'Channel not found.');
-  requireAdmin(c.server_id, req.userId);
+  const c = requireManageableChannel(req.params.id, req.userId);
   const name = req.body.name !== undefined ? cleanChannelName(req.body.name, c.type) : c.name;
   const topic = req.body.topic !== undefined ? String(req.body.topic).slice(0, 300) : c.topic;
   const category = req.body.category !== undefined ? (cleanCategory(req.body.category) || c.category) : c.category;
@@ -1615,13 +2445,12 @@ api.patch('/channels/:id', auth, (req, res) => {
 });
 
 api.delete('/channels/:id', auth, (req, res) => {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!c) fail(404, 'Channel not found.');
-  requireAdmin(c.server_id, req.userId);
+  const c = requireManageableChannel(req.params.id, req.userId);
   const m = voiceChannels.get(c.id);
   if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
-  removeMessageFiles(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
-  db.prepare('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?)').run(c.id);
+  // Bots hear about it first, while the channel (and who could see it) still exists.
+  BOTS.event('channel.deleted', c.server_id, { channelId: c.id, name: c.name, type: c.type }, { channel: c, actorId: req.userId });
+  forgetMessages(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
   db.prepare('DELETE FROM channels WHERE id = ?').run(c.id);
   emitServer(c.server_id);
   res.json({ ok: true });
@@ -1632,7 +2461,8 @@ const MAX_MESSAGE = 4000;
 
 // Page through a conversation: newest (default), ?before=id (older), ?after=id (newer) or ?around=id (jump).
 function pageRows(table, col, containerId, q, extra = '') {
-  const limit = Math.min(100, parseInt(q.limit || '50', 10) || 50);
+  // Between 1 and 100 (SQLite reads a negative LIMIT as "no limit": the whole history in one go).
+  const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 50));
   const base = `SELECT * FROM ${table} WHERE ${col} = ? ${extra}`;
   if (q.around) {
     const older = db.prepare(`${base} AND id <= ? ORDER BY id DESC LIMIT 26`).all(containerId, String(q.around));
@@ -1659,18 +2489,35 @@ api.get('/channels/:id/messages', auth, (req, res) => {
 
 // Who gets a push for a channel message. The sender's app tells us which members it @mentions
 // (that's the only part of the message the server learns), plus replies and group DMs.
-function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions) {
+// everyone: the sender's app says the message uses @everyone / @channel / @here; it counts only from someone
+// with Mention Everyone in this channel. Mentions and replies are also kept (mention_marks) for unread counts.
+function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, everyone) {
   const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id).filter((u) => u !== senderId);
   const url = '/#m/' + id;
-  if (srv.kind === 'group') return pushTo(members, { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', tag: 'c:' + c.id, url });
-  const where = `#${c.name} \u00b7 ${srv.name}`;
-  const mentioned = Array.isArray(mentions) ? mentions.slice(0, 50).map(String).filter((u) => members.includes(u)) : [];
-  pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, tag: 'c:' + c.id, url });
+  const base = { tag: 'c:' + c.id, url, generic: 'New message' };
+  const what = (kind) => ({ kind, serverId: srv.id, channelId: c.id });
+  // Only people who can see the channel: a push to anyone else would tell them a private channel's name.
+  const open = !perms.restricted(srv, c);
+  const reaches = (u) => members.includes(u) && (open || (perms.channel(srv, c, u) & PM.VIEW_CHANNEL) !== 0);
+  const mentioned = Array.isArray(mentions) ? [...new Set(mentions.slice(0, 50).map(String))].filter(reaches) : [];
+  const pingAll = srv.kind !== 'group' && everyone === true && canIn(srv, c, senderId, PM.MENTION_EVERYONE);
   const replyAuthor = replyTo && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(replyTo) || {}).author_id;
   const rootAuthor = threadId && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(threadId) || {}).author_id;
-  pushTo([replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && members.includes(u)),
-    { title: `${nameOf(senderId)} replied to you`, body: where, tag: 'c:' + c.id, url });
+  const replied = [replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && reaches(u));
+  if (USE && !threadId && srv.kind !== 'group') USE.recordMentions(id, 'c:' + c.id, [...mentioned, ...replied], pingAll);
+  if (srv.kind === 'group') {
+    const named = new Set(mentioned);
+    pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: srv.name ? `in ${srv.name}` : 'in your group', ...base }, what('mention'));
+    return pushTo(members.filter((u) => !named.has(u)), { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', ...base }, what('group'));
+  }
+  const where = `#${c.name} \u00b7 ${srv.name}`;
+  pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, ...base }, what('mention'));
+  pushTo(replied, { title: `${nameOf(senderId)} replied to you`, body: where, ...base }, what('reply'));
+  const told = new Set([...mentioned, ...replied]);
+  if (pingAll) pushTo(members.filter((u) => !told.has(u) && reaches(u)), { title: `${nameOf(senderId)} mentioned everyone`, body: where, ...base }, what('everyone'));
+  // People who picked "All messages" for this channel or server hear about the rest too.
+  if (USE && !threadId && !pingAll) pushTo(USE.wantsAll(srv, c).filter((u) => u !== senderId && !told.has(u) && reaches(u)), { title: nameOf(senderId), body: where, ...base }, what('message'));
 }
 
 const validCipher = (c) => {
@@ -1703,8 +2550,10 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   if (Array.isArray(files) && files.length && !(cp & PM.ATTACH_FILES)) fail(403, 'You don\u2019t have permission to attach files here.');
   if ((req.body || {}).threadId && !(cp & PM.CREATE_THREADS)) fail(403, 'You don\u2019t have permission to reply in threads here.');
   if (c.slowmode > 0 && !(cp & (PM.MANAGE_MESSAGES | PM.MANAGE_CHANNELS))) {
-    const last = db.prepare('SELECT created_at FROM messages WHERE channel_id = ? AND author_id = ? ORDER BY id DESC LIMIT 1').get(c.id, req.userId);
-    const wait = last ? Math.ceil((last.created_at + c.slowmode * 1000 - now()) / 1000) : 0;
+    // Their latest message here: one lookup in the (channel, author, time) index. Ordering by id instead walked the
+    // channel's whole history, newest first, for someone who had never written there.
+    const last = db.prepare('SELECT MAX(created_at) AS created_at FROM messages WHERE channel_id = ? AND author_id = ?').get(c.id, req.userId);
+    const wait = last && last.created_at != null ? Math.ceil((last.created_at + c.slowmode * 1000 - now()) / 1000) : 0;
     if (wait > 0) fail(429, `Slowmode is on. You can send another message in ${wait}s.`, 'slowmode');
   }
   const ep = requireCurrentEpoch(c.server_id, epoch);
@@ -1722,7 +2571,10 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
   withNonce(msg, req.body);
   toChannel(c).emit('message:new', msg);
-  notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions);
+  notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions, (req.body || {}).everyone);
+  if (USE && !threadId) USE.markSent(req.userId, 'c:' + c.id, id);
+  // Bots get who, where and when: never the text, which is end-to-end encrypted.
+  BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId: req.userId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null }, { channel: c, actorId: req.userId });
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
   res.json(msg);
 });
@@ -1731,6 +2583,7 @@ api.patch('/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
   const c = requireChannel(m.channel_id, req.userId);
+  if (perms.timedOut(c.server_id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
   const { ciphertext, epoch } = req.body || {};
   validCipher(ciphertext);
   const ep = requireCurrentEpoch(c.server_id, epoch);
@@ -1748,13 +2601,10 @@ api.delete('/messages/:id', auth, (req, res) => {
   const c = requireChannel(m.channel_id, req.userId);
   const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (m.author_id !== req.userId && !canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You can only delete your own messages.');
-  const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((r) => r.id)];
-  removeMessageFiles(ids);
-  const q = ids.map(() => '?').join(',');
-  db.prepare(`DELETE FROM reactions WHERE message_id IN (${q})`).run(...ids);
-  db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
+  deleteMessageTree(m.id);
   toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   if (m.thread_id) toChannel(c).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
+  BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
   res.json({ ok: true });
 });
 
@@ -1762,9 +2612,10 @@ api.get('/messages/:id/thread', auth, (req, res) => {
   const root = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!root || root.thread_id) fail(404, 'Thread not found.');
   const c = requireChannel(root.channel_id, req.userId);
-  const rows = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY id').all(root.id);
+  // Paged like a channel (newest replies first, ?before=id for older ones): a thread can be any size.
+  const { rows, hasMore, hasNewer } = pageRows('messages', 'thread_id', root.id, { limit: '100', ...req.query });
   const reactions = reactionsFor([root.id, ...rows.map((r) => r.id)]);
-  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)) });
+  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)), hasMore, hasNewer });
 });
 
 // Where does a message live? Used by message links, search results and notifications.
@@ -1780,22 +2631,32 @@ api.get('/messages/:id/locate', auth, (req, res) => {
   res.json({ kind: 'dm', dmId: dm.dm_id });
 });
 
-// Pins: shared per conversation. In servers, admins and the author can pin; in DMs, either person.
+// Pins: shared per conversation. In server channels pinning needs Manage Messages (your own messages too: pins
+// are the channel's notice board) and each pin and unpin is kept in the channel's pin history; in group chats
+// and DMs, anyone in the conversation can pin.
+const MAX_PINS = 50;
 function pinTarget(id, userId) {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
   if (m) {
     const c = requireChannel(m.channel_id, userId);
     const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
-    if (s.kind !== 'group' && m.author_id !== userId && !canIn(s, c, userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission to pin other people\u2019s messages.');
-    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id } };
+    if (s.kind !== 'group' && !canIn(s, c, userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission to pin messages here.');
+    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at };
   }
   const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
   if (!dm) fail(404, 'Message not found.');
   const d = requireDm(dm.dm_id, userId);
-  return { table: 'dm_messages', room: [`user:${d.user_a}`, `user:${d.user_b}`], payload: { messageId: dm.id, dmId: d.id } };
+  if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
+  return { table: 'dm_messages', room: [`user:${d.user_a}`, `user:${d.user_b}`], payload: { messageId: dm.id, dmId: d.id }, dmId: d.id, pinned: !!dm.pinned_at };
 }
 api.post('/messages/:id/pin', auth, (req, res) => {
   const t = pinTarget(req.params.id, req.userId);
+  if (!t.pinned) {
+    const n = t.channelId ? db.prepare('SELECT COUNT(*) n FROM messages WHERE channel_id = ? AND pinned_at IS NOT NULL').get(t.channelId).n
+      : db.prepare('SELECT COUNT(*) n FROM dm_messages WHERE dm_id = ? AND pinned_at IS NOT NULL').get(t.dmId).n;
+    if (n >= MAX_PINS) fail(400, `This conversation already has ${MAX_PINS} pinned messages. Unpin one first.`);
+  }
+  if (t.channelId && USE && !t.pinned) USE.logPin(t.channelId, req.params.id, req.userId, 'pin');
   const at = now();
   db.prepare(`UPDATE ${t.table} SET pinned_at = ?, pinned_by = ? WHERE id = ?`).run(at, req.userId, req.params.id);
   (typeof t.room === 'object' && !Array.isArray(t.room) ? t.room : io.to(t.room)).emit('pin:update', { ...t.payload, pinnedAt: at, pinnedBy: req.userId });
@@ -1803,6 +2664,7 @@ api.post('/messages/:id/pin', auth, (req, res) => {
 });
 api.delete('/messages/:id/pin', auth, (req, res) => {
   const t = pinTarget(req.params.id, req.userId);
+  if (t.channelId && USE && t.pinned) USE.logPin(t.channelId, req.params.id, req.userId, 'unpin');
   db.prepare(`UPDATE ${t.table} SET pinned_at = NULL, pinned_by = NULL WHERE id = ?`).run(req.params.id);
   (typeof t.room === 'object' && !Array.isArray(t.room) ? t.room : io.to(t.room)).emit('pin:update', { ...t.payload, pinnedAt: null });
   res.json({ ok: true });
@@ -1837,6 +2699,9 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
     const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
     if (!dm) fail(404, 'Message not found.');
     const d = requireDm(dm.dm_id, req.userId);
+    // After a block, nobody in the conversation can add reactions (taking your own away is still fine).
+    const mine = db.prepare('SELECT 1 FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?').get(dm.id, req.userId, emoji);
+    if (!mine && isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
     target = [`user:${d.user_a}`, `user:${d.user_b}`];
     payload = { messageId: dm.id, dmId: d.id };
   }
@@ -1846,6 +2711,7 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
     const distinct = db.prepare('SELECT COUNT(DISTINCT emoji) AS n FROM reactions WHERE message_id = ?').get(req.params.id).n;
     if (distinct >= 20) fail(400, 'That message has too many different reactions.');
     db.prepare('INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, ?, ?)').run(req.params.id, req.userId, emoji, now());
+    if (m) { const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id); BOTS.event('reaction.added', c.server_id, { messageId: m.id, channelId: c.id, userId: req.userId, emoji }, { channel: c, actorId: req.userId }); }
   }
   payload.reactions = reactionsFor([req.params.id])[req.params.id] || [];
   (typeof target === 'object' && !Array.isArray(target) ? target : io.to(target)).emit('reaction:update', payload);
@@ -1880,6 +2746,8 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   const d = requireDm(req.params.id, req.userId);
   limitMessages(req);
   if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t message this person.');
+  // A deleted account keeps its public key (so old messages stay readable), but nobody can read new ones.
+  if ((getUserRow(d.user_a === req.userId ? d.user_b : d.user_a) || {}).deleted_at) fail(403, 'This account was deleted.', 'deleted');
   const { ciphertext, files } = req.body || {};
   validCipher(ciphertext);
   let replyTo = (req.body || {}).replyTo || null;
@@ -1888,7 +2756,8 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   const t = now();
   db.prepare('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, d.id, req.userId, ciphertext, replyTo, t);
   attachBlobs(files, req.userId, id);
-  pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id });
+  pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id, generic: 'New message' }, { kind: 'dm', dmId: d.id });
+  if (USE) USE.markSent(req.userId, 'd:' + d.id, id);
   db.prepare('UPDATE dm_channels SET last_message_at = ? WHERE id = ?').run(t, d.id);
   const msg = serializeDmMessage(db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id));
   withNonce(msg, req.body);
@@ -1903,6 +2772,8 @@ api.patch('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
   if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
   const d = requireDm(m.dm_id, req.userId);
+  // Editing is sending new words: a block stops it like it stops new messages (deleting your own still works).
+  if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t message this person.');
   const { ciphertext } = req.body || {};
   validCipher(ciphertext);
   db.prepare('UPDATE dm_messages SET ciphertext = ?, edited_at = ? WHERE id = ?').run(ciphertext, now(), m.id);
@@ -1915,8 +2786,7 @@ api.delete('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
   if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
   const d = requireDm(m.dm_id, req.userId);
-  removeMessageFiles([m.id]);
-  db.prepare('DELETE FROM reactions WHERE message_id = ?').run(m.id);
+  forgetMessages([m.id]);
   db.prepare('DELETE FROM dm_messages WHERE id = ?').run(m.id);
   io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit('dm:delete', { id: m.id, dmId: d.id });
   res.json({ ok: true });
@@ -2017,6 +2887,9 @@ api.patch('/roles/:id', auth, (req, res) => {
   const name = everyone ? '@everyone' : b.name !== undefined ? (String(b.name).trim().slice(0, 32) || r.name) : r.name;
   // You can't grant permissions you don't have yourself.
   const permissions = b.permissions !== undefined ? (((parseInt(b.permissions, 10) || 0) & mine) | (r.permissions & ~mine)) & ALL_PERMS : r.permissions;
+  // A role sold as a membership can't get moderator powers (they'd be for sale).
+  const tier = MEMB.tierForRole(r.id);
+  if (tier && (permissions & MEMB.POWERFUL & ~r.permissions)) fail(400, `This role is sold as the "${tier.name}" membership, so it can't have moderator powers.`);
   db.prepare('UPDATE roles SET name = ?, color = ?, icon = ?, permissions = ?, hoist = ?, mentionable = ? WHERE id = ?').run(
     name, everyone ? '' : b.color !== undefined ? cleanColor(b.color) : r.color, everyone ? '' : b.icon !== undefined ? cleanIcon(b.icon) : r.icon,
     permissions, everyone ? 0 : b.hoist !== undefined ? (b.hoist ? 1 : 0) : r.hoist, everyone ? 0 : b.mentionable !== undefined ? (b.mentionable ? 1 : 0) : r.mentionable, r.id);
@@ -2026,6 +2899,9 @@ api.patch('/roles/:id', auth, (req, res) => {
 api.delete('/roles/:id', auth, (req, res) => {
   const { r, s } = requireManageableRole(req.params.id, req.userId);
   if (r.id === s.id) fail(400, 'The @everyone role can\u2019t be deleted.');
+  // Paying members would silently lose what they pay for, and the membership would keep selling nothing.
+  const tier = MEMB.tierForRole(r.id);
+  if (tier) fail(409, `This role is sold as the "${tier.name}" membership. Give that membership another role, or stop selling it and wait for its members to end, first.`);
   db.prepare('DELETE FROM roles WHERE id = ?').run(r.id);
   db.prepare("DELETE FROM channel_overrides WHERE target_type = 'role' AND target_id = ?").run(r.id);
   emitServer(s.id);
@@ -2045,28 +2921,66 @@ api.post('/servers/:id/roles/order', auth, (req, res) => {
   emitServer(s.id);
   res.json({ ok: true });
 });
-// Per-channel overrides: [{ type: 'role'|'member', id, allow, deny }]
+// Members whose highest role is at or above `top` (with no role of your own above @everyone, that's everyone).
+const membersAtOrAbove = (serverId, top) => db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND (? <= 0 OR EXISTS
+    (SELECT 1 FROM member_roles mr JOIN roles r ON r.id = mr.role_id WHERE mr.server_id = m.server_id AND mr.user_id = m.user_id AND r.position >= ?))`)
+  .all(serverId, top, top).map((r) => r.user_id);
+// Per-channel overrides: [{ type: 'role'|'member', id, allow, deny }]. The list replaces the channel's overrides,
+// within your reach: you need Manage Roles in this channel (one you can see), you can only allow or deny what you
+// have here yourself (other bits keep their old value), and overrides for roles or people at or above your
+// highest role aren't yours to add, change or remove, the same rule as editing roles. Unless you're the owner or
+// an Administrator, the change also can't take anything away from anyone at or above your highest role, yourself
+// included: denying @everyone reaches everyone, so checking targets alone would still let a junior moderator lock
+// seniors out of a channel (or lock themselves out with no way back).
 api.put('/channels/:id/overrides', auth, (req, res) => {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!c) fail(404, 'Channel not found.');
+  const c = requireChannel(req.params.id, req.userId);
   const s = requirePerm(c.server_id, req.userId, PM.MANAGE_ROLES, 'You need the Manage Roles permission.');
+  if (!canIn(s, c, req.userId, PM.MANAGE_ROLES)) fail(403, 'You don\u2019t have permission to change this channel\u2019s permissions.');
   const list = Array.isArray((req.body || {}).overrides) ? req.body.overrides.slice(0, 100) : [];
-  const roleIds = new Set(db.prepare('SELECT id FROM roles WHERE server_id = ?').all(s.id).map((r) => r.id));
-  const mine = perms.base(s, req.userId);
+  const roles = new Map(db.prepare('SELECT id, position FROM roles WHERE server_id = ?').all(s.id).map((r) => [r.id, r]));
+  const mine = perms.channel(s, c, req.userId) & CHANNEL_SCOPED;
+  const myTop = perms.top(s, req.userId);
+  const reachable = (o) => (o.type === 'role'
+    ? o.id === s.id || (roles.has(o.id) && roles.get(o.id).position < myTop)
+    : o.id === req.userId || perms.top(s, o.id) < myTop);
+  const key = (o) => `${o.type}:${o.id}`;
+  // What's stored now, cleaned the same way new entries are (so an untouched override compares equal).
+  const old = new Map();
+  for (const r of db.prepare('SELECT * FROM channel_overrides WHERE channel_id = ?').all(c.id)) {
+    const allow = r.allow & CHANNEL_SCOPED; const deny = r.deny & CHANNEL_SCOPED & ~allow;
+    const o = { type: r.target_type, id: r.target_id, allow, deny };
+    if (allow || deny) old.set(key(o), o);
+  }
+  const next = new Map();
+  for (const o of list) {
+    const t = { type: o.type === 'member' ? 'member' : 'role', id: String(o.id || '') };
+    if (t.type === 'role' ? !roles.has(t.id) : !isMember(s.id, t.id)) continue;
+    // Roles sold as memberships can't get moderator powers in a channel either.
+    const tier = t.type === 'role' && MEMB.tierForRole(t.id);
+    if (tier && ((parseInt(o.allow, 10) || 0) & mine & MEMB.POWERFUL)) fail(400, `That role is sold as the "${tier.name}" membership, so it can't have moderator powers here.`);
+    const prev = old.get(key(t)) || { allow: 0, deny: 0 };
+    const allow = (((parseInt(o.allow, 10) || 0) & mine) | (prev.allow & ~mine)) & CHANNEL_SCOPED;
+    const deny = (((parseInt(o.deny, 10) || 0) & mine) | (prev.deny & ~mine)) & CHANNEL_SCOPED & ~allow;
+    if (allow || deny) next.set(key(t), { ...t, allow, deny });
+  }
+  for (const k of new Set([...old.keys(), ...next.keys()])) {
+    const o = old.get(k); const n = next.get(k);
+    if (reachable(o || n)) continue;
+    if (!o || !n || o.allow !== n.allow || o.deny !== n.deny) fail(403, 'You can only change overrides for roles and people below your highest role.');
+  }
+  const guarded = perms.base(s, req.userId) === ALL_PERMS ? [] : membersAtOrAbove(s.id, myTop).filter((u) => u !== s.owner_id);
+  const had = guarded.map((u) => [u, perms.channel(s, c, u)]);
+  // Write, then compare what each guarded person can do here now; any loss throws, which undoes the write.
   db.transaction(() => {
     db.prepare('DELETE FROM channel_overrides WHERE channel_id = ?').run(c.id);
-    for (const o of list) {
-      const type = o.type === 'member' ? 'member' : 'role';
-      const id = String(o.id || '');
-      if (type === 'role' ? !roleIds.has(id) : !isMember(s.id, id)) continue;
-      const allow = (parseInt(o.allow, 10) || 0) & CHANNEL_SCOPED & mine;
-      const deny = (parseInt(o.deny, 10) || 0) & CHANNEL_SCOPED & ~allow;
-      if (allow || deny) db.prepare('INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, ?, ?)').run(c.id, type, id, allow, deny);
+    for (const o of next.values()) db.prepare('INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, ?, ?)').run(c.id, o.type, o.id, o.allow, o.deny);
+    for (const [u, was] of had) {
+      if (!(was & ~perms.channel(s, c, u))) continue;
+      if (u === req.userId) fail(409, 'That would take permissions in this channel away from you too, and you couldn\u2019t undo it. Allow them for yourself in the same change.');
+      fail(403, 'That would take permissions in this channel away from people at or above your highest role.');
     }
   })();
-  // Anyone who just lost access leaves the voice channel.
-  for (const [uid] of voiceChannels.get(c.id) || []) if (!(perms.channel(s, c, uid) & PM.CONNECT)) leaveVoice(uid, true);
-  emitServer(s.id);
+  emitServer(s.id); // anyone who just lost access leaves the voice channel (recheckVoice)
   res.json({ ok: true });
 });
 
@@ -2082,6 +2996,8 @@ api.post('/servers/:id/bans', auth, (req, res) => {
   if (!getUserRow(uid) || uid === s.owner_id || uid === req.userId) fail(400, 'You can\u2019t ban that person.');
   if (isMember(s.id, uid) && perms.top(s, uid) >= perms.top(s, req.userId)) fail(403, 'You can only ban people whose highest role is below yours.');
   db.prepare('INSERT OR REPLACE INTO bans (server_id, user_id, banned_by, reason, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, uid, req.userId, String((req.body || {}).reason || '').slice(0, 300), now());
+  // Invites a banned person made stop working too: they could have handed them to a new account.
+  db.prepare('DELETE FROM invites WHERE server_id = ? AND creator_id = ?').run(s.id, uid);
   if (isMember(s.id, uid)) removeMember(s.id, uid);
   emitServer(s.id);
   res.json({ ok: true });
@@ -2107,10 +3023,13 @@ function isAnimatedImage(buf) {
 }
 const EMOJI_MAX = 2 * 1024 * 1024;
 const emojiName = (n) => String(n || '').trim().replace(/[^A-Za-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 32);
-function addEmoji(s, name, url, animated, userId) {
+function checkEmojiRoom(s, name) {
   if (name.length < 2) fail(400, 'Emoji names need at least 2 letters, numbers or underscores.');
   if (db.prepare('SELECT COUNT(*) AS n FROM emojis WHERE server_id = ?').get(s.id).n >= 200) fail(400, 'A server can have up to 200 emoji.');
   if (db.prepare('SELECT 1 FROM emojis WHERE server_id = ? AND name = ?').get(s.id, name)) fail(409, `There's already an emoji called :${name}:.`);
+}
+function addEmoji(s, name, url, animated, userId) {
+  checkEmojiRoom(s, name);
   const id = newId();
   db.prepare('INSERT INTO emojis (id, server_id, name, url, animated, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, url, animated ? 1 : 0, userId, now());
   emitServer(s.id);
@@ -2134,14 +3053,22 @@ api.post('/servers/:id/emojis/from-giphy', auth, wrap(async (req, res) => {
   if (!/^[A-Za-z0-9]{4,40}$/.test(gid)) fail(400, 'Pick a GIF.');
   const name = emojiName((req.body || {}).name);
   if (name.length < 2) fail(400, 'Give the emoji a name.');
+  // The cheap checks come first, so a request that can't succeed never costs a GIPHY/KLIPY call or a download.
+  rateLimit('giphyemoji:' + req.userId, 20, 10 * 60000);
+  checkEmojiRoom(s, name);
+  const q = quotaOf(req.userId);
+  if (q.blocked) fail(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.');
   const pickR = await gifForEmoji(gid);
   if (!pickR) fail(400, 'That GIF is too big to use as an emoji. Try another one.');
-  const media = new URL(pickR.url);
-  if (!(MEDIA_HOSTS.test(media.hostname) || EXTRA_MEDIA_HOSTS.includes(media.host))) fail(400, 'Unexpected GIF location.');
-  const r = await fetch(media);
-  if (!r.ok) fail(502, 'Couldn\u2019t download that GIF from GIPHY.');
-  const buf = Buffer.from(await r.arrayBuffer());
-  if (buf.length > EMOJI_MAX) fail(400, 'That GIF is too big to use as an emoji.');
+  let media;
+  try { media = new URL(pickR.url); } catch { fail(400, 'Unexpected GIF location.'); }
+  const r = await fetchGifMedia(media, AbortSignal.timeout(15000)).catch(() => fail(502, 'Couldn\u2019t download that GIF from GIPHY.'));
+  if (!r) fail(400, 'Unexpected GIF location.');
+  if (!r.ok) { cancelBody(r.body); fail(502, 'Couldn\u2019t download that GIF from GIPHY.'); }
+  const buf = await readLimited(r, EMOJI_MAX).catch(() => fail(502, 'Couldn\u2019t download that GIF from GIPHY.'));
+  if (!buf) fail(400, 'That GIF is too big to use as an emoji.');
+  const over = overLimit(req.userId, q, buf.length);
+  if (over) throw over;
   const file = `${newId()}${crypto.randomBytes(8).toString('hex')}.gif`;
   fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
   recordFile(req.userId, file, 'emoji', buf.length);
@@ -2171,7 +3098,14 @@ api.delete('/emojis/:id', auth, (req, res) => {
 // ---------------------------------------------------------------- group DMs
 // A group DM is a small private "server" (one text channel + one call channel) so it gets the same
 // end-to-end encrypted group keys, key rotation and voice. It never shows up in the server rail.
-const canAddToGroup = (adder, uid) => uid !== adder && getUserRow(uid) && !isBlocked(adder, uid) && (areFriends(adder, uid) || sharesServer(adder, uid));
+// You can add friends and people you share a server with, but someone who takes DMs only from friends can't be
+// pulled into a group chat (and rung in it) by a non-friend either.
+function requireGroupAddable(adder, uid) {
+  const row = uid !== adder && getUserRow(uid);
+  const friends = !!row && areFriends(adder, uid);
+  if (!row || isBlocked(adder, uid) || !(friends || sharesServer(adder, uid))) fail(403, 'You can add friends and people who share a server with you.');
+  if (!friends && privacyOf(row).dms === 'friends') fail(403, `${row.username} only accepts messages from friends.`);
+}
 // Group chats: up to GROUP_MAX people, end-to-end encrypted like servers (they are small servers with one chat
 // and one call). Anyone in the group can add friends or people they share a server with; the person who made
 // it (the owner, passed on if they leave) can also remove people.
@@ -2181,7 +3115,7 @@ api.post('/groups', auth, (req, res) => {
   const ids = [...new Set(((req.body || {}).userIds || []).map(String))].filter((u) => u !== req.userId);
   if (!ids.length) fail(400, 'Pick at least one person.');
   if (ids.length > GROUP_MAX - 1) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
-  ids.forEach((u) => { if (!canAddToGroup(req.userId, u)) fail(403, 'You can add friends and people who share a server with you.'); });
+  ids.forEach((u) => requireGroupAddable(req.userId, u));
   const id = newId();
   const t = now();
   db.transaction(() => {
@@ -2207,7 +3141,8 @@ api.post('/groups/:id/members', auth, (req, res) => {
   const uid = String((req.body || {}).userId || '');
   if (isMember(s.id, uid)) fail(409, 'They\u2019re already in this group.');
   if (db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n >= GROUP_MAX) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
-  if (!canAddToGroup(req.userId, uid)) fail(403, 'You can add friends and people who share a server with you.');
+  requireGroupAddable(req.userId, uid);
+  keyOnRejoin(s.id, uid);
   db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(s.id, uid, now());
   io.to(`server:${s.id}`).emit('member:add', { serverId: s.id, user: publicUser(getUserRow(uid)) });
   io.in(`user:${uid}`).socketsJoin(`server:${s.id}`);
@@ -2333,18 +3268,43 @@ api.post('/me/sessions/revoke-others', auth, (req, res) => {
 
 // ---------------------------------------------------------------- instance settings + GIPHY
 // Instance staff, highest first:
-//   owner      one person: the first account (or the first ADMIN_USERS name that exists) until handed over.
-//              Only the owner can give or take away staff roles, and hand over ownership.
-//   admin      the whole admin dashboard and Settings → Instance. ADMIN_USERS names are always admins.
+//   owner      one person, settled once (see ownerId) and then only changed by handing it over. Only the owner
+//              can give or take away staff roles, and hand over ownership.
+//   admin      the whole admin dashboard and Settings → Instance. The accounts that took ADMIN_USERS names
+//              are always admins.
 //   moderator  reports, users (suspend, sign out, reset profile, notes), who's online and the audit log.
 // Staff can only act on people ranked below them.
 const getSetting = (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value;
 const setSetting = (k, v) => (v === null || v === undefined
   ? db.prepare('DELETE FROM instance_settings WHERE key = ?').run(k)
   : db.prepare('INSERT OR REPLACE INTO instance_settings (key, value) VALUES (?, ?)').run(k, String(v)));
-const firstAccount = () => (db.prepare('SELECT id FROM users WHERE is_bot = 0 ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
+const firstAccount = () => (db.prepare('SELECT id FROM users WHERE is_bot = 0 AND deleted_at IS NULL ORDER BY created_at, rowid LIMIT 1').get() || {}).id;
+// A person's account that can still sign in (not deleted, not a bot): the only kind that can hold staff powers.
+const liveAccount = (id) => { const r = id && getUserRow(id); return r && !r.deleted_at && !r.is_bot ? r : null; };
 const STAFF_RANK = { moderator: 1, admin: 2, owner: 3 };
 const envAdmins = () => (process.env.ADMIN_USERS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+// ADMIN_USERS names are matched to an account once: { name: userId }. The first account to hold a listed name
+// keeps it, with its powers, even after renaming or deleting itself. So the name stays reserved, and nobody can
+// register it later and become an admin. (Removing the name from ADMIN_USERS takes the powers away.)
+// HELD_BACK marks a listed name nobody had when this was first set up on a server that already had accounts
+// (see the start-up code below): nobody may take it, since it may have been an admin's before a rename.
+const HELD_BACK = '!';
+function envClaims() {
+  try { const c = JSON.parse(getSetting('envAdminClaims') || '{}'); return c && typeof c === 'object' && !Array.isArray(c) ? c : {}; } catch { return {}; }
+}
+function claimEnvAdmin(row) {
+  const n = String((row && row.username) || '').toLowerCase();
+  if (!envAdmins().includes(n) || row.deleted_at || row.is_bot) return;
+  const c = envClaims();
+  if (c[n]) return;
+  c[n] = row.id;
+  setSetting('envAdminClaims', JSON.stringify(c));
+}
+// The ADMIN_USERS name an account holds its powers through, if any (it may have been renamed since).
+const envAdminName = (uid) => { const c = envClaims(); return envAdmins().find((n) => c[n] === uid) || null; };
+// True when nobody but `uid` may take this name because it's in ADMIN_USERS: it already belongs to another
+// account, or (for renames) nobody has it yet and it would bring admin powers with it.
+const envNameReserved = (name, uid) => { const n = String(name).toLowerCase(); return envAdmins().includes(n) && envClaims()[n] !== uid; };
 // { userId: 'admin' | 'moderator' }. Older versions kept a plain list of extra admins under 'admins'.
 function staffRoles() {
   let r = null;
@@ -2356,19 +3316,59 @@ function staffRoles() {
   return r;
 }
 const saveStaffRoles = (r) => setSetting('staffRoles', JSON.stringify(r));
+// Who owns the server is settled once and written down ('owner'), so a later sign-up can never take it over:
+//   - an account holding an ADMIN_USERS name owns it (the first such name in the list), else the first account;
+//   - except on a server set up with ADMIN_USERS before anyone signed up, whose first account took none of its
+//     names ('ownerAwaitsEnv', see settleOwnerAtFirstSignUp): there the first listed name owns the server as
+//     soon as it's registered, as documented. Until then ownerStandIn() runs it, without being written down.
+// After that it changes only by handing it over in the app, or with `node server/cli.js set-owner`.
+const ownerStandIn = (c) => envAdmins().map((n) => c[n]).find((x) => liveAccount(x)) || firstAccount();
 function ownerId() {
   const set = getSetting('owner');
-  if (set && getUserRow(set)) return set;
-  for (const n of envAdmins()) { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) return r.id; }
-  return firstAccount();
+  if (set && liveAccount(set)) return set;
+  const c = envClaims();
+  const awaited = getSetting('ownerAwaitsEnv');
+  if (awaited && envAdmins().includes(awaited) && !c[awaited]) return ownerStandIn(c); // still waiting for that sign-up
+  if (awaited) setSetting('ownerAwaitsEnv', null); // registered now (or taken off ADMIN_USERS): settle below
+  const id = (awaited && liveAccount(c[awaited]) && c[awaited]) || ownerStandIn(c);
+  if (id && id !== set) setSetting('owner', id);
+  return id;
+}
+// Right after an account is created. The very first one settles the owner, unless ADMIN_USERS names someone else
+// who hasn't signed up yet: the operator set it up before signing up, so the first listed name gets the server.
+function settleOwnerAtFirstSignUp() {
+  const admins = envAdmins(); const c = envClaims();
+  if (!getSetting('owner') && !getSetting('ownerAwaitsEnv') && admins.length && !admins.some((n) => c[n])) setSetting('ownerAwaitsEnv', admins[0]);
+  ownerId();
 }
 function staffRole(uid) {
   const row = uid && getUserRow(uid);
-  if (!row) return null;
+  if (!row || row.deleted_at) return null;
   if (ownerId() === uid) return 'owner';
-  if (envAdmins().includes(row.username.toLowerCase())) return 'admin';
+  if (envAdminName(uid)) return 'admin';
   const r = staffRoles()[uid];
   return STAFF_RANK[r] && r !== 'owner' ? r : null;
+}
+// At start-up (ADMIN_USERS may have changed): tie listed names to the accounts holding them now, then settle
+// the owner. Sign-ups claim names as they're registered (see /auth/register).
+{
+  const firstTime = getSetting('envAdminClaims') === undefined;
+  for (const n of envAdmins()) claimEnvAdmin(db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(n));
+  const c = envClaims();
+  // The first start of this version on a server that already has accounts: before it, an ADMIN_USERS admin could
+  // rename or delete their account and leave the name free, and the next person to register it became an admin.
+  // There's no telling which free names were someone's, so all of them are held back.
+  if (firstTime && firstAccount()) for (const n of envAdmins()) if (!c[n]) c[n] = HELD_BACK;
+  // A held-back name taken off ADMIN_USERS is let go (listed again later, it goes to whoever registers it first).
+  for (const n of Object.keys(c)) if (c[n] === HELD_BACK && !envAdmins().includes(n)) delete c[n];
+  setSetting('envAdminClaims', JSON.stringify(c));
+  const owner = ownerId();
+  const who = (id) => (getUserRow(id) || {}).username;
+  const held = envAdmins().filter((n) => c[n] === HELD_BACK);
+  if (held.length) log.warn('accounts', 'admin_users', { msg: `ADMIN_USERS lists ${held.join(', ')}, which no account has. Nobody can sign up with ${held.length > 1 ? 'these names' : 'it'}: before this update, an admin who renamed or deleted their account left the name free for anyone. If you're keeping one for someone who hasn't signed up yet, take it off ADMIN_USERS and restart (then give them a role in Admin \u2192 Team & roles once they've signed up).` });
+  const first = envAdmins()[0];
+  if (getSetting('ownerAwaitsEnv')) log.warn('accounts', 'admin_users', { msg: `${getSetting('ownerAwaitsEnv')} (the first name in ADMIN_USERS when this server got its first account) will own this server once that account is signed up.${owner ? ` Until then ${who(owner)} runs it.` : ''}` });
+  else if (first && owner && c[first] !== owner && !held.includes(first)) log.warn('accounts', 'admin_users', { msg: `ADMIN_USERS starts with ${first}, but ${who(owner)} owns this server (the owner is settled once and doesn't follow ADMIN_USERS). To change it, hand ownership over in Admin \u2192 Team & roles, or run: node server/cli.js set-owner ${liveAccount(c[first]) ? who(c[first]) : '<username>'}` });
 }
 const staffRank = (uid) => STAFF_RANK[staffRole(uid)] || 0;
 const isStaff = (uid) => staffRank(uid) >= 1;
@@ -2377,9 +3377,10 @@ const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'On
 // Email, recovery key and two-factor sign-in (server/accounts.js).
 ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
   tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), requireOutranks: (req, id) => requireOutranks(req, id), auditLog, secEvent: (...a) => secEvent(...a), cleanIp,
-  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions });
-// The key saved in the app wins over .env, so the admin never has to edit files.
-const giphyKey = () => getSetting('giphyKey') || GIPHY_API_KEY;
+  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions, hitsSoFar, verifyCaptcha: (...a) => verifyCaptcha(...a) });
+// The key saved in the app wins over .env, so the admin never has to edit files. Keys saved in the app are
+// sealed with data/secret.key (sealSecret in db.js), like the SMTP password.
+const giphyKey = () => openSecret(getSetting('giphyKey')) || GIPHY_API_KEY;
 const giphyRating = () => (['g', 'pg', 'pg-13', 'r'].includes(getSetting('giphyRating')) ? getSetting('giphyRating') : 'pg-13');
 const gifProxyOn = () => (getSetting('gifProxy') ?? (process.env.GIF_PROXY || 'true')) !== 'false';
 const GIPHY_API = process.env.GIPHY_API_BASE || 'https://api.giphy.com';
@@ -2387,7 +3388,7 @@ const GIPHY_API = process.env.GIPHY_API_BASE || 'https://api.giphy.com';
 // GIF providers. KLIPY (free, unlimited production keys; same API shape as the retired Tenor) is the
 // default; GIPHY is still supported. Results are cached and shared by everyone, so popular searches,
 // trending and categories cost one API call per 15–30 minutes instead of one per person.
-const klipyKey = () => getSetting('klipyKey') || process.env.KLIPY_API_KEY || '';
+const klipyKey = () => openSecret(getSetting('klipyKey')) || process.env.KLIPY_API_KEY || '';
 const gifProvider = () => {
   const p = getSetting('gifProvider');
   if (p === 'klipy' || p === 'giphy' || p === 'library') return p;
@@ -2495,7 +3496,11 @@ api.get('/gifs', auth, wrap(async (req, res) => {
   if (req.query.source === 'library' || !gifKey() || Date.now() < gifLimitedUntil) {
     return res.json({ ...librarySearch({ q, sticker: type === 'stickers', offset: parseInt(pos, 10) || 0 }), library: true, limited: Date.now() < gifLimitedUntil && req.query.source !== 'library' });
   }
-  try { res.json(await gifSearch({ q, type, pos })); } catch (e) {
+  try {
+    const found = await gifSearch({ q, type, pos });
+    rememberServedGifs(found.items, q, type === 'stickers');
+    res.json(found);
+  } catch (e) {
     if (e.code !== 'gif_limit' && !(e.status >= 500)) throw e;
     res.json({ ...librarySearch({ q, sticker: type === 'stickers', offset: 0 }), library: true, limited: true });
   }
@@ -2538,15 +3543,35 @@ function imageDims(buf) {
   if (buf.length > 30 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 12, 16) === 'VP8X') return [1 + buf.readUIntLE(24, 3), 1 + buf.readUIntLE(27, 3)];
   return [0, 0];
 }
-function addToLibrary({ buf, ext, title, tags, sticker, source, sourceId, userId }) {
-  const file = `${newId()}${crypto.randomBytes(6).toString('hex')}${ext}`;
-  fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
-  const [w, hgt] = imageDims(buf);
+// Adds a GIF to the library: either bytes downloaded from a provider (buf) or a file already uploaded to
+// UPLOAD_DIR (file + size, recorded in user_files by limited() so it counts toward the uploader's storage).
+function addToLibrary({ buf, file, size, ext, title, tags, sticker, source, sourceId, userId }) {
+  let head = buf;
+  if (buf) {
+    file = fileName(ext);
+    fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
+    size = buf.length;
+  } else {
+    head = Buffer.alloc(32);
+    const fd = fs.openSync(path.join(UPLOAD_DIR, file), 'r');
+    try { head = head.subarray(0, fs.readSync(fd, head, 0, 32, 0)); } finally { fs.closeSync(fd); }
+  }
+  const [w, hgt] = imageDims(head);
   const id = newId();
-  db.prepare(`INSERT INTO gif_library (id, file, title, tags, width, height, size, sticker, source, source_id, added_by, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, file, String(title || '').slice(0, 120), cleanTags(title || '', tags || ''), w, hgt, buf.length, sticker ? 1 : 0, source, sourceId || null, userId || null, now());
+  try {
+    db.prepare(`INSERT INTO gif_library (id, file, title, tags, width, height, size, sticker, source, source_id, added_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, file, String(title || '').slice(0, 120), cleanTags(title || '', tags || ''), w, hgt, size, sticker ? 1 : 0, source, sourceId || null, userId || null, now());
+  } catch (e) {
+    if (buf) fs.promises.unlink(path.join(UPLOAD_DIR, file)).catch(() => {}); // e.g. two people sent the same new GIF at once
+    throw e;
+  }
   trimLibrary();
   return db.prepare('SELECT * FROM gif_library WHERE id = ?').get(id);
+}
+// Removes a library GIF and its file (and its storage bookkeeping, if someone uploaded it).
+function removeLibraryGif(g) {
+  db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
+  removeUpload('/uploads/' + g.file);
 }
 // Over the size the admin allows: the least used GIFs that were collected automatically go first.
 function trimLibrary() {
@@ -2555,34 +3580,50 @@ function trimLibrary() {
   if (total <= cap) return;
   for (const g of db.prepare("SELECT id, file, size FROM gif_library ORDER BY (source = 'upload') ASC, uses ASC, created_at ASC LIMIT 200").all()) {
     if (total <= cap) break;
-    db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
-    fs.promises.unlink(path.join(UPLOAD_DIR, g.file)).catch(() => {});
+    removeLibraryGif(g);
     total -= g.size;
   }
 }
 const uploadGif = {
-  storage: multer.memoryStorage(),
+  storage: diskStorage,
   fileFilter: (req, file, cb) => (['.gif', '.webp', '.png'].includes(safeExt(file.originalname)) && /^image\//.test(file.mimetype) ? cb(null, true) : cb(new HttpError(400, 'Use a GIF, animated WebP or PNG.'))),
 };
 api.get('/gifs/library', auth, (req, res) => {
   const total = db.prepare('SELECT COUNT(*) n, COALESCE(SUM(size), 0) bytes FROM gif_library').get();
   res.json({ count: total.n, bytes: total.bytes, capMb: libraryCapMb(), who: libraryWho(), learn: libraryLearn(), canAdd: libraryWho() === 'everyone' || isStaff(req.userId) });
 });
+// Library uploads go through limited() like every other upload: they count toward the uploader's storage and
+// daily allowance, and an admin's "delete their files" removes them too.
 api.post('/gifs/library', auth, (req, res, next) => {
-  if (libraryWho() === 'staff' && !isStaff(req.userId)) return next(new HttpError(403, 'Only staff can add GIFs to this server\u2019s library.'));
-  if (quotaOf(req.userId).blocked) return next(new HttpError(403, 'Uploads are turned off for your account.'));
-  multer({ ...uploadGif, limits: { fileSize: LIB_MAX_MB * MB, files: 1 } }).single('file')(req, res, (err) => {
-    if (err && err.code === 'LIMIT_FILE_SIZE') return next(new HttpError(413, `GIFs for the library can be up to ${LIB_MAX_MB} MB.`));
-    next(err);
-  });
-}, (req, res) => {
+  try {
+    if (!features().gifs) fail(404, 'GIFs are turned off on this server.');
+    if (libraryWho() === 'staff' && !isStaff(req.userId)) fail(403, 'Only staff can add GIFs to this server\u2019s library.');
+    rateLimit('giflib:' + req.userId, 60, 3600000); // before the file is received
+    next();
+  } catch (e) { next(e); }
+}, limited('gif', uploadGif, 'file'), (req, res) => {
   if (!req.file) fail(400, 'Choose a GIF.');
-  rateLimit('giflib:' + req.userId, 60, 3600000);
   const b = req.body || {};
   checkWords(b.title, b.tags);
-  const g = addToLibrary({ buf: req.file.buffer, ext: safeExt(req.file.originalname) || '.gif', title: b.title, tags: b.tags, sticker: b.sticker === 'true', source: 'upload', userId: req.userId });
+  const g = addToLibrary({ file: req.file.filename, size: req.file.size, title: b.title, tags: b.tags, sticker: b.sticker === 'true', source: 'upload', userId: req.userId });
   res.json(libOut(g));
 });
+// GIFs this server recently found for someone (provider search results), so a GIF that's sent can be checked
+// against what the provider really returned: its address, title and the search it came from. The app only says
+// which one was picked; it can't choose what gets stored or how it's tagged.
+const servedGifs = new Map(); // `${provider}|${id}` -> { url, title, q, sticker, at }
+function rememberServedGifs(items, q, sticker) {
+  const provider = gifProvider();
+  const at = Date.now();
+  for (const g of items || []) {
+    if (!g || !g.id || typeof g.url !== 'string') continue;
+    const key = `${provider}|${g.id}`;
+    servedGifs.delete(key); // keep the map in "last seen" order
+    servedGifs.set(key, { url: g.url, title: String(g.title || ''), q, sticker, at });
+  }
+  while (servedGifs.size > 5000) servedGifs.delete(servedGifs.keys().next().value);
+}
+const learning = new Set(); // downloads in progress, so one GIF sent twice at once is fetched once
 // Someone sent a GIF: count it (library GIFs) or, if allowed, keep a copy of a KLIPY/GIPHY one.
 api.post('/gifs/used', auth, wrap(async (req, res) => {
   const b = req.body || {};
@@ -2595,26 +3636,33 @@ api.post('/gifs/used', auth, wrap(async (req, res) => {
   const source = gifProvider();
   const have = db.prepare('SELECT id FROM gif_library WHERE source = ? AND source_id = ?').get(source, b.id);
   if (have) { db.prepare('UPDATE gif_library SET uses = uses + 1, last_used = ? WHERE id = ?').run(now(), have.id); return res.json({ ok: true }); }
+  // Only a GIF this server found for someone in the last few hours, at the address the provider gave for it.
+  // Its title and tags come from the provider and the search, and go through the word filter like uploads.
+  const key = `${source}|${b.id}`;
+  const seen = servedGifs.get(key);
+  if (!seen || seen.url !== b.url || Date.now() - seen.at > 6 * 3600000 || learning.has(key)) return res.json({ ok: true });
   let u;
-  try { u = new URL(b.url); } catch { return res.json({ ok: true }); }
-  if (!(u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname))) return res.json({ ok: true });
+  try { u = new URL(seen.url); } catch { return res.json({ ok: true }); }
+  if (!gifHostOk(u)) return res.json({ ok: true });
+  try { checkWords(seen.title, seen.q); } catch { return res.json({ ok: true }); }
   res.json({ ok: true }); // the download happens in the background
+  learning.add(key);
   try {
-    const r = await fetch(u, { headers: { 'User-Agent': 'Hearth' }, signal: AbortSignal.timeout(15000) });
-    const type = r.headers.get('content-type') || '';
-    if (!r.ok || !/^image\/(gif|webp|png)/.test(type)) return;
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > LIB_MAX_MB * MB) return;
+    const r = await fetchGifMedia(u, AbortSignal.timeout(15000));
+    const type = (r && r.headers.get('content-type')) || '';
+    if (!r || !r.ok || !/^image\/(gif|webp|png)/.test(type)) { if (r) cancelBody(r.body); return; }
+    const buf = await readLimited(r, LIB_MAX_MB * MB);
+    if (!buf) return;
     const ext = type.includes('webp') ? '.webp' : type.includes('png') ? '.png' : '.gif';
-    addToLibrary({ buf, ext, title: b.title, tags: b.query, sticker: !!b.sticker, source, sourceId: b.id, userId: null });
-  } catch { /* not important */ }
+    // added_by: who caused it to be stored, so admins can trace (and clear) what an account added.
+    addToLibrary({ buf, ext, title: seen.title, tags: seen.q, sticker: seen.sticker, source, sourceId: b.id, userId: req.userId });
+  } catch { /* not important */ } finally { learning.delete(key); }
 }));
 api.delete('/gifs/library/:id', auth, (req, res) => {
   if (!isStaff(req.userId)) fail(403, 'Only staff can remove GIFs from the library.');
   const g = db.prepare('SELECT * FROM gif_library WHERE id = ?').get(String(req.params.id).replace(/^lib:/, ''));
   if (!g) fail(404, 'Already gone.');
-  db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
-  fs.promises.unlink(path.join(UPLOAD_DIR, g.file)).catch(() => {});
+  removeLibraryGif(g);
   adminLog(req, 'gif_removed', g.id, g.title);
   res.json({ ok: true });
 });
@@ -2634,39 +3682,64 @@ api.put('/admin/gif-library', auth, (req, res) => {
 // hosts are allowed, so this can't be used as an open proxy.
 const MEDIA_HOSTS = /^(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)$/i;
 const EXTRA_MEDIA_HOSTS = (process.env.GIF_PROXY_EXTRA_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean);
-function mediaToken(uid) {
+const gifHostOk = (u) => (u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname)) || EXTRA_MEDIA_HOSTS.includes(u.host);
+const GIF_MEDIA_MAX = 20 * 1024 * 1024;
+// Fetches GIF media, following up to 3 redirects itself and checking each one, so a redirect can't send this
+// server anywhere but the GIF providers' media hosts. null if it leads elsewhere.
+async function fetchGifMedia(u, signal) {
+  let target = u;
+  for (let hop = 0; hop < 4; hop++) {
+    if (!gifHostOk(target)) return null;
+    const r = await fetch(target, { signal, redirect: 'manual', headers: { 'User-Agent': 'Hearth' } });
+    const loc = r.status >= 300 && r.status < 400 ? r.headers.get('location') : null;
+    if (!loc) return r;
+    await cancelBody(r.body);
+    try { target = new URL(loc, target); } catch { return null; }
+  }
+  return null;
+}
+// The token belongs to one sign-in session: it stops working when that session ends (log out, revoked, expired)
+// or the account is suspended or deleted, not just after its 7 days.
+const mediaSig = (uid, sid, exp) => crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${sid}|${exp}`).digest('base64url').slice(0, 22);
+function mediaToken(uid, sid) {
   const exp = Math.floor(Date.now() / 1000) + 7 * 86400;
-  const sig = crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${exp}`).digest('base64url').slice(0, 22);
-  return `${uid}.${exp}.${sig}`;
+  return `${uid}.${sid}.${exp}.${mediaSig(uid, sid, exp)}`;
 }
 function checkMediaToken(t) {
-  const [uid, exp, sig] = String(t || '').split('.');
-  if (!uid || !exp || !sig || +exp < Date.now() / 1000) return false;
-  const good = crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${exp}`).digest('base64url').slice(0, 22);
-  return sig.length === good.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good)) && !!getUserRow(uid);
+  const [uid, sid, exp, sig, extra] = String(t || '').split('.');
+  if (!uid || !sid || !exp || !sig || extra !== undefined || +exp < Date.now() / 1000) return false;
+  const good = mediaSig(uid, sid, exp);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
+  const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sid);
+  const u = s && s.user_id === uid && sessionLive(s) && db.prepare('SELECT id, suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(uid);
+  return !!u && !u.deleted_at && !stillSuspended(u);
 }
 app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
   if (!gifProxyOn()) return res.status(404).end();
   if (!checkMediaToken(req.query.t)) return res.status(403).end();
   let u;
   try { u = new URL(String(req.query.u || '')); } catch { return res.status(400).end(); }
-  if (!(u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname)) && !EXTRA_MEDIA_HOSTS.includes(u.host)) return res.status(400).end();
+  if (!gifHostOk(u)) return res.status(400).end();
   rateLimit('gifmedia:' + req.ip, 600, 60000);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 15000);
   try {
-    const r = await fetch(u, { signal: ctl.signal, headers: { 'User-Agent': 'Hearth' } });
+    const r = await fetchGifMedia(u, ctl.signal);
+    if (!r) return res.status(502).end();
     const type = r.headers.get('content-type') || '';
-    if (!r.ok || !/^(image|video)\//.test(type)) return res.status(502).end();
+    if (!r.ok || !/^(image|video)\//.test(type)) { cancelBody(r.body); return res.status(502).end(); }
     const len = +(r.headers.get('content-length') || 0);
-    if (len > 20 * 1024 * 1024) return res.status(413).end();
+    if (len > GIF_MEDIA_MAX) { cancelBody(r.body); return res.status(413).end(); }
     res.setHeader('Content-Type', type);
     if (len) res.setHeader('Content-Length', String(len));
     res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
-    const { Readable } = require('stream');
-    Readable.fromWeb(r.body).on('error', () => res.destroy()).pipe(res);
+    const { Readable, Transform, pipeline } = require('stream');
+    // The size limit holds even when the provider doesn't say the size up front: past it, the copy stops.
+    let sent = 0;
+    const cap = new Transform({ transform(chunk, enc, cb) { sent += chunk.length; if (sent > GIF_MEDIA_MAX) cb(new Error('too big')); else cb(null, chunk); } });
+    pipeline(Readable.fromWeb(r.body), cap, res, () => {});
   } catch { if (!res.headersSent) res.status(502).end(); } finally { clearTimeout(timer); }
 }));
 
@@ -2677,11 +3750,11 @@ const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, s
   // Personal trackers found something: tell the person's open apps, and push a notification if they want one.
   notifyUser: (uid, p) => {
     io.to(`user:${uid}`).emit('updates:new', p);
-    if (p.notify) pushTo([uid], { title: `${p.count} new \u2014 ${p.title}`, body: p.first.title, tag: `updates-${p.feedId}`, url: '/#updates' });
+    if (p.notify) pushTo([uid], { title: `${p.count} new \u2014 ${p.title}`, body: p.first.title, tag: `updates-${p.feedId}`, url: '/#updates', generic: 'New updates' }, { kind: 'tracker' });
   } });
 // Study tools (server/study.js): encrypted sync for Recall's decks, pictures and profile.
 require('./study')({ api, auth, db, fail, rateLimit, pushTo: (...a) => pushTo(...a), emitToUser: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
-ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken,
+ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, sealSecret, openSecret, auditLog,
   requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
 
 // Admin: GIF settings (key, rating, privacy proxy) without editing .env.
@@ -2694,12 +3767,14 @@ api.get('/admin/settings', auth, (req, res) => {
 api.patch('/admin/settings', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
   const b = req.body || {};
-  if (b.giphyKey !== undefined) setSetting('giphyKey', String(b.giphyKey || '').trim().slice(0, 100) || null);
-  if (b.klipyKey !== undefined) setSetting('klipyKey', String(b.klipyKey || '').trim().slice(0, 200) || null);
+  if (b.giphyKey !== undefined) setSetting('giphyKey', sealSecret(String(b.giphyKey || '').trim().slice(0, 100)) || null);
+  if (b.klipyKey !== undefined) setSetting('klipyKey', sealSecret(String(b.klipyKey || '').trim().slice(0, 200)) || null);
   if (['klipy', 'giphy', 'library'].includes(b.gifProvider)) { setSetting('gifProvider', b.gifProvider); gifCache.clear(); gifLimitedUntil = 0; }
   if (b.giphyRating !== undefined && ['g', 'pg', 'pg-13', 'r'].includes(b.giphyRating)) setSetting('giphyRating', b.giphyRating);
   if (b.gifProxy !== undefined) setSetting('gifProxy', b.gifProxy ? 'true' : 'false');
   io.emit('config:update', { gifsEnabled: true, gifLibraryOnly: !gifKey(), gifProvider: gifProvider(), gifProxy: gifProxyOn() });
+  const changed = ['giphyKey', 'klipyKey', 'gifProvider', 'giphyRating', 'gifProxy'].filter((k) => b[k] !== undefined);
+  if (changed.length) adminLog(req, 'gif_settings', null, changed.join(', '));
   res.json({ ok: true });
 });
 api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
@@ -2720,26 +3795,38 @@ api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
 // ---------------------------------------------------------------- TURN relay for calls
 // Some networks (mobile data, CGNAT home routers, school/office Wi-Fi) block direct connections, so calls
 // need a relay. With coturn's shared-secret mode, every signed-in user gets short-lived relay passwords
-// (valid 12 hours), so the relay can't be used by outsiders. Set up with scripts/setup-turn.sh.
+// (valid 12 to 18 hours), so only people with an account here can use the relay (anyone, while sign-ups are
+// open). Set up with scripts/setup-turn.sh, which also caps each relayed connection's bandwidth.
 const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || '').split(',').map((x) => x.trim()).filter(Boolean);
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
+// The older static TURN_USERNAME/TURN_CREDENTIAL still work, but then every signed-in user (and every former
+// member) holds the same relay password, forever. Say so, so it gets replaced by the shared-secret mode.
+if (process.env.TURN_USERNAME && !turnSecret()) log.warn('turn', 'static_password', { msg: 'TURN_USERNAME/TURN_CREDENTIAL hand everyone the same relay password that never expires. Use TURN_SECRET instead (sudo bash scripts/setup-turn.sh sets it all up).' });
 // Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
 // entry with a region name, so the app can measure which answer fastest and use those.
-const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..') });
+const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..'), stepUp, auditLog });
+const TURN_STEP = 6 * 3600; // seconds
 function iceServersFor(uid) {
   const list = [iceServers[0]];
   const urls = turnUrls();
   const relays = [...(urls.length ? [{ id: 'main', region: 'Main server', urls }] : []), ...REG.liveRelays().map((r) => ({ id: r.id, region: r.name, urls: r.urls }))];
   if (relays.length && turnSecret()) {
-    const username = `${Math.floor(Date.now() / 1000) + 12 * 3600}:${uid}`;
+    // Relay logins run out 12 to 18 hours from now, at a 6-hour boundary, so a person has at most three logins
+    // alive at once. (The relay's per-login limits then work per person, not per request.) expiresAt tells the
+    // app when to fetch new ones (GET /api/ice): an app left open for days keeps working calls.
+    const exp = (Math.floor(Date.now() / 1000 / TURN_STEP) + 3) * TURN_STEP;
+    const username = `${exp}:${uid}`;
     const credential = crypto.createHmac('sha1', turnSecret()).update(username).digest('base64');
-    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region, regionId: r.id });
+    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region, regionId: r.id, expiresAt: exp * 1000 });
   } else if (urls.length && process.env.TURN_USERNAME) {
     list.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL || '' });
   }
   return list;
 }
-api.get('/ice', auth, (req, res) => res.json(iceServersFor(req.userId)));
+api.get('/ice', auth, (req, res) => {
+  rateLimit('ice:' + req.userId, 60, 3600000);
+  res.json(iceServersFor(req.userId));
+});
 
 // A call's region, like Discord's: pick which relay everyone in a voice channel or DM call goes through, and
 // everyone in the call switches together. "auto" (null) = direct when possible, otherwise the nearest relays.
@@ -2754,72 +3841,99 @@ api.post('/calls/region', auth, (req, res) => {
     if (!known) fail(400, 'No such region.');
   }
   const me = req.userId;
-  const tell = (ids, extra = {}) => {
-    const out = { room, region: want, by: me, ...extra };
+  // Two people switching at once: the last write wins. Each change gets the next version number, and apps only
+  // ever move to a newer version than the one they have, so everyone ends up on what the server holds.
+  const tell = (ids, version) => {
+    const out = { room, region: want, by: me, version };
     io.to(`voice:${room}`).emit('call:region', out);
     ids.forEach((id) => io.to(`user:${id}`).emit('call:region', out));
+    return out;
   };
   if (room.startsWith('dm:')) {
     const d = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(room.slice(3));
     if (!d || (d.user_a !== me && d.user_b !== me)) fail(404, 'No such call.');
-    db.prepare('UPDATE dm_channels SET rtc_region = ? WHERE id = ?').run(want, d.id);
-    tell([d.user_a, d.user_b]);
-    return res.json({ room, region: want });
+    const { v } = db.prepare('UPDATE dm_channels SET rtc_region = ?, rtc_region_v = rtc_region_v + 1 WHERE id = ? RETURNING rtc_region_v AS v').get(want, d.id);
+    tell([d.user_a, d.user_b], v);
+    return res.json({ room, region: want, version: v });
   }
   const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(room);
   const srv = c && db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (!c || !srv || c.type !== 'voice' || !isMember(srv.id, me) || !(perms.channel(srv, c, me) & PM.VIEW_CHANNEL)) fail(404, 'No such call.');
   if (srv.kind !== 'group' && !canIn(srv, c, me, PM.MANAGE_CHANNELS)) fail(403, 'You need the Manage Channels permission to change this channel’s region.');
-  db.prepare('UPDATE channels SET rtc_region = ? WHERE id = ?').run(want, c.id);
+  const { v } = db.prepare('UPDATE channels SET rtc_region = ?, rtc_region_v = rtc_region_v + 1 WHERE id = ? RETURNING rtc_region_v AS v').get(want, c.id);
+  tell([], v); // (first: the call switches over on this, the channel update below only refreshes lists)
   emitServer(srv.id);
-  tell([]);
-  res.json({ room, region: want });
+  res.json({ room, region: want, version: v });
 });
 api.get('/admin/turn', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
   res.json({ urls: turnUrls(), secretSet: !!turnSecret(), source: getSetting('turnUrls') ? 'app' : process.env.TURN_URL ? 'env' : null });
 });
-api.put('/admin/turn', auth, (req, res) => {
+// The relay secret signs every relay login (on every region too), and the relay addresses decide where everyone's
+// calls are relayed: changing either needs the password again and is always logged.
+api.put('/admin/turn', auth, wrap(async (req, res) => {
   requireInstanceAdmin(req.userId);
+  await stepUp(req, req.body);
   const b = req.body || {};
+  const before = turnUrls().join(',');
   if (b.urls !== undefined) setSetting('turnUrls', String(b.urls || '').split(/[\s,]+/).filter((u) => /^turns?:/.test(u)).slice(0, 12).join(',') || null);
   if (b.secret !== undefined) setSetting('turnSecret', String(b.secret || '').trim().slice(0, 200) || null);
+  const changed = [turnUrls().join(',') !== before ? `relays: ${turnUrls().join(', ') || 'none'}` : '', b.secret !== undefined ? 'secret changed' : ''].filter(Boolean).join('; ');
+  auditLog(req, 'turn_settings', null, changed || 'saved, no change');
   res.json({ ok: true, urls: turnUrls(), secretSet: !!turnSecret() });
-});
+}));
 
 // ---------------------------------------------------------------- captcha (self-hosted proof of work)
 // The browser must find a number that, hashed together with a random challenge, starts with N zero bits.
 // That takes a person's browser well under a second, but makes every bot attempt cost real computing time.
 // Challenges are signed (can't be forged or made easier), single-use, and expire after 5 minutes.
-// IPs that keep failing logins get harder puzzles automatically. No third parties, no tracking.
+// Networks that keep failing logins get harder puzzles automatically, and so does everyone while the instance is
+// unusually busy (see busyBits). No third parties, no tracking.
 const CAPTCHA_BASE = 18;
 const CAPTCHA_MAX = 24;
-const captchaFails = new Map(); // ip -> { n, at }
+const captchaFails = new Map(); // network (netOf) -> { n, at }
 const usedCaptchas = new Map(); // salt -> expires
-setInterval(() => {
+jobs.every('captcha.sweep', 60000, () => {
   const t = Date.now();
   for (const [k, exp] of usedCaptchas) if (exp < t) usedCaptchas.delete(k);
   for (const [k, f] of captchaFails) if (t - f.at > 3600000) captchaFails.delete(k);
-}, 60000).unref();
+});
 const captchaMode = (purpose) => getSetting(purpose === 'register' ? 'captchaRegister' : 'captchaLogin') || 'on';
-function captchaDifficulty(ip) {
-  const f = captchaFails.get(ip);
+// The instance-wide limits on sign-ups and sign-ins. Past one, the robot check gets harder for everyone (one more
+// bit, so twice the work, for every half a limit over, up to CAPTCHA_MAX) instead of turning everyone away: a
+// flood then costs its sender more and more computing time, while a real person still gets in after one slower
+// check. With the check switched off there's nothing to make harder, so the limit turns requests away instead.
+const INSTANCE_LIMITS = { register: { key: 'reg:all', max: 120, windowMs: 60 * 60 * 1000 }, login: { key: 'login:all', max: 3000, windowMs: 10 * 60 * 1000 } };
+function busyBits(purpose) {
+  const l = INSTANCE_LIMITS[purpose];
+  const n = hitsSoFar(l.key);
+  return n < l.max ? 0 : 1 + Math.floor((n - l.max) / (l.max / 2));
+}
+function countInstanceWide(purpose) {
+  const l = INSTANCE_LIMITS[purpose];
+  if (captchaMode(purpose) === 'off') rateLimit(l.key, l.max, l.windowMs);
+  else countHit(l.key, l.windowMs);
+}
+// How hard the check has to be for a request from this address right now. Failures are counted per network
+// (an IPv6 /64), so hopping between addresses in one doesn't make it easy again.
+function captchaDifficulty(ip, purpose) {
+  const f = captchaFails.get(netOf(cleanIp(ip)));
   const n = f && Date.now() - f.at < 3600000 ? f.n : 0;
-  return Math.min(CAPTCHA_MAX, CAPTCHA_BASE + Math.floor(n / 3));
+  return Math.min(CAPTCHA_MAX, CAPTCHA_BASE + Math.floor(n / 3) + busyBits(purpose));
 }
 function noteAuthFailure(ip) {
-  ip = cleanIp(ip);
-  const f = captchaFails.get(ip) || { n: 0, at: 0 };
+  const k = netOf(cleanIp(ip));
+  const f = captchaFails.get(k) || { n: 0, at: 0 };
   f.n++; f.at = Date.now();
-  captchaFails.set(ip, f);
+  captchaFails.set(k, f);
 }
 const captchaSig = (salt, d, exp, purpose) => crypto.createHmac('sha256', atRestKey).update(`captcha|${salt}|${d}|${exp}|${purpose}`).digest('hex');
 api.get('/captcha', (req, res) => {
-  rateLimit('captcha:' + req.ip, 60, 10 * 60 * 1000);
+  limitNet(req, 'captcha', 60, 10 * 60 * 1000);
   const purpose = req.query.purpose === 'register' ? 'register' : 'login';
   if (captchaMode(purpose) === 'off') return res.json({ required: false });
   const salt = crypto.randomBytes(16).toString('hex');
-  const difficulty = captchaDifficulty(cleanIp(req.ip));
+  const difficulty = captchaDifficulty(req.ip, purpose);
   const expires = now() + 5 * 60 * 1000;
   res.json({ required: true, salt, difficulty, expires, purpose, sig: captchaSig(salt, difficulty, expires, purpose) });
 });
@@ -2828,17 +3942,20 @@ function zeroBits(buf) {
   for (const b of buf) { if (b === 0) { n += 8; continue; } n += Math.clz32(b) - 24; break; }
   return n;
 }
-function verifyCaptcha(c, purpose) {
+// Checks a solved robot check. It has to be at least as hard as one handed out to this address right now:
+// puzzles aren't tied to an address, so otherwise easy ones could be fetched elsewhere, or before a rush.
+function verifyCaptcha(c, purpose, ip) {
   if (captchaMode(purpose) === 'off') return;
   const bad = (msg) => fail(400, msg, 'captcha');
   if (!c || typeof c !== 'object') bad('Please complete the \u201cI\u2019m not a robot\u201d check.');
   const { salt, difficulty, expires, sig, nonce } = c;
   if (!/^[0-9a-f]{32}$/.test(String(salt)) || !Number.isInteger(difficulty) || difficulty < CAPTCHA_BASE || difficulty > CAPTCHA_MAX
     || !Number.isInteger(nonce) || nonce < 0 || typeof sig !== 'string' || sig.length !== 64) bad('The robot check didn\u2019t work. Please try again.');
-  const good = captchaSig(salt, difficulty, expires, purpose);
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) bad('The robot check didn\u2019t work. Please try again.');
+  if (!safeEqual(sig, captchaSig(salt, difficulty, expires, purpose))) bad('The robot check didn\u2019t work. Please try again.');
   if (+expires < now()) bad('The robot check expired. Please try again.');
   if (usedCaptchas.has(salt)) bad('That robot check was already used. Please try again.');
+  // The app solves a new, harder one by itself when it sees this code.
+  if (difficulty < captchaDifficulty(ip, purpose)) fail(400, 'The robot check needs to be a little harder right now. Please try again.', 'captcha_harder');
   if (zeroBits(crypto.createHash('sha256').update(`${salt}:${nonce}`).digest()) < difficulty) { secEvent('captcha_failed', '', purpose); bad('The robot check didn\u2019t work. Please try again.'); }
   usedCaptchas.set(salt, +expires);
 }
@@ -2881,42 +3998,27 @@ api.post('/terms/accept', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- moderation helpers
+// Same rule as req.ip (TRUST_PROXY), so a live connection can't claim an address that HTTP wouldn't accept.
 function socketIp(socket) {
   const remote = socket.handshake.address || (socket.request && socket.request.socket.remoteAddress);
-  if (PRIVATE_IP.test(String(remote || ''))) {
-    const xff = String(socket.handshake.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
-    for (let i = xff.length - 1; i >= 0; i--) if (!PRIVATE_IP.test(xff[i])) return cleanIp(xff[i]);
-  }
-  return cleanIp(remote);
+  return cleanIp(clientIp(remote, socket.handshake.headers['x-forwarded-for'], app.get('trust proxy fn')));
 }
 // The audit log: staff actions and security events on accounts (password changes and resets, two-factor,
-// sessions, deletions). Append-only — the database refuses to edit or delete entries (see db.js), and each
-// entry's hash covers the previous one, so a hand-edited database shows up as a broken chain.
+// sessions, deletions). Append-only — the database refuses to edit or delete entries (see db.js). Each entry's
+// hash covers the previous one and is keyed with a secret from data/secret.key, and the newest entry is anchored
+// in a file outside the database, so editing the database by hand, or cutting entries off the end, shows up.
 // `req` may be null for things the server does by itself; actorId then says whose account it was.
 function auditLog(req, action, target, detail = '', actorId = undefined) {
-  db.transaction(() => {
-    const last = db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
-    const r = { id: last.id + 1, admin_id: actorId !== undefined ? actorId : (req && req.userId) || null, action, target: target || null, detail: String(detail).slice(0, 1000), ip: req ? cleanIp(req.ip) : null, created_at: now() };
-    db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(r.id, r.admin_id, r.action, r.target, r.detail, r.ip, r.created_at, last.hash || '', auditHash(last.hash || '', r));
-  })();
+  auditAppend({ admin_id: actorId !== undefined ? actorId : (req && req.userId) || null, action, target: target || null, detail: String(detail), ip: req ? cleanIp(req.ip) : null });
 }
 const adminLog = auditLog;
-// Walks the whole chain. Returns { ok, entries, brokenAt }.
-function verifyAuditChain() {
-  let prev = ''; let n = 0;
-  for (const r of db.prepare('SELECT * FROM admin_log ORDER BY id').iterate()) {
-    n++;
-    if ((r.prev_hash || '') !== prev || r.hash !== auditHash(prev, r)) return { ok: false, entries: n, brokenAt: r.id };
-    prev = r.hash;
-  }
-  return { ok: true, entries: n, brokenAt: null };
-}
+// Walks the whole chain (see auditVerify in db.js): { ok, entries, brokenAt, reason, gaps, … }.
+const verifyAuditChain = () => auditVerify();
 function suspendUser(uid, reason, hours = 0) {
   const until = hours > 0 ? now() + hours * 3600000 : null;
   db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ?, suspended_until = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), until, uid);
   revokeSessions(uid, { reason: 'suspended' });
-  io.in(`user:${uid}`).disconnectSockets(true);
+  closeWindows(uid, 'suspended');
 }
 const ipsOf = (uid) => db.prepare('SELECT ip, first_seen AS firstSeen, last_seen AS lastSeen FROM user_ips WHERE user_id = ? ORDER BY last_seen DESC LIMIT 20').all(uid);
 // Placeholder until the Support account exists (phase 2): every new account will get it as a friend.
@@ -2961,6 +4063,12 @@ api.post('/reports', auth, (req, res) => {
     if (!evidence.some((e) => e.reported)) fail(400, 'Include the reported message.');
   }
   if (!getUserRow(targetId) || targetId === req.userId) fail(400, 'You can\u2019t report that account.');
+  // Reporting the same message again while staff haven't closed the first report adds nothing: the first one stands.
+  if (context.messageId) {
+    const dup = db.prepare(`SELECT id FROM reports WHERE reporter_id = ? AND status IN ('open','reviewing') AND json_valid(context)
+      AND json_extract(context, '$.messageId') = ? LIMIT 1`).get(req.userId, context.messageId);
+    if (dup) return res.json({ ok: true, id: dup.id, duplicate: true });
+  }
   const target = getUserRow(targetId);
   const ips = [...new Set([target.last_ip, ...ipsOf(targetId).map((x) => x.ip)].filter(Boolean))].slice(0, 20);
   const id = newId();
@@ -3113,7 +4221,7 @@ api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
 api.post('/admin/users/:id/logout', auth, staffOnly, (req, res) => {
   requireOutranks(req, req.params.id);
   revokeSessions(req.params.id, { reason: 'staff' });
-  io.in(`user:${req.params.id}`).disconnectSockets(true);
+  closeWindows(req.params.id, 'staff');
   adminLog(req, 'sign_out_everywhere', req.params.id);
   res.json({ ok: true });
 });
@@ -3130,32 +4238,48 @@ api.get('/admin/reports', auth, staffOnly, (req, res) => {
     priorReports: db.prepare('SELECT COUNT(*) n FROM reports WHERE target_id = ? AND id != ?').get(r.target_id, r.id).n,
   })));
 });
+// Staff can't close (or reopen) reports about themselves or about staff at their level or above: those are for
+// someone ranked higher. The owner handles reports about the owner (nobody is above them).
+function requireCanHandleReport(req, r) {
+  if (staffRole(req.userId) === 'owner') return;
+  if (r.target_id === req.userId) fail(403, 'This report is about you, so someone ranked above you handles it.');
+  if (r.target_id && staffRank(r.target_id) >= staffRank(req.userId)) fail(403, `This report is about ${staffRole(r.target_id) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them handles it.`);
+}
 api.patch('/admin/reports/:id', auth, staffOnly, (req, res) => {
   const b = req.body || {};
   const r = db.prepare('SELECT * FROM reports WHERE id = ?').get(req.params.id);
   if (!r) fail(404, 'Report not found.');
+  requireCanHandleReport(req, r);
   const status = ['open', 'reviewing', 'resolved', 'dismissed'].includes(b.status) ? b.status : r.status;
   db.prepare('UPDATE reports SET status = ?, resolution = ?, handled_by = ?, handled_at = ? WHERE id = ?').run(status, String(b.resolution ?? r.resolution).slice(0, 1000), req.userId, now(), r.id);
   adminLog(req, 'report_' + status, r.id, b.resolution || '');
   res.json({ ok: true });
 });
-// Remove a reported message (or any message) for everyone.
+// Whether a message is part of a report (the reported message or one of the messages included with it).
+const inReport = (mid) => !!db.prepare(`SELECT 1 FROM reports r WHERE (CASE WHEN json_valid(r.context) THEN json_extract(r.context, '$.messageId') END) = ?
+  OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r.evidence) THEN r.evidence ELSE '[]' END) e WHERE json_extract(e.value, '$.id') = ?) LIMIT 1`).get(mid, mid);
+// Remove a reported message for everyone. Like every other staff action on a person, only messages by people
+// ranked below you (or your own) can be removed; that goes for the replies in its thread too, since they go with
+// it. Direct messages and group chats are private, so staff can only remove ones that were reported.
 api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
+  const d = !m && db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
+  if (!m && !d) fail(404, 'Message already gone.');
+  const outranks = (author) => !author || author === req.userId || staffRank(author) < staffRank(req.userId);
+  const author = (m || d).author_id;
+  if (!outranks(author)) fail(403, `You can’t remove messages by ${staffRole(author) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
+  const c = m && db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
+  const group = !!c && !!db.prepare("SELECT 1 FROM servers WHERE id = ? AND kind = 'group'").get(c.server_id);
+  if ((d || group) && !inReport((m || d).id)) fail(403, `${d ? 'Direct messages' : 'Group chat messages'} can only be removed when they were reported.`);
   if (m) {
-    const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
-    const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.id)];
-    removeMessageFiles(ids);
-    const q = ids.map(() => '?').join(',');
-    db.prepare(`DELETE FROM reactions WHERE message_id IN (${q})`).run(...ids);
-    db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
+    const above = db.prepare('SELECT DISTINCT author_id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.author_id).find((a) => !outranks(a));
+    if (above) fail(403, `This thread has replies by ${staffRole(above) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them has to remove it.`);
+    deleteMessageTree(m.id);
     if (c) toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
+    if (c) BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
   } else {
-    const d = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
-    if (!d) fail(404, 'Message already gone.');
     const dm = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(d.dm_id);
-    removeMessageFiles([d.id]);
-    db.prepare('DELETE FROM reactions WHERE message_id = ?').run(d.id);
+    forgetMessages([d.id]);
     db.prepare('DELETE FROM dm_messages WHERE id = ?').run(d.id);
     if (dm) io.to([`user:${dm.user_a}`, `user:${dm.user_b}`]).emit('dm:delete', { id: d.id, dmId: dm.id });
   }
@@ -3164,9 +4288,9 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
 });
 // Staff roles. Everyone on staff can see the team; only the owner can change it.
 function staffList() {
-  const ids = new Set([ownerId(), ...Object.keys(staffRoles())]);
-  envAdmins().forEach((n) => { const r = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(n); if (r) ids.add(r.id); });
-  return [...ids].filter((id) => id && staffRole(id)).map((id) => ({ ...brief(id), role: staffRole(id), fromEnv: envAdmins().includes((getUserRow(id) || {}).username?.toLowerCase()) && staffRole(id) !== 'owner' }))
+  const claims = envClaims();
+  const ids = new Set([ownerId(), ...Object.keys(staffRoles()), ...envAdmins().map((n) => claims[n])]);
+  return [...ids].filter((id) => id && staffRole(id)).map((id) => ({ ...brief(id), role: staffRole(id), fromEnv: !!envAdminName(id) && staffRole(id) !== 'owner' }))
     .sort((x, y) => STAFF_RANK[y.role] - STAFF_RANK[x.role] || x.username.localeCompare(y.username));
 }
 function staffChanged(uid) {
@@ -3175,41 +4299,69 @@ function staffChanged(uid) {
 }
 api.get('/admin/staff', auth, staffOnly, (req, res) => res.json({ staff: staffList(), me: staffRole(req.userId) }));
 // Give someone a role, change it, or take it away (role: 'admin' | 'moderator' | null).
-api.put('/admin/staff', auth, ownerOnly, (req, res) => {
+// Needs the owner's password (and two-factor) again: a stolen session alone can't add itself to the team.
+api.put('/admin/staff', auth, ownerOnly, wrap(async (req, res) => {
   const b = req.body || {};
   const row = b.userId ? getUserRow(String(b.userId)) : db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(String(b.username || '').trim().replace(/^@/, '').toLowerCase());
   if (!row) fail(404, 'No account with that username.');
   if (row.id === ownerId()) fail(400, 'You\u2019re the owner. To step down, hand ownership to someone else first.');
   const role = b.role === 'admin' || b.role === 'moderator' ? b.role : null;
-  if (!role && envAdmins().includes(row.username.toLowerCase())) fail(400, `${row.username} is an admin through ADMIN_USERS in the server's .env file. Remove the name there and restart to take it away.`);
+  if (!role && envAdminName(row.id)) fail(400, `${row.username} is an admin through ADMIN_USERS (as ${envAdminName(row.id)}) in the server's .env file. Remove the name there and restart to take it away.`);
+  await stepUp(req, b);
   const roles = staffRoles();
   if (role) roles[row.id] = role; else delete roles[row.id];
   saveStaffRoles(roles);
   staffChanged(row.id);
   adminLog(req, role ? `role_${role}` : 'role_removed', row.id, row.username);
   res.json({ staff: staffList(), me: staffRole(req.userId) });
-});
+}));
 // Hand the whole instance to someone else. They become owner; the old owner stays on as an admin.
-api.post('/admin/owner', auth, ownerOnly, (req, res) => {
+// It can't be undone from the old owner's side, so it needs the password (and two-factor) again, and the old
+// owner gets an email about it (if they have a confirmed one) in case it wasn't them.
+api.post('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
   const row = getUserRow(String((req.body || {}).userId || ''));
   if (!row) fail(404, 'User not found.');
   if (row.id === req.userId) fail(400, 'You already own this server.');
+  // A deleted account or a bot can never sign in, so it could never use (or hand back) ownership.
+  if (row.deleted_at || row.is_bot) fail(400, 'That account can’t sign in, so it can’t own this server.');
   if (row.suspended_at) fail(400, 'Unsuspend them first.');
+  const me = await stepUp(req, req.body);
   const roles = staffRoles();
   delete roles[row.id];
   roles[req.userId] = 'admin';
   saveStaffRoles(roles);
   setSetting('owner', row.id);
+  setSetting('ownerAwaitsEnv', null); // handed over: no ADMIN_USERS sign-up takes it later
   staffChanged(row.id); staffChanged(req.userId);
-  adminLog(req, 'ownership_transferred', row.id, row.username);
+  adminLog(req, 'ownership_transferred', row.id, `${me.username} \u2192 ${row.username}`);
+  secEvent('ownership_transferred', req.ip, `${me.username} -> ${row.username}`);
+  ACCT.notify(me, 'you handed over ownership', `${me.username} handed ownership of ${brand().name} to ${row.username} (from ${cleanIp(req.ip)}). You're now an admin, and only ${row.username} can give ownership back.`);
+  ACCT.notify(row, 'you now own this Hearth', `${me.username} made ${row.username} the owner of ${brand().name}.`);
   res.json({ ok: true });
-});
+}));
 // IP bans
 api.get('/admin/ip-bans', auth, adminOnly, (req, res) => res.json(ipBans()));
+// Whether a ban entry ("203.0.113.7" or "203.0.113.0/24") covers an address (same rules as ipBanned).
+function banCovers(entry, ip) {
+  ip = cleanIp(ip);
+  const [base, bits] = String(entry).split('/');
+  if (bits === undefined) return base.toLowerCase() === ip.toLowerCase();
+  const a = ip4num(ip); const n = ip4num(base); const k = +bits;
+  if (a === null || n === null || !(k >= 0 && k <= 32)) return false;
+  const mask = k === 0 ? 0 : (~0 << (32 - k)) >>> 0;
+  return ((a & mask) >>> 0) === ((n & mask) >>> 0);
+}
 api.post('/admin/ip-bans', auth, adminOnly, (req, res) => {
   const ip = String((req.body || {}).ip || '').trim();
   if (!/^(\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?|[0-9a-f:]{3,39})$/i.test(ip)) fail(400, 'Enter an IP address like 203.0.113.7 or a range like 203.0.113.0/24.');
-  if (ipBanned(req.ip) || (ip.includes('/') ? false : ip === cleanIp(req.ip))) fail(400, 'That would block your own connection.');
+  if (ipBanned(req.ip) || banCovers(ip, req.ip)) fail(400, 'That would block your own connection.');
+  // Like every other staff action: no banning the networks the owner, or staff at your level or above, use.
+  const mine = staffRank(req.userId);
+  for (const s of staffList().filter((x) => x.id !== req.userId && STAFF_RANK[x.role] >= mine)) {
+    const row = getUserRow(s.id);
+    const seen = [row && row.last_ip, ...ipsOf(s.id).map((x) => x.ip)].filter(Boolean);
+    if (seen.some((a) => banCovers(ip, a))) fail(403, `That would block ${s.role === 'owner' ? 'the owner' : 'staff at your level or above'} (${s.username}).`);
+  }
   const list = ipBans().filter((b) => b.ip !== ip);
   list.unshift({ ip, reason: String((req.body || {}).reason || '').slice(0, 200), by: req.userId, at: now() });
   setSetting('ipBans', JSON.stringify(list.slice(0, 1000)));
@@ -3232,13 +4384,19 @@ api.get('/admin/servers', auth, adminOnly, (req, res) => {
     FROM servers s WHERE s.kind = 'server' ORDER BY members DESC LIMIT 500`).all()
     .map((x) => ({ id: x.id, name: x.name, icon: x.icon, owner: brief(x.owner_id), members: x.members, messages: x.messages, createdAt: x.created_at, lastActive: x.lastActive })));
 });
+// Staff can only act on servers whose owner ranks below them (or their own servers).
+function requireOutranksServerOwner(req, srv) {
+  if (srv.owner_id !== req.userId && staffRank(srv.owner_id) >= staffRank(req.userId)) {
+    fail(403, `This server belongs to ${staffRole(srv.owner_id) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
+  }
+}
+// Group chats are private conversations, not servers: they can't be deleted from here.
 api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
-  const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(req.params.id);
+  const srv = db.prepare("SELECT * FROM servers WHERE id = ? AND kind = 'server'").get(req.params.id);
   if (!srv) fail(404, 'Server not found.');
+  requireOutranksServerOwner(req, srv);
   const memberIds = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(srv.id).map((r) => r.user_id);
-  const ids = db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(srv.id).map((r) => r.id);
-  if (ids.length) removeMessageFiles(ids);
-  removeUpload(srv.icon);
+  purgeServerContent(srv);
   MEMB.onServerDeleted(srv.id);
   db.prepare('DELETE FROM servers WHERE id = ?').run(srv.id);
   memberIds.forEach((u) => io.to(`user:${u}`).emit('server:remove', { serverId: srv.id }));
@@ -3250,6 +4408,7 @@ api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
 api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
   const srv = db.prepare("SELECT * FROM servers WHERE id = ? AND kind = 'server'").get(req.params.id);
   if (!srv) fail(404, 'Server not found.');
+  requireOutranksServerOwner(req, srv);
   const row = db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(String((req.body || {}).username || '').trim().replace(/^@/, '').toLowerCase());
   if (!row) fail(404, 'No account with that username.');
   if (!isMember(srv.id, row.id)) fail(400, `${row.username} isn\u2019t a member of ${srv.name}.`);
@@ -3262,7 +4421,7 @@ api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
 api.post('/admin/sign-out-all', auth, adminOnly, (req, res) => {
   const victims = db.prepare('SELECT DISTINCT user_id FROM sessions WHERE revoked_at IS NULL').all().map((r) => r.user_id).filter((id) => !isStaff(id));
   db.transaction(() => victims.forEach((id) => revokeSessions(id, { reason: 'staff' })))();
-  victims.forEach((id) => io.in(`user:${id}`).disconnectSockets(true));
+  victims.forEach((id) => closeWindows(id, 'staff'));
   adminLog(req, 'sign_out_all', null, `${victims.length} accounts`);
   res.json({ ok: true, count: victims.length });
 });
@@ -3316,7 +4475,7 @@ api.put('/admin/terms', auth, adminOnly, (req, res) => {
 
 // ---------------------------------------------------------------- profile pages (MySpace style)
 const pageViews = new Map(); // "viewer:owner" -> last counted, so reloading doesn't inflate the counter
-setInterval(() => { const t = now() - 3600000; for (const [k, v] of pageViews) if (v < t) pageViews.delete(k); }, 600000).unref();
+jobs.every('pages.view_sweep', 600000, () => { const t = now() - 3600000; for (const [k, v] of pageViews) if (v < t) pageViews.delete(k); });
 function canCommentOn(viewerId, row, page) {
   if (!features().comments) return false;
   if (viewerId === row.id) return true;
@@ -3324,6 +4483,13 @@ function canCommentOn(viewerId, row, page) {
   return page.comments === 'everyone' ? true : areFriends(viewerId, row.id);
 }
 const commentOut = (c) => ({ id: c.id, text: c.text, createdAt: c.created_at, author: publicUser(getUserRow(c.author_id)) });
+// "Last seen", as the app shows it: the day only. Nothing at all while the person is invisible, or when
+// either of you has blocked the other: the exact time would tell a watcher when they're using Hearth.
+const DAY_MS = 86400000;
+function lastSeenFor(viewerId, row, blocked = row && viewerId !== row.id && isBlocked(viewerId, row.id)) {
+  if (!row || !row.last_seen_at || row.status === 'invisible' || row.is_bot || blocked) return null;
+  return Math.floor(row.last_seen_at / DAY_MS) * DAY_MS + DAY_MS / 2; // noon UTC: the same date almost everywhere
+}
 api.get('/users/:id/page', auth, (req, res) => {
   const row = getUserRow(req.params.id);
   if (!row) fail(404, 'User not found.');
@@ -3340,9 +4506,9 @@ api.get('/users/:id/page', auth, (req, res) => {
   res.json({
     page: features().customCss ? page : { ...page, css: '' }, pageBg: row.page_bg || null, views,
     friendCount: db.prepare("SELECT COUNT(*) n FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)").get(row.id, row.id).n,
-    topFriends: prof.topFriends.map((id) => publicUser(getUserRow(id))).filter(Boolean),
+    topFriends: blocked ? [] : prof.topFriends.map((id) => publicUser(getUserRow(id))).filter(Boolean),
     isFriend: areFriends(req.userId, row.id),
-    lastSeen: row.last_seen_at || null,
+    lastSeen: lastSeenFor(req.userId, row, blocked),
     comments: blocked ? [] : db.prepare('SELECT * FROM profile_comments WHERE profile_id = ? ORDER BY created_at DESC LIMIT 100').all(row.id).map(commentOut),
     commentCount: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE profile_id = ?').get(row.id).n,
     canComment: canCommentOn(req.userId, row, page),
@@ -3351,6 +4517,7 @@ api.get('/users/:id/page', auth, (req, res) => {
 });
 api.put('/me/page', auth, (req, res) => {
   requireUnlocked(req.userId);
+  limitProfileWrites(req);
   const row = getUserRow(req.userId);
   const page = sanitizePage(req.body || {}, parsePage(row));
   checkWords(page.meet, page.details.map((d) => [d.label, d.value]), Object.values(page.interests));
@@ -3385,11 +4552,20 @@ api.delete('/profile-comments/:id', auth, (req, res) => {
 // ---------------------------------------------------------------- polls
 // The question and options travel inside the encrypted message; the server only stores which option
 // number each person picked, so it can count votes without knowing what they're about.
-function pollTarget(messageId, userId) {
+// act: voting or ending it, which a block stops in a DM like any other new interaction (reading it still works).
+function pollTarget(messageId, userId, act = false) {
   const cm = db.prepare('SELECT id, channel_id FROM messages WHERE id = ?').get(messageId);
-  if (cm) { const c = requireChannel(cm.channel_id, userId); return { emit: (ev, data) => toChannel(c).emit(ev, data) }; }
+  if (cm) {
+    const c = requireChannel(cm.channel_id, userId);
+    if (act && perms.timedOut(c.server_id, userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
+    return { emit: (ev, data) => toChannel(c).emit(ev, data) };
+  }
   const dm = db.prepare('SELECT id, dm_id FROM dm_messages WHERE id = ?').get(messageId);
-  if (dm) { const d = requireDm(dm.dm_id, userId); return { emit: (ev, data) => io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit(ev, data) }; }
+  if (dm) {
+    const d = requireDm(dm.dm_id, userId);
+    if (act && isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
+    return { emit: (ev, data) => io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit(ev, data) };
+  }
   fail(404, 'That poll no longer exists.');
 }
 function pollState(messageId) {
@@ -3399,7 +4575,7 @@ function pollState(messageId) {
 }
 api.get('/polls/:id', auth, (req, res) => { pollTarget(req.params.id, req.userId); res.json(pollState(req.params.id)); });
 api.post('/polls/:id/vote', auth, (req, res) => {
-  const t = pollTarget(req.params.id, req.userId);
+  const t = pollTarget(req.params.id, req.userId, true);
   rateLimit('vote:' + req.userId, 60, 60000);
   if (db.prepare('SELECT 1 FROM poll_closed WHERE message_id = ?').get(req.params.id)) fail(400, 'This poll has ended.');
   const choices = [...new Set((Array.isArray((req.body || {}).choices) ? req.body.choices : []).map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < 10))].slice(0, 10);
@@ -3412,7 +4588,7 @@ api.post('/polls/:id/vote', auth, (req, res) => {
   res.json(st);
 });
 api.post('/polls/:id/close', auth, (req, res) => {
-  const t = pollTarget(req.params.id, req.userId);
+  const t = pollTarget(req.params.id, req.userId, true);
   const row = db.prepare('SELECT author_id FROM messages WHERE id = ? UNION SELECT author_id FROM dm_messages WHERE id = ?').get(req.params.id, req.params.id);
   if (!row || row.author_id !== req.userId) fail(403, 'Only the person who made the poll can end it.');
   db.prepare('INSERT OR IGNORE INTO poll_closed (message_id, closed_at) VALUES (?, ?)').run(req.params.id, now());
@@ -3423,20 +4599,35 @@ api.post('/polls/:id/close', auth, (req, res) => {
 
 // ---------------------------------------------------------------- server events (hangouts, game nights…)
 // Not end-to-end encrypted (the server needs the time to send reminders) — the app says so.
+// An event's channel, for this person: only a channel they can see (a private channel's id isn't for everyone).
+function eventChannelFor(e, uid) {
+  const c = e.channel_id && db.prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?').get(e.channel_id, e.server_id);
+  return c && isMember(c.server_id, uid) && (perms.channel(serverOf(c), c, uid) & PM.VIEW_CHANNEL) ? c.id : null;
+}
+const mayEditEvent = (e, srv, uid) => e.created_by === uid || can(srv, uid, PM.MANAGE_SERVER) || can(srv, uid, PM.MANAGE_CHANNELS);
 const eventOut = (e, uid) => {
-  const rsvps = db.prepare('SELECT user_id, status FROM event_rsvps WHERE event_id = ?').all(e.id);
-  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId: e.channel_id, startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
+  // RSVPs of current members only (someone who left or was removed isn't coming).
+  const rsvps = db.prepare('SELECT r.user_id, r.status FROM event_rsvps r JOIN members m ON m.server_id = ? AND m.user_id = r.user_id WHERE r.event_id = ?').all(e.server_id, e.id);
+  const channelId = eventChannelFor(e, uid);
+  // Someone who may edit it learns only that it links to a channel they can't see, so the editor can keep that
+  // link instead of showing "no channel" and quietly dropping or replacing it on save.
+  const channelHidden = !channelId && !!e.channel_id && !!db.prepare('SELECT 1 FROM channels WHERE id = ? AND server_id = ?').get(e.channel_id, e.server_id)
+    && mayEditEvent(e, serverOf(e), uid);
+  return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId, startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
+    ...(channelHidden ? { channelHidden: true } : {}),
     going: rsvps.filter((r) => r.status === 'going').map((r) => r.user_id), maybe: rsvps.filter((r) => r.status === 'maybe').map((r) => r.user_id), no: rsvps.filter((r) => r.status === 'no').map((r) => r.user_id),
     mine: (rsvps.find((r) => r.user_id === uid) || {}).status || null };
 };
-function cleanEvent(b, srv) {
+// uid: who's saving it (they can only link a channel they can see); keep: the channel it already links to.
+function cleanEvent(b, srv, uid, keep = null) {
   const title = String(b.title || '').trim().slice(0, 100);
   if (!title) fail(400, 'Give the event a name.');
   const startsAt = Number(b.startsAt);
   if (!Number.isFinite(startsAt) || startsAt < now() - 3600000 || startsAt > now() + 400 * 86400000) fail(400, 'Pick a time in the next year.');
   const endsAt = b.endsAt ? Number(b.endsAt) : null;
   if (endsAt && (!Number.isFinite(endsAt) || endsAt <= startsAt)) fail(400, 'The end has to be after the start.');
-  const channelId = b.channelId && db.prepare('SELECT id FROM channels WHERE id = ? AND server_id = ?').get(String(b.channelId), srv.id) ? String(b.channelId) : null;
+  const want = b.channelId ? String(b.channelId) : null;
+  const channelId = want && (want === keep || eventChannelFor({ channel_id: want, server_id: srv.id }, uid)) ? want : null;
   const out = { title, description: String(b.description || '').slice(0, 2000), location: String(b.location || '').slice(0, 120), startsAt, endsAt, channelId };
   checkWords(out.title, out.description, out.location);
   return out;
@@ -3451,11 +4642,19 @@ api.get('/events', auth, (req, res) => {
   res.json(db.prepare(`SELECT e.* FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE m.user_id = ? AND COALESCE(e.ends_at, e.starts_at + 3 * 3600000) > ? AND e.starts_at < ? ORDER BY e.starts_at LIMIT 20`)
     .all(req.userId, now(), now() + 14 * 86400000).map((e) => eventOut(e, req.userId)));
 });
+// Events show up for everyone in the server, so posting one takes what posting a message does: someone muted
+// everywhere can't post events instead. Admins always can.
+function requireEventPoster(srv, uid) {
+  if (can(srv, uid, PM.MANAGE_SERVER) || can(srv, uid, PM.MANAGE_CHANNELS)) return;
+  const text = db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text'").all(srv.id);
+  if (!text.some((c) => canIn(srv, c, uid, PM.VIEW_CHANNEL | PM.SEND_MESSAGES))) fail(403, 'You need permission to send messages here to post events.');
+}
 api.post('/servers/:id/events', auth, (req, res) => {
   const srv = requireServer(req.params.id, req.userId);
   if (srv.kind === 'group') fail(400, 'Events are for servers.');
   rateLimit('event:' + req.userId, 20, 3600000);
-  const e = cleanEvent(req.body || {}, srv);
+  requireEventPoster(srv, req.userId);
+  const e = cleanEvent(req.body || {}, srv, req.userId);
   const id = newId();
   db.prepare('INSERT INTO server_events (id, server_id, title, description, location, channel_id, starts_at, ends_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(id, srv.id, e.title, e.description, e.location, e.channelId, e.startsAt, e.endsAt, req.userId, now());
@@ -3467,12 +4666,13 @@ function requireEventEditor(eventId, uid) {
   const e = db.prepare('SELECT * FROM server_events WHERE id = ?').get(eventId);
   if (!e) fail(404, 'That event no longer exists.');
   const srv = requireServer(e.server_id, uid);
-  if (e.created_by !== uid && !can(srv, uid, PM.MANAGE_SERVER) && !can(srv, uid, PM.MANAGE_CHANNELS)) fail(403, 'Only the person who made it (or a server admin) can change this event.');
+  if (!mayEditEvent(e, srv, uid)) fail(403, 'Only the person who made it (or a server admin) can change this event.');
   return { e, srv };
 }
 api.patch('/events/:id', auth, (req, res) => {
   const { e, srv } = requireEventEditor(req.params.id, req.userId);
-  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id }, ...(req.body || {}) }, srv);
+  requireEventPoster(srv, req.userId);
+  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id }, ...(req.body || {}) }, srv, req.userId, e.channel_id);
   db.prepare('UPDATE server_events SET title = ?, description = ?, location = ?, channel_id = ?, starts_at = ?, ends_at = ?, reminded = CASE WHEN starts_at = ? THEN reminded ELSE 0 END WHERE id = ?')
     .run(v.title, v.description, v.location, v.channelId, v.startsAt, v.endsAt, v.startsAt, e.id);
   emitEvents(srv.id);
@@ -3495,16 +4695,18 @@ api.post('/events/:id/rsvp', auth, (req, res) => {
   res.json(eventOut(e, req.userId));
 });
 // Reminders: 15 minutes before, everyone going (or maybe) gets a nudge — in the app and as a push notification.
-setInterval(() => {
+jobs.every('events.reminders', 60000, () => {
   const soon = db.prepare('SELECT * FROM server_events WHERE reminded = 0 AND starts_at <= ? AND starts_at > ?').all(now() + 15 * 60000, now() - 5 * 60000);
   for (const e of soon) {
     db.prepare('UPDATE server_events SET reminded = 1 WHERE id = ?').run(e.id);
-    const who = db.prepare("SELECT user_id FROM event_rsvps WHERE event_id = ? AND status IN ('going', 'maybe')").all(e.id).map((r) => r.user_id);
+    // Only people still in the server (an RSVP doesn't outlive membership).
+    const who = db.prepare(`SELECT r.user_id FROM event_rsvps r JOIN members m ON m.server_id = ? AND m.user_id = r.user_id
+      WHERE r.event_id = ? AND r.status IN ('going', 'maybe')`).all(e.server_id, e.id).map((r) => r.user_id);
     const srv = db.prepare('SELECT name FROM servers WHERE id = ?').get(e.server_id) || {};
-    who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: e.channel_id }));
-    pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/' });
+    who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: eventChannelFor(e, u) }));
+    pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/', generic: 'An event is starting soon' }, { kind: 'event', serverId: srv.id });
   }
-}, 60000).unref();
+});
 
 // People directory: everyone you share a server with, plus your friends, with what their profile shows.
 api.get('/people', auth, (req, res) => {
@@ -3514,7 +4716,8 @@ api.get('/people', auth, (req, res) => {
       u.id IN (SELECT y.user_id FROM members x JOIN members y ON x.server_id = y.server_id WHERE x.user_id = ?)
       OR u.id IN (SELECT CASE WHEN requester_id = ? THEN addressee_id ELSE requester_id END FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)))
     LIMIT 2000`).all(req.userId, req.userId, req.userId, req.userId, req.userId);
-  let list = rows.map((r) => ({ ...publicUser(r), views: r.page_views || 0, lastSeen: r.last_seen_at || 0 }))
+  const blockedIds = new Set(db.prepare('SELECT blocked_id AS id FROM blocks WHERE blocker_id = ? UNION SELECT blocker_id FROM blocks WHERE blocked_id = ?').all(req.userId, req.userId).map((b) => b.id));
+  let list = rows.map((r) => ({ ...publicUser(r), views: r.page_views || 0, lastSeen: lastSeenFor(req.userId, r, blockedIds.has(r.id)) || 0 }))
     .filter((u) => !q || u.username.toLowerCase().includes(q) || (u.profile.displayName || '').toLowerCase().includes(q)
       || (u.profile.interests || []).some((t) => t.toLowerCase().includes(q)) || (u.profile.headline || '').toLowerCase().includes(q));
   const on = (u) => (u.presence && u.presence !== 'offline' ? 1 : 0);
@@ -3584,8 +4787,11 @@ api.delete('/admin/users/:id/files', auth, adminOnly, (req, res) => {
   const r = requireOutranks(req, req.params.id);
   const files = db.prepare('SELECT name FROM user_files WHERE user_id = ?').all(r.id);
   files.forEach((f) => removeUpload('/uploads/' + f.name));
+  // GIFs they put in the server's library (uploaded, or collected from what they sent).
+  db.prepare('SELECT id, file FROM gif_library WHERE added_by = ?').all(r.id).forEach((g) => removeLibraryGif(g));
   db.prepare('UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, page_bg = NULL WHERE id = ?').run(r.id);
   db.prepare('DELETE FROM blobs WHERE uploader_id = ?').run(r.id);
+  STORE.cancelUserSessions(r.id);
   broadcastUser(r.id);
   adminLog(req, 'files_deleted', r.id, `${files.length} files`);
   res.json({ ok: true, count: files.length });
@@ -3601,7 +4807,7 @@ api.delete('/admin/users/:id/comments', auth, staffOnly, (req, res) => {
 // ---------------------------------------------------------------- owner tools
 // Branding, feature switches, funding, backups and server health.
 const brand = () => ({ name: (getSetting('brandName') || INSTANCE_NAME).slice(0, 40), tagline: (getSetting('brandTagline') || '').slice(0, 140) });
-const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, createServers: 'everyone' };
+const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, createServers: 'everyone', createBots: 'admins' };
 function features() {
   let v = {};
   try { v = JSON.parse(getSetting('features') || '{}') || {}; } catch { /* defaults */ }
@@ -3613,12 +4819,25 @@ function funding() {
   return { enabled: !!v.enabled, url: typeof v.url === 'string' ? v.url : '', monthly: +v.monthly || 0, raised: +v.raised || 0, currency: typeof v.currency === 'string' ? v.currency.slice(0, 3) : 'USD', note: typeof v.note === 'string' ? v.note : '' };
 }
 // Payments through Ko-fi / Stripe (server/money.js) count toward "raised this month" by themselves.
-const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, brief,
+const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, brief, auditLog, stepUp, sealSecret, openSecret,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), onChange: () => io && io.emit('config:update', { funding: fundingPublic(), support: MONEY.available() }) });
 // Creator memberships (server/memberships.js): server owners sell monthly tiers that give a role.
 const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
-  isMember, emitServer, seal, unseal, newId, brief, PM, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
+  isMember, emitServer, seal, unseal, newId, brief, PM, auditLog, stepUp, sealSecret, openSecret, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
   mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
+// Resumable uploads, storage reports and orphan cleanup (server/storage.js).
+STORE = require('./storage')({ api, auth, db, fail, wrap, rateLimit, limitNet, HttpError, quotaOf, overLimit, uploadLimits, fmtMb, MB, getUserRow,
+  removeUpload, fileName, UPLOAD_DIR, DATA_DIR, unseal, auditLog, stepUp, adminOnly, brief });
+// Message search (server/search.js): filters by where, who and when; the search words stay in the app.
+require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
+// Bots and integrations (server/bots.js): installs, scopes, the bot API, signed webhooks, slash commands.
+BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, checkWords,
+  perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
+  getIo: () => io, features, isStaff, isInstanceAdmin, maintenance, newsBot: NEWS_BOT_ID });
+// Saved messages, read state, notification preferences, pin history, timeouts, data export (server/usability.js).
+USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
+  emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
+  requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();
@@ -3643,8 +4862,18 @@ api.get('/admin/owner', auth, ownerOnly, (req, res) => {
   res.json({ brand: brand(), features: features(), funding: funding(), supporterQuotaMb: +(getSetting('supporterQuotaMb') || 0),
     supporters: db.prepare('SELECT id FROM users WHERE supporter = 1').all().map((r) => brief(r.id)), ...backupInfo(), autoBackup: autoBackup() });
 });
-api.put('/admin/owner', auth, ownerOnly, (req, res) => {
+// The donation link is where supporters' money goes, and fewer (or no) automatic backups means older ones get
+// deleted sooner: like deleting a backup or changing payment destinations, those need the password (and
+// two-factor) again, so a stolen session can't quietly do it.
+api.put('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
   const b = req.body || {};
+  const fundingUrl = b.funding && b.funding.url !== undefined ? String(b.funding.url || '').slice(0, 300) : null;
+  if (fundingUrl && !/^https:\/\/[^\s]+$/i.test(fundingUrl)) fail(400, 'The donation link must start with https://');
+  const urlChanged = fundingUrl !== null && fundingUrl !== funding().url;
+  const was = autoBackup();
+  const nextBackup = b.autoBackup ? { enabled: !!b.autoBackup.enabled, keep: Math.max(1, Math.min(60, Math.round(+b.autoBackup.keep) || 7)) } : null;
+  const fewerBackups = !!nextBackup && ((was.enabled && !nextBackup.enabled) || nextBackup.keep < was.keep);
+  if (urlChanged || fewerBackups) await stepUp(req, b);
   if (b.brand) {
     checkWords(b.brand.name, b.brand.tagline);
     if (b.brand.name !== undefined) setSetting('brandName', String(b.brand.name).trim().slice(0, 40) || null);
@@ -3654,6 +4883,7 @@ api.put('/admin/owner', auth, ownerOnly, (req, res) => {
     const f = features();
     for (const k of ['customCss', 'comments', 'watch', 'gifs']) if (b.features[k] !== undefined) f[k] = !!b.features[k];
     if (['everyone', 'staff'].includes(b.features.createServers)) f.createServers = b.features.createServers;
+    if (['everyone', 'staff', 'admins'].includes(b.features.createBots)) f.createBots = b.features.createBots;
     setSetting('features', JSON.stringify(f));
   }
   if (b.funding) {
@@ -3663,11 +4893,13 @@ api.put('/admin/owner', auth, ownerOnly, (req, res) => {
       currency: /^[A-Z]{3}$/.test(f.currency) ? f.currency : 'USD', note: String(f.note || '').slice(0, 300) }));
   }
   if (b.supporterQuotaMb !== undefined) setSetting('supporterQuotaMb', String(Math.max(0, Math.min(1e6, Math.round(+b.supporterQuotaMb) || 0))));
-  if (b.autoBackup) setSetting('autoBackup', JSON.stringify({ enabled: !!b.autoBackup.enabled, keep: Math.max(1, Math.min(60, Math.round(+b.autoBackup.keep) || 7)) }));
-  adminLog(req, 'owner_settings', null, Object.keys(b).join(', '));
+  if (nextBackup) setSetting('autoBackup', JSON.stringify(nextBackup));
+  const what = Object.keys(b).filter((k) => !['authKey', 'totp', 'backupCode'].includes(k)).map((k) => (k === 'funding' && urlChanged ? 'funding (donation link changed)'
+    : k === 'autoBackup' ? `autoBackup (${was.enabled ? 'on' : 'off'}, keep ${was.keep} → ${nextBackup.enabled ? 'on' : 'off'}, keep ${nextBackup.keep})` : k));
+  adminLog(req, 'owner_settings', null, what.join(', '));
   io.emit('config:update', { name: brand().name, tagline: brand().tagline, features: features(), funding: fundingPublic() });
   res.json({ ok: true });
-});
+}));
 // Backups, two kinds:
 //   - database copies in data/backups/*.db (daily, and before every upgrade): for quickly undoing a bad update on
 //     this machine. They never leave the server (not even as a download): they're as sensitive as the database.
@@ -3676,7 +4908,16 @@ api.put('/admin/owner', auth, ownerOnly, (req, res) => {
 //     These are what you download or keep elsewhere.
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const ENC_DIR = path.join(BACKUP_DIR, 'encrypted');
+// The plaintext database snapshot a backup starts from lives here (private), never in ENC_DIR: that folder is the
+// one people copy off-site as it is.
+const BACKUP_TMP = path.join(BACKUP_DIR, '.tmp');
 const BK = require('./backup');
+// Leftovers untouched this long can't belong to a backup that's still running (it keeps writing to its files).
+const STALE_BACKUP_MS = 10 * 60000;
+const cleanStaleBackups = (olderThanMs = STALE_BACKUP_MS) => {
+  const removed = BK.cleanStale({ outDir: ENC_DIR, tmpDir: BACKUP_TMP, scratchDir: BACKUP_DIR, olderThanMs });
+  if (removed.length) log.info('backup', 'cleanup', { msg: `Removed leftovers of an interrupted backup: ${removed.join(', ')}` });
+};
 const autoBackup = () => { try { return { enabled: true, keep: 7, ...JSON.parse(getSetting('autoBackup') || '{}') }; } catch { return { enabled: true, keep: 7 }; } };
 function listBackups() {
   try {
@@ -3703,29 +4944,60 @@ async function makeBackup(kind) {
   await db.backup(path.join(BACKUP_DIR, name));
   return name;
 }
+// Which encrypted backups retention removes (list: newest first). It keeps the newest `keep` (at least 2), and also
+// the newest backup of each of the last `keep` days that have one, so a burst of backups made by hand (say, by a
+// stolen session) can't push older days out any faster than the daily schedule does.
+function backupsToPrune(list, keep) {
+  const n = Math.max(2, keep);
+  const kept = new Set(list.slice(0, n).map((x) => x.name));
+  const days = new Set();
+  for (const x of list) {
+    const day = new Date(x.at).toISOString().slice(0, 10);
+    if (!days.has(day) && days.size < n) { days.add(day); kept.add(x.name); }
+  }
+  return list.filter((x) => !kept.has(x.name));
+}
 let encBusy = null;
 // Make → restore-test → copy off-site. One at a time.
 function makeEncryptedBackup() {
   if (encBusy) return encBusy;
   encBusy = (async () => {
-    const b = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: ENC_DIR });
+    cleanStaleBackups(3600000); // anything this old belongs to a backup that was cut off, not one still running
+    const b = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: ENC_DIR, tmpDir: BACKUP_TMP });
     let verified;
     try { verified = { ...(await BK.verifyBackup(b.file, BK.loadKey(DATA_DIR), BACKUP_DIR)), at: now() }; } catch (e) { verified = { ok: false, error: e.message, at: now() }; }
-    saveBackupStatus(b.name, { verified });
-    if (!verified.ok) { console.error(`Encrypted backup ${b.name} FAILED its restore test: ${verified.error}`); auditLog(null, 'backup_restore_test_failed', null, `${b.name}: ${verified.error}`); return { ...b, verified }; }
+    saveBackupStatus(b.name, { verified, missing: b.missing.length });
+    // Files the database refers to that weren't on disk: the backup is still made (see docs/RECOVERY.md), and says so.
+    if (b.missing.length) {
+      log.warn('backup', 'files_missing', { file: b.name, count: b.missing.length, msg: `Backup ${b.name}: ${b.missing.length} file(s) the database refers to were missing: ${b.missing.slice(0, 10).join(', ')}` });
+      auditLog(null, 'backup_files_missing', null, `${b.name}: ${b.missing.length} missing (${b.missing.slice(0, 5).join(', ')}${b.missing.length > 5 ? ', …' : ''})`);
+    }
+    if (!verified.ok) {
+      log.error('backup', 'restore_test_failed', new Error(verified.error), { file: b.name, outcome: 'error', msg: `Encrypted backup ${b.name} FAILED its restore test.` });
+      auditLog(null, 'backup_restore_test_failed', null, `${b.name}: ${verified.error}`);
+      if (ALERTS) ALERTS.raise('backup_verify_failed', { severity: 'critical', title: 'A backup failed its restore test', detail: `${b.name} was made but couldn’t be restored in the test (${verified.error}). Older backups are kept. Try Admin → Owner → Backups → Back up now; if it fails again, check disk space and the backup key.` });
+      return { ...b, verified };
+    }
+    if (ALERTS) ALERTS.clear('backup_verify_failed');
     const offsite = await BK.uploadOffsite(b.file);
     if (!offsite.skipped) {
       saveBackupStatus(b.name, { offsite: { ...offsite, at: now() } });
-      if (!offsite.ok) { console.error(`Copying ${b.name} off-site failed: ${offsite.error}`); auditLog(null, 'backup_offsite_failed', null, `${b.name}: ${offsite.error}`); }
+      if (!offsite.ok) {
+        log.error('backup', 'offsite_failed', new Error(offsite.error), { file: b.name, outcome: 'error' });
+        auditLog(null, 'backup_offsite_failed', null, `${b.name}: ${offsite.error}`);
+        if (ALERTS) ALERTS.raise('backup_offsite_failed', { severity: 'warning', title: 'Copying a backup off-site failed', detail: `${b.name} is safe on this machine, but the copy to BACKUP_RCLONE_REMOTE failed: ${offsite.error}` });
+      }
     }
     // A copy on each linked region with backup space (server/regions.js), so losing this machine isn't losing it all.
     const regions = await REG.copyBackup(b.file).catch((e) => ({ error: { ok: false, error: e.message, at: now() } }));
     if (Object.keys(regions).length) {
       saveBackupStatus(b.name, { regions });
-      for (const r of Object.values(regions)) if (!r.ok) { console.error(`Copying ${b.name} to region ${r.name || ''} failed: ${r.error}`); auditLog(null, 'backup_region_failed', null, `${b.name} → ${r.name || '?'}: ${r.error}`); }
+      for (const r of Object.values(regions)) if (!r.ok) { log.error('backup', 'region_copy_failed', new Error(r.error), { file: b.name, region: r.name || '?', outcome: 'error' }); auditLog(null, 'backup_region_failed', null, `${b.name} → ${r.name || '?'}: ${r.error}`); }
     }
-    const a = autoBackup();
-    listEncBackups().slice(Math.max(2, a.keep)).forEach((x) => fs.promises.unlink(path.join(ENC_DIR, x.name)).catch(() => {}));
+    const keep = autoBackup().keep;
+    for (const x of backupsToPrune(listEncBackups(), keep)) {
+      try { fs.unlinkSync(path.join(ENC_DIR, x.name)); auditLog(null, 'backup_pruned', null, `${x.name} (keeping ${keep})`); } catch { /* already gone */ }
+    }
     return { ...b, verified, offsite, regions };
   })().finally(() => { encBusy = null; });
   return encBusy;
@@ -3734,9 +5006,15 @@ const backupInfo = () => ({ backups: listBackups(), encrypted: listEncBackups(),
   regionCopies: db.prepare('SELECT name, stats FROM regions').all().map((r) => { try { const b = JSON.parse(r.stats || '{}').backup; return b && b.ready ? r.name : null; } catch { return null; } }).filter(Boolean) });
 api.post('/admin/backups', auth, ownerOnly, wrap(async (req, res) => {
   rateLimit('backup:' + req.userId, 6, 3600000);
-  const b = await makeEncryptedBackup();
-  auditLog(req, 'backup_made', null, `${b.name}${b.verified && b.verified.ok ? ', restore test passed' : ', RESTORE TEST FAILED'}`);
-  res.json({ name: b.name, verified: b.verified, offsite: b.offsite, ...backupInfo() });
+  let b;
+  try { b = await makeEncryptedBackup(); } catch (e) {
+    // Nothing is left behind (createBackup removes its .part), and it's never reported as a backup.
+    log.error('backup', 'manual_failed', e, { outcome: 'error', msg: 'Encrypted backup (Back up now) failed.' });
+    auditLog(req, 'backup_failed', null, e.message);
+    fail(500, ['ENOSPC', 'EDQUOT'].includes(e.code) ? 'The backup failed because the disk is full. Nothing was saved. Free some space and try again.' : 'The backup failed. Nothing was saved. The server log says why.', 'backup_failed');
+  }
+  auditLog(req, 'backup_made', null, `${b.name}${b.verified && b.verified.ok ? ', restore test passed' : ', RESTORE TEST FAILED'}${b.missing.length ? `, ${b.missing.length} file(s) missing` : ''}`);
+  res.json({ name: b.name, verified: b.verified, offsite: b.offsite, missing: b.missing, ...backupInfo() });
 }));
 api.post('/admin/backups/:name/verify', auth, ownerOnly, wrap(async (req, res) => {
   rateLimit('backupverify:' + req.userId, 20, 3600000);
@@ -3755,13 +5033,16 @@ api.get('/admin/backups/:name', auth, ownerOnly, (req, res) => {
   auditLog(req, 'backup_downloaded', null, hit.name);
   res.download(path.join(ENC_DIR, hit.name), hit.name);
 });
-api.delete('/admin/backups/:name', auth, ownerOnly, (req, res) => {
+// Deleting a backup can't be undone (and is what someone covering their tracks would do), so it needs the
+// password (and two-factor) again.
+api.delete('/admin/backups/:name', auth, ownerOnly, wrap(async (req, res) => {
   const hit = listEncBackups().find((b) => b.name === req.params.name) || listBackups().find((b) => b.name === req.params.name);
   if (!hit) fail(404, 'Backup not found.');
+  await stepUp(req, req.body);
   fs.unlinkSync(path.join(hit.name.endsWith('.hbk') ? ENC_DIR : BACKUP_DIR, hit.name));
   auditLog(req, 'backup_deleted', null, hit.name);
   res.json(backupInfo());
-});
+}));
 // The backup key, to keep in a password manager. Needs the password (and two-factor) again; always logged.
 api.post('/admin/backups/key', auth, ownerOnly, wrap(async (req, res) => {
   await stepUp(req, req.body);
@@ -3770,22 +5051,33 @@ api.post('/admin/backups/key', auth, ownerOnly, wrap(async (req, res) => {
   auditLog(req, 'backup_key_viewed', null, '');
   res.json({ key });
 }));
-// Every day: a database copy (for quick rollback here) and an encrypted, restore-tested, off-site backup.
-setInterval(async () => {
+// Every day: a database copy (for quick rollback here) and an encrypted, restore-tested, off-site backup. Checked
+// hourly (the first check BACKUP_FIRST_CHECK_MS after start, default an hour). Both are tried even if one fails; a
+// failure is logged, alerted, and marks the job as failing.
+jobs.every('backup.daily', 3600000, async () => {
   const a = autoBackup();
   if (!a.enabled) return;
+  let failed = null;
   const autos = listBackups().filter((b) => b.name.startsWith('hearth-auto-'));
   if (!autos.length || Date.now() - autos[0].at > 23.5 * 3600000) {
     try {
       await makeBackup('auto');
       listBackups().filter((b) => b.name.startsWith('hearth-auto-')).slice(a.keep).forEach((b) => fs.promises.unlink(path.join(BACKUP_DIR, b.name)).catch(() => {}));
-    } catch (e) { console.error('Automatic backup failed:', e.message); }
+    } catch (e) { log.error('backup', 'db_copy_failed', e, { outcome: 'error', msg: 'Automatic backup failed.' }); failed = e; }
   }
   const enc = listEncBackups();
   if (!enc.length || Date.now() - enc[0].at > 23.5 * 3600000) {
-    try { await makeEncryptedBackup(); } catch (e) { console.error('Encrypted backup failed:', e.message); auditLog(null, 'backup_failed', null, e.message); }
+    try {
+      const b = await makeEncryptedBackup();
+      if (b && b.verified && !b.verified.ok) failed = failed || new Error(`restore test failed: ${b.verified.error}`);
+    } catch (e) { log.error('backup', 'encrypted_failed', e, { outcome: 'error', msg: 'Encrypted backup failed.' }); auditLog(null, 'backup_failed', null, e.message); failed = e; }
   }
-}, 3600000).unref();
+  if (failed) {
+    if (ALERTS) ALERTS.raise('backup_failed', { severity: 'critical', title: 'The daily backup failed', detail: `${log.errorCategory(failed)}: ${failed.message}. Older backups are kept. Admin → Health shows when the last good one was made.` });
+    throw failed;
+  }
+  if (ALERTS) ALERTS.clear('backup_failed');
+}, { firstDelay: +(process.env.BACKUP_FIRST_CHECK_MS || 3600000) });
 
 // One-time: list files uploaded before storage tracking existed, so quotas count them too.
 function indexOldFiles() {
@@ -3802,6 +5094,28 @@ function indexOldFiles() {
   })();
   setSetting('filesIndexed', '1');
 }
+// One-time: GIFs people uploaded to the server's GIF library before library uploads counted toward storage, so
+// they count (and show under "GIF library" in Storage) like the ones uploaded since. Learned GIFs aren't anyone's
+// upload and stay uncounted. The original upload time is kept, so they don't use up today's allowance.
+function indexLibraryUploads() {
+  if (getSetting('gifLibraryIndexed')) return;
+  const add = db.prepare('INSERT OR IGNORE INTO user_files (name, user_id, kind, size, created_at) VALUES (?, ?, ?, ?, ?)');
+  db.transaction(() => {
+    db.prepare("SELECT g.file, g.added_by, g.size, g.created_at FROM gif_library g JOIN users u ON u.id = g.added_by WHERE g.source = 'upload'").all()
+      .forEach((g) => { if (fs.existsSync(path.join(UPLOAD_DIR, path.basename(g.file)))) add.run(path.basename(g.file), g.added_by, 'gif', g.size, g.created_at); });
+  })();
+  setSetting('gifLibraryIndexed', '1');
+}
+
+// ---------------------------------------------------------------- health and alerts (server/health.js, server/alerts.js)
+// Alerts go to the owner's confirmed email and to the dashboard live ('admins' room). Unexpected errors, jobs that
+// keep failing and sign-in abuse (secEvent) feed them; backups raise their own.
+ALERTS = require('./alerts')({ getSetting, setSetting, emitAdmins: (ev, data) => io && io.to('admins').emit(ev, data), ownerRow: () => getUserRow(ownerId()), notify: (...a) => ACCT.notify(...a) });
+log.onError((line) => ALERTS.countError(line));
+jobs.setOnFailure((r) => ALERTS.jobFailed(r));
+jobs.setOnRecover((r) => ALERTS.jobRecovered(r.name));
+require('./health').setupHealth({ api, auth, adminOnly, wrap, fail, rateLimit, limitNet, db, DATA_DIR, SCHEMA_VERSION, VERSION, maintenance, stepUp, auditLog, alerts: ALERTS,
+  sockets: () => (io ? io.engine.clientsCount : 0), listEncBackups, listBackups, autoBackup, NEWS_BOT_ID, isAlive: REG.isAlive });
 
 // ---------------------------------------------------------------- errors + SPA fallback
 api.use((req, res) => res.status(404).json({ error: 'Not found.' }));
@@ -3816,7 +5130,7 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   if (err.type && /^(encoding|charset)\./.test(err.type)) return res.status(415).json({ error: 'Unsupported request encoding.' });
   const status = err.status || 500;
   const expected = err instanceof HttpError; // our own, user-facing errors keep their message
-  if (!expected) console.error(err);
+  if (!expected) log.error('http', 'unhandled_error', err, { method: req.method, route: log.routeOf(req), outcome: 'error' });
   if (expected && err.retryAfter) res.setHeader('Retry-After', String(err.retryAfter));
   res.status(status).json({ error: expected ? err.message : 'Something broke on the server.', code: err.code });
 });
@@ -3846,7 +5160,7 @@ async function loadTls() {
     });
     fs.writeFileSync(certPath, pems.cert);
     fs.writeFileSync(keyPath, pems.private, { mode: 0o600 });
-    console.log('Generated a self-signed certificate in', DATA_DIR);
+    log.info('tls', 'self_signed', { msg: `Generated a self-signed certificate in ${DATA_DIR}` });
   }
   return { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
 }
@@ -3855,6 +5169,10 @@ let io;
 
 // Voice rooms are server voice channels (by channel id) or 1-to-1 DM calls ("dm:<dmId>").
 const dmOfRoom = (room) => (String(room).startsWith('dm:') ? db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(String(room).slice(3)) : null);
+function roomRegion(room) {
+  const row = dmOfRoom(room) || db.prepare('SELECT rtc_region, rtc_region_v FROM channels WHERE id = ?').get(String(room));
+  return { region: (row && row.rtc_region) || null, regionVersion: (row && row.rtc_region_v) || 0 };
+}
 function emitVoiceState(room) {
   const payload = { channelId: room, users: voiceStateList(room) };
   const d = dmOfRoom(room);
@@ -3875,9 +5193,15 @@ function callees(room, callerId) {
 // One shared player per call: what's playing, where it was at `updatedAt` and whether it's playing.
 // Everyone in the call keeps their player in step with it; late joiners jump straight in.
 const watchRooms = new Map(); // room -> { item, queue, playing, position, rate, updatedAt, by, hostOnly }
+// The whole shared state (queue included) goes to everyone in the call on every change, so it stays small:
+// links are capped, and so is the state as a whole.
+const WATCH_URL_MAX = 2048;
+const WATCH_STATE_MAX = 64 * 1024;
 function parseWatchUrl(raw) {
   let u;
-  try { u = new URL(String(raw || '').trim()); } catch { fail(400, 'Paste a link to a video.'); }
+  const text = String(raw || '').trim();
+  if (text.length > WATCH_URL_MAX) fail(400, 'That link is too long.');
+  try { u = new URL(text); } catch { fail(400, 'Paste a link to a video.'); }
   const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, '');
   const secs = (t) => { if (!t) return 0; if (/^\d+$/.test(t)) return +t; const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(t); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0; };
   if (!/^https?:$/.test(u.protocol)) fail(400, 'Paste a link to a video.');
@@ -3896,7 +5220,10 @@ function parseWatchUrl(raw) {
     if (!/^[a-z0-9_]{3,25}$/i.test(ch) || ['videos', 'directory', 'settings'].includes(ch)) fail(400, 'Paste the link of a live Twitch channel (twitch.tv/name).');
     return { kind: 'twitch', src: ch.toLowerCase(), start: 0, link: `https://twitch.tv/${ch}`, live: true };
   }
-  if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(u.pathname) && /^https?:$/.test(u.protocol)) return { kind: 'video', src: u.href, start: 0, link: u.href };
+  if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(u.pathname) && /^https?:$/.test(u.protocol)) {
+    if (u.href.length > WATCH_URL_MAX) fail(400, 'That link is too long.'); // URL() can lengthen it (escaping)
+    return { kind: 'video', src: u.href, start: 0, link: u.href };
+  }
   fail(400, 'That site isn\u2019t supported yet. YouTube, Vimeo, Twitch (live) and direct video files (.mp4, .webm) work. For anything else, share your screen.');
 }
 async function watchTitle(item) {
@@ -3910,8 +5237,20 @@ async function watchTitle(item) {
     return String(j.title || '').slice(0, 150);
   } catch { return ''; }
 }
-const watchOut = (room) => { const w = watchRooms.get(room); return w ? { ...w, serverNow: Date.now() } : null; };
-const emitWatch = (room) => io.to(`voice:${room}`).emit('watch:state', { room, state: watchOut(room) });
+const watchOut = (room) => { const w = watchRooms.get(room); if (!w) return null; const { votes, ...out } = w; return { ...out, serverNow: Date.now() }; };
+// Changes are sent at most 4 times a second per call: quick bursts (dragging through a video, a stream of
+// controls) go out as one update carrying the latest state, so a flood of tiny events can't turn into a
+// flood of full-state broadcasts.
+const watchEmits = new Map(); // room -> { last, timer }
+function emitWatch(room) {
+  const e = watchEmits.get(room) || { last: 0, timer: null };
+  watchEmits.set(room, e);
+  if (e.timer) return;
+  const send = () => { e.timer = null; e.last = Date.now(); io.to(`voice:${room}`).emit('watch:state', { room, state: watchOut(room) }); };
+  const wait = e.last + 250 - Date.now();
+  if (wait <= 0) send(); else e.timer = setTimeout(jobs.job('watch.emit', send), wait);
+}
+const dropWatch = (room) => { const e = watchEmits.get(room); if (e) clearTimeout(e.timer); watchEmits.delete(room); watchRooms.delete(room); };
 // Where the video is right now, according to the shared state.
 const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 1000) * w.rate : 0);
 
@@ -3922,7 +5261,8 @@ function leaveVoice(userId, notifyUser = false) {
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
   const state = m && m.get(userId);
-  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); } }
+  if (state) clearTimeout(state.grace);
+  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); dropWatch(channelId); } }
   userVoice.delete(userId);
   if (state) {
     const sock = io.sockets.sockets.get(state.socketId);
@@ -3935,11 +5275,31 @@ function leaveVoice(userId, notifyUser = false) {
   if (!voiceChannels.has(channelId)) callees(channelId, userId).concat(userId).forEach((u) => io.to(`user:${u}`).emit('call:end', { room: channelId }));
 }
 
+// Realtime flood limits shared by all of a person's connections (each connection also has its own; see below).
+const MAX_SOCKETS_PER_USER = 30;
+const USER_BURST = 120; const USER_RATE = 30; // events: at most 120 at once, then 30 a second
+const userBudget = new Map(); // userId -> { tokens, at }
+function spendUserBudget(uid) {
+  const t = Date.now();
+  const b = userBudget.get(uid) || { tokens: USER_BURST, at: t };
+  b.tokens = Math.min(USER_BURST, b.tokens + ((t - b.at) / 1000) * USER_RATE);
+  b.at = t;
+  userBudget.set(uid, b);
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+// "Typing…" fans out to a whole server (and, in private channels, works out who may see it for every member),
+// so one person's typing events are passed on at most once a second, however many windows send them.
+const typingAt = new Map(); // userId -> when their last typing event was passed on
+
 function setupSockets(server) {
-  io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 1e6, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
+  // Every realtime event is small (the largest, a call offer, is a few kilobytes), so a message can be at most
+  // 256 KB: bigger ones only cost the server time to read.
+  io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 256 * 1024, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
   // Every minute: an open connection whose session has ended (signed out, expired, account suspended or
   // deleted) is closed; one that's still fine counts as use, so an app left open never idles out.
-  setInterval(() => {
+  jobs.every('sockets.session_sweep', 60000, () => {
     const t = now();
     const touch = db.prepare('UPDATE sessions SET last_used_at = ? WHERE id = ?');
     const seen = new Set();
@@ -3951,7 +5311,7 @@ function setupSockets(server) {
         sock.disconnect(true);
       } else if (!seen.has(s.id) && t - (s.last_used_at || 0) > 5 * 60000) { seen.add(s.id); touch.run(t, s.id); }
     }
-  }, 60000).unref();
+  });
 
   io.use((socket, next) => {
     const token = socket.handshake.auth && socket.handshake.auth.token;
@@ -3961,6 +5321,10 @@ function setupSockets(server) {
     if (!u || u.deleted_at || stillSuspended(u)) return next(new Error('unauthorized'));
     if (ipBanned(socketIp(socket)) && !isStaff(s.user_id)) { secEvent('blocked_ip', socketIp(socket), 'connection'); return next(new Error('unauthorized')); }
     if (maintenance() && !isStaff(s.user_id)) return next(new Error('maintenance'));
+    // Every window is one connection. Far more than anyone has open only multiplies what one account can send,
+    // and connecting over and over (each one is checked and recorded) only costs the server time.
+    if ((onlineSockets.get(s.user_id)?.size || 0) >= MAX_SOCKETS_PER_USER) return next(new Error('too_many_connections'));
+    try { rateLimit('sockconn:' + s.user_id, 60, 60000); } catch { return next(new Error('rate_limited')); }
     socket.userId = s.user_id;
     socket.data.token = token;
     socket.data.sid = s.id;
@@ -3973,14 +5337,31 @@ function setupSockets(server) {
 
   io.on('connection', (socket) => {
     const uid = socket.userId;
-    // Flood protection: at most 40 events per 4 seconds per connection; persistent flooding disconnects.
-    let bucket = 40; let strikes = 0;
-    const refill = setInterval(() => { bucket = Math.min(40, bucket + 10); }, 1000);
+    // Flood protection. A connection may send 40 events per 4 seconds, and all of a person's connections together
+    // 120, so opening more windows doesn't buy more. Call signaling has its own, larger allowance: joining a call
+    // sends an offer and a dozen network candidates to every person in it at once. A refused event is answered
+    // with "Slow down." so the app isn't left waiting. Refusals are forgiven over time (5 a second), so a busy
+    // call never adds up to a disconnect; only flooding that keeps going closes the connection, and the app is
+    // told why first ('flood'), so it reconnects instead of taking it for a sign-out.
+    let bucket = 40; let signalBucket = 200; let strikes = 0;
+    const refill = setInterval(() => {
+      bucket = Math.min(40, bucket + 10);
+      signalBucket = Math.min(200, signalBucket + 50);
+      strikes = Math.max(0, strikes - 5);
+    }, 1000);
     socket.on('disconnect', () => clearInterval(refill));
+    const refuse = (packet) => { const ack = packet[packet.length - 1]; if (typeof ack === 'function') ack({ error: 'Slow down.' }); };
     socket.use((packet, next) => {
-      if (bucket > 0) { bucket--; return next(); }
-      if (++strikes > 50) socket.disconnect(true);
-      return next(new Error('Slow down.'));
+      // (The bigger signaling allowance is only for the one connection this person is in a call with.)
+      const signal = packet[0] === 'voice:signal' && voiceChannels.get(userVoice.get(uid))?.get(uid)?.socketId === socket.id;
+      if (signal ? signalBucket > 0 : bucket > 0) {
+        if (signal) { signalBucket--; return next(); }
+        bucket--;
+        if (spendUserBudget(uid)) return next();
+        return refuse(packet); // this person's other windows used up the shared allowance: no strike for this one
+      }
+      refuse(packet);
+      if (++strikes > 50 && socket.connected) { socket.emit('flood', { reason: 'too_many_events' }); socket.disconnect(true); }
     });
     socket.join(`user:${uid}`);
     if (isStaff(uid)) socket.join('admins');
@@ -3993,15 +5374,27 @@ function setupSockets(server) {
 
     const guard = (fn) => (...args) => {
       const cb = typeof args[args.length - 1] === 'function' ? args.pop() : () => {};
-      try { cb(fn(...args) || { ok: true }); } catch (e) { cb({ error: e.message || 'Error' }); }
+      try { cb(fn(...args) || { ok: true }); } catch (e) {
+        // Our own refusals are expected; anything else is a bug worth seeing in the log (without the event's data).
+        if (!(e instanceof HttpError)) log.error('socket', 'handler_error', e, { outcome: 'error', uid: log.userHash(uid) });
+        cb({ error: e.message || 'Error' });
+      }
     };
 
+    // "Is typing…" goes only where the person could actually send: not in channels where they can't post,
+    // and never to someone who blocked them (or whom they blocked).
     socket.on('typing', guard((p = {}) => {
       if (p.channelId) {
         const c = requireChannel(String(p.channelId), uid);
+        if (!(perms.channel(serverOf(c), c, uid) & PM.SEND_MESSAGES)) fail(403, 'You can\u2019t send messages here.');
+        if (Date.now() - (typingAt.get(uid) || 0) < 1000) return;
+        typingAt.set(uid, Date.now());
         toChannel(c, socket).emit('typing', { channelId: c.id, userId: uid });
       } else if (p.dmId) {
         const d = requireDm(String(p.dmId), uid);
+        if (isBlocked(d.user_a, d.user_b)) return; // quietly: they can't message, so they aren't typing to anyone
+        if (Date.now() - (typingAt.get(uid) || 0) < 1000) return;
+        typingAt.set(uid, Date.now());
         const other = d.user_a === uid ? d.user_b : d.user_a;
         io.to(`user:${other}`).emit('typing', { dmId: d.id, userId: uid });
       }
@@ -4022,27 +5415,58 @@ function setupSockets(server) {
         room = c.id;
       }
       const c = { id: room };
+      // The call's region and its version: an app joining late uses the one that's active now, even if what it
+      // loaded at start-up is older.
+      const where = roomRegion(room);
+      // Coming back after a dropped connection (or a server restart, which forgets calls: then it's a fresh join).
+      // Only the same sign-in resumes; the access checks above ran again, so lost permissions still end it.
+      const prev = userVoice.get(uid) === room ? voiceChannels.get(room)?.get(uid) : null;
+      if (p.resume && prev && prev.sid === socket.data.sid) {
+        clearTimeout(prev.grace);
+        const oldSocket = prev.socketId;
+        if (oldSocket !== socket.id) {
+          // The old connection may not have been noticed as gone yet: it stops getting this call's events.
+          const old = io.sockets.sockets.get(oldSocket);
+          if (old) old.leave(`voice:${room}`);
+        }
+        const speak = !!(vp & PM.SPEAK);
+        Object.assign(prev, { socketId: socket.id, reconnecting: false, grace: null, speak, muted: !!p.muted || !speak, deafened: !!p.deafened, video: !!p.video, screen: !!p.screen });
+        socket.join(`voice:${room}`);
+        const m = voiceChannels.get(room);
+        const peers = [...m.entries()].filter(([userId]) => userId !== uid).map(([userId, s]) => ({ userId, socketId: s.socketId, reconnecting: !!s.reconnecting }));
+        // Everyone else points their connection to this person at the new socket (and renegotiates if needed).
+        socket.to(`voice:${room}`).emit('voice:peer-joined', { userId: uid, socketId: socket.id, resumed: true });
+        emitVoiceState(room);
+        if (watchRooms.has(room)) socket.emit('watch:state', { room, state: watchOut(room) });
+        return { ok: true, peers, canSpeak: speak, resumed: true, ...where };
+      }
       if (userVoice.has(uid)) {
         const prev = voiceChannels.get(userVoice.get(uid))?.get(uid);
         leaveVoice(uid, prev && prev.socketId !== socket.id);
       }
       if (!voiceChannels.has(c.id)) voiceChannels.set(c.id, new Map());
       const m = voiceChannels.get(c.id);
-      const peers = [...m.entries()].map(([userId, s]) => ({ userId, socketId: s.socketId }));
-      m.set(uid, { socketId: socket.id, muted: !!p.muted, deafened: !!p.deafened, video: false, screen: false });
+      const peers = [...m.entries()].map(([userId, s]) => ({ userId, socketId: s.socketId, reconnecting: !!s.reconnecting }));
+      // speak: whether they may talk here (the app keeps the mic off without it; recheckVoice keeps it current).
+      const speak = !!(vp & PM.SPEAK);
+      m.set(uid, { socketId: socket.id, sid: socket.data.sid, muted: !!p.muted || !speak, deafened: !!p.deafened, video: false, screen: false, speak, reconnecting: false, grace: null });
       userVoice.set(uid, c.id);
       socket.join(`voice:${c.id}`);
+      // Anyone still connected to this person from before (their app reloaded, or the server restarted) moves
+      // that connection to the new socket; a brand-new connection replaces it if the app started over.
+      socket.to(`voice:${c.id}`).emit('voice:peer-joined', { userId: uid, socketId: socket.id, resumed: false });
       emitVoiceState(c.id);
       if (watchRooms.has(c.id)) socket.emit('watch:state', { room: c.id, state: watchOut(c.id) });
       // First one in a DM or group call: ring everyone else (and push-notify them if their app is closed).
-      if (!peers.length) {
+      // (Not when an app comes back after the server restarted: that call was already ringing or answered.)
+      if (!peers.length && !p.resume) {
         const ring = callees(c.id, uid);
         const d = dmOfRoom(c.id);
         const ch = !d && db.prepare('SELECT * FROM channels WHERE id = ?').get(c.id);
         ring.forEach((u) => io.to(`user:${u}`).emit('call:ring', { room: c.id, dmId: d ? d.id : null, serverId: ch ? ch.server_id : null, from: uid, video: !!p.video }));
-        if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/' });
+        if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/', generic: 'Incoming call' }, { kind: 'call' });
       }
-      return { ok: true, peers, canSpeak: !!(vp & PM.SPEAK) };
+      return { ok: true, peers, canSpeak: speak, ...where };
     }));
 
     socket.on('voice:signal', guard((p = {}) => {
@@ -4051,6 +5475,9 @@ function setupSockets(server) {
       if (!m || m.get(uid)?.socketId !== socket.id) fail(400, 'You are not in voice.');
       const target = [...m.values()].find((s) => s.socketId === p.to);
       if (!target) fail(404, 'Peer left.');
+      // An offer or answer is a few kilobytes and a network candidate a few hundred bytes; signaling has a bigger
+      // allowance than other events, so it can't be used to push megabytes at someone.
+      if (JSON.stringify(p.data ?? null).length > 64 * 1024) fail(413, 'That signal is too big.');
       io.to(p.to).emit('voice:signal', { from: socket.id, userId: uid, data: p.data });
     }));
 
@@ -4058,7 +5485,7 @@ function setupSockets(server) {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);
       if (!s || s.socketId !== socket.id) return;
-      s.muted = !!p.muted;
+      s.muted = !!p.muted || !s.speak;
       s.deafened = !!p.deafened;
       if (p.video !== undefined) s.video = !!p.video;
       if (p.screen !== undefined) s.screen = !!p.screen;
@@ -4068,8 +5495,15 @@ function setupSockets(server) {
     // Declining a call: tell whoever is calling, and stop this person's other devices ringing.
     socket.on('call:decline', guard((p = {}) => {
       const room = String(p.room || '');
+      // Only someone who could join the call can decline it (or anyone could fake "X declined" into any call).
       const d = dmOfRoom(room);
       if (d && d.user_a !== uid && d.user_b !== uid) fail(403, 'Not your call.');
+      // Only calls that ring can be declined: a DM call, or a group chat's call by one of its members.
+      if (!d) {
+        const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(room);
+        const srv = c && serverOf(c);
+        if (!srv || srv.kind !== 'group' || c.type !== 'voice' || !isMember(srv.id, uid)) fail(404, 'No such call.');
+      }
       const m = voiceChannels.get(room);
       if (m) for (const [u] of m) io.to(`user:${u}`).emit('call:declined', { room, userId: uid });
       io.to(`user:${uid}`).emit('call:end', { room });
@@ -4091,13 +5525,14 @@ function setupSockets(server) {
       if (cur && p.queue) {
         if (!mayControl(room, cur) && cur.hostOnly) fail(403, 'Only the host can add videos.');
         if (cur.queue.length >= 25) fail(400, 'The queue is full (25).');
+        if (JSON.stringify(cur).length + JSON.stringify(item).length > WATCH_STATE_MAX) fail(400, 'The queue is full.');
         cur.queue.push(item);
       } else {
         if (cur && !mayControl(room, cur)) fail(403, 'Only the host can change the video.');
         watchRooms.set(room, { item, queue: cur ? cur.queue : [], playing: true, position: item.start || 0, rate: 1, updatedAt: Date.now(), by: cur && cur.hostOnly ? cur.by : uid, hostOnly: cur ? cur.hostOnly : !!p.hostOnly, seq: ((cur && cur.seq) || 0) + 1, lastBy: uid, lastAction: 'start' });
       }
       emitWatch(room);
-      watchTitle(item).then((t) => { if (t) { item.title = t; emitWatch(room); } });
+      watchTitle(item).then((t) => { if (t && watchRooms.has(room)) { item.title = t; emitWatch(room); } });
       return { ok: true };
     }));
     socket.on('watch:control', guard((p = {}) => {
@@ -4124,7 +5559,17 @@ function setupSockets(server) {
       const room = myWatchRoom();
       const w = watchRooms.get(room);
       if (!w || (p.itemId && p.itemId !== w.item.id)) return { ok: true };
-      if (p.skip && !mayControl(room, w)) fail(403, 'Only the host can skip.');
+      if (!mayControl(room, w)) {
+        // Only the host skips. "My video ended" from anyone else counts once most of the call says so (players
+        // finish a moment apart), so one person can't skip or stop the video for everyone.
+        if (p.skip || !p.itemId) fail(403, 'Only the host can skip.');
+        const m = voiceChannels.get(room);
+        if (!w.votes || w.votes.item !== w.item.id) w.votes = { item: w.item.id, users: new Set() };
+        w.votes.users.add(uid);
+        const ended = [...w.votes.users].filter((u) => m && m.has(u)).length;
+        if (ended * 2 <= (m ? m.size : 1)) return { ok: true };
+      }
+      w.votes = null;
       if (!w.queue.length) { w.playing = false; w.position = watchPos(w); w.updatedAt = Date.now(); emitWatch(room); return { ok: true }; }
       w.item = w.queue.shift();
       Object.assign(w, { playing: true, position: w.item.start || 0, rate: 1, updatedAt: Date.now() });
@@ -4144,7 +5589,7 @@ function setupSockets(server) {
       const w = watchRooms.get(room);
       if (!w) return { ok: true };
       if (!mayControl(room, w)) fail(403, 'Only the host can stop it.');
-      watchRooms.delete(room);
+      dropWatch(room);
       io.to(`voice:${room}`).emit('watch:state', { room, state: null });
       return { ok: true };
     }));
@@ -4152,16 +5597,26 @@ function setupSockets(server) {
     socket.on('voice:leave', guard(() => {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);
-      if (s && s.socketId === socket.id) leaveVoice(uid);
+      // (Or the same sign-in hanging up while its place was being kept after a dropped connection.)
+      if (s && (s.socketId === socket.id || (s.reconnecting && s.sid === socket.data.sid))) leaveVoice(uid);
     }));
 
     socket.on('disconnect', () => {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);
-      if (s && s.socketId === socket.id) leaveVoice(uid);
+      // A dropped connection keeps its place in the call for a short while (the media between the people in it
+      // often keeps flowing): the others see "reconnecting", and the app resumes the call when it's back.
+      if (s && s.socketId === socket.id) {
+        s.reconnecting = true;
+        clearTimeout(s.grace);
+        // A safe job: an error ending the kept place is logged, never fatal.
+        s.grace = setTimeout(jobs.job('voice.grace_end', () => { if (voiceChannels.get(ch)?.get(uid) === s && s.reconnecting) leaveVoice(uid); }), VOICE_GRACE_MS);
+        s.grace.unref?.();
+        emitVoiceState(ch);
+      }
       const set = onlineSockets.get(uid);
       if (set) { set.delete(socket.id); if (!set.size) onlineSockets.delete(uid); }
-      if (!isOnline(uid)) broadcastPresence(uid);
+      if (!isOnline(uid)) { userBudget.delete(uid); typingAt.delete(uid); broadcastPresence(uid); }
     });
   });
 }
@@ -4171,17 +5626,23 @@ function setupSockets(server) {
   if (USE_HTTPS) server = https.createServer(await loadTls(), app);
   else server = http.createServer(app);
   setupSockets(server);
-  try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
+  try { indexOldFiles(); } catch (e) { log.error('uploads', 'index_failed', e, { msg: 'Could not index existing uploads.' }); }
+  try { indexLibraryUploads(); } catch (e) { log.error('uploads', 'index_failed', e, { msg: 'Could not index GIF library uploads.' }); }
+  // A backup cut off by a crash or a forced stop may have left a plaintext snapshot or a half-written file. Files
+  // touched in the last few minutes may belong to a backup that's still running (`node server/cli.js backup` from
+  // a cron job, say), so those are looked at again a little later instead.
+  const cleanLeftovers = () => cleanStaleBackups(STALE_BACKUP_MS);
+  jobs.job('backup.cleanup_leftovers', cleanLeftovers)();
+  jobs.after('backup.cleanup_leftovers', STALE_BACKUP_MS + 60000, cleanLeftovers);
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
-    console.log(`\n  ${INSTANCE_NAME} is running.\n`);
-    console.log(`  This computer:  ${scheme}://localhost:${PORT}`);
+    const urls = [`${scheme}://localhost:${PORT}`];
     for (const list of Object.values(os.networkInterfaces())) {
-      for (const n of list || []) if (n.family === 'IPv4' && !n.internal) console.log(`  Your network:   ${scheme}://${n.address}:${PORT}`);
+      for (const n of list || []) if (n.family === 'IPv4' && !n.internal) urls.push(`${scheme}://${n.address}:${PORT}`);
     }
-    if (USE_HTTPS && !process.env.SSL_CERT) console.log('\n  Using a self-signed certificate: browsers will show a warning the first time. Click "Advanced" → "Proceed".');
-    if (!USE_HTTPS) console.log('\n  HTTPS is off. Voice chat and encryption only work on localhost or behind an HTTPS reverse proxy.');
-    console.log('');
+    log.info('server', 'listening', { msg: `${INSTANCE_NAME} is running. Open ${urls.join(' or ')}`, version: VERSION, schema: SCHEMA_VERSION, node: process.version, pid: process.pid });
+    if (USE_HTTPS && !process.env.SSL_CERT) log.info('server', 'tls', { msg: 'Using a self-signed certificate: browsers will show a warning the first time. Click "Advanced" → "Proceed".' });
+    if (!USE_HTTPS) log.info('server', 'tls', { msg: 'HTTPS is off. Voice chat and encryption only work on localhost or behind an HTTPS reverse proxy.' });
   });
 
   // Fast, clean restarts (updates, docker restart, systemctl restart). Without this, Docker waits
@@ -4191,16 +5652,19 @@ function setupSockets(server) {
   const shutdown = (signal) => {
     if (stopping) return;
     stopping = true;
-    console.log(`\n  ${signal} received: restarting cleanly.`);
+    log.info('server', 'shutdown', { msg: `${signal} received: restarting cleanly.` });
+    jobs.saveAll();
     try { io.emit('server:restarting', { at: Date.now() }); } catch { /* ignore */ }
+    // A backup still running can't finish now: don't leave its plaintext snapshot or half-written file behind.
+    const exit = () => { try { BK.removeInFlight(); } catch { /* ignore */ } process.exit(0); };
     setTimeout(() => {
       try { io.close(); } catch { /* ignore */ }
       server.close();
       server.closeAllConnections?.();
       try { db.pragma('wal_checkpoint(TRUNCATE)'); db.close(); } catch { /* ignore */ }
-      process.exit(0);
+      exit();
     }, 250);
-    setTimeout(() => process.exit(0), 4000).unref();
+    setTimeout(exit, 4000).unref();
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

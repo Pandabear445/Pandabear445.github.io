@@ -12,6 +12,9 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { readLimited, cancel: cancelBody } = require('./fetchlimit');
+const netguard = require('./netguard');
+const jobs = require('./jobs');
 
 const env = process.env;
 const BASE = {
@@ -44,22 +47,30 @@ const GAME_ID = /^(steam:\d{1,10}|wiki:\d{1,12}|rawg:\d{1,10})$/;
 const NOT_GAMES = new Set(['431960', '250820', '228980', '1070560', '1391110', '1493710']);
 
 module.exports = function setupActivity(ctx) {
-  const { api, app, auth, db, fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, requireInstanceAdmin, checkWords, DATA_DIR, version } = ctx;
+  const { api, app, auth, db, fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, requireInstanceAdmin, checkWords, DATA_DIR, version,
+    sealSecret, openSecret, auditLog } = ctx;
   const UA = `Hearth/${version} (self-hosted chat; https://github.com/)`;
   const now = () => Date.now();
-  const lastfmKey = () => getSetting('lastfmKey') || env.LASTFM_API_KEY || '';
-  const rawgKey = () => getSetting('rawgKey') || env.RAWG_API_KEY || '';
+  // Keys saved in the app are sealed with data/secret.key (see sealSecret in db.js).
+  const lastfmKey = () => openSecret(getSetting('lastfmKey')) || env.LASTFM_API_KEY || '';
+  const rawgKey = () => openSecret(getSetting('rawgKey')) || env.RAWG_API_KEY || '';
 
   // Follows up to 3 redirects itself, checking every hop, so a redirect can't send this server somewhere else.
-  async function safeFetch(url, ok, opts = {}) {
-    let u = url;
-    for (let hop = 0; hop < 4; hop++) {
-      if (!ok(u)) return null;
-      const r = await fetch(u, { ...opts, redirect: 'manual' });
-      if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { u = new URL(r.headers.get('location'), u).href; continue; }
-      return r;
+  // Each hop also goes through the outbound guard (netguard.js): the host's addresses must be public and the
+  // connection is pinned to them, and the answer is read with a size cap. Hosts an admin listed themselves in
+  // ART_PROXY_EXTRA_HOSTS may be on the local network.
+  async function safeFetch(url, ok, { signal, headers, maxBytes = 8 * 1024 * 1024, truncate = false } = {}) {
+    let r;
+    try {
+      r = await netguard.request(url, { allowUrl: (x) => ok(x.href), allowPrivate: (x) => EXTRA_ART_HOSTS.includes(x.host), maxRedirects: 3, timeout: 15000, signal, headers, maxBytes, truncate });
+    } catch (e) {
+      if (e.code === 'NOT_ALLOWED' || e.code === 'REDIRECTS' || e.code === 'BAD_URL' || e.code === 'BAD_PROTOCOL') return null;
+      throw e;
     }
-    return null;
+    // Callers read it like a fetch() answer.
+    const h = new Headers();
+    for (const [k, v] of Object.entries(r.headers)) [].concat(v).forEach((x) => h.append(k, String(x)));
+    return new Response([101, 204, 205, 304].includes(r.status) ? null : r.body, { status: r.status, headers: h });
   }
   async function getJson(url, { timeout = 8000, headers = {} } = {}) {
     const ctl = new AbortController();
@@ -74,7 +85,7 @@ module.exports = function setupActivity(ctx) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), timeout);
     try {
-      const r = await safeFetch(url, (x) => { try { const h = new URL(x); return h.protocol === 'https:' && okHost(h.hostname); } catch { return false; } }, { signal: ctl.signal, headers: { 'User-Agent': UA, Accept: 'text/html' } });
+      const r = await safeFetch(url, (x) => { try { const h = new URL(x); return h.protocol === 'https:' && okHost(h.hostname); } catch { return false; } }, { signal: ctl.signal, headers: { 'User-Agent': UA, Accept: 'text/html' }, maxBytes: 1024 * 1024, truncate: true });
       if (!r || !r.ok) return '';
       const reader = r.body.getReader(); let out = ''; const dec = new TextDecoder();
       while (out.length < 400000) { const { done, value } = await reader.read(); if (done) break; out += dec.decode(value, { stream: true }); }
@@ -99,11 +110,12 @@ module.exports = function setupActivity(ctx) {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 10000);
       try {
-        const r = await safeFetch(url, artAllowed, { signal: ctl.signal, headers: { 'User-Agent': UA } });
+        const r = await safeFetch(url, artAllowed, { signal: ctl.signal, headers: { 'User-Agent': UA }, maxBytes: 6 * 1024 * 1024 });
         const type = r ? (r.headers.get('content-type') || '').split(';')[0] : '';
-        if (!r || !r.ok || !/^image\//.test(type)) return null;
-        const buf = Buffer.from(await r.arrayBuffer());
-        if (buf.length > 6 * 1024 * 1024) return null;
+        if (!r || !r.ok || !/^image\//.test(type)) { if (r) cancelBody(r.body); return null; }
+        // Read with a running count: a huge picture is dropped as soon as it passes 6 MB, never held whole.
+        const buf = await readLimited(r, 6 * 1024 * 1024);
+        if (!buf) return null;
         fs.writeFileSync(file, buf); fs.writeFileSync(file + '.type', type);
         return { file, type };
       } catch { return null; } finally { clearTimeout(t); inflight.delete(key); }
@@ -122,8 +134,7 @@ module.exports = function setupActivity(ctx) {
       }
     } catch { /* ignore */ }
   }
-  setTimeout(pruneCache, 30000).unref();
-  setInterval(pruneCache, 3600000).unref();
+  jobs.every('activity.art_cache_prune', 3600000, pruneCache, { firstDelay: 30000 });
   const sendImage = (res, img) => {
     if (!img) return res.status(404).end();
     res.setHeader('Content-Type', img.type);
@@ -269,12 +280,12 @@ module.exports = function setupActivity(ctx) {
   let timer = null;
   function announce(uid) {
     queue.add(uid);
-    if (!timer) timer = setTimeout(() => {
+    if (!timer) timer = setTimeout(jobs.job('activity.broadcast', () => {
       timer = null;
       const list = [...queue].map((id) => { const row = getUserRow(id); return { id, activity: row ? activityFor(row) : null }; });
       queue.clear();
       if (list.length) ctx.emit('user:activity', list);
-    }, 800);
+    }), 800);
   }
   function activityFor(row) {
     if (!row || !isOnline(row.id) || row.status === 'invisible') return null;
@@ -321,7 +332,7 @@ module.exports = function setupActivity(ctx) {
   // Clean up: the desktop app re-sends every ~30 s (gone after 2 minutes of silence), Last.fm songs
   // after 10 minutes without a "now playing", hand-picked ones after 12 hours, everything 5 minutes after
   // the person goes offline.
-  setInterval(() => {
+  jobs.every('activity.expire', 30000, () => {
     const t = now();
     for (const [uid, e] of live) {
       if (!isOnline(uid)) { if (!e.offlineAt) e.offlineAt = t; } else e.offlineAt = 0;
@@ -331,7 +342,7 @@ module.exports = function setupActivity(ctx) {
       if (stale(e.music)) setMusic(uid, null);
       if (!e.game && !e.music) live.delete(uid);
     }
-  }, 30000).unref();
+  });
 
   // Album art for a song we only know by name (desktop app): ask the iTunes search once.
   const artCache = new Map();
@@ -486,7 +497,7 @@ module.exports = function setupActivity(ctx) {
       }
     } finally { polling = false; }
   }
-  setInterval(() => { pollLastfm().catch(() => {}); }, 10000).unref();
+  jobs.every('activity.lastfm', 10000, pollLastfm);
 
   // ------------------------------------------------------------------ admin: keys
   api.get('/admin/activity', auth, (req, res) => {
@@ -496,8 +507,10 @@ module.exports = function setupActivity(ctx) {
   api.patch('/admin/activity', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
     const b = req.body || {};
-    if (b.lastfmKey !== undefined) setSetting('lastfmKey', String(b.lastfmKey || '').trim().slice(0, 64) || null);
-    if (b.rawgKey !== undefined) { setSetting('rawgKey', String(b.rawgKey || '').trim().slice(0, 64) || null); searchCache.clear(); }
+    if (b.lastfmKey !== undefined) setSetting('lastfmKey', sealSecret(String(b.lastfmKey || '').trim().slice(0, 64)) || null);
+    if (b.rawgKey !== undefined) { setSetting('rawgKey', sealSecret(String(b.rawgKey || '').trim().slice(0, 64)) || null); searchCache.clear(); }
+    const changed = ['lastfmKey', 'rawgKey'].filter((k) => b[k] !== undefined);
+    if (changed.length) auditLog(req, 'activity_settings', null, changed.join(', '));
     res.json({ ok: true, lastfmKeySet: !!lastfmKey(), rawgKeySet: !!rawgKey() });
   });
 

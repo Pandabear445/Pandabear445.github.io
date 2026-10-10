@@ -7,6 +7,7 @@ import { profileCard, FONT_STACKS, cropStyle, customFxLayer } from './profile-ui
 import { pageEditorTab } from './page.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
+import { runExport, EXPORT_LIMITS, quietNow } from './usability.js';
 import { androidApp } from './android.js';
 import { desktopSettingsSection } from './desktop-settings.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
@@ -74,7 +75,7 @@ const TAB_GROUPS = [
 ];
 const SUBTABS = {
   profile: [['profile', 'Profile card'], ['page', 'Profile page'], ['activity', 'Games & music']],
-  account: [['account', 'Security & storage'], ['sessions', 'Signed-in devices']],
+  account: [['account', 'Security & storage'], ['storage', 'Storage'], ['sessions', 'Signed-in devices']],
   appearance: [['appearance', 'Theme'], ['layout', 'Layout']],
 };
 const parentTab = (k) => Object.keys(SUBTABS).find((p) => SUBTABS[p].some(([s]) => s === k)) || k;
@@ -97,7 +98,7 @@ export function openSettings(app, tab = 'profile') {
     h('button', { class: 'icon-btn set-close', 'aria-label': 'Close settings', onclick: () => tryClose() }, icon('close')),
     content));
 
-  const m = modal({ size: 'full', className: 'settings-modal', body: shell, onClose: stopMicTest });
+  const m = modal({ size: 'full', className: 'settings-modal', label: 'Settings', body: shell, onClose: stopMicTest });
 
   async function tryClose() {
     if (dirty && !(await confirmDialog({ title: 'Discard changes?', text: 'You have changes that are not saved yet.', confirm: 'Discard', danger: true }))) return;
@@ -139,8 +140,8 @@ export function openSettings(app, tab = 'profile') {
         class: `set-subtab${k === current ? ' active' : ''}`, role: 'tab', 'aria-selected': String(k === current), onclick: () => go(k),
       }, label))));
     }
-    const views = { study: studyTab, keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
-    content.append(views[current](app, (d) => { dirty = d; }));
+    const views = { study: studyTab, keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, storage: storageTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
+    content.append(views[current](app, (d) => { dirty = d; }, go));
     content.scrollTop = 0;
   };
   draw();
@@ -402,7 +403,7 @@ function profileTab(app, setDirty) {
 }
 
 // ------------------------------------------------------------------ account tab
-function accountTab(app) {
+function accountTab(app, setDirty, go) {
   const S = app.S;
   const fp = h('code', { class: 'fingerprint' }, '…');
   E2EE.keyFingerprint(S.me).then((f) => { fp.textContent = f; }).catch(() => { fp.textContent = 'Unavailable'; });
@@ -422,10 +423,10 @@ function accountTab(app) {
       const oldParams = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
       const oldK = await E2EE.deriveKeys(S.me.username, oldPw.value, oldParams);
       const newK = await E2EE.deriveKeys(S.me.username, newPw.value, { kdf: 'argon2id', salt });
+      const locked = await lockedKey(oldK.authKey).catch((x) => { throw x.code === 'bad_password' ? new Error('Your current password is not right.') : x; });
       let enc;
-      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, S.encPrivateKey); } catch { throw new Error('Your current password is not right.'); }
+      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, locked); } catch { throw new Error('Your current password is not right.'); }
       await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }));
-      S.encPrivateKey = enc;
       S.me = { ...S.me, kdf: 'argon2id', kdfSalt: salt };
       oldPw.value = ''; newPw.value = ''; confirmPw.value = '';
       toast('Password changed. Other devices were logged out.');
@@ -440,14 +441,15 @@ function accountTab(app) {
     const MB = 1024 * 1024;
     const mb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
     const pct = q.quotaMb ? Math.min(100, (q.used / (q.quotaMb * MB)) * 100) : 0;
-    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji' };
-    clear(storage).append(
+    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji', gif: 'GIF library', reserved: 'Uploads in progress' };
+    clear(storage).append(...[
       q.blocked ? h('p', { class: 'key-bar bad' }, icon('ban'), 'An admin has turned off uploads for your account.') : null,
       h('div', { class: 'kv' }, h('span', null, 'Used'), h('strong', null, q.quotaMb ? `${mb(q.used)} of ${q.quotaMb} MB` : `${mb(q.used)} (no limit)`)),
       q.quotaMb ? h('div', { class: `storage-bar${pct > 90 ? ' warn' : ''}` }, h('i', { style: { width: `${pct}%` } })) : null,
       h('div', { class: 'kv' }, h('span', null, 'Uploaded today'), h('strong', null, q.dailyMb ? `${mb(q.today)} of ${q.dailyMb} MB` : mb(q.today))),
       h('div', { class: 'kv' }, h('span', null, 'Largest file'), h('strong', null, `${q.fileMb} MB (pictures ${q.imageMb} MB, songs ${q.songMb} MB)`)),
-      ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))));
+      ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))),
+      go ? h('button', { class: 'btn ghost sm', onclick: () => go('storage') }, 'See your biggest files') : null].filter(Boolean));
   }).catch((e) => clear(storage).append(h('p', { class: 'form-error' }, e.message)));
 
   // Change your display name: what people see in chats and member lists (doesn't have to be unique).
@@ -496,13 +498,13 @@ function accountTab(app) {
       h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device'),
       h('p', { class: 'field-hint' }, 'To see or sign out your other devices, open Sessions.')),
     section('Delete account',
-      h('p', { class: 'muted-p' }, 'Erases your keys, email, profile, pictures and friends, takes you out of every server, and signs out every device. Messages you sent stay where they are (still encrypted) and show “Deleted user”. This can’t be undone.'),
+      h('p', { class: 'muted-p' }, 'Erases your private keys, email, profile, pictures and friends, takes you out of every server, and signs out every device. Messages you sent stay where they are (still encrypted, readable by the people who could read them before) and show “Deleted user”. This can’t be undone.'),
       h('div', null, h('button', { class: 'btn danger', onclick: () => deleteAccount(app).catch(quiet) }, 'Delete my account'))),
   );
 }
 async function deleteAccount(app) {
   const S = app.S;
-  const keys = await askPassword(app, { title: 'Delete your account?', text: 'This can’t be undone. Your old messages can never be read again by anyone, including you.', button: 'Continue' });
+  const keys = await askPassword(app, { title: 'Delete your account?', text: 'This can’t be undone. You won’t be able to read your old messages again; the people you sent them to still can.', button: 'Continue' });
   if (!keys) return;
   const confirmName = h('input', { class: 'input', autocomplete: 'off', placeholder: S.me.username });
   modal({ title: 'Type your username to confirm', size: 'sm',
@@ -516,7 +518,17 @@ async function deleteAccount(app) {
 }
 
 // ------------------------------------------------------------------ account safety: email, recovery key, 2FA
-// Asks for the password again (sensitive changes). Checked on this device first: it must unlock your key.
+// Your password-locked private key. The server only hands it out with the password, plus a two-factor code when
+// that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). A
+// wrong password fails here.
+async function lockedKey(authKey) {
+  try { return (await withCode((x) => api('POST', '/me/keys/wrapped', { authKey, ...x }))).encPrivateKey; } catch (e) {
+    if (e.code === 'bad_password') throw Object.assign(new Error('That password isn’t right.'), { code: 'bad_password' });
+    throw e;
+  }
+}
+// Asks for the password again (sensitive changes). It must also unlock your key on this device. Resolves with
+// the derived keys plus the locked private key (encPrivateKey), or null if cancelled.
 function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'Continue' } = {}) {
   const S = app.S;
   return new Promise((resolve) => {
@@ -524,10 +536,13 @@ function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'C
     modal({ title, size: 'sm', onClose: () => resolve(null),
       body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw)),
       actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
+        // (The password hashing library's own message for an empty one means nothing to people.)
+        if (!pw.value) throw new Error('Enter your password.');
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        try { await E2EE.unwrapPrivateKey(keys.wrapKey, S.encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
-        resolve(keys);
+        const encPrivateKey = await lockedKey(keys.authKey);
+        try { await E2EE.unwrapPrivateKey(keys.wrapKey, encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
+        resolve({ ...keys, encPrivateKey });
       } }] });
   });
 }
@@ -604,6 +619,7 @@ function securitySections(app) {
     modal({ title: S.me.email ? 'Change your email' : 'Add an email', size: 'sm',
       body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw)),
       actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
+        if (!pw.value) throw new Error('Enter your password.');
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
         setTimeout(() => withCode((x) => api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey, ...x })).then((r) => verifyEmail(r.sentTo)).catch(quiet), 150);
@@ -628,7 +644,7 @@ function securitySections(app) {
     if (!keys) return;
     const code = E2EE.newRecoveryCode();
     const salt = E2EE.newKdfSalt();
-    const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), S.encPrivateKey);
+    const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), keys.encPrivateKey);
     const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }));
     await showSecretOnce({ title: `${S.config.name} recovery key for ${S.me.username}`, intro: 'Save this key. If you forget your password, the email reset plus this key brings back everything, including your old messages. It’s shown only now.',
       secret: code, filename: `${S.config.name.replace(/\W+/g, '-')}-recovery-key-${S.me.username}.txt`, note: 'Anyone with this key AND access to your email could get into your account, so keep it private (a password manager is ideal).' });
@@ -667,14 +683,27 @@ function securitySections(app) {
         }, 150);
       } }] });
   };
-  const disable2fa = async () => {
-    const keys = await askPassword(app, { title: 'Turn off two-factor sign-in' });
-    if (!keys) return;
+  // The password and a code in one dialog, sent together. (Asking for the password first with askPassword fetches
+  // the locked key, which takes a code of its own once the last one is 10 minutes old. That used up the code on
+  // the phone, so the one asked for next was refused until the app showed a new one.) Nothing needs unlocking
+  // here, so the password is only checked by the server.
+  const disable2fa = () => {
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
-    modal({ title: 'Enter a code to turn it off', size: 'sm', body: h('div', { class: 'stack' }, field('Code from your app (or a backup code)', code)),
+    modal({ title: 'Turn off two-factor sign-in', size: 'sm',
+      body: h('div', { class: 'stack' }, field('Your password', pw), field('Code from your app (or a backup code)', code)),
       actions: [{ label: 'Cancel' }, { label: 'Turn off', kind: 'danger', action: async () => {
-        const c = code.value.trim();
-        refresh(await api('POST', '/me/2fa/disable', { authKey: keys.authKey, ...(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c }) }));
+        if (!pw.value) throw new Error('Enter your password.');
+        const c = code.value.trim().replace(/\s/g, '');
+        if (!c) throw new Error('Enter the code from your authenticator app (or a backup code).');
+        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
+        const { authKey } = await E2EE.deriveKeys(S.me.username, pw.value, params);
+        try {
+          refresh(await api('POST', '/me/2fa/disable', { authKey, ...(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c }) }));
+        } catch (e) {
+          if (e.code === 'bad_password') throw new Error('That password isn’t right.');
+          throw e;
+        }
         toast('Two-factor sign-in is off.');
       } }] });
   };
@@ -691,7 +720,7 @@ function securitySections(app) {
     if (S.me.totpEnabled) {
       tfaBox.append(h('div', { class: 'kv' }, h('span', null, 'Two-factor sign-in'), h('span', { class: 'rpill ok' }, 'On')),
         h('p', { class: 'field-hint' }, `${S.me.backupCodesLeft} backup code${S.me.backupCodesLeft === 1 ? '' : 's'} left.`),
-        h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: newCodes }, 'New backup codes'), h('button', { class: 'btn ghost sm', onclick: () => disable2fa().catch((e) => toast(e.message, 'error')) }, 'Turn off')));
+        h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: newCodes }, 'New backup codes'), h('button', { class: 'btn ghost sm', onclick: disable2fa }, 'Turn off')));
     } else {
       tfaBox.append(h('p', { class: 'muted-p' }, 'After your password, sign-in asks for a 6-digit code from an app on your phone, so a stolen password alone isn’t enough. It’s also needed to reset your password by email.'),
         h('div', null, h('button', { class: 'btn primary', onclick: () => setup2fa().catch((e) => toast(e.message, 'error')) }, 'Set up two-factor sign-in')));
@@ -735,10 +764,20 @@ function setAudioPref(k, v) { const p = audioPrefs(); p[k] = v; localStorage.set
 
 function voiceTab(app) {
   const prefs = audioPrefs();
-  const inputSel = h('select', { class: 'input', onchange: (e) => { setAudioPref('inputId', e.target.value); if (micTest) startTest(); } });
-  const outputSel = h('select', { class: 'input', onchange: (e) => setAudioPref('outputId', e.target.value) });
+  // In a call, a new device takes over straight away (same connection, the track is swapped).
+  const live = () => app.voice && app.voice.inVoice;
+  const inputSel = h('select', { class: 'input', onchange: (e) => {
+    setAudioPref('inputId', e.target.value);
+    if (micTest) startTest();
+    if (live()) app.voice.setInputDevice().then((r) => { if (r === 'mic') toast('Your call now uses this microphone.'); }).catch((err) => toast(err.message, 'error'));
+  } });
+  const outputSel = h('select', { class: 'input', onchange: (e) => { setAudioPref('outputId', e.target.value); if (live()) app.voice.setOutputDevice(e.target.value); } });
   // Camera: pick a device and preview it.
-  const camSel = h('select', { class: 'input', onchange: (e) => { setAudioPref('cameraId', e.target.value); if (camStream) startCam(); } });
+  const camSel = h('select', { class: 'input', onchange: (e) => {
+    setAudioPref('cameraId', e.target.value);
+    if (camStream) startCam();
+    if (live() && app.voice.camStream) app.voice.setCameraDevice().catch((err) => toast(err.name === 'NotFoundError' ? 'That camera isn\u2019t available.' : err.message, 'error'));
+  } });
   const camVideo = h('video', { class: 'cam-preview', autoplay: true, playsinline: true });
   camVideo.muted = true;
   let camStream = null;
@@ -1199,23 +1238,61 @@ function notificationsTab(app) {
       }, 'For DMs and @mentions while this tab is in the background. Do Not Disturb silences them.'),
       state),
     soundsSection(),
-    section('Push (when Hearth is closed)', pushToggleRow(app)),
+    quietHoursSection(app),
+    section('Push (when Hearth is closed)', pushToggleRow(app), previewsRow(app)),
     perServerNotifications(app),
   );
+}
+// Quiet hours: Do Not Disturb on a schedule. The server follows it for push; this app follows it for sounds
+// and pop-ups. Days are when a quiet period starts (22:00–07:00 on Friday covers Saturday morning).
+function quietHoursSection(app) {
+  const st = app.S.notifySettings || {};
+  const d = { on: false, start: '22:00', end: '08:00', days: [0, 1, 2, 3, 4, 5, 6], ...(st.dnd || {}) };
+  const status = h('p', { class: 'field-hint', 'aria-live': 'polite' });
+  const drawStatus = () => { status.textContent = d.on ? (quietNow({ ...st, dnd: d }) ? 'Quiet hours are on right now.' : 'Not in quiet hours right now.') : ''; };
+  const save = async (patch) => {
+    Object.assign(d, patch);
+    try { await app.setNotifySettings({ dnd: d }); drawStatus(); } catch (e) { toast(e.message, 'error'); }
+  };
+  const start = h('input', { class: 'input sm', type: 'time', value: d.start, 'aria-label': 'Quiet hours start', onchange: (e) => e.target.value && save({ start: e.target.value }) });
+  const end = h('input', { class: 'input sm', type: 'time', value: d.end, 'aria-label': 'Quiet hours end', onchange: (e) => e.target.value && save({ end: e.target.value }) });
+  const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const days = h('div', { class: 'chips', role: 'group', 'aria-label': 'Days' }, DAYS.map((label, i) => {
+    const b = h('button', { type: 'button', class: `chip${d.days.includes(i) ? ' active' : ''}`, 'aria-pressed': String(d.days.includes(i)), onclick: () => {
+      const on = !d.days.includes(i);
+      const next = on ? [...d.days, i].sort() : d.days.filter((x) => x !== i);
+      b.classList.toggle('active', on); b.setAttribute('aria-pressed', String(on));
+      save({ days: next });
+    } }, label);
+    return b;
+  }));
+  drawStatus();
+  return section('Quiet hours',
+    toggle('Do Not Disturb on a schedule', !!d.on, (v) => save({ on: v }), 'No sounds, pop-ups or push notifications during these hours. Messages still arrive and show as unread.'),
+    h('div', { class: 'row gap' }, h('span', null, 'From'), start, h('span', null, 'to'), end),
+    days, status);
+}
+// What a phone's lock screen shows. Pushes never contain message text (the server can't read it); this decides
+// whether they say who and where, or just "New message".
+function previewsRow(app) {
+  const st = app.S.notifySettings || {};
+  return toggle('Show who and where on the lock screen', st.previews === 'names', async (v) => {
+    try { await app.setNotifySettings({ previews: v ? 'names' : 'hidden' }); toast(v ? 'Push notifications now show the sender and conversation.' : 'Push notifications now just say \u201cNew message\u201d.'); } catch (e) { toast(e.message, 'error'); }
+  }, 'Off by default: notifications on your phone or computer only say \u201cNew message\u201d. Message text is never sent, either way.');
 }
 function perServerNotifications(app) {
   const servers = app.S.servers.filter((s) => s.kind !== 'group');
   if (!servers.length) return null;
   return section('Per server',
-    h('p', { class: 'set-sub' }, 'DMs and replies to you always notify unless you mute that conversation. Channels can override these from their right-click menu.'),
+    h('p', { class: 'set-sub' }, 'DMs and replies to you always notify unless you mute that conversation. Channels can override these from their right-click menu. These follow you to all your devices, and push notifications follow them too.'),
     ...servers.map((s) => {
-      const sel = h('select', { class: 'input sm', 'aria-label': `Notifications for ${s.name}`, onchange: (e) => {
-        const p = app.P.notify;
-        if (e.target.value === 'all') delete p['s:' + s.id]; else p['s:' + s.id] = e.target.value;
-        app.P.notify = p; app.rerender();
-      } }, h('option', { value: 'all' }, 'All messages'), h('option', { value: 'mentions' }, 'Only @mentions'), h('option', { value: 'muted' }, 'Muted'));
-      sel.value = app.P.notify['s:' + s.id] || 'all';
-      return h('div', { class: 'kv' }, h('span', null, s.name), sel);
+      const pref = app.S.notifyPrefs['s:' + s.id] || {};
+      const cur = pref.level && pref.level !== 'default' ? (pref.level === 'none' ? 'muted' : pref.level) : 'default';
+      const sel = h('select', { class: 'input sm', 'aria-label': `Notifications for ${s.name}`, onchange: (e) => app.setNotify('s:' + s.id, e.target.value) },
+        h('option', { value: 'default' }, 'Pings (default)'), h('option', { value: 'all' }, 'All messages'), h('option', { value: 'mentions' }, 'Only @mentions'), h('option', { value: 'muted' }, 'Nothing'));
+      sel.value = cur;
+      const everyone = h('label', { class: 'row gap tight field-hint' }, h('input', { type: 'checkbox', checked: !!pref.suppressEveryone, onchange: (e) => app.setNotify('s:' + s.id, undefined, { suppressEveryone: e.target.checked }) }), 'Ignore @everyone');
+      return h('div', { class: 'kv' }, h('span', null, s.name), h('span', { class: 'row gap' }, everyone, sel));
     }));
 }
 
@@ -1265,6 +1342,73 @@ const agoText = (t) => {
   return new Date(t).toLocaleDateString();
 };
 const ENDED = { logged_out: 'Logged out', revoked: 'Signed out from another device', password_changed: 'Signed out: password changed', password_reset: 'Signed out: password reset', '2fa_enabled': 'Signed out: two-factor turned on', staff: 'Signed out by a server admin', suspended: 'Signed out: account suspended', expired: 'Expired', signed_out: 'Signed out' };
+// Settings → Storage: how much room you use, your biggest files and uploads that haven't finished.
+// The server knows only sizes, dates and where a file was posted. Names come from the encrypted messages, so
+// they're shown for files in conversations this device can open (and "Encrypted file" otherwise).
+function storageTab(app) {
+  const MB = 1024 * 1024;
+  const size = (b) => (b < MB ? `${Math.max(1, Math.round(b / 1024))} KB` : b < 1024 * MB ? `${(b / MB).toFixed(1)} MB` : `${(b / 1024 / MB).toFixed(2)} GB`);
+  const summary = h('div', { class: 'stack' }, h('span', { class: 'field-hint' }, 'Loading\u2026'));
+  const files = h('div', { class: 'stack' });
+  const uploads = h('div', { class: 'stack' });
+  const KIND = { image: 'Picture', song: 'Profile song', emoji: 'Emoji', gif: 'GIF library' };
+  const where = (f) => {
+    const w = f.where;
+    if (!w) return KIND[f.kind] || 'File';
+    if (w.type === 'unsent') return 'Uploaded, not sent (removed after a day)';
+    if (w.type === 'dm') return 'In a direct message';
+    const s = (app.S.servers || []).find((x) => x.id === w.serverId);
+    const c = s && (s.channels || []).find((x) => x.id === w.channelId);
+    return s ? (s.kind === 'group' ? 'In a group chat' : `In #${c ? c.name : 'a channel'} \u00b7 ${s.name}`) : 'In a server you\u2019ve left';
+  };
+  async function load() {
+    let q; let mine;
+    try { [q, mine] = await Promise.all([api('GET', '/me/storage'), api('GET', '/me/storage/files')]); } catch (e) { clear(summary).append(h('p', { class: 'form-error' }, e.message)); return; }
+    const pct = q.quotaMb ? Math.min(100, (q.used / (q.quotaMb * MB)) * 100) : 0;
+    // (Element.append would print a null as "null": h() skips them.)
+    clear(summary).append(...[
+      q.blocked ? h('p', { class: 'key-bar bad' }, icon('ban'), 'An admin has turned off uploads for your account.') : null,
+      h('div', { class: 'kv' }, h('span', null, 'Used'), h('strong', null, q.quotaMb ? `${size(q.used)} of ${q.quotaMb} MB` : `${size(q.used)} (no limit)`)),
+      q.quotaMb ? h('div', { class: `storage-bar${pct > 90 ? ' warn' : ''}` }, h('i', { style: { width: `${pct}%` } })) : null,
+      h('div', { class: 'kv' }, h('span', null, 'Uploaded today'), h('strong', null, q.dailyMb ? `${size(q.today)} of ${q.dailyMb} MB` : size(q.today))),
+      h('div', { class: 'kv' }, h('span', null, 'Largest file'), h('strong', null, `${q.fileMb} MB`))].filter(Boolean));
+    clear(files);
+    if (!mine.files.length) files.append(h('p', { class: 'field-hint' }, 'You haven\u2019t uploaded anything yet.'));
+    const rows = mine.files.map((f) => {
+      const name = h('strong', { class: 'file-row-name' }, f.kind === 'attachment' ? 'Encrypted file' : (KIND[f.kind] || 'File'));
+      const show = f.where && f.where.messageId ? h('button', { class: 'btn ghost sm', onclick: () => { app.showMessage(f.where); } }, 'Show') : null;
+      files.append(h('div', { class: 'file-row' }, icon(f.kind === 'attachment' ? 'lock' : 'image'),
+        h('span', { class: 'file-row-text' }, name, h('span', { class: 'field-hint' }, `${size(f.size)} \u00b7 ${new Date(f.createdAt).toLocaleDateString()} \u00b7 ${where(f)}`)), show));
+      return { f, name };
+    });
+    // Names, a few at a time (each may need its message fetched and opened).
+    (async () => {
+      for (const { f, name } of rows.filter((r) => r.f.kind === 'attachment').slice(0, 25)) {
+        try {
+          const info = await app.fileInfo(f.url, f.where);
+          if (info && info.name) name.textContent = info.preview ? `${info.name} (preview)` : info.name;
+        } catch { /* left as "Encrypted file" */ }
+      }
+    })();
+    clear(uploads);
+    if (!mine.uploads.length) uploads.append(h('p', { class: 'field-hint' }, 'None right now.'));
+    mine.uploads.forEach((u) => uploads.append(h('div', { class: 'file-row' }, icon('download'),
+      h('span', { class: 'file-row-text' }, h('strong', null, `${size(u.received)} of ${size(u.size)}`),
+        h('span', { class: 'field-hint' }, `Started ${new Date(u.createdAt).toLocaleString()} \u00b7 removed if nothing more arrives by ${new Date(u.expiresAt).toLocaleString()}`)),
+      h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
+        try { await api('DELETE', `/uploads/${encodeURIComponent(u.id)}`); toast('Upload cancelled. Its room is free again.'); load(); } catch (e) { toast(e.message, 'error'); }
+      } }, 'Cancel'))));
+  }
+  load();
+  return h('div', { class: 'set-form narrow' },
+    h('h2', { class: 'set-title' }, 'Storage'),
+    section('Your storage', summary),
+    section('Biggest files', h('p', { class: 'muted-p' }, 'Your files are end-to-end encrypted: the server knows their sizes but not their names. Names show here for files in conversations this device can open.'), files),
+    section('Uploads in progress', h('p', { class: 'muted-p' }, 'Big files go up in pieces, so a dropped connection doesn\u2019t start them over. Unfinished ones are removed after a day without progress.'), uploads),
+    section('What happens to your files',
+      h('p', { class: 'muted-p' }, 'Deleting a message deletes its files straight away. So does deleting a server or group, for every message in it. When you leave a server, the files you posted stay there for the others. Deleting your account removes your profile pictures and song; the messages you sent stay (still encrypted), with their files.')));
+}
+
 function sessionsTab(app) {
   const list = h('div', { class: 'stack' }, h('span', { class: 'spinner' }));
   const ended = h('div', { class: 'stack' });
@@ -1334,8 +1478,38 @@ function privacyTab(app) {
     section('Blocked people',
       h('p', { class: 'set-sub' }, 'Blocked people can\u2019t DM you or send friend requests. Their messages in shared servers are hidden behind a click. They aren\u2019t notified.'),
       blockedHost),
+    exportSection(app),
   );
 }
+// Export my data: your account, profile, servers and every message you can decrypt, as JSON plus attachments in a
+// zip. The server sends ciphertext; it's decrypted and packed on this device. Starting needs your password.
+function exportSection(app) {
+  const status = h('p', { class: 'field-hint', 'aria-live': 'polite' });
+  const bar = h('div', { class: 'export-progress', hidden: true }, h('div', { class: 'bar' }));
+  let ctl = null;
+  const cancel = h('button', { class: 'btn ghost sm', hidden: true, onclick: () => ctl && ctl.abort() }, 'Cancel');
+  const start = h('button', { class: 'btn', onclick: async () => {
+    let res;
+    try { res = await confirmedCall(app, (x) => api('POST', '/me/export', x), { title: 'Export your data', text: 'This makes a zip of your account and the messages you can read, on this device.', button: 'Start export' }); } catch (e) { quiet(e); return; }
+    if (!res) return;
+    ctl = new AbortController();
+    start.disabled = true; cancel.hidden = false; bar.hidden = false;
+    try {
+      const { blob, manifest } = await runExport({ token: res.token, S: app.S, sec: app.sec, decryptMessage: app.decryptMessage, signal: ctl.signal,
+        onProgress: (text, f) => { status.textContent = text; bar.firstChild.style.width = Math.round(f * 100) + '%'; } });
+      const url = URL.createObjectURL(blob);
+      h('a', { href: url, download: `hearth-export-${app.S.me.username}-${new Date().toISOString().slice(0, 10)}.zip` }).click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      status.textContent = `Done: ${manifest.totals.messages.toLocaleString()} messages and ${manifest.totals.attachments} files (${fmtBytes(blob.size)}).${manifest.skipped.length ? ` ${manifest.skipped.length} item(s) were skipped; see manifest.json.` : ''}`;
+    } catch (e) { status.textContent = ctl.signal.aborted ? 'Export cancelled.' : `The export stopped: ${e.message}`; }
+    start.disabled = false; cancel.hidden = true; bar.hidden = true; ctl = null;
+  } }, icon('download'), 'Export my data');
+  return section('Your data',
+    h('p', { class: 'set-sub' }, 'Download a copy of your account, profile, the servers and groups you\u2019re in, and every message you can read (with attachments), as JSON files in a zip. It\u2019s put together on this device after decrypting, so the server never sees it. Other people\u2019s private details aren\u2019t included.'),
+    h('p', { class: 'field-hint' }, `Up to ${EXPORT_LIMITS.messages.toLocaleString()} messages and ${fmtBytes(EXPORT_LIMITS.attachmentBytes)} of attachments. Keep the page open while it runs.`),
+    h('div', { class: 'row gap' }, start, cancel), bar, status);
+}
+const fmtBytes = (n) => (n >= 1073741824 ? `${(n / 1073741824).toFixed(1)} GB` : n >= 1048576 ? `${Math.round(n / 1048576)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 // ------------------------------------------------------------------ games & music tab
 function activityTab(app) {
@@ -1573,7 +1747,7 @@ function appsTab(app) {
       : section('Notifications', pushToggleRow(app),
         h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
     section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
-      h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download` }),
+      h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download`, 'aria-label': 'Download page link' }),
         h('button', { class: 'btn ghost', onclick: () => { navigator.clipboard.writeText(`${location.origin}/download`).then(() => toast('Link copied.')); } }, 'Copy'))),
   );
 }
@@ -1590,7 +1764,7 @@ function instanceTab(app) {
     const turnSecretIn = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: turn.secretSet ? 'A secret is saved' : 'static-auth-secret' });
     const relayResult = h('div', { class: 'giphy-test' });
     const curHint = st.gifProvider === 'giphy' ? (st.giphyKeySet ? st.giphyKeyHint : '') : (st.klipyKeySet ? st.klipyKeyHint : '');
-    const keyIn = h('input', { class: 'input mono', placeholder: curHint ? `Current key ${curHint}` : `Paste your ${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'} API key`, autocomplete: 'off', spellcheck: 'false' });
+    const keyIn = h('input', { class: 'input mono', placeholder: curHint ? `Current key ${curHint}` : `Paste your ${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'} API key`, 'aria-label': `${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'} API key`, autocomplete: 'off', spellcheck: 'false' });
     const result = h('div', { class: 'giphy-test' });
     const test = async () => {
       clear(result).append(h('span', { class: 'spinner' }), ' Testing\u2026');
@@ -1638,7 +1812,13 @@ function instanceTab(app) {
         field('Relay addresses', turnUrlsIn, 'Comma-separated, e.g. turn:203.0.113.7:3478?transport=udp,turn:203.0.113.7:3478?transport=tcp'),
         field('Shared secret', turnSecretIn, 'The static-auth-secret from coturn. Leave empty to keep the current one.'),
         h('div', { class: 'row gap' },
-          h('button', { class: 'btn primary', onclick: async () => { await api('PUT', '/admin/turn', { urls: turnUrlsIn.value, ...(turnSecretIn.value.trim() ? { secret: turnSecretIn.value.trim() } : {}) }); toast('Saved.'); draw(); } }, 'Save'),
+          // The relay secret and addresses decide where everyone's calls are relayed: saving needs your password again.
+          h('button', { class: 'btn primary', onclick: async () => {
+            try {
+              const r = await confirmedCall(app, (x) => api('PUT', '/admin/turn', { urls: turnUrlsIn.value, ...(turnSecretIn.value.trim() ? { secret: turnSecretIn.value.trim() } : {}), ...x }), { title: 'Save relay settings', button: 'Save' });
+              if (r) { toast('Saved.'); draw(); }
+            } catch (e) { quiet(e); }
+          } }, 'Save'),
           h('button', { class: 'btn ghost', onclick: () => testRelay(relayResult) }, 'Test relay')),
         relayResult)
     );

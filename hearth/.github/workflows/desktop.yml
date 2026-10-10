@@ -3,6 +3,12 @@
 #   Result: installers attached to a GitHub release (tags only) and as workflow artifacts.
 #   Optional: set the VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR secrets to also copy the
 #   installers to your server's data/downloads folder, where they show up on https://your-server/download.
+#   Use a user that can only write that folder (not root). With them, VPS_HOST_FINGERPRINT is required too: the
+#   server's SSH host key fingerprint (on the server: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, the
+#   SHA256:... part), so the copy refuses any other machine.
+#   Security: read-only token except for the release job, actions pinned to exact commits, the exact library
+#   versions from package-lock.json, and the server copy uses the runner's own ssh/scp (no third-party code
+#   ever handles VPS_SSH_KEY).
 name: Desktop app
 
 on:
@@ -11,12 +17,13 @@ on:
   workflow_dispatch:
     inputs:
       server:
-        description: 'Server address baked into this build (leave empty to ask on first launch)'
+        description: 'Server address baked into this build (empty: the HEARTH_SERVER variable, else the one in hearth.config.json)'
         required: false
         default: ''
 
+# Least privilege: read-only unless a job says otherwise.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -29,10 +36,12 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: 20
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
       - name: Set version from tag
         if: startsWith(github.ref, 'refs/tags/desktop-v')
         shell: bash
@@ -43,12 +52,12 @@ jobs:
         env:
           SERVER: ${{ github.event.inputs.server || vars.HEARTH_SERVER }}
         run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
-      - run: npm install
+      - run: npm ci --no-audit --no-fund
       - name: Build installers
         run: npx electron-builder --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-${{ matrix.os }}
           path: |
@@ -63,34 +72,74 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/desktop-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # the only job that writes: it creates the GitHub release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true
 
+  # Installers reach everyone's apps from there: tags and the default branch only.
   publish-to-vps:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/desktop-v') || github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     env:
       HAS_VPS: ${{ secrets.VPS_HOST != '' }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: env.HAS_VPS == 'true'
         with:
           path: dist
           merge-multiple: true
+      # The runner's own OpenSSH does the copy: no third-party action (or the image or download one could swap in
+      # without a new commit) ever sees VPS_SSH_KEY. ssh only talks to the machine whose host key matches
+      # VPS_HOST_FINGERPRINT, which is required: without it nothing is copied.
       - name: Copy installers to the server
         if: env.HAS_VPS == 'true'
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb'
-          target: ${{ secrets.VPS_DOWNLOADS_DIR }}
-          strip_components: 1
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST_FINGERPRINT: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          VPS_DOWNLOADS_DIR: ${{ secrets.VPS_DOWNLOADS_DIR }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/vps-ssh"
+          mkdir -p "$ssh_dir"
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$ssh_dir/key"
+          want="$(printf '%s' "$VPS_HOST_FINGERPRINT" | tr -d ' \r\n')"
+          want="${want#SHA256:}"
+          want="${want%%=*}"
+          if [ -z "$want" ]; then
+            echo "::error::Add the secret VPS_HOST_FINGERPRINT: the server's SSH host key fingerprint (on the server: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, the SHA256:... part). Nothing was copied."
+            exit 1
+          fi
+          # Ask the server for its host keys and keep only the one with the pinned fingerprint. ssh then refuses
+          # any machine that can't prove it holds that key.
+          : > "$ssh_dir/known_hosts"
+          ssh-keyscan -T 20 -- "$VPS_HOST" 2>/dev/null > "$ssh_dir/offered" || true
+          while IFS= read -r line; do
+            case "$line" in '' | '#'*) continue ;; esac
+            printf '%s\n' "$line" > "$ssh_dir/one"
+            fp="$(ssh-keygen -lf "$ssh_dir/one" 2>/dev/null | awk '{ print $2 }')" || fp=""
+            fp="${fp#SHA256:}"
+            if [ -n "$fp" ] && [ "${fp%%=*}" = "$want" ]; then printf '%s\n' "$line" >> "$ssh_dir/known_hosts"; fi
+          done < "$ssh_dir/offered"
+          if [ ! -s "$ssh_dir/known_hosts" ]; then
+            echo "::error::$VPS_HOST didn't show the host key that VPS_HOST_FINGERPRINT names (or couldn't be reached). Nothing was copied."
+            exit 1
+          fi
+          shopt -s nullglob
+          files=(dist/*.exe dist/*.dmg dist/*.AppImage dist/*.deb)
+          if [ ${#files[@]} -eq 0 ]; then echo "No installers to copy."; exit 0; fi
+          host="$VPS_HOST"
+          case "$host" in *:*) host="[$host]" ;; esac
+          scp -i "$ssh_dir/key" -o IdentitiesOnly=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes -o ConnectTimeout=20 -- "${files[@]}" "$VPS_USER@$host:$VPS_DOWNLOADS_DIR/"

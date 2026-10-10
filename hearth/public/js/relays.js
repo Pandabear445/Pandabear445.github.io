@@ -38,12 +38,20 @@ export async function rankRelays(list, { force = false } = {}) {
 }
 export const relayTime = (ranks, e) => (ranks && sig(e) in ranks ? ranks[sig(e)] : undefined);
 
+// Relay logins run out (expiresAt, 12 to 18 hours after they're handed out). An app left open longer fetches
+// new ones before a call, and in the background; true when they're gone or will be within `margin`.
+export function iceExpiresAt(list) {
+  const times = (list || []).map((e) => e && e.expiresAt).filter((t) => Number.isFinite(t));
+  return times.length ? Math.min(...times) : Infinity;
+}
+export const iceStale = (list, now = Date.now(), margin = 3600000) => iceExpiresAt(list) - now < margin;
+
 // What a call uses: every STUN server, plus the two relays that answered fastest (all of them until measured).
 // Fewer relays = the connection is found sooner.
 // With a region picked for the call (like Discord's region override), everything goes through that region's
 // relay: { iceServers, iceTransportPolicy: 'relay' }. If that region is down, the call falls back to automatic.
 export function chooseIce(list, ranks, regionId = null) {
-  const strip = (e) => { const { region, regionId: _r, ...rest } = e; return rest; };
+  const strip = (e) => { const { region, regionId: _r, expiresAt: _x, ...rest } = e; return rest; };
   const stun = (list || []).filter((e) => !isRelay(e));
   const relays = (list || []).filter(isRelay);
   if (regionId) {
