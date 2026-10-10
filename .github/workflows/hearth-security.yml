@@ -7,6 +7,9 @@
 #   - image:   builds the Docker image and scans it with Trivy (fails on fixable high/critical), plus a
 #              configuration check of the Dockerfile and docker-compose.yml (report only).
 #   - codeql:  GitHub's code analysis for JavaScript; findings show under Security → Code scanning.
+#   - upgrade-drill: the last release before the security overhaul (c55a9dc, database version 16) and this commit,
+#              each filled through its API and then upgraded in place to this commit (also killed half-way through
+#              the upgrade, then restarted); plus the recovery drill's report (hearth/docs/RECOVERY.md).
 # Third-party actions are pinned to exact commits (the comment says which version); Dependabot updates them.
 name: Hearth security
 
@@ -159,3 +162,27 @@ jobs:
       - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           category: /language:javascript-typescript
+
+  upgrade-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: hearth
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the older releases are checked out from the history
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hearth/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Upgrade older releases in place (and kill one upgrade half-way)
+        run: bash scripts/upgrade-drill.sh c55a9dc HEAD
+      - name: Recovery drill report
+        run: node scripts/recovery-drill.js
