@@ -134,6 +134,50 @@ function createPlayer(room, initialCtx) {
   let timer = null; let ticks = 0; let lastSeq = 0; let deniedAt = 0; let playCheck = null;
   const quiet = (ms = 1200) => { quietUntil = Date.now() + ms; };
   const timeEl = h('span', { class: 'wt-time' });
+
+  // Full screen: the video plus the shared controls (not the embedded player's own full screen, which would hide
+  // Sync, the shared buttons and what others do). Where the browser can't put an element in full screen (iPhone,
+  // some app web views) it fills the window instead. Notices (toasts) move inside so they still show.
+  const isFull = () => document.fullscreenElement === el || document.webkitFullscreenElement === el || el.classList.contains('wt-full');
+  let idleTimer = null;
+  const wake = () => { el.classList.remove('wt-idle'); clearTimeout(idleTimer); idleTimer = setTimeout(() => { if (isFull()) el.classList.add('wt-idle'); }, 2600); };
+  const onFullChange = () => {
+    const full = isFull();
+    el.classList.toggle('wt-is-full', full);
+    const toasts = document.getElementById('toasts');
+    if (toasts) (full ? el : document.body).append(toasts);
+    if (full) wake(); else { el.classList.remove('wt-idle'); clearTimeout(idleTimer); }
+    if (self.state) drawBar();
+  };
+  const onKey = (e) => { if (e.key === 'Escape' && el.classList.contains('wt-full')) { e.stopPropagation(); exitFull(); } };
+  function enterFull() {
+    const req = el.requestFullscreen ? el.requestFullscreen({ navigationUI: 'hide' }) : el.webkitRequestFullscreen ? el.webkitRequestFullscreen() : Promise.reject(new Error('no fullscreen'));
+    Promise.resolve(req).then(() => {
+      // Phones: turn sideways for the video, where the browser allows it.
+      if (screen.orientation && screen.orientation.lock && matchMedia('(pointer: coarse)').matches) screen.orientation.lock('landscape').catch(() => {});
+    }).catch(() => { el.classList.add('wt-full'); document.addEventListener('keydown', onKey, true); onFullChange(); });
+  }
+  function exitFull() {
+    if (el.classList.contains('wt-full')) { el.classList.remove('wt-full'); document.removeEventListener('keydown', onKey, true); onFullChange(); return; }
+    if (screen.orientation && screen.orientation.unlock) try { screen.orientation.unlock(); } catch { /* not locked */ }
+    (document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen && document.webkitExitFullscreen());
+  }
+  const toggleFull = () => (isFull() ? exitFull() : enterFull());
+  document.addEventListener('fullscreenchange', onFullChange);
+  document.addEventListener('webkitfullscreenchange', onFullChange);
+  el.addEventListener('mousemove', wake);
+  el.addEventListener('touchstart', wake, { passive: true });
+  stage.addEventListener('dblclick', (e) => { e.preventDefault(); toggleFull(); });
+  // F toggles full screen while the video is on screen (not while typing).
+  const onF = (e) => {
+    if (e.key !== 'f' && e.key !== 'F') return;
+    if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || !self.state || el.hidden || !el.getClientRects().length) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    e.preventDefault(); toggleFull();
+  };
+  document.addEventListener('keydown', onF);
+  self.toggleFullscreen = toggleFull;
   const emit = (ev, data) => self.ctx.socket.emit(ev, { ...data, itemId }, (r) => { if (r && r.error) { toast(r.error, 'error'); follow(true); } });
   const canControl = () => {
     const st = self.state;
@@ -204,7 +248,8 @@ function createPlayer(room, initialCtx) {
       ib(h('span', { class: 'wt-skip' }, '10\u21bb'), 'Ahead 10 seconds', () => seekTo(now() + 10)),
       ib(h('span', { class: 'wt-skip' }, '30\u21bb'), 'Ahead 30 seconds', () => seekTo(now() + 30)),
       timeEl,
-      h('button', { class: 'btn ghost sm', 'data-tip': 'Jump to where everyone else is', onclick: () => follow(true) }, 'Sync')));
+      h('button', { class: 'btn ghost sm', 'data-tip': 'Jump to where everyone else is', onclick: () => follow(true) }, 'Sync'),
+      h('button', { class: 'icon-btn sm wt-ctl wt-fs', 'aria-label': isFull() ? 'Exit full screen' : 'Full screen', 'data-tip': isFull() ? 'Exit full screen (Esc)' : 'Full screen (F)', onclick: toggleFull }, icon(isFull() ? 'minimize' : 'maximize'))));
     drawTime();
     bar.append(
       h('div', { class: 'wt-title' }, h('span', { class: 'wt-kind' }, KIND_LABEL[st.item.kind] || 'Video'),
@@ -240,6 +285,7 @@ function createPlayer(room, initialCtx) {
     self.state = st;
     el.hidden = !st;
     if (!st) {
+      if (isFull()) exitFull();
       if (adapter) { adapter.destroy(); adapter = null; }
       itemId = null; clear(stage); clear(bar); clear(queueEl);
       clearInterval(timer); timer = null; clearTimeout(playCheck);
@@ -256,7 +302,13 @@ function createPlayer(room, initialCtx) {
     // Every second: update the clock; every 3 seconds: gentle drift correction.
     if (!timer) timer = setInterval(() => { drawTime(); if (++ticks % 3 === 0) follow(); }, 1000);
   };
-  self.destroy = () => { if (adapter) adapter.destroy(); clearInterval(timer); clearTimeout(playCheck); el.remove(); };
+  self.destroy = () => {
+    if (isFull()) exitFull();
+    document.removeEventListener('fullscreenchange', onFullChange);
+    document.removeEventListener('webkitfullscreenchange', onFullChange);
+    document.removeEventListener('keydown', onF);
+    if (adapter) adapter.destroy(); clearInterval(timer); clearTimeout(playCheck); clearTimeout(idleTimer); el.remove();
+  };
   self.el = el;
   return self;
 }

@@ -2145,6 +2145,17 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .watch-chip:hover { background: rgb(var(--accent-rgb) / .22); }
 .watch-chip .ic { width: 14px; height: 14px; }
 .wt-queue:empty { display: none; }
+/* Watch together, full screen: the video fills the screen and the shared controls fade away when the mouse is
+   still. .wt-full is the fallback where the browser can't do real full screen. */
+.wt.wt-full { position: fixed; inset: 0; z-index: 1000; }
+.wt.wt-is-full { background: #000; gap: 0; height: 100%; width: 100%; color: #fff; }
+.wt.wt-is-full .wt-stage { flex: 1; max-height: none; min-height: 0; aspect-ratio: auto; border-radius: 0; }
+/* The shared controls sit just under the video, so they never cover the player's own controls bar. */
+.wt.wt-is-full .wt-bar { padding: 8px 12px max(8px, env(safe-area-inset-bottom)); background: #000; transition: opacity .25s; }
+.wt.wt-is-full .wt-controls { background: rgb(255 255 255 / .07); }
+.wt.wt-is-full .wt-title, .wt.wt-is-full .wt-actions > :not(.btn.primary), .wt.wt-is-full .wt-queue { display: none; }
+.wt.wt-is-full.wt-idle { cursor: none; }
+.wt.wt-is-full.wt-idle .wt-bar { opacity: 0; pointer-events: none; }
 .wt-queue { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 10px; background: var(--hover); }
 .wt-qh { font-size: 12px; font-weight: 700; color: var(--text-2); }
 .wt-qi { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto auto; align-items: center; gap: 8px; font-size: 13px; }

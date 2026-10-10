@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.26.1', items: [
+    'Watch together has a full screen button (or press F, or double-click the video). The shared controls and Sync stay at the bottom and fade away while you watch; Esc goes back. On phones it fills the screen and turns sideways where it can.',
+  ] },
   { version: '1.26.0', items: [
     'Creator memberships: server owners can sell monthly memberships, like Patreon inside your server. Each one gives a role, and roles can open private channels. Members join from the server\u2019s Memberships row and pay on Stripe\u2019s page; the money goes to the creator. Everything that\u2019s free stays free.',
     'Fixed: on phones and tablets the member list no longer covers the chat every time you open a channel (tap the people button when you want it).',
