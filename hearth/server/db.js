@@ -698,6 +698,19 @@ CREATE INDEX IF NOT EXISTS idx_dm_messages_time ON dm_messages(dm_id, created_at
 CREATE INDEX IF NOT EXISTS idx_dm_messages_author_time ON dm_messages(dm_id, author_id, created_at, id);
 `);
 
+// v17 (authz): leaving, kicks and bans now take away the person's roles, per-channel overrides and event RSVPs.
+// Older versions left them behind, so someone who was removed got their roles (even Administrator) back by
+// rejoining with any invite. Clear what's left from before; it only touches rows of people no longer in the
+// server, so running it on every start is harmless.
+db.exec(`
+DELETE FROM member_roles WHERE NOT EXISTS
+  (SELECT 1 FROM members m WHERE m.server_id = member_roles.server_id AND m.user_id = member_roles.user_id);
+DELETE FROM channel_overrides WHERE target_type = 'member' AND NOT EXISTS
+  (SELECT 1 FROM channels c JOIN members m ON m.server_id = c.server_id WHERE c.id = channel_overrides.channel_id AND m.user_id = channel_overrides.target_id);
+DELETE FROM event_rsvps WHERE NOT EXISTS
+  (SELECT 1 FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE e.id = event_rsvps.event_id AND m.user_id = event_rsvps.user_id);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are

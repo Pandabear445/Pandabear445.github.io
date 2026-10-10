@@ -270,8 +270,12 @@ function openEventEditor(server, e, onDone) {
   const starts = h('input', { class: 'input', type: 'datetime-local', value: local(start0) });
   const hours = h('input', { class: 'input', type: 'number', min: '0', max: '48', step: '0.5', value: e && e.endsAt ? String((e.endsAt - e.startsAt) / 3600000) : '2' });
   const chans = (server.channels || []).filter((c) => c.type === 'voice' || c.type === 'text');
-  const chan = h('select', { class: 'input' }, h('option', { value: '' }, 'No channel'), chans.map((c) => h('option', { value: c.id }, `${c.type === 'voice' ? '🔊' : '#'} ${c.name}`)));
-  chan.value = e && e.channelId ? e.channelId : (chans.find((c) => c.type === 'voice') || {}).id || '';
+  // An event can link to a channel you can't see (the server doesn't say which): offer to keep it as it is.
+  const chan = h('select', { class: 'input' }, e && e.channelHidden ? h('option', { value: 'hidden' }, 'A channel you can\u2019t see') : null,
+    h('option', { value: '' }, 'No channel'), chans.map((c) => h('option', { value: c.id }, `${c.type === 'voice' ? '🔊' : '#'} ${c.name}`)));
+  // A new event suggests a voice channel; an existing one shows what it has (which may be none).
+  chan.value = !e ? (chans.find((c) => c.type === 'voice') || {}).id || '' : e.channelHidden ? 'hidden' : e.channelId || '';
+  const chan0 = chan.value;
   const where = h('input', { class: 'input', maxlength: '120', value: e ? e.location : '', placeholder: 'Optional: somewhere else, a link…' });
   const desc = h('textarea', { class: 'input', rows: '3', maxlength: '2000', placeholder: 'What’s happening? What to bring?' });
   desc.value = e ? e.description : '';
@@ -282,6 +286,8 @@ function openEventEditor(server, e, onDone) {
       const startsAt = new Date(starts.value).getTime();
       const len = Math.max(0, +hours.value || 0);
       const body = { title: title.value, startsAt, endsAt: len ? startsAt + len * 3600000 : null, channelId: chan.value || null, location: where.value, description: desc.value };
+      // Leave the channel out unless it was changed, so saving other edits never moves or drops the link.
+      if (e && chan.value === chan0) delete body.channelId;
       await api(e ? 'PATCH' : 'POST', e ? `/events/${e.id}` : `/servers/${server.id}/events`, body);
       toast(e ? 'Event updated.' : 'Event created. Everyone in the server can see it.');
       if (onDone) onDone();
