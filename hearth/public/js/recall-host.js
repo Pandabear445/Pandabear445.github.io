@@ -39,21 +39,30 @@ export function createRecall(ctx) {
   // ------------------------------------------------------------------ encrypted sync
   async function vkey() { if (!key) key = await E2EE.vaultKey(ctx.S.privateKey, ctx.S.me.publicKey); return key; }
   // Pull everything changed since last time. Returns the ids that changed (deleted ones included).
+  // The server answers a page at a time (`more` = there's another), and everything has to be in before the first
+  // load counts as done: tidying up (migrate, unused pictures) on half a list would overwrite or delete the rest.
   function sync() {
     if (loading) return loading;
     loading = (async () => {
-      const r = await api('GET', `/me/study?since=${since}`);
       const k = await vkey();
       const changed = [];
-      for (const it of r.items) {
-        since = Math.max(since, it.updatedAt);
-        if (it.deleted) { if (items.delete(it.id)) changed.push(it.id); continue; }
-        try {
-          const obj = await E2EE.openVault(k, it.kind, it.id, it.data);
-          items.set(it.id, { kind: it.kind, obj, updatedAt: it.updatedAt });
-          saved.set(it.id, JSON.stringify(obj));
-          changed.push(it.id);
-        } catch { /* unreadable (made before a reset with new keys) */ }
+      for (let more = true; more;) {
+        let r;
+        try { r = await api('GET', `/me/study?since=${since}&paged=1`); } catch (e) {
+          if (!loaded) throw e;
+          break; // later pages come with the next sync
+        }
+        for (const it of r.items) {
+          since = Math.max(since, it.updatedAt);
+          if (it.deleted) { if (items.delete(it.id)) changed.push(it.id); continue; }
+          try {
+            const obj = await E2EE.openVault(k, it.kind, it.id, it.data);
+            items.set(it.id, { kind: it.kind, obj, updatedAt: it.updatedAt });
+            saved.set(it.id, JSON.stringify(obj));
+            changed.push(it.id);
+          } catch { /* unreadable (made before a reset with new keys) */ }
+        }
+        more = !!r.more && r.items.length > 0;
       }
       loaded = true;
       return changed;

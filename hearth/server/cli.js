@@ -20,6 +20,13 @@ const keyFrom = (hex) => {
   if (hex) { if (!/^[0-9a-f]{64}$/i.test(hex.trim())) throw new Error('The backup key is 64 hex characters.'); return Buffer.from(hex.trim(), 'hex'); }
   return require('./backup').loadKey(DATA_DIR);
 };
+// The newest database version this code understands. Read from db.js as text: requiring it would open (and upgrade)
+// the live database, which verifying or restoring a backup mustn't touch.
+const codeSchema = () => Number((/const SCHEMA_VERSION = (\d+);/.exec(fs.readFileSync(path.join(__dirname, 'db.js'), 'utf8')) || [])[1]) || 0;
+// A backup from a newer Hearth can't be started with this code (it refuses to run on a newer database).
+const newerWarning = (schema) => (codeSchema() && schema > codeSchema()
+  ? `Warning: this backup is from a newer version of Hearth (database version ${schema}; this version understands up to ${codeSchema()}). Install that version (or newer) before starting Hearth on it.`
+  : '');
 const settings = () => {
   const { db } = require('./db');
   return { db, set: (k, v) => db.prepare('INSERT OR REPLACE INTO instance_settings (key, value) VALUES (?, ?)').run(k, v), get: (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value };
@@ -47,9 +54,13 @@ const settings = () => {
   } else if (cmd === 'verify-backup' && a) {
     const v = await require('./backup').verifyBackup(path.resolve(a), keyFrom(b), os.tmpdir());
     console.log(`Restore test passed: ${v.users} accounts, ${v.messages} messages, ${v.files} files, database version ${v.schema}${v.hasSecretKey ? '' : ' (no secret.key inside: this server used AT_REST_KEY)'}.`);
+    if (newerWarning(v.schema)) console.error(newerWarning(v.schema));
   } else if (cmd === 'restore' && a && b) {
-    const entries = await require('./backup').restoreBackup(path.resolve(a), keyFrom(c), path.resolve(b));
+    const BK = require('./backup');
+    const entries = await BK.restoreBackup(path.resolve(a), keyFrom(c), path.resolve(b));
     console.log(`Restored ${entries.length} files into ${path.resolve(b)}. Start Hearth with DATA_DIR=${path.resolve(b)} (or move it to data/).`);
+    const warn = newerWarning(BK.schemaOf(path.join(path.resolve(b), 'hearth.db')));
+    if (warn) { console.error(warn); process.exitCode = 2; }
   } else {
     console.log('Usage: node server/cli.js set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key]');
     process.exitCode = 1;

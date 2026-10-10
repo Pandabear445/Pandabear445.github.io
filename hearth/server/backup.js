@@ -189,6 +189,13 @@ async function verifyBackup(file, master, scratchDir) {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+// The database version (PRAGMA user_version) of a restored database file, read without changing it.
+function schemaOf(file) {
+  const Database = require('better-sqlite3');
+  const d = new Database(file, { readonly: true, fileMustExist: true });
+  try { return d.pragma('user_version', { simple: true }); } finally { d.close(); }
+}
+
 // Restores into an empty folder (a new data/ directory).
 async function restoreBackup(file, master, targetDir) {
   fs.mkdirSync(targetDir, { recursive: true });
@@ -208,4 +215,4 @@ function uploadOffsite(file) {
   });
 }
 
-module.exports = { createBackup, openBackup, verifyBackup, restoreBackup, uploadOffsite, loadKey };
+module.exports = { createBackup, openBackup, verifyBackup, restoreBackup, uploadOffsite, loadKey, schemaOf };

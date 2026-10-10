@@ -24,13 +24,27 @@ module.exports = function setupStudy(ctx) {
     res.json({ enabled });
   });
 
-  // Sync: everything changed since `since` (deletions included, as tombstones).
+  // Sync: everything changed since `since` (deletions included, as tombstones), oldest change first, a page at a
+  // time: at most PAGE_ITEMS items or about PAGE_BYTES of data per answer (someone's 100 MB in one answer held up
+  // everyone on the server). `more: true` means ask again with since = the last item's updatedAt.
+  const PAGE_ITEMS = 500;
+  const PAGE_BYTES = 4 * 1024 * 1024;
   api.get('/me/study', auth, (req, res) => {
+    rateLimit('studysync:' + req.userId, 120, 60000);
     const since = Math.max(0, Math.floor(+req.query.since) || 0);
-    const items = db.prepare('SELECT id, kind, data, updated_at, deleted FROM study_items WHERE user_id = ? AND updated_at > ? ORDER BY updated_at LIMIT 5000').all(req.userId, since)
-      .map((r) => ({ id: r.id, kind: r.kind, data: r.deleted ? null : r.data, updatedAt: r.updated_at, deleted: !!r.deleted }));
+    const items = []; let bytes = 0; let more = false;
+    for (const r of db.prepare('SELECT id, kind, data, updated_at, deleted FROM study_items WHERE user_id = ? AND updated_at > ? ORDER BY updated_at').iterate(req.userId, since)) {
+      // Never stop between two items changed at the same moment: `since` couldn't point between them.
+      const last = items[items.length - 1];
+      if ((items.length >= PAGE_ITEMS || bytes >= PAGE_BYTES) && r.updated_at !== last.updatedAt) { more = true; break; }
+      items.push({ id: r.id, kind: r.kind, data: r.deleted ? null : r.data, updatedAt: r.updated_at, deleted: !!r.deleted });
+      bytes += r.deleted ? 0 : r.data.length;
+    }
+    // Apps from before paging read one answer as everything. Rather than let one of them act on half the list (and
+    // overwrite the rest), ask for a reload: the new version is already waiting in the browser.
+    if (more && req.query.paged !== '1') fail(409, 'Reload Hearth to finish syncing your study decks (a newer version of the app is ready).', 'study_paged');
     const used = db.prepare('SELECT COALESCE(SUM(size), 0) b, COUNT(*) n FROM study_items WHERE user_id = ? AND deleted = 0').get(req.userId);
-    res.json({ items, now: now(), usedBytes: used.b, count: used.n });
+    res.json({ items, more, now: now(), usedBytes: used.b, count: used.n });
   });
   api.put('/me/study/:id', auth, (req, res) => {
     rateLimit('study:' + req.userId, 600, 60000);
@@ -59,6 +73,9 @@ module.exports = function setupStudy(ctx) {
     const last = db.prepare('SELECT MAX(updated_at) t FROM study_items WHERE user_id = ?').get(req.userId).t || 0;
     const t = Math.max(now(), last + 1);
     db.prepare("UPDATE study_items SET data = '', size = 0, deleted = 1, updated_at = ? WHERE user_id = ? AND id = ?").run(t, req.userId, id);
+    // Deletions stay as tombstones so devices that are open hear about them. After 90 days they go: an app that
+    // starts syncs from the beginning and doesn't need them, and they'd otherwise pile up forever.
+    db.prepare('DELETE FROM study_items WHERE user_id = ? AND deleted = 1 AND updated_at < ?').run(req.userId, t - 90 * 86400000);
     emitToUser(req.userId, 'study:changed', { since: t - 1, from: req.session.id });
     res.json({ ok: true, updatedAt: t });
   });
