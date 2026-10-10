@@ -15,3 +15,7 @@
 hearth/data/
 node_modules/
 .DS_Store
+
+# Hearth server update zips (hearth/scripts/make-update-zip.sh): published with releases, never committed.
+hearth-update-*.zip
+hearth-update-*.zip.sha256

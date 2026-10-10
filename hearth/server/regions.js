@@ -137,11 +137,15 @@ REGION=${q(r.id)}
 TOKEN=${q(token)}
 PIN=${q(pinFor(origin))}
 
-cat > /tmp/hearth-setup-turn.sh <<'HEARTH_TURN_EOF'
+# A private folder (mktemp: only root can read or write it), not a fixed name in /tmp that another account
+# could create first and swap the script in before root runs it.
+SETUP_DIR="$(mktemp -d)"
+trap 'rm -rf "$SETUP_DIR"' EXIT
+cat > "$SETUP_DIR/setup-turn.sh" <<'HEARTH_TURN_EOF'
 ${turnScript}
 HEARTH_TURN_EOF
-bash /tmp/hearth-setup-turn.sh --relay-only --managed --secret ${q(ensureSecret())}
-rm -f /tmp/hearth-setup-turn.sh
+bash "$SETUP_DIR/setup-turn.sh" --relay-only --managed --secret ${q(ensureSecret())}
+rm -rf "$SETUP_DIR"
 
 # Off-site backups: an upload-only SFTP account that can write into one folder and nothing else. The main
 # server copies its encrypted backups here (useless without the backup key, which never leaves it).
