@@ -93,6 +93,14 @@ test('a thread with more replies than SQLite allows placeholders opens a page at
   const older = await as(alice, 'GET', `/messages/${t.root}/thread?before=${r.json.messages[0].id}`);
   assert.deepEqual(older.json.messages.map((m) => m.id), t.replies.slice(-200, -100));
   assert.ok((await as(alice, 'GET', `/messages/${t.root}/thread?limit=-1`)).json.messages.length <= 100);
+  // Opening it at a linked reply deep inside takes one request for the page around it, then ?after for newer ones.
+  const at = await as(alice, 'GET', `/messages/${t.root}/thread?around=${t.replies[5000]}`);
+  assert.deepEqual(at.json.messages.map((m) => m.id), t.replies.slice(4975, 5026));
+  assert.equal(at.json.hasMore, true);
+  assert.equal(at.json.hasNewer, true);
+  const newer = await as(alice, 'GET', `/messages/${t.root}/thread?limit=100&after=${t.replies[5025]}`);
+  assert.deepEqual(newer.json.messages.map((m) => m.id), t.replies.slice(5026, 5126));
+  assert.equal(newer.json.hasNewer, true);
 
   // If the database part fails, nothing is lost: the files are only removed after it has committed.
   srv.sql("CREATE TRIGGER block_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'blocked for the test'); END");
@@ -122,52 +130,108 @@ test('staff can remove a huge thread too; deleting one reply leaves the rest', a
   assert.equal((await as(bob, 'DELETE', `/messages/${small.replies[0]}`)).status, 403);
 });
 
+test('a page whose messages carry 200k reactions opens (no stack overflow), reactions in the order they were added', async () => {
+  const ch = (await as(alice, 'POST', `/servers/${server.id}/channels`, { name: 'popular', type: 'text' })).json;
+  const EMOJI = Array.from({ length: 20 }, (_, i) => 'e' + i);
+  const d = srv.db();
+  const users = []; const msgs = [];
+  d.transaction(() => {
+    const t0 = Date.now() - 1e6;
+    const u = d.prepare("INSERT INTO users (id, username, auth_hash, public_key, enc_private_key, created_at) VALUES (?, ?, 'x', 'x', 'x', ?)");
+    const m = d.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)');
+    const re = d.prepare('INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, ?, ?)');
+    for (let i = 0; i < 100; i++) { const id = 'fan' + hex(6); users.push(id); u.run(id, id, t0); }
+    for (let i = 0; i < 100; i++) { const id = idAt(t0 + i); msgs.push(id); m.run(id, ch.id, alice.id, '', cipher(), t0 + i); }
+    // Added newest emoji first and in reverse user order, so the answer's order can only come from created_at.
+    let t = t0;
+    for (const id of msgs) for (const e of [...EMOJI].reverse()) for (const uid of [...users].reverse()) re.run(id, uid, e, t++);
+  })();
+  d.close();
+  for (const q of ['limit=100', `around=${msgs[50]}`]) {
+    const r = await as(bob, 'GET', `/channels/${ch.id}/messages?${q}`);
+    assert.equal(r.status, 200, `${q}: ${r.text}`);
+    const first = r.json.messages.find((x) => x.id === msgs[50]);
+    assert.equal(first.reactions.length, 20);
+    assert.deepEqual(first.reactions.map((x) => x.emoji), [...EMOJI].reverse());
+    assert.deepEqual(first.reactions[0].userIds, [...users].reverse());
+  }
+  assert.doesNotMatch(srv.log, /Maximum call stack/);
+});
+
 // ------------------------------------------------------------------ data-3: join/leave in a big server
-test('join and leave in a 2000-member server stay fast for everyone, and still reach online members', async () => {
-  const M = 2000;
+test('join, leave, a kick and a channel edit in a 2000-member server with 500 online stay fast, and reach everyone online', async () => {
+  const M = 2000; const ONLINE = 500;
   const big = (await as(alice, 'POST', '/servers', { name: 'Big' })).json;
   for (let i = 0; i < 10; i++) await as(alice, 'POST', `/servers/${big.id}/channels`, { name: 'c' + i, type: 'text' });
   const { code } = (await as(alice, 'POST', `/servers/${big.id}/invites`, {})).json;
   const d = srv.db();
+  const tokens = [];
   d.transaction(() => {
+    const t = Date.now();
     const u = d.prepare("INSERT INTO users (id, username, auth_hash, public_key, enc_private_key, created_at) VALUES (?, ?, 'x', 'x', 'x', ?)");
     const m = d.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)');
     const k = d.prepare("INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, 1, ?, ?, ?, ?)");
-    d.prepare("INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, 1, 'chk', ?, ?)").run(big.id, alice.id, Date.now());
+    const se = d.prepare('INSERT INTO sessions (id, token_hash, user_id, created_at, last_used_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)');
+    d.prepare("INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, 1, 'chk', ?, ?)").run(big.id, alice.id, t);
     d.prepare('UPDATE servers SET key_epoch = 1, needs_rotation = 0 WHERE id = ?').run(big.id);
-    k.run(big.id, alice.id, 'w'.repeat(60), alice.id, Date.now());
-    for (let i = 0; i < M; i++) { const id = 'syn' + hex(6); u.run(id, 'syn' + hex(6), Date.now()); m.run(big.id, id, Date.now() + i); k.run(big.id, id, 'w'.repeat(60), alice.id, Date.now()); }
+    k.run(big.id, alice.id, 'w'.repeat(60), alice.id, t);
+    for (let i = 0; i < M; i++) {
+      const id = 'syn' + hex(6);
+      u.run(id, 'syn' + hex(6), t); m.run(big.id, id, t + i); k.run(big.id, id, 'w'.repeat(60), alice.id, t);
+      if (i < ONLINE) { const tok = hex(32); tokens.push(tok); se.run(hex(12), crypto.createHash('sha256').update(tok).digest('hex'), id, t, t, t + 86400000); }
+    }
   })();
   d.close();
-  const mallory = await srv.register();
-  const sock = await srv.socket(alice.token);
-  const seen = [];
-  for (const ev of ['keys:state', 'member:add', 'member:remove', 'server:update']) sock.on(ev, (p) => seen.push([ev, p]));
-  let worst = 0; let stop = false;
-  const pinger = (async () => { while (!stop) { const s = Date.now(); await srv.api('GET', '/config'); worst = Math.max(worst, Date.now() - s); await sleep(20); } })();
-  const times = [];
+  // Members with the app open: each gets their own server update and key state, so this is the fan-out that costs.
+  const sockets = [];
+  const heard = { 'server:update': 0, 'keys:state': 0 };
   try {
-    for (let i = 0; i < 3; i++) {
-      let t = Date.now(); const j = await as(mallory, 'POST', `/invites/${code}/join`); times.push(Date.now() - t);
-      assert.equal(j.status, 200, j.text);
-      t = Date.now(); const l = await as(mallory, 'POST', `/servers/${big.id}/leave`); times.push(Date.now() - t);
-      assert.equal(l.status, 200, l.text);
+    for (const tok of tokens) {
+      const so = await srv.socket(tok);
+      so.on('server:update', (p) => { if (p.id === big.id) heard['server:update']++; });
+      so.on('keys:state', (p) => { if (p.serverId === big.id) heard['keys:state']++; });
+      sockets.push(so);
     }
-  } finally { stop = true; await pinger; }
-  await sleep(200);
-  sock.close();
-  // Before: about 1.5 s per join and 4 s per leave here, with everyone else waiting as long.
-  assert.ok(Math.max(...times) < 1000, `join/leave took ${times.join(', ')} ms`);
-  assert.ok(worst < 1000, `others waited up to ${worst} ms`);
-  // The online owner still hears who came and went, and that the newcomer needs the key.
-  const keyUpdates = seen.filter(([ev, p]) => ev === 'keys:state' && p.serverId === big.id);
-  assert.ok(keyUpdates.length >= 3, 'keys:state on every join');
-  assert.ok(keyUpdates.some(([, p]) => p.missing.includes(mallory.id)));
-  assert.equal(seen.filter(([ev, p]) => ev === 'member:add' && p.serverId === big.id).length, 3);
-  assert.equal(seen.filter(([ev, p]) => ev === 'member:remove' && p.serverId === big.id && p.userId === mallory.id).length, 3);
+    const mallory = await srv.register();
+    const sock = await srv.socket(alice.token);
+    sockets.push(sock);
+    const seen = [];
+    for (const ev of ['keys:state', 'member:add', 'member:remove', 'server:update']) sock.on(ev, (p) => seen.push([ev, p]));
+    let worst = 0; let stop = false;
+    const pinger = (async () => { while (!stop) { const s = Date.now(); await srv.api('GET', '/config'); worst = Math.max(worst, Date.now() - s); await sleep(20); } })();
+    const times = {};
+    const timed = async (name, fn) => { const t = Date.now(); const r = await fn(); (times[name] ||= []).push(Date.now() - t); assert.equal(r.status, 200, `${name}: ${r.text}`); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        await timed('join', () => as(mallory, 'POST', `/invites/${code}/join`));
+        await timed('leave', () => as(mallory, 'POST', `/servers/${big.id}/leave`));
+      }
+      await timed('join', () => as(mallory, 'POST', `/invites/${code}/join`));
+      // Both send everyone online their own view of the whole server (permissions differ per person).
+      await timed('kick', () => as(alice, 'DELETE', `/servers/${big.id}/members/${mallory.id}`));
+      await timed('channel edit', () => as(alice, 'PATCH', `/channels/${big.channels[0].id}`, { name: 'renamed' }));
+    } finally { stop = true; await pinger; }
+    for (let i = 0; i < 50 && (heard['server:update'] < 2 * ONLINE || heard['keys:state'] < 8 * ONLINE); i++) await sleep(100);
+    // Before: about 1.5 s per join and 4 s per leave here (with 1 online), with everyone else waiting as long. The kick
+    // and the edit take about 0.1-0.2 s; working the shared part of a server update out again for each member online
+    // (online × members) made them 0.8-1 s.
+    for (const [name, ms] of Object.entries(times)) assert.ok(Math.max(...ms) < (['kick', 'channel edit'].includes(name) ? 600 : 1000), `${name} took ${ms.join(', ')} ms`);
+    assert.ok(worst < 1000, `others waited up to ${worst} ms`);
+    // Everyone online heard both server updates and all 8 key changes (4 joins, 3 leaves, the kick).
+    assert.equal(heard['server:update'], 2 * ONLINE);
+    assert.equal(heard['keys:state'], 8 * ONLINE);
+    // The online owner still hears who came and went, and that the newcomer needs the key.
+    const keyUpdates = seen.filter(([ev, p]) => ev === 'keys:state' && p.serverId === big.id);
+    assert.equal(keyUpdates.length, 8);
+    assert.ok(keyUpdates.some(([, p]) => p.missing.includes(mallory.id)));
+    assert.equal(seen.filter(([ev, p]) => ev === 'member:add' && p.serverId === big.id).length, 4);
+    assert.equal(seen.filter(([ev, p]) => ev === 'member:remove' && p.serverId === big.id && p.userId === mallory.id).length, 4);
+    const after = seen.filter(([ev, p]) => ev === 'server:update' && p.id === big.id).pop();
+    assert.ok(after && !after[1].memberIds.includes(mallory.id) && after[1].channels.some((c) => c.name === 'renamed'));
+  } finally { sockets.forEach((x) => x.close()); }
 });
 
-test('joining and leaving are rate limited per account', async () => {
+test('joining is rate limited per account; leaving never is, so nobody can be kept in a group', async () => {
   const small = (await as(alice, 'POST', '/servers', { name: 'Door' })).json;
   const { code } = (await as(alice, 'POST', `/servers/${small.id}/invites`, {})).json;
   const eve = await srv.register();
@@ -181,7 +245,18 @@ test('joining and leaving are rate limited per account', async () => {
   // Someone else is unaffected.
   const fred = await srv.register();
   assert.equal((await as(fred, 'POST', `/invites/${code}/join`)).status, 200);
+
+  // Anyone who shares a server with you can put you in a group and add you back each time you leave. However often
+  // that happens, leaving still works, and so does leaving a server afterwards.
+  const group = (await as(alice, 'POST', '/groups', { userIds: [fred.id], name: 'Trap' })).json;
+  for (let i = 0; i < 30; i++) {
+    assert.equal((await as(fred, 'POST', `/servers/${group.id}/leave`)).status, 200, `group leave ${i + 1}`);
+    assert.equal((await as(alice, 'POST', `/groups/${group.id}/members`, { userId: fred.id })).status, 200, `re-add ${i + 1}`);
+  }
+  assert.equal((await as(fred, 'POST', `/servers/${group.id}/leave`)).status, 200);
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM members WHERE server_id = ? AND user_id = ?', group.id, fred.id)[0].n, 0);
   assert.equal((await as(fred, 'POST', `/servers/${small.id}/leave`)).status, 200);
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM members WHERE server_id = ? AND user_id = ?', small.id, fred.id)[0].n, 0);
 });
 
 // ------------------------------------------------------------------ data-9 / data-10: query plans
@@ -287,11 +362,34 @@ test('thousands of deletions no longer hide the newest items (the Recall profile
   assert.equal(srv.sql("SELECT deleted FROM study_items WHERE user_id = ? AND id = 'r-live0'", u.id)[0].deleted, 1);
 });
 
-test('the study sync is rate limited per account', async () => {
+test('the study sync is limited per account, by requests and by data sent, leaving room for several devices', async () => {
+  // Requests: as many as saves (600 a minute), since each save on one device makes every other open device ask once.
   const u = await srv.register();
-  for (let i = 0; i < 120; i++) assert.equal((await as(u, 'GET', '/me/study?paged=1')).status, 200);
+  for (let i = 0; i < 600; i++) assert.equal((await as(u, 'GET', '/me/study?paged=1')).status, 200, `sync ${i + 1}`);
   assert.equal((await as(u, 'GET', '/me/study?paged=1')).status, 429);
   assert.equal((await as(alice, 'GET', '/me/study?paged=1')).status, 200);
+
+  // Data: about two full study spaces (2 x 100 MB) a minute, then a wait, whatever the pages look like.
+  const v = await srv.register();
+  const d = srv.db();
+  d.transaction(() => {
+    const ins = d.prepare("INSERT INTO study_items (id, user_id, kind, data, size, updated_at, deleted) VALUES (?, ?, 'deck', ?, ?, ?, 0)");
+    for (let i = 0; i < 12; i++) ins.run(`r-big${i}`, v.id, 'x1:' + 'A'.repeat(1e6 - 3), 1e6, Date.now() - 1e5 + i);
+  })();
+  d.close();
+  let sent = 0; let refused = null;
+  for (let since = 0, i = 0; !refused && i < 200; i++) {
+    const r = await as(v, 'GET', `/me/study?since=${since}&paged=1`);
+    if (r.status !== 200) { refused = r; break; }
+    sent += r.json.items.reduce((n, it) => n + it.data.length, 0);
+    since = r.json.more ? r.json.items[r.json.items.length - 1].updatedAt : 0;
+  }
+  assert.ok(refused, 'the data limit kicks in');
+  assert.equal(refused.status, 429);
+  assert.equal(refused.json.code, 'rate_limited');
+  assert.ok(Number(refused.headers.get('retry-after')) > 0);
+  assert.ok(sent >= 200e6 && sent <= 225e6, `sent ${sent} bytes before the limit`);
+  assert.equal((await as(alice, 'GET', '/me/study?paged=1')).status, 200, 'other accounts are unaffected');
 });
 
 // The app side (public/js/recall-host.js), run in Node with its imports replaced by small fakes.
@@ -328,17 +426,18 @@ test('Recall loads every page before tidying up, so the profile and pictures of 
   rows.push({ id: 'recall-profile', kind: 'settings', data: enc({ updatedAt: 5, courses: ['Biology'] }) });
   rows.forEach((r, i) => { r.updatedAt = 1000 + i; r.deleted = !!r.deleted; });
 
-  const run = async ({ failSecondPage = false } = {}) => {
-    const calls = []; const posted = []; let gets = 0;
+  const run = async ({ failSecondPage = false, busyFirst = false } = {}) => {
+    const calls = []; const posted = []; let gets = 0; let clock = 5000;
     const win = { postMessage: (m) => posted.push(m) };
     globalThis.__recall = {
       toasts: [],
       h: (tag) => ({ tag, style: {}, append() {}, isConnected: true, contentWindow: tag === 'iframe' ? win : undefined, getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) }),
       api: async (method, p, body) => {
         calls.push([method, p, body]);
-        if (method !== 'GET') return { updatedAt: Date.now() };
+        if (method !== 'GET') return { updatedAt: ++clock };
         gets++;
         if (failSecondPage && gets === 2) throw new Error('network down');
+        if (busyFirst && gets === 1) throw Object.assign(new Error('Too many attempts. Try again in 1 seconds.'), { status: 429, retryAfter: 1 });
         const since = Number(new URL(p, 'http://x').searchParams.get('since'));
         const rest = rows.filter((r) => r.updatedAt > since);
         return { items: rest.slice(0, 500), more: rest.length > 500, now: Date.now() };
@@ -347,9 +446,11 @@ test('Recall loads every page before tidying up, so the profile and pictures of 
     handlers.length = 0;
     const recall = createRecall({ S: { me: { publicKey: 'pk', studyEnabled: true }, privateKey: 'sk' }, onEnabled() {} });
     recall.view(); // opens the frame
-    for (const fn of handlers) fn({ source: win, data: { recall: 1, t: 'ready' } });
-    for (let i = 0; i < 100 && !posted.length && !globalThis.__recall.toasts.length; i++) await sleep(10);
-    return { calls, posted, toasts: globalThis.__recall.toasts };
+    const own = handlers.slice(); // this instance's message listener (later runs add their own)
+    const send = (data) => { for (const fn of own) fn({ source: win, data: { recall: 1, ...data } }); };
+    send({ t: 'ready' });
+    for (let i = 0; i < 300 && !posted.length && !globalThis.__recall.toasts.length; i++) await sleep(10);
+    return { calls, posted, toasts: globalThis.__recall.toasts, recall, send, gets: () => gets };
   };
 
   const ok = await run();
@@ -366,6 +467,36 @@ test('Recall loads every page before tidying up, so the profile and pictures of 
   assert.ok(!bad.posted.some((m) => m.t === 'init'));
   assert.ok(!bad.calls.some(([m]) => m === 'PUT' || m === 'DELETE'));
   assert.match(String(bad.toasts[0] && bad.toasts[0][0]), /network down/);
+
+  // Busy server on the first load (a 429): it waits as told and opens, instead of failing until a reload.
+  const busy = await run({ busyFirst: true });
+  assert.ok(busy.posted.some((m) => m.t === 'init'), 'Recall opened after waiting');
+  assert.equal(busy.toasts.length, 0);
+  assert.equal(busy.calls.filter(([m]) => m === 'GET').length, 3);
+
+  // Changes elsewhere. This tab's own saves come back as study:changed too: those don't make it sync. Others are
+  // fetched at most once a second, and only what really changed goes to Recall.
+  const live = await run(); // the fakes talk to the newest instance
+  const gets = live.gets();
+  live.send({ t: 'profile', profile: { updatedAt: 9, courses: ['Chemistry'] } });
+  await sleep(1100); // saves wait 900 ms for more changes
+  const put = live.calls.find(([m, p]) => m === 'PUT' && p.endsWith('/recall-profile'));
+  assert.ok(put, 'the profile was saved');
+  const own = 5000 + live.calls.filter(([m]) => m !== 'GET').length;
+  live.recall.onRemoteChange({ since: own - 1 });
+  await sleep(1200);
+  assert.equal(live.gets(), gets, 'no sync for its own save');
+  // The server now has that save and a new deck from another device; three changes in a burst mean one request.
+  rows.push({ id: 'recall-profile', kind: 'settings', data: enc({ updatedAt: 9, courses: ['Chemistry'] }), updatedAt: own, deleted: false });
+  rows.push({ id: 'r-b', kind: 'deck', data: enc({ id: 'b', cards: [] }), updatedAt: own + 1, deleted: false });
+  const before = live.posted.length;
+  for (let i = 0; i < 3; i++) live.recall.onRemoteChange({ since: own });
+  await sleep(1200);
+  assert.equal(live.gets(), gets + 1, 'one sync for the burst');
+  const remote = live.posted.slice(before).filter((m) => m.t === 'remote');
+  assert.equal(remote.length, 1);
+  assert.deepEqual(remote[0].decks.map((x) => x.id), ['b']);
+  assert.equal(remote[0].profile, null, 'its own profile isn\u2019t sent back to Recall as a change');
 });
 
 // ------------------------------------------------------------------ data-4 / data-14: upgrades and downgrades
@@ -461,6 +592,8 @@ test('a database from a newer Hearth is refused at start-up, untouched; backups 
     const restore = cli(['restore', newer, path.join(tmp, 'newer'), key()]);
     assert.equal(restore.code, 2);
     assert.match(restore.err, /newer version of Hearth/);
+    // Reading the version leaves nothing behind in the new data folder (opening it with SQLite left -wal and -shm).
+    for (const dir of ['same', 'newer']) assert.deepEqual(fs.readdirSync(path.join(tmp, dir)).filter((f) => /-(wal|shm)$/.test(f)), [], dir);
 
     await stopChild(s);
     const db = path.join(s.dir, 'hearth.db');

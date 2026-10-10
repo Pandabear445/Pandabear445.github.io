@@ -189,11 +189,14 @@ async function verifyBackup(file, master, scratchDir) {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
-// The database version (PRAGMA user_version) of a restored database file, read without changing it.
+// The database version (PRAGMA user_version) of a restored database file: 4 bytes at offset 60 of its header, read
+// straight from the file. Opening it with SQLite instead would leave -wal and -shm files next to it (it's in WAL mode).
 function schemaOf(file) {
-  const Database = require('better-sqlite3');
-  const d = new Database(file, { readonly: true, fileMustExist: true });
-  try { return d.pragma('user_version', { simple: true }); } finally { d.close(); }
+  const head = Buffer.alloc(100);
+  const fd = fs.openSync(file, 'r');
+  try { fs.readSync(fd, head, 0, 100, 0); } finally { fs.closeSync(fd); }
+  if (head.toString('latin1', 0, 16) !== 'SQLite format 3\0') throw new Error(`${file} isn't a SQLite database.`);
+  return head.readInt32BE(60);
 }
 
 // Restores into an empty folder (a new data/ directory).

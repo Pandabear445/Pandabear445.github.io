@@ -29,8 +29,14 @@ module.exports = function setupStudy(ctx) {
   // everyone on the server). `more: true` means ask again with since = the last item's updatedAt.
   const PAGE_ITEMS = 500;
   const PAGE_BYTES = 4 * 1024 * 1024;
+  // Two limits per account. Requests: every save on one device makes each of your other open devices ask what
+  // changed (usually one small item), so there are as many as there are saves. Data: what's expensive is sending
+  // pages of a few MB, so a minute's syncs may send about two full study spaces (a new device needs one).
+  const SYNC_BYTES = 2 * MAX_TOTAL + PAGE_BYTES;
   api.get('/me/study', auth, (req, res) => {
-    rateLimit('studysync:' + req.userId, 120, 60000);
+    rateLimit('studysync:' + req.userId, 600, 60000);
+    const budget = 'studysyncbytes:' + req.userId;
+    rateLimit(budget, SYNC_BYTES, 60000, 0); // used up already? (refused before reading anything)
     const since = Math.max(0, Math.floor(+req.query.since) || 0);
     const items = []; let bytes = 0; let more = false;
     for (const r of db.prepare('SELECT id, kind, data, updated_at, deleted FROM study_items WHERE user_id = ? AND updated_at > ? ORDER BY updated_at').iterate(req.userId, since)) {
@@ -40,6 +46,7 @@ module.exports = function setupStudy(ctx) {
       items.push({ id: r.id, kind: r.kind, data: r.deleted ? null : r.data, updatedAt: r.updated_at, deleted: !!r.deleted });
       bytes += r.deleted ? 0 : r.data.length;
     }
+    rateLimit(budget, Infinity, 60000, bytes); // counted, never refused: this page has been read already
     // Apps from before paging read one answer as everything. Rather than let one of them act on half the list (and
     // overwrite the rest), ask for a reload: the new version is already waiting in the browser.
     if (more && req.query.paged !== '1') fail(409, 'Reload Hearth to finish syncing your study decks (a newer version of the app is ready).', 'study_paged');

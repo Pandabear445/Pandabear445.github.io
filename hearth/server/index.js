@@ -57,12 +57,13 @@ const wrap = (fn) => (req, res, next) => {
 // Small in-memory rate limiter: at most `max` hits per key per window. Sensitive routes check several keys at
 // once (the network it comes from, the account it targets, the session using it, and everyone together), so
 // switching IP addresses doesn't get around the account's limit and one account can't use up another's.
+// `cost` lets a limit count something other than requests (bytes sent, say); a cost of 0 only checks it.
 const buckets = new Map();
-function rateLimit(key, max, windowMs) {
+function rateLimit(key, max, windowMs, cost = 1) {
   const t = now();
   let b = buckets.get(key);
   if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
-  b.count += 1;
+  b.count += cost;
   if (b.count > max) {
     const wait = Math.ceil((b.reset - t) / 1000);
     fail(429, `Too many attempts. Try again in ${wait < 90 ? `${wait} seconds` : `${Math.ceil(wait / 60)} minutes`}.`, 'rate_limited', wait);
@@ -251,18 +252,17 @@ const emitServer = (serverId) => {
 function reactionsFor(ids) {
   const map = {};
   if (!ids.length) return map;
-  // In slices: SQLite refuses a query with more than 32766 placeholders.
-  const rows = [];
+  // In slices: SQLite refuses a query with more than 32766 placeholders. All of a message's reactions are in one
+  // slice, so sorting each slice keeps them in the order they were added. Rows are taken one at a time: a page can
+  // have hundreds of thousands, and spreading that many into one call overflows the stack.
   for (let i = 0; i < ids.length; i += 500) {
     const part = ids.slice(i, i + 500);
-    rows.push(...db.prepare(`SELECT message_id, emoji, user_id, created_at FROM reactions WHERE message_id IN (${part.map(() => '?').join(',')})`).all(...part));
-  }
-  rows.sort((a, b) => a.created_at - b.created_at);
-  for (const r of rows) {
-    const list = (map[r.message_id] ||= []);
-    let entry = list.find((e) => e.emoji === r.emoji);
-    if (!entry) { entry = { emoji: r.emoji, userIds: [] }; list.push(entry); }
-    entry.userIds.push(r.user_id);
+    for (const r of db.prepare(`SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${part.map(() => '?').join(',')}) ORDER BY created_at`).iterate(...part)) {
+      const list = (map[r.message_id] ||= []);
+      let entry = list.find((e) => e.emoji === r.emoji);
+      if (!entry) { entry = { emoji: r.emoji, userIds: [] }; list.push(entry); }
+      entry.userIds.push(r.user_id);
+    }
   }
   return map;
 }
@@ -1427,16 +1427,11 @@ api.delete('/servers/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Joining and leaving update everyone in the server (and their keys), so they're limited: a script that joins and
-// leaves a big community in a loop would otherwise keep the whole instance busy.
-function limitMembership(req, what) {
-  rateLimit(`${what}:${req.userId}`, 20, 3600000);
-  limitNet(req, what, 60, 3600000);
-}
-
+// Leaving is never rate limited. Every leave needs a membership, which for a server takes a join (limited below), and
+// a group never has more than GROUP_MAX people to tell. A limit here would also trap people: anyone in a group can
+// add you back, so someone could re-add you faster than you were allowed to leave.
 api.post('/servers/:id/leave', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
-  limitMembership(req, 'leave');
   if (s.kind === 'group' && s.owner_id === req.userId) {
     const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(s.id, req.userId);
     if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, s.id);
@@ -1534,8 +1529,11 @@ api.get('/invites/:code', auth, (req, res) => {
   res.json({ serverId: s.id, name: s.name, icon: s.icon, memberCount: count, alreadyMember: isMember(s.id, req.userId) });
 });
 
+// Joining updates everyone in the server (and their keys), so it's limited: a script that joins and leaves a big
+// community in a loop would otherwise keep the whole instance busy.
 api.post('/invites/:code/join', auth, (req, res) => {
-  limitMembership(req, 'join');
+  rateLimit('join:' + req.userId, 20, 3600000);
+  limitNet(req, 'join', 60, 3600000);
   const inv = validInvite(req.params.code);
   const sid = inv.server_id;
   if (db.prepare('SELECT 1 FROM bans WHERE server_id = ? AND user_id = ?').get(sid, req.userId)) fail(403, 'You are banned from this server.');

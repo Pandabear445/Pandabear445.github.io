@@ -535,7 +535,7 @@ function startApp() {
     if (!S.view.serverId) renderSidebar();
   });
   socket.on('rail:update', ({ rail }) => folders.applyRemote(rail));
-  socket.on('study:changed', () => { if (S.me.studyEnabled) study.onRemoteChange(); });
+  socket.on('study:changed', (p) => { if (S.me.studyEnabled) study.onRemoteChange(p); });
   socket.on('study:enabled', ({ enabled }) => { S.me.studyEnabled = enabled; if (!S.view.serverId) renderSidebar(); });
   socket.on('updates:new', (p) => { updates.onNew(p); if (S.view.type === 'updates') renderMain(); });
   socket.on('server:update', (server) => {
@@ -2832,13 +2832,10 @@ async function openThread(root, focusId) {
   document.body.classList.add('panel-open');
   renderPanel(); renderHeader();
   try {
-    // Threads come a page at a time, newest replies first. Opening one at a linked reply loads back until it's there.
-    const res = await api('GET', `/messages/${root.id}/thread?limit=100`);
-    const t = { root: res.root, list: res.messages, loaded: true, hasMore: !!res.hasMore, total: Math.max(res.messages.length, res.root.threadCount || 0) };
-    for (let i = 0; focusId && t.hasMore && t.list.length && i < 20 && !t.list.some((x) => x.id === focusId); i++) {
-      const older = await api('GET', `/messages/${root.id}/thread?limit=100&before=${encodeURIComponent(t.list[0].id)}`);
-      t.list = [...older.messages, ...t.list]; t.hasMore = !!older.hasMore;
-    }
+    // Threads come a page at a time, newest replies first. Opening one at a linked reply asks for the page around it
+    // instead (there may be newer replies after that page: see loadNewerReplies).
+    const res = await api('GET', `/messages/${root.id}/thread?${focusId ? `around=${encodeURIComponent(focusId)}` : 'limit=100'}`);
+    const t = { root: res.root, list: res.messages, loaded: true, hasMore: !!res.hasMore, hasNewer: !!res.hasNewer, total: Math.max(res.messages.length, res.root.threadCount || 0) };
     await Promise.all([t.root, ...t.list].map(decryptMessage));
     S.threads[root.id] = t;
     if (S.thread && S.thread.rootId === root.id) renderPanel();
@@ -2854,7 +2851,15 @@ function closeThread() {
 async function onThreadMessage(m) {
   await decryptMessage(m);
   const t = S.threads[m.threadId];
-  if (t && !t.list.find((x) => x.id === m.id)) {
+  if (t && t.hasNewer && !t.list.find((x) => x.id === m.id)) {
+    // Showing an older part of the thread: a new reply doesn't belong right after it. Your own reply takes you to
+    // the newest replies (where it is); anyone else's just counts.
+    t.total = (t.total || 0) + 1;
+    if (S.thread && S.thread.rootId === m.threadId) {
+      if (m.authorId === S.me.id && !t.jumping) loadNewestReplies();
+      else { const div = $('.thread-list .thread-divider span'); if (div) div.textContent = threadCountLabel(t); }
+    }
+  } else if (t && !t.list.find((x) => x.id === m.id)) {
     t.list.push(m);
     t.total = (t.total || 0) + 1;
     if (S.thread && S.thread.rootId === m.threadId) {
@@ -3046,6 +3051,7 @@ function threadPanel(el) {
   if (t.hasMore) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadOlderReplies(e.currentTarget) }, 'Show earlier replies'));
   let prev = null;
   t.list.forEach((m) => { list.append(messageEl(m, prev, 'thread')); prev = m; });
+  if (t.hasNewer) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadNewerReplies(e.currentTarget) }, 'Show newer replies'));
   const comp = createComposer({ id: 'thread', key: () => 'c:' + S.thread.channelId, threadId: () => S.thread.rootId, placeholder: 'Reply in thread\u2026' });
   composers.thread = comp;
   el.append(list, comp.el);
@@ -3058,9 +3064,9 @@ function threadPanel(el) {
     if (!keep) comp.focus();
   });
 }
-// "12 replies": with only the newest page loaded, the count comes from the server.
+// "12 replies": with only part of the thread loaded, the count comes from the server.
 function threadCountLabel(t) {
-  const n = t.hasMore ? Math.max(t.list.length, t.total || 0) : t.list.length;
+  const n = t.hasMore || t.hasNewer ? Math.max(t.list.length, t.total || 0) : t.list.length;
   return n ? `${n} ${n === 1 ? 'reply' : 'replies'}` : 'No replies yet';
 }
 async function loadOlderReplies(btn) {
@@ -3076,6 +3082,35 @@ async function loadOlderReplies(btn) {
     t.hasMore = !!res.hasMore;
     if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = [...have][0]; renderPanel(); }
   } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+}
+// After opening a thread at an older reply: the next page of newer ones.
+async function loadNewerReplies(btn) {
+  const t = S.thread && S.threads[S.thread.rootId];
+  if (!t || !t.hasNewer || !t.list.length) return;
+  btn.disabled = true;
+  try {
+    const rootId = S.thread.rootId;
+    const last = t.list[t.list.length - 1].id;
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100&after=${encodeURIComponent(last)}`);
+    await Promise.all(res.messages.map(decryptMessage));
+    const have = new Set(t.list.map((m) => m.id));
+    t.list = [...t.list, ...res.messages.filter((m) => !have.has(m.id))];
+    t.hasNewer = !!res.hasNewer;
+    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = last; renderPanel(); }
+  } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+}
+// Straight to the newest replies (after you reply while an older part of the thread is showing).
+async function loadNewestReplies() {
+  const rootId = S.thread && S.thread.rootId;
+  const t = rootId && S.threads[rootId];
+  if (!t) return;
+  t.jumping = true; // your reply arrives twice (the answer and the socket): one reload is enough
+  try {
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100`);
+    await Promise.all(res.messages.map(decryptMessage));
+    Object.assign(t, { list: res.messages, hasMore: !!res.hasMore, hasNewer: false, total: Math.max(res.messages.length, res.root.threadCount || 0) });
+    if (S.thread && S.thread.rootId === rootId) renderPanel();
+  } catch (e) { toast(e.message, 'error'); } finally { t.jumping = false; }
 }
 
 // ======================================================================= composer
