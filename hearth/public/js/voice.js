@@ -9,7 +9,7 @@
 const LANE = { mic: 0, cam: 1, screen: 2, screenAudio: 3 };
 
 export class Voice {
-  constructor({ socket, getIceServers, onChange, onSpeaking, signSdp, verifySdp, onSecurityWarning, isPeerMuted }) {
+  constructor({ socket, getIceServers, ensureIce, onChange, onSpeaking, signSdp, verifySdp, onSecurityWarning, isPeerMuted }) {
     this.socket = socket;
     this.isPeerMuted = isPeerMuted;
     // Offers/answers are signed with the sender's signing key and checked before use. The DTLS
@@ -19,6 +19,7 @@ export class Voice {
     this.verifySdp = verifySdp;
     this.onSecurityWarning = onSecurityWarning || (() => {});
     this.getIceServers = getIceServers;
+    this.ensureIce = ensureIce; // fetches new relay logins first when the ones we have are about to run out
     this.onChange = onChange || (() => {});
     this.onSpeaking = onSpeaking || (() => {});
     this.channelId = null;
@@ -37,9 +38,20 @@ export class Voice {
     this.camStream = null;
     this.screenStream = null;
 
-    socket.on('voice:signal', (p) => this.handleSignal(p).catch((e) => console.warn('signal error', e)));
+    // Signals from one person are handled one at a time, in the order they were sent: a network candidate that
+    // arrives while their offer is still being checked waits for it instead of being lost.
+    this.signalChains = new Map(); // socketId -> promise of the last signal handled
+    this.early = new Map(); // socketId -> candidates that came before the connection they belong to
+    socket.on('voice:signal', (p) => this.queueSignal(p));
     socket.on('voice:peer-left', ({ socketId }) => this.closePeer(socketId));
     socket.on('voice:kicked', () => this.cleanup());
+    // Someone changed what this person may do in the channel: without Speak, the mic goes off and stays off.
+    socket.on('voice:perms', ({ channelId, canSpeak } = {}) => {
+      if (!this.channelId || channelId !== this.channelId) return;
+      this.speakLocked = canSpeak === false || this.noMic;
+      if (this.speakLocked && !this.muted) { this.muted = true; this.applyLocalTrackState(); this.sendState(); }
+      this.onChange();
+    });
     socket.on('disconnect', () => { if (this.channelId) this.cleanup(); });
   }
 
@@ -84,6 +96,7 @@ export class Voice {
         this.rawStream = ctx.createMediaStreamDestination().stream;
       }
       this.localStream = new MediaStream(this.rawStream.getAudioTracks().map((t) => t.clone()));
+      const iceReady = this.ensureIce ? Promise.resolve(this.ensureIce()).catch(() => {}) : null;
       this.gateOpen = true;
       this.applyLocalTrackState();
       this.channelId = channelId;
@@ -93,6 +106,7 @@ export class Voice {
       this.speakLocked = res.canSpeak === false || this.noMic;
       if (this.speakLocked) { this.muted = true; this.applyLocalTrackState(); this.emit('voice:update', { muted: true, deafened: this.deafened }); }
       this.watch('me', this.rawStream);
+      await iceReady;
       for (const p of res.peers || []) await this.createPeer(p.socketId, p.userId, true);
       if (video) await this.setCamera(true).catch(() => {});
       this.onChange();
@@ -111,6 +125,7 @@ export class Voice {
   cleanup() {
     this.speakLocked = false;
     for (const id of [...this.peers.keys()]) this.closePeer(id);
+    this.early.clear();
     if (this.localStream) this.localStream.getTracks().forEach((t) => t.stop());
     if (this.rawStream) this.rawStream.getTracks().forEach((t) => t.stop());
     this.localStream = null;
@@ -126,6 +141,10 @@ export class Voice {
 
   // getIceServers() gives a list (automatic), or { iceServers, iceTransportPolicy } when the call has a region.
   rtcConfig() { const r = this.getIceServers(); return Array.isArray(r) ? { iceServers: r } : r; }
+  // New relay logins (the old ones run out): connections in progress use them from their next network change on.
+  updateIceServers() {
+    for (const peer of this.peers.values()) { try { peer.pc.setConfiguration(this.rtcConfig()); } catch { /* keeps the old ones */ } }
+  }
   // The call's region changed: reconnect every connection through the new relays (like Discord moving a call to
   // another voice server: a short blip, nobody has to rejoin). Everyone gets the change at about the same time;
   // whoever started each connection rebuilds it, a moment later so both sides have the new region by then.
@@ -147,7 +166,8 @@ export class Voice {
 
   async createPeer(socketId, userId, initiator) {
     const pc = new RTCPeerConnection(this.rtcConfig());
-    const peer = { pc, userId, audio: null, screenAudio: null, cam: null, screen: null, pending: [], initiator };
+    // hold: our own network candidates wait until our offer (or answer) has gone out, so they never arrive first.
+    const peer = { pc, userId, audio: null, screenAudio: null, cam: null, screen: null, pending: [], initiator, hold: true, outbox: [] };
     this.peers.set(socketId, peer);
     if (initiator) {
       // The caller creates the four lanes; the other side gets them from the offer (see setupLanes).
@@ -158,7 +178,11 @@ export class Voice {
       await this.fillLanes(peer);
     }
 
-    pc.onicecandidate = (e) => { if (e.candidate) this.signal(socketId, { candidate: e.candidate.toJSON() }); };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      const candidate = e.candidate.toJSON();
+      if (peer.hold) peer.outbox.push(candidate); else this.signal(socketId, { candidate });
+    };
     pc.ontrack = (e) => {
       const lane = pc.getTransceivers().indexOf(e.transceiver);
       if (lane === LANE.cam || lane === LANE.screen) {
@@ -216,11 +240,7 @@ export class Voice {
       this.onChange();
     };
 
-    if (initiator) {
-      const offer = await pc.createOffer({ offerToReceiveAudio: true });
-      await pc.setLocalDescription(offer);
-      await this.sendSdp(socketId, userId, pc.localDescription);
-    }
+    if (initiator) await this.sendLocal(socketId, peer, await pc.createOffer({ offerToReceiveAudio: true }));
     return peer;
   }
 
@@ -232,9 +252,7 @@ export class Voice {
     clearTimeout(peer.restartTimer);
     peer.restartTimer = setTimeout(() => this.restartDone(socketId, peer), 8000); // no answer: let the next try go
     try {
-      const offer = await peer.pc.createOffer({ iceRestart: true });
-      await peer.pc.setLocalDescription(offer);
-      await this.sendSdp(socketId, peer.userId, peer.pc.localDescription);
+      await this.sendLocal(socketId, peer, await peer.pc.createOffer({ iceRestart: true }));
     } catch { this.restartDone(socketId, peer); /* try again on the next round */ }
   }
   restartDone(socketId, peer) {
@@ -256,6 +274,32 @@ export class Voice {
     const sdp = { type: desc.type, sdp: desc.sdp };
     this.signal(to, { sdp, sig: await this.signSdp(toUserId, sdp) });
   }
+  // Sets our offer or answer and sends it (signed). The network candidates found meanwhile wait, and follow it once
+  // it's out, so the other side never gets candidates for a description it hasn't seen. (If a newer offer started
+  // meanwhile, they wait for that one instead.)
+  async sendLocal(socketId, peer, description) {
+    const gen = (peer.gen || 0) + 1;
+    peer.gen = gen;
+    peer.hold = true;
+    await peer.pc.setLocalDescription(description);
+    await this.sendSdp(socketId, peer.userId, peer.pc.localDescription);
+    if (peer.gen !== gen || this.peers.get(socketId) !== peer) return;
+    peer.hold = false;
+    for (const candidate of peer.outbox.splice(0)) this.signal(socketId, { candidate });
+  }
+
+  queueSignal(p) {
+    const from = p && p.from;
+    // (One that takes too long, say a key that won't load, doesn't hold up the rest for more than 10 seconds.)
+    const step = () => new Promise((resolve, reject) => {
+      const t = setTimeout(resolve, 10000);
+      this.handleSignal(p).then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+    });
+    const run = (this.signalChains.get(from) || Promise.resolve()).then(step).catch((e) => console.warn('signal error', e));
+    this.signalChains.set(from, run);
+    run.then(() => { if (this.signalChains.get(from) === run) this.signalChains.delete(from); });
+    return run;
+  }
 
   async handleSignal({ from, userId, data }) {
     if (!this.channelId || !data) return;
@@ -270,13 +314,15 @@ export class Voice {
         return;
       }
       if (data.sdp.type === 'offer') {
-        if (!peer) peer = await this.createPeer(from, userId, false);
+        if (!peer) {
+          peer = await this.createPeer(from, userId, false);
+          peer.pending.push(...(this.early.get(from) || []));
+          this.early.delete(from);
+        }
         await peer.pc.setRemoteDescription(data.sdp);
         await this.setupLanes(peer);
         await this.flush(peer);
-        const answer = await peer.pc.createAnswer();
-        await peer.pc.setLocalDescription(answer);
-        await this.sendSdp(from, userId, peer.pc.localDescription);
+        await this.sendLocal(from, peer, await peer.pc.createAnswer());
       } else if (data.sdp.type === 'answer' && peer) {
         if (peer.pc.signalingState === 'have-local-offer') await peer.pc.setRemoteDescription(data.sdp);
         await this.flush(peer);
@@ -285,6 +331,11 @@ export class Voice {
     } else if (data.candidate && peer) {
       if (!peer.pc.remoteDescription) peer.pending.push(data.candidate);
       else await peer.pc.addIceCandidate(data.candidate).catch(() => {});
+    } else if (data.candidate) {
+      // Their connection doesn't exist here yet (its offer is on the way): keep the candidate for it.
+      const list = this.early.get(from) || [];
+      if (list.length < 50) list.push(data.candidate);
+      this.early.set(from, list);
     }
   }
 
@@ -294,6 +345,7 @@ export class Voice {
   }
 
   closePeer(socketId) {
+    this.early.delete(socketId);
     const peer = this.peers.get(socketId);
     if (!peer) return;
     clearTimeout(peer.watchdog);

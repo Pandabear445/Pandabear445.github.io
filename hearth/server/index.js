@@ -212,13 +212,36 @@ function serializeServer(s, uid) {
   }
   return out;
 }
-// Everyone gets their own view (private channels and permissions differ per person).
+// Everyone gets their own view (private channels and permissions differ per person). Every change to roles,
+// role permissions, channel overrides or ownership ends here, so this is also where people already in a voice
+// channel are checked again (recheckVoice).
 const emitServer = (serverId) => {
   const row = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
   if (!row) return;
+  recheckVoice(row);
   db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
     .forEach((m) => io.to(`user:${m.user_id}`).emit('server:update', serializeServer(row, m.user_id)));
 };
+// Permissions are checked when someone joins a call, and again here after anything that can change them: whoever
+// can no longer see the channel or connect to it (or is no longer a member) leaves the call, and anyone whose
+// permission to talk changed is told, so their app turns the mic off (or allows it again).
+function recheckVoice(srv) {
+  if (!voiceChannels.size) return;
+  for (const c of db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'voice'").all(srv.id)) {
+    const m = voiceChannels.get(c.id);
+    if (!m) continue;
+    for (const [uid, st] of [...m]) {
+      const p = isMember(srv.id, uid) ? perms.channel(srv, c, uid) : 0;
+      if (!(p & PM.CONNECT)) { leaveVoice(uid, true); continue; }
+      const speak = !!(p & PM.SPEAK);
+      if (speak === st.speak) continue;
+      st.speak = speak;
+      if (!speak) st.muted = true;
+      io.to(st.socketId).emit('voice:perms', { channelId: c.id, canSpeak: speak });
+      emitVoiceState(c.id);
+    }
+  }
+}
 
 function reactionsFor(ids) {
   const map = {};
@@ -2064,9 +2087,7 @@ api.put('/channels/:id/overrides', auth, (req, res) => {
       if (allow || deny) db.prepare('INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, ?, ?)').run(c.id, type, id, allow, deny);
     }
   })();
-  // Anyone who just lost access leaves the voice channel.
-  for (const [uid] of voiceChannels.get(c.id) || []) if (!(perms.channel(s, c, uid) & PM.CONNECT)) leaveVoice(uid, true);
-  emitServer(s.id);
+  emitServer(s.id); // anyone who just lost access leaves the voice channel (recheckVoice)
   res.json({ ok: true });
 });
 
@@ -2720,26 +2741,35 @@ api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
 // ---------------------------------------------------------------- TURN relay for calls
 // Some networks (mobile data, CGNAT home routers, school/office Wi-Fi) block direct connections, so calls
 // need a relay. With coturn's shared-secret mode, every signed-in user gets short-lived relay passwords
-// (valid 12 hours), so the relay can't be used by outsiders. Set up with scripts/setup-turn.sh.
+// (valid 12 to 18 hours), so only people with an account here can use the relay (anyone, while sign-ups are
+// open). Set up with scripts/setup-turn.sh, which also caps each relayed connection's bandwidth.
 const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || '').split(',').map((x) => x.trim()).filter(Boolean);
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
 // Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
 // entry with a region name, so the app can measure which answer fastest and use those.
-const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..') });
+const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..'), stepUp, auditLog });
+const TURN_STEP = 6 * 3600; // seconds
 function iceServersFor(uid) {
   const list = [iceServers[0]];
   const urls = turnUrls();
   const relays = [...(urls.length ? [{ id: 'main', region: 'Main server', urls }] : []), ...REG.liveRelays().map((r) => ({ id: r.id, region: r.name, urls: r.urls }))];
   if (relays.length && turnSecret()) {
-    const username = `${Math.floor(Date.now() / 1000) + 12 * 3600}:${uid}`;
+    // Relay logins run out 12 to 18 hours from now, at a 6-hour boundary, so a person has at most three logins
+    // alive at once. (The relay's per-login limits then work per person, not per request.) expiresAt tells the
+    // app when to fetch new ones (GET /api/ice): an app left open for days keeps working calls.
+    const exp = (Math.floor(Date.now() / 1000 / TURN_STEP) + 3) * TURN_STEP;
+    const username = `${exp}:${uid}`;
     const credential = crypto.createHmac('sha1', turnSecret()).update(username).digest('base64');
-    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region, regionId: r.id });
+    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region, regionId: r.id, expiresAt: exp * 1000 });
   } else if (urls.length && process.env.TURN_USERNAME) {
     list.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL || '' });
   }
   return list;
 }
-api.get('/ice', auth, (req, res) => res.json(iceServersFor(req.userId)));
+api.get('/ice', auth, (req, res) => {
+  rateLimit('ice:' + req.userId, 60, 3600000);
+  res.json(iceServersFor(req.userId));
+});
 
 // A call's region, like Discord's: pick which relay everyone in a voice channel or DM call goes through, and
 // everyone in the call switches together. "auto" (null) = direct when possible, otherwise the nearest relays.
@@ -2779,13 +2809,19 @@ api.get('/admin/turn', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
   res.json({ urls: turnUrls(), secretSet: !!turnSecret(), source: getSetting('turnUrls') ? 'app' : process.env.TURN_URL ? 'env' : null });
 });
-api.put('/admin/turn', auth, (req, res) => {
+// The relay secret signs every relay login (on every region too), and the relay addresses decide where everyone's
+// calls are relayed: changing either needs the password again and is always logged.
+api.put('/admin/turn', auth, wrap(async (req, res) => {
   requireInstanceAdmin(req.userId);
+  await stepUp(req, req.body);
   const b = req.body || {};
+  const before = turnUrls().join(',');
   if (b.urls !== undefined) setSetting('turnUrls', String(b.urls || '').split(/[\s,]+/).filter((u) => /^turns?:/.test(u)).slice(0, 12).join(',') || null);
   if (b.secret !== undefined) setSetting('turnSecret', String(b.secret || '').trim().slice(0, 200) || null);
+  const changed = [turnUrls().join(',') !== before ? `relays: ${turnUrls().join(', ') || 'none'}` : '', b.secret !== undefined ? 'secret changed' : ''].filter(Boolean).join('; ');
+  auditLog(req, 'turn_settings', null, changed || 'saved, no change');
   res.json({ ok: true, urls: turnUrls(), secretSet: !!turnSecret() });
-});
+}));
 
 // ---------------------------------------------------------------- captcha (self-hosted proof of work)
 // The browser must find a number that, hashed together with a random challenge, starts with N zero bits.
@@ -3875,9 +3911,15 @@ function callees(room, callerId) {
 // One shared player per call: what's playing, where it was at `updatedAt` and whether it's playing.
 // Everyone in the call keeps their player in step with it; late joiners jump straight in.
 const watchRooms = new Map(); // room -> { item, queue, playing, position, rate, updatedAt, by, hostOnly }
+// The whole shared state (queue included) goes to everyone in the call on every change, so it stays small:
+// links are capped, and so is the state as a whole.
+const WATCH_URL_MAX = 2048;
+const WATCH_STATE_MAX = 64 * 1024;
 function parseWatchUrl(raw) {
   let u;
-  try { u = new URL(String(raw || '').trim()); } catch { fail(400, 'Paste a link to a video.'); }
+  const text = String(raw || '').trim();
+  if (text.length > WATCH_URL_MAX) fail(400, 'That link is too long.');
+  try { u = new URL(text); } catch { fail(400, 'Paste a link to a video.'); }
   const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, '');
   const secs = (t) => { if (!t) return 0; if (/^\d+$/.test(t)) return +t; const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(t); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0; };
   if (!/^https?:$/.test(u.protocol)) fail(400, 'Paste a link to a video.');
@@ -3896,7 +3938,10 @@ function parseWatchUrl(raw) {
     if (!/^[a-z0-9_]{3,25}$/i.test(ch) || ['videos', 'directory', 'settings'].includes(ch)) fail(400, 'Paste the link of a live Twitch channel (twitch.tv/name).');
     return { kind: 'twitch', src: ch.toLowerCase(), start: 0, link: `https://twitch.tv/${ch}`, live: true };
   }
-  if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(u.pathname) && /^https?:$/.test(u.protocol)) return { kind: 'video', src: u.href, start: 0, link: u.href };
+  if (/\.(mp4|webm|ogv|ogg|mov|m4v)$/i.test(u.pathname) && /^https?:$/.test(u.protocol)) {
+    if (u.href.length > WATCH_URL_MAX) fail(400, 'That link is too long.'); // URL() can lengthen it (escaping)
+    return { kind: 'video', src: u.href, start: 0, link: u.href };
+  }
   fail(400, 'That site isn\u2019t supported yet. YouTube, Vimeo, Twitch (live) and direct video files (.mp4, .webm) work. For anything else, share your screen.');
 }
 async function watchTitle(item) {
@@ -3910,8 +3955,20 @@ async function watchTitle(item) {
     return String(j.title || '').slice(0, 150);
   } catch { return ''; }
 }
-const watchOut = (room) => { const w = watchRooms.get(room); return w ? { ...w, serverNow: Date.now() } : null; };
-const emitWatch = (room) => io.to(`voice:${room}`).emit('watch:state', { room, state: watchOut(room) });
+const watchOut = (room) => { const w = watchRooms.get(room); if (!w) return null; const { votes, ...out } = w; return { ...out, serverNow: Date.now() }; };
+// Changes are sent at most 4 times a second per call: quick bursts (dragging through a video, a stream of
+// controls) go out as one update carrying the latest state, so a flood of tiny events can't turn into a
+// flood of full-state broadcasts.
+const watchEmits = new Map(); // room -> { last, timer }
+function emitWatch(room) {
+  const e = watchEmits.get(room) || { last: 0, timer: null };
+  watchEmits.set(room, e);
+  if (e.timer) return;
+  const send = () => { e.timer = null; e.last = Date.now(); io.to(`voice:${room}`).emit('watch:state', { room, state: watchOut(room) }); };
+  const wait = e.last + 250 - Date.now();
+  if (wait <= 0) send(); else e.timer = setTimeout(send, wait);
+}
+const dropWatch = (room) => { const e = watchEmits.get(room); if (e) clearTimeout(e.timer); watchEmits.delete(room); watchRooms.delete(room); };
 // Where the video is right now, according to the shared state.
 const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 1000) * w.rate : 0);
 
@@ -3922,7 +3979,7 @@ function leaveVoice(userId, notifyUser = false) {
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
   const state = m && m.get(userId);
-  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); watchRooms.delete(channelId); } }
+  if (m) { m.delete(userId); if (!m.size) { voiceChannels.delete(channelId); dropWatch(channelId); } }
   userVoice.delete(userId);
   if (state) {
     const sock = io.sockets.sockets.get(state.socketId);
@@ -3935,8 +3992,28 @@ function leaveVoice(userId, notifyUser = false) {
   if (!voiceChannels.has(channelId)) callees(channelId, userId).concat(userId).forEach((u) => io.to(`user:${u}`).emit('call:end', { room: channelId }));
 }
 
+// Realtime flood limits shared by all of a person's connections (each connection also has its own; see below).
+const MAX_SOCKETS_PER_USER = 30;
+const USER_BURST = 120; const USER_RATE = 30; // events: at most 120 at once, then 30 a second
+const userBudget = new Map(); // userId -> { tokens, at }
+function spendUserBudget(uid) {
+  const t = Date.now();
+  const b = userBudget.get(uid) || { tokens: USER_BURST, at: t };
+  b.tokens = Math.min(USER_BURST, b.tokens + ((t - b.at) / 1000) * USER_RATE);
+  b.at = t;
+  userBudget.set(uid, b);
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+// "Typing…" fans out to a whole server (and, in private channels, works out who may see it for every member),
+// so one person's typing events are passed on at most once a second, however many windows send them.
+const typingAt = new Map(); // userId -> when their last typing event was passed on
+
 function setupSockets(server) {
-  io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 1e6, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
+  // Every realtime event is small (the largest, a call offer, is a few kilobytes), so a message can be at most
+  // 256 KB: bigger ones only cost the server time to read.
+  io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 256 * 1024, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
   // Every minute: an open connection whose session has ended (signed out, expired, account suspended or
   // deleted) is closed; one that's still fine counts as use, so an app left open never idles out.
   setInterval(() => {
@@ -3961,6 +4038,10 @@ function setupSockets(server) {
     if (!u || u.deleted_at || stillSuspended(u)) return next(new Error('unauthorized'));
     if (ipBanned(socketIp(socket)) && !isStaff(s.user_id)) { secEvent('blocked_ip', socketIp(socket), 'connection'); return next(new Error('unauthorized')); }
     if (maintenance() && !isStaff(s.user_id)) return next(new Error('maintenance'));
+    // Every window is one connection. Far more than anyone has open only multiplies what one account can send,
+    // and connecting over and over (each one is checked and recorded) only costs the server time.
+    if ((onlineSockets.get(s.user_id)?.size || 0) >= MAX_SOCKETS_PER_USER) return next(new Error('too_many_connections'));
+    try { rateLimit('sockconn:' + s.user_id, 60, 60000); } catch { return next(new Error('rate_limited')); }
     socket.userId = s.user_id;
     socket.data.token = token;
     socket.data.sid = s.id;
@@ -3973,14 +4054,31 @@ function setupSockets(server) {
 
   io.on('connection', (socket) => {
     const uid = socket.userId;
-    // Flood protection: at most 40 events per 4 seconds per connection; persistent flooding disconnects.
-    let bucket = 40; let strikes = 0;
-    const refill = setInterval(() => { bucket = Math.min(40, bucket + 10); }, 1000);
+    // Flood protection. A connection may send 40 events per 4 seconds, and all of a person's connections together
+    // 120, so opening more windows doesn't buy more. Call signaling has its own, larger allowance: joining a call
+    // sends an offer and a dozen network candidates to every person in it at once. A refused event is answered
+    // with "Slow down." so the app isn't left waiting. Refusals are forgiven over time (5 a second), so a busy
+    // call never adds up to a disconnect; only flooding that keeps going closes the connection, and the app is
+    // told why first ('flood'), so it reconnects instead of taking it for a sign-out.
+    let bucket = 40; let signalBucket = 200; let strikes = 0;
+    const refill = setInterval(() => {
+      bucket = Math.min(40, bucket + 10);
+      signalBucket = Math.min(200, signalBucket + 50);
+      strikes = Math.max(0, strikes - 5);
+    }, 1000);
     socket.on('disconnect', () => clearInterval(refill));
+    const refuse = (packet) => { const ack = packet[packet.length - 1]; if (typeof ack === 'function') ack({ error: 'Slow down.' }); };
     socket.use((packet, next) => {
-      if (bucket > 0) { bucket--; return next(); }
-      if (++strikes > 50) socket.disconnect(true);
-      return next(new Error('Slow down.'));
+      // (The bigger signaling allowance is only for the one connection this person is in a call with.)
+      const signal = packet[0] === 'voice:signal' && voiceChannels.get(userVoice.get(uid))?.get(uid)?.socketId === socket.id;
+      if (signal ? signalBucket > 0 : bucket > 0) {
+        if (signal) { signalBucket--; return next(); }
+        bucket--;
+        if (spendUserBudget(uid)) return next();
+        return refuse(packet); // this person's other windows used up the shared allowance: no strike for this one
+      }
+      refuse(packet);
+      if (++strikes > 50 && socket.connected) { socket.emit('flood', { reason: 'too_many_events' }); socket.disconnect(true); }
     });
     socket.join(`user:${uid}`);
     if (isStaff(uid)) socket.join('admins');
@@ -3996,12 +4094,20 @@ function setupSockets(server) {
       try { cb(fn(...args) || { ok: true }); } catch (e) { cb({ error: e.message || 'Error' }); }
     };
 
+    // "Is typing…" goes only where the person could actually send: not in channels where they can't post,
+    // and never to someone who blocked them (or whom they blocked).
     socket.on('typing', guard((p = {}) => {
       if (p.channelId) {
         const c = requireChannel(String(p.channelId), uid);
+        if (!(perms.channel(serverOf(c), c, uid) & PM.SEND_MESSAGES)) fail(403, 'You can\u2019t send messages here.');
+        if (Date.now() - (typingAt.get(uid) || 0) < 1000) return;
+        typingAt.set(uid, Date.now());
         toChannel(c, socket).emit('typing', { channelId: c.id, userId: uid });
       } else if (p.dmId) {
         const d = requireDm(String(p.dmId), uid);
+        if (isBlocked(d.user_a, d.user_b)) return;
+        if (Date.now() - (typingAt.get(uid) || 0) < 1000) return;
+        typingAt.set(uid, Date.now());
         const other = d.user_a === uid ? d.user_b : d.user_a;
         io.to(`user:${other}`).emit('typing', { dmId: d.id, userId: uid });
       }
@@ -4029,7 +4135,9 @@ function setupSockets(server) {
       if (!voiceChannels.has(c.id)) voiceChannels.set(c.id, new Map());
       const m = voiceChannels.get(c.id);
       const peers = [...m.entries()].map(([userId, s]) => ({ userId, socketId: s.socketId }));
-      m.set(uid, { socketId: socket.id, muted: !!p.muted, deafened: !!p.deafened, video: false, screen: false });
+      // speak: whether they may talk here (the app keeps the mic off without it; recheckVoice keeps it current).
+      const speak = !!(vp & PM.SPEAK);
+      m.set(uid, { socketId: socket.id, muted: !!p.muted || !speak, deafened: !!p.deafened, video: false, screen: false, speak });
       userVoice.set(uid, c.id);
       socket.join(`voice:${c.id}`);
       emitVoiceState(c.id);
@@ -4042,7 +4150,7 @@ function setupSockets(server) {
         ring.forEach((u) => io.to(`user:${u}`).emit('call:ring', { room: c.id, dmId: d ? d.id : null, serverId: ch ? ch.server_id : null, from: uid, video: !!p.video }));
         if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/' });
       }
-      return { ok: true, peers, canSpeak: !!(vp & PM.SPEAK) };
+      return { ok: true, peers, canSpeak: speak };
     }));
 
     socket.on('voice:signal', guard((p = {}) => {
@@ -4051,6 +4159,9 @@ function setupSockets(server) {
       if (!m || m.get(uid)?.socketId !== socket.id) fail(400, 'You are not in voice.');
       const target = [...m.values()].find((s) => s.socketId === p.to);
       if (!target) fail(404, 'Peer left.');
+      // An offer or answer is a few kilobytes and a network candidate a few hundred bytes; signaling has a bigger
+      // allowance than other events, so it can't be used to push megabytes at someone.
+      if (JSON.stringify(p.data ?? null).length > 64 * 1024) fail(413, 'That signal is too big.');
       io.to(p.to).emit('voice:signal', { from: socket.id, userId: uid, data: p.data });
     }));
 
@@ -4058,7 +4169,7 @@ function setupSockets(server) {
       const ch = userVoice.get(uid);
       const s = ch && voiceChannels.get(ch)?.get(uid);
       if (!s || s.socketId !== socket.id) return;
-      s.muted = !!p.muted;
+      s.muted = !!p.muted || !s.speak;
       s.deafened = !!p.deafened;
       if (p.video !== undefined) s.video = !!p.video;
       if (p.screen !== undefined) s.screen = !!p.screen;
@@ -4070,6 +4181,12 @@ function setupSockets(server) {
       const room = String(p.room || '');
       const d = dmOfRoom(room);
       if (d && d.user_a !== uid && d.user_b !== uid) fail(403, 'Not your call.');
+      // Only calls that ring can be declined: a DM call, or a group chat's call by one of its members.
+      if (!d) {
+        const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(room);
+        const srv = c && serverOf(c);
+        if (!srv || srv.kind !== 'group' || c.type !== 'voice' || !isMember(srv.id, uid)) fail(404, 'No such call.');
+      }
       const m = voiceChannels.get(room);
       if (m) for (const [u] of m) io.to(`user:${u}`).emit('call:declined', { room, userId: uid });
       io.to(`user:${uid}`).emit('call:end', { room });
@@ -4091,13 +4208,14 @@ function setupSockets(server) {
       if (cur && p.queue) {
         if (!mayControl(room, cur) && cur.hostOnly) fail(403, 'Only the host can add videos.');
         if (cur.queue.length >= 25) fail(400, 'The queue is full (25).');
+        if (JSON.stringify(cur).length + JSON.stringify(item).length > WATCH_STATE_MAX) fail(400, 'The queue is full.');
         cur.queue.push(item);
       } else {
         if (cur && !mayControl(room, cur)) fail(403, 'Only the host can change the video.');
         watchRooms.set(room, { item, queue: cur ? cur.queue : [], playing: true, position: item.start || 0, rate: 1, updatedAt: Date.now(), by: cur && cur.hostOnly ? cur.by : uid, hostOnly: cur ? cur.hostOnly : !!p.hostOnly, seq: ((cur && cur.seq) || 0) + 1, lastBy: uid, lastAction: 'start' });
       }
       emitWatch(room);
-      watchTitle(item).then((t) => { if (t) { item.title = t; emitWatch(room); } });
+      watchTitle(item).then((t) => { if (t && watchRooms.has(room)) { item.title = t; emitWatch(room); } });
       return { ok: true };
     }));
     socket.on('watch:control', guard((p = {}) => {
@@ -4124,7 +4242,17 @@ function setupSockets(server) {
       const room = myWatchRoom();
       const w = watchRooms.get(room);
       if (!w || (p.itemId && p.itemId !== w.item.id)) return { ok: true };
-      if (p.skip && !mayControl(room, w)) fail(403, 'Only the host can skip.');
+      if (!mayControl(room, w)) {
+        // Only the host skips. "My video ended" from anyone else counts once most of the call says so (players
+        // finish a moment apart), so one person can't skip or stop the video for everyone.
+        if (p.skip || !p.itemId) fail(403, 'Only the host can skip.');
+        const m = voiceChannels.get(room);
+        if (!w.votes || w.votes.item !== w.item.id) w.votes = { item: w.item.id, users: new Set() };
+        w.votes.users.add(uid);
+        const ended = [...w.votes.users].filter((u) => m && m.has(u)).length;
+        if (ended * 2 <= (m ? m.size : 1)) return { ok: true };
+      }
+      w.votes = null;
       if (!w.queue.length) { w.playing = false; w.position = watchPos(w); w.updatedAt = Date.now(); emitWatch(room); return { ok: true }; }
       w.item = w.queue.shift();
       Object.assign(w, { playing: true, position: w.item.start || 0, rate: 1, updatedAt: Date.now() });
@@ -4144,7 +4272,7 @@ function setupSockets(server) {
       const w = watchRooms.get(room);
       if (!w) return { ok: true };
       if (!mayControl(room, w)) fail(403, 'Only the host can stop it.');
-      watchRooms.delete(room);
+      dropWatch(room);
       io.to(`voice:${room}`).emit('watch:state', { room, state: null });
       return { ok: true };
     }));
@@ -4161,7 +4289,7 @@ function setupSockets(server) {
       if (s && s.socketId === socket.id) leaveVoice(uid);
       const set = onlineSockets.get(uid);
       if (set) { set.delete(socket.id); if (!set.size) onlineSockets.delete(uid); }
-      if (!isOnline(uid)) broadcastPresence(uid);
+      if (!isOnline(uid)) { userBudget.delete(uid); typingAt.delete(uid); broadcastPresence(uid); }
     });
   });
 }

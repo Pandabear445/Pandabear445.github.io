@@ -122,7 +122,8 @@ test('a broken, heavy feed never freezes the server', async () => {
 // ------------------------------------------------------------------ backups kept on linked regions
 test('regions with backup space get this server\'s key; their identity is checked', async () => {
   const owner = srv.owner; // the instance owner (Admin → Regions)
-  const add = await as(owner, 'POST', '/admin/regions', { name: 'US Central', origin: 'https://chat.example.test' });
+  // Adding a region needs the password again (its install command carries the relay secret).
+  const add = await as(owner, 'POST', '/admin/regions', { name: 'US Central', origin: 'https://chat.example.test', authKey: owner.authKey });
   assert.equal(add.status, 200, add.text);
   const { id } = add.json.region;
   const token = add.json.command.match(/k=([0-9a-f]+)/)[1];
