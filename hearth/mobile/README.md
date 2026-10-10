@@ -68,6 +68,6 @@ workflow's run number`.
 
 Needs Node 22, JDK 21 and the Android SDK (Android Studio Otter 2025.2.1 or newer): the app uses Capacitor 8
 and targets Android 16 (API 36), which Google Play requires for new apps and updates. The workflow's *Create
-the Android project* step shows exactly what it does: `npm install`, `npx cap add android`, copy
-`native/MainActivity.java` in, add the microphone/camera/notification permissions and the `androidx.webkit`
+the Android project* step shows exactly what it does: `npm ci` (exactly what `package-lock.json` lists; use it
+locally too), `npx cap add android`, copy `native/*.java` in (`MainActivity.java` and `BridgePolicy.java`), add the microphone/camera/notification permissions and the `androidx.webkit`
 dependency, then `./gradlew assembleRelease` (and `bundleRelease` for Google Play).
