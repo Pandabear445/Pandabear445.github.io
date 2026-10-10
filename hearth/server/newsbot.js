@@ -10,6 +10,7 @@
 // encryption, not end-to-end) and the app labels them that way. Everything people write stays end-to-end.
 const crypto = require('crypto');
 const netguard = require('./netguard');
+const jobs = require('./jobs');
 
 const BOT_ID = 'newsbot00000000000001';
 const KINDS = {
@@ -285,8 +286,9 @@ module.exports = function setupNewsbot(ctx) {
       for (const f of due) await check(f);
     } finally { running = false; }
   }
-  setInterval(() => { tick().catch(() => {}); userTick().catch(() => {}); }, 60000).unref();
-  setTimeout(() => { tick().catch(() => {}); userTick().catch(() => {}); }, 20000).unref();
+  // The feed worker's health (last run, last success) is what Admin → Health checks, not just that the bot exists.
+  jobs.every('newsbot.feeds', 60000, tick, { firstDelay: 20000 });
+  jobs.every('newsbot.trackers', 60000, () => userTick(), { firstDelay: 20000 });
 
   // ------------------------------------------------------------------ personal trackers ("Updates")
   // The same feeds, followed by one person for themselves instead of posted to a server. Found items go to their

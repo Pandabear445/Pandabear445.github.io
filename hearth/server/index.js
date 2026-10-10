@@ -1,4 +1,9 @@
 require('dotenv').config({ quiet: true });
+// Logging and safe background jobs come first, so even a failure while opening the database is logged
+// (server/log.js, server/jobs.js). An exception nobody caught is logged, then the process exits for a clean restart.
+const log = require('./log');
+const jobs = require('./jobs');
+log.installProcessHandlers({ beforeExit: () => jobs.saveAll() });
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -9,7 +14,16 @@ const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
-const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret } = require('./db');
+const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION } = require('./db');
+// User ids in the access log are keyed hashes: groupable, but not checkable against a list of ids.
+log.setUserHashKey(atRestKey);
+// Job health is saved (at most once a minute per job, right away when one starts or stops failing) for the
+// admin dashboard after a restart and for `node server/cli.js doctor`.
+jobs.setStore((r) => db.prepare(`INSERT INTO job_health (name, every_ms, last_run, last_ok, last_error, last_error_at, last_error_category, failures, runs, total_failures, duration_ms, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET every_ms = excluded.every_ms, last_run = excluded.last_run, last_ok = excluded.last_ok,
+  last_error = excluded.last_error, last_error_at = excluded.last_error_at, last_error_category = excluded.last_error_category, failures = excluded.failures,
+  runs = excluded.runs, total_failures = excluded.total_failures, duration_ms = excluded.duration_ms, updated_at = excluded.updated_at`)
+  .run(r.name, r.everyMs, r.lastRun, r.lastOk, r.lastError, r.lastErrorAt, r.lastErrorCategory, r.failures, r.runs, r.totalFailures, r.durationMs, Date.now()));
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
@@ -26,6 +40,7 @@ const REGISTRATION_CODE = process.env.REGISTRATION_CODE || '';
 const REGISTRATION_OPEN = (process.env.REGISTRATION_OPEN || 'true').toLowerCase() !== 'false';
 const GIPHY_API_KEY = process.env.GIPHY_API_KEY || '';
 const INSTANCE_NAME = process.env.INSTANCE_NAME || 'Hearth';
+const VERSION = require('../package.json').version;
 
 const iceServers = [{ urls: (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302').split(',') }];
 if (process.env.TURN_URL) {
@@ -98,7 +113,7 @@ function limitMessages(req) {
   if (req.session) rateLimit('msgs:' + req.session.id, 25, 10000);
   limitNet(req, 'msg', 120, 10000);
 }
-setInterval(() => { const t = now(); for (const [k, b] of buckets) if (b.reset < t) buckets.delete(k); }, 60000).unref();
+jobs.every('ratelimit.sweep', 60000, () => { const t = now(); for (const [k, b] of buckets) if (b.reset < t) buckets.delete(k); });
 
 // ---------------------------------------------------------------- presence + voice state
 const onlineSockets = new Map(); // userId -> Set(socketId)
@@ -455,6 +470,8 @@ try {
   throw new Error(`TRUST_PROXY=${process.env.TRUST_PROXY} isn't valid (${e.message}). Use your proxy's addresses or subnets, a number of proxies, or false.`);
 }
 app.disable('x-powered-by');
+// Request ids (X-Request-Id, echoed or made up) and the access log: route templates, never full URLs.
+app.use(log.requestLogger());
 const PRIVATE_IP = /^(::1|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|f[cd][0-9a-f]{2}:|fe80:|::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.))/i;
 const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/, '').slice(0, 64);
 // Behind a proxy (HTTPS=false) on another address (an older docker-compose.yml, nginx in its own container)
@@ -469,7 +486,7 @@ function noteIgnoredXff(remote, xff) {
   if (xffIgnoredNoted.has(ip) || xffIgnoredNoted.size >= 5) return;
   if (app.get('trust proxy fn')(String(remote), 0)) return;
   xffIgnoredNoted.add(ip);
-  console.warn(`  ${ignoredXffHint(ip, netContext())}`);
+  log.warn('http', 'proxy_header_ignored', { msg: ignoredXffHint(ip, netContext()) });
 }
 // Behind a proxy (HTTPS=false), refuse plain-HTTP requests that come straight from the internet, so nobody
 // can bypass the proxy's HTTPS and send login tokens unencrypted. ALLOW_DIRECT_HTTP=true turns this off.
@@ -770,11 +787,11 @@ function deleteMessageTree(id) {
   files.forEach((u) => removeUpload(u));
 }
 // Blobs uploaded but never attached to a message (abandoned sends) are removed after a day.
-setInterval(() => {
+jobs.every('uploads.unlinked_cleanup', 3600 * 1000, () => {
   const old = db.prepare('SELECT name FROM blobs WHERE message_id IS NULL AND created_at < ?').all(Date.now() - 24 * 3600 * 1000);
   old.forEach((b) => removeUpload('/uploads/' + b.name));
   if (old.length) db.prepare('DELETE FROM blobs WHERE message_id IS NULL AND created_at < ?').run(Date.now() - 24 * 3600 * 1000);
-}, 3600 * 1000).unref();
+});
 // Leftovers whose message is gone: from before the cleanup above existed (groups that emptied out, for example).
 // Once shortly after start, then daily.
 function sweepOrphans() {
@@ -785,10 +802,7 @@ function sweepOrphans() {
   for (const t of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${t} WHERE ${gone(t)}`).run();
   return blobs.length;
 }
-setTimeout(() => {
-  try { sweepOrphans(); } catch (e) { console.error('Orphan cleanup failed:', e.message); }
-  setInterval(() => { try { sweepOrphans(); } catch (e) { console.error('Orphan cleanup failed:', e.message); } }, 24 * 3600 * 1000).unref();
-}, +(process.env.ORPHAN_SWEEP_DELAY_MS || 2 * 60 * 1000)).unref();
+jobs.every('uploads.orphan_sweep', 24 * 3600 * 1000, sweepOrphans, { firstDelay: +(process.env.ORPHAN_SWEEP_DELAY_MS || 2 * 60 * 1000) });
 
 app.get('/uploads/:file', (req, res) => {
   const f = req.params.file;
@@ -944,11 +958,15 @@ function ipBanned(ip) {
   }
   return null;
 }
-// Security log: recent failed logins, captcha failures and blocked IPs (kept in memory, newest first).
+// Security log: recent failed logins, captcha failures and blocked IPs (kept in memory, newest first). Each event
+// also goes to the server log (address cut to its network there) and counts toward the sign-in abuse alert.
 const securityLog = [];
+let ALERTS = null; // server/alerts.js, set up once email and sockets exist
 function secEvent(type, ip, detail = '') {
   securityLog.unshift({ type, ip: cleanIp(ip), detail: String(detail).slice(0, 120), at: Date.now() });
   if (securityLog.length > 500) securityLog.length = 500;
+  log.info('security', type, { ip: cleanIp(ip), outcome: 'denied' });
+  if (ALERTS) ALERTS.countSecurity(type);
 }
 const maintenance = () => getSetting('maintenance') || '';
 const suspendedMsg = (row) => `This account is suspended${row.suspended_until ? ` until ${new Date(row.suspended_until).toUTCString().replace(/:\d\d GMT$/, ' UTC')}` : ''}${row.suspend_reason ? `: ${row.suspend_reason}` : '.'}`;
@@ -1006,11 +1024,11 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   return ids.length;
 }
 // Revoked and expired sessions are kept 30 days (so Settings → Sessions can say what happened), then deleted.
-setInterval(() => {
+jobs.every('sessions.purge', 3600000, () => {
   const t = now();
   db.prepare('DELETE FROM sessions WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ? OR COALESCE(last_used_at, created_at) < ?')
     .run(t - 30 * 86400000, t - 30 * 86400000, t - SESSION_IDLE_MS - 30 * 86400000);
-}, 3600000).unref();
+});
 function auth(req, res, next) {
   const token = tokenFrom(req);
   const s = sessionFor(token);
@@ -1070,7 +1088,7 @@ try {
   else if (fs.existsSync(VAPID_FILE)) vapid = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8'));
   else { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(VAPID_FILE, JSON.stringify(vapid), { mode: 0o600 }); }
   webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
-} catch (e) { console.warn('Push notifications are off:', e.message); vapid = null; }
+} catch (e) { log.warn('push', 'disabled', { err: e, msg: 'Push notifications are off.' }); vapid = null; }
 
 const nameOf = (uid) => { const r = getUserRow(uid); return r ? (parseProfile(r).displayName || r.username) : 'Someone'; };
 // A push endpoint is a web address the app hands us, so sending to it is an outbound request like a feed and
@@ -1641,7 +1659,7 @@ function broadcastPresence(userId) {
   const row = getUserRow(userId);
   if (!row) return;
   presenceQueue.set(userId, isOnline(row.id) && row.status !== 'invisible' ? row.status : 'offline');
-  if (!presenceTimer) presenceTimer = setTimeout(flushPresence, 1000);
+  if (!presenceTimer) presenceTimer = setTimeout(jobs.job('presence.flush', flushPresence), 1000);
   io.to(`user:${userId}`).emit('user:update', selfUser(row));
 }
 // Who sees a person in their app: everyone in a server with them, friends and friend requests, and DM partners.
@@ -1674,7 +1692,7 @@ function broadcastUser(userId, audience) {
   const rooms = userUpdateQueue.get(userId) || new Set();
   if (Array.isArray(audience)) audience.forEach((r) => rooms.add(r));
   userUpdateQueue.set(userId, rooms);
-  if (!userUpdateTimer) userUpdateTimer = setTimeout(flushUserUpdates, 1000);
+  if (!userUpdateTimer) userUpdateTimer = setTimeout(jobs.job('users.flush_updates', flushUserUpdates), 1000);
 }
 // Profile edits: plenty for a person saving changes, not enough to flood the instance from a script.
 function limitProfileWrites(req) {
@@ -3232,10 +3250,10 @@ function staffRole(uid) {
   const owner = ownerId();
   const who = (id) => (getUserRow(id) || {}).username;
   const held = envAdmins().filter((n) => c[n] === HELD_BACK);
-  if (held.length) console.warn(`\n  ADMIN_USERS lists ${held.join(', ')}, which no account has. Nobody can sign up with ${held.length > 1 ? 'these names' : 'it'}: before this update, an admin who renamed or deleted their account left the name free for anyone. If you're keeping one for someone who hasn't signed up yet, take it off ADMIN_USERS and restart (then give them a role in Admin \u2192 Team & roles once they've signed up).`);
+  if (held.length) log.warn('accounts', 'admin_users', { msg: `ADMIN_USERS lists ${held.join(', ')}, which no account has. Nobody can sign up with ${held.length > 1 ? 'these names' : 'it'}: before this update, an admin who renamed or deleted their account left the name free for anyone. If you're keeping one for someone who hasn't signed up yet, take it off ADMIN_USERS and restart (then give them a role in Admin \u2192 Team & roles once they've signed up).` });
   const first = envAdmins()[0];
-  if (getSetting('ownerAwaitsEnv')) console.warn(`\n  ${getSetting('ownerAwaitsEnv')} (the first name in ADMIN_USERS when this server got its first account) will own this server once that account is signed up.${owner ? ` Until then ${who(owner)} runs it.` : ''}`);
-  else if (first && owner && c[first] !== owner && !held.includes(first)) console.warn(`\n  ADMIN_USERS starts with ${first}, but ${who(owner)} owns this server (the owner is settled once and doesn't follow ADMIN_USERS). To change it, hand ownership over in Admin \u2192 Team & roles, or run: node server/cli.js set-owner ${liveAccount(c[first]) ? who(c[first]) : '<username>'}`);
+  if (getSetting('ownerAwaitsEnv')) log.warn('accounts', 'admin_users', { msg: `${getSetting('ownerAwaitsEnv')} (the first name in ADMIN_USERS when this server got its first account) will own this server once that account is signed up.${owner ? ` Until then ${who(owner)} runs it.` : ''}` });
+  else if (first && owner && c[first] !== owner && !held.includes(first)) log.warn('accounts', 'admin_users', { msg: `ADMIN_USERS starts with ${first}, but ${who(owner)} owns this server (the owner is settled once and doesn't follow ADMIN_USERS). To change it, hand ownership over in Admin \u2192 Team & roles, or run: node server/cli.js set-owner ${liveAccount(c[first]) ? who(c[first]) : '<username>'}` });
 }
 const staffRank = (uid) => STAFF_RANK[staffRole(uid)] || 0;
 const isStaff = (uid) => staffRank(uid) >= 1;
@@ -3668,7 +3686,7 @@ const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || 
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
 // The older static TURN_USERNAME/TURN_CREDENTIAL still work, but then every signed-in user (and every former
 // member) holds the same relay password, forever. Say so, so it gets replaced by the shared-secret mode.
-if (process.env.TURN_USERNAME && !turnSecret()) console.warn('  TURN_USERNAME/TURN_CREDENTIAL hand everyone the same relay password that never expires. Use TURN_SECRET instead (sudo bash scripts/setup-turn.sh sets it all up).');
+if (process.env.TURN_USERNAME && !turnSecret()) log.warn('turn', 'static_password', { msg: 'TURN_USERNAME/TURN_CREDENTIAL hand everyone the same relay password that never expires. Use TURN_SECRET instead (sudo bash scripts/setup-turn.sh sets it all up).' });
 // Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
 // entry with a region name, so the app can measure which answer fastest and use those.
 const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..'), stepUp, auditLog });
@@ -3757,11 +3775,11 @@ const CAPTCHA_BASE = 18;
 const CAPTCHA_MAX = 24;
 const captchaFails = new Map(); // network (netOf) -> { n, at }
 const usedCaptchas = new Map(); // salt -> expires
-setInterval(() => {
+jobs.every('captcha.sweep', 60000, () => {
   const t = Date.now();
   for (const [k, exp] of usedCaptchas) if (exp < t) usedCaptchas.delete(k);
   for (const [k, f] of captchaFails) if (t - f.at > 3600000) captchaFails.delete(k);
-}, 60000).unref();
+});
 const captchaMode = (purpose) => getSetting(purpose === 'register' ? 'captchaRegister' : 'captchaLogin') || 'on';
 // The instance-wide limits on sign-ups and sign-ins. Past one, the robot check gets harder for everyone (one more
 // bit, so twice the work, for every half a limit over, up to CAPTCHA_MAX) instead of turning everyone away: a
@@ -4332,7 +4350,7 @@ api.put('/admin/terms', auth, adminOnly, (req, res) => {
 
 // ---------------------------------------------------------------- profile pages (MySpace style)
 const pageViews = new Map(); // "viewer:owner" -> last counted, so reloading doesn't inflate the counter
-setInterval(() => { const t = now() - 3600000; for (const [k, v] of pageViews) if (v < t) pageViews.delete(k); }, 600000).unref();
+jobs.every('pages.view_sweep', 600000, () => { const t = now() - 3600000; for (const [k, v] of pageViews) if (v < t) pageViews.delete(k); });
 function canCommentOn(viewerId, row, page) {
   if (!features().comments) return false;
   if (viewerId === row.id) return true;
@@ -4548,7 +4566,7 @@ api.post('/events/:id/rsvp', auth, (req, res) => {
   res.json(eventOut(e, req.userId));
 });
 // Reminders: 15 minutes before, everyone going (or maybe) gets a nudge — in the app and as a push notification.
-setInterval(() => {
+jobs.every('events.reminders', 60000, () => {
   const soon = db.prepare('SELECT * FROM server_events WHERE reminded = 0 AND starts_at <= ? AND starts_at > ?').all(now() + 15 * 60000, now() - 5 * 60000);
   for (const e of soon) {
     db.prepare('UPDATE server_events SET reminded = 1 WHERE id = ?').run(e.id);
@@ -4559,7 +4577,7 @@ setInterval(() => {
     who.forEach((u) => io.to(`user:${u}`).emit('event:starting', { id: e.id, serverId: e.server_id, title: e.title, startsAt: e.starts_at, channelId: eventChannelFor(e, u) }));
     pushTo(who, { title: `Starting soon: ${e.title}`, body: srv.name || 'Event', tag: 'event:' + e.id, url: '/' });
   }
-}, 60000).unref();
+});
 
 // People directory: everyone you share a server with, plus your friends, with what their profile shows.
 api.get('/people', auth, (req, res) => {
@@ -4756,7 +4774,7 @@ const BK = require('./backup');
 const STALE_BACKUP_MS = 10 * 60000;
 const cleanStaleBackups = (olderThanMs = STALE_BACKUP_MS) => {
   const removed = BK.cleanStale({ outDir: ENC_DIR, tmpDir: BACKUP_TMP, scratchDir: BACKUP_DIR, olderThanMs });
-  if (removed.length) console.log(`Removed leftovers of an interrupted backup: ${removed.join(', ')}`);
+  if (removed.length) log.info('backup', 'cleanup', { msg: `Removed leftovers of an interrupted backup: ${removed.join(', ')}` });
 };
 const autoBackup = () => { try { return { enabled: true, keep: 7, ...JSON.parse(getSetting('autoBackup') || '{}') }; } catch { return { enabled: true, keep: 7 }; } };
 function listBackups() {
@@ -4807,17 +4825,27 @@ function makeEncryptedBackup() {
     let verified;
     try { verified = { ...(await BK.verifyBackup(b.file, BK.loadKey(DATA_DIR), BACKUP_DIR)), at: now() }; } catch (e) { verified = { ok: false, error: e.message, at: now() }; }
     saveBackupStatus(b.name, { verified });
-    if (!verified.ok) { console.error(`Encrypted backup ${b.name} FAILED its restore test: ${verified.error}`); auditLog(null, 'backup_restore_test_failed', null, `${b.name}: ${verified.error}`); return { ...b, verified }; }
+    if (!verified.ok) {
+      log.error('backup', 'restore_test_failed', new Error(verified.error), { file: b.name, outcome: 'error', msg: `Encrypted backup ${b.name} FAILED its restore test.` });
+      auditLog(null, 'backup_restore_test_failed', null, `${b.name}: ${verified.error}`);
+      if (ALERTS) ALERTS.raise('backup_verify_failed', { severity: 'critical', title: 'A backup failed its restore test', detail: `${b.name} was made but couldn’t be restored in the test (${verified.error}). Older backups are kept. Try Admin → Owner → Backups → Back up now; if it fails again, check disk space and the backup key.` });
+      return { ...b, verified };
+    }
+    if (ALERTS) ALERTS.clear('backup_verify_failed');
     const offsite = await BK.uploadOffsite(b.file);
     if (!offsite.skipped) {
       saveBackupStatus(b.name, { offsite: { ...offsite, at: now() } });
-      if (!offsite.ok) { console.error(`Copying ${b.name} off-site failed: ${offsite.error}`); auditLog(null, 'backup_offsite_failed', null, `${b.name}: ${offsite.error}`); }
+      if (!offsite.ok) {
+        log.error('backup', 'offsite_failed', new Error(offsite.error), { file: b.name, outcome: 'error' });
+        auditLog(null, 'backup_offsite_failed', null, `${b.name}: ${offsite.error}`);
+        if (ALERTS) ALERTS.raise('backup_offsite_failed', { severity: 'warning', title: 'Copying a backup off-site failed', detail: `${b.name} is safe on this machine, but the copy to BACKUP_RCLONE_REMOTE failed: ${offsite.error}` });
+      }
     }
     // A copy on each linked region with backup space (server/regions.js), so losing this machine isn't losing it all.
     const regions = await REG.copyBackup(b.file).catch((e) => ({ error: { ok: false, error: e.message, at: now() } }));
     if (Object.keys(regions).length) {
       saveBackupStatus(b.name, { regions });
-      for (const r of Object.values(regions)) if (!r.ok) { console.error(`Copying ${b.name} to region ${r.name || ''} failed: ${r.error}`); auditLog(null, 'backup_region_failed', null, `${b.name} → ${r.name || '?'}: ${r.error}`); }
+      for (const r of Object.values(regions)) if (!r.ok) { log.error('backup', 'region_copy_failed', new Error(r.error), { file: b.name, region: r.name || '?', outcome: 'error' }); auditLog(null, 'backup_region_failed', null, `${b.name} → ${r.name || '?'}: ${r.error}`); }
     }
     const keep = autoBackup().keep;
     for (const x of backupsToPrune(listEncBackups(), keep)) {
@@ -4870,22 +4898,33 @@ api.post('/admin/backups/key', auth, ownerOnly, wrap(async (req, res) => {
   auditLog(req, 'backup_key_viewed', null, '');
   res.json({ key });
 }));
-// Every day: a database copy (for quick rollback here) and an encrypted, restore-tested, off-site backup.
-setInterval(async () => {
+// Every day: a database copy (for quick rollback here) and an encrypted, restore-tested, off-site backup. Checked
+// hourly (the first check BACKUP_FIRST_CHECK_MS after start, default an hour). Both are tried even if one fails; a
+// failure is logged, alerted, and marks the job as failing.
+jobs.every('backup.daily', 3600000, async () => {
   const a = autoBackup();
   if (!a.enabled) return;
+  let failed = null;
   const autos = listBackups().filter((b) => b.name.startsWith('hearth-auto-'));
   if (!autos.length || Date.now() - autos[0].at > 23.5 * 3600000) {
     try {
       await makeBackup('auto');
       listBackups().filter((b) => b.name.startsWith('hearth-auto-')).slice(a.keep).forEach((b) => fs.promises.unlink(path.join(BACKUP_DIR, b.name)).catch(() => {}));
-    } catch (e) { console.error('Automatic backup failed:', e.message); }
+    } catch (e) { log.error('backup', 'db_copy_failed', e, { outcome: 'error', msg: 'Automatic backup failed.' }); failed = e; }
   }
   const enc = listEncBackups();
   if (!enc.length || Date.now() - enc[0].at > 23.5 * 3600000) {
-    try { await makeEncryptedBackup(); } catch (e) { console.error('Encrypted backup failed:', e.message); auditLog(null, 'backup_failed', null, e.message); }
+    try {
+      const b = await makeEncryptedBackup();
+      if (b && b.verified && !b.verified.ok) failed = failed || new Error(`restore test failed: ${b.verified.error}`);
+    } catch (e) { log.error('backup', 'encrypted_failed', e, { outcome: 'error', msg: 'Encrypted backup failed.' }); auditLog(null, 'backup_failed', null, e.message); failed = e; }
   }
-}, 3600000).unref();
+  if (failed) {
+    if (ALERTS) ALERTS.raise('backup_failed', { severity: 'critical', title: 'The daily backup failed', detail: `${log.errorCategory(failed)}: ${failed.message}. Older backups are kept. Admin → Health shows when the last good one was made.` });
+    throw failed;
+  }
+  if (ALERTS) ALERTS.clear('backup_failed');
+}, { firstDelay: +(process.env.BACKUP_FIRST_CHECK_MS || 3600000) });
 
 // One-time: list files uploaded before storage tracking existed, so quotas count them too.
 function indexOldFiles() {
@@ -4915,6 +4954,16 @@ function indexLibraryUploads() {
   setSetting('gifLibraryIndexed', '1');
 }
 
+// ---------------------------------------------------------------- health and alerts (server/health.js, server/alerts.js)
+// Alerts go to the owner's confirmed email and to the dashboard live ('admins' room). Unexpected errors, jobs that
+// keep failing and sign-in abuse (secEvent) feed them; backups raise their own.
+ALERTS = require('./alerts')({ getSetting, setSetting, emitAdmins: (ev, data) => io && io.to('admins').emit(ev, data), ownerRow: () => getUserRow(ownerId()), notify: (...a) => ACCT.notify(...a) });
+log.onError((line) => ALERTS.countError(line));
+jobs.setOnFailure((r) => ALERTS.jobFailed(r));
+jobs.setOnRecover((r) => ALERTS.jobRecovered(r.name));
+require('./health').setupHealth({ api, auth, adminOnly, wrap, fail, rateLimit, limitNet, db, DATA_DIR, SCHEMA_VERSION, VERSION, maintenance, stepUp, auditLog, alerts: ALERTS,
+  sockets: () => (io ? io.engine.clientsCount : 0), listEncBackups, listBackups, autoBackup, NEWS_BOT_ID, isAlive: REG.isAlive });
+
 // ---------------------------------------------------------------- errors + SPA fallback
 api.use((req, res) => res.status(404).json({ error: 'Not found.' }));
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
@@ -4928,7 +4977,7 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   if (err.type && /^(encoding|charset)\./.test(err.type)) return res.status(415).json({ error: 'Unsupported request encoding.' });
   const status = err.status || 500;
   const expected = err instanceof HttpError; // our own, user-facing errors keep their message
-  if (!expected) console.error(err);
+  if (!expected) log.error('http', 'unhandled_error', err, { method: req.method, route: log.routeOf(req), outcome: 'error' });
   if (expected && err.retryAfter) res.setHeader('Retry-After', String(err.retryAfter));
   res.status(status).json({ error: expected ? err.message : 'Something broke on the server.', code: err.code });
 });
@@ -4958,7 +5007,7 @@ async function loadTls() {
     });
     fs.writeFileSync(certPath, pems.cert);
     fs.writeFileSync(keyPath, pems.private, { mode: 0o600 });
-    console.log('Generated a self-signed certificate in', DATA_DIR);
+    log.info('tls', 'self_signed', { msg: `Generated a self-signed certificate in ${DATA_DIR}` });
   }
   return { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
 }
@@ -5042,7 +5091,7 @@ function emitWatch(room) {
   if (e.timer) return;
   const send = () => { e.timer = null; e.last = Date.now(); io.to(`voice:${room}`).emit('watch:state', { room, state: watchOut(room) }); };
   const wait = e.last + 250 - Date.now();
-  if (wait <= 0) send(); else e.timer = setTimeout(send, wait);
+  if (wait <= 0) send(); else e.timer = setTimeout(jobs.job('watch.emit', send), wait);
 }
 const dropWatch = (room) => { const e = watchEmits.get(room); if (e) clearTimeout(e.timer); watchEmits.delete(room); watchRooms.delete(room); };
 // Where the video is right now, according to the shared state.
@@ -5092,7 +5141,7 @@ function setupSockets(server) {
   io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 256 * 1024, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
   // Every minute: an open connection whose session has ended (signed out, expired, account suspended or
   // deleted) is closed; one that's still fine counts as use, so an app left open never idles out.
-  setInterval(() => {
+  jobs.every('sockets.session_sweep', 60000, () => {
     const t = now();
     const touch = db.prepare('UPDATE sessions SET last_used_at = ? WHERE id = ?');
     const seen = new Set();
@@ -5104,7 +5153,7 @@ function setupSockets(server) {
         sock.disconnect(true);
       } else if (!seen.has(s.id) && t - (s.last_used_at || 0) > 5 * 60000) { seen.add(s.id); touch.run(t, s.id); }
     }
-  }, 60000).unref();
+  });
 
   io.use((socket, next) => {
     const token = socket.handshake.auth && socket.handshake.auth.token;
@@ -5167,7 +5216,11 @@ function setupSockets(server) {
 
     const guard = (fn) => (...args) => {
       const cb = typeof args[args.length - 1] === 'function' ? args.pop() : () => {};
-      try { cb(fn(...args) || { ok: true }); } catch (e) { cb({ error: e.message || 'Error' }); }
+      try { cb(fn(...args) || { ok: true }); } catch (e) {
+        // Our own refusals are expected; anything else is a bug worth seeing in the log (without the event's data).
+        if (!(e instanceof HttpError)) log.error('socket', 'handler_error', e, { outcome: 'error', uid: log.userHash(uid) });
+        cb({ error: e.message || 'Error' });
+      }
     };
 
     // "Is typing…" goes only where the person could actually send: not in channels where they can't post,
@@ -5376,24 +5429,23 @@ function setupSockets(server) {
   if (USE_HTTPS) server = https.createServer(await loadTls(), app);
   else server = http.createServer(app);
   setupSockets(server);
-  try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
-  try { indexLibraryUploads(); } catch (e) { console.error('Could not index GIF library uploads:', e.message); }
+  try { indexOldFiles(); } catch (e) { log.error('uploads', 'index_failed', e, { msg: 'Could not index existing uploads.' }); }
+  try { indexLibraryUploads(); } catch (e) { log.error('uploads', 'index_failed', e, { msg: 'Could not index GIF library uploads.' }); }
   // A backup cut off by a crash or a forced stop may have left a plaintext snapshot or a half-written file. Files
   // touched in the last few minutes may belong to a backup that's still running (`node server/cli.js backup` from
   // a cron job, say), so those are looked at again a little later instead.
-  const cleanLeftovers = () => { try { cleanStaleBackups(STALE_BACKUP_MS); } catch (e) { console.error('Could not clean up old backup files:', e.message); } };
-  cleanLeftovers();
-  setTimeout(cleanLeftovers, STALE_BACKUP_MS + 60000).unref();
+  const cleanLeftovers = () => cleanStaleBackups(STALE_BACKUP_MS);
+  jobs.job('backup.cleanup_leftovers', cleanLeftovers)();
+  jobs.after('backup.cleanup_leftovers', STALE_BACKUP_MS + 60000, cleanLeftovers);
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
-    console.log(`\n  ${INSTANCE_NAME} is running.\n`);
-    console.log(`  This computer:  ${scheme}://localhost:${PORT}`);
+    const urls = [`${scheme}://localhost:${PORT}`];
     for (const list of Object.values(os.networkInterfaces())) {
-      for (const n of list || []) if (n.family === 'IPv4' && !n.internal) console.log(`  Your network:   ${scheme}://${n.address}:${PORT}`);
+      for (const n of list || []) if (n.family === 'IPv4' && !n.internal) urls.push(`${scheme}://${n.address}:${PORT}`);
     }
-    if (USE_HTTPS && !process.env.SSL_CERT) console.log('\n  Using a self-signed certificate: browsers will show a warning the first time. Click "Advanced" → "Proceed".');
-    if (!USE_HTTPS) console.log('\n  HTTPS is off. Voice chat and encryption only work on localhost or behind an HTTPS reverse proxy.');
-    console.log('');
+    log.info('server', 'listening', { msg: `${INSTANCE_NAME} is running. Open ${urls.join(' or ')}`, version: VERSION, schema: SCHEMA_VERSION, node: process.version, pid: process.pid });
+    if (USE_HTTPS && !process.env.SSL_CERT) log.info('server', 'tls', { msg: 'Using a self-signed certificate: browsers will show a warning the first time. Click "Advanced" → "Proceed".' });
+    if (!USE_HTTPS) log.info('server', 'tls', { msg: 'HTTPS is off. Voice chat and encryption only work on localhost or behind an HTTPS reverse proxy.' });
   });
 
   // Fast, clean restarts (updates, docker restart, systemctl restart). Without this, Docker waits
@@ -5403,7 +5455,8 @@ function setupSockets(server) {
   const shutdown = (signal) => {
     if (stopping) return;
     stopping = true;
-    console.log(`\n  ${signal} received: restarting cleanly.`);
+    log.info('server', 'shutdown', { msg: `${signal} received: restarting cleanly.` });
+    jobs.saveAll();
     try { io.emit('server:restarting', { at: Date.now() }); } catch { /* ignore */ }
     // A backup still running can't finish now: don't leave its plaintext snapshot or half-written file behind.
     const exit = () => { try { BK.removeInFlight(); } catch { /* ignore */ } process.exit(0); };

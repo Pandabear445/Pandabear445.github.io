@@ -14,6 +14,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 const netguard = require('./netguard');
+const jobs = require('./jobs');
 
 const env = process.env;
 const BASE = {
@@ -133,8 +134,7 @@ module.exports = function setupActivity(ctx) {
       }
     } catch { /* ignore */ }
   }
-  setTimeout(pruneCache, 30000).unref();
-  setInterval(pruneCache, 3600000).unref();
+  jobs.every('activity.art_cache_prune', 3600000, pruneCache, { firstDelay: 30000 });
   const sendImage = (res, img) => {
     if (!img) return res.status(404).end();
     res.setHeader('Content-Type', img.type);
@@ -280,12 +280,12 @@ module.exports = function setupActivity(ctx) {
   let timer = null;
   function announce(uid) {
     queue.add(uid);
-    if (!timer) timer = setTimeout(() => {
+    if (!timer) timer = setTimeout(jobs.job('activity.broadcast', () => {
       timer = null;
       const list = [...queue].map((id) => { const row = getUserRow(id); return { id, activity: row ? activityFor(row) : null }; });
       queue.clear();
       if (list.length) ctx.emit('user:activity', list);
-    }, 800);
+    }), 800);
   }
   function activityFor(row) {
     if (!row || !isOnline(row.id) || row.status === 'invisible') return null;
@@ -332,7 +332,7 @@ module.exports = function setupActivity(ctx) {
   // Clean up: the desktop app re-sends every ~30 s (gone after 2 minutes of silence), Last.fm songs
   // after 10 minutes without a "now playing", hand-picked ones after 12 hours, everything 5 minutes after
   // the person goes offline.
-  setInterval(() => {
+  jobs.every('activity.expire', 30000, () => {
     const t = now();
     for (const [uid, e] of live) {
       if (!isOnline(uid)) { if (!e.offlineAt) e.offlineAt = t; } else e.offlineAt = 0;
@@ -342,7 +342,7 @@ module.exports = function setupActivity(ctx) {
       if (stale(e.music)) setMusic(uid, null);
       if (!e.game && !e.music) live.delete(uid);
     }
-  }, 30000).unref();
+  });
 
   // Album art for a song we only know by name (desktop app): ask the iTunes search once.
   const artCache = new Map();
@@ -497,7 +497,7 @@ module.exports = function setupActivity(ctx) {
       }
     } finally { polling = false; }
   }
-  setInterval(() => { pollLastfm().catch(() => {}); }, 10000).unref();
+  jobs.every('activity.lastfm', 10000, pollLastfm);
 
   // ------------------------------------------------------------------ admin: keys
   api.get('/admin/activity', auth, (req, res) => {
