@@ -5,6 +5,7 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
+    "bench": "node scripts/bench.js",
     "dev": "node --watch server/index.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "test:security": "node --test --test-concurrency=1 test/*.test.js",

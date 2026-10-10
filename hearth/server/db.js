@@ -15,7 +15,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -976,6 +976,20 @@ CREATE TABLE IF NOT EXISTS server_key_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
+`);
+
+// v18 (quality): indexes for reads that walked a whole channel or table (numbers in docs/PERFORMANCE.md).
+//   pins          a conversation's pinned messages (a handful) without reading all its messages
+//   top-level     a channel's history without stepping over thread replies (a busy thread's replies are the
+//                 newest rows of its channel's index, so the latest page used to read past all of them)
+//   created_at    the admin activity chart (every staff member's app asks for it at start-up) counts messages per
+//                 day with a range per day instead of scanning both message tables 14 times
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_pins ON messages(channel_id, pinned_at) WHERE pinned_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dm_messages_pins ON dm_messages(dm_id, pinned_at) WHERE pinned_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_channel_top ON messages(channel_id, id) WHERE thread_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_created ON dm_messages(created_at);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
