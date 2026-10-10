@@ -689,6 +689,15 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE INDEX IF NOT EXISTS idx_memberships_server_user ON memberships(server_id, user_id);
 `);
 
+// v17 (search): message search (server/search.js) walks each conversation newest first by (created_at, id),
+// optionally only one author's messages. These indexes make every step a range scan that never reads a row.
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_author_time ON messages(channel_id, author_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_time ON dm_messages(dm_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_author_time ON dm_messages(dm_id, author_id, created_at, id);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are

@@ -3672,136 +3672,372 @@ function gifPicker(anchor, onPick, { onEmoji = null } = {}) {
 }
 
 // ======================================================================= global search (Ctrl+K)
-// Messages are end-to-end encrypted, so the server can't search them. Search runs here, over messages
-// this browser has decrypted, and can dig further back through a conversation on request.
+// Messages are end-to-end encrypted, so the server can't read them, and the words you search for never leave
+// this device. The server is only asked for messages by where, who and when (server/search.js); each page is
+// decrypted here and matched against the words, together with the messages already loaded on this device.
+// The filter syntax (from:, in:, has:, dates, "phrases") is parsed by search-query.js. Imports are hoisted,
+// so this one sits next to the only code that uses it.
+import * as SQ from './search-query.js';
+
+const SEARCH_RUN = 1000; // messages checked per click, so one search never runs on for long
+const SEARCH_PAGE = 200; // the server's largest page
+const SEARCH_ENOUGH = 50; // a run also stops early once this many results are showing
+const SEARCH_SHOWN = 200; // results drawn at most
+// Recent searches are kept only in this browser, and only while "Remember my searches" is on.
+const searchHistory = {
+  get on() { return LS.get(mine('searchHistoryOn'), true) !== false; },
+  set on(v) { LS.set(mine('searchHistoryOn'), !!v); if (!v) this.clear(); },
+  get list() { return this.on ? LS.get(mine('searchHistory'), []) : []; },
+  add(text) {
+    const t = String(text || '').trim();
+    if (t && this.on) LS.set(mine('searchHistory'), [t, ...this.list.filter((x) => x !== t)].slice(0, 15));
+  },
+  clear() { LS.set(mine('searchHistory'), []); },
+};
+const SEARCH_HINTS = {
+  from: 'Type a name: from:@username, from:name or from:me',
+  in: 'Type a channel: in:#general (or in:@username for a DM)',
+  has: 'has:file, has:image or has:link',
+  is: 'is:edited or is:pinned',
+  before: 'A date: 2025-05-31, or a month (2025-05) or a year (2025)',
+};
+SEARCH_HINTS.after = SEARCH_HINTS.before;
+SEARCH_HINTS.during = SEARCH_HINTS.before;
+
 function openSearch({ scope = null } = {}) {
   let tab = scope ? 'messages' : 'all';
-  let scopeKey = scope;
-  const input = h('input', { class: 'search-main', placeholder: scope ? 'Search this conversation' : 'Search messages, people, channels, servers', 'aria-label': 'Search' });
-  const tabsEl = h('div', { class: 'seg' });
-  const results = h('div', { class: 'search-results', role: 'listbox' });
-  const scopeChip = h('div', { class: 'search-scope' });
+  let scopeKey = scope; // 'c:<channel>' | 'd:<dm>' | 's:<server>' | null (everywhere)
+  let q = SQ.parseQuery('');
+  let scan = null; // the server-side part of the current search (see runScan)
+  const scans = new Map(); // recent ones by filters, while this search is open
+  let rows = []; // what the arrow keys move through: { id, action, build }
   let sel = 0;
-  let rows = [];
-  let deepRunning = false;
+  let selId = null;
+  let lastHits = 0;
+  let closed = false;
+  const gone = new Set(); // results deleted (or hidden from us) since the search found them
+  const input = h('input', { class: 'search-main', placeholder: scope ? 'Search this conversation' : 'Search messages, people, channels, servers', 'aria-label': 'Search', autocomplete: 'off', spellcheck: 'false', 'aria-controls': 'search-results', 'aria-autocomplete': 'list' });
+  const chipsEl = h('div', { class: 'search-chips' });
+  const noteEl = h('div', { class: 'search-note', 'aria-live': 'polite' });
+  const tabsEl = h('div', { class: 'seg', role: 'tablist' });
+  const results = h('div', { class: 'search-results', id: 'search-results', role: 'listbox', 'aria-label': 'Search results' });
   const go = (fn) => () => { mdl.close(); fn(); };
+  const refocus = () => { selId = null; draw(); input.focus(); };
 
-  const convoMessages = (key) => (S.msgs[key] ? S.msgs[key].list.filter(readable) : []);
-  const allLoaded = () => Object.keys(S.msgs).flatMap((k) => convoMessages(k).map((m) => ({ m, key: k })));
-  const matchMsg = (m, q, kind) => {
-    const t = textOf(m).toLowerCase();
-    const files = filesOf(m);
-    if (kind === 'files') return files.length && (!q || files.some((f) => (f.name || '').toLowerCase().includes(q)));
-    if (kind === 'links') return /https?:\/\//i.test(t) && (!q || t.includes(q));
-    return q && (t.includes(q) || files.some((f) => (f.name || '').toLowerCase().includes(q)));
-  };
-  const snippet = (t, q) => {
-    const i = q ? t.toLowerCase().indexOf(q) : -1;
-    const s = i > 40 ? '\u2026' + t.slice(i - 40) : t;
-    return s.slice(0, 180);
-  };
-  const highlight = (text, q) => {
-    if (!q) return document.createTextNode(text);
-    const frag = document.createDocumentFragment();
-    const lower = text.toLowerCase();
-    let i = 0;
-    for (;;) {
-      const j = lower.indexOf(q, i);
-      if (j < 0) { frag.append(text.slice(i)); break; }
-      frag.append(text.slice(i, j), h('mark', null, text.slice(j, j + q.length)));
-      i = j + q.length;
+  // ---- where and who: from: and in: name people and places, the server wants ids
+  const serverOfScope = (key) => (!key ? null : key.startsWith('s:') ? S.servers.find((s) => s.id === key.slice(2)) : key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null);
+  function scopeLabel(key) {
+    if (key.startsWith('d:')) return `In DM with ${displayName(getUser((S.dms.find((d) => d.id === key.slice(2)) || {}).userId))}`;
+    const s = serverOfScope(key);
+    if (key.startsWith('s:')) return `In ${s ? s.name : 'this server'}`;
+    return isGroup(s) ? `In ${groupName(s)}` : `In #${(channelById(key.slice(2)) || {}).name || 'channel'}`;
+  }
+  const handles = (list) => list.slice(0, 4).map((u) => '@' + u.username).join(', ') + (list.length > 4 ? '…' : '');
+  function findPerson(f) {
+    if (f.me) return { id: S.me.id, user: S.me };
+    const n = f.name.toLowerCase();
+    const users = Object.values(S.users).filter((u) => u && u.username);
+    const exact = users.find((u) => u.username.toLowerCase() === n);
+    if (exact) return { id: exact.id, user: exact };
+    if (f.exact) return { error: `No one with the username @${f.name} in your servers or DMs.` };
+    const named = users.filter((u) => displayName(u).toLowerCase() === n);
+    if (named.length > 1) return { error: `Several people are called “${f.name}” (${handles(named)}). Use from:@username.` };
+    const near = named.length ? named : users.filter((u) => u.username.toLowerCase().startsWith(n) || displayName(u).toLowerCase().startsWith(n));
+    if (near.length === 1) return { id: near[0].id, user: near[0] };
+    return { error: near.length ? `“${f.name}” could be ${handles(near)}. Type more, or use from:@username.` : `No one called “${f.name}” in your servers or DMs. Try from:@username.` };
+  }
+  function findPlace(f) {
+    if (f.kind === 'user') {
+      const p = findPerson({ name: f.name });
+      if (p.error) return p;
+      const d = S.dms.find((x) => x.userId === p.id);
+      return d ? { key: 'd:' + d.id } : { error: `You don’t have a DM with @${p.user.username}.` };
     }
-    return frag;
+    const n = f.name.toLowerCase();
+    const hits = realServers().flatMap((s) => s.channels.filter((c) => c.type === 'text' && c.name.toLowerCase() === n).map((c) => ({ c, s })));
+    if (!hits.length) return { error: `No channel called #${f.name} that you can see.` };
+    // Several servers have one: take the one being searched or looked at.
+    const here = (serverOfScope(scopeKey) || {}).id || S.view.serverId;
+    const pick = hits.length === 1 ? hits[0] : hits.find((x) => x.s.id === here);
+    if (!pick) return { error: `#${f.name} is in ${hits.length} servers (${hits.slice(0, 3).map((x) => x.s.name).join(', ')}). Search from inside the one you mean.` };
+    return { key: 'c:' + pick.c.id };
+  }
+  // What to ask the server for. Only these metadata filters are sent; the words stay here.
+  function plan() {
+    const p = { errors: [...q.errors], fromId: null, where: scopeKey, badFrom: false, badIn: false };
+    if (q.from) { const r = findPerson(q.from); if (r.error) { p.errors.push(r.error); p.badFrom = true; } else p.fromId = r.id; }
+    if (q.in) { const r = findPlace(q.in); if (r.error) { p.errors.push(r.error); p.badIn = true; } else p.where = r.key; }
+    p.params = { scope: p.where || 'all', limit: String(SEARCH_PAGE) };
+    if (p.fromId) p.params.from = p.fromId;
+    if (q.after !== null) p.params.after = String(q.after);
+    if (q.before !== null) p.params.before = String(q.before);
+    p.sig = JSON.stringify([p.params.scope, p.fromId, q.after, q.before]);
+    return p;
+  }
+
+  // ---- the server part: ciphertext pages, newest first. Each click checks up to SEARCH_RUN messages, and
+  // "Search further back" carries on from the cursor. Typing more words reuses what's already decrypted.
+  function startScan(p) {
+    if (scan && scan.sig === p.sig) return;
+    // Going back to filters used a moment ago picks up where that search was (draw() continues it if needed).
+    scan = scans.get(p.sig);
+    if (scan) return;
+    scan = { sig: p.sig, params: p.params, items: new Map(), cursor: null, done: false, checked: 0, unreadable: 0, goal: SEARCH_RUN, running: false, error: null, oldest: null };
+    scans.set(p.sig, scan);
+    if (scans.size > 8) scans.delete(scans.keys().next().value);
+    runScan(scan);
+  }
+  async function runScan(sc, further = false) {
+    if (further) sc.goal = sc.checked + SEARCH_RUN;
+    if (sc.running || sc.done || closed || sc.checked >= sc.goal) return;
+    sc.running = true;
+    sc.error = null;
+    const stale = () => closed || scan !== sc;
+    try {
+      while (!sc.done && sc.checked < sc.goal && !stale()) {
+        const res = await api('GET', '/search/messages?' + new URLSearchParams({ ...sc.params, ...(sc.cursor ? { cursor: sc.cursor } : {}) }));
+        await Promise.all(res.messages.map((m) => decryptMessage(m).catch(() => {})));
+        if (stale()) return;
+        for (const m of res.messages) {
+          if (readable(m)) sc.items.set(m.id, { m, key: keyOfMessage(m) });
+          else sc.unreadable++;
+        }
+        sc.checked += res.messages.length;
+        if (res.messages.length) sc.oldest = res.messages[res.messages.length - 1].createdAt;
+        sc.cursor = res.nextCursor;
+        sc.done = !res.nextCursor;
+        draw();
+        if (lastHits >= SEARCH_ENOUGH) break;
+      }
+    } catch (e) {
+      if (!stale()) sc.error = e.message;
+    } finally {
+      sc.running = false;
+      if (!stale()) draw();
+    }
+  }
+
+  // ---- matching, on this device
+  // While you share your screen, DMs and group chats stay out of the results (see shareCover).
+  const privateHidden = (key) => (key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)))) && hiddenWhileSharing(key);
+  const inPlace = (key, m, where) => !where || (where.startsWith('s:') ? !m.dmId && m.serverId === where.slice(2) : key === where);
+  const viewOf = (m) => ({ text: textOf(m), files: filesOf(m), edited: !!m.editedAt, pinned: !!m.pinnedAt, createdAt: m.createdAt, get imageLinks() { return extractImageUrls(textOf(m)).length; } });
+  function messageHits(p) {
+    const found = new Map();
+    const consider = (m, key) => {
+      if (found.has(m.id) || !readable(m) || !inPlace(key, m, p.where) || (p.fromId && m.authorId !== p.fromId)) return;
+      if (privateHidden(key) || S.blocked.has(m.authorId)) return;
+      if (tab === 'files' && !filesOf(m).length) return;
+      if (tab === 'links' && !/https?:\/\//i.test(textOf(m))) return;
+      if (SQ.matchMessage(q, viewOf(m))) found.set(m.id, { m, key });
+    };
+    // Loaded on this device first (kept up to date live), then what the server search turned up.
+    for (const [key, store] of Object.entries(S.msgs)) store.list.forEach((m) => consider(m, key));
+    for (const t of Object.values(S.threads)) (t.list || []).forEach((m) => consider(m, 'c:' + m.channelId));
+    if (scan && scan.sig === p.sig) scan.items.forEach(({ m, key }) => consider(m, key));
+    return [...found.values()].sort((a, b) => b.m.createdAt - a.m.createdAt || (a.m.id < b.m.id ? 1 : -1));
+  }
+  // Matches are highlighted with real text nodes and <mark> elements, never HTML.
+  const marked = (text) => SQ.segments(text, q).map((s) => (s.hit ? h('mark', null, s.text) : s.text));
+
+  async function openResult(m, key) {
+    if (gone.has(m.id)) return;
+    searchHistory.add(input.value);
+    let loc;
+    try { loc = await api('GET', `/messages/${m.id}/locate`); } catch (e) {
+      if (e.status === 404) { gone.add(m.id); draw(); return; }
+      toast(e.message, 'error');
+      return;
+    }
+    if (closed) return;
+    mdl.close();
+    if (loc.threadId) {
+      // A reply in a thread: open its channel at the thread's first message, then the thread itself.
+      await jumpToMessage('c:' + loc.channelId, loc.threadId);
+      openThread({ id: loc.threadId, channelId: loc.channelId, serverId: loc.serverId }, m.id);
+    } else jumpToMessage(key, m.id);
+  }
+
+  // ---- drawing
+  const item = (id, o) => ({ id, action: o.action, build: (i) => h('button', {
+    class: `search-item${o.cls ? ' ' + o.cls : ''}`, id: 'sr-' + i, role: 'option', 'aria-selected': 'false', 'aria-disabled': o.disabled ? 'true' : null,
+    onclick: o.action, onmouseenter: () => select(i),
+  }, o.av, h('span', { class: 'search-item-text' }, h('span', { class: 'search-item-title' }, o.title), o.sub ? h('span', { class: 'search-item-sub' }, o.sub) : null,
+    o.badges && o.badges.length ? h('span', { class: 'search-badges' }, o.badges) : null), o.meta ? h('span', { class: 'search-item-meta' }, o.meta) : null) });
+  function messageItem({ m, key }) {
+    const u = getUser(m.authorId);
+    const files = filesOf(m);
+    const deleted = gone.has(m.id);
+    const body = tab === 'files' ? files.map((f) => f.name).join(', ') : SQ.excerpt(textOf(m), q);
+    const badges = [];
+    if (files.length) {
+      const img = files.some(SQ.isImageFile);
+      const what = `${files.length} ${img ? 'image' : 'file'}${files.length > 1 ? 's' : ''}`;
+      badges.push(h('span', { class: 'search-badge', title: what, 'aria-label': what }, icon(img ? 'image' : 'file'), String(files.length)));
+    }
+    if (m.threadId) badges.push(h('span', { class: 'search-badge' }, icon('thread'), 'In a thread'));
+    if (m.editedAt) badges.push(h('span', { class: 'search-badge' }, 'Edited'));
+    return item('m:' + m.id, {
+      cls: `search-msg${deleted ? ' gone' : ''}`, disabled: deleted, av: avatarEl(u, 30),
+      title: h('span', null, h('strong', null, displayName(u)), h('span', { class: 'search-where' }, ` · ${whereLabel(m)}`)),
+      sub: deleted ? h('span', { class: 'search-gone' }, 'This message was deleted after the search found it, or you can’t see it any more.')
+        : body ? marked(body) : h('em', null, files.length ? 'Only attachments' : 'No text'),
+      badges: deleted ? [] : badges,
+      meta: h('time', { datetime: new Date(m.createdAt).toISOString(), title: new Date(m.createdAt).toLocaleString() }, fmtStamp(m.createdAt)),
+      action: () => openResult(m, key),
+    });
+  }
+  function chipLabel(f, p) {
+    if (SQ.parseQuery(f.raw).errors.length) return f.raw;
+    if (f.key === 'from') return p.fromId ? `From ${displayName(getUser(p.fromId))}` : f.raw;
+    if (f.key === 'in') return p.where && !p.badIn ? scopeLabel(p.where) : f.raw;
+    if (f.key === 'has') return { file: 'Has a file', image: 'Has an image', link: 'Has a link' }[SQ.parseQuery(f.raw).has[0]];
+    if (f.key === 'is') return f.value.toLowerCase() === 'edited' ? 'Edited' : 'Pinned';
+    return `${f.key[0].toUpperCase()}${f.key.slice(1)} ${f.value}`;
+  }
+  function statusEl(p, n) {
+    const sc = scan;
+    if (!sc || sc.sig !== p.sig) return null;
+    const count = (x) => x.toLocaleString();
+    const lost = sc.unreadable ? ` ${count(sc.unreadable)} couldn’t be decrypted on this device.` : '';
+    if (sc.running) return h('div', { class: 'search-status' }, h('span', { class: 'spinner' }), h('span', null, `Searching… ${count(sc.checked)} messages checked`));
+    if (sc.error) {
+      return h('div', { class: 'search-status bad' }, h('span', null, `Couldn’t search further: ${sc.error}`),
+        h('button', { class: 'btn ghost sm', onclick: () => { runScan(sc, true); draw(); } }, 'Try again'));
+    }
+    if (sc.done) return h('div', { class: 'search-status' }, h('span', null, `${n ? '' : 'No messages match. '}Checked all ${count(sc.checked)} messages that fit the filters.${lost}`));
+    return h('div', { class: 'search-status' },
+      h('span', null, `${n ? '' : 'No matches yet. '}Checked ${count(sc.checked)} messages, back to ${fmtDay(sc.oldest)}.${lost}`),
+      h('button', { class: 'btn ghost sm', onclick: () => { searchHistory.add(input.value); runScan(sc, true); draw(); } }, 'Search further back'));
+  }
+  function select(i, scroll = false) {
+    if (!rows.length) { input.removeAttribute('aria-activedescendant'); return; }
+    sel = Math.max(0, Math.min(rows.length - 1, i));
+    selId = rows[sel].id;
+    results.querySelectorAll('.search-item').forEach((b, n) => { b.classList.toggle('active', n === sel); b.setAttribute('aria-selected', String(n === sel)); });
+    const el = results.querySelector('#sr-' + sel);
+    if (el) { input.setAttribute('aria-activedescendant', el.id); if (scroll) el.scrollIntoView({ block: 'nearest' }); }
+  }
+  const insert = (token) => {
+    const v = input.value.replace(/\s+$/, '');
+    input.value = (v ? v + ' ' : '') + token;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    refocus();
   };
 
-  const draw = () => {
+  function draw() {
+    if (closed) return;
+    q = SQ.parseQuery(input.value);
+    const p = plan();
+    const empty = !input.value.trim();
+    const words = q.terms.join(' ').toLowerCase();
+    // A filter still being typed ("from:" at the end) gets a hint, not an error, and doesn't search yet.
+    const typing = /(?:^|\s)(from|in|before|after|during|has|is):[#@"]?$/i.exec(input.value);
+    const wantsMessages = ['all', 'messages', 'files', 'links'].includes(tab);
+    const messageQuery = !typing && !p.errors.length && (q.filters.length > 0 || tab === 'files' || tab === 'links' || q.terms.join('').length >= (scopeKey ? 1 : 2));
+    if (wantsMessages && messageQuery) startScan(p);
+
     clear(tabsEl);
     [['all', 'All'], ['messages', 'Messages'], ['people', 'People'], ['places', 'Channels & servers'], ['files', 'Files'], ['links', 'Links']].forEach(([k, l]) => tabsEl.append(
-      h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; sel = 0; draw(); input.focus(); } }, l)));
-    clear(scopeChip);
-    if (scopeKey) {
-      const label = scopeKey.startsWith('d:') ? `In DM with ${displayName(getUser((S.dms.find((d) => d.id === scopeKey.slice(2)) || {}).userId))}` : (() => { const s = serverOfChannel(scopeKey.slice(2)); return isGroup(s) ? `In ${groupName(s)}` : `In #${(channelById(scopeKey.slice(2)) || {}).name}`; })();
-      scopeChip.append(h('span', { class: 'chip active' }, label, h('button', { class: 'chip-x', 'aria-label': 'Search everywhere', onclick: () => { scopeKey = null; draw(); } }, icon('close'))));
+      h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(tab === k), onclick: () => { tab = k; refocus(); } }, l)));
+
+    // Chips: where the search is limited to, then each filter (× removes it from the box).
+    clear(chipsEl);
+    if (scopeKey && !q.in) {
+      chipsEl.append(h('span', { class: 'chip active search-chip' }, scopeLabel(scopeKey), h('button', { class: 'chip-x', 'aria-label': 'Search everywhere', onclick: () => { scopeKey = null; refocus(); } }, icon('close'))));
+      const s = serverOfScope(scopeKey);
+      if (scopeKey.startsWith('c:') && s && !isGroup(s)) chipsEl.append(h('button', { class: 'chip search-chip', onclick: () => { scopeKey = 's:' + s.id; refocus(); } }, `All of ${s.name}`));
     }
-    const q = input.value.trim().toLowerCase();
+    q.filters.forEach((f) => {
+      const bad = SQ.parseQuery(f.raw).errors.length > 0 || (f.key === 'from' && p.badFrom) || (f.key === 'in' && p.badIn);
+      chipsEl.append(h('span', { class: `chip active search-chip${bad ? ' bad' : ''}`, title: f.raw }, chipLabel(f, p),
+        h('button', { class: 'chip-x', 'aria-label': `Remove ${f.raw}`, onclick: () => { input.value = SQ.removeFilter(input.value, f); refocus(); } }, icon('close'))));
+    });
+    if (q.filters.length || scopeKey) chipsEl.append(h('button', { class: 'link-btn search-clear', onclick: () => { input.value = SQ.clearFilters(input.value); scopeKey = null; refocus(); } }, 'Clear filters'));
+
+    clear(noteEl);
+    noteEl.className = 'search-note';
+    if (typing) { noteEl.classList.add('hint'); noteEl.append(icon('info'), h('span', null, SEARCH_HINTS[typing[1].toLowerCase()])); }
+    else if (p.errors.length) { noteEl.classList.add('bad'); noteEl.append(icon('info'), h('span', null, p.errors.join(' '))); }
+
     clear(results);
     rows = [];
-    const add = (section, items) => {
+    const add = (title, items) => {
       if (!items.length) return;
-      results.append(h('div', { class: 'search-sec' }, section));
-      items.forEach((it) => { const i = rows.length; rows.push(it); results.append(it.el(i)); });
+      if (title) results.append(h('div', { class: 'search-sec' }, title));
+      items.forEach((it) => { const i = rows.length; rows.push(it); results.append(it.build(i)); });
     };
-    const item = (opts) => (i) => h('button', {
-      class: `search-item${i === sel ? ' active' : ''}`, role: 'option', 'aria-selected': String(i === sel),
-      onclick: opts.action, onmouseenter: () => { sel = i; [...results.querySelectorAll('.search-item')].forEach((b, n) => b.classList.toggle('active', n === sel)); },
-    }, opts.av, h('span', { class: 'search-item-text' }, h('span', { class: 'search-item-title' }, opts.title), opts.sub ? h('span', { class: 'search-item-sub' }, opts.sub) : null), opts.meta ? h('span', { class: 'search-item-meta' }, opts.meta) : null);
 
-    if (!scopeKey && (tab === 'all' || tab === 'people')) {
-      const people = Object.values(S.users).filter((u) => u.id !== S.me.id && (!q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q)))
-        .sort((a, b) => displayName(a).localeCompare(displayName(b))).slice(0, tab === 'all' ? 5 : 30);
-      add('People', people.map((u) => ({ el: item({ av: avatarEl(u, 30, { status: true, meId: S.me.id }), title: displayName(u), sub: u.username, action: go(() => openDmWith(u.id)) }), action: go(() => openDmWith(u.id)) })));
+    if (empty && (tab === 'all' || tab === 'messages')) {
+      results.append(h('div', { class: 'search-suggest' }, h('span', { class: 'search-sec' }, 'Filters'),
+        h('div', { class: 'search-suggest-list' }, SQ.SUGGESTIONS.map((s) => h('button', { class: 'chip search-chip', title: s.hint, onclick: () => insert(s.insert) }, s.insert)))));
+      const hist = searchHistory.list;
+      if (hist.length && isSharing()) results.append(h('div', { class: 'search-empty' }, 'Recent searches are hidden while you share your screen.'));
+      else if (hist.length) {
+        add('Recent searches', hist.map((t) => item('h:' + t, { av: h('span', { class: 'search-ic' }, icon('search')), title: t, action: () => { input.value = t; refocus(); } })));
+        results.append(h('div', { class: 'search-hist-actions' }, h('button', { class: 'link-btn', onclick: () => { searchHistory.clear(); refocus(); } }, 'Clear history')));
+      }
+      results.append(h('div', { class: 'search-privacy' }, icon('lock'), h('div', { class: 'stack' },
+        h('p', null, 'Search runs on this device. Messages are decrypted here, and your search words never leave it: the server only learns which conversation, person and dates you filter by.'),
+        h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Remember my searches on this device'), h('span', { class: 'field-hint' }, 'Kept only in this browser.')),
+          h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: searchHistory.on, onchange: (e) => { searchHistory.on = e.target.checked; refocus(); } }), h('span', { class: 'switch-track' }))))));
     }
-    if (!scopeKey && (tab === 'all' || tab === 'places')) {
+    // People and places only for plain words (filters are about messages).
+    if (!scopeKey && !q.filters.length && (tab === 'people' || (tab === 'all' && !empty))) {
+      const people = Object.values(S.users).filter((u) => u.id !== S.me.id && (!words || u.username.toLowerCase().includes(words) || displayName(u).toLowerCase().includes(words)))
+        .sort((a, b) => displayName(a).localeCompare(displayName(b))).slice(0, tab === 'all' ? 5 : 30);
+      add('People', people.map((u) => item('u:' + u.id, { av: avatarEl(u, 30, { status: true, meId: S.me.id }), title: displayName(u), sub: u.username, action: go(() => openDmWith(u.id)) })));
+    }
+    if (!scopeKey && !q.filters.length && (tab === 'places' || (tab === 'all' && !empty))) {
       const places = [];
       realServers().forEach((s) => {
-        if (!q || s.name.toLowerCase().includes(q)) places.push({ av: s.icon ? h('img', { class: 'search-img', src: s.icon, alt: '' }) : h('span', { class: 'search-ic' }, s.name.slice(0, 2)), title: s.name, sub: 'Server', action: go(() => openServer(s.id)) });
-        s.channels.forEach((c) => { if (!q || c.name.toLowerCase().includes(q)) places.push({ av: h('span', { class: 'search-ic' }, icon(channelIcon(c))), title: c.name, sub: s.name, action: go(() => (c.type === 'voice' ? joinVoice(c, s) : openChannel(c.id, s.id))) }); });
+        if (!words || s.name.toLowerCase().includes(words)) places.push({ id: 's:' + s.id, av: s.icon ? h('img', { class: 'search-img', src: s.icon, alt: '' }) : h('span', { class: 'search-ic' }, s.name.slice(0, 2)), title: s.name, sub: 'Server', action: go(() => openServer(s.id)) });
+        s.channels.forEach((c) => { if (!words || c.name.toLowerCase().includes(words)) places.push({ id: 'c:' + c.id, av: h('span', { class: 'search-ic' }, icon(channelIcon(c))), title: c.name, sub: s.name, action: go(() => (c.type === 'voice' ? joinVoice(c, s) : openChannel(c.id, s.id))) }); });
       });
-      groups().forEach((g) => { if (!q || groupName(g).toLowerCase().includes(q)) places.push({ av: groupAvatar(g, 30), title: groupName(g), sub: 'Group', action: go(() => openGroup(g.id)) }); });
-      add('Channels & servers', places.slice(0, tab === 'all' ? 6 : 50).map((p) => ({ el: item(p), action: p.action })));
+      groups().forEach((g) => { if (!words || groupName(g).toLowerCase().includes(words)) places.push({ id: 'g:' + g.id, av: groupAvatar(g, 30), title: groupName(g), sub: 'Group', action: go(() => openGroup(g.id)) }); });
+      add('Channels & servers', places.slice(0, tab === 'all' ? 6 : 50).map((x) => item(x.id, x)));
     }
-    if (['all', 'messages', 'files', 'links'].includes(tab) && (q || tab === 'files' || tab === 'links')) {
-      const kind = tab === 'files' ? 'files' : tab === 'links' ? 'links' : 'text';
-      // While you share your screen, messages from DMs and group chats stay out of the results (see shareCover).
-      const privateHidden = (key) => (key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)))) && hiddenWhileSharing(key);
-      const pool = (scopeKey ? convoMessages(scopeKey).map((m) => ({ m, key: scopeKey })) : allLoaded()).filter(({ key }) => !privateHidden(key));
-      const hits = pool.filter(({ m }) => matchMsg(m, q, kind)).sort((a, b) => b.m.createdAt - a.m.createdAt).slice(0, tab === 'all' ? 8 : 60);
-      add(tab === 'files' ? 'Files' : tab === 'links' ? 'Links' : 'Messages', hits.map(({ m, key }) => {
-        const u = getUser(m.authorId);
-        const files = filesOf(m);
-        const t = kind === 'files' ? files.map((f) => f.name).join(', ') : snippet(textOf(m), q);
-        const action = go(() => jumpToMessage(key, m.id));
-        return { el: item({ av: avatarEl(u, 30), title: h('span', null, h('strong', null, displayName(u)), h('span', { class: 'search-where' }, ` \u00b7 ${whereLabel(m)}`)), sub: highlight(t, kind === 'files' ? '' : q), meta: fmtDay(m.createdAt), action }), action };
-      }));
-      if (!hits.length && q) results.append(h('div', { class: 'search-empty' }, 'No loaded messages match.'));
+    lastHits = 0;
+    if (wantsMessages && messageQuery) {
+      const hits = messageHits(p);
+      lastHits = hits.length;
+      // Fewer results than a run aims for (say, after adding a word): use the rest of this click's budget.
+      if (scan && scan.sig === p.sig && !scan.running && !scan.error && hits.length < SEARCH_ENOUGH) runScan(scan);
+      const shown = hits.slice(0, tab === 'all' ? 8 : SEARCH_SHOWN);
+      add(tab === 'files' ? 'Files' : tab === 'links' ? 'Links' : 'Messages', shown.map(messageItem));
+      if (tab === 'all' && hits.length > shown.length) {
+        add('', [item('more', { av: h('span', { class: 'search-ic' }, icon('message')), title: `Show all ${hits.length.toLocaleString()} message results`, action: () => { tab = 'messages'; refocus(); } })]);
+      } else if (hits.length > shown.length) results.append(h('div', { class: 'search-empty' }, `Showing the newest ${SEARCH_SHOWN} of ${hits.length.toLocaleString()} results. Add words or filters to narrow them down.`));
+      const st = statusEl(p, hits.length);
+      if (st) results.append(st);
+      else if (!hits.length) results.append(h('div', { class: 'search-empty' }, 'No messages match.'));
+    } else if (!empty && !rows.length && !typing && !p.errors.length) {
+      results.append(h('div', { class: 'search-empty' }, wantsMessages ? 'Keep typing to search messages.' : 'Nothing matches.'));
     }
-    if (scopeKey && (tab === 'messages' || tab === 'files' || tab === 'links')) {
-      const store = S.msgs[scopeKey];
-      if (store && store.hasMore) {
-        results.append(h('div', { class: 'search-deep' },
-          h('span', null, `Searched ${store.list.length} messages decrypted on this device.`),
-          h('button', { class: 'btn ghost sm', disabled: deepRunning, onclick: async (e) => {
-            deepRunning = true; e.target.textContent = 'Decrypting older messages\u2026';
-            for (let i = 0; i < 20 && S.msgs[scopeKey].hasMore; i++) await loadOlderQuiet(scopeKey);
-            deepRunning = false; draw();
-          } }, 'Search older history')));
-      }
-    }
-    if (!rows.length && !q && tab === 'all') results.append(h('div', { class: 'search-empty' }, 'Type to search. Messages are searched on this device because the server can\u2019t read them.'));
-    sel = Math.min(sel, Math.max(0, rows.length - 1));
-  };
-  input.addEventListener('input', debounce(() => { sel = 0; draw(); }, 120));
+    const keep = selId ? rows.findIndex((r) => r.id === selId) : -1;
+    select(keep >= 0 ? keep : 0);
+  }
+
+  input.addEventListener('input', debounce(() => { selId = null; draw(); }, 150));
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(rows.length - 1, sel + 1); draw(); results.querySelector('.search-item.active')?.scrollIntoView({ block: 'nearest' }); }
-    if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(0, sel - 1); draw(); results.querySelector('.search-item.active')?.scrollIntoView({ block: 'nearest' }); }
-    if (e.key === 'Enter' && rows[sel]) { e.preventDefault(); rows[sel].action(); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); select(sel + 1, true); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); select(sel - 1, true); }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (input.value !== q.text) { selId = null; draw(); } // don't act on results from before the last keystroke
+      if (rows[sel]) rows[sel].action(); else searchHistory.add(input.value);
+    }
   });
-  const mdl = modal({ size: 'search', className: 'search-modal', body: h('div', { class: 'search' },
-    h('div', { class: 'search-bar' }, icon('search'), input, h('kbd', null, 'Esc')), scopeChip, tabsEl, results,
-    h('div', { class: 'search-foot' }, h('span', null, h('kbd', null, '\u2191'), h('kbd', null, '\u2193'), ' to move'), h('span', null, h('kbd', null, 'Enter'), ' to open'), h('span', null, icon('lock', 'ic'), 'Searched privately on this device'))) });
+  const mdl = modal({ size: 'search', className: 'search-modal', onClose: () => { closed = true; }, body: h('div', { class: 'search' },
+    h('div', { class: 'search-bar' }, icon('search'), input, h('kbd', null, 'Esc'), h('button', { class: 'icon-btn search-close', 'aria-label': 'Close search', onclick: () => mdl.close() }, icon('close'))),
+    chipsEl, noteEl, tabsEl, results,
+    h('div', { class: 'search-foot' }, h('span', { class: 'search-keys' }, h('kbd', null, '↑'), h('kbd', null, '↓'), ' to move'), h('span', { class: 'search-keys' }, h('kbd', null, 'Enter'), ' to open'),
+      h('span', null, icon('lock', 'ic'), 'Search words stay on this device'))) });
+  mdl.box.setAttribute('aria-label', 'Search');
   draw();
   input.focus();
   requestAnimationFrame(() => { if (document.activeElement !== input) input.focus(); });
-}
-// Load one older page into a store without touching the screen (for deep search).
-async function loadOlderQuiet(key) {
-  const store = S.msgs[key];
-  if (!store || !store.hasMore || !store.list.length) return;
-  const res = await api('GET', msgUrl(key) + `?before=${store.list[0].id}`);
-  await Promise.all(res.messages.map(decryptMessage));
-  store.list = [...res.messages, ...store.list];
-  store.hasMore = res.hasMore;
-  if (currentKey() === key) { const sc = $('#messages'); const prevH = sc.scrollHeight; const top = sc.scrollTop; renderMessages(false); sc.scrollTop = sc.scrollHeight - prevH + top; }
 }
 
 // ======================================================================= voice room

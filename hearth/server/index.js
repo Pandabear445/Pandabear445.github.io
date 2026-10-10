@@ -3619,6 +3619,8 @@ const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSett
 const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
   isMember, emitServer, seal, unseal, newId, brief, PM, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
   mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
+// Message search (server/search.js): filters by where, who and when; the search words stay in the app.
+require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();
