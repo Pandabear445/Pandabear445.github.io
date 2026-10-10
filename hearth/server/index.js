@@ -59,12 +59,13 @@ const wrap = (fn) => (req, res, next) => {
 // Small in-memory rate limiter: at most `max` hits per key per window. Sensitive routes check several keys at
 // once (the network it comes from, the account it targets, the session using it, and everyone together), so
 // switching IP addresses doesn't get around the account's limit and one account can't use up another's.
+// `cost` lets a limit count something other than requests (bytes sent, say); a cost of 0 only checks it.
 const buckets = new Map();
-function rateLimit(key, max, windowMs) {
+function rateLimit(key, max, windowMs, cost = 1) {
   const t = now();
   let b = buckets.get(key);
   if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
-  b.count += 1;
+  b.count += cost;
   if (b.count > max) {
     const wait = Math.ceil((b.reset - t) / 1000);
     fail(429, `Too many attempts. Try again in ${wait < 90 ? `${wait} seconds` : `${Math.ceil(wait / 60)} minutes`}.`, 'rate_limited', wait);
@@ -157,41 +158,44 @@ function selfUser(row) {
 // ---------------------------------------------------------------- end-to-end key state for a server
 // What one member needs to know: the current key epoch, their own wrapped keys, and who still
 // needs the current key. The server never sees the keys themselves.
-function keyState(serverId, userId) {
+// The part that's the same for every member (worked out once when it goes to everyone, see emitKeyState).
+function serverKeyInfo(serverId) {
   const s = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(serverId);
   if (!s) return null;
-  const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, e.key_check FROM server_keys k
-      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
-      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId)
-    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check }));
   const missing = s.key_epoch
     ? db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND NOT EXISTS
         (SELECT 1 FROM server_keys k WHERE k.server_id = m.server_id AND k.user_id = m.user_id AND k.epoch = ?)`)
       .all(serverId, s.key_epoch).map((r) => r.user_id)
     : [];
-  return { serverId, keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, keys, missing };
+  return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing };
 }
+function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
+  if (!info) return null;
+  const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, e.key_check FROM server_keys k
+      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
+      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId)
+    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check }));
+  return { serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing };
+}
+// Is this person connected right now? Updates for anyone who isn't would go nowhere (they get the current state
+// when their app starts), so a big server's fan-out only does work for the people actually online.
+const connected = (userId) => io.sockets.adapter.rooms.has(`user:${userId}`);
 function emitKeyState(serverId) {
+  const info = serverKeyInfo(serverId);
+  if (!info) return;
   db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
-    .forEach((m) => io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id)));
+    .forEach((m) => { if (connected(m.user_id)) io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id, info)); });
 }
 
 const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined });
 const THEME_DEFAULT = { accent: '', banner: '', bannerCrop: null, background: { kind: 'none' }, welcome: '', roleColors: true, iconShape: 'rounded' };
 const themeOf = (s) => { try { return { ...THEME_DEFAULT, ...JSON.parse(s.theme || '{}') }; } catch { return { ...THEME_DEFAULT }; } };
-// What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
 const NEWS_BOT_ID = require('./newsbot').BOT_ID;
-function serializeServer(s, uid) {
-  const myBase = perms.base(s, uid);
-  const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
-  const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id)
-    .map((c) => ({ c, p: perms.channel(s, c, uid) }))
-    .filter(({ p }) => p & PM.VIEW_CHANNEL)
-    .map(({ c, p }) => ({
-      ...serializeChannel(c), perms: p,
-      overrides: manage ? db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?').all(c.id) : undefined,
-    }));
-  const mrows = db.prepare('SELECT user_id FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id);
+// The parts of a server that look the same to every member. Sending an update to everyone reads these once,
+// not once per member (that made a big server's updates cost members × members).
+function serverCommon(s) {
+  const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id);
+  const memberIds = db.prepare('SELECT user_id FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id).map((r) => r.user_id);
   const memberRoles = {};
   db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
     WHERE mr.server_id = ?`).all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
@@ -201,20 +205,43 @@ function serializeServer(s, uid) {
   let categoryOrder = [];
   try { categoryOrder = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
   const out = {
-    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: mrows.map((r) => r.user_id),
-    roleDefs, memberRoles, myPerms: myBase, emojis, theme: themeOf(s), description: s.description || '', categoryOrder,
+    channels, memberIds, memberRoles, roleDefs, emojis, categoryOrder,
     // Bots working for this server (shown in the member list like on Discord): the news bot while it follows something.
     bots: db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : [],
     // This server sells memberships (the app shows "Memberships" in its menu); owners see the tab either way.
     memberships: s.kind !== 'group' && MEMB.offers(s.id),
     membershipsOn: s.kind !== 'group' && MEMB.usable(),
   };
-  if (out.kind === 'group') {
-    const last = db.prepare(`SELECT m.* FROM messages m JOIN channels c ON c.id = m.channel_id
-      WHERE c.server_id = ? AND m.thread_id IS NULL ORDER BY m.id DESC LIMIT 1`).get(s.id);
+  if ((s.kind || 'server') === 'group') {
+    // The newest message, looked up channel by channel (the channel index). Joining on the group's id instead made
+    // SQLite walk every top-level message on the whole instance until it reached one from this group.
+    let last = null;
+    for (const c of channels) {
+      const m = db.prepare('SELECT * FROM messages WHERE channel_id = ? AND thread_id IS NULL ORDER BY id DESC LIMIT 1').get(c.id);
+      if (m && (!last || m.id > last.id)) last = m;
+    }
     out.last = last ? { id: last.id, authorId: last.author_id, channelId: last.channel_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null;
     out.lastMessageAt = last ? last.created_at : s.created_at;
   }
+  return out;
+}
+// What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
+function serializeServer(s, uid, common = serverCommon(s)) {
+  const myBase = perms.base(s, uid);
+  const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
+  const channels = common.channels
+    .map((c) => ({ c, p: perms.channel(s, c, uid) }))
+    .filter(({ p }) => p & PM.VIEW_CHANNEL)
+    .map(({ c, p }) => ({
+      ...serializeChannel(c), perms: p,
+      overrides: manage ? db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?').all(c.id) : undefined,
+    }));
+  const out = {
+    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: common.memberIds,
+    roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder,
+    bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
+  };
+  if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
   return out;
 }
 // Everyone gets their own view (private channels and permissions differ per person). Every change to roles,
@@ -224,8 +251,10 @@ const emitServer = (serverId) => {
   const row = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
   if (!row) return;
   recheckVoice(row);
-  db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
-    .forEach((m) => io.to(`user:${m.user_id}`).emit('server:update', serializeServer(row, m.user_id)));
+  const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
+  if (!online.length) return;
+  const common = serverCommon(row);
+  online.forEach((uid) => io.to(`user:${uid}`).emit('server:update', serializeServer(row, uid, common)));
 };
 // Permissions are checked when someone joins a call, and again here after anything that can change them: whoever
 // can no longer see the channel or connect to it (or is no longer a member) leaves the call, and anyone whose
@@ -251,12 +280,17 @@ function recheckVoice(srv) {
 function reactionsFor(ids) {
   const map = {};
   if (!ids.length) return map;
-  const rows = db.prepare(`SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at`).all(...ids);
-  for (const r of rows) {
-    const list = (map[r.message_id] ||= []);
-    let entry = list.find((e) => e.emoji === r.emoji);
-    if (!entry) { entry = { emoji: r.emoji, userIds: [] }; list.push(entry); }
-    entry.userIds.push(r.user_id);
+  // In slices: SQLite refuses a query with more than 32766 placeholders. All of a message's reactions are in one
+  // slice, so sorting each slice keeps them in the order they were added. Rows are taken one at a time: a page can
+  // have hundreds of thousands, and spreading that many into one call overflows the stack.
+  for (let i = 0; i < ids.length; i += 500) {
+    const part = ids.slice(i, i + 500);
+    for (const r of db.prepare(`SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${part.map(() => '?').join(',')}) ORDER BY created_at`).iterate(...part)) {
+      const list = (map[r.message_id] ||= []);
+      let entry = list.find((e) => e.emoji === r.emoji);
+      if (!entry) { entry = { emoji: r.emoji, userIds: [] }; list.push(entry); }
+      entry.userIds.push(r.user_id);
+    }
   }
   return map;
 }
@@ -697,6 +731,23 @@ function purgeServerContent(s) {
   [s.icon, th.banner, th.background && th.background.image, ...db.prepare('SELECT url FROM emojis WHERE server_id = ?').all(s.id).map((e) => e.url)]
     .forEach((u) => { if (typeof u === 'string') removeUpload(u); });
 }
+// Deletes a channel message, with its thread's replies if it starts one, their reactions, poll votes and files. The rows
+// are picked with subqueries (a thread can have more replies than SQLite allows placeholders in one query) and go in
+// one transaction; the files are removed only once that has committed, so a failure can't leave a message behind
+// whose attachments are already gone.
+function deleteMessageTree(id) {
+  const tree = 'SELECT id FROM messages WHERE id = ? OR thread_id = ?';
+  const files = db.prepare(`SELECT name FROM blobs WHERE message_id IN (${tree})`).all(id, id).map((b) => '/uploads/' + b.name);
+  // Older, server-encrypted messages keep their attachment list in the sealed body.
+  db.prepare('SELECT body FROM messages WHERE (id = ? OR thread_id = ?) AND ciphertext IS NULL').all(id, id)
+    .forEach((m) => (unseal(m.body).attachments || []).forEach((a) => files.push(a.url)));
+  db.transaction(() => {
+    db.prepare(`DELETE FROM blobs WHERE message_id IN (${tree})`).run(id, id);
+    for (const x of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${x} WHERE message_id IN (${tree})`).run(id, id);
+    db.prepare('DELETE FROM messages WHERE id = ? OR thread_id = ?').run(id, id);
+  })();
+  files.forEach((u) => removeUpload(u));
+}
 // Blobs uploaded but never attached to a message (abandoned sends) are removed after a day.
 setInterval(() => {
   const old = db.prepare('SELECT name FROM blobs WHERE message_id IS NULL AND created_at < ?').all(Date.now() - 24 * 3600 * 1000);
@@ -969,10 +1020,20 @@ api.use((req, res, next) => {
     if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return json(body);
     const text = JSON.stringify(body);
     if (text === undefined || text.length < 4096) return json(body);
-    res.setHeader('Content-Encoding', 'gzip');
-    res.setHeader('Vary', 'Accept-Encoding');
-    res.type('application/json');
-    return res.end(zlib.gzipSync(text, { level: 4 }));
+    const send = (buf) => {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.type('application/json');
+      res.end(buf);
+    };
+    if (text.length < 256 * 1024) return send(zlib.gzipSync(text, { level: 4 }));
+    // Big answers are compressed off the main thread, so everyone else's requests don't wait for it.
+    zlib.gzip(text, { level: 4 }, (err, buf) => {
+      if (res.headersSent) return;
+      if (err) { res.type('application/json'); return res.end(text); }
+      send(buf);
+    });
+    return res;
   };
   next();
 });
@@ -1767,6 +1828,9 @@ api.delete('/servers/:id', auth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// Leaving is never rate limited. Every leave needs a membership, which for a server takes a join (limited below), and
+// a group never has more than GROUP_MAX people to tell. A limit here would also trap people: anyone in a group can
+// add you back, so someone could re-add you faster than you were allowed to leave.
 api.post('/servers/:id/leave', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   if (s.kind === 'group' && s.owner_id === req.userId) {
@@ -1778,7 +1842,10 @@ api.post('/servers/:id/leave', auth, (req, res) => {
   if (s.kind === 'group' && !left) {
     purgeServerContent(s);
     db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
-  } else emitServer(s.id);
+  }
+  // A server's members already got member:remove (their apps drop the person from the list). A group may also
+  // have a new owner, so its members get the whole group again.
+  else if (s.kind === 'group') emitServer(s.id);
   res.json({ ok: true });
 });
 
@@ -1921,11 +1988,16 @@ api.get('/invites/:code', auth, (req, res) => {
   res.json({ serverId: s.id, name: s.name, icon: s.icon, memberCount: count, alreadyMember: isMember(s.id, req.userId) });
 });
 
+// Joining updates everyone in the server (and their keys), so it's limited: a script that joins and leaves a big
+// community in a loop would otherwise keep the whole instance busy.
 api.post('/invites/:code/join', auth, (req, res) => {
+  rateLimit('join:' + req.userId, 20, 3600000);
+  limitNet(req, 'join', 60, 3600000);
   const inv = validInvite(req.params.code);
   const sid = inv.server_id;
   if (db.prepare('SELECT 1 FROM bans WHERE server_id = ? AND user_id = ?').get(sid, req.userId)) fail(403, 'You are banned from this server.');
-  if (!isMember(sid, req.userId)) {
+  const joined = !isMember(sid, req.userId);
+  if (joined) {
     db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(sid, req.userId, now());
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(inv.code);
     io.to(`server:${sid}`).emit('member:add', { serverId: sid, user: publicUser(getUserRow(req.userId)) });
@@ -1938,7 +2010,8 @@ api.post('/invites/:code/join', auth, (req, res) => {
   const voice = {};
   server.channels.filter((c) => c.type === 'voice').forEach((c) => { voice[c.id] = voiceStateList(c.id); });
   io.to(`user:${req.userId}`).emit('server:add', { server, users, voice, keyState: keyState(sid, req.userId) });
-  emitKeyState(sid);
+  // Someone new needs the server key, so the members holding it hear about that (nothing changed if they were in already).
+  if (joined) emitKeyState(sid);
   res.json({ ...server, keyState: keyState(sid, req.userId) });
 });
 
@@ -2093,7 +2166,8 @@ const MAX_MESSAGE = 4000;
 
 // Page through a conversation: newest (default), ?before=id (older), ?after=id (newer) or ?around=id (jump).
 function pageRows(table, col, containerId, q, extra = '') {
-  const limit = Math.min(100, parseInt(q.limit || '50', 10) || 50);
+  // Between 1 and 100 (SQLite reads a negative LIMIT as "no limit": the whole history in one go).
+  const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 50));
   const base = `SELECT * FROM ${table} WHERE ${col} = ? ${extra}`;
   if (q.around) {
     const older = db.prepare(`${base} AND id <= ? ORDER BY id DESC LIMIT 26`).all(containerId, String(q.around));
@@ -2212,10 +2286,7 @@ api.delete('/messages/:id', auth, (req, res) => {
   const c = requireChannel(m.channel_id, req.userId);
   const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (m.author_id !== req.userId && !canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You can only delete your own messages.');
-  const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((r) => r.id)];
-  forgetMessages(ids);
-  const q = ids.map(() => '?').join(',');
-  db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
+  deleteMessageTree(m.id);
   toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   if (m.thread_id) toChannel(c).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
   res.json({ ok: true });
@@ -2225,9 +2296,10 @@ api.get('/messages/:id/thread', auth, (req, res) => {
   const root = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!root || root.thread_id) fail(404, 'Thread not found.');
   const c = requireChannel(root.channel_id, req.userId);
-  const rows = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY id').all(root.id);
+  // Paged like a channel (newest replies first, ?before=id for older ones): a thread can be any size.
+  const { rows, hasMore, hasNewer } = pageRows('messages', 'thread_id', root.id, { limit: '100', ...req.query });
   const reactions = reactionsFor([root.id, ...rows.map((r) => r.id)]);
-  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)) });
+  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)), hasMore, hasNewer });
 });
 
 // Where does a message live? Used by message links, search results and notifications.
@@ -3862,10 +3934,7 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   if (m) {
     const above = db.prepare('SELECT DISTINCT author_id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.author_id).find((a) => !outranks(a));
     if (above) fail(403, `This thread has replies by ${staffRole(above) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them has to remove it.`);
-    const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.id)];
-    forgetMessages(ids);
-    const q = ids.map(() => '?').join(',');
-    db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
+    deleteMessageTree(m.id);
     if (c) toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   } else {
     const dm = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(d.dm_id);

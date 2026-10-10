@@ -918,6 +918,7 @@ mark { background: rgb(var(--accent-rgb) / .35); color: inherit; border-radius: 
 .thread-list .msg-tools { right: 8px; }
 .thread-divider { display: flex; align-items: center; gap: 10px; margin: 8px 16px; font-size: 12px; font-weight: 600; color: var(--muted); }
 .thread-divider::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.thread-list > .btn { margin: 0 16px 8px; }
 
 /* ------------------------------------------------------------------ popovers, menus, pickers */
 #layer > * { z-index: 40; }

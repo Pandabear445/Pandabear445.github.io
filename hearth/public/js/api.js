@@ -23,6 +23,7 @@ export async function api(method, path, body) {
     const e = new Error(data.error || `Request failed (${r.status})`);
     e.status = r.status;
     e.code = data.code;
+    e.retryAfter = Number(r.headers.get('Retry-After')) || 0; // seconds, on 429
     throw e;
   }
   return data;

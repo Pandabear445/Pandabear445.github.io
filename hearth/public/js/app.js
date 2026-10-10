@@ -565,7 +565,7 @@ function startApp() {
     if (!S.view.serverId) renderSidebar();
   });
   socket.on('rail:update', ({ rail }) => folders.applyRemote(rail));
-  socket.on('study:changed', () => { if (S.me.studyEnabled) study.onRemoteChange(); });
+  socket.on('study:changed', (p) => { if (S.me.studyEnabled) study.onRemoteChange(p); });
   socket.on('study:enabled', ({ enabled }) => { S.me.studyEnabled = enabled; if (!S.view.serverId) renderSidebar(); });
   socket.on('updates:new', (p) => { updates.onNew(p); if (S.view.type === 'updates') renderMain(); });
   socket.on('server:update', (server) => {
@@ -628,7 +628,7 @@ function startApp() {
   socket.on('message:delete', ({ id, channelId, threadId }) => {
     if (threadId) {
       const t = S.threads[threadId];
-      if (t) { t.list = t.list.filter((x) => x.id !== id); if (S.thread && S.thread.rootId === threadId) renderPanel(); }
+      if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); if (S.thread && S.thread.rootId === threadId) renderPanel(); }
     } else onDeleteMessage('c:' + channelId, id);
   });
   socket.on('thread:update', ({ rootId, channelId, threadCount, threadLastAt }) => {
@@ -2897,8 +2897,10 @@ async function openThread(root, focusId) {
   document.body.classList.add('panel-open');
   renderPanel(); renderHeader();
   try {
-    const res = await api('GET', `/messages/${root.id}/thread`);
-    const t = { root: res.root, list: res.messages, loaded: true };
+    // Threads come a page at a time, newest replies first. Opening one at a linked reply asks for the page around it
+    // instead (there may be newer replies after that page: see loadNewerReplies).
+    const res = await api('GET', `/messages/${root.id}/thread?${focusId ? `around=${encodeURIComponent(focusId)}` : 'limit=100'}`);
+    const t = { root: res.root, list: res.messages, loaded: true, hasMore: !!res.hasMore, hasNewer: !!res.hasNewer, total: Math.max(res.messages.length, res.root.threadCount || 0) };
     await Promise.all([t.root, ...t.list].map(decryptMessage));
     S.threads[root.id] = t;
     if (S.thread && S.thread.rootId === root.id) renderPanel();
@@ -2914,14 +2916,23 @@ function closeThread() {
 async function onThreadMessage(m) {
   await decryptMessage(m);
   const t = S.threads[m.threadId];
-  if (t && !t.list.find((x) => x.id === m.id)) {
+  if (t && t.hasNewer && !t.list.find((x) => x.id === m.id)) {
+    // Showing an older part of the thread: a new reply doesn't belong right after it. Your own reply takes you to
+    // the newest replies (where it is); anyone else's just counts.
+    t.total = (t.total || 0) + 1;
+    if (S.thread && S.thread.rootId === m.threadId) {
+      if (m.authorId === S.me.id && !t.jumping) loadNewestReplies();
+      else { const div = $('.thread-list .thread-divider span'); if (div) div.textContent = threadCountLabel(t); }
+    }
+  } else if (t && !t.list.find((x) => x.id === m.id)) {
     t.list.push(m);
+    t.total = (t.total || 0) + 1;
     if (S.thread && S.thread.rootId === m.threadId) {
       const list = $('.thread-list');
       if (list) {
         list.append(messageEl(m, t.list[t.list.length - 2] || null, 'thread'));
         const div = list.querySelector('.thread-divider span');
-        if (div) div.textContent = `${t.list.length} ${t.list.length === 1 ? 'reply' : 'replies'}`;
+        if (div) div.textContent = threadCountLabel(t);
         list.scrollTop = list.scrollHeight;
       }
     }
@@ -3102,18 +3113,70 @@ function threadPanel(el) {
   const list = h('div', { class: 'thread-list', role: 'log', 'aria-label': 'Thread messages' });
   list.addEventListener('click', onMessageAreaClick);
   list.append(messageEl(t.root, null, 'thread'));
-  list.append(h('div', { class: 'thread-divider' }, h('span', null, t.list.length ? `${t.list.length} ${t.list.length === 1 ? 'reply' : 'replies'}` : 'No replies yet')));
+  list.append(h('div', { class: 'thread-divider' }, h('span', null, threadCountLabel(t))));
+  if (t.hasMore) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadOlderReplies(e.currentTarget) }, 'Show earlier replies'));
   let prev = null;
   t.list.forEach((m) => { list.append(messageEl(m, prev, 'thread')); prev = m; });
+  if (t.hasNewer) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadNewerReplies(e.currentTarget) }, 'Show newer replies'));
   const comp = createComposer({ id: 'thread', key: () => 'c:' + S.thread.channelId, threadId: () => S.thread.rootId, placeholder: 'Reply in thread\u2026' });
   composers.thread = comp;
   el.append(list, comp.el);
   comp.renderExtras();
   requestAnimationFrame(() => {
-    list.scrollTop = list.scrollHeight;
+    // After "Show earlier replies", stay where the reader was instead of jumping to the newest reply.
+    const keep = S.thread && S.thread.keepId && list.querySelector(`[data-mid="${S.thread.keepId}"]`);
+    if (keep) { keep.scrollIntoView({ block: 'start' }); S.thread.keepId = null; } else list.scrollTop = list.scrollHeight;
     if (S.thread && S.thread.focusId) { const f = list.querySelector(`[data-mid="${S.thread.focusId}"]`); if (f) flash(f); S.thread.focusId = null; }
-    comp.focus();
+    if (!keep) comp.focus();
   });
+}
+// "12 replies": with only part of the thread loaded, the count comes from the server.
+function threadCountLabel(t) {
+  const n = t.hasMore || t.hasNewer ? Math.max(t.list.length, t.total || 0) : t.list.length;
+  return n ? `${n} ${n === 1 ? 'reply' : 'replies'}` : 'No replies yet';
+}
+async function loadOlderReplies(btn) {
+  const t = S.thread && S.threads[S.thread.rootId];
+  if (!t || !t.hasMore || !t.list.length) return;
+  btn.disabled = true;
+  try {
+    const rootId = S.thread.rootId;
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100&before=${encodeURIComponent(t.list[0].id)}`);
+    await Promise.all(res.messages.map(decryptMessage));
+    const have = new Set(t.list.map((m) => m.id));
+    t.list = [...res.messages.filter((m) => !have.has(m.id)), ...t.list];
+    t.hasMore = !!res.hasMore;
+    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = [...have][0]; renderPanel(); }
+  } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+}
+// After opening a thread at an older reply: the next page of newer ones.
+async function loadNewerReplies(btn) {
+  const t = S.thread && S.threads[S.thread.rootId];
+  if (!t || !t.hasNewer || !t.list.length) return;
+  btn.disabled = true;
+  try {
+    const rootId = S.thread.rootId;
+    const last = t.list[t.list.length - 1].id;
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100&after=${encodeURIComponent(last)}`);
+    await Promise.all(res.messages.map(decryptMessage));
+    const have = new Set(t.list.map((m) => m.id));
+    t.list = [...t.list, ...res.messages.filter((m) => !have.has(m.id))];
+    t.hasNewer = !!res.hasNewer;
+    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = last; renderPanel(); }
+  } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
+}
+// Straight to the newest replies (after you reply while an older part of the thread is showing).
+async function loadNewestReplies() {
+  const rootId = S.thread && S.thread.rootId;
+  const t = rootId && S.threads[rootId];
+  if (!t) return;
+  t.jumping = true; // your reply arrives twice (the answer and the socket): one reload is enough
+  try {
+    const res = await api('GET', `/messages/${rootId}/thread?limit=100`);
+    await Promise.all(res.messages.map(decryptMessage));
+    Object.assign(t, { list: res.messages, hasMore: !!res.hasMore, hasNewer: false, total: Math.max(res.messages.length, res.root.threadCount || 0) });
+    if (S.thread && S.thread.rootId === rootId) renderPanel();
+  } catch (e) { toast(e.message, 'error'); } finally { t.jumping = false; }
 }
 
 // ======================================================================= composer

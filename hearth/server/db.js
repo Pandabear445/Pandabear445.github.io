@@ -8,25 +8,62 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..',
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'hearth.db'));
-db.pragma('journal_mode = WAL');
+const DB_FILE = path.join(DATA_DIR, 'hearth.db');
+const db = new Database(DB_FILE);
 
 // ---------- safety: back up the database before any upgrade changes its structure ----------
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 const fromVersion = db.pragma('user_version', { simple: true });
+// v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
+// restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
+// new data, so refuse to start, without touching the file, and say how to get back.
+if (fromVersion > SCHEMA_VERSION) {
+  db.close();
+  const err = new Error(`This database (${DB_FILE}) was written by a newer version of Hearth (database version ${fromVersion}; this version understands up to ${SCHEMA_VERSION}). `
+    + `Install that newer version again, or stop Hearth and restore the copy made before that upgrade (${path.join(DATA_DIR, 'backups', `hearth-before-v${fromVersion}-*.db`)}).`);
+  err.code = 'HEARTH_DB_TOO_NEW';
+  throw err;
+}
+db.pragma('journal_mode = WAL');
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
 if (hasData && fromVersion < SCHEMA_VERSION) {
   const dir = path.join(DATA_DIR, 'backups');
   fs.mkdirSync(dir, { recursive: true });
-  db.pragma('wal_checkpoint(TRUNCATE)');
-  const file = path.join(dir, `hearth-before-v${SCHEMA_VERSION}-${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
-  fs.copyFileSync(path.join(DATA_DIR, 'hearth.db'), file);
-  console.log(`Backed up the database before upgrading: ${file}`);
+  const prefix = `hearth-before-v${SCHEMA_VERSION}-`;
+  // v17 (data): an upgrade either finishes or changes nothing (it runs as one transaction, below). So a copy made
+  // after the data last changed is still exact, and a server stuck restarting on a failing upgrade (Docker and
+  // systemd restart it) doesn't write another full copy of the database on every attempt. Writing everything
+  // into the main file first makes its timestamps say when the data last changed (the change time too, which a
+  // file put back with its old dates, e.g. from a tar archive, still updates).
+  const ck = db.pragma('wal_checkpoint(TRUNCATE)')[0] || {};
+  const wal = `${DB_FILE}-wal`;
+  const settled = ck.busy === 0 && (!fs.existsSync(wal) || fs.statSync(wal).size === 0);
+  const st = fs.statSync(DB_FILE);
+  const changedAt = Math.max(st.mtimeMs, st.ctimeMs);
+  for (const f of fs.readdirSync(dir)) if (f.startsWith('hearth-before-') && f.endsWith('.partial')) fs.rmSync(path.join(dir, f), { force: true });
+  const fresh = settled && fs.readdirSync(dir).find((f) => f.startsWith(prefix) && f.endsWith('.db') && fs.statSync(path.join(dir, f)).mtimeMs > changedAt);
+  if (fresh) console.log(`The database was already backed up before this upgrade: ${path.join(dir, fresh)}`);
+  else {
+    // VACUUM INTO makes a consistent copy through SQLite (even if something else has the file open). It's written
+    // under a temporary name first, so a copy that was cut short is never taken for a complete one.
+    const file = path.join(dir, `${prefix}${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
+    try {
+      db.prepare('VACUUM INTO ?').run(`${file}.partial`);
+      fs.renameSync(`${file}.partial`, file);
+    } catch (e) { fs.rmSync(`${file}.partial`, { force: true }); throw e; }
+    console.log(`Backed up the database before upgrading: ${file}`);
+  }
 }
 db.pragma('foreign_keys = ON');
+
+// v17 (data): every step from here to the version bump at the end runs in one transaction. An upgrade that's cut
+// short (killed, out of memory, power cut) then leaves the database exactly as it was and simply runs again on the
+// next start, instead of leaving it half-changed with the old version number (which could stop it ever starting).
+// So nothing below may use VACUUM or change journal_mode/foreign_keys: SQLite doesn't allow those in a transaction.
+db.exec('BEGIN IMMEDIATE');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -309,8 +346,10 @@ if (fromVersion < 5) {
       }
       const admins = db.prepare(`SELECT user_id FROM members WHERE server_id = ? AND role = 'admin'`).all(srv.id);
       if (admins.length) {
-        const rid = newId();
-        db.prepare(`INSERT INTO roles (id, server_id, name, color, position, permissions, hoist, mentionable, created_at) VALUES (?, ?, 'Admin', '#f2a541', 1, ?, 1, 1, ?)`).run(rid, srv.id, PERMS.ADMINISTRATOR, Date.now());
+        // Run again (older releases could be stopped part-way through an upgrade)? Reuse the Admin role made last time.
+        const made = db.prepare(`SELECT id FROM roles WHERE server_id = ? AND name = 'Admin' AND position = 1 AND permissions = ?`).get(srv.id, PERMS.ADMINISTRATOR);
+        const rid = made ? made.id : newId();
+        if (!made) db.prepare(`INSERT INTO roles (id, server_id, name, color, position, permissions, hoist, mentionable, created_at) VALUES (?, ?, 'Admin', '#f2a541', 1, ?, 1, 1, ?)`).run(rid, srv.id, PERMS.ADMINISTRATOR, Date.now());
         admins.forEach((a) => db.prepare('INSERT OR IGNORE INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(srv.id, a.user_id, rid));
       }
     }
@@ -494,7 +533,9 @@ addColumn('users', 'stripe_customer', 'TEXT');
 
 // v12: sessions are stored as SHA-256 fingerprints of their tokens (see auth() in index.js). Existing raw tokens
 // are converted once, so nobody gets signed out by the upgrade.
-if (hasData && fromVersion < 12) {
+// Only while the raw-token column is still there: a database whose upgrade was cut short after v13 renamed it
+// would otherwise fail here on every start.
+if (hasData && fromVersion < 12 && db.prepare('PRAGMA table_info(sessions)').all().some((c) => c.name === 'token')) {
   const rows = db.prepare('SELECT rowid, token FROM sessions').all();
   const upd = db.prepare('UPDATE sessions SET token = ? WHERE rowid = ?');
   db.transaction(() => { for (const r of rows) upd.run(require('crypto').createHash('sha256').update(String(r.token)).digest('hex'), r.rowid); })();
@@ -880,10 +921,25 @@ function auditVerify() {
   }
 }
 
+
+// v17 (data): indexes for lookups that run on every connection, start-up and server update but used to read whole
+// tables: someone's servers (and who they share one with), their DMs and friend requests, a server's channels, one
+// member's server keys, and reports about one account (the admin user list).
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id, server_id);
+CREATE INDEX IF NOT EXISTS idx_channels_server ON channels(server_id, position, created_at);
+CREATE INDEX IF NOT EXISTS idx_dm_channels_b ON dm_channels(user_b);
+CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_id);
+CREATE INDEX IF NOT EXISTS idx_server_keys_user ON server_keys(server_id, user_id, epoch);
+CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_id);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
+db.exec('COMMIT');
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
-// hundreds of them, many run per message). Statements are only used with get/all/run, so sharing is safe.
+// hundreds of them, many run per message). Statements are only used with get/all/run (or an iterate() loop that
+// finishes before anything else runs), so sharing is safe.
 // Queries built with a variable number of placeholders stop being cached once the cache is full.
 const compile = db.prepare.bind(db);
 const statements = new Map();
@@ -893,4 +949,4 @@ db.prepare = (sql) => {
   return st;
 };
 
-module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret };
+module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION };

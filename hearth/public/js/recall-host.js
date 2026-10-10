@@ -34,26 +34,41 @@ export function createRecall(ctx) {
   const $ = (sel) => document.querySelector(sel);
   const pending = new Map(); // item id -> timer
   const saved = new Map(); // item id -> JSON last uploaded (skip saves that change nothing)
+  const mine = new Set(); // updatedAt of this tab's own saves (see onChanged)
   let warnedBig = false;
 
   // ------------------------------------------------------------------ encrypted sync
   async function vkey() { if (!key) key = await E2EE.vaultKey(ctx.S.privateKey, ctx.S.me.publicKey); return key; }
   // Pull everything changed since last time. Returns the ids that changed (deleted ones included).
+  // The server answers a page at a time (`more` = there's another), and everything has to be in before the first
+  // load counts as done: tidying up (migrate, unused pictures) on half a list would overwrite or delete the rest.
   function sync() {
     if (loading) return loading;
     loading = (async () => {
-      const r = await api('GET', `/me/study?since=${since}`);
       const k = await vkey();
       const changed = [];
-      for (const it of r.items) {
-        since = Math.max(since, it.updatedAt);
-        if (it.deleted) { if (items.delete(it.id)) changed.push(it.id); continue; }
-        try {
-          const obj = await E2EE.openVault(k, it.kind, it.id, it.data);
-          items.set(it.id, { kind: it.kind, obj, updatedAt: it.updatedAt });
-          saved.set(it.id, JSON.stringify(obj));
-          changed.push(it.id);
-        } catch { /* unreadable (made before a reset with new keys) */ }
+      for (let more = true, waits = 0; more;) {
+        let r;
+        try { r = await api('GET', `/me/study?since=${since}&paged=1`); } catch (e) {
+          // Too many syncs just now (several devices busy at once): the first load waits its turn instead of failing.
+          if (!loaded && e.status === 429 && waits++ < 3) { await new Promise((ok) => setTimeout(ok, Math.min(60, e.retryAfter || 5) * 1000)); continue; }
+          if (!loaded) throw e;
+          break; // later pages come with the next sync
+        }
+        for (const it of r.items) {
+          since = Math.max(since, it.updatedAt);
+          if (it.deleted) { if (items.delete(it.id)) changed.push(it.id); continue; }
+          try {
+            const obj = await E2EE.openVault(k, it.kind, it.id, it.data);
+            const json = JSON.stringify(obj);
+            // Exactly what this tab has (its own save coming back): nothing to tell Recall.
+            const same = items.has(it.id) && saved.get(it.id) === json;
+            items.set(it.id, { kind: it.kind, obj, updatedAt: it.updatedAt });
+            saved.set(it.id, json);
+            if (!same) changed.push(it.id);
+          } catch { /* unreadable (made before a reset with new keys) */ }
+        }
+        more = !!r.more && r.items.length > 0;
       }
       loaded = true;
       return changed;
@@ -67,10 +82,12 @@ export function createRecall(ctx) {
     const r = await api('PUT', `/me/study/${id}`, { kind, data });
     items.set(id, { kind, obj, updatedAt: r.updatedAt });
     saved.set(id, json);
+    ownChange(r.updatedAt);
   }
   async function del(id) {
     items.delete(id); saved.delete(id);
-    await api('DELETE', `/me/study/${id}`).catch(() => {});
+    const r = await api('DELETE', `/me/study/${id}`).catch(() => null);
+    if (r) ownChange(r.updatedAt);
   }
   const deckItemId = (deckId) => 'r-' + deckId;
 
@@ -185,6 +202,24 @@ export function createRecall(ctx) {
   }
   addEventListener('message', (e) => { onMessage(e); });
 
+  // The server tells every open session about every save (study:changed, with since = the save's updatedAt - 1),
+  // this tab's own included. Those are skipped, and the rest are fetched at most once a second: a study round on
+  // another device saves its deck and profile every second or so, and each would otherwise be a request.
+  function ownChange(t) { mine.add(t); if (mine.size > 200) mine.delete(mine.values().next().value); }
+  let heard = []; let heardTimer = null; let applying = Promise.resolve();
+  function onChanged(p) {
+    heard.push(Number(p && p.since) + 1);
+    if (heardTimer) return;
+    heardTimer = setTimeout(() => {
+      heardTimer = null;
+      const times = heard; heard = [];
+      const theirs = times.filter((t) => !mine.has(t));
+      times.forEach((t) => mine.delete(t));
+      // One at a time, so a sync never reuses one that started before the change it's for.
+      if (theirs.length) applying = applying.then(onRemoteChange).catch(() => {});
+    }, 1000);
+  }
+
   // Another device saved something: pass the decks that changed on to Recall.
   async function onRemoteChange() {
     if (!loaded) return;
@@ -244,5 +279,5 @@ export function createRecall(ctx) {
     return host;
   }
 
-  return { view, settingsSection, onRemoteChange: () => onRemoteChange().catch(() => {}) };
+  return { view, settingsSection, onRemoteChange: onChanged };
 }
