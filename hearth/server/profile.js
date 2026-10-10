@@ -48,9 +48,12 @@ const pick = (v, list, fallback) => (list.includes(v) ? v : fallback);
 
 const num = (v, min, max, d) => (Number.isFinite(+v) ? Math.min(max, Math.max(min, +v)) : d);
 // Up to 6 characters/emoji ("graphemes"), so flags and skin-tone emoji count as one.
+// One segmenter for the whole process: making one is slow, and this runs for every profile sent out (each person
+// in a big server's member list), not only when one is saved.
+const SEGMENTER = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter() : null;
 const graphemes = (v) => {
   const t = typeof v === 'string' ? v.replace(/[\u0000-\u001f<>]/g, '') : '';
-  const seg = typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter().segment(t)].map((x) => x.segment) : Array.from(t);
+  const seg = SEGMENTER ? [...SEGMENTER.segment(t)].map((x) => x.segment) : Array.from(t);
   return seg.filter((g) => g.trim()).slice(0, 6).join('');
 };
 const crop = (c) => ({ x: num(c && c.x, -200, 200, 0), y: num(c && c.y, -200, 200, 0), z: num(c && c.z, 1, 5, 1) });

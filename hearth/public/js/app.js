@@ -25,7 +25,7 @@ import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
-import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn } from './ui.js';
+import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn, markInvalid, clearInvalid, trapTab } from './ui.js';
 import { openSettings, applyAppearance, confirmedCall, displayNameDialog } from './settings.js';
 import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
@@ -34,6 +34,7 @@ import { openMemberships, membershipsTab } from './memberships.js';
 import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, quietNow } from './usability.js';
+import { trackViewport } from './viewport.js';
 
 // ======================================================================= state
 const S = {
@@ -154,6 +155,10 @@ init();
 async function init() {
   applyAppearance();
   setupServiceWorker();
+  trackViewport();
+  // "Skip to conversation": the first Tab stop, so keyboard users don't have to go through the server
+  // list and channels first.
+  $('#skip-main').onclick = () => { const c = $('#composer-input') || $('#messages') || $('#main'); if (c) c.focus(); };
   const resetToken = (location.hash.match(/^#reset=([A-Za-z0-9_-]{20,100})$/) || [])[1];
   if (resetToken) { history.replaceState(null, '', '/'); sessionStorage.setItem('hearth.resetToken', resetToken); } // keep it out of the address bar
   const m = location.pathname.match(/^\/invite\/([A-Za-z0-9]+)/);
@@ -241,6 +246,7 @@ function showAuth() {
     const btn = loginForm.querySelector('button[type=submit]');
     const err = loginForm.querySelector('.form-error');
     err.textContent = '';
+    [...loginForm.elements].forEach((x) => x.name && clearInvalid(x));
     btn.disabled = true; btn.textContent = 'Unlocking…';
     try {
       const username = loginForm.username.value.trim();
@@ -273,6 +279,9 @@ function showAuth() {
       await finishLogin(res, priv);
     } catch (ex) {
       err.textContent = ex.message;
+      // Point the error at the field it's about, so screen readers read them together.
+      const bad = /2fa|code/i.test(ex.code || '') && !totpField.hidden ? loginForm.totp : /captcha/i.test(ex.code || '') ? null : loginForm.password;
+      if (bad) markInvalid(bad, err);
     } finally { btn.disabled = false; btn.textContent = 'Log in'; }
   };
 
@@ -281,10 +290,12 @@ function showAuth() {
     const btn = regForm.querySelector('button[type=submit]');
     const err = regForm.querySelector('.form-error');
     err.textContent = '';
+    [...regForm.elements].forEach((x) => x.name && clearInvalid(x));
     const username = regForm.username.value.trim();
     const pw = regForm.password.value;
-    if (pw.length < 8) { err.textContent = 'Use at least 8 characters for your password.'; return; }
-    if (pw !== regForm.confirm.value) { err.textContent = 'The passwords do not match.'; return; }
+    const fail = (input, text) => { err.textContent = text; markInvalid(input, err); input.focus(); };
+    if (pw.length < 8) return fail(regForm.password, 'Use at least 8 characters for your password.');
+    if (pw !== regForm.confirm.value) return fail(regForm.confirm, 'The passwords do not match.');
     btn.disabled = true; btn.textContent = 'Creating your keys…';
     try {
       const kdfSalt = E2EE.newKdfSalt();
@@ -300,6 +311,8 @@ function showAuth() {
       await finishLogin(res, id.privateKey);
     } catch (ex) {
       err.textContent = ex.message;
+      const bad = /username|name/i.test(ex.message) ? regForm.username : /code/i.test(ex.code || ex.message) && regForm.code && !$('#reg-code-field').hidden ? regForm.code : null;
+      if (bad) markInvalid(bad, err);
     } finally { btn.disabled = false; btn.textContent = 'Create account'; }
   };
 }
@@ -518,6 +531,7 @@ function startApp() {
       $$(`[data-user-av="${id}"][data-status="1"] .status-dot`).forEach((d) => {
         d.className = d.className.replace(/\bst-\S+/, `st-${presence}`);
         d.title = STATUS_LABEL[presence] || '';
+        d.setAttribute('aria-label', STATUS_LABEL[presence] || '');
       });
     }
     if (!changed) return;
@@ -1357,7 +1371,9 @@ function globalKeys(e) {
   if ((e.ctrlKey || e.metaKey) && k === 'k') { e.preventDefault(); openSearch(); return; }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); stepChannel(e.key === 'ArrowUp' ? -1 : 1); }
   if (e.key === 'Escape' && !document.querySelector('.modal-backdrop, .popover')) {
-    if (S.editing) { S.editing = null; renderMessages(false); }
+    // Phones: the navigation drawer closes first, and focus goes back to the button that opened it.
+    if (document.body.classList.contains('nav-open')) { document.body.classList.remove('nav-open'); const t = $('.nav-toggle'); if (t) t.focus(); }
+    else if (S.editing) { S.editing = null; renderMessages(false); }
     else if (composers.main && composers.main.state.replyTo) composers.main.setReply(null);
     else if (S.panel === 'thread') closeThread();
   }
@@ -1907,7 +1923,7 @@ function statusMenu(anchor) {
         closePopover();
         try { await api('PATCH', '/me/status', { status: s }); S.me.status = s; S.users[S.me.id].status = s; renderUserPanel(); } catch (e) { toast(e.message, 'error'); }
       },
-    }, h('span', { class: `status-dot inline st-${s}` }), h('span', { class: 'menu-col' }, s === 'idle' ? 'Away' : STATUS_LABEL[s], desc[s] ? h('span', { class: 'menu-desc' }, desc[s]) : null))),
+    }, h('span', { class: `status-dot inline st-${s}`, 'aria-hidden': 'true' }), h('span', { class: 'menu-col' }, s === 'idle' ? 'Away' : STATUS_LABEL[s], desc[s] ? h('span', { class: 'menu-desc' }, desc[s]) : null))),
     h('div', { class: 'menu-sep' }),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openCustomStatus(); } }, icon('smile', 'ic menu-ic'), 'Set a custom status'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openActivityPicker(S.me.activity); } }, icon('gamepad', 'ic menu-ic'), 'Set what I\u2019m playing or listening to'),
@@ -1976,7 +1992,14 @@ function togglePanel(mode) {
 function renderHeader() {
   const head = $('#main-head');
   if (!head || !S.me) return;
+  // Redrawing replaces the buttons: keep keyboard focus on the same one ("Show members" becomes "Hide members").
+  const buttons = () => [...head.querySelectorAll('button')];
+  const at = buttons().indexOf(document.activeElement);
   clear(head);
+  drawHeader(head);
+  if (at >= 0 && buttons()[at]) buttons()[at].focus({ preventScroll: true });
+}
+function drawHeader(head) {
   head.append(navToggle());
   const v = S.view;
   const key = currentKey();
@@ -2337,6 +2360,7 @@ function chatView() {
   const scroller = h('div', { class: 'messages', id: 'messages', tabindex: '0', 'aria-label': 'Messages', role: 'log' });
   scroller.addEventListener('scroll', onMessagesScroll);
   scroller.addEventListener('click', onMessageAreaClick);
+  messageListKeys(scroller);
   const jump = h('button', { class: 'jump-latest', id: 'jump-latest', hidden: true, onclick: () => jumpToLatest() }, icon('arrowDown'), 'Jump to latest');
   const unreadBar = h('div', { class: 'unread-bar', id: 'unread-bar', role: 'status', hidden: true });
   const key = currentKey();
@@ -2390,10 +2414,11 @@ async function loadMessages(key, mode = 'latest') {
       const prevTop = sc.scrollTop;
       if (!prependOlder(sc, store, fresh)) renderMessages(false);
       sc.scrollTop = sc.scrollHeight - prevH + prevTop;
+      dropNewest(sc, store);
     } else if (mode === 'newer') {
-      const top = sc.scrollTop;
-      renderMessages(false);
-      sc.scrollTop = top;
+      // Coming back down: let go of the oldest ones instead, and keep what you're reading where it is.
+      if (store.list.length > HISTORY_WINDOW) { store.list.splice(0, store.list.length - HISTORY_WINDOW); store.hasMore = true; }
+      keepAnchor(sc, () => renderMessages(false));
     } else renderMessages(typeof mode !== 'object');
     if (!store.hasNewer) markRead(key);
   } catch (e) {
@@ -2407,6 +2432,38 @@ function trimStore(store, keep) {
   store.list.splice(0, store.list.length - keep);
   store.hasMore = true;
   return true;
+}
+// Reading far back: at most this many messages stay loaded and on screen. Scrolling up lets go of the newest
+// ones (they load again on the way down), so a long read back through history doesn't keep growing the page.
+const HISTORY_WINDOW = 300;
+function dropNewest(sc, store) {
+  if (store.list.length <= HISTORY_WINDOW) return false;
+  const gone = new Set(store.list.splice(HISTORY_WINDOW).map((m) => m.id));
+  store.hasNewer = true;
+  for (const el of sc.querySelectorAll(':scope > .msg[data-mid]')) if (gone.has(el.dataset.mid)) el.remove();
+  // Your own unsent messages and dividers left dangling at the bottom go too (they come back with the latest).
+  for (let el = sc.lastElementChild; el && !el.matches('.msg[data-mid]');) {
+    const prev = el.previousElementSibling;
+    if (el.matches('.day-div, .new-div, .msg.sending')) el.remove();
+    el = prev;
+  }
+  // The message keyboard focus was on may be gone: give the Tab order a current one again.
+  ensureCurrentMessage(sc);
+  const jl = $('#jump-latest');
+  if (jl) jl.hidden = false;
+  return true;
+}
+// Redraws with `fn` and keeps the first message in view at the same spot on screen.
+function keepAnchor(sc, fn) {
+  const top = sc.getBoundingClientRect().top;
+  const anchor = [...sc.querySelectorAll(':scope > .msg[data-mid]')].find((el) => el.getBoundingClientRect().bottom > top);
+  const id = anchor && anchor.dataset.mid;
+  const offset = anchor ? anchor.getBoundingClientRect().top - top : 0;
+  const before = sc.scrollTop;
+  fn();
+  const again = id && sc.querySelector(`.msg[data-mid="${id}"]`);
+  if (again) sc.scrollTop += again.getBoundingClientRect().top - top - offset;
+  else sc.scrollTop = before;
 }
 // Scrolling up: add just the older messages at the top instead of redrawing everything.
 function prependOlder(sc, store, fresh) {
@@ -2568,6 +2625,7 @@ function renderMessages(stick) {
   const jl = $('#jump-latest');
   if (jl) jl.hidden = !store.hasNewer;
   renderUnreadBar();
+  ensureCurrentMessage(sc);
   renderTyping();
 }
 // "12 new messages since 3:04 PM · Jump to first unread · Mark as read", above the messages while there's a
@@ -2718,7 +2776,60 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       m.threadLastAt ? h('span', null, `Last reply ${relTime(m.threadLastAt)}`) : null, icon('chevronRight')));
   }
   el.append(gutter, body, messageTools(m, ctx));
+  roveMessage(el, false);
   return el;
+}
+
+// ---- keyboard in message lists
+// One message at a time is in the Tab order, together with its links and buttons; ↑/↓, Home and End
+// move between messages. Otherwise Tab would walk through every message's toolbar to reach the composer.
+const ROVABLE = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
+function roveMessage(el, on) {
+  el.tabIndex = on ? 0 : -1;
+  if (on) {
+    for (const x of el.querySelectorAll('[data-roved]')) {
+      if (x.dataset.roved) x.setAttribute('tabindex', x.dataset.roved); else x.removeAttribute('tabindex');
+      delete x.dataset.roved;
+    }
+  } else {
+    for (const x of el.querySelectorAll(ROVABLE)) {
+      if (x.dataset.roved !== undefined) continue;
+      x.dataset.roved = x.getAttribute('tabindex') || '';
+      x.tabIndex = -1;
+    }
+  }
+}
+// Makes `msg` the list's current message (the one Tab reaches).
+function setCurrentMessage(list, msg) {
+  const cur = list.querySelector(':scope > .msg[tabindex="0"]');
+  if (cur === msg) return;
+  if (cur) roveMessage(cur, false);
+  if (msg) roveMessage(msg, true);
+}
+// After a redraw: keep the current message if it's still there, else the newest one.
+function ensureCurrentMessage(list) {
+  if (!list || list.querySelector(':scope > .msg[tabindex="0"]')) return;
+  const all = list.querySelectorAll(':scope > .msg[data-mid]');
+  if (all.length) setCurrentMessage(list, all[all.length - 1]);
+}
+function messageListKeys(list) {
+  list.addEventListener('focusin', (e) => {
+    const msg = e.target.closest('.msg[data-mid]');
+    if (msg && msg.parentElement === list) setCurrentMessage(list, msg);
+  });
+  list.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey || !['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    const msg = e.target.closest('.msg[data-mid]');
+    // Only from the message itself: arrows inside an edit box or a slider keep their usual meaning.
+    if (!msg || e.target !== msg) return;
+    const all = [...list.querySelectorAll(':scope > .msg[data-mid]')];
+    const i = all.indexOf(msg);
+    const next = e.key === 'Home' ? all[0] : e.key === 'End' ? all[all.length - 1] : all[i + (e.key === 'ArrowDown' ? 1 : -1)];
+    if (!next) return;
+    e.preventDefault();
+    next.focus({ preventScroll: true });
+    next.scrollIntoView({ block: 'nearest' });
+  });
 }
 // GIPHY media goes through our server (if the admin left the privacy proxy on), so GIPHY never sees viewers' IPs.
 const isGiphy = (u) => /^https:\/\/(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)\//i.test(u);
@@ -2782,7 +2893,11 @@ function replaceMessageEl(m) {
     const list = ctx === 'thread' ? threadList() : (S.msgs[keyOfMessage(m)] || { list: [] }).list;
     const i = list.findIndex((x) => x.id === m.id);
     const fresh = messageEl(m, i > 0 ? list[i - 1] : null, ctx);
+    const wasCurrent = el.tabIndex === 0;
+    const hadFocus = el.contains(document.activeElement);
     el.replaceWith(fresh);
+    if (wasCurrent) setCurrentMessage(fresh.parentElement, fresh);
+    if (hadFocus) fresh.focus({ preventScroll: true });
     if (S.editing === m.id) { const ta = fresh.querySelector('textarea'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }
   });
 }
@@ -3046,7 +3161,8 @@ function attachmentEl(f, m) {
     if (media === 'img') {
       el._full = fullWatched;
       el.addEventListener('click', () => openViewer(el, { name: f.name, download: () => downloadAttachment(m, f) }));
-      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.click(); });
+      // It's a button for screen readers and keyboards, so Enter and Space open it too.
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); } });
     }
     if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name, h('span', { class: 'att-size' }, fmtSize(f.size || 0))));
     holder.append(meter, mediaDownloadBtn(m, f));
@@ -3092,6 +3208,7 @@ function attachmentEl(f, m) {
 }
 
 function openViewer(fromImg, { name, download } = {}) {
+  const opener = document.activeElement;
   // Every picture in the conversation loaded so far, including those not scrolled into view yet (they load as
   // you reach them here).
   const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src || i._full);
@@ -3120,9 +3237,14 @@ function openViewer(fromImg, { name, download } = {}) {
     scale = 1; tx = 0; ty = 0; apply();
   };
   const zoom = (f) => { scale = Math.min(6, Math.max(1, scale * f)); if (scale === 1) { tx = 0; ty = 0; } apply(); };
-  const close = () => { overlay.classList.add('closing'); setTimeout(() => overlay.remove(), 140); document.removeEventListener('keydown', keys, true); };
+  const close = () => {
+    overlay.classList.add('closing'); setTimeout(() => overlay.remove(), 140); document.removeEventListener('keydown', keys, true);
+    // Back to whatever opened it (the picture in the chat), like other dialogs.
+    if (opener && opener.isConnected && opener !== document.body) opener.focus({ preventScroll: true });
+  };
   const keys = (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    if (e.key === 'Tab') trapTab(e, overlay);
     if (e.key === 'ArrowRight') show(idx + 1);
     if (e.key === 'ArrowLeft') show(idx - 1);
     if (e.key === '+' || e.key === '=') zoom(1.4);
@@ -3195,6 +3317,7 @@ async function onNewMessage(key, m) {
         const put = (node) => (firstPending ? sc.insertBefore(node, firstPending) : sc.append(node));
         if (newDay) put(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
         put(messageEl(m, newDay ? null : prev, 'main'));
+        ensureCurrentMessage(sc);
         if (near || m.authorId === S.me.id) sc.scrollTop = sc.scrollHeight;
       }
     }
@@ -3397,6 +3520,7 @@ function membersPanel(el) {
     clear(list);
     const q = search.value.trim().toLowerCase();
     const users = server.memberIds.map(getUser).filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q));
+    const changedKeys = sec.keysChanged(users);
     // Like Discord: online people grouped under their highest "show separately" role, then Online, then Offline.
     const hoisted = (server.roleDefs || []).filter((r) => r.hoist && !r.everyone).sort((a, b) => b.position - a.position);
     const sections = new Map(hoisted.map((r) => [r.id, []]));
@@ -3420,7 +3544,7 @@ function membersPanel(el) {
         h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color }),
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
-          sec.keyChanged(u) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
+          changedKeys.has(u.id) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
         activityLine(u) ? h('span', { class: 'member-status' }, activityLine(u)) : cs ? h('span', { class: 'member-status' }, cs) : null));
     };
     for (const r of hoisted) {
@@ -3550,12 +3674,14 @@ function threadPanel(el) {
   if (!t) { el.append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' }))); return; }
   const list = h('div', { class: 'thread-list', role: 'log', 'aria-label': 'Thread messages' });
   list.addEventListener('click', onMessageAreaClick);
+  messageListKeys(list);
   list.append(messageEl(t.root, null, 'thread'));
   list.append(h('div', { class: 'thread-divider' }, h('span', null, threadCountLabel(t))));
   if (t.hasMore) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadOlderReplies(e.currentTarget) }, 'Show earlier replies'));
   let prev = null;
   t.list.forEach((m) => { list.append(messageEl(m, prev, 'thread')); prev = m; });
   if (t.hasNewer) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadNewerReplies(e.currentTarget) }, 'Show newer replies'));
+  ensureCurrentMessage(list);
   const comp = createComposer({ id: 'thread', key: () => 'c:' + S.thread.channelId, threadId: () => S.thread.rootId, placeholder: 'Reply in thread\u2026' });
   composers.thread = comp;
   el.append(list, comp.el);
@@ -4070,7 +4196,8 @@ function emojiPicker(anchor, onPick, { keepOpen = false } = {}) {
 function emojiPanel(onPick, { keepOpen = false } = {}) {
   const search = h('input', { class: 'input emoji-search', placeholder: 'Search emoji', 'aria-label': 'Search emoji' });
   const grid = h('div', { class: 'emoji-grid', role: 'listbox' });
-  const tabs = h('div', { class: 'emoji-tabs', role: 'tablist' });
+  // The category buttons jump within one scrolling grid, so they're a toolbar rather than tabs.
+  const tabs = h('div', { class: 'emoji-tabs', role: 'toolbar', 'aria-label': 'Emoji categories' });
   const preview = h('div', { class: 'emoji-preview' });
   const custom = allEmojis();
   // Custom emoji from every server you're in can be used anywhere.
@@ -4093,7 +4220,7 @@ function emojiPanel(onPick, { keepOpen = false } = {}) {
     sections.forEach(([name, list]) => grid.append(h('div', { class: 'emoji-cat', id: slug(name) }, name), ...list.map(btn)));
   };
   sections.forEach(([name, , sv]) => tabs.append(h('button', {
-    class: 'emoji-tab', role: 'tab', 'data-tip': name, 'aria-label': name,
+    class: 'emoji-tab', 'data-tip': name, 'aria-label': name,
     onclick: () => { search.value = ''; drawAll(); const t = grid.querySelector('#' + slug(name)); if (t) grid.scrollTop = t.offsetTop - grid.offsetTop; },
   }, name === 'Frequently used' ? icon('star') : sv ? (sv.icon ? h('img', { class: 'emoji-tab-img', src: sv.icon, alt: '' }) : h('span', { class: 'emoji-tab-txt' }, sv.name.slice(0, 2))) : CATEGORY_ICONS[name])));
   search.addEventListener('input', () => {
@@ -4684,7 +4811,7 @@ function openSearch({ scope = null } = {}) {
       if (rows[sel]) rows[sel].action(); else searchHistory.add(input.value);
     }
   });
-  const mdl = modal({ size: 'search', className: 'search-modal', onClose: () => { closed = true; }, body: h('div', { class: 'search' },
+  const mdl = modal({ size: 'search', className: 'search-modal', label: 'Search', onClose: () => { closed = true; }, body: h('div', { class: 'search' },
     h('div', { class: 'search-bar' }, icon('search'), input, h('kbd', null, 'Esc'), h('button', { class: 'icon-btn search-close', 'aria-label': 'Close search', onclick: () => mdl.close() }, icon('close'))),
     chipsEl, noteEl, tabsEl, results,
     h('div', { class: 'search-foot' }, h('span', { class: 'search-keys' }, h('kbd', null, '↑'), h('kbd', null, '↓'), ' to move'), h('span', { class: 'search-keys' }, h('kbd', null, 'Enter'), ' to open'),
@@ -5085,7 +5212,7 @@ async function newsBotTab(s, body) {
     feeds.length ? list : h('p', { class: 'field-hint' }, 'Not following anything yet.'),
     h('h4', null, 'Follow something new'),
     kindChips,
-    h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'What to follow'), query, hint),
+    h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'What to follow'), query, hint),
     h('div', { class: 'grid-2' }, field('Post into', channel), field('Only posts mentioning (optional)', keywords, 'Comma-separated words. Leave empty for everything.')),
     h('label', { class: 'row gap tight' }, postNow, h('span', null, 'Post the newest item right now, so you can see it working')),
     h('div', { class: 'row gap' },
@@ -5277,7 +5404,7 @@ function openServerSettings(server, startTab = 'overview') {
   }
 
   function members(s) {
-    const q = h('input', { class: 'input search-input', placeholder: 'Search members' });
+    const q = h('input', { class: 'input search-input', placeholder: 'Search members', 'aria-label': 'Search members' });
     const listEl = h('div', { class: 'stack tight' });
     const drawList = () => {
       clear(listEl);
@@ -5384,7 +5511,7 @@ function openServerSettings(server, startTab = 'overview') {
   }
 
   function danger(s) {
-    const transfer = h('select', { class: 'input' }, h('option', { value: '' }, 'Choose a member'),
+    const transfer = h('select', { class: 'input', 'aria-label': 'New owner' }, h('option', { value: '' }, 'Choose a member'),
       s.memberIds.filter((id) => id !== S.me.id).map((id) => h('option', { value: id }, `${displayName(getUser(id))} (${getUser(id).username})`)));
     add(body, h('h3', null, 'Danger zone'),
       h('div', { class: 'danger-zone' }, h('strong', null, 'Transfer ownership'), h('p', { class: 'muted-p' }, 'You\u2019ll keep your roles but lose owner powers.'),

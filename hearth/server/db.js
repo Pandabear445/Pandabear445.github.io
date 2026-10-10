@@ -1152,6 +1152,21 @@ CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
 addColumn('channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('dm_channels', 'rtc_region_v', 'INTEGER NOT NULL DEFAULT 0');
 
+
+// v18 (quality): indexes for reads that walked a whole channel or table (numbers in docs/PERFORMANCE.md).
+//   pins          a conversation's pinned messages (a handful) without reading all its messages
+//   top-level     a channel's history without stepping over thread replies (a busy thread's replies are the
+//                 newest rows of its channel's index, so the latest page used to read past all of them)
+//   created_at    the admin activity chart (every staff member's app asks for it at start-up) counts messages per
+//                 day with a range per day instead of scanning both message tables 14 times
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_pins ON messages(channel_id, pinned_at) WHERE pinned_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dm_messages_pins ON dm_messages(dm_id, pinned_at) WHERE pinned_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_channel_top ON messages(channel_id, id) WHERE thread_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_created ON dm_messages(created_at);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

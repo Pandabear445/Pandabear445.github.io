@@ -132,6 +132,15 @@ let BOTS = null; // server/bots.js: installed bots, their API and webhooks
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+// Many accounts at once (a big server's member list): one query instead of one per person. id -> row.
+function userRows(ids) {
+  const out = new Map();
+  const list = [...ids];
+  for (let i = 0; i < list.length; i += 5000) {
+    for (const r of db.prepare('SELECT * FROM users WHERE id IN (SELECT value FROM json_each(?))').all(JSON.stringify(list.slice(i, i + 5000)))) out.set(r.id, r);
+  }
+  return out;
+}
 // Public keys people had before a reset without a recovery key (newest first, up to 10 each), added to a
 // { id: user } map. Apps may open old direct messages and old server keys with them, shown as not verified
 // (nothing vouches for them: see public/js/secure.js keysOf). Only GET /users/:id and the start-up users list
@@ -208,14 +217,15 @@ function serverKeyInfo(serverId) {
   const cur = s.key_epoch ? db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, s.key_epoch) : null;
   return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
 }
+// createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
+const keyOut = (k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at });
+const keyStateFrom = (serverId, info, keys) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt });
 function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
   if (!info) return null;
-  // createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
   const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
       JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
-      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId)
-    .map((k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at }));
-  return { serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt };
+      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId).map(keyOut);
+  return keyStateFrom(serverId, info, keys);
 }
 // Is this person connected right now? Updates for anyone who isn't would go nowhere (they get the current state
 // when their app starts), so a big server's fan-out only does work for the people actually online.
@@ -223,8 +233,14 @@ const connected = (userId) => io.sockets.adapter.rooms.has(`user:${userId}`);
 function emitKeyState(serverId) {
   const info = serverKeyInfo(serverId);
   if (!info) return;
-  db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
-    .forEach((m) => { if (connected(m.user_id)) io.to(`user:${m.user_id}`).emit('keys:state', keyState(serverId, m.user_id, info)); });
+  const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
+  if (!online.length) return;
+  // Everyone's own wrapped keys in one query (the same rows keyState reads one person at a time).
+  const keys = new Map(online.map((u) => [u, []]));
+  for (const k of db.prepare(`SELECT k.user_id, k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
+      JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
+      WHERE k.server_id = ? AND k.user_id IN (SELECT value FROM json_each(?)) ORDER BY k.user_id, k.epoch`).iterate(serverId, JSON.stringify(online))) keys.get(k.user_id).push(keyOut(k));
+  for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list));
 }
 
 const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
@@ -267,11 +283,12 @@ function serverCommon(s) {
   return out;
 }
 // What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
-function serializeServer(s, uid, common = serverCommon(s)) {
-  const myBase = perms.base(s, uid);
+// ev: permissions already worked out for many members at once (perms.forServer), when there is one.
+function serializeServer(s, uid, common = serverCommon(s), ev = null) {
+  const myBase = ev ? ev.base(uid) : perms.base(s, uid);
   const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
   const channels = common.channels
-    .map((c) => ({ c, p: perms.channel(s, c, uid) }))
+    .map((c) => ({ c, p: ev ? ev.channel(c, uid) : perms.channel(s, c, uid) }))
     .filter(({ p }) => p & PM.VIEW_CHANNEL)
     .map(({ c, p }) => ({
       ...serializeChannel(c), perms: p,
@@ -297,7 +314,19 @@ const emitServer = (serverId) => {
   const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
   if (!online.length) return;
   const common = serverCommon(row);
-  online.forEach((uid) => io.to(`user:${uid}`).emit('server:update', serializeServer(row, uid, common)));
+  // What a member sees depends only on their permissions (server-wide and in each channel), so everyone whose
+  // permissions come out the same gets the same update: it's built and encoded once per group, not once per
+  // member (in a big server that was most of the work, for the same few variants over and over).
+  const ev = perms.forServer(row, online);
+  // A timed-out member's update also carries their own timeout (when it ends, why), so each of them is a group of one.
+  const timedOut = new Set(db.prepare('SELECT user_id FROM member_timeouts WHERE server_id = ? AND until > ?').all(row.id, now()).map((r) => r.user_id));
+  const groups = new Map();
+  for (const uid of online) {
+    const key = [ev.base(uid), ...common.channels.map((c) => ev.channel(c, uid))].join(',') + (timedOut.has(uid) ? `|${uid}` : '');
+    if (!groups.has(key)) groups.set(key, { uid, rooms: [] });
+    groups.get(key).rooms.push(`user:${uid}`);
+  }
+  for (const g of groups.values()) io.to(g.rooms).emit('server:update', serializeServer(row, g.uid, common, ev));
 };
 // Permissions are checked when someone joins a call, and again here after anything that can change them: whoever
 // can no longer see the channel or connect to it (or is no longer a member) leaves the call, and anyone whose
@@ -443,8 +472,9 @@ const serverOf = (c) => db.prepare('SELECT * FROM servers WHERE id = ?').get(c.s
 function toChannel(c, except) {
   const srv = serverOf(c);
   if (!srv || !perms.restricted(srv, c)) return except ? except.to(`server:${c.server_id}`) : io.to(`server:${c.server_id}`);
+  const ev = perms.forServer(srv); // every member's permissions in one go, not three queries per member
   const rooms = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id)
-    .filter((u) => perms.channel(srv, c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
+    .filter((u) => ev.channel(c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
   return rooms.length ? (except ? except.to(rooms) : io.to(rooms)) : { emit() {} };
 }
 const isBlocked = (a, b) => !!db.prepare('SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)').get(a, b, b, a);
@@ -1666,7 +1696,8 @@ api.get('/bootstrap', auth, (req, res) => {
   dms.forEach((d) => ids.add(d.userId));
   relationships.forEach((r) => ids.add(r.userId));
   const users = {};
-  for (const id of ids) { const u = publicUser(getUserRow(id)); if (u) users[id] = u; }
+  const rows = userRows(ids);
+  for (const id of ids) { const u = publicUser(rows.get(id)); if (u) users[id] = u; }
   withPastKeys(users);
   users[uid] = selfUser(me);
   const voice = {};
@@ -2152,7 +2183,8 @@ api.post('/invites/:code/join', auth, (req, res) => {
   }
   const server = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(sid), req.userId);
   const users = {};
-  server.memberIds.forEach((id) => { users[id] = publicUser(getUserRow(id)); });
+  const rows = userRows(server.memberIds);
+  server.memberIds.forEach((id) => { users[id] = publicUser(rows.get(id)); });
   const voice = {};
   server.channels.filter((c) => c.type === 'voice').forEach((c) => { voice[c.id] = voiceStateList(c.id); });
   io.to(`user:${req.userId}`).emit('server:add', { server, users, voice, keyState: keyState(sid, req.userId) });
@@ -2518,8 +2550,10 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   if (Array.isArray(files) && files.length && !(cp & PM.ATTACH_FILES)) fail(403, 'You don\u2019t have permission to attach files here.');
   if ((req.body || {}).threadId && !(cp & PM.CREATE_THREADS)) fail(403, 'You don\u2019t have permission to reply in threads here.');
   if (c.slowmode > 0 && !(cp & (PM.MANAGE_MESSAGES | PM.MANAGE_CHANNELS))) {
-    const last = db.prepare('SELECT created_at FROM messages WHERE channel_id = ? AND author_id = ? ORDER BY id DESC LIMIT 1').get(c.id, req.userId);
-    const wait = last ? Math.ceil((last.created_at + c.slowmode * 1000 - now()) / 1000) : 0;
+    // Their latest message here: one lookup in the (channel, author, time) index. Ordering by id instead walked the
+    // channel's whole history, newest first, for someone who had never written there.
+    const last = db.prepare('SELECT MAX(created_at) AS created_at FROM messages WHERE channel_id = ? AND author_id = ?').get(c.id, req.userId);
+    const wait = last && last.created_at != null ? Math.ceil((last.created_at + c.slowmode * 1000 - now()) / 1000) : 0;
     if (wait > 0) fail(429, `Slowmode is on. You can send another message in ${wait}s.`, 'slowmode');
   }
   const ep = requireCurrentEpoch(c.server_id, epoch);

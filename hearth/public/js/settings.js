@@ -98,7 +98,7 @@ export function openSettings(app, tab = 'profile') {
     h('button', { class: 'icon-btn set-close', 'aria-label': 'Close settings', onclick: () => tryClose() }, icon('close')),
     content));
 
-  const m = modal({ size: 'full', className: 'settings-modal', body: shell, onClose: stopMicTest });
+  const m = modal({ size: 'full', className: 'settings-modal', label: 'Settings', body: shell, onClose: stopMicTest });
 
   async function tryClose() {
     if (dirty && !(await confirmDialog({ title: 'Discard changes?', text: 'You have changes that are not saved yet.', confirm: 'Discard', danger: true }))) return;
@@ -1747,7 +1747,7 @@ function appsTab(app) {
       : section('Notifications', pushToggleRow(app),
         h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
     section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
-      h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download` }),
+      h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download`, 'aria-label': 'Download page link' }),
         h('button', { class: 'btn ghost', onclick: () => { navigator.clipboard.writeText(`${location.origin}/download`).then(() => toast('Link copied.')); } }, 'Copy'))),
   );
 }
@@ -1764,7 +1764,7 @@ function instanceTab(app) {
     const turnSecretIn = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: turn.secretSet ? 'A secret is saved' : 'static-auth-secret' });
     const relayResult = h('div', { class: 'giphy-test' });
     const curHint = st.gifProvider === 'giphy' ? (st.giphyKeySet ? st.giphyKeyHint : '') : (st.klipyKeySet ? st.klipyKeyHint : '');
-    const keyIn = h('input', { class: 'input mono', placeholder: curHint ? `Current key ${curHint}` : `Paste your ${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'} API key`, autocomplete: 'off', spellcheck: 'false' });
+    const keyIn = h('input', { class: 'input mono', placeholder: curHint ? `Current key ${curHint}` : `Paste your ${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'} API key`, 'aria-label': `${st.gifProvider === 'giphy' ? 'GIPHY' : 'KLIPY'} API key`, autocomplete: 'off', spellcheck: 'false' });
     const result = h('div', { class: 'giphy-test' });
     const test = async () => {
       clear(result).append(h('span', { class: 'spinner' }), ' Testing\u2026');

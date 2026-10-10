@@ -45,6 +45,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     return ok;
   }
   const keyChanged = (user) => !!user && user.id !== S.me.id && E2EE.checkPin(S.me.id, user) === 'changed';
+  // keyChanged for a whole list at once (the member list): a Set of the ids whose keys changed.
+  const keysChanged = (users) => E2EE.checkPins(S.me.id, users);
   function acceptKeys(user) { E2EE.acceptPin(S.me.id, user); warned.delete(user.id); }
   // Someone's keys to open (which: 'e', identity keys) or check (which: 's', signing keys) what they wrote at
   // `at` (ms; 0 if unknown), best first, each with how far it's trusted:
@@ -518,7 +520,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   return {
     ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain,
     encryptChannel, decryptChannelMessage, encryptDm, decryptDmMessage, decryptAttachment,
-    signSdp, verifySdp, keyChanged, acceptKeys, trust, userWithKeys, reset,
+    signSdp, verifySdp, keyChanged, keysChanged, acceptKeys, trust, userWithKeys, reset,
     heldEpochs: (serverId) => [...keysFor(serverId).keys()],
     keysSaved: (serverId) => keeping.get(serverId) || Promise.resolve(), // our own copies are stored back
     signKeysFor,

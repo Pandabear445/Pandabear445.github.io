@@ -48,35 +48,87 @@ function makePerms(db) {
   // Is this member timed out in this server right now? (v18, see member_timeouts in db.js)
   const timedOut = (serverId, userId) => !!db.prepare('SELECT 1 FROM member_timeouts WHERE server_id = ? AND user_id = ? AND until > ?').get(serverId, userId, Date.now());
 
-  // Server-wide permissions for a member.
-  function base(server, userId) {
+  // The rules themselves, as plain functions of what was read from the database, so checking one person
+  // (base, channel) and many at once (forServer) can't drift apart.
+  //   roleBits: permissions of the roles that count (@everyone and the ones they hold, of this server)
+  //   mine():   ids of the roles they hold (only read when the channel has overrides)
+  //   muted():  whether they're timed out in this server right now
+  function baseFrom(server, userId, roleBits, muted) {
     if (!server) return 0;
     if (server.owner_id === userId) return ALL;
     if (server.kind === 'group') return GROUP_MEMBER;
     let p = 0;
-    for (const r of rolesOf(server.id, userId)) p |= r.permissions;
+    for (const bits of roleBits) p |= bits;
     if (p & P.ADMINISTRATOR) return ALL;
-    return timedOut(server.id, userId) ? p & ~TALK : p;
+    return muted() ? p & ~TALK : p;
   }
-
-  // Permissions in one channel, after overrides.
-  function channel(server, ch, userId) {
-    let p = base(server, userId);
+  function channelFrom(server, userId, p, ov, mine, muted) {
     if (p === ALL) return ALL;
-    const ov = db.prepare('SELECT * FROM channel_overrides WHERE channel_id = ?').all(ch.id);
     if (ov.length) {
       const everyone = ov.find((o) => o.target_type === 'role' && o.target_id === server.id);
       if (everyone) p = (p & ~everyone.deny) | everyone.allow;
-      const mine = new Set(db.prepare(heldRoles).all(server.id, userId).map((r) => r.role_id));
+      const held = mine();
       let allow = 0; let deny = 0;
-      for (const o of ov) if (o.target_type === 'role' && mine.has(o.target_id)) { allow |= o.allow; deny |= o.deny; }
+      for (const o of ov) if (o.target_type === 'role' && held.has(o.target_id)) { allow |= o.allow; deny |= o.deny; }
       p = (p & ~deny) | allow;
       const me = ov.find((o) => o.target_type === 'member' && o.target_id === userId);
       if (me) p = (p & ~me.deny) | me.allow;
       // A channel override can't give a timed-out member their voice back.
-      if (server.kind !== 'group' && timedOut(server.id, userId)) p &= ~TALK;
+      if (server.kind !== 'group' && muted()) p &= ~TALK;
     }
     return p & P.VIEW_CHANNEL ? p : 0;
+  }
+  const overridesOf = (channelId) => db.prepare('SELECT * FROM channel_overrides WHERE channel_id = ?').all(channelId);
+
+  // Server-wide permissions for a member.
+  function base(server, userId) {
+    if (!server) return 0;
+    if (server.owner_id === userId || server.kind === 'group') return baseFrom(server, userId, [], () => false);
+    return baseFrom(server, userId, rolesOf(server.id, userId).map((r) => r.permissions), () => timedOut(server.id, userId));
+  }
+
+  // Permissions in one channel, after overrides.
+  function channel(server, ch, userId) {
+    const p = base(server, userId);
+    if (p === ALL) return ALL;
+    return channelFrom(server, userId, p, overridesOf(ch.id), () => new Set(db.prepare(heldRoles).all(server.id, userId).map((r) => r.role_id)), () => timedOut(server.id, userId));
+  }
+
+  // The same answers for many members of one server at once (who receives a private channel's message, everyone's
+  // own view of a server after a change): the server's roles and the members' roles are read in one query each,
+  // and each channel's overrides once, instead of again for every member and channel. Nothing is kept once the
+  // caller is done with it (it's made for one fan-out), so a later role or override change is always seen.
+  //   userIds: the members it will be asked about (default: all of them). Anyone else is worked out the usual way.
+  function forServer(server, userIds = null) {
+    const roleBits = new Map(db.prepare('SELECT id, permissions FROM roles WHERE server_id = ?').all(server.id).map((r) => [r.id, r.permissions]));
+    const held = new Map();
+    const rows = userIds
+      ? db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
+          WHERE mr.server_id = ? AND mr.user_id IN (SELECT value FROM json_each(?))`).all(server.id, JSON.stringify(userIds))
+      : db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
+          WHERE mr.server_id = ?`).all(server.id);
+    for (const r of rows) { if (!held.has(r.user_id)) held.set(r.user_id, new Set()); held.get(r.user_id).add(r.role_id); }
+    const known = userIds ? new Set(userIds) : null;
+    // Who is timed out here right now, read once like the roles.
+    const muted = new Set(db.prepare('SELECT user_id FROM member_timeouts WHERE server_id = ? AND until > ?').all(server.id, Date.now()).map((r) => r.user_id));
+    const none = new Set();
+    const ovs = new Map(); const bases = new Map();
+    const ovOf = (id) => { if (!ovs.has(id)) ovs.set(id, overridesOf(id)); return ovs.get(id); };
+    const baseOf = (uid) => {
+      if (known && !known.has(uid)) return base(server, uid);
+      if (!bases.has(uid)) {
+        // Like rolesOf: @everyone (the role with the server's id) plus the roles they hold that belong to this server.
+        const bits = [];
+        if (roleBits.has(server.id)) bits.push(roleBits.get(server.id));
+        for (const id of held.get(uid) || none) if (id !== server.id && roleBits.has(id)) bits.push(roleBits.get(id));
+        bases.set(uid, baseFrom(server, uid, bits, () => muted.has(uid)));
+      }
+      return bases.get(uid);
+    };
+    return {
+      base: baseOf,
+      channel: (ch, uid) => (known && !known.has(uid) ? channel(server, ch, uid) : channelFrom(server, uid, baseOf(uid), ovOf(ch.id), () => held.get(uid) || none, () => muted.has(uid))),
+    };
   }
 
   // Highest role position (owner is above everyone). Used for "you can only manage roles below yours".
@@ -92,7 +144,7 @@ function makePerms(db) {
     return !!db.prepare('SELECT 1 FROM channel_overrides WHERE channel_id = ? AND (deny & ?) != 0').get(ch.id, P.VIEW_CHANNEL);
   }
 
-  return { base, channel, top, restricted, rolesOf, timedOut };
+  return { base, channel, forServer, top, restricted, rolesOf, timedOut };
 }
 
 module.exports = { PERMS, ALL, DEFAULT_EVERYONE, CHANNEL_SCOPED, GROUP_MEMBER, TALK, makePerms };

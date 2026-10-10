@@ -54,7 +54,8 @@ export function avatarEl(u, size = 40, { status = false, meId = '', speaking = f
   if (u && u.avatar) inner.append(h('img', { class: 'cropped', src: u.avatar, alt: '', loading: 'lazy', draggable: 'false', style: cropStyle(p.avatarCrop) }));
   else inner.append(h('span', { class: 'av-initials', style: { fontSize: Math.max(10, size * 0.38) + 'px' } }, initials(displayName(u))));
   wrap.append(inner);
-  if (status) wrap.append(h('span', { class: `status-dot st-${presenceOf(u, meId)}`, title: STATUS_LABEL[presenceOf(u, meId)] }));
+  // The dot's shape differs per status too (ring, moon, bar), and it carries the words for screen readers.
+  if (status) wrap.append(h('span', { class: `status-dot st-${presenceOf(u, meId)}`, title: STATUS_LABEL[presenceOf(u, meId)], role: 'img', 'aria-label': STATUS_LABEL[presenceOf(u, meId)] }));
   return wrap;
 }
 

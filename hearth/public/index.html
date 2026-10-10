@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#100e16">
   <title>Hearth</title>
@@ -74,14 +74,15 @@
 
   <!-- ============================== app -->
   <div id="app" class="loading" hidden>
+    <button id="skip-main" class="skip-link" type="button">Skip to conversation</button>
     <nav id="rail" aria-label="Servers"></nav>
-    <aside id="sidebar">
+    <aside id="sidebar" aria-label="Channels and conversations">
       <div id="sidebar-head"></div>
       <div id="sidebar-body"></div>
       <div id="voice-panel" hidden></div>
       <div id="user-panel"></div>
     </aside>
-    <main id="main"></main>
+    <main id="main" tabindex="-1"></main>
     <aside id="members" aria-label="Members"></aside>
     <div class="nav-scrim" aria-hidden="true"></div>
     <div class="app-loader" aria-live="polite"><span class="spinner big"></span><span>Lighting the fire…</span></div>
@@ -89,7 +90,7 @@
 
   <div id="conn-banner" hidden role="status"><span class="spinner"></span>Reconnecting…</div>
   <div id="layer"></div>
-  <div id="toasts" aria-live="polite"></div>
+  <div id="toasts" role="status" aria-live="polite"></div>
   <div id="audio-sink" hidden></div>
 
   <script src="/socket.io/socket.io.js"></script>

@@ -72,7 +72,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   const go = (t) => { clearInterval(timer); tab = t; setTab && setTab(t); draw(); };
   const openUser = (id) => userModal(id, () => draw(), myRank);
   const draw = () => {
-    clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', onclick: () => go(k) }, icon(ic), l,
+    clear(nav).append(...tabs.map(([k, l, ic]) => h('button', { class: `admin-tab${tab === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(tab === k), onclick: () => go(k) }, icon(ic), l,
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     const page = tab === 'security' ? secSub : tab;
@@ -80,7 +80,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   };
   // Security's sub-tabs stay on top of whichever page is showing (pages redraw the body themselves).
   const subBar = h('div', { class: 'set-subtabs admin-subtabs', role: 'tablist' });
-  const drawSubBar = () => clear(subBar).append(...SECURITY_SUBS.map(([k, l, ic]) => h('button', { class: `set-subtab${secSub === k ? ' active' : ''}`, role: 'tab', onclick: () => { secSub = k; draw(); } }, icon(ic), l)));
+  const drawSubBar = () => clear(subBar).append(...SECURITY_SUBS.map(([k, l, ic]) => h('button', { class: `set-subtab${secSub === k ? ' active' : ''}`, role: 'tab', 'aria-selected': String(secSub === k), onclick: () => { secSub = k; draw(); } }, icon(ic), l)));
   new MutationObserver(() => { if (tab === 'security' && body.firstChild !== subBar) { drawSubBar(); body.prepend(subBar); } }).observe(body, { childList: true });
 
   async function overview() {
@@ -178,7 +178,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   }
 
   async function users(q = '', filter = '') {
-    const search = h('input', { class: 'input search-input', placeholder: 'Search by username, name or IP', value: q });
+    const search = h('input', { class: 'input search-input', placeholder: 'Search by username, name or IP', 'aria-label': 'Search users', value: q });
     const listEl = h('div', { class: 'adm-table' });
     const seg = h('div', { class: 'seg' }, [['', 'Everyone'], ['online', 'Online'], ['suspended', 'Suspended'], ['staff', 'Staff']].map(([k, l]) => h('button', {
       class: `seg-btn${filter === k ? ' active' : ''}`, onclick: () => users(search.value, k).catch((e) => toast(e.message, 'error')),
@@ -201,7 +201,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const reg = await api('GET', '/admin/registration');
     const terms = await api('GET', '/terms');
     const code = h('input', { class: 'input mono', value: reg.code || '', placeholder: 'invite code people must enter' });
-    const ta = h('textarea', { class: 'input mono', rows: '16', spellcheck: 'true' });
+    const ta = h('textarea', { class: 'input mono', rows: '16', spellcheck: 'true', 'aria-label': 'Terms of Service text' });
     ta.value = terms.text;
     const preview = h('div', { class: 'tos-text md', html: renderDoc(terms.text) });
     ta.addEventListener('input', () => { preview.innerHTML = renderDoc(ta.value); });
@@ -262,7 +262,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
 
   async function security() {
     const [sec, bans] = await Promise.all([api('GET', '/admin/security'), api('GET', '/admin/ip-bans')]);
-    const ipIn = h('input', { class: 'input mono', placeholder: '203.0.113.7 or 203.0.113.0/24' });
+    const ipIn = h('input', { class: 'input mono', placeholder: '203.0.113.7 or 203.0.113.0/24', 'aria-label': 'IP address or range to block' });
     const label = { failed_login: 'Failed login', captcha_failed: 'Failed robot check', blocked_ip: 'Blocked IP', username_changed: 'Username changed' };
     clear(body).append(
       h('div', { class: 'admin-head' }, h('h3', null, 'Emergency')),
@@ -450,7 +450,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           toast(`${a.displayName} is now the owner.`); admins();
         } }] });
     };
-    const name = h('input', { class: 'input', placeholder: 'username' });
+    const name = h('input', { class: 'input', placeholder: 'username', 'aria-label': 'Username to add to the team' });
     let newRole = 'moderator';
     const roleChips = h('div', { class: 'chips' });
     const drawChips = () => clear(roleChips).append(...[['moderator', 'Moderator'], ['admin', 'Admin']].map(([k, l]) => h('button', { class: `chip${newRole === k ? ' active' : ''}`, onclick: () => { newRole = k; drawChips(); } }, l)));
@@ -726,7 +726,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       user: h('input', { class: 'input', value: mail.user || '', autocomplete: 'off' }),
       pass: h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: mail.passSet ? 'Saved (paste to replace)' : 'SMTP password / API key' }),
       from: h('input', { class: 'input', value: mail.from || '', placeholder: 'Hearth <no-reply@yourdomain.com>' }),
-      test: h('input', { class: 'input', type: 'email', placeholder: 'you@example.com' }),
+      test: h('input', { class: 'input', type: 'email', placeholder: 'you@example.com', 'aria-label': 'Send a test email to' }),
     };
     const lastfmKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.lastfmKeySet ? 'Saved (paste to replace, or clear)' : 'Last.fm API key' });
     const rawgKey = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: act.rawgKeySet ? 'Saved (paste to replace, or clear)' : 'RAWG API key (optional)' });
@@ -749,7 +749,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       raised: h('input', { class: 'input', type: 'number', min: '0', value: String(F.raised || '') }), currency: h('input', { class: 'input', maxlength: '3', value: F.currency || 'USD' }),
       note: h('input', { class: 'input', maxlength: '300', value: F.note, placeholder: 'Optional: your own message' }) };
     const supQuota = h('input', { class: 'input', type: 'number', min: '0', value: String(o.supporterQuotaMb || '') , placeholder: '0 = same as everyone' });
-    const keep = h('input', { class: 'input', type: 'number', min: '1', max: '60', value: String(o.autoBackup.keep) });
+    const keep = h('input', { class: 'input', type: 'number', min: '1', max: '60', value: String(o.autoBackup.keep), 'aria-label': 'Number of daily backups to keep' });
     const download = async (b) => {
       try {
         const r = await fetch(`/api/admin/backups/${encodeURIComponent(b.name)}`, { headers: { authorization: 'Bearer ' + localStorage.getItem('hearth.token') } });
