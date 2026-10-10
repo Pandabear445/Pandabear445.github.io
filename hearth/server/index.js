@@ -109,6 +109,7 @@ const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(user
 // Games/music people are playing (server/activity.js fills these in once everything it needs exists).
 let ACT = { activityFor: () => null, recentFor: () => undefined };
 let ACCT = null; // server/accounts.js: email, recovery key, two-factor
+let STORE = null; // server/storage.js: resumable uploads, storage reports
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
@@ -802,9 +803,23 @@ app.get('/uploads/:file', (req, res) => {
     res.type('application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment');
   }
-  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  // Encrypted blobs (.bin) are checked with the server every time (a cheap 304 while the file is there), so a
+  // deleted attachment stops loading at once instead of living on in caches. Other uploads (avatars, icons,
+  // emoji…) get a new name whenever they change, so they can be cached for good. Either way only the browser
+  // keeps a copy (private), never a shared proxy.
+  res.setHeader('Cache-Control', path.extname(f).toLowerCase() === '.bin' ? 'private, no-cache' : 'private, max-age=31536000, immutable');
   res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
-  res.sendFile(p);
+  // Range requests (206, 416) come from sendFile, so long videos and songs can seek without downloading it all.
+  res.sendFile(p, { acceptRanges: true }, (err) => {
+    if (!err || res.headersSent) return;
+    if (err.status === 416) {
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch { /* deleted meanwhile */ }
+      res.setHeader('Content-Range', `bytes */${size}`);
+      return res.sendStatus(416);
+    }
+    res.sendStatus(404);
+  });
 });
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -1499,6 +1514,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
   // Who has them on screen, worked out before their servers and friendships go: they all see "Deleted user".
   const audience = userAudience(row.id);
   revokeSessions(row.id, { reason: 'account_deleted' });
+  STORE.cancelUserSessions(row.id); // unfinished uploads go at once, with their reserved room
   for (const m of db.prepare('SELECT s.id, s.kind, s.owner_id FROM members m JOIN servers s ON s.id = m.server_id WHERE m.user_id = ?').all(row.id)) {
     if (m.kind === 'group' && m.owner_id === row.id) {
       const next = db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? ORDER BY joined_at LIMIT 1').get(m.id, row.id);
@@ -4644,6 +4660,7 @@ api.delete('/admin/users/:id/files', auth, adminOnly, (req, res) => {
   db.prepare('SELECT id, file FROM gif_library WHERE added_by = ?').all(r.id).forEach((g) => removeLibraryGif(g));
   db.prepare('UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, page_bg = NULL WHERE id = ?').run(r.id);
   db.prepare('DELETE FROM blobs WHERE uploader_id = ?').run(r.id);
+  STORE.cancelUserSessions(r.id);
   broadcastUser(r.id);
   adminLog(req, 'files_deleted', r.id, `${files.length} files`);
   res.json({ ok: true, count: files.length });
@@ -4677,6 +4694,9 @@ const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSett
 const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
   isMember, emitServer, seal, unseal, newId, brief, PM, auditLog, stepUp, sealSecret, openSecret, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
   mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
+// Resumable uploads, storage reports and orphan cleanup (server/storage.js).
+STORE = require('./storage')({ api, auth, db, fail, wrap, rateLimit, limitNet, HttpError, quotaOf, overLimit, uploadLimits, fmtMb, MB, getUserRow,
+  removeUpload, fileName, UPLOAD_DIR, DATA_DIR, unseal, auditLog, stepUp, adminOnly, brief });
 // Message search (server/search.js): filters by where, who and when; the search words stay in the app.
 require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
 function fundingTotals() {

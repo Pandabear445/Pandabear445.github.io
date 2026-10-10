@@ -15,7 +15,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -976,6 +976,24 @@ CREATE TABLE IF NOT EXISTS server_key_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
+`);
+
+// v18 (storage): resumable uploads in progress. The bytes wait in data/upload-parts/<id>.part (never served,
+// never backed up) until the whole file is there and its SHA-256 matches; the room it needs is reserved in
+// user_files (kind 'reserved') from the start. See server/storage.js.
+db.exec(`
+CREATE TABLE IF NOT EXISTS upload_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  size INTEGER NOT NULL,
+  received INTEGER NOT NULL DEFAULT 0,
+  chunk_size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_user ON upload_sessions(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_updated ON upload_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_user_files_kind ON user_files(kind);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
