@@ -389,7 +389,10 @@ module.exports = function setupAccounts(ctx) {
       db.prepare("UPDATE users SET auth_hash = ?, kdf = 'argon2id', kdf_salt = ?, enc_private_key = ? WHERE id = ?").run(hash, b.kdfSalt, b.encPrivateKey, row.id);
       if (!keep) {
         // New keys: the old ones are gone for good. Friends' apps see the change (and say so), and re-share
-        // every server's current key with the new one once someone verifies it.
+        // every server's current key with the new one once someone verifies it. The old PUBLIC keys are kept on
+        // record: key handoffs and posts signed with them still check out, and the people this account talked
+        // to can still open their old direct messages (they hold their own half of those keys).
+        if (row.public_key) db.prepare('INSERT INTO user_key_history (user_id, public_key, sign_public_key, retired_at) VALUES (?, ?, ?, ?)').run(row.id, row.public_key, row.sign_public_key || null, now());
         db.prepare('UPDATE users SET public_key = ?, sign_public_key = NULL, enc_sign_private_key = NULL, enc_private_key_recovery = NULL, recovery_salt = NULL WHERE id = ?').run(b.publicKey, row.id);
         db.prepare('DELETE FROM server_keys WHERE user_id = ?').run(row.id);
       }

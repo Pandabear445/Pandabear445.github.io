@@ -689,6 +689,24 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE INDEX IF NOT EXISTS idx_memberships_server_user ON memberships(server_id, user_id);
 `);
 
+// v17 (crypto): the public keys a person had before a password reset without a recovery key. Key handoffs
+// and messages they signed back then still check out against the key that was valid when they were made,
+// and the people they talked to can still open their old direct messages. Public keys only.
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_key_history (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  public_key TEXT NOT NULL,
+  sign_public_key TEXT,
+  retired_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_key_history ON user_key_history(user_id, retired_at);
+`);
+// When this Hearth started encrypting channel messages end to end: the first encrypted message, or now. No
+// member's app can write a plaintext channel message after that, so apps refuse "older" plaintext rows dated
+// later (only the server could have written them). Set once, never moved.
+db.prepare("INSERT OR IGNORE INTO instance_settings (key, value) VALUES ('e2eeSince', ?)")
+  .run(String(db.prepare('SELECT MIN(created_at) AS t FROM messages WHERE ciphertext IS NOT NULL').get().t || Date.now()));
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are

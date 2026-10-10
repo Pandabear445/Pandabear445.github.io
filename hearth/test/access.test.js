@@ -149,8 +149,10 @@ test('a deleted account is gone: can’t sign in, its sessions are dead, its nam
   assert.equal((await srv.api('GET', '/bootstrap', { token: u.token, ip: u.ip })).status, 401);
   assert.equal((await srv.api('GET', '/bootstrap', { token: other, ip: u.ip })).status, 401);
   assert.equal((await srv.login(u)).status, 401);
-  const row = srv.sql('SELECT username, public_key, email, totp_secret, deleted_at FROM users WHERE id = ?', u.id)[0];
-  assert.ok(row.deleted_at && row.public_key === '' && !row.email && !row.totp_secret && row.username !== u.username);
+  const row = srv.sql('SELECT username, public_key, enc_private_key, email, totp_secret, deleted_at FROM users WHERE id = ?', u.id)[0];
+  // The private key is erased; the PUBLIC key stays, so the people they talked to can still read old messages.
+  assert.ok(row.deleted_at && row.enc_private_key === '' && !row.email && !row.totp_secret && row.username !== u.username);
+  assert.equal(row.public_key, u.publicKey);
   await srv.register(u.username); // the name can be used again
   assert.equal((await as(srv.owner, 'DELETE', '/me', { authKey: srv.owner.authKey, confirm: 'owner' })).status, 400, 'the instance owner must hand over first');
   assert.equal((await as(alice, 'DELETE', '/me', { authKey: alice.authKey, confirm: 'alice' })).json.code, 'owns_servers');

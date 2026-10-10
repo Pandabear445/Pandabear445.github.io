@@ -107,6 +107,10 @@ let ACCT = null; // server/accounts.js: email, recovery key, two-factor
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+// Public keys someone had before a reset without a recovery key (newest first). Apps check old key handoffs
+// and signatures against them, and open old direct messages with them.
+const pastKeysOf = (id) => db.prepare('SELECT public_key, sign_public_key, retired_at FROM user_key_history WHERE user_id = ? ORDER BY retired_at DESC LIMIT 10').all(id)
+  .map((k) => ({ publicKey: k.public_key, signPublicKey: k.sign_public_key || null, retiredAt: k.retired_at }));
 
 function publicUser(row) {
   if (!row) return null;
@@ -114,6 +118,7 @@ function publicUser(row) {
   let presence = 'offline';
   if (isOnline(row.id) && row.status !== 'invisible') presence = row.status;
   if (row.is_bot) presence = 'online'; // bots run inside this server: they're up whenever it is
+  const pastKeys = pastKeysOf(row.id);
   return {
     id: row.id,
     username: row.username,
@@ -125,6 +130,7 @@ function publicUser(row) {
     profile,
     publicKey: row.public_key,
     signPublicKey: row.sign_public_key || null,
+    pastKeys: pastKeys.length ? pastKeys : undefined,
     supporter: !!row.supporter || undefined,
     bot: !!row.is_bot || undefined,
     deleted: !!row.deleted_at || undefined,
@@ -165,7 +171,9 @@ function keyState(serverId, userId) {
         (SELECT 1 FROM server_keys k WHERE k.server_id = m.server_id AND k.user_id = m.user_id AND k.epoch = ?)`)
       .all(serverId, s.key_epoch).map((r) => r.user_id)
     : [];
-  return { serverId, keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, keys, missing };
+  // Who made the current key, so members (and moderators) can see who replaced it.
+  const cur = s.key_epoch ? db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, s.key_epoch) : null;
+  return { serverId, keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, keys, missing, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
 }
 function emitKeyState(serverId) {
   db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId)
@@ -240,7 +248,7 @@ function serializeMessage(row, channel, reactions) {
     if (r && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch };
     else if (r) {
       const rd = unseal(r.body);
-      reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0 };
+      reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0, createdAt: r.created_at, ...(rd.bot ? { bot: true } : {}) };
     }
   }
   // End-to-end encrypted message: the server only has ciphertext.
@@ -1060,7 +1068,9 @@ api.post('/me/password', auth, wrap(async (req, res) => {
 
 // Deleting your account. Needs your password (and a two-factor code when it's on). What happens:
 //   - you're signed out everywhere, and the account can never sign in again; the username is freed
-//   - your keys, email, two-factor, recovery key, profile, pictures, friends, blocks and push devices are erased
+//   - your private keys, email, two-factor, recovery key, profile, pictures, friends, blocks and push devices are
+//     erased. Your PUBLIC keys stay: the people you talked to need them to keep reading your old direct
+//     messages, to check the signatures on your old posts and to unlock server keys you handed out.
 //   - you leave every server and group (the others switch to a new server key, as when anyone leaves)
 //   - messages you sent stay where they are (still end-to-end encrypted) and show "Deleted user"
 // Owners first hand over or delete their servers; the instance owner first hands over ownership.
@@ -1084,7 +1094,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
   const files = [row.avatar, row.banner, row.background, row.song, row.page_bg];
   const friends = db.prepare('SELECT requester_id, addressee_id FROM friendships WHERE requester_id = ? OR addressee_id = ?').all(row.id, row.id);
   db.transaction(() => {
-    db.prepare(`UPDATE users SET username = ?, auth_hash = '!', public_key = '', enc_private_key = '', sign_public_key = NULL, enc_sign_private_key = NULL,
+    db.prepare(`UPDATE users SET username = ?, auth_hash = '!', enc_private_key = '', enc_sign_private_key = NULL,
       enc_private_key_recovery = NULL, recovery_salt = NULL, email = NULL, email_verified = 0, totp_enabled = 0, totp_secret = NULL, backup_codes = '[]',
       avatar = NULL, banner = NULL, background = NULL, song = NULL, page = NULL, page_bg = NULL, profile = ?, status = 'offline', activity_cfg = '{}',
       last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
@@ -1106,14 +1116,67 @@ api.delete('/me', auth, wrap(async (req, res) => {
 
 // One-time upload of the user's message-signing key. Its private half is encrypted by the
 // browser with a key only the account's own identity key can derive.
+// The upload has to prove two things, so a stolen session alone can't plant a signing key that contacts would
+// then trust: that this device holds the account's identity key (an HMAC keyed by ECDH between it and a
+// one-off server key, as for a password reset that keeps the keys), and that it holds the new signing key
+// (a signature over the challenge). Challenges live in memory for a few minutes and work once.
+const signKeyChallenges = new Map(); // nonce -> { userId, priv, expires }
+const SIGN_CHALLENGE_MS = 5 * 60 * 1000;
+api.post('/me/sign-key/challenge', auth, (req, res) => {
+  rateLimit('signkeychal:' + req.userId, 20, 10 * 60 * 1000);
+  const t = now();
+  for (const [k, c] of signKeyChallenges) if (c.expires < t) signKeyChallenges.delete(k);
+  if (signKeyChallenges.size > 5000) fail(429, 'Too many attempts. Try again in a minute.', 'rate_limited', 60);
+  const eph = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const nonce = crypto.randomBytes(24).toString('base64url');
+  signKeyChallenges.set(nonce, { userId: req.userId, priv: eph.privateKey, expires: t + SIGN_CHALLENGE_MS });
+  res.json({ serverPublicKey: eph.publicKey.export({ type: 'spki', format: 'der' }).toString('base64'), nonce });
+});
+// P-256 public key (SPKI, base64) or null.
+function p256Key(b64) {
+  try {
+    const k = crypto.createPublicKey({ key: Buffer.from(b64, 'base64'), format: 'der', type: 'spki' });
+    return k.asymmetricKeyType === 'ec' && k.asymmetricKeyDetails.namedCurve === 'prime256v1' ? k : null;
+  } catch { return null; }
+}
+function signKeyProofOk(row, b) {
+  const c = typeof b.nonce === 'string' && signKeyChallenges.get(b.nonce);
+  if (!c || c.userId !== row.id || c.expires < now()) return false;
+  signKeyChallenges.delete(b.nonce);
+  if (typeof b.keyProof !== 'string' || typeof b.signature !== 'string' || b.signature.length > 200) return false;
+  const identity = p256Key(row.public_key);
+  const signing = p256Key(b.signPublicKey);
+  if (!identity || !signing) return false;
+  try {
+    const shared = crypto.diffieHellman({ privateKey: c.priv, publicKey: identity });
+    const mac = crypto.createHmac('sha256', shared).update(`hearth-sign-key-proof|${row.id}|${b.nonce}|${b.signPublicKey}`).digest('base64');
+    if (!safeEqual(mac, b.keyProof)) return false;
+    return crypto.verify('sha256', Buffer.from(`hearth-sign-key|${row.id}|${row.public_key}|${b.nonce}`), { key: signing, dsaEncoding: 'ieee-p1363' }, Buffer.from(b.signature, 'base64'));
+  } catch { return false; }
+}
 api.post('/me/sign-key', auth, wrap(async (req, res) => {
-  const { signPublicKey, encSignPrivateKey } = req.body || {};
+  rateLimit('signkey:' + req.userId, 20, 10 * 60 * 1000);
+  const b = req.body || {};
+  const { signPublicKey, encSignPrivateKey } = b;
   if (!isB64ish(signPublicKey, 2000) || !isB64ish(encSignPrivateKey, 4000)) fail(400, 'Bad key material.');
   const row = getUserRow(req.userId);
   if (row.sign_public_key) fail(409, 'You already have a signing key.');
-  db.prepare('UPDATE users SET sign_public_key = ?, enc_sign_private_key = ? WHERE id = ?').run(signPublicKey, encSignPrivateKey, req.userId);
+  if (!b.nonce && !b.keyProof) fail(400, 'This page is out of date. Reload and try again.', 'need_proof');
+  if (!signKeyProofOk(row, b)) { secEvent('sign_key_bad_proof', req.ip, row.username); fail(403, 'That signing key couldn\u2019t be confirmed. Reload the page and try again.', 'bad_key_proof'); }
+  if (db.prepare('UPDATE users SET sign_public_key = ?, enc_sign_private_key = ? WHERE id = ? AND sign_public_key IS NULL').run(signPublicKey, encSignPrivateKey, req.userId).changes !== 1) fail(409, 'You already have a signing key.');
   broadcastUser(req.userId);
   res.json(selfUser(getUserRow(req.userId)));
+}));
+
+// Your password-locked private key, for changing the password or making a recovery key on this device.
+// It needs the password (not just a session): with only a stolen session, someone could otherwise take the
+// locked key away and guess the password offline, as fast as they like.
+api.post('/me/keys/wrapped', auth, wrap(async (req, res) => {
+  rateLimit('wrappedkey:' + req.userId, 20, 10 * 60 * 1000);
+  const row = getUserRow(req.userId);
+  const key = (req.body || {}).authKey;
+  if (typeof key !== 'string' || !(await bcrypt.compare(key.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
+  res.json({ encPrivateKey: row.enc_private_key, kdf: row.kdf, kdfSalt: row.kdf_salt });
 }));
 
 // ---------------------------------------------------------------- bootstrap
@@ -1137,7 +1200,10 @@ api.get('/bootstrap', auth, (req, res) => {
   const keyStates = {};
   servers.forEach((s) => { keyStates[s.id] = keyState(s.id, uid); });
   const blocked = db.prepare('SELECT blocked_id FROM blocks WHERE blocker_id = ?').all(uid).map((r) => r.blocked_id);
-  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid), me: selfUser(me), encPrivateKey: me.enc_private_key, encSignPrivateKey: me.enc_sign_private_key, servers, dms, relationships, users, voice, keyStates, blocked });
+  // No password-locked private key here: a session alone must not be enough to take it away and guess the
+  // password offline (POST /me/keys/wrapped hands it out with the password). The signing key's private half
+  // is locked with the identity key, not the password, so it can't be guessed at and stays.
+  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid), me: selfUser(me), encSignPrivateKey: me.enc_sign_private_key, e2eeSince: Number(getSetting('e2eeSince')) || 0, servers, dms, relationships, users, voice, keyStates, blocked });
 });
 
 // ---------------------------------------------------------------- profile
@@ -1468,6 +1534,7 @@ api.post('/invites/:code/join', auth, (req, res) => {
   const sid = inv.server_id;
   if (db.prepare('SELECT 1 FROM bans WHERE server_id = ? AND user_id = ?').get(sid, req.userId)) fail(403, 'You are banned from this server.');
   if (!isMember(sid, req.userId)) {
+    keyOnRejoin(sid, req.userId);
     db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(sid, req.userId, now());
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(inv.code);
     io.to(`server:${sid}`).emit('member:add', { serverId: sid, user: publicUser(getUserRow(req.userId)) });
@@ -1485,13 +1552,32 @@ api.post('/invites/:code/join', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- server encryption keys
-const isWrapped = (s) => typeof s === 'string' && s.length > 40 && s.length < 2000;
+// A wrapped server key exactly as the apps make it (e2ee.js wrapGroupKey): w1:<ephemeral P-256 public key>:
+// <12-byte iv>:<32-byte key + 16-byte tag>:<64-byte signature>, all base64. Checked strictly, so a member can't
+// fill the database (and every member's start-up) with junk "keys".
+const B64_FIELD = /^[A-Za-z0-9+/]+={0,2}$/;
+const b64Len = (x) => (B64_FIELD.test(x) && x.length % 4 === 0 ? Buffer.from(x, 'base64').length : -1);
+function isWrapped(w) {
+  if (typeof w !== 'string' || w.length > 600) return false;
+  const p = w.split(':');
+  if (p.length !== 5 || p[0] !== 'w1') return false;
+  const eph = b64Len(p[1]);
+  const sig = b64Len(p[4]);
+  return eph >= 60 && eph <= 120 && b64Len(p[2]) === 12 && b64Len(p[3]) === 48 && sig >= 64 && sig <= 72;
+}
 // Which wrapped keys were made for a public key the person no longer has (the sharer's app had stale info).
 // Apps send the public key they wrapped for; older apps that don't are trusted as before.
 function staleWraps(pubs, ids) {
   if (!pubs || typeof pubs !== 'object') return [];
   const get = db.prepare('SELECT public_key FROM users WHERE id = ?');
   return ids.filter((uid) => typeof pubs[uid] === 'string' && (get.get(uid) || {}).public_key !== pubs[uid]);
+}
+// Someone who was in this server before (they still hold keys from back then) is back, e.g. after a kick with
+// an invite they kept: switch to a new key, so they can't read what was said while they were away.
+function keyOnRejoin(serverId, userId) {
+  if (db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ? LIMIT 1').get(serverId, userId)) {
+    db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ? AND key_epoch > 0').run(serverId);
+  }
 }
 
 api.get('/servers/:id/keys', auth, (req, res) => {
@@ -1500,38 +1586,54 @@ api.get('/servers/:id/keys', auth, (req, res) => {
 });
 
 // Start a new key epoch. The client generated a fresh random key and wrapped it to every member.
+// Replacing a key that's still fine (nobody left) is limited: every rotation adds a row per member, every app
+// unlocks every key it holds at start-up, and a member could otherwise keep swapping in keys the others can't
+// open. People who manage the server can do it any time (to fix things fast), others once the current key is
+// 10 minutes old, and at most 12 times an hour per server. A key that's needed (someone left) is never held up.
+const VOLUNTARY_ROTATE_MS = 10 * 60 * 1000;
 api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('rotate:' + req.userId, 30, 60 * 1000);
   const { epoch, check, wraps, pubs } = req.body || {};
   if (typeof check !== 'string' || !/^[A-Za-z0-9+/=]{16,64}$/.test(check)) fail(400, 'Bad key check.');
-  if (!wraps || typeof wraps !== 'object') fail(400, 'Missing wrapped keys.');
+  if (!wraps || typeof wraps !== 'object' || Array.isArray(wraps)) fail(400, 'Missing wrapped keys.');
+  if (!Object.values(wraps).every(isWrapped)) fail(400, 'Those wrapped keys aren\u2019t in the right format.', 'bad_wraps');
   const tx = db.transaction(() => {
-    const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
-    if (Number(epoch) !== cur + 1) fail(409, 'Someone else just refreshed the key.', 'epoch');
+    const cur = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(s.id);
+    if (Number(epoch) !== cur.key_epoch + 1) fail(409, 'Someone else just refreshed the key.', 'epoch');
+    if (cur.key_epoch && !cur.needs_rotation) {
+      if (s.kind === 'group' || !can(s, req.userId, PM.MANAGE_SERVER)) {
+        const last = db.prepare('SELECT created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, cur.key_epoch);
+        const wait = last ? last.created_at + VOLUNTARY_ROTATE_MS - now() : 0;
+        if (wait > 0) fail(429, `This key was replaced less than 10 minutes ago. Try again in ${Math.ceil(wait / 60000)} min, or ask someone who manages the server.`, 'rotate_too_soon', Math.ceil(wait / 1000));
+      }
+      rateLimit('rotatevol:' + s.id, 12, 60 * 60 * 1000);
+    }
     const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(s.id).map((r) => r.user_id);
     const ids = Object.keys(wraps);
     if (ids.length !== members.length || !members.every((m) => isWrapped(wraps[m]))) fail(409, 'The member list changed. Try again.', 'members');
     const stale = staleWraps(pubs, members);
     if (stale.length) fail(409, 'A member\u2019s keys just changed. Try again.', 'stale_keys');
     const t = now();
-    db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur + 1, check, req.userId, t);
+    db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur.key_epoch + 1, check, req.userId, t);
     const ins = db.prepare('INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
-    members.forEach((m) => ins.run(s.id, cur + 1, m, wraps[m], req.userId, t));
-    db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0 WHERE id = ?').run(cur + 1, s.id);
+    members.forEach((m) => ins.run(s.id, cur.key_epoch + 1, m, wraps[m], req.userId, t));
+    db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0 WHERE id = ?').run(cur.key_epoch + 1, s.id);
   });
   tx();
   emitKeyState(s.id);
   res.json(keyState(s.id, req.userId));
 });
 
-// Give the current key to members who don't have it yet (new joiners).
+// Give the current key to members who don't have it yet (new joiners). Not while the key needs replacing:
+// whoever just came back must get the next key, not this one.
 api.post('/servers/:id/keys/share', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('share:' + req.userId, 60, 60 * 1000);
   const { epoch, wraps, pubs } = req.body || {};
-  const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
-  if (!cur || Number(epoch) !== cur) fail(409, 'That key is out of date.', 'epoch');
+  const st = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(s.id);
+  const cur = st.key_epoch;
+  if (!cur || Number(epoch) !== cur || st.needs_rotation) fail(409, 'That key is out of date.', 'epoch');
   if (!db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND epoch = ? AND user_id = ?').get(s.id, cur, req.userId)) fail(403, 'You do not have this key.');
   const ins = db.prepare('INSERT OR IGNORE INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
   let n = 0;
@@ -1543,15 +1645,45 @@ api.post('/servers/:id/keys/share', auth, (req, res) => {
   if (n) emitKeyState(s.id);
   res.json({ shared: n, stale });
 });
-// A member's app couldn't unlock the key it was given (wrapped for keys it no longer has, e.g. right after
-// a password reset): drop it so the others share it again.
+// A member's app couldn't unlock the CURRENT key it was given (wrapped for keys it no longer has, e.g. right
+// after a password reset): drop it so the others share it again. Older keys are never dropped: nobody can
+// share them again, so dropping one would lose that part of the history for good (and the app may only have
+// failed because whoever handed it out has changed keys since).
 api.post('/servers/:id/keys/bad', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('badkey:' + req.userId, 20, 60 * 60 * 1000);
   const epoch = Number((req.body || {}).epoch);
-  const n = db.prepare('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').run(s.id, req.userId, epoch).changes;
-  if (n) emitKeyState(s.id);
+  const cur = db.prepare('SELECT key_epoch FROM servers WHERE id = ?').get(s.id).key_epoch;
+  if (!cur || epoch !== cur) return res.json({ removed: 0 });
+  const row = db.prepare('SELECT wrapper_id FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').get(s.id, req.userId, cur);
+  const n = db.prepare('DELETE FROM server_keys WHERE server_id = ? AND user_id = ? AND epoch = ?').run(s.id, req.userId, cur).changes;
+  if (n) {
+    // The copy the rotation itself handed out doesn't open: the new key is broken (or was made so that others
+    // can't open it). Sharing can't fix that, so the apps start a fresh key. A few times an hour at most.
+    const ep = db.prepare('SELECT creator_id FROM server_epochs WHERE server_id = ? AND epoch = ?').get(s.id, cur);
+    if (row && ep && row.wrapper_id === ep.creator_id && ep.creator_id !== req.userId && countHit('badrotate:' + s.id, 60 * 60 * 1000) <= 6) {
+      db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ?').run(s.id);
+    }
+    emitKeyState(s.id);
+  }
   res.json({ removed: n });
+});
+// Your app re-wraps the keys it was handed to yourself (signed by you), so your own history no longer depends
+// on whoever shared them keeping their keys. Only your own rows, and only keys you already have.
+api.post('/servers/:id/keys/self', auth, (req, res) => {
+  const s = requireServer(req.params.id, req.userId);
+  rateLimit('selfkeys:' + req.userId, 30, 60 * 1000);
+  const wraps = (req.body || {}).wraps;
+  if (!wraps || typeof wraps !== 'object' || Array.isArray(wraps)) fail(400, 'Missing wrapped keys.');
+  const upd = db.prepare('UPDATE server_keys SET wrapped = ?, wrapper_id = ? WHERE server_id = ? AND user_id = ? AND epoch = ?');
+  let n = 0;
+  db.transaction(() => {
+    for (const [e, w] of Object.entries(wraps).slice(0, 500)) {
+      const ep = Number(e);
+      if (Number.isInteger(ep) && ep > 0 && isWrapped(w)) n += upd.run(w, req.userId, s.id, req.userId, ep).changes;
+    }
+  })();
+  res.json({ updated: n });
 });
 
 // ---------------------------------------------------------------- channels
@@ -1880,6 +2012,8 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   const d = requireDm(req.params.id, req.userId);
   limitMessages(req);
   if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t message this person.');
+  // A deleted account keeps its public key (so old messages stay readable), but nobody can read new ones.
+  if ((getUserRow(d.user_a === req.userId ? d.user_b : d.user_a) || {}).deleted_at) fail(403, 'This account was deleted.', 'deleted');
   const { ciphertext, files } = req.body || {};
   validCipher(ciphertext);
   let replyTo = (req.body || {}).replyTo || null;
@@ -2208,6 +2342,7 @@ api.post('/groups/:id/members', auth, (req, res) => {
   if (isMember(s.id, uid)) fail(409, 'They\u2019re already in this group.');
   if (db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n >= GROUP_MAX) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
   if (!canAddToGroup(req.userId, uid)) fail(403, 'You can add friends and people who share a server with you.');
+  keyOnRejoin(s.id, uid);
   db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(s.id, uid, now());
   io.to(`server:${s.id}`).emit('member:add', { serverId: s.id, user: publicUser(getUserRow(uid)) });
   io.in(`user:${uid}`).socketsJoin(`server:${s.id}`);
