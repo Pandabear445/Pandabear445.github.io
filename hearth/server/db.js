@@ -689,6 +689,11 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE INDEX IF NOT EXISTS idx_memberships_server_user ON memberships(server_id, user_id);
 `);
 
+// v17 (outbound): a push subscription remembers the session that turned it on, so signing that session out
+// (or revoking it, a password change, a suspension) stops its notifications. Older rows have none.
+addColumn('push_subs', 'session_id', 'TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
