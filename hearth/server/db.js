@@ -1016,6 +1016,81 @@ CREATE INDEX IF NOT EXISTS idx_upload_sessions_updated ON upload_sessions(update
 CREATE INDEX IF NOT EXISTS idx_user_files_kind ON user_files(kind);
 `);
 
+// v18 (bots): the bot platform (server/bots.js). A bot is a users row with is_bot = 1 (it never signs in) plus a
+// bots row saying who made it. It's installed into servers one at a time, each with its own scopes and channels.
+// Tokens are stored as SHA-256 hashes only (the secret is shown once); the webhook signing secret has to be
+// usable, so it's sealed with data/secret.key instead. Deliveries hold event metadata only, never message text.
+// The news bot keeps its own tables (feeds) and shows up next to these as a built-in bot.
+db.exec(`
+CREATE TABLE IF NOT EXISTS bots (
+  id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  owner_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  description TEXT NOT NULL DEFAULT '',
+  webhook_url TEXT,
+  webhook_secret TEXT,
+  requested_scopes TEXT NOT NULL DEFAULT '[]',
+  listed INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  disabled INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_id);
+CREATE TABLE IF NOT EXISTS bot_installations (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  installed_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  scopes TEXT NOT NULL DEFAULT '[]',
+  channels TEXT NOT NULL DEFAULT '[]',
+  events TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  last_ok_at INTEGER,
+  last_error TEXT,
+  last_error_at INTEGER,
+  UNIQUE (bot_id, server_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_installations_server ON bot_installations(server_id);
+CREATE TABLE IF NOT EXISTS bot_tokens (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  installation_id TEXT REFERENCES bot_installations(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bot_tokens_bot ON bot_tokens(bot_id);
+CREATE TABLE IF NOT EXISTS bot_commands (
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  options TEXT NOT NULL DEFAULT '[]',
+  permission TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot_id, name)
+);
+CREATE TABLE IF NOT EXISTS bot_deliveries (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+  installation_id TEXT,
+  server_id TEXT,
+  type TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_at INTEGER,
+  last_status INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  done_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bot_deliveries_due ON bot_deliveries(status, next_at);
+CREATE INDEX IF NOT EXISTS idx_bot_deliveries_bot ON bot_deliveries(bot_id, installation_id, created_at);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 

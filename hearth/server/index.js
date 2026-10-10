@@ -125,6 +125,7 @@ const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(user
 let ACT = { activityFor: () => null, recentFor: () => undefined };
 let ACCT = null; // server/accounts.js: email, recovery key, two-factor
 let STORE = null; // server/storage.js: resumable uploads, storage reports
+let BOTS = null; // server/bots.js: installed bots, their API and webhooks
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
@@ -242,8 +243,9 @@ function serverCommon(s) {
   try { categoryOrder = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
   const out = {
     channels, memberIds, memberRoles, roleDefs, emojis, categoryOrder,
-    // Bots working for this server (shown in the member list like on Discord): the news bot while it follows something.
-    bots: db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : [],
+    // Bots working for this server (shown in the member list like on Discord): the news bot while it follows
+    // something, and the bots installed here (server/bots.js).
+    bots: [...(db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : []), ...(BOTS ? BOTS.serverBots(s.id) : [])],
     // This server sells memberships (the app shows "Memberships" in its menu); owners see the tab either way.
     memberships: s.kind !== 'group' && MEMB.offers(s.id),
     membershipsOn: s.kind !== 'group' && MEMB.usable(),
@@ -1984,6 +1986,7 @@ function removeMember(serverId, userId) {
   io.to(`user:${userId}`).emit('server:remove', { serverId });
   io.to(`server:${serverId}`).emit('member:remove', { serverId, userId });
   emitKeyState(serverId);
+  if (BOTS) BOTS.event('member.left', serverId, { serverId, userId }, { actorId: userId });
 }
 
 api.delete('/servers/:id/members/:uid', auth, (req, res) => {
@@ -2120,6 +2123,7 @@ api.post('/invites/:code/join', auth, (req, res) => {
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(inv.code);
     io.to(`server:${sid}`).emit('member:add', { serverId: sid, user: publicUser(getUserRow(req.userId)) });
     io.in(`user:${req.userId}`).socketsJoin(`server:${sid}`);
+    BOTS.event('member.joined', sid, { serverId: sid, userId: req.userId, joinedAt: now() }, { actorId: req.userId });
     MEMB.syncRoles(sid, req.userId); // back with a membership they still pay for: their role comes back too
   }
   const server = serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(sid), req.userId);
@@ -2356,8 +2360,10 @@ api.post('/servers/:id/channels', auth, (req, res) => {
   const pos = (db.prepare('SELECT MAX(position) AS p FROM channels WHERE server_id = ?').get(s.id).p ?? -1) + 1;
   const id = newId();
   db.prepare('INSERT INTO channels (id, server_id, name, type, position, created_at, category) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, type, pos, now(), category);
-  const ch = serializeChannel(db.prepare('SELECT * FROM channels WHERE id = ?').get(id));
+  const row = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  const ch = serializeChannel(row);
   emitServer(s.id);
+  BOTS.event('channel.created', s.id, { channelId: id, name: row.name, type: row.type, category: row.category }, { channel: row, actorId: req.userId });
   res.json(ch);
 });
 
@@ -2386,6 +2392,8 @@ api.delete('/channels/:id', auth, (req, res) => {
   const c = requireManageableChannel(req.params.id, req.userId);
   const m = voiceChannels.get(c.id);
   if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
+  // Bots hear about it first, while the channel (and who could see it) still exists.
+  BOTS.event('channel.deleted', c.server_id, { channelId: c.id, name: c.name, type: c.type }, { channel: c, actorId: req.userId });
   forgetMessages(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
   db.prepare('DELETE FROM channels WHERE id = ?').run(c.id);
   emitServer(c.server_id);
@@ -2492,6 +2500,8 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   withNonce(msg, req.body);
   toChannel(c).emit('message:new', msg);
   notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions);
+  // Bots get who, where and when: never the text, which is end-to-end encrypted.
+  BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId: req.userId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null }, { channel: c, actorId: req.userId });
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
   res.json(msg);
 });
@@ -2520,6 +2530,7 @@ api.delete('/messages/:id', auth, (req, res) => {
   deleteMessageTree(m.id);
   toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   if (m.thread_id) toChannel(c).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
+  BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
   res.json({ ok: true });
 });
 
@@ -2616,6 +2627,7 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
     const distinct = db.prepare('SELECT COUNT(DISTINCT emoji) AS n FROM reactions WHERE message_id = ?').get(req.params.id).n;
     if (distinct >= 20) fail(400, 'That message has too many different reactions.');
     db.prepare('INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, ?, ?)').run(req.params.id, req.userId, emoji, now());
+    if (m) { const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id); BOTS.event('reaction.added', c.server_id, { messageId: m.id, channelId: c.id, userId: req.userId, emoji }, { channel: c, actorId: req.userId }); }
   }
   payload.reactions = reactionsFor([req.params.id])[req.params.id] || [];
   (typeof target === 'object' && !Array.isArray(target) ? target : io.to(target)).emit('reaction:update', payload);
@@ -4170,6 +4182,7 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
     if (above) fail(403, `This thread has replies by ${staffRole(above) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them has to remove it.`);
     deleteMessageTree(m.id);
     if (c) toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
+    if (c) BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
   } else {
     const dm = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(d.dm_id);
     forgetMessages([d.id]);
@@ -4696,7 +4709,7 @@ api.delete('/admin/users/:id/comments', auth, staffOnly, (req, res) => {
 // ---------------------------------------------------------------- owner tools
 // Branding, feature switches, funding, backups and server health.
 const brand = () => ({ name: (getSetting('brandName') || INSTANCE_NAME).slice(0, 40), tagline: (getSetting('brandTagline') || '').slice(0, 140) });
-const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, createServers: 'everyone' };
+const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, createServers: 'everyone', createBots: 'admins' };
 function features() {
   let v = {};
   try { v = JSON.parse(getSetting('features') || '{}') || {}; } catch { /* defaults */ }
@@ -4719,6 +4732,10 @@ STORE = require('./storage')({ api, auth, db, fail, wrap, rateLimit, limitNet, H
   removeUpload, fileName, UPLOAD_DIR, DATA_DIR, unseal, auditLog, stepUp, adminOnly, brief });
 // Message search (server/search.js): filters by where, who and when; the search words stay in the app.
 require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
+// Bots and integrations (server/bots.js): installs, scopes, the bot API, signed webhooks, slash commands.
+BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, checkWords,
+  perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
+  getIo: () => io, features, isStaff, isInstanceAdmin, maintenance, newsBot: NEWS_BOT_ID });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();
@@ -4764,6 +4781,7 @@ api.put('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
     const f = features();
     for (const k of ['customCss', 'comments', 'watch', 'gifs']) if (b.features[k] !== undefined) f[k] = !!b.features[k];
     if (['everyone', 'staff'].includes(b.features.createServers)) f.createServers = b.features.createServers;
+    if (['everyone', 'staff', 'admins'].includes(b.features.createBots)) f.createBots = b.features.createBots;
     setSetting('features', JSON.stringify(f));
   }
   if (b.funding) {

@@ -30,6 +30,7 @@ import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
 import { createRecall } from './recall-host.js';
 import { openMemberships, membershipsTab } from './memberships.js';
+import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 
 // ======================================================================= state
@@ -644,6 +645,7 @@ function startApp() {
     const m = store && store.list.find((x) => x.id === rootId);
     if (m) { m.threadCount = threadCount || 0; m.threadLastAt = threadLastAt; if (currentKey() === 'c:' + channelId) replaceMessageEl(m); }
   });
+  socket.on('bot:interaction', (x) => SLASH.onInteraction(x));
   socket.on('reaction:update', (p) => {
     const key = p.channelId ? 'c:' + p.channelId : 'd:' + p.dmId;
     const store = S.msgs[key];
@@ -2400,7 +2402,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const wc = watchChips(text);
     if (wc) body.append(wc);
     if (embed) body.append(newsCard(embed));
-    if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
+    if (m.dec && m.dec.bot && m.authorId === NEWS_BOT_ID) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
+    else if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by a bot this server added. Bot messages aren\u2019t end-to-end encrypted. Everything people write still is.' }, 'Bot \u00b7 not end-to-end encrypted'));
     else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only, and nothing proves who wrote it: the server could have.' }, 'Older message \u2014 not end-to-end encrypted, sender not verified'));
     // Opened or signed with a key that isn't the person's current, trusted one (secure.js keysOf).
     else if (m.dec && m.dec.keyNote === 'listed') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'Written with a key the server says this person had before they reset their password. This device never saw that key as theirs and it can\u2019t be checked with safety numbers, so the server could have written this.' }, '\u26a0 Older key \u2014 not verified'));
@@ -3125,7 +3128,7 @@ function membersPanel(el) {
       class: 'member', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'left'),
     }, avatarEl(u, 34, { status: true, meId: S.me.id }),
     h('span', { class: 'member-text' }, h('span', { class: 'member-name' }, nameEl(u), h('span', { class: 'bot-tag' }, 'BOT')),
-      h('span', { class: 'member-status' }, 'Posting news from the feeds this server follows')))));
+      h('span', { class: 'member-status' }, u.id === NEWS_BOT_ID ? 'Posting news from the feeds this server follows' : ((u.profile || {}).bio || 'A bot added to this server'))))));
     if (offline.length) list.append(h('div', { class: 'group-label' }, h('span', null, `Offline \u2014 ${offline.length}`)), ...offline.sort(byName).map(row));
     if (!users.length && !bots.length) list.append(h('p', { class: 'sidebar-empty' }, 'No one matches.'));
   };
@@ -3284,6 +3287,12 @@ async function loadNewestReplies() {
 
 // ======================================================================= composer
 const composers = {};
+// Bots' slash commands (bots.js). Answers only you can see live in memory and show above the main composer.
+const SLASH = createSlash({
+  getSocketId: () => (socket && socket.id) || null,
+  members: (s) => (s.memberIds || []).map(getUser),
+  onEphemeral: () => { if (composers.main) composers.main.renderEph(); },
+});
 const drafts = new Map();
 let lastTypingSent = 0;
 function createComposer({ id, key, threadId, placeholder }) {
@@ -3330,7 +3339,28 @@ function createComposer({ id, key, threadId, placeholder }) {
     };
     tick();
   };
-  const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, extras, box, slowNote, typing);
+  // Slash commands (bots.js): the bar with usage and the encryption warning, and bot answers only you can see.
+  const cmdBar = h('div', { class: 'cmd-bar', hidden: true });
+  const ephBox = h('div', { class: 'eph-list' });
+  const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, ephBox, cmdBar, extras, box, slowNote, typing);
+  const slashChannel = () => { const kk = key(); if (id !== 'main' || !kk || !kk.startsWith('c:')) return null; const s = serverOfChannel(kk.slice(2)); return s && !isGroup(s) ? kk.slice(2) : null; };
+  const renderCmdBar = () => {
+    const ch = slashChannel();
+    const cmd = ch && SLASH.match(ch, ta.value);
+    clear(cmdBar).hidden = !cmd;
+    if (cmd) cmdBar.append(SLASH.hint(cmd, ta.value, serverOfChannel(ch)));
+  };
+  const renderEph = () => {
+    clear(ephBox);
+    const ch = slashChannel();
+    if (!ch) return;
+    for (const e of SLASH.ephemeralFor(ch)) {
+      ephBox.append(h('div', { class: 'eph-msg' },
+        h('div', { class: 'eph-head' }, icon('bot'), h('b', null, e.botName), h('span', { class: 'bot-tag' }, 'BOT'), h('span', { class: 'field-hint' }, 'Only you can see this \u00b7 not end-to-end encrypted \u00b7 not saved'),
+          ibtn('close', 'Dismiss', () => SLASH.dismiss(e), { cls: 'sm' })),
+        h('div', { class: 'msg-text', html: md(e.content, { mentionName: S.me.username }) })));
+    }
+  };
 
   // ---- @mention autocomplete
   let sugg = { items: [], i: 0, start: -1 };
@@ -3357,18 +3387,28 @@ function createComposer({ id, key, threadId, placeholder }) {
       class: `suggest-item${i === sugg.i ? ' active' : ''}`, role: 'option', 'aria-selected': String(i === sugg.i),
       onmousedown: (e) => { e.preventDefault(); pick(i); },
     },
-    c.emoji ? h('span', { class: 'suggest-emoji' }, c.custom ? h('img', { class: 'cemoji', src: c.custom.url, alt: '' }) : c.emoji)
+    c.cmd ? h('span', { class: 'suggest-at' }, icon('bot'))
+      : c.emoji ? h('span', { class: 'suggest-emoji' }, c.custom ? h('img', { class: 'cemoji', src: c.custom.url, alt: '' }) : c.emoji)
       : c.special ? h('span', { class: 'suggest-at' }, icon('at'))
         : c.role ? h('span', { class: 'suggest-at role', style: c.role.color ? { color: c.role.color } : null }, c.role.icon || icon('shield'))
           : avatarEl(c, 24),
     h('span', { class: 'suggest-name', style: c.role && c.role.color ? { color: c.role.color } : null },
-      c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : displayName(c)),
-    h('span', { class: 'suggest-hint' }, c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
+      c.cmd ? SLASH.usage(c.cmd) : c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : displayName(c)),
+    h('span', { class: 'suggest-hint' }, c.cmd ? `${c.cmd.botName} \u00b7 ${c.cmd.description}` : c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
     suggest.hidden = !sugg.items.length;
   };
   const checkSuggest = () => {
     const pos = ta.selectionStart;
     const before = ta.value.slice(0, pos);
+    const slashIn = slashChannel();
+    const sm = slashIn && /^\/([a-z0-9_-]{0,32})$/i.exec(before);
+    if (sm) {
+      const list = SLASH.cached(slashIn);
+      if (!list) { SLASH.load(slashIn).then(() => { if (ta.value.startsWith('/')) { checkSuggest(); renderCmdBar(); } }); return closeSuggest(); }
+      const items = list.filter((c) => c.name.startsWith(sm[1].toLowerCase())).slice(0, 8).map((c) => ({ cmd: c }));
+      sugg = { items, i: 0, start: 0, kind: 'cmd' };
+      return drawSuggest();
+    }
     const em = before.match(/(^|\s):([A-Za-z0-9_]{2,32})$/);
     if (em) {
       const q = em[2].toLowerCase();
@@ -3387,6 +3427,13 @@ function createComposer({ id, key, threadId, placeholder }) {
   const pick = (i) => {
     const c = sugg.items[i];
     if (!c) return;
+    if (c.cmd) {
+      ta.value = `/${c.cmd.name} ` + ta.value.slice(ta.selectionStart).trimStart();
+      const at = c.cmd.name.length + 2;
+      ta.setSelectionRange(at, at);
+      closeSuggest(); update(); renderCmdBar(); ta.focus();
+      return;
+    }
     const insert = c.emoji ? (c.custom ? emojiToken(c.custom) : c.emoji) : c.role ? `<@&${c.role.id}>` : '@' + (c.special || c.username);
     if (c.emoji) pushRecentEmoji(c.custom ? emojiToken(c.custom) : c.emoji);
     ta.value = ta.value.slice(0, sugg.start) + insert + ' ' + ta.value.slice(ta.selectionStart);
@@ -3396,7 +3443,7 @@ function createComposer({ id, key, threadId, placeholder }) {
   };
 
   ta.addEventListener('input', () => {
-    autosize(); update(); checkSuggest();
+    autosize(); update(); checkSuggest(); renderCmdBar();
     drafts.set(key() + (threadId() || ''), ta.value);
     const kk = key();
     if (ta.value && Date.now() - lastTypingSent > 3000 && !threadId()) {
@@ -3482,6 +3529,16 @@ function createComposer({ id, key, threadId, placeholder }) {
     const files = extra.files || (overrideText != null ? [] : state.pending.slice());
     const poll = extra.poll || null;
     if (!text.trim() && !files.length && !poll) return;
+    // A bot's slash command goes to the bot (after the warning), not into the channel.
+    const slashIn = overrideText == null && !poll && slashChannel();
+    const cmd = slashIn && SLASH.match(slashIn, text.trim());
+    if (cmd) {
+      SLASH.run(slashIn, cmd, text.trim(), serverOfChannel(slashIn)).then((sent) => {
+        if (!sent || ta.value.trim() !== text.trim()) return;
+        ta.value = ''; drafts.delete(key()); autosize(); update(); renderCmdBar();
+      });
+      return;
+    }
     const kk = key();
     const tid = threadId();
     const replyTo = state.replyTo ? state.replyTo.id : null;
@@ -3538,8 +3595,8 @@ function createComposer({ id, key, threadId, placeholder }) {
       setProgress(1);
     }
   }
-  setTimeout(() => { autosize(); update(); }, 0);
-  return { el, state, focus: () => ta.focus(), addFiles, setReply, renderExtras, send };
+  setTimeout(() => { autosize(); update(); renderEph(); }, 0);
+  return { el, state, focus: () => ta.focus(), addFiles, setReply, renderExtras, send, renderEph };
 }
 const fmtDuration = (sec) => (sec >= 3600 ? `${Math.round(sec / 3600)}h` : sec >= 60 ? `${Math.round(sec / 60)}m` : `${sec}s`);
 function placeholderFor(k) {
@@ -4728,6 +4785,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['members', 'Members', 'people', (s) => can(s, PERMS.MANAGE_ROLES) || can(s, PERMS.KICK_MEMBERS) || can(s, PERMS.BAN_MEMBERS)],
     ['emoji', 'Emoji', 'smile', (s) => can(s, PERMS.MANAGE_EMOJIS)],
     ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
+    ['bots', 'Bots', 'bot', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bans', 'Bans', 'ban', (s) => can(s, PERMS.BAN_MEMBERS)],
     ['invites', 'Invites', 'link', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
@@ -4747,7 +4805,7 @@ function openServerSettings(server, startTab = 'overview') {
     if (!allowed.some(([k]) => k === tab)) tab = allowed[0] ? allowed[0][0] : 'overview';
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
-    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger })[tab](s);
+    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bots: (sv) => botsTab(sv, body, { confirm: (fn, opts) => confirmedCall(app, fn, opts) }), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger })[tab](s);
   };
 
   function overview(s) {
