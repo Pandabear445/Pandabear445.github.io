@@ -490,3 +490,58 @@ test('reports: you can see your own reports’ status, nobody else’s, and repe
   assert.equal((await as(oli, 'GET', '/me/reports')).json[0].status, 'resolved');
   assert.notEqual((await as(oli, 'POST', '/reports', body)).json.id, r1.json.id, 'after it’s closed, a new report is new');
 });
+
+// ------------------------------------------------------------------ the app's own helpers (run in Node)
+test('app helpers: quiet hours follow the same rule as the server, and the export zip is a valid archive', async () => {
+  const { pathToFileURL } = require('node:url');
+  const zlib = require('node:zlib');
+  const U = await import(pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'usability.js')).href);
+  // Quiet hours: 22:00–07:00 starting Friday covers Saturday 03:00 but not Saturday 23:00 (Saturday isn't a start day).
+  const dnd = { on: true, start: '22:00', end: '07:00', days: [5] };
+  const at = (iso) => Date.parse(iso);
+  assert.equal(U.quietNow({ dnd, tz: 'UTC' }, at('2026-10-09T23:30:00Z')), true, 'Friday night');
+  assert.equal(U.quietNow({ dnd, tz: 'UTC' }, at('2026-10-10T03:00:00Z')), true, 'Saturday early morning');
+  assert.equal(U.quietNow({ dnd, tz: 'UTC' }, at('2026-10-10T08:00:00Z')), false, 'Saturday after it ends');
+  assert.equal(U.quietNow({ dnd, tz: 'UTC' }, at('2026-10-10T23:00:00Z')), false, 'Saturday night: not a start day');
+  assert.equal(U.quietNow({ dnd, tz: 'America/New_York' }, at('2026-10-10T03:00:00Z')), true, 'time zones count (Friday 23:00 in New York)');
+  assert.equal(U.quietNow({ dnd: { ...dnd, on: false }, tz: 'UTC' }, at('2026-10-09T23:30:00Z')), false, 'off is off');
+  assert.equal(U.quietNow({ dnd: { on: true, start: '09:00', end: '09:00', days: [6] }, tz: 'UTC' }, at('2026-10-10T15:00:00Z')), true, 'same start and end: all day');
+  // The server agrees (same settings, same moment, through the real endpoint).
+  const u = await srv.register(`tz${hex(3)}`);
+  const quiet = (await as(u, 'PUT', '/me/notify-settings', { dnd: { on: true, start: '00:00', end: '23:59', days: [new Date().getUTCDay()] }, tz: 'UTC' })).json.dndActive;
+  assert.equal(quiet, U.quietNow({ dnd: { on: true, start: '00:00', end: '23:59', days: [new Date().getUTCDay()] }, tz: 'UTC' }));
+
+  // The zip: every entry's local header and central record agree, and CRC-32s check out.
+  assert.equal(U.crc32(Buffer.from('hello')), zlib.crc32(Buffer.from('hello')));
+  const z = U.createZip();
+  const files = { 'account.json': '{"a":1}', 'conversations/x.json': 'é'.repeat(1000), 'attachments/a.bin': crypto.randomBytes(5000) };
+  for (const [n, d] of Object.entries(files)) z.add(n, typeof d === 'string' ? d : new Uint8Array(d));
+  assert.equal(z.add('account.json', 'again'), 'account (1).json', 'names are kept unique');
+  const buf = Buffer.from(await z.blob().arrayBuffer());
+  const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(eocd > 0);
+  const count = buf.readUInt16LE(eocd + 10); const cdOff = buf.readUInt32LE(eocd + 16);
+  assert.equal(count, 4);
+  let p = cdOff;
+  const seen = {};
+  for (let i = 0; i < count; i++) {
+    assert.equal(buf.readUInt32LE(p), 0x02014b50);
+    const crc = buf.readUInt32LE(p + 16); const size = buf.readUInt32LE(p + 24); const nlen = buf.readUInt16LE(p + 28); const off = buf.readUInt32LE(p + 42);
+    const name = buf.subarray(p + 46, p + 46 + nlen).toString('utf8');
+    assert.equal(buf.readUInt32LE(off), 0x04034b50, `${name}: local header`);
+    const data = buf.subarray(off + 30 + buf.readUInt16LE(off + 26), off + 30 + buf.readUInt16LE(off + 26) + size);
+    assert.equal(zlib.crc32(data), crc, `${name}: CRC-32`);
+    seen[name] = data;
+    p += 46 + nlen;
+  }
+  assert.equal(seen['conversations/x.json'].toString('utf8'), files['conversations/x.json']);
+  assert.ok(seen['attachments/a.bin'].equals(files['attachments/a.bin']));
+});
+
+test('app: saved messages and read markers are no longer kept as plaintext in the browser', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  assert.doesNotMatch(src, /get saved\(\)/, 'no local saved list');
+  assert.doesNotMatch(src, /text: textOf\(m\), files: filesOf\(m\)\.length/, 'saving doesn’t copy the decrypted text anywhere');
+  assert.match(src, /api\('PUT', `\/me\/saved\/\$\{m\.id\}`, \{\}\)/, 'saving sends the id only');
+  assert.match(src, /localStorage\.removeItem\(k\); lsCache\.delete\(k\);/, 'the old local copy is removed after it is handed over');
+});
