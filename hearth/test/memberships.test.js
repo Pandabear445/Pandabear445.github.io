@@ -69,7 +69,7 @@ test('memberships: off until the Hearth owner sets up Stripe; only they can', as
   const admin = srv.owner;
   assert.equal((await as(admin, 'PUT', '/admin/memberships', { key: 'pk_live_nope' })).status, 400, 'publishable keys are refused');
   assert.equal((await as(admin, 'PUT', '/admin/memberships', { feePercent: 50 })).status, 400, 'fee capped');
-  const r = await as(admin, 'PUT', '/admin/memberships', { enabled: true, key: 'sk_test_' + 'k'.repeat(24), webhookSecret: WHSEC, feePercent: 5, currency: 'usd' });
+  const r = await as(admin, 'PUT', '/admin/memberships', { enabled: true, key: 'sk_test_' + 'k'.repeat(24), webhookSecret: WHSEC, feePercent: 5, currency: 'usd', authKey: admin.authKey });
   assert.equal(r.status, 200, r.text);
   const cfg = (await as(admin, 'GET', '/admin/memberships')).json;
   assert.deepEqual([cfg.config.enabled, cfg.config.keySet, cfg.config.keyMode, cfg.config.webhookSet, cfg.config.feePercent, cfg.config.currency], [true, true, 'test', true, 5, 'USD']);

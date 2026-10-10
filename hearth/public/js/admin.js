@@ -32,6 +32,10 @@ const ago = (ts) => {
   if (s < 60) return 'just now'; if (s < 3600) return `${Math.floor(s / 60)} min ago`; if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
   return fmtStamp(ts);
 };
+// Changes that need the password (and two-factor) again, like the team, ownership, backups and where payments
+// go: fn gets { authKey, totp|backupCode }. Resolves to null if the person cancels. Set by adminView.
+let confirmPw = null;
+const withPassword = (fn, opts) => (confirmPw ? confirmPw(fn, opts) : fn({}));
 const dur = (ms) => { const m = Math.floor(ms / 60000); return m < 60 ? `${m} min` : m < 1440 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${Math.floor(m / 1440)} d`; };
 export function device(ua) {
   ua = ua || '';
@@ -55,6 +59,7 @@ const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => 
 
 export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin', confirm = null } = {}) {
   const myRank = RANK[role] || 0;
+  confirmPw = confirm;
   const tabs = TABS.filter((t) => myRank >= t[3]);
   // Old links to the Storage or Broadcast tab open them inside Security.
   let secSub = SECURITY_SUBS.some(([k]) => k === tab) ? tab : 'security';
@@ -142,7 +147,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const seg = h('div', { class: 'seg' }, [['open', 'Open'], ['resolved', 'Resolved'], ['dismissed', 'Dismissed'], ['all', 'All']].map(([k, l]) => h('button', {
       class: `seg-btn${status === k ? ' active' : ''}`, onclick: () => reports(k).catch((e) => toast(e.message, 'error')),
     }, l)));
-    const act = async (r, body2, msg) => { await api('PATCH', `/admin/reports/${r.id}`, body2); toast(msg); reports(status); };
+    // Reports about yourself or about staff at your level or above are for someone ranked higher (the server says so).
+    const act = async (r, body2, msg) => { try { await api('PATCH', `/admin/reports/${r.id}`, body2); toast(msg); reports(status); } catch (e) { toast(e.message, 'error'); } };
     clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Reports'), seg),
       ...(list.length ? [] : [h('div', { class: 'panel-empty' }, icon('shield'), h('p', null, status === 'open' ? 'No open reports. \uD83C\uDF89' : 'Nothing here.'))]),
       ...list.map((r) => h('div', { class: `report-card st-${r.status}` },
@@ -161,7 +167,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
             h('div', { class: 'ev-body' }, h('div', { class: 'ev-meta' }, h('strong', null, e.author ? e.author.displayName : 'Deleted user'), h('span', null, fmtStamp(e.createdAt)), e.reported ? h('span', { class: 'badge-tag bad' }, 'Reported') : null),
               h('div', { class: 'ev-text', html: e.text ? md(e.text) : (e.files.length ? `[${e.files.map((f) => f.replace(/[<>&"]/g, '')).join(', ')}]` : '(no text)') })),
             e.reported ? h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
-              if (await confirmDialog({ title: 'Delete this message for everyone?', text: 'It disappears from the conversation for all members.', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/messages/${e.id}`).catch((x) => toast(x.message, 'error')); toast('Message deleted.'); }
+              if (await confirmDialog({ title: 'Delete this message for everyone?', text: 'It disappears from the conversation for all members.', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/messages/${e.id}`).then(() => toast('Message deleted.'), (x) => toast(x.message, 'error')); }
             } }, 'Delete message') : null))) : null,
         r.resolution ? h('p', { class: 'stat-sub' }, `Note: ${r.resolution}${r.handledBy ? ` \u2014 ${r.handledBy.displayName}` : ''}`) : null,
         h('div', { class: 'report-actions' },
@@ -232,7 +238,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', null, `${x.members} \u00b7 ${x.messages}`),
           h('span', { class: 'stat-sub' }, ago(x.lastActive)),
           h('span', { class: 'row gap tight' }, h('button', { class: 'btn ghost sm', onclick: () => transferServer(x, servers) }, 'Give to\u2026'), h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
-            if (await confirmDialog({ title: `Delete ${x.name}?`, text: 'Every channel, message and file in it is deleted for everyone. This can\u2019t be undone.', confirm: 'Delete server', danger: true })) { await api('DELETE', `/admin/servers/${x.id}`); toast('Server deleted.'); servers(); }
+            if (await confirmDialog({ title: `Delete ${x.name}?`, text: 'Every channel, message and file in it is deleted for everyone. This can\u2019t be undone.', confirm: 'Delete server', danger: true })) { await api('DELETE', `/admin/servers/${x.id}`).then(() => { toast('Server deleted.'); servers(); }, (e) => toast(e.message, 'error')); }
           } }, 'Delete'))))));
   }
 
@@ -345,19 +351,19 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   async function admins() {
     const { staff, me } = await api('GET', '/admin/staff');
     const owner = me === 'owner';
-    const setRole = async (who, newRole) => {
-      const r = await api('PUT', '/admin/staff', { ...who, role: newRole });
+    const setRole = async (who, newRole, ask) => {
+      const r = await withPassword((x) => api('PUT', '/admin/staff', { ...who, role: newRole, ...x }), { title: 'Confirm the team change', text: 'Changing the team needs your password.', ...ask });
+      if (!r) return null;
       toast(newRole ? `Now ${ROLE_LABEL[newRole].toLowerCase()}.` : 'Removed from staff.');
       admins();
       return r;
     };
+    const quietErr = (x) => { if (!x.cancelled) toast(x.message, 'error'); };
     const roleMenu = (a) => h('button', { class: 'btn ghost sm', 'data-pop-anchor': '', onclick: (e) => menu(e.currentTarget, [
-      a.role !== 'admin' ? { label: 'Make admin', icon: 'star', action: () => setRole({ userId: a.id }, 'admin').catch((x) => toast(x.message, 'error')) } : null,
-      a.role !== 'moderator' ? { label: 'Make moderator', icon: 'shield', action: () => setRole({ userId: a.id }, 'moderator').catch((x) => toast(x.message, 'error')) } : null,
+      a.role !== 'admin' ? { label: 'Make admin', icon: 'star', action: () => setRole({ userId: a.id }, 'admin', { title: `Make ${a.displayName} an admin?`, text: ROLE_HINT.admin }).catch(quietErr) } : null,
+      a.role !== 'moderator' ? { label: 'Make moderator', icon: 'shield', action: () => setRole({ userId: a.id }, 'moderator', { title: `Make ${a.displayName} a moderator?`, text: ROLE_HINT.moderator }).catch(quietErr) } : null,
       { label: 'Make owner\u2026', icon: 'star', action: () => transferOwner(a) },
-      { label: 'Remove from staff', icon: 'close', danger: true, action: async () => {
-        if (await confirmDialog({ title: `Remove ${a.displayName} from staff?`, text: 'They lose access to the dashboard right away.', confirm: 'Remove', danger: true })) setRole({ userId: a.id }, null).catch((x) => toast(x.message, 'error'));
-      } },
+      { label: 'Remove from staff', icon: 'close', danger: true, action: () => setRole({ userId: a.id }, null, { title: `Remove ${a.displayName} from staff?`, text: 'They lose access to the dashboard right away.', button: 'Remove' }).catch(quietErr) },
     ]) }, 'Change role');
     const transferOwner = async (a) => {
       const typed = h('input', { class: 'input', placeholder: a.username, autocomplete: 'off' });
@@ -365,7 +371,10 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They get full control, including staff roles. You stay on as an admin, and only they can give ownership back.'), field(`Type ${a.username} to confirm`, typed)),
         actions: [{ label: 'Cancel' }, { label: 'Make owner', kind: 'danger', action: async () => {
           if (typed.value.trim().toLowerCase() !== a.username.toLowerCase()) { toast('The name doesn\u2019t match.', 'error'); return false; }
-          await api('POST', '/admin/owner', { userId: a.id }); toast(`${a.displayName} is now the owner.`); admins();
+          const r = await withPassword((x) => api('POST', '/admin/owner', { userId: a.id, ...x }), { title: 'Confirm handing over ownership', text: `${a.displayName} becomes the owner. This can\u2019t be undone from your side.` })
+            .catch((x) => { if (x.cancelled) return null; throw x; });
+          if (!r) return false;
+          toast(`${a.displayName} is now the owner.`); admins();
         } }] });
     };
     const name = h('input', { class: 'input', placeholder: 'username' });
@@ -385,8 +394,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('div', { class: 'row gap' }, name, h('button', { class: 'btn primary', onclick: async () => {
           const u = name.value.trim().replace(/^@/, '');
           if (!u) return toast('Type a username first.', 'error');
-          if (!(await confirmDialog({ title: `Make ${u} ${newRole === 'admin' ? 'an admin' : 'a moderator'}?`, text: ROLE_HINT[newRole], confirm: 'Add' }))) return;
-          await setRole({ username: u }, newRole).catch((x) => toast(x.message, 'error'));
+          await setRole({ username: u }, newRole, { title: `Make ${u} ${newRole === 'admin' ? 'an admin' : 'a moderator'}?`, text: ROLE_HINT[newRole], button: 'Add' }).catch(quietErr);
         } }, 'Add')))
         : h('p', { class: 'field-hint' }, 'Only the owner can change roles.'));
   }
@@ -462,6 +470,10 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const c = d.config;
     const cur = (cents, code = c.currency) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: code || 'USD' }).format(cents / 100); } catch { return `${(cents / 100).toFixed(2)} ${code}`; } };
     const save = async (patch) => { try { await api('PUT', '/admin/money', patch); toast('Saved.'); money(); } catch (e) { toast(e.message, 'error'); } };
+    // Where payments go (and the secrets that prove they're real) needs the password again.
+    const saveSecure = async (patch) => {
+      try { if (await withPassword((x) => api('PUT', '/admin/money', { ...patch, ...x }), { title: 'Confirm payment settings', text: 'Changing where payments go needs your password.' })) { toast('Saved.'); money(); } } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+    };
     const hook = (p) => `${location.origin}/api/pay/${p}`;
     const f = {
       price: h('input', { class: 'input', type: 'number', min: '1', step: '0.5', value: String(c.monthlyCents / 100) }),
@@ -504,7 +516,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('li', null, 'People paste their support code into the Ko-fi message. Payments without a code wait in the list below for you to match.')),
       copyRow('Webhook URL', hook('kofi')),
       h('div', { class: 'grid-2' }, field('Your Ko-fi page', f.kofiUrl), field('Verification token', f.kofiToken)),
-      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ kofiUrl: f.kofiUrl.value, ...(f.kofiToken.value.trim() ? { kofiToken: f.kofiToken.value.trim() } : {}) }) }, 'Save Ko-fi')),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => saveSecure({ kofiUrl: f.kofiUrl.value, ...(f.kofiToken.value.trim() ? { kofiToken: f.kofiToken.value.trim() } : {}) }) }, 'Save Ko-fi')),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Stripe (cards, Apple Pay, Google Pay, monthly)')),
       h('ol', { class: 'steps' },
@@ -513,7 +525,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('li', null, 'Hearth adds each person\u2019s code to the link, so their payment matches them without typing anything.')),
       copyRow('Webhook URL', hook('stripe')),
       h('div', { class: 'grid-2' }, field('Payment Link', f.stripeLink), field('Webhook signing secret', f.stripeSecret)),
-      h('div', null, h('button', { class: 'btn primary', onclick: () => save({ stripeLink: f.stripeLink.value, ...(f.stripeSecret.value.trim() ? { stripeSecret: f.stripeSecret.value.trim() } : {}) }) }, 'Save Stripe')),
+      h('div', null, h('button', { class: 'btn primary', onclick: () => saveSecure({ stripeLink: f.stripeLink.value, ...(f.stripeSecret.value.trim() ? { stripeSecret: f.stripeSecret.value.trim() } : {}) }) }, 'Save Stripe')),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Payments')),
       d.payments.length ? h('div', { class: 'adm-table' }, ...d.payments.map((p) => h('div', { class: 'adm-row pay-row' },
@@ -529,7 +541,11 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const m = await api('GET', '/admin/memberships').catch(() => null);
     if (!m) return '';
     const c = m.config;
-    const save = async (patch) => { try { await api('PUT', '/admin/memberships', patch); toast('Saved.'); money(); } catch (e) { toast(e.message, 'error'); } };
+    // A new Stripe key or webhook secret decides where the money goes, so it needs the password again.
+    const save = async (patch) => {
+      const send = (x) => api('PUT', '/admin/memberships', { ...patch, ...x });
+      try { if (await (patch.key || patch.webhookSecret ? withPassword(send, { title: 'Confirm the Stripe keys', text: 'Changing the Stripe keys needs your password.' }) : send({}))) { toast('Saved.'); money(); } } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+    };
     const f = {
       key: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.keySet ? `Saved (${c.keyMode} mode, paste to replace)` : 'sk_live_\u2026 or rk_live_\u2026' }),
       secret: h('input', { class: 'input mono', type: 'password', autocomplete: 'off', placeholder: c.webhookSet ? 'Saved (paste to replace)' : 'whsec_\u2026' }),
@@ -545,6 +561,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Paying members'), h('strong', null, String(m.stats.members))),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Memberships a month'), h('strong', null, cur(m.stats.monthlyCents, c.currency))),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, `Your ${c.feePercent}% a month`), h('strong', null, cur(m.stats.feeCents, c.currency)))),
+      m.stats.pendingCancellations ? h('p', { class: 'warn-box' }, `${m.stats.pendingCancellations} membership${m.stats.pendingCancellations === 1 ? '' : 's'} of deleted servers still need${m.stats.pendingCancellations === 1 ? 's' : ''} cancelling in Stripe (Stripe couldn’t be reached). Hearth tries again every hour; you can also cancel them in your Stripe dashboard.`) : '',
       h('ol', { class: 'steps' },
         h('li', null, 'In Stripe, turn on Connect (Connect \u2192 Get started, choose \u201cExpress\u201d accounts). Stripe handles the creators\u2019 identity checks, payouts and tax forms.'),
         h('li', null, 'Developers \u2192 API keys: paste your secret key below (or a restricted key with write access to Accounts, Account Links, Checkout Sessions and Subscriptions).'),
@@ -662,7 +679,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         b.regions ? h('span', { class: 'stat-sub' }, Object.values(b.regions).map((x) => (x.ok ? `${x.name} \u2713` : `${x.name}: failed`)).join(' \u00b7 ')) : null,
         h('button', { class: 'btn ghost sm', onclick: async () => { try { const r = await api('POST', `/admin/backups/${encodeURIComponent(b.name)}/verify`); toast(r.verified.ok ? `Restore test passed: ${r.verified.users} accounts, ${r.verified.messages} messages, ${r.verified.files} files.` : `Restore test FAILED: ${r.verified.error}`, r.verified.ok ? undefined : 'error'); owner(); } catch (x) { toast(x.message, 'error'); } } }, 'Test restore'),
         h('button', { class: 'btn ghost sm', onclick: () => download(b) }, 'Download'),
-        h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: 'Delete this backup?', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`); owner(); } } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No encrypted backups yet.'),
+        h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
+          try { if (await withPassword((x) => api('DELETE', `/admin/backups/${encodeURIComponent(b.name)}`, x), { title: 'Delete this backup?', text: `${b.name} is deleted for good.`, button: 'Delete' })) owner(); } catch (x) { if (!x.cancelled) toast(x.message, 'error'); }
+        } }, 'Delete')))) : h('p', { class: 'field-hint' }, 'No encrypted backups yet.'),
       o.backups.length ? h('p', { class: 'field-hint' }, `${o.backups.length} plain database cop${o.backups.length === 1 ? 'y' : 'ies'} on the server for undoing updates (newest ${ago(o.backups[0].at)}).`) : null);
   }
 
@@ -679,7 +698,11 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     } }, 'Older entries');
     clear(body).append(h('div', { class: 'admin-head' }, h('h3', null, 'Audit log'), h('span', { class: 'field-hint' }, 'Staff actions and account security events, newest first. Entries can\u2019t be edited or deleted.')),
       chain ? (chain.ok ? h('div', { class: 'chain-ok' }, icon('check'), `Tamper check passed: all ${chain.entries} entries are intact and in order.`)
-        : h('div', { class: 'chain-bad' }, icon('shield'), `Tamper check FAILED at entry #${chain.brokenAt}: the log was changed outside Hearth (someone edited the database file).`)) : '',
+        : h('div', { class: 'chain-bad' }, icon('shield'), chain.reason === 'missing'
+          ? `Tamper check FAILED: entries up to #${chain.anchoredId} were recorded on this machine, but the log now ends at #${chain.brokenAt - 1}. Entries were removed outside Hearth, or an older copy of the database was put back.`
+          : chain.reason === 'anchor' || chain.reason === 'keyed_from' ? 'Tamper check FAILED: the files Hearth uses to check the log were changed outside Hearth.'
+            : `Tamper check FAILED at entry #${chain.brokenAt}: the log was changed outside Hearth (someone edited the database file).`)) : '',
+      chain && chain.gaps && chain.gaps.length ? h('div', { class: 'chain-bad' }, icon('shield'), `Earlier problem${chain.gaps.length === 1 ? '' : 's'} found and recorded: ${chain.gaps.slice(-3).map((g) => `#${g.id} (${fmtStamp(g.at)})`).join(', ')}. See those entries below.`) : '',
       table, h('div', null, more));
   }
 
@@ -768,7 +791,8 @@ async function userModal(id, refresh, myRank = 2) {
       notesBox(u, () => { m.close(); userModal(id, refresh, myRank); }, myRank),
       u.myRole === 'owner' && u.canAct ? h('div', { class: 'row gap wrap' }, h('span', { class: 'field-label' }, 'Staff role'),
         ...[['moderator', 'Moderator'], ['admin', 'Admin'], [null, 'None']].map(([r, l]) => h('button', { class: `chip${(u.role || null) === r ? ' active' : ''}`, onclick: async () => {
-          await api('PUT', '/admin/staff', { userId: id, role: r }).then(() => { toast(r ? `Now ${l.toLowerCase()}.` : 'Removed from staff.'); m.close(); userModal(id, refresh, myRank); refresh(); }, (x) => toast(x.message, 'error'));
+          await withPassword((x) => api('PUT', '/admin/staff', { userId: id, role: r, ...x }), { title: 'Confirm the team change', text: 'Changing the team needs your password.' })
+            .then((ok) => { if (!ok) return; toast(r ? `Now ${l.toLowerCase()}.` : 'Removed from staff.'); m.close(); userModal(id, refresh, myRank); refresh(); }, (x) => { if (!x.cancelled) toast(x.message, 'error'); });
         } }, l))) : null,
       u.canAct ? null : h('p', { class: 'field-hint' }, 'You can look, but only someone ranked above this account can suspend, sign out or reset it.')),
     actions: !u.canAct ? [] : [

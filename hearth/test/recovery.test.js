@@ -290,7 +290,7 @@ test('admins can remove 2FA only for people below them; others can’t at all', 
   const rando = await srv.register();
   assert.equal((await srv.api('POST', `/admin/users/${u.id}/2fa/remove`, { token: rando.token, ip: rando.ip })).status, 403);
   const admin = await srv.register();
-  assert.equal((await srv.api('PUT', '/admin/staff', { token: srv.owner.token, ip: srv.owner.ip, body: { userId: admin.id, role: 'admin' } })).status, 200);
+  assert.equal((await srv.api('PUT', '/admin/staff', { token: srv.owner.token, ip: srv.owner.ip, body: { userId: admin.id, role: 'admin', authKey: srv.owner.authKey } })).status, 200);
   await enable2fa(srv, srv.owner).catch(() => {}); // owner turns on 2FA (their session stays)
   assert.equal((await srv.api('POST', `/admin/users/${srv.owner.id}/2fa/remove`, { token: admin.token, ip: admin.ip })).status, 403, 'an admin can’t strip the owner’s 2FA');
   assert.equal((await srv.api('POST', `/admin/users/${admin.id}/2fa/remove`, { token: admin.token, ip: admin.ip })).status, 400, 'nor their own');

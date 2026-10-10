@@ -18,6 +18,7 @@ const { execFile, execFileSync } = require('child_process');
 
 module.exports = function setupRegions(ctx) {
   const { api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT } = ctx;
+  const auditLog = ctx.auditLog || (() => {});
   const now = () => Date.now();
   const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
   const ALIVE_MS = 3 * 60000;
@@ -76,6 +77,7 @@ module.exports = function setupRegions(ctx) {
     // Remember the address the admin uses: that's the one the region must check in at (behind a proxy, this
     // server can't always tell its own public https:// address).
     db.prepare('INSERT INTO regions (id, name, token_hash, setup_until, stats, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, name, sha(token), now() + 24 * 3600000, JSON.stringify({ origin }), now());
+    auditLog(req, 'region_added', id, name);
     res.json({ region: regionOut(db.prepare('SELECT * FROM regions WHERE id = ?').get(id)), command: installCommand(origin, id, token) });
   });
   // A new install command for an existing region (new token; the old one stops working).
@@ -88,18 +90,23 @@ module.exports = function setupRegions(ctx) {
     ensureSecret();
     const token = crypto.randomBytes(24).toString('hex');
     db.prepare('UPDATE regions SET token_hash = ?, setup_until = ?, stats = ? WHERE id = ?').run(sha(token), now() + 24 * 3600000, JSON.stringify({ ...parse(r.stats, {}), origin }), r.id);
+    auditLog(req, 'region_reinstall', r.id, r.name);
     res.json({ command: installCommand(origin, r.id, token) });
   });
   api.patch('/admin/regions/:id', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
     const name = String((req.body || {}).name || '').trim().slice(0, 40);
     if (!name) fail(400, 'Name required.');
+    const before = db.prepare('SELECT name FROM regions WHERE id = ?').get(req.params.id);
     db.prepare('UPDATE regions SET name = ? WHERE id = ?').run(name, req.params.id);
+    if (before) auditLog(req, 'region_renamed', req.params.id, `${before.name} \u2192 ${name}`);
     res.json({ ok: true });
   });
   api.delete('/admin/regions/:id', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
+    const r = db.prepare('SELECT name FROM regions WHERE id = ?').get(req.params.id);
     db.prepare('DELETE FROM regions WHERE id = ?').run(req.params.id);
+    if (r) auditLog(req, 'region_removed', req.params.id, r.name);
     res.json({ ok: true });
   });
 

@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 module.exports = function setupMoney(ctx) {
-  const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, emitTo, brief } = ctx;
+  const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, emitTo, brief, auditLog, stepUp, sealSecret, openSecret } = ctx;
   const now = () => Date.now();
   const DAY = 86400000;
 
@@ -20,9 +20,9 @@ module.exports = function setupMoney(ctx) {
     let v = {};
     try { v = JSON.parse(getSetting('payments') || '{}') || {}; } catch { /* defaults */ }
     return {
-      kofiToken: typeof v.kofiToken === 'string' ? v.kofiToken : '',
+      kofiToken: openSecret(v.kofiToken),
       kofiUrl: typeof v.kofiUrl === 'string' ? v.kofiUrl : '',
-      stripeSecret: typeof v.stripeSecret === 'string' ? v.stripeSecret : '',
+      stripeSecret: openSecret(v.stripeSecret),
       stripeLink: typeof v.stripeLink === 'string' ? v.stripeLink : '',
       monthlyCents: Math.max(100, Math.round(+v.monthlyCents || 300)),
       currency: typeof v.currency === 'string' && v.currency ? v.currency.slice(0, 3).toUpperCase() : 'USD',
@@ -30,7 +30,8 @@ module.exports = function setupMoney(ctx) {
       autoRaised: v.autoRaised !== false,
     };
   }
-  const saveCfg = (c) => setSetting('payments', JSON.stringify(c));
+  // The Ko-fi token and the Stripe signing secret are sealed with data/secret.key (anyone with them can fake payments).
+  const saveCfg = (c) => setSetting('payments', JSON.stringify({ ...c, kofiToken: sealSecret(c.kofiToken), stripeSecret: sealSecret(c.stripeSecret) }));
 
   // ------------------------------------------------------------------ support codes and granting
   function supportCode(uid) {
@@ -111,12 +112,24 @@ module.exports = function setupMoney(ctx) {
     const expected = crypto.createHmac('sha256', secret).update(`${t}.${req.rawBody.toString('utf8')}`).digest('hex');
     return sigs.some((s) => safeEq(s, expected));
   }
+  // Creator memberships (memberships.js) are paid through the same kind of Stripe events. When the owner uses one
+  // Stripe account for both, those payments reach this webhook too; they're the creators' money, not support for
+  // this server, so they're left out.
+  function isMembership(o) {
+    const subRef = o.subscription || (o.parent && o.parent.subscription_details && o.parent.subscription_details.subscription);
+    const sub = subRef && typeof subRef === 'object' ? subRef.id : subRef ? String(subRef) : '';
+    const metas = [o.metadata, o.subscription_details && o.subscription_details.metadata, o.parent && o.parent.subscription_details && o.parent.subscription_details.metadata,
+      subRef && typeof subRef === 'object' ? subRef.metadata : null];
+    if (metas.some((m) => m && m.kind === 'membership')) return true;
+    return !!sub && !!(db.prepare('SELECT 1 FROM memberships WHERE stripe_sub = ?').get(sub) || db.prepare('SELECT 1 FROM membership_cancellations WHERE stripe_sub = ?').get(sub));
+  }
   api.post('/pay/stripe', (req, res) => {
     rateLimit('stripe:' + req.ip, 300, 60000);
     const c = cfg();
     if (!c.stripeSecret || !stripeVerified(req, c.stripeSecret)) return res.status(400).json({ error: 'Bad signature.' });
     const ev = req.body || {};
     const o = (ev.data && ev.data.object) || {};
+    if (isMembership(o)) return res.json({ received: true, ignored: 'membership' });
     if (ev.type === 'checkout.session.completed') {
       const uid = whoFrom(o.client_reference_id) || null;
       if (uid && o.customer) {
@@ -171,10 +184,15 @@ module.exports = function setupMoney(ctx) {
       payments: list,
     });
   });
-  api.put('/admin/money', auth, (req, res) => {
+  // Every change is in the audit log (names of what changed, never the secrets). Changing where payments go or
+  // the secrets that prove a payment is real needs the password (and two-factor) again, so a stolen admin session
+  // can't quietly send supporters' money somewhere else.
+  const SENSITIVE = ['kofiToken', 'kofiUrl', 'stripeSecret', 'stripeLink'];
+  api.put('/admin/money', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
     const b = req.body || {};
     const c = cfg();
+    const before = { ...c };
     const url = (v) => { const s = String(v || '').trim(); if (!s) return ''; try { const u = new URL(s); if (u.protocol !== 'https:') throw new Error(); return u.href; } catch { fail(400, 'Links must start with https://'); } return ''; };
     if (b.kofiToken !== undefined) c.kofiToken = String(b.kofiToken || '').trim().slice(0, 100);
     if (b.kofiUrl !== undefined) c.kofiUrl = url(b.kofiUrl);
@@ -184,10 +202,13 @@ module.exports = function setupMoney(ctx) {
     if (b.currency !== undefined) c.currency = String(b.currency || 'USD').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3) || 'USD';
     if (b.fileMb !== undefined) c.fileMb = Math.max(0, Math.min(4096, Math.round(+b.fileMb || 0)));
     if (b.autoRaised !== undefined) c.autoRaised = !!b.autoRaised;
+    const changed = Object.keys(c).filter((k) => c[k] !== before[k]);
+    if (changed.some((k) => SENSITIVE.includes(k))) await stepUp(req, b);
     saveCfg(c);
+    if (changed.length) auditLog(req, 'payment_settings', null, changed.join(', '));
     ctx.onChange();
     res.json({ ok: true });
-  });
+  }));
   // Give a payment that couldn't be matched to the right person.
   api.post('/admin/money/payments/:id/assign', auth, (req, res) => {
     requireInstanceAdmin(req.userId);
@@ -199,7 +220,9 @@ module.exports = function setupMoney(ctx) {
     db.prepare('UPDATE payments SET user_id = ? WHERE id = ?').run(u.id, p.id);
     const custom = String(p.note).match(/^customer:(.+)$/);
     if (custom) db.prepare('UPDATE users SET stripe_customer = ? WHERE id = ?').run(custom[1], u.id);
-    grant(u.id, /monthly/i.test(p.kind) ? Math.max(31, daysFor(p.amount_cents)) : daysFor(p.amount_cents));
+    const days = /monthly/i.test(p.kind) ? Math.max(31, daysFor(p.amount_cents)) : daysFor(p.amount_cents);
+    grant(u.id, days);
+    auditLog(req, 'payment_assigned', u.id, `${(p.amount_cents / 100).toFixed(2)} ${p.currency} ${p.kind} (${p.provider} ${p.ref}): ${days} days`);
     res.json({ ok: true });
   });
 

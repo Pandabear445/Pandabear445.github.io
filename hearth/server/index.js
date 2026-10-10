@@ -9,7 +9,7 @@ const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
-const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash } = require('./db');
+const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret } = require('./db');
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
@@ -987,9 +987,14 @@ api.post('/auth/logout', auth, (req, res) => {
 async function stepUp(req, body, authKeyField = 'authKey') {
   const row = getUserRow(req.userId);
   const b = body || {};
-  rateLimit('stepup:' + req.userId, 10, 10 * 60 * 1000);
+  // 10 tries per 10 minutes, counted before the (slow) check so guesses sent in parallel are limited too. A right
+  // password gives its try back, so an owner confirming a run of team or backup changes isn't locked out.
+  const limitKey = 'stepup:' + req.userId;
+  rateLimit(limitKey, 10, 10 * 60 * 1000);
   const key = b[authKeyField];
   if (typeof key !== 'string' || !(await bcrypt.compare(key.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
+  const tries = buckets.get(limitKey);
+  if (tries && tries.count > 0) tries.count -= 1;
   if (row.totp_enabled && !(req.session.mfa_at && now() - req.session.mfa_at < 10 * 60000)) {
     ACCT.require2fa(row, b, req);
     db.prepare('UPDATE sessions SET mfa_at = ? WHERE id = ?').run(now(), req.session.id);
@@ -2017,6 +2022,9 @@ api.patch('/roles/:id', auth, (req, res) => {
   const name = everyone ? '@everyone' : b.name !== undefined ? (String(b.name).trim().slice(0, 32) || r.name) : r.name;
   // You can't grant permissions you don't have yourself.
   const permissions = b.permissions !== undefined ? (((parseInt(b.permissions, 10) || 0) & mine) | (r.permissions & ~mine)) & ALL_PERMS : r.permissions;
+  // A role sold as a membership can't get moderator powers (they'd be for sale).
+  const tier = MEMB.tierForRole(r.id);
+  if (tier && (permissions & MEMB.POWERFUL & ~r.permissions)) fail(400, `This role is sold as the "${tier.name}" membership, so it can't have moderator powers.`);
   db.prepare('UPDATE roles SET name = ?, color = ?, icon = ?, permissions = ?, hoist = ?, mentionable = ? WHERE id = ?').run(
     name, everyone ? '' : b.color !== undefined ? cleanColor(b.color) : r.color, everyone ? '' : b.icon !== undefined ? cleanIcon(b.icon) : r.icon,
     permissions, everyone ? 0 : b.hoist !== undefined ? (b.hoist ? 1 : 0) : r.hoist, everyone ? 0 : b.mentionable !== undefined ? (b.mentionable ? 1 : 0) : r.mentionable, r.id);
@@ -2026,6 +2034,9 @@ api.patch('/roles/:id', auth, (req, res) => {
 api.delete('/roles/:id', auth, (req, res) => {
   const { r, s } = requireManageableRole(req.params.id, req.userId);
   if (r.id === s.id) fail(400, 'The @everyone role can\u2019t be deleted.');
+  // Paying members would silently lose what they pay for, and the membership would keep selling nothing.
+  const tier = MEMB.tierForRole(r.id);
+  if (tier) fail(409, `This role is sold as the "${tier.name}" membership. Give that membership another role, or stop selling it and wait for its members to end, first.`);
   db.prepare('DELETE FROM roles WHERE id = ?').run(r.id);
   db.prepare("DELETE FROM channel_overrides WHERE target_type = 'role' AND target_id = ?").run(r.id);
   emitServer(s.id);
@@ -2053,6 +2064,11 @@ api.put('/channels/:id/overrides', auth, (req, res) => {
   const list = Array.isArray((req.body || {}).overrides) ? req.body.overrides.slice(0, 100) : [];
   const roleIds = new Set(db.prepare('SELECT id FROM roles WHERE server_id = ?').all(s.id).map((r) => r.id));
   const mine = perms.base(s, req.userId);
+  // Roles sold as memberships can't get moderator powers in a channel either.
+  for (const o of list) {
+    const tier = o.type !== 'member' && roleIds.has(String(o.id || '')) && MEMB.tierForRole(String(o.id));
+    if (tier && ((parseInt(o.allow, 10) || 0) & CHANNEL_SCOPED & mine & MEMB.POWERFUL)) fail(400, `That role is sold as the "${tier.name}" membership, so it can't have moderator powers here.`);
+  }
   db.transaction(() => {
     db.prepare('DELETE FROM channel_overrides WHERE channel_id = ?').run(c.id);
     for (const o of list) {
@@ -2378,8 +2394,9 @@ const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'On
 ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
   tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), requireOutranks: (req, id) => requireOutranks(req, id), auditLog, secEvent: (...a) => secEvent(...a), cleanIp,
   emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions });
-// The key saved in the app wins over .env, so the admin never has to edit files.
-const giphyKey = () => getSetting('giphyKey') || GIPHY_API_KEY;
+// The key saved in the app wins over .env, so the admin never has to edit files. Keys saved in the app are
+// sealed with data/secret.key (sealSecret in db.js), like the SMTP password.
+const giphyKey = () => openSecret(getSetting('giphyKey')) || GIPHY_API_KEY;
 const giphyRating = () => (['g', 'pg', 'pg-13', 'r'].includes(getSetting('giphyRating')) ? getSetting('giphyRating') : 'pg-13');
 const gifProxyOn = () => (getSetting('gifProxy') ?? (process.env.GIF_PROXY || 'true')) !== 'false';
 const GIPHY_API = process.env.GIPHY_API_BASE || 'https://api.giphy.com';
@@ -2387,7 +2404,7 @@ const GIPHY_API = process.env.GIPHY_API_BASE || 'https://api.giphy.com';
 // GIF providers. KLIPY (free, unlimited production keys; same API shape as the retired Tenor) is the
 // default; GIPHY is still supported. Results are cached and shared by everyone, so popular searches,
 // trending and categories cost one API call per 15–30 minutes instead of one per person.
-const klipyKey = () => getSetting('klipyKey') || process.env.KLIPY_API_KEY || '';
+const klipyKey = () => openSecret(getSetting('klipyKey')) || process.env.KLIPY_API_KEY || '';
 const gifProvider = () => {
   const p = getSetting('gifProvider');
   if (p === 'klipy' || p === 'giphy' || p === 'library') return p;
@@ -2681,7 +2698,7 @@ const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, s
   } });
 // Study tools (server/study.js): encrypted sync for Recall's decks, pictures and profile.
 require('./study')({ api, auth, db, fail, rateLimit, pushTo: (...a) => pushTo(...a), emitToUser: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
-ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken,
+ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, sealSecret, openSecret, auditLog,
   requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
 
 // Admin: GIF settings (key, rating, privacy proxy) without editing .env.
@@ -2694,12 +2711,14 @@ api.get('/admin/settings', auth, (req, res) => {
 api.patch('/admin/settings', auth, (req, res) => {
   requireInstanceAdmin(req.userId);
   const b = req.body || {};
-  if (b.giphyKey !== undefined) setSetting('giphyKey', String(b.giphyKey || '').trim().slice(0, 100) || null);
-  if (b.klipyKey !== undefined) setSetting('klipyKey', String(b.klipyKey || '').trim().slice(0, 200) || null);
+  if (b.giphyKey !== undefined) setSetting('giphyKey', sealSecret(String(b.giphyKey || '').trim().slice(0, 100)) || null);
+  if (b.klipyKey !== undefined) setSetting('klipyKey', sealSecret(String(b.klipyKey || '').trim().slice(0, 200)) || null);
   if (['klipy', 'giphy', 'library'].includes(b.gifProvider)) { setSetting('gifProvider', b.gifProvider); gifCache.clear(); gifLimitedUntil = 0; }
   if (b.giphyRating !== undefined && ['g', 'pg', 'pg-13', 'r'].includes(b.giphyRating)) setSetting('giphyRating', b.giphyRating);
   if (b.gifProxy !== undefined) setSetting('gifProxy', b.gifProxy ? 'true' : 'false');
   io.emit('config:update', { gifsEnabled: true, gifLibraryOnly: !gifKey(), gifProvider: gifProvider(), gifProxy: gifProxyOn() });
+  const changed = ['giphyKey', 'klipyKey', 'gifProvider', 'giphyRating', 'gifProxy'].filter((k) => b[k] !== undefined);
+  if (changed.length) adminLog(req, 'gif_settings', null, changed.join(', '));
   res.json({ ok: true });
 });
 api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
@@ -2725,7 +2744,7 @@ const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || 
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
 // Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
 // entry with a region name, so the app can measure which answer fastest and use those.
-const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..') });
+const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..'), auditLog });
 function iceServersFor(uid) {
   const list = [iceServers[0]];
   const urls = turnUrls();
@@ -2784,6 +2803,8 @@ api.put('/admin/turn', auth, (req, res) => {
   const b = req.body || {};
   if (b.urls !== undefined) setSetting('turnUrls', String(b.urls || '').split(/[\s,]+/).filter((u) => /^turns?:/.test(u)).slice(0, 12).join(',') || null);
   if (b.secret !== undefined) setSetting('turnSecret', String(b.secret || '').trim().slice(0, 200) || null);
+  const changed = [b.urls !== undefined ? 'urls' : '', b.secret !== undefined ? 'secret' : ''].filter(Boolean);
+  if (changed.length) adminLog(req, 'turn_settings', null, changed.join(', '));
   res.json({ ok: true, urls: turnUrls(), secretSet: !!turnSecret() });
 });
 
@@ -2890,28 +2911,16 @@ function socketIp(socket) {
   return cleanIp(remote);
 }
 // The audit log: staff actions and security events on accounts (password changes and resets, two-factor,
-// sessions, deletions). Append-only — the database refuses to edit or delete entries (see db.js), and each
-// entry's hash covers the previous one, so a hand-edited database shows up as a broken chain.
+// sessions, deletions). Append-only — the database refuses to edit or delete entries (see db.js). Each entry's
+// hash covers the previous one and is keyed with a secret from data/secret.key, and the newest entry is anchored
+// in a file outside the database, so editing the database by hand, or cutting entries off the end, shows up.
 // `req` may be null for things the server does by itself; actorId then says whose account it was.
 function auditLog(req, action, target, detail = '', actorId = undefined) {
-  db.transaction(() => {
-    const last = db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
-    const r = { id: last.id + 1, admin_id: actorId !== undefined ? actorId : (req && req.userId) || null, action, target: target || null, detail: String(detail).slice(0, 1000), ip: req ? cleanIp(req.ip) : null, created_at: now() };
-    db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(r.id, r.admin_id, r.action, r.target, r.detail, r.ip, r.created_at, last.hash || '', auditHash(last.hash || '', r));
-  })();
+  auditAppend({ admin_id: actorId !== undefined ? actorId : (req && req.userId) || null, action, target: target || null, detail: String(detail), ip: req ? cleanIp(req.ip) : null });
 }
 const adminLog = auditLog;
-// Walks the whole chain. Returns { ok, entries, brokenAt }.
-function verifyAuditChain() {
-  let prev = ''; let n = 0;
-  for (const r of db.prepare('SELECT * FROM admin_log ORDER BY id').iterate()) {
-    n++;
-    if ((r.prev_hash || '') !== prev || r.hash !== auditHash(prev, r)) return { ok: false, entries: n, brokenAt: r.id };
-    prev = r.hash;
-  }
-  return { ok: true, entries: n, brokenAt: null };
-}
+// Walks the whole chain (see auditVerify in db.js): { ok, entries, brokenAt, reason, gaps, … }.
+const verifyAuditChain = () => auditVerify();
 function suspendUser(uid, reason, hours = 0) {
   const until = hours > 0 ? now() + hours * 3600000 : null;
   db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ?, suspended_until = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), until, uid);
@@ -3130,18 +3139,38 @@ api.get('/admin/reports', auth, staffOnly, (req, res) => {
     priorReports: db.prepare('SELECT COUNT(*) n FROM reports WHERE target_id = ? AND id != ?').get(r.target_id, r.id).n,
   })));
 });
+// Staff can't close (or reopen) reports about themselves or about staff at their level or above: those are for
+// someone ranked higher. The owner handles reports about the owner (nobody is above them).
+function requireCanHandleReport(req, r) {
+  if (staffRole(req.userId) === 'owner') return;
+  if (r.target_id === req.userId) fail(403, 'This report is about you, so someone ranked above you handles it.');
+  if (r.target_id && staffRank(r.target_id) >= staffRank(req.userId)) fail(403, `This report is about ${staffRole(r.target_id) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them handles it.`);
+}
 api.patch('/admin/reports/:id', auth, staffOnly, (req, res) => {
   const b = req.body || {};
   const r = db.prepare('SELECT * FROM reports WHERE id = ?').get(req.params.id);
   if (!r) fail(404, 'Report not found.');
+  requireCanHandleReport(req, r);
   const status = ['open', 'reviewing', 'resolved', 'dismissed'].includes(b.status) ? b.status : r.status;
   db.prepare('UPDATE reports SET status = ?, resolution = ?, handled_by = ?, handled_at = ? WHERE id = ?').run(status, String(b.resolution ?? r.resolution).slice(0, 1000), req.userId, now(), r.id);
   adminLog(req, 'report_' + status, r.id, b.resolution || '');
   res.json({ ok: true });
 });
-// Remove a reported message (or any message) for everyone.
+// Whether a message is part of a report (the reported message or one of the messages included with it).
+const inReport = (mid) => !!db.prepare(`SELECT 1 FROM reports r WHERE (CASE WHEN json_valid(r.context) THEN json_extract(r.context, '$.messageId') END) = ?
+  OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r.evidence) THEN r.evidence ELSE '[]' END) e WHERE json_extract(e.value, '$.id') = ?) LIMIT 1`).get(mid, mid);
+// Remove a reported message for everyone. Like every other staff action on a person, only messages by people
+// ranked below you (or your own) can be removed. Direct messages are private, so staff can only remove ones
+// that were reported.
 api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
+  const d = !m && db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
+  if (!m && !d) fail(404, 'Message already gone.');
+  const author = (m || d).author_id;
+  if (author && author !== req.userId && staffRank(author) >= staffRank(req.userId)) {
+    fail(403, `You can’t remove messages by ${staffRole(author) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
+  }
+  if (d && !inReport(d.id)) fail(403, 'Direct messages can only be removed when they were reported.');
   if (m) {
     const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
     const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.id)];
@@ -3151,8 +3180,6 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
     db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
     if (c) toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   } else {
-    const d = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
-    if (!d) fail(404, 'Message already gone.');
     const dm = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(d.dm_id);
     removeMessageFiles([d.id]);
     db.prepare('DELETE FROM reactions WHERE message_id = ?').run(d.id);
@@ -3175,41 +3202,66 @@ function staffChanged(uid) {
 }
 api.get('/admin/staff', auth, staffOnly, (req, res) => res.json({ staff: staffList(), me: staffRole(req.userId) }));
 // Give someone a role, change it, or take it away (role: 'admin' | 'moderator' | null).
-api.put('/admin/staff', auth, ownerOnly, (req, res) => {
+// Needs the owner's password (and two-factor) again: a stolen session alone can't add itself to the team.
+api.put('/admin/staff', auth, ownerOnly, wrap(async (req, res) => {
   const b = req.body || {};
   const row = b.userId ? getUserRow(String(b.userId)) : db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(String(b.username || '').trim().replace(/^@/, '').toLowerCase());
   if (!row) fail(404, 'No account with that username.');
   if (row.id === ownerId()) fail(400, 'You\u2019re the owner. To step down, hand ownership to someone else first.');
   const role = b.role === 'admin' || b.role === 'moderator' ? b.role : null;
   if (!role && envAdmins().includes(row.username.toLowerCase())) fail(400, `${row.username} is an admin through ADMIN_USERS in the server's .env file. Remove the name there and restart to take it away.`);
+  await stepUp(req, b);
   const roles = staffRoles();
   if (role) roles[row.id] = role; else delete roles[row.id];
   saveStaffRoles(roles);
   staffChanged(row.id);
   adminLog(req, role ? `role_${role}` : 'role_removed', row.id, row.username);
   res.json({ staff: staffList(), me: staffRole(req.userId) });
-});
+}));
 // Hand the whole instance to someone else. They become owner; the old owner stays on as an admin.
-api.post('/admin/owner', auth, ownerOnly, (req, res) => {
+// It can't be undone from the old owner's side, so it needs the password (and two-factor) again, and the old
+// owner gets an email about it (if they have a confirmed one) in case it wasn't them.
+api.post('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
   const row = getUserRow(String((req.body || {}).userId || ''));
   if (!row) fail(404, 'User not found.');
   if (row.id === req.userId) fail(400, 'You already own this server.');
-  if (row.suspended_at) fail(400, 'Unsuspend them first.');
+  if (row.suspended_at || row.deleted_at || row.is_bot) fail(400, row.suspended_at ? 'Unsuspend them first.' : 'That account can\u2019t own the server.');
+  const me = await stepUp(req, req.body);
   const roles = staffRoles();
   delete roles[row.id];
   roles[req.userId] = 'admin';
   saveStaffRoles(roles);
   setSetting('owner', row.id);
   staffChanged(row.id); staffChanged(req.userId);
-  adminLog(req, 'ownership_transferred', row.id, row.username);
+  adminLog(req, 'ownership_transferred', row.id, `${me.username} \u2192 ${row.username}`);
+  secEvent('ownership_transferred', req.ip, `${me.username} -> ${row.username}`);
+  ACCT.notify(me, 'you handed over ownership', `${me.username} handed ownership of ${brand().name} to ${row.username} (from ${cleanIp(req.ip)}). You're now an admin, and only ${row.username} can give ownership back.`);
+  ACCT.notify(row, 'you now own this Hearth', `${me.username} made ${row.username} the owner of ${brand().name}.`);
   res.json({ ok: true });
-});
+}));
 // IP bans
 api.get('/admin/ip-bans', auth, adminOnly, (req, res) => res.json(ipBans()));
+// Whether a ban entry ("203.0.113.7" or "203.0.113.0/24") covers an address (same rules as ipBanned).
+function banCovers(entry, ip) {
+  ip = cleanIp(ip);
+  const [base, bits] = String(entry).split('/');
+  if (bits === undefined) return base.toLowerCase() === ip.toLowerCase();
+  const a = ip4num(ip); const n = ip4num(base); const k = +bits;
+  if (a === null || n === null || !(k >= 0 && k <= 32)) return false;
+  const mask = k === 0 ? 0 : (~0 << (32 - k)) >>> 0;
+  return ((a & mask) >>> 0) === ((n & mask) >>> 0);
+}
 api.post('/admin/ip-bans', auth, adminOnly, (req, res) => {
   const ip = String((req.body || {}).ip || '').trim();
   if (!/^(\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?|[0-9a-f:]{3,39})$/i.test(ip)) fail(400, 'Enter an IP address like 203.0.113.7 or a range like 203.0.113.0/24.');
-  if (ipBanned(req.ip) || (ip.includes('/') ? false : ip === cleanIp(req.ip))) fail(400, 'That would block your own connection.');
+  if (ipBanned(req.ip) || banCovers(ip, req.ip)) fail(400, 'That would block your own connection.');
+  // Like every other staff action: no banning the networks the owner, or staff at your level or above, use.
+  const mine = staffRank(req.userId);
+  for (const s of staffList().filter((x) => x.id !== req.userId && STAFF_RANK[x.role] >= mine)) {
+    const row = getUserRow(s.id);
+    const seen = [row && row.last_ip, ...ipsOf(s.id).map((x) => x.ip)].filter(Boolean);
+    if (seen.some((a) => banCovers(ip, a))) fail(403, `That would block ${s.role === 'owner' ? 'the owner' : 'staff at your level or above'} (${s.username}).`);
+  }
   const list = ipBans().filter((b) => b.ip !== ip);
   list.unshift({ ip, reason: String((req.body || {}).reason || '').slice(0, 200), by: req.userId, at: now() });
   setSetting('ipBans', JSON.stringify(list.slice(0, 1000)));
@@ -3232,9 +3284,17 @@ api.get('/admin/servers', auth, adminOnly, (req, res) => {
     FROM servers s WHERE s.kind = 'server' ORDER BY members DESC LIMIT 500`).all()
     .map((x) => ({ id: x.id, name: x.name, icon: x.icon, owner: brief(x.owner_id), members: x.members, messages: x.messages, createdAt: x.created_at, lastActive: x.lastActive })));
 });
+// Staff can only act on servers whose owner ranks below them (or their own servers).
+function requireOutranksServerOwner(req, srv) {
+  if (srv.owner_id !== req.userId && staffRank(srv.owner_id) >= staffRank(req.userId)) {
+    fail(403, `This server belongs to ${staffRole(srv.owner_id) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
+  }
+}
+// Group chats are private conversations, not servers: they can't be deleted from here.
 api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
-  const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(req.params.id);
+  const srv = db.prepare("SELECT * FROM servers WHERE id = ? AND kind = 'server'").get(req.params.id);
   if (!srv) fail(404, 'Server not found.');
+  requireOutranksServerOwner(req, srv);
   const memberIds = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(srv.id).map((r) => r.user_id);
   const ids = db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(srv.id).map((r) => r.id);
   if (ids.length) removeMessageFiles(ids);
@@ -3250,6 +3310,7 @@ api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
 api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
   const srv = db.prepare("SELECT * FROM servers WHERE id = ? AND kind = 'server'").get(req.params.id);
   if (!srv) fail(404, 'Server not found.');
+  requireOutranksServerOwner(req, srv);
   const row = db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(String((req.body || {}).username || '').trim().replace(/^@/, '').toLowerCase());
   if (!row) fail(404, 'No account with that username.');
   if (!isMember(srv.id, row.id)) fail(400, `${row.username} isn\u2019t a member of ${srv.name}.`);
@@ -3613,11 +3674,11 @@ function funding() {
   return { enabled: !!v.enabled, url: typeof v.url === 'string' ? v.url : '', monthly: +v.monthly || 0, raised: +v.raised || 0, currency: typeof v.currency === 'string' ? v.currency.slice(0, 3) : 'USD', note: typeof v.note === 'string' ? v.note : '' };
 }
 // Payments through Ko-fi / Stripe (server/money.js) count toward "raised this month" by themselves.
-const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, brief,
+const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, getUserRow, broadcastUser, newId, express, brief, auditLog, stepUp, sealSecret, openSecret,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), onChange: () => io && io.emit('config:update', { funding: fundingPublic(), support: MONEY.available() }) });
 // Creator memberships (server/memberships.js): server owners sell monthly tiers that give a role.
 const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
-  isMember, emitServer, seal, unseal, newId, brief, PM, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
+  isMember, emitServer, seal, unseal, newId, brief, PM, auditLog, stepUp, sealSecret, openSecret, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
   mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
 function fundingTotals() {
   const f = funding();
@@ -3676,7 +3737,14 @@ api.put('/admin/owner', auth, ownerOnly, (req, res) => {
 //     These are what you download or keep elsewhere.
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const ENC_DIR = path.join(BACKUP_DIR, 'encrypted');
+// The plaintext database snapshot a backup starts from lives here (private), never in ENC_DIR: that folder is the
+// one people copy off-site as it is.
+const BACKUP_TMP = path.join(BACKUP_DIR, '.tmp');
 const BK = require('./backup');
+const cleanStaleBackups = (olderThanMs = 0) => {
+  const removed = BK.cleanStale({ outDir: ENC_DIR, tmpDir: BACKUP_TMP, scratchDir: BACKUP_DIR, olderThanMs });
+  if (removed.length) console.log(`Removed leftovers of an interrupted backup: ${removed.join(', ')}`);
+};
 const autoBackup = () => { try { return { enabled: true, keep: 7, ...JSON.parse(getSetting('autoBackup') || '{}') }; } catch { return { enabled: true, keep: 7 }; } };
 function listBackups() {
   try {
@@ -3708,7 +3776,8 @@ let encBusy = null;
 function makeEncryptedBackup() {
   if (encBusy) return encBusy;
   encBusy = (async () => {
-    const b = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: ENC_DIR });
+    cleanStaleBackups(3600000); // anything this old belongs to a backup that was cut off, not one still running
+    const b = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: ENC_DIR, tmpDir: BACKUP_TMP });
     let verified;
     try { verified = { ...(await BK.verifyBackup(b.file, BK.loadKey(DATA_DIR), BACKUP_DIR)), at: now() }; } catch (e) { verified = { ok: false, error: e.message, at: now() }; }
     saveBackupStatus(b.name, { verified });
@@ -3755,13 +3824,16 @@ api.get('/admin/backups/:name', auth, ownerOnly, (req, res) => {
   auditLog(req, 'backup_downloaded', null, hit.name);
   res.download(path.join(ENC_DIR, hit.name), hit.name);
 });
-api.delete('/admin/backups/:name', auth, ownerOnly, (req, res) => {
+// Deleting a backup can't be undone (and is what someone covering their tracks would do), so it needs the
+// password (and two-factor) again.
+api.delete('/admin/backups/:name', auth, ownerOnly, wrap(async (req, res) => {
   const hit = listEncBackups().find((b) => b.name === req.params.name) || listBackups().find((b) => b.name === req.params.name);
   if (!hit) fail(404, 'Backup not found.');
+  await stepUp(req, req.body);
   fs.unlinkSync(path.join(hit.name.endsWith('.hbk') ? ENC_DIR : BACKUP_DIR, hit.name));
   auditLog(req, 'backup_deleted', null, hit.name);
   res.json(backupInfo());
-});
+}));
 // The backup key, to keep in a password manager. Needs the password (and two-factor) again; always logged.
 api.post('/admin/backups/key', auth, ownerOnly, wrap(async (req, res) => {
   await stepUp(req, req.body);
@@ -4172,6 +4244,8 @@ function setupSockets(server) {
   else server = http.createServer(app);
   setupSockets(server);
   try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
+  // A backup cut off by a crash or a forced stop may have left a plaintext snapshot or a half-written file.
+  try { cleanStaleBackups(0); } catch (e) { console.error('Could not clean up old backup files:', e.message); }
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
     console.log(`\n  ${INSTANCE_NAME} is running.\n`);
@@ -4193,14 +4267,16 @@ function setupSockets(server) {
     stopping = true;
     console.log(`\n  ${signal} received: restarting cleanly.`);
     try { io.emit('server:restarting', { at: Date.now() }); } catch { /* ignore */ }
+    // A backup still running can't finish now: don't leave its plaintext snapshot or half-written file behind.
+    const exit = () => { try { BK.removeInFlight(); } catch { /* ignore */ } process.exit(0); };
     setTimeout(() => {
       try { io.close(); } catch { /* ignore */ }
       server.close();
       server.closeAllConnections?.();
       try { db.pragma('wal_checkpoint(TRUNCATE)'); db.close(); } catch { /* ignore */ }
-      process.exit(0);
+      exit();
     }, 250);
-    setTimeout(() => process.exit(0), 4000).unref();
+    setTimeout(exit, 4000).unref();
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
