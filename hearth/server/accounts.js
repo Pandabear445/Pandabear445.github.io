@@ -45,7 +45,7 @@ const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24
 module.exports = function setupAccounts(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
     tokenId, requireInstanceAdmin, requireOutranks, auditLog, secEvent, cleanIp, emitKeyState, brandName, isB64ish, isSalt, atRestKey,
-    stepUp, createSession, revokeSessions } = ctx;
+    stepUp, createSession, revokeSessions, hitsSoFar, verifyCaptcha } = ctx;
   const now = () => Date.now();
 
   // ------------------------------------------------------------------ sending email
@@ -336,19 +336,27 @@ module.exports = function setupAccounts(ctx) {
 
   // ------------------------------------------------------------------ forgot password
   // Always answers the same way, so it can't be used to find out which accounts or emails exist.
-  // Limits: per network, per account and for everyone together. The last two are quiet (refusing would tell
-  // the asker that the account exists): per account so an inbox can't be flooded with reset emails, and for
-  // everyone to protect the mail quota. Only emails actually sent count there, so requests for made-up names
-  // can't use it up and stop real people from resetting.
+  // The robot check (the sign-in one) comes before anything is counted. Limits: per network, per account and
+  // for everyone together. The per-account one is quiet (refusing would tell the asker that the account
+  // exists), so an inbox can't be flooded with reset emails. The one for everyone protects the mail quota: only
+  // an account's first email in the hour counts toward it, so asking about the same people again and again
+  // can't fill it, and while it's full everyone is told to try later alike, which says nothing about anyone.
+  const FORGOT_ALL = 300;
   api.post('/auth/forgot', wrap(async (req, res) => {
     limitNet(req, 'forgot', 5, 15 * 60000);
     if (!mailReady()) fail(503, 'Password reset by email isn’t set up on this server. Ask the owner.');
+    verifyCaptcha((req.body || {}).captcha, 'login', req.ip);
+    if (hitsSoFar('forgot:all') >= FORGOT_ALL) {
+      secEvent('reset_capped', cleanIp(req.ip));
+      fail(429, 'Lots of password resets were asked for in the last hour. Please try again later.', 'rate_limited');
+    }
     const login = String((req.body || {}).login || '').trim().slice(0, 200);
     const row = login.includes('@')
       ? db.prepare('SELECT * FROM users WHERE email = ? AND email_verified = 1').get(login.toLowerCase())
       : db.prepare('SELECT * FROM users WHERE username = ?').get(login);
-    if (row && row.email && row.email_verified && !row.is_bot && !row.deleted_at && countHit('forgotuser:' + row.id, 3600000) <= 3) {
-      if (countHit('forgot:all', 3600000) > 300) { secEvent('reset_capped', cleanIp(req.ip), row.username); return res.json({ ok: true }); }
+    const sent = row && row.email && row.email_verified && !row.is_bot && !row.deleted_at ? countHit('forgotuser:' + row.id, 3600000) : 0;
+    if (sent && sent <= 3) {
+      if (sent === 1) countHit('forgot:all', 3600000);
       // The link only works while the account still has this address (see /auth/reset).
       const raw = newToken(row.id, 'reset', { email: row.email }, 30 * 60000);
       const link = `${mailCfg().publicUrl}/#reset=${raw}`;

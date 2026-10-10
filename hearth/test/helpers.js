@@ -43,11 +43,23 @@ function totp(secret, offsetSteps = 0) {
 }
 
 // ------------------------------------------------------------------ the "I'm not a robot" proof of work
-const zeroBits = (buf) => { let n = 0; for (const b of buf) { if (b === 0) { n += 8; continue; } n += Math.clz32(b) - 24; break; } return n; };
-function solveCaptcha(c) {
-  for (let nonce = 0; ; nonce++) {
-    if (zeroBits(crypto.createHash('sha256').update(`${c.salt}:${nonce}`).digest()) >= c.difficulty) return { salt: c.salt, difficulty: c.difficulty, expires: c.expires, sig: c.sig, nonce };
-  }
+// Solved with the app's own solver (public/js/captcha-worker.js, minus its message handler): several times faster
+// than hashing with node:crypto, and it checks that what browsers run gets accepted.
+const SOLVER_SRC = fs.readFileSync(path.join(ROOT, 'public', 'js', 'captcha-worker.js'), 'utf8').replace(/self\.onmessage[\s\S]*$/, '');
+const appSolve = new Function(`${SOLVER_SRC}\nreturn solve;`)();
+const solved = (c, nonce) => ({ salt: c.salt, difficulty: c.difficulty, expires: c.expires, sig: c.sig, nonce });
+function solveCaptcha(c) { return solved(c, appSolve(c.salt, c.difficulty)); }
+// Many at once, on all but one of this machine's cores (for tests that need a flood of solved checks).
+async function solveCaptchas(list) {
+  const { Worker } = require('node:worker_threads');
+  const n = Math.max(1, Math.min(list.length, os.cpus().length - 1));
+  const code = `${SOLVER_SRC}\nconst { parentPort, workerData } = require('node:worker_threads');\nparentPort.postMessage(workerData.map((c) => solve(c.salt, c.difficulty)));`;
+  const parts = await Promise.all(Array.from({ length: n }, (_, i) => new Promise((resolve, reject) => {
+    const w = new Worker(code, { eval: true, workerData: list.filter((_, j) => j % n === i).map((c) => ({ salt: c.salt, difficulty: c.difficulty })) });
+    w.once('message', (m) => { w.terminate(); resolve(m); });
+    w.once('error', reject);
+  })));
+  return list.map((c, j) => solved(c, parts[j % n][Math.floor(j / n)]));
 }
 
 async function startServer(extraEnv = {}) {
@@ -78,8 +90,9 @@ async function startServer(extraEnv = {}) {
 
   const srv = {
     base, dir, port, config, get child() { return child; }, get log() { return log; },
-    // Stops and starts the same server on the same data (like an update or a reboot).
-    async restart() { await halt(); log = ''; await launch(); },
+    // Stops and starts the same server on the same data (like an update or a reboot), optionally with some
+    // settings in its environment changed (as an operator editing .env).
+    async restart(envChanges = {}) { await halt(); Object.assign(env, envChanges); log = ''; await launch(); },
     // One HTTP request. Returns { status, json, text, headers }. Never throws on an error status.
     async call(method, p, { token, body, ip, headers = {}, raw, timeout = 15000 } = {}) {
       const h = { 'x-forwarded-for': ip || '198.51.100.1', ...headers };
@@ -183,4 +196,4 @@ function resetProof(user, challenge) {
 }
 const resetTokenFrom = (mail) => /#reset=([\w-]+)/.exec(mail.text)[1];
 
-module.exports = { startServer, confirmEmail, enable2fa, freshCode, totp, resetProof, resetTokenFrom, newIp, hex, b64, sleep, solveCaptcha };
+module.exports = { startServer, confirmEmail, enable2fa, freshCode, totp, resetProof, resetTokenFrom, newIp, hex, b64, sleep, solveCaptcha, solveCaptchas };

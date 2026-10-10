@@ -75,6 +75,8 @@ function countHit(key, windowMs) {
   if (!b || b.reset < t) { b = { count: 0, reset: t + windowMs }; buckets.set(key, b); }
   return ++b.count;
 }
+// How many hits a key has in its current window, without counting one.
+const hitsSoFar = (key) => { const b = buckets.get(key); return b && b.reset >= now() ? b.count : 0; };
 // The "network" an address belongs to for rate limits: the address itself for IPv4, its /64 for IPv6 (a home
 // connection or a VPS usually gets a whole /64, so rotating addresses inside it changes nothing).
 function netOf(ip) {
@@ -788,9 +790,12 @@ function auth(req, res, next) {
   const u = db.prepare('SELECT id, suspended_at, suspend_reason, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
   if (!u || u.deleted_at) return res.status(401).json({ error: 'Not signed in.', code: 'signed_out' });
   if (stillSuspended(u)) return res.status(403).json({ error: suspendedMsg(u), code: 'suspended' });
+  // Logging out always works: it only takes access away, and an app turned away here would drop its copy of the
+  // token while the session stayed live on the server.
+  const loggingOut = req.path === '/auth/logout';
   // A ban covers people who were already signed in, too (staff excepted, so nobody locks the admins out).
-  if (ipBanned(req.ip) && !isStaff(s.user_id)) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
-  if (maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
+  if (!loggingOut && ipBanned(req.ip) && !isStaff(s.user_id)) { secEvent('blocked_ip', req.ip, req.path); return res.status(403).json({ error: BANNED_MSG, code: 'ip_banned' }); }
+  if (!loggingOut && maintenance() && !isStaff(s.user_id) && !req.path.startsWith('/config')) return res.status(503).json({ error: maintenance(), code: 'maintenance' });
   req.userId = s.user_id;
   req.token = token;
   req.session = s;
@@ -936,10 +941,11 @@ api.post('/auth/register', wrap(async (req, res) => {
   if (mode === 'code' && (!regCode() || typeof code !== 'string' || !safeEqual(code, regCode()))) fail(403, 'That registration code is not right.');
   const tos = termsInfo();
   if (tos.version && +acceptTos !== tos.version) fail(400, 'Please read and accept the Terms of Service to create an account.');
-  verifyCaptcha((req.body || {}).captcha, 'register');
-  // Slows bot floods across many IPs. Counted only after the robot check, so requests without a solved one
-  // can't use it up and stop everyone else from signing up.
-  rateLimit('reg:all', 120, 60 * 60 * 1000);
+  verifyCaptcha((req.body || {}).captcha, 'register', req.ip);
+  // Slows bot floods across many IPs: past the instance-wide limit the robot check gets harder for everyone,
+  // rather than turning everyone away (see busyBits). Counted only after the check, so requests without a
+  // solved one don't count at all.
+  countInstanceWide('register');
   if (typeof username !== 'string' || !USERNAME_RE.test(username)) fail(400, 'Usernames are 2–24 characters: letters, numbers, _ and . only.');
   if (typeof authKey !== 'string' || !/^[0-9a-f]{64}$/.test(authKey)) fail(400, 'Bad auth key.');
   if (!isB64ish(publicKey, 2000) || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
@@ -961,32 +967,56 @@ api.post('/auth/register', wrap(async (req, res) => {
   // The first account to take a free ADMIN_USERS name keeps it for good; and the very first account settles who
   // owns the server (nothing awaits between the insert and here, so two sign-ups can't both claim).
   claimEnvAdmin(getUserRow(id));
-  ownerId();
+  settleOwnerAtFirstSignUp();
   const token = createSession(req, id);
   addSupportFriend(id);
-  res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey });
+  res.json({ token, user: selfUser(getUserRow(id)), encPrivateKey, device: deviceNote(getUserRow(id)) });
 }));
 
 // Compared against when the username doesn't exist, so a wrong username takes as long as a wrong password
 // (otherwise the response time would tell which accounts exist).
 const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 11);
+// "This device has signed in to this account before": a note the app keeps after signing in and shows again
+// next time, so an account's own devices get their own sign-in limit wherever they are (a phone's address
+// changes all the time). It's signed with the server's key over the account and its current password hash, so
+// it can't be made up, works for no other account, and stops counting once the password changes.
+const deviceSig = (row, n) => crypto.createHmac('sha256', atRestKey).update(`login-device|${row.id}|${n}|${row.auth_hash}`).digest('base64url').slice(0, 22);
+function deviceKnown(row, note) {
+  const [n, sig, extra] = String(note || '').split('.');
+  if (!/^[\w-]{22}$/.test(n || '') || !/^[\w-]{22}$/.test(sig || '') || extra !== undefined) return null;
+  return safeEqual(sig, deviceSig(row, n)) ? n : null;
+}
+function deviceNote(row, keep = null) {
+  const n = keep || crypto.randomBytes(16).toString('base64url');
+  return `${n}.${deviceSig(row, n)}`;
+}
+// A network this account has been used from (IPv6: the same /64, since devices pick a new address in it
+// every day or so).
+function knownNetwork(uid, ip) {
+  const net = netOf(ip);
+  if (!net.includes(':')) return !!db.prepare('SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?').get(uid, net);
+  return db.prepare("SELECT ip FROM user_ips WHERE user_id = ? AND ip LIKE '%:%' ORDER BY last_seen DESC LIMIT 1000").all(uid).some((r) => netOf(r.ip) === net);
+}
 api.post('/auth/login', wrap(async (req, res) => {
   limitNet(req, 'login', 20, 10 * 60 * 1000);
   // The robot check comes before every shared limit: a request without a solved one is turned away here, so
   // junk can't use up the instance-wide limit or an account's own (which would lock real people out).
-  verifyCaptcha((req.body || {}).captcha, 'login');
-  rateLimit('login:all', 3000, 10 * 60 * 1000); // password checks are slow on purpose; this keeps a flood from using all the CPU
+  verifyCaptcha((req.body || {}).captcha, 'login', req.ip);
   const { username, authKey } = req.body || {};
   const name = typeof username === 'string' ? username.slice(0, 40) : '';
   const row = name ? db.prepare('SELECT * FROM users WHERE username = ?').get(name) : null;
-  // Per-account limits too, so guessing one person's password from many IPs is slowed down. Attempts from
-  // networks this account has signed in from before are counted apart (per network, per day), so nobody can
-  // lock a person out of their usual devices by spamming from somewhere else.
+  // Per-account limits too, so guessing one person's password from many IPs is slowed down. Attempts from the
+  // account's own devices and from networks it has been used from are counted apart (per device or network,
+  // per day), so nobody can lock a person out of their usual devices by spamming from somewhere else.
   // (The name is encoded so a made-up one like "day:alice" can't land in alice's buckets.)
   const lname = Buffer.from(name.toLowerCase()).toString('base64url');
-  const knownIp = row && db.prepare('SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?').get(row.id, cleanIp(req.ip));
-  if (knownIp) rateLimit(`loginuser:known:${lname}:${netOf(req.ip)}`, 100, 24 * 60 * 60 * 1000);
+  const device = row && deviceKnown(row, (req.body || {}).device);
+  const known = device ? 'd:' + device : row && knownNetwork(row.id, req.ip) ? netOf(req.ip) : null;
+  if (known) rateLimit(`loginuser:known:${lname}:${known}`, 100, 24 * 60 * 60 * 1000);
   else {
+    // Password checks are slow on purpose; this keeps a flood from using all the CPU. An account's own devices
+    // and networks don't count (there are only so many of those), so a flood never stands in their way.
+    countInstanceWide('login');
     rateLimit('loginuser:' + lname, 10, 15 * 60 * 1000);
     rateLimit('loginuser:day:' + lname, 100, 24 * 60 * 60 * 1000);
   }
@@ -998,7 +1028,7 @@ api.post('/auth/login', wrap(async (req, res) => {
   // Two-factor sign-in: the right password isn't enough on its own.
   ACCT.require2fa(row, req.body, req);
   const token = createSession(req, row.id, { mfa: !!row.totp_enabled });
-  res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key });
+  res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key, device: deviceNote(row, device) });
 }));
 
 api.post('/auth/logout', auth, (req, res) => {
@@ -2362,9 +2392,8 @@ api.post('/me/sessions/revoke-others', auth, (req, res) => {
 
 // ---------------------------------------------------------------- instance settings + GIPHY
 // Instance staff, highest first:
-//   owner      one person: the first account (or the first ADMIN_USERS name that has an account when the owner
-//              is first settled) until handed over. Only the owner can give or take away staff roles, and hand
-//              over ownership.
+//   owner      one person, settled once (see ownerId) and then only changed by handing it over. Only the owner
+//              can give or take away staff roles, and hand over ownership.
 //   admin      the whole admin dashboard and Settings → Instance. The accounts that took ADMIN_USERS names
 //              are always admins.
 //   moderator  reports, users (suspend, sign out, reset profile, notes), who's online and the audit log.
@@ -2381,6 +2410,9 @@ const envAdmins = () => (process.env.ADMIN_USERS || '').split(',').map((x) => x.
 // ADMIN_USERS names are matched to an account once: { name: userId }. The first account to hold a listed name
 // keeps it, with its powers, even after renaming or deleting itself. So the name stays reserved, and nobody can
 // register it later and become an admin. (Removing the name from ADMIN_USERS takes the powers away.)
+// HELD_BACK marks a listed name nobody had when this was first set up on a server that already had accounts
+// (see the start-up code below): nobody may take it, since it may have been an admin's before a rename.
+const HELD_BACK = '!';
 function envClaims() {
   try { const c = JSON.parse(getSetting('envAdminClaims') || '{}'); return c && typeof c === 'object' && !Array.isArray(c) ? c : {}; } catch { return {}; }
 }
@@ -2408,16 +2440,30 @@ function staffRoles() {
   return r;
 }
 const saveStaffRoles = (r) => setSetting('staffRoles', JSON.stringify(r));
+// Who owns the server is settled once and written down ('owner'), so a later sign-up can never take it over:
+//   - an account holding an ADMIN_USERS name owns it (the first such name in the list), else the first account;
+//   - except on a server set up with ADMIN_USERS before anyone signed up, whose first account took none of its
+//     names ('ownerAwaitsEnv', see settleOwnerAtFirstSignUp): there the first listed name owns the server as
+//     soon as it's registered, as documented. Until then ownerStandIn() runs it, without being written down.
+// After that it changes only by handing it over in the app, or with `node server/cli.js set-owner`.
+const ownerStandIn = (c) => envAdmins().map((n) => c[n]).find((x) => liveAccount(x)) || firstAccount();
 function ownerId() {
   const set = getSetting('owner');
   if (set && liveAccount(set)) return set;
-  // Not decided yet (or the owner's account can't sign in any more): the first ADMIN_USERS name that belongs to
-  // an account, else the first account. It's written down right away, so a later sign-up (say, of a name added
-  // to ADMIN_USERS) can't change who owns the server. Hand it over in the app, or with `node server/cli.js set-owner`.
   const c = envClaims();
-  const id = envAdmins().map((n) => c[n]).find((x) => liveAccount(x)) || firstAccount();
+  const awaited = getSetting('ownerAwaitsEnv');
+  if (awaited && envAdmins().includes(awaited) && !c[awaited]) return ownerStandIn(c); // still waiting for that sign-up
+  if (awaited) setSetting('ownerAwaitsEnv', null); // registered now (or taken off ADMIN_USERS): settle below
+  const id = (awaited && liveAccount(c[awaited]) && c[awaited]) || ownerStandIn(c);
   if (id && id !== set) setSetting('owner', id);
   return id;
+}
+// Right after an account is created. The very first one settles the owner, unless ADMIN_USERS names someone else
+// who hasn't signed up yet: the operator set it up before signing up, so the first listed name gets the server.
+function settleOwnerAtFirstSignUp() {
+  const admins = envAdmins(); const c = envClaims();
+  if (!getSetting('owner') && !getSetting('ownerAwaitsEnv') && admins.length && !admins.some((n) => c[n])) setSetting('ownerAwaitsEnv', admins[0]);
+  ownerId();
 }
 function staffRole(uid) {
   const row = uid && getUserRow(uid);
@@ -2429,8 +2475,25 @@ function staffRole(uid) {
 }
 // At start-up (ADMIN_USERS may have changed): tie listed names to the accounts holding them now, then settle
 // the owner. Sign-ups claim names as they're registered (see /auth/register).
-for (const n of envAdmins()) claimEnvAdmin(db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(n));
-ownerId();
+{
+  const firstTime = getSetting('envAdminClaims') === undefined;
+  for (const n of envAdmins()) claimEnvAdmin(db.prepare('SELECT * FROM users WHERE lower(username) = ?').get(n));
+  const c = envClaims();
+  // The first start of this version on a server that already has accounts: before it, an ADMIN_USERS admin could
+  // rename or delete their account and leave the name free, and the next person to register it became an admin.
+  // There's no telling which free names were someone's, so all of them are held back.
+  if (firstTime && firstAccount()) for (const n of envAdmins()) if (!c[n]) c[n] = HELD_BACK;
+  // A held-back name taken off ADMIN_USERS is let go (listed again later, it goes to whoever registers it first).
+  for (const n of Object.keys(c)) if (c[n] === HELD_BACK && !envAdmins().includes(n)) delete c[n];
+  setSetting('envAdminClaims', JSON.stringify(c));
+  const owner = ownerId();
+  const who = (id) => (getUserRow(id) || {}).username;
+  const held = envAdmins().filter((n) => c[n] === HELD_BACK);
+  if (held.length) console.warn(`\n  ADMIN_USERS lists ${held.join(', ')}, which no account has. Nobody can sign up with ${held.length > 1 ? 'these names' : 'it'}: before this update, an admin who renamed or deleted their account left the name free for anyone. If you're keeping one for someone who hasn't signed up yet, take it off ADMIN_USERS and restart (then give them a role in Admin \u2192 Team & roles once they've signed up).`);
+  const first = envAdmins()[0];
+  if (getSetting('ownerAwaitsEnv')) console.warn(`\n  ${getSetting('ownerAwaitsEnv')} (the first name in ADMIN_USERS when this server got its first account) will own this server once that account is signed up.${owner ? ` Until then ${who(owner)} runs it.` : ''}`);
+  else if (first && owner && c[first] !== owner && !held.includes(first)) console.warn(`\n  ADMIN_USERS starts with ${first}, but ${who(owner)} owns this server (the owner is settled once and doesn't follow ADMIN_USERS). To change it, hand ownership over in Admin \u2192 Team & roles, or run: node server/cli.js set-owner ${liveAccount(c[first]) ? who(c[first]) : '<username>'}`);
+}
 const staffRank = (uid) => STAFF_RANK[staffRole(uid)] || 0;
 const isStaff = (uid) => staffRank(uid) >= 1;
 function isInstanceAdmin(uid) { return staffRank(uid) >= 2; }
@@ -2438,7 +2501,7 @@ const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'On
 // Email, recovery key and two-factor sign-in (server/accounts.js).
 ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
   tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), requireOutranks: (req, id) => requireOutranks(req, id), auditLog, secEvent: (...a) => secEvent(...a), cleanIp,
-  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions });
+  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions, hitsSoFar, verifyCaptcha: (...a) => verifyCaptcha(...a) });
 // The key saved in the app wins over .env, so the admin never has to edit files.
 const giphyKey = () => getSetting('giphyKey') || GIPHY_API_KEY;
 const giphyRating = () => (['g', 'pg', 'pg-13', 'r'].includes(getSetting('giphyRating')) ? getSetting('giphyRating') : 'pg-13');
@@ -2857,10 +2920,11 @@ api.put('/admin/turn', auth, (req, res) => {
 // The browser must find a number that, hashed together with a random challenge, starts with N zero bits.
 // That takes a person's browser well under a second, but makes every bot attempt cost real computing time.
 // Challenges are signed (can't be forged or made easier), single-use, and expire after 5 minutes.
-// IPs that keep failing logins get harder puzzles automatically. No third parties, no tracking.
+// Networks that keep failing logins get harder puzzles automatically, and so does everyone while the instance is
+// unusually busy (see busyBits). No third parties, no tracking.
 const CAPTCHA_BASE = 18;
 const CAPTCHA_MAX = 24;
-const captchaFails = new Map(); // ip -> { n, at }
+const captchaFails = new Map(); // network (netOf) -> { n, at }
 const usedCaptchas = new Map(); // salt -> expires
 setInterval(() => {
   const t = Date.now();
@@ -2868,24 +2932,41 @@ setInterval(() => {
   for (const [k, f] of captchaFails) if (t - f.at > 3600000) captchaFails.delete(k);
 }, 60000).unref();
 const captchaMode = (purpose) => getSetting(purpose === 'register' ? 'captchaRegister' : 'captchaLogin') || 'on';
-function captchaDifficulty(ip) {
-  const f = captchaFails.get(ip);
+// The instance-wide limits on sign-ups and sign-ins. Past one, the robot check gets harder for everyone (one more
+// bit, so twice the work, for every half a limit over, up to CAPTCHA_MAX) instead of turning everyone away: a
+// flood then costs its sender more and more computing time, while a real person still gets in after one slower
+// check. With the check switched off there's nothing to make harder, so the limit turns requests away instead.
+const INSTANCE_LIMITS = { register: { key: 'reg:all', max: 120, windowMs: 60 * 60 * 1000 }, login: { key: 'login:all', max: 3000, windowMs: 10 * 60 * 1000 } };
+function busyBits(purpose) {
+  const l = INSTANCE_LIMITS[purpose];
+  const n = hitsSoFar(l.key);
+  return n < l.max ? 0 : 1 + Math.floor((n - l.max) / (l.max / 2));
+}
+function countInstanceWide(purpose) {
+  const l = INSTANCE_LIMITS[purpose];
+  if (captchaMode(purpose) === 'off') rateLimit(l.key, l.max, l.windowMs);
+  else countHit(l.key, l.windowMs);
+}
+// How hard the check has to be for a request from this address right now. Failures are counted per network
+// (an IPv6 /64), so hopping between addresses in one doesn't make it easy again.
+function captchaDifficulty(ip, purpose) {
+  const f = captchaFails.get(netOf(cleanIp(ip)));
   const n = f && Date.now() - f.at < 3600000 ? f.n : 0;
-  return Math.min(CAPTCHA_MAX, CAPTCHA_BASE + Math.floor(n / 3));
+  return Math.min(CAPTCHA_MAX, CAPTCHA_BASE + Math.floor(n / 3) + busyBits(purpose));
 }
 function noteAuthFailure(ip) {
-  ip = cleanIp(ip);
-  const f = captchaFails.get(ip) || { n: 0, at: 0 };
+  const k = netOf(cleanIp(ip));
+  const f = captchaFails.get(k) || { n: 0, at: 0 };
   f.n++; f.at = Date.now();
-  captchaFails.set(ip, f);
+  captchaFails.set(k, f);
 }
 const captchaSig = (salt, d, exp, purpose) => crypto.createHmac('sha256', atRestKey).update(`captcha|${salt}|${d}|${exp}|${purpose}`).digest('hex');
 api.get('/captcha', (req, res) => {
-  rateLimit('captcha:' + req.ip, 60, 10 * 60 * 1000);
+  limitNet(req, 'captcha', 60, 10 * 60 * 1000);
   const purpose = req.query.purpose === 'register' ? 'register' : 'login';
   if (captchaMode(purpose) === 'off') return res.json({ required: false });
   const salt = crypto.randomBytes(16).toString('hex');
-  const difficulty = captchaDifficulty(cleanIp(req.ip));
+  const difficulty = captchaDifficulty(req.ip, purpose);
   const expires = now() + 5 * 60 * 1000;
   res.json({ required: true, salt, difficulty, expires, purpose, sig: captchaSig(salt, difficulty, expires, purpose) });
 });
@@ -2894,17 +2975,20 @@ function zeroBits(buf) {
   for (const b of buf) { if (b === 0) { n += 8; continue; } n += Math.clz32(b) - 24; break; }
   return n;
 }
-function verifyCaptcha(c, purpose) {
+// Checks a solved robot check. It has to be at least as hard as one handed out to this address right now:
+// puzzles aren't tied to an address, so otherwise easy ones could be fetched elsewhere, or before a rush.
+function verifyCaptcha(c, purpose, ip) {
   if (captchaMode(purpose) === 'off') return;
   const bad = (msg) => fail(400, msg, 'captcha');
   if (!c || typeof c !== 'object') bad('Please complete the \u201cI\u2019m not a robot\u201d check.');
   const { salt, difficulty, expires, sig, nonce } = c;
   if (!/^[0-9a-f]{32}$/.test(String(salt)) || !Number.isInteger(difficulty) || difficulty < CAPTCHA_BASE || difficulty > CAPTCHA_MAX
     || !Number.isInteger(nonce) || nonce < 0 || typeof sig !== 'string' || sig.length !== 64) bad('The robot check didn\u2019t work. Please try again.');
-  const good = captchaSig(salt, difficulty, expires, purpose);
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) bad('The robot check didn\u2019t work. Please try again.');
+  if (!safeEqual(sig, captchaSig(salt, difficulty, expires, purpose))) bad('The robot check didn\u2019t work. Please try again.');
   if (+expires < now()) bad('The robot check expired. Please try again.');
   if (usedCaptchas.has(salt)) bad('That robot check was already used. Please try again.');
+  // The app solves a new, harder one by itself when it sees this code.
+  if (difficulty < captchaDifficulty(ip, purpose)) fail(400, 'The robot check needs to be a little harder right now. Please try again.', 'captcha_harder');
   if (zeroBits(crypto.createHash('sha256').update(`${salt}:${nonce}`).digest()) < difficulty) { secEvent('captcha_failed', '', purpose); bad('The robot check didn\u2019t work. Please try again.'); }
   usedCaptchas.set(salt, +expires);
 }
@@ -3268,6 +3352,7 @@ api.post('/admin/owner', auth, ownerOnly, (req, res) => {
   roles[req.userId] = 'admin';
   saveStaffRoles(roles);
   setSetting('owner', row.id);
+  setSetting('ownerAwaitsEnv', null); // handed over: no ADMIN_USERS sign-up takes it later
   staffChanged(row.id); staffChanged(req.userId);
   adminLog(req, 'ownership_transferred', row.id, row.username);
   res.json({ ok: true });

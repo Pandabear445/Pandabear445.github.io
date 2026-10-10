@@ -1,9 +1,12 @@
 // Sign-in, sign-up, reset links and sessions: regressions for the auth hardening batch.
 //   - ADMIN_USERS names belong to the account that first took them (a freed name brings no powers to a stranger),
-//     and the owner is settled once, so a later sign-up can't take the server over.
-//   - Requests without a solved robot check don't use up anyone's sign-in limits, and an account's usual
-//     networks can't be locked out by strangers.
-//   - Reset links die when the password or email changes; IP bans cover existing sessions and the reset flow.
+//     and the owner is settled once, so a later sign-up can't take the server over. A server set up with
+//     ADMIN_USERS before anyone signed up still goes to its first listed name, whoever signed up first.
+//   - Requests without a solved robot check don't use up anyone's sign-in limits; an account's usual networks
+//     (whole IPv6 /64s) and devices can't be locked out by strangers; past the instance-wide limits the robot
+//     check gets harder instead of turning everyone away.
+//   - Reset links die when the password or email changes; IP bans cover existing sessions and the reset flow,
+//     but never stop anyone logging out.
 const { test, before, after, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -11,7 +14,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { startServer, confirmEmail, resetTokenFrom, newIp, hex, b64, sleep, solveCaptcha } = require('./helpers');
+const { startServer, confirmEmail, resetTokenFrom, newIp, hex, b64, sleep, solveCaptcha, solveCaptchas } = require('./helpers');
 
 const as = (srv, u, method, p, body) => srv.api(method, p, { token: u.token, ip: u.ip, body });
 const role = async (srv, u) => (await as(srv, u, 'GET', '/bootstrap')).json.me.staffRole;
@@ -21,6 +24,8 @@ function regBody(srv, username) {
   return { username, authKey: hex(32), publicKey: kp.publicKey.export({ type: 'spki', format: 'der' }).toString('base64'), encPrivateKey: b64(120), kdfSalt: b64(16), acceptTos: srv.config.termsVersion || undefined };
 }
 const tryRegister = (srv, username, ip = newIp()) => srv.api('POST', '/auth/register', { ip, body: regBody(srv, username) });
+const setting = (srv, k) => (srv.sql('SELECT value FROM instance_settings WHERE key = ?', k)[0] || {}).value;
+const cliSetOwner = (srv, name) => spawnSync(process.execPath, ['server/cli.js', 'set-owner', name], { cwd: path.join(__dirname, '..'), env: { ...process.env, DATA_DIR: srv.dir }, encoding: 'utf8' });
 
 // ------------------------------------------------------------------ ADMIN_USERS and ownership (auth-1, admin-1, admin-3)
 describe('ADMIN_USERS names and the owner', () => {
@@ -105,16 +110,105 @@ describe('ADMIN_USERS names and the owner', () => {
     assert.equal(t.status, 200, t.text);
     assert.equal(await role(srv, heir), 'owner');
     assert.equal(await role(srv, srv.owner), 'admin');
-    const cli = spawnSync(process.execPath, ['server/cli.js', 'set-owner', srv.owner.username], { cwd: path.join(__dirname, '..'), env: { ...process.env, DATA_DIR: srv.dir }, encoding: 'utf8' });
+    const cli = cliSetOwner(srv, srv.owner.username);
     assert.equal(cli.status, 0, cli.stderr + cli.stdout);
     assert.equal(await role(srv, srv.owner), 'owner');
     assert.equal(srv.sql("SELECT COUNT(*) n FROM admin_log WHERE action = 'ownership_set_cli' AND target = ?", srv.owner.id)[0].n, 1, 'on the audit log');
     assert.equal((await srv.api('GET', '/admin/log/verify', { token: srv.owner.token, ip: srv.owner.ip })).json.ok, true, 'hash chain intact');
     // A deleted account can't be made the owner from the command line either.
     const gone = srv.sql('SELECT username FROM users WHERE deleted_at IS NOT NULL')[0].username;
-    const bad = spawnSync(process.execPath, ['server/cli.js', 'set-owner', gone], { cwd: path.join(__dirname, '..'), env: { ...process.env, DATA_DIR: srv.dir }, encoding: 'utf8' });
+    const bad = cliSetOwner(srv, gone);
     assert.notEqual(bad.status, 0);
     assert.equal(await role(srv, srv.owner), 'owner');
+  });
+
+  test('the CLI won’t make a suspended account the owner, and drops the new owner’s other staff role', async () => {
+    const mod = await srv.register('mod' + hex(3));
+    assert.equal((await as(srv, srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator' })).status, 200);
+    assert.equal((await as(srv, srv.owner, 'POST', `/admin/users/${mod.id}/suspend`, { reason: 'x' })).status, 200);
+    // A suspended owner couldn't sign in, and nobody outranks the owner to lift it: the server would have no owner.
+    const sus = cliSetOwner(srv, mod.username);
+    assert.notEqual(sus.status, 0);
+    assert.match(sus.stderr, /suspended/);
+    assert.equal(await role(srv, srv.owner), 'owner');
+    assert.equal((await as(srv, srv.owner, 'POST', `/admin/users/${mod.id}/unsuspend`)).status, 200);
+    const ok = cliSetOwner(srv, mod.username);
+    assert.equal(ok.status, 0, ok.stderr + ok.stdout);
+    mod.token = (await srv.login(mod)).json.token; // the suspension signed it out
+    assert.equal(await role(srv, mod), 'owner');
+    assert.ok(!(mod.id in JSON.parse(setting(srv, 'staffRoles') || '{}')), 'no moderator role left over');
+    assert.equal(cliSetOwner(srv, srv.owner.username).status, 0); // back as it was
+    assert.equal(await role(srv, mod), null, 'its moderator role went when it became the owner');
+  });
+});
+
+describe('a server set up with ADMIN_USERS, where someone else signs up first', () => {
+  let srv;
+  // The documented setup: ADMIN_USERS names the operator before anyone has signed up, but another account (the
+  // helper's 'owner' here: a friend, or a bot scanning for new servers) gets there first.
+  before(async () => { srv = await startServer({ ADMIN_USERS: 'chief' }); });
+  after(() => srv.stop());
+
+  test('the first account only stands in; the listed name owns the server once it signs up, for good', async () => {
+    assert.equal(await role(srv, srv.owner), 'owner', 'someone has to run it meanwhile');
+    assert.equal(setting(srv, 'owner'), undefined, 'not written down');
+    assert.equal(setting(srv, 'ownerAwaitsEnv'), 'chief');
+    const plain = await srv.register('plain' + hex(3));
+    assert.equal(await role(srv, plain), null);
+    await srv.restart();
+    assert.match(srv.log, /chief \(the first name in ADMIN_USERS[^)]*\) will own this server/);
+    assert.equal(await role(srv, srv.owner), 'owner');
+    const chief = await srv.register('chief');
+    assert.equal(await role(srv, chief), 'owner');
+    assert.equal(await role(srv, srv.owner), null, 'the stand-in had no role of its own');
+    assert.equal(setting(srv, 'owner'), chief.id);
+    assert.equal(setting(srv, 'ownerAwaitsEnv'), undefined);
+    await srv.restart();
+    assert.equal(await role(srv, chief), 'owner', 'kept after a restart');
+    // Settled now: a rename doesn't move it, and the old name stays chief's.
+    assert.equal((await as(srv, chief, 'POST', '/me/username', { username: 'chief2', authKey: chief.authKey })).status, 200);
+    assert.equal(await role(srv, chief), 'owner');
+    assert.equal((await tryRegister(srv, 'chief')).status, 409);
+  });
+});
+
+describe('ADMIN_USERS names added later, and names held back by the update', () => {
+  let srv; let carol;
+  before(async () => { srv = await startServer(); }); // no ADMIN_USERS at first: the first account owns the server
+  after(() => srv.stop());
+
+  test('a name added to ADMIN_USERS later brings admin, never ownership', async () => {
+    await srv.restart({ ADMIN_USERS: 'carol' });
+    assert.match(srv.log, /ADMIN_USERS starts with carol, but owner owns this server/, 'the operator is told who owns it');
+    carol = await srv.register('carol');
+    assert.equal(await role(srv, carol), 'admin');
+    assert.equal(await role(srv, srv.owner), 'owner');
+  });
+
+  test('upgrading: listed names nobody has are held back, since they may have been a renamed or deleted admin’s', async () => {
+    // A server from before this version has no record of which account took which ADMIN_USERS name.
+    srv.sql("DELETE FROM instance_settings WHERE key = 'envAdminClaims'");
+    await srv.restart({ ADMIN_USERS: 'carol,boss,dave' });
+    assert.match(srv.log, /ADMIN_USERS lists boss, dave, which no account has/);
+    for (const name of ['boss', 'Dave']) {
+      const r = await tryRegister(srv, name);
+      assert.equal(r.status, 409, `${name}: ${r.text}`);
+      assert.match(r.json.error, /reserved/);
+    }
+    const x = await srv.register('x' + hex(3));
+    assert.equal((await as(srv, x, 'POST', '/me/username', { username: 'boss', authKey: x.authKey })).status, 409, 'or rename into');
+    assert.equal(await role(srv, carol), 'admin', 'a name someone had at the update is still theirs');
+    assert.equal(await role(srv, srv.owner), 'owner');
+    // Taking a held-back name off ADMIN_USERS lets it go.
+    await srv.restart({ ADMIN_USERS: 'carol,boss' });
+    const dave = await srv.register('dave');
+    assert.equal(await role(srv, dave), null);
+    assert.equal((await tryRegister(srv, 'boss')).status, 409, 'still held back');
+    // Only names listed at the update are held back: one added afterwards goes to whoever takes it first.
+    await srv.restart({ ADMIN_USERS: 'carol,boss,erin' });
+    assert.doesNotMatch(srv.log, /lists[^\n]*erin/);
+    const erin = await srv.register('erin');
+    assert.equal(await role(srv, erin), 'admin');
   });
 });
 
@@ -176,6 +270,59 @@ read(); setInterval(read, 25).unref(); Date.now = () => real() + off;\n`);
     assert.equal(st[10], 429, 'per-account limit');
   });
 
+  test('an account’s own networks (the whole IPv6 /64) and devices keep their own limit', async () => {
+    const home = '2001:db8:aa:1::1';
+    const u = await srv.register(undefined, { ip: home });
+    // A stranger uses up the account's limit for new networks, solving every robot check.
+    const st = [];
+    for (let i = 0; i < 11; i++) { const ip = newIp(); st.push((await login(ip, hex(32), { captcha: await solved(ip) }, u)).status); }
+    assert.deepEqual(st, [...Array(10).fill(401), 429]);
+    // The laptop picked a new address in the same /64 overnight (IPv6 privacy addresses): still its network.
+    const v6 = '2001:db8:aa:1::2';
+    const r = await login(v6, u.authKey, { captcha: await solved(v6) }, u);
+    assert.equal(r.status, 200, r.text);
+    assert.match(r.json.device, /^[\w-]{22}\.[\w-]{22}$/, 'a note for this device');
+    // Somewhere new entirely (mobile data, travel): the note from that sign-in says it's the account's device.
+    const away = newIp();
+    const r2 = await login(away, u.authKey, { captcha: await solved(away), device: r.json.device }, u);
+    assert.equal(r2.status, 200, r2.text);
+    assert.equal(r2.json.device, r.json.device, 'the same note is kept');
+    // Without a note, a new device on a new network waits like anyone (the honest limit). Notes can't be made up
+    // or borrowed from another account.
+    const w = await srv.register();
+    const wip = newIp();
+    const wNote = (await login(wip, w.authKey, { captcha: await solved(wip) }, w)).json.device;
+    const forged = r.json.device.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'));
+    for (const device of [undefined, forged, wNote, `${r.json.device}.x`]) {
+      const ip = newIp();
+      assert.equal((await login(ip, u.authKey, { captcha: await solved(ip), device }, u)).status, 429, String(device));
+    }
+    // A password change retires the notes handed out before it.
+    const k2 = hex(32);
+    assert.equal((await srv.api('POST', '/me/password', { token: r.json.token, ip: v6, body: { oldAuthKey: u.authKey, newAuthKey: k2, encPrivateKey: b64(60), salt: b64(16) } })).status, 200);
+    const later = newIp();
+    assert.equal((await login(later, k2, { captcha: await solved(later), device: r.json.device }, u)).status, 429);
+  });
+
+  test('failed sign-ins make the robot check harder for the whole /64, wherever its puzzles come from', async () => {
+    const u = await srv.register();
+    const net = (i) => `2001:db8:bb:7::${i}`;
+    for (let i = 1; i <= 3; i++) assert.equal((await login(net(i), hex(32), { captcha: await solved(net(i)) }, u)).status, 401);
+    assert.equal((await srv.api('GET', '/captcha?purpose=login', { ip: net(9) })).json.difficulty, 19, 'another address in the same /64');
+    assert.equal((await srv.api('GET', '/captcha?purpose=login', { ip: newIp() })).json.difficulty, 18, 'other networks are unaffected');
+    // An easier puzzle fetched from another network isn't accepted from this one.
+    const easy = await solved(newIp());
+    const r = await login(net(10), u.authKey, { captcha: easy }, u);
+    assert.equal(r.status, 400);
+    assert.equal(r.json.code, 'captcha_harder');
+    assert.equal((await login(net(10), u.authKey, { captcha: await solved(net(10)) }, u)).status, 200);
+    // Fetching puzzles is limited per /64 too.
+    const got = [];
+    for (let i = 0; i < 61; i++) got.push((await srv.api('GET', '/captcha?purpose=login', { ip: `2001:db8:bb:8::${(i + 1).toString(16)}` })).status);
+    assert.deepEqual(got.slice(0, 60), Array(60).fill(200));
+    assert.equal(got[60], 429);
+  });
+
   test('a stranger filling the account’s daily limit can’t lock it out of its usual network', async () => {
     const u = await srv.register(); // u.ip is a network the account has used
     await setCaptcha('off'); // every attempt counts now: the worst case
@@ -215,13 +362,60 @@ read(); setInterval(read, 25).unref(); Date.now = () => real() + off;\n`);
     assert.equal(r.status, 200, r.text);
   });
 
-  test('password resets: requests for made-up names don’t use up the instance-wide cap', async () => {
+  test('password resets: the robot check comes first, and made-up names don’t use up the instance-wide cap', async () => {
     const u = resetter;
-    for (let n = 0; n < 61; n++) { const ip = newIp(); for (let i = 0; i < 5; i++) assert.equal((await srv.api('POST', '/auth/forgot', { ip, body: { login: 'nobody' + hex(3) } })).status, 200); }
+    const forgot = (ip, login, extra = {}) => srv.api('POST', '/auth/forgot', { ip, body: { login, ...extra } });
+    // Without a solved check: turned away, nothing counted, no email.
     const before = srv.mails().length;
-    const r = await srv.api('POST', '/auth/forgot', { ip: newIp(), body: { login: u.username } });
+    const st = [];
+    for (let n = 0; n < 61; n++) { const ip = newIp(); for (let i = 0; i < 5; i++) st.push((await forgot(ip, i ? 'nobody' + hex(3) : u.username)).status); }
+    assert.ok(st.every((x) => x === 400), JSON.stringify(st));
+    assert.equal(srv.mails().length, before);
+    // Made-up names with solved checks: answered like real ones, and still nothing counted.
+    for (let i = 0; i < 3; i++) { const ip = newIp(); assert.equal((await forgot(ip, 'nobody' + hex(3), { captcha: await solved(ip) })).status, 200); }
+    const ip = newIp();
+    const r = await forgot(ip, u.username, { captcha: await solved(ip) });
     assert.equal(r.status, 200, r.text);
     assert.ok(srv.mails().slice(before).some((m) => m.to === `${u.username}@example.test` && /reset your password/.test(m.subject)), 'the real reset email went out');
+  });
+});
+
+// ------------------------------------------------------------------ busy times (auth-3)
+describe('busy times: past the instance-wide sign-up limit the robot check gets harder, nobody is turned away', () => {
+  let srv;
+  before(async () => {
+    srv = await startServer();
+    assert.equal((await srv.api('PUT', '/admin/registration', { token: srv.owner.token, ip: srv.owner.ip, body: { captchaRegister: 'on', captchaLogin: 'on' } })).status, 200);
+  });
+  after(() => srv.stop());
+  const challenge = async (ip, purpose = 'register') => (await srv.api('GET', `/captcha?purpose=${purpose}`, { ip })).json;
+
+  test('junk with solved checks past the limit only makes the check harder; a real sign-up still gets in', async () => {
+    const early = solveCaptcha(await challenge(newIp())); // an ordinary check, solved before the rush
+    assert.equal(early.difficulty, 18);
+    // 119 junk sign-ups, each with a solved check (24 networks, 5 each): with the owner's, the limit (120) is used up.
+    const asks = [];
+    for (let n = 0; n < 24; n++) { const ip = newIp(); for (let i = 0; i < 5 && asks.length < 119; i++) asks.push({ ip, c: await challenge(ip) }); }
+    const sols = await solveCaptchas(asks.map((a) => a.c));
+    for (let i = 0; i < asks.length; i++) {
+      const r = await srv.api('POST', '/auth/register', { ip: asks[i].ip, body: { ...regBody(srv, '!'), captcha: sols[i] } });
+      assert.equal(r.status, 400);
+      assert.match(r.json.error, /Usernames are/, 'got past the robot check');
+    }
+    assert.equal((await challenge(newIp())).difficulty, 19, 'a harder check for everyone now');
+    assert.equal((await challenge(newIp(), 'login')).difficulty, 18, 'signing in isn’t affected');
+    // A real person: the check solved before the rush is too easy now (the app then solves a new one by itself)...
+    const ip = newIp();
+    const body = regBody(srv, 'legit' + hex(3));
+    const tooEasy = await srv.api('POST', '/auth/register', { ip, body: { ...body, captcha: early } });
+    assert.equal(tooEasy.status, 400);
+    assert.equal(tooEasy.json.code, 'captcha_harder');
+    // ...and with the harder one they're in, not told to come back in an hour.
+    const ok = await srv.api('POST', '/auth/register', { ip, body: { ...body, captcha: solveCaptcha(await challenge(ip)) } });
+    assert.equal(ok.status, 200, ok.text);
+    // With the robot check switched off there's nothing to make harder: then the limit turns sign-ups away.
+    assert.equal((await srv.api('PUT', '/admin/registration', { token: srv.owner.token, ip: srv.owner.ip, body: { captchaRegister: 'off' } })).status, 200);
+    assert.equal((await tryRegister(srv, 'off' + hex(3))).status, 429);
   });
 });
 
@@ -291,6 +485,26 @@ describe('reset links, IP bans and sessions', () => {
     await srv.api('DELETE', '/admin/ip-bans', { token: srv.owner.token, ip: srv.owner.ip, body: { ip: spam.ip } });
     assert.equal((await rs(spam, 'GET', '/bootstrap')).status, 200);
     assert.equal((await useLink(link)).status, 200);
+  });
+
+  test('logging out works from a banned address (and in maintenance), and really ends the session', async () => {
+    const u = await srv.register();
+    const ban = await srv.api('POST', '/admin/ip-bans', { token: srv.owner.token, ip: srv.owner.ip, body: { ip: u.ip, reason: 'spam' } });
+    assert.equal(ban.status, 200, ban.text);
+    assert.equal((await rs(u, 'GET', '/bootstrap')).status, 403);
+    // The app logs out when it's turned away; if the server refused that, the session would stay live for
+    // anyone holding a copy of the token.
+    assert.equal((await rs(u, 'POST', '/auth/logout')).status, 200);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: u.token, ip: newIp() })).status, 401, 'dead everywhere');
+    await srv.api('DELETE', '/admin/ip-bans', { token: srv.owner.token, ip: srv.owner.ip, body: { ip: u.ip } });
+    assert.equal((await rs(u, 'GET', '/bootstrap')).status, 401, 'and after the ban is lifted');
+    const m = await srv.register();
+    assert.equal((await srv.api('PUT', '/admin/maintenance', { token: srv.owner.token, ip: srv.owner.ip, body: { text: 'Back soon' } })).status, 200);
+    try {
+      assert.equal((await rs(m, 'GET', '/bootstrap')).status, 503);
+      assert.equal((await rs(m, 'POST', '/auth/logout')).status, 200);
+    } finally { await srv.api('PUT', '/admin/maintenance', { token: srv.owner.token, ip: srv.owner.ip, body: { text: '' } }); }
+    assert.equal((await rs(m, 'GET', '/bootstrap')).status, 401);
   });
 
   test('old-format accounts: "keep other sessions" only right after signing in, and always logged and emailed', async () => {

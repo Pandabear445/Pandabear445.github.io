@@ -167,6 +167,27 @@ async function init() {
 }
 
 // ======================================================================= auth screen
+// "This device has signed in here before" notes from the server, one per account (see /auth/login). With one, a
+// flood of wrong passwords from somewhere else can't lock this device out of the account. Kept across log-outs.
+const DEVICE_NOTES = 'hearth.deviceNotes';
+function deviceNote(username) {
+  try { return (JSON.parse(localStorage.getItem(DEVICE_NOTES) || '{}') || {})[username.toLowerCase()] || undefined; } catch { return undefined; }
+}
+function saveDeviceNote(username, note) {
+  if (typeof note !== 'string') return;
+  try {
+    const all = JSON.parse(localStorage.getItem(DEVICE_NOTES) || '{}') || {};
+    delete all[username.toLowerCase()];
+    all[username.toLowerCase()] = note;
+    const names = Object.keys(all);
+    names.slice(0, Math.max(0, names.length - 10)).forEach((k) => delete all[k]); // the 10 most recent accounts
+    localStorage.setItem(DEVICE_NOTES, JSON.stringify(all));
+  } catch { /* storage blocked: the limit for this network still applies */ }
+}
+// While lots of people are signing in (or this network keeps getting passwords wrong), the server can ask for a
+// harder robot check: solve a new one and try once more.
+const harderOnce = (attempt) => attempt().catch((ex) => (ex.code === 'captcha_harder' ? attempt() : Promise.reject(ex)));
+
 function showAuth() {
   $('#app').hidden = true;
   $('#auth').hidden = false;
@@ -218,13 +239,13 @@ function showAuth() {
       }
       const { params } = derived;
       const { authKey, wrapKey } = derived.keys;
-      const captcha = await loginCap.token();
       const second = !totpField.hidden && loginForm.totp.value.trim() ? (useBackup ? { backupCode: loginForm.totp.value.trim() } : { totp: loginForm.totp.value.trim() }) : {};
-      const res = await api('POST', '/auth/login', { username, authKey, captcha, ...second }).finally(() => loginCap.reset())
+      const res = await harderOnce(async () => api('POST', '/auth/login', { username, authKey, captcha: await loginCap.token(), device: deviceNote(username), ...second }).finally(() => loginCap.reset()))
         .catch((ex) => {
           if (ex.code === 'need_2fa' || ex.code === 'bad_2fa') { totpField.hidden = false; setTimeout(() => loginForm.totp.focus(), 30); }
           throw ex;
         });
+      saveDeviceNote(username, res.device);
       totpField.hidden = true; loginForm.totp.value = ''; derived = null;
       const priv = await E2EE.unwrapPrivateKey(wrapKey, res.encPrivateKey);
       if (params.kdf !== 'argon2id') {
@@ -256,11 +277,13 @@ function showAuth() {
       const kdfSalt = E2EE.newKdfSalt();
       const [{ authKey, wrapKey }, captcha] = await Promise.all([E2EE.deriveKeys(username, pw, { kdf: 'argon2id', salt: kdfSalt }), regCap.token()]);
       const id = await E2EE.createIdentity(wrapKey);
-      const res = await api('POST', '/auth/register', {
-        captcha,
+      const body = {
         username, authKey, kdfSalt, publicKey: id.publicKey, encPrivateKey: id.encPrivateKey, code: regForm.code ? regForm.code.value : '',
         acceptTos: regForm.tos && regForm.tos.checked ? S.config.termsVersion || 1 : 0,
-      }).finally(() => regCap.reset());
+      };
+      const send = (c) => api('POST', '/auth/register', { captcha: c, ...body }).finally(() => regCap.reset());
+      const res = await send(captcha).catch(async (ex) => (ex.code === 'captcha_harder' ? send(await regCap.token()) : Promise.reject(ex)));
+      saveDeviceNote(username, res.device);
       await finishLogin(res, id.privateKey);
     } catch (ex) {
       err.textContent = ex.message;
@@ -271,13 +294,15 @@ function showAuth() {
 // "Forgot your password?": a reset link goes to the account's verified email.
 function openForgot(prefill) {
   const input = h('input', { class: 'input', value: prefill || '', placeholder: 'Username or email', autocomplete: 'username', autocapitalize: 'off', spellcheck: 'false' });
+  const cap = captchaWidget('login'); // the same robot check as signing in
   modal({ title: 'Reset your password', size: 'sm',
-    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'We\u2019ll email a reset link to the address on your account (if it has a confirmed one).'), field('Username or email', input)),
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'We\u2019ll email a reset link to the address on your account (if it has a confirmed one).'), field('Username or email', input), cap.el),
     actions: [{ label: 'Cancel' }, { label: 'Send reset link', kind: 'primary', action: async () => {
       if (!input.value.trim()) throw new Error('Enter your username or email.');
-      await api('POST', '/auth/forgot', { login: input.value.trim() });
+      await harderOnce(async () => api('POST', '/auth/forgot', { login: input.value.trim(), captcha: await cap.token() }).finally(() => cap.reset()));
       toast('If that account has a confirmed email, a reset link is on its way. Check your inbox (and spam).');
     } }] });
+  cap.start(); // solving starts right away, so it's usually done by the time the name is typed
 }
 // The link from that email: #reset=<token>. Recovery key → everything stays readable; without → new keys.
 async function openReset(token) {

@@ -39,10 +39,21 @@ const settings = () => {
     console.log(`TURN relays saved (${urls.length / 2 | 0 || urls.length} relay${urls.length > 2 ? 's' : ''}). Calls use them right away.`);
   } else if (cmd === 'set-owner' && a) {
     const { db, get, set } = settings();
-    const r = db.prepare('SELECT id, username FROM users WHERE lower(username) = ? AND deleted_at IS NULL AND is_bot = 0').get(a.trim().replace(/^@/, '').toLowerCase());
+    const r = db.prepare('SELECT id, username, suspended_at, suspended_until FROM users WHERE lower(username) = ? AND deleted_at IS NULL AND is_bot = 0').get(a.trim().replace(/^@/, '').toLowerCase());
     if (!r) throw new Error(`There's no account called ${a} that can sign in.`);
+    // Like a handover in the app: a suspended owner couldn't sign in, and nobody outranks the owner to lift it.
+    if (r.suspended_at && (!r.suspended_until || r.suspended_until > Date.now())) throw new Error(`${r.username} is suspended, so they couldn't use the server. Pick an account that isn't (it can lift the suspension in Admin \u2192 Users).`);
     const before = get('owner');
     set('owner', r.id);
+    db.prepare("DELETE FROM instance_settings WHERE key = 'ownerAwaitsEnv'").run(); // settled: no ADMIN_USERS sign-up takes it later
+    // The owner needs no other staff role (as in the app's handover). Older versions kept a plain list of admins.
+    let roles = null;
+    try { roles = JSON.parse(get('staffRoles') || 'null'); } catch { /* rebuilt below */ }
+    if (!roles || typeof roles !== 'object' || Array.isArray(roles)) {
+      roles = {};
+      try { (JSON.parse(get('admins') || '[]') || []).forEach((id) => { roles[id] = 'admin'; }); } catch { /* none */ }
+    }
+    if (roles[r.id]) { delete roles[r.id]; set('staffRoles', JSON.stringify(roles)); }
     // On the audit log like an in-app handover (append-only, hash-chained; see auditLog in index.js).
     const { auditHash } = require('./db');
     db.transaction(() => {
