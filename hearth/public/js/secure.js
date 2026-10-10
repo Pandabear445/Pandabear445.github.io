@@ -390,8 +390,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     const mine = keysFor(serverId);
     const raw = mine.get(epoch);
     if (!raw) {
+      // Only the current key is ever handed out later (keys/share), so a missing key older than one we hold
+      // never arrives: written before we joined, or while we were away (a rejoin always gets a new key).
       const held = [...mine.keys()];
-      return { pending: true, before: held.length > 0 && epoch < Math.min(...held), t: '', f: [] };
+      return { pending: true, before: held.length > 0 && epoch < Math.max(...held), t: '', f: [] };
     }
     try {
       const author = await userWithKeys(authorId);

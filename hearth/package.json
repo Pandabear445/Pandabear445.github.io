@@ -7,7 +7,8 @@
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
-    "test:security": "node --test --test-concurrency=1 test/*.test.js"
+    "test:security": "node --test --test-concurrency=1 test/*.test.js",
+    "test:e2e": "node test/e2e/run.mjs"
   },
   "license": "MIT",
   "dependencies": {

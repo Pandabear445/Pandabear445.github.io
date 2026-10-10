@@ -534,6 +534,8 @@ function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'C
     modal({ title, size: 'sm', onClose: () => resolve(null),
       body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw)),
       actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
+        // (The password hashing library's own message for an empty one means nothing to people.)
+        if (!pw.value) throw new Error('Enter your password.');
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
         const encPrivateKey = await lockedKey(keys.authKey);
@@ -615,6 +617,7 @@ function securitySections(app) {
     modal({ title: S.me.email ? 'Change your email' : 'Add an email', size: 'sm',
       body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw)),
       actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
+        if (!pw.value) throw new Error('Enter your password.');
         const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
         const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
         setTimeout(() => withCode((x) => api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey, ...x })).then((r) => verifyEmail(r.sentTo)).catch(quiet), 150);

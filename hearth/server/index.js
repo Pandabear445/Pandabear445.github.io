@@ -1005,6 +1005,12 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { if (gone.has(x.data.sid)) { x.emit('session:revoked', { reason }); x.disconnect(true); } })).catch(() => {});
   return ids.length;
 }
+// Closes every open app window of an account that can't be used any more (suspended, deleted, signed out by
+// staff), saying why first, like revokeSessions. Closing them straight away instead (disconnectSockets) would
+// overtake that notice, and the app would land on the sign-in screen without telling the person why.
+function closeWindows(userId, reason) {
+  if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { x.emit('session:revoked', { reason }); x.disconnect(true); })).catch(() => {});
+}
 // Revoked and expired sessions are kept 30 days (so Settings → Sessions can say what happened), then deleted.
 setInterval(() => {
   const t = now();
@@ -1527,7 +1533,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
   files.forEach((f) => removeUpload(f));
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
   broadcastUser(row.id, audience);
-  io.in(`user:${row.id}`).disconnectSockets(true);
+  closeWindows(row.id, 'account_deleted');
   auditLog(req, 'account_deleted', row.id, row.username);
   ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
   res.json({ ok: true });
@@ -3882,7 +3888,7 @@ function suspendUser(uid, reason, hours = 0) {
   const until = hours > 0 ? now() + hours * 3600000 : null;
   db.prepare('UPDATE users SET suspended_at = ?, suspend_reason = ?, suspended_until = ? WHERE id = ?').run(now(), String(reason || '').slice(0, 300), until, uid);
   revokeSessions(uid, { reason: 'suspended' });
-  io.in(`user:${uid}`).disconnectSockets(true);
+  closeWindows(uid, 'suspended');
 }
 const ipsOf = (uid) => db.prepare('SELECT ip, first_seen AS firstSeen, last_seen AS lastSeen FROM user_ips WHERE user_id = ? ORDER BY last_seen DESC LIMIT 20').all(uid);
 // Placeholder until the Support account exists (phase 2): every new account will get it as a friend.
@@ -4079,7 +4085,7 @@ api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
 api.post('/admin/users/:id/logout', auth, staffOnly, (req, res) => {
   requireOutranks(req, req.params.id);
   revokeSessions(req.params.id, { reason: 'staff' });
-  io.in(`user:${req.params.id}`).disconnectSockets(true);
+  closeWindows(req.params.id, 'staff');
   adminLog(req, 'sign_out_everywhere', req.params.id);
   res.json({ ok: true });
 });
@@ -4278,7 +4284,7 @@ api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
 api.post('/admin/sign-out-all', auth, adminOnly, (req, res) => {
   const victims = db.prepare('SELECT DISTINCT user_id FROM sessions WHERE revoked_at IS NULL').all().map((r) => r.user_id).filter((id) => !isStaff(id));
   db.transaction(() => victims.forEach((id) => revokeSessions(id, { reason: 'staff' })))();
-  victims.forEach((id) => io.in(`user:${id}`).disconnectSockets(true));
+  victims.forEach((id) => closeWindows(id, 'staff'));
   adminLog(req, 'sign_out_all', null, `${victims.length} accounts`);
   res.json({ ok: true, count: victims.length });
 });
