@@ -8,10 +8,15 @@
 // Encrypted backups (see server/backup.js):
 //   node server/cli.js backup                      make one now (restore-tested, copied off-site if configured)
 //   node server/cli.js verify-backup FILE [KEY]    restore it into a scratch folder and check the database
-//   node server/cli.js restore FILE NEW_DATA_DIR [KEY]
+//   node server/cli.js restore FILE NEW_DATA_DIR [KEY] [--sign-out-everyone]
 //                                                  unpack it into an empty folder; then point DATA_DIR there (or
 //                                                  move it to data/) and start Hearth. KEY = the 64-character backup
 //                                                  key, if this machine doesn't have the original data/backup.key.
+//                                                  --sign-out-everyone ends every session in the restored copy (use
+//                                                  it after a break-in; see docs/RECOVERY.md).
+//   node server/cli.js check-files                 compare the database with data/uploads: files it needs that
+//                                                  are missing, and files nothing refers to
+// Exit codes: 0 done; 1 failed; 2 restore refused (backup from a newer Hearth); 3 done, but files are missing.
 // Checking an install (server/doctor.js; read-only unless a --fix flag is given):
 //   node server/cli.js doctor [--relays] [--integrity] [--json] [--fix-permissions]
 //                                                  exit status 0 = all passed, 1 = warnings, 2 = failures
@@ -19,7 +24,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
-const [cmd, a, b, c] = process.argv.slice(2);
+const argv = process.argv.slice(2);
+const flags = new Set(argv.filter((x) => x.startsWith('--')));
+const [cmd, a, b, c] = argv.filter((x) => !x.startsWith('--'));
 // Output piped into something that stops reading (| head) isn't an error worth a stack trace.
 process.stdout.on('error', (e) => { if (e.code === 'EPIPE') process.exit(process.exitCode || 0); });
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
@@ -34,6 +41,8 @@ const codeSchema = () => Number((/const SCHEMA_VERSION = (\d+);/.exec(fs.readFil
 const newerWarning = (schema) => (codeSchema() && schema > codeSchema()
   ? `Warning: this backup is from a newer version of Hearth (database version ${schema}; this version understands up to ${codeSchema()}). Install that version (or newer) before starting Hearth on it.`
   : '');
+// Files the database refers to but that aren't there: those attachments and pictures can't be opened.
+const missingNote = (n, names, what) => `Warning: ${n} file${n === 1 ? '' : 's'} the database refers to ${what}: ${names.slice(0, 10).join(', ')}${n > 10 ? ', …' : ''}. Those attachments or pictures will show as unavailable.`;
 const settings = () => {
   const { db } = require('./db');
   return { db, set: (k, v) => db.prepare('INSERT OR REPLACE INTO instance_settings (key, value) VALUES (?, ?)').run(k, v), get: (k) => (db.prepare('SELECT value FROM instance_settings WHERE key = ?').get(k) || {}).value };
@@ -73,9 +82,13 @@ const settings = () => {
     const BK = require('./backup');
     const { db, UPLOAD_DIR } = require('./db');
     const out = path.join(DATA_DIR, 'backups', 'encrypted');
-    const bk = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: out });
+    let bk;
+    try { bk = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: out }); } catch (e) {
+      throw new Error(`Backup FAILED, nothing was saved: ${['ENOSPC', 'EDQUOT'].includes(e.code) ? 'the disk is full. Free some space (or back up to a bigger disk) and try again.' : e.message}`);
+    }
     const v = await BK.verifyBackup(bk.file, BK.loadKey(DATA_DIR), path.join(DATA_DIR, 'backups'));
     console.log(`Backup: ${bk.file} (${(bk.size / 1048576).toFixed(1)} MB). Restore test passed: ${v.users} accounts, ${v.messages} messages, ${v.files} files.`);
+    if (bk.missing.length) { console.error(missingNote(bk.missing.length, bk.missing, 'were not on disk, so they are not in this backup')); process.exitCode = 3; }
     const off = await BK.uploadOffsite(bk.file);
     if (!off.skipped) console.log(off.ok ? `Copied off-site to ${off.remote}.` : `Copying off-site FAILED: ${off.error}`);
   } else if (cmd === 'verify-backup' && a) {
@@ -84,20 +97,31 @@ const settings = () => {
     if (newerWarning(v.schema)) console.error(newerWarning(v.schema));
   } else if (cmd === 'restore' && a && b) {
     const BK = require('./backup');
-    const entries = await BK.restoreBackup(path.resolve(a), keyFrom(c), path.resolve(b));
-    console.log(`Restored ${entries.length} files into ${path.resolve(b)}. Start Hearth with DATA_DIR=${path.resolve(b)} (or move it to data/).`);
-    const warn = newerWarning(BK.schemaOf(path.join(path.resolve(b), 'hearth.db')));
-    if (warn) { console.error(warn); process.exitCode = 2; }
+    const target = path.resolve(b);
+    let r;
+    try { r = await BK.restoreBackup(path.resolve(a), keyFrom(c), target, { maxSchema: codeSchema(), signOutEveryone: flags.has('--sign-out-everyone') }); } catch (e) {
+      if (e.code !== 'HEARTH_BACKUP_TOO_NEW') throw e;
+      console.error(e.message); process.exitCode = 2; return;
+    }
+    console.log(`Restored ${r.entries.length} files into ${target} (database version ${r.schema}). Start Hearth with DATA_DIR=${target} (or move it to data/).`);
+    if (flags.has('--sign-out-everyone')) console.log(`Signed out ${r.sessionsRevoked} session${r.sessionsRevoked === 1 ? '' : 's'}: everyone signs in again with their password.`);
+    else console.log('Everyone stays signed in as they were when the backup was made. After a break-in, restore again with --sign-out-everyone.');
+    console.log(`Files: ${r.files.referenced} the database refers to, ${r.files.present} restored, ${r.files.unreferencedCount} not referred to by anything.`);
+    if (r.files.missingCount) { console.error(missingNote(r.files.missingCount, r.files.missing, 'are not in this backup')); process.exitCode = 3; }
+  } else if (cmd === 'check-files') {
+    const BK = require('./backup');
+    const f = BK.uploadReport(path.join(DATA_DIR, 'hearth.db'), path.join(DATA_DIR, 'uploads'));
+    console.log(`Files: ${f.referenced} the database refers to, ${f.present} in uploads/, ${f.unreferencedCount} not referred to by anything.`);
+    if (f.missingCount) { console.error(missingNote(f.missingCount, f.missing, 'are missing from uploads/')); process.exitCode = 3; }
   } else if (cmd === 'doctor') {
     // Same .env as the server reads, so the checks see the configuration Hearth runs with.
     require('dotenv').config({ quiet: true });
-    const flags = new Set(process.argv.slice(3));
     const { runDoctor, printReport } = require('./doctor');
     const r = await runDoctor({ dataDir: path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data')), flags });
     if (flags.has('--json')) console.log(JSON.stringify(r, null, 2)); else printReport(r);
     process.exitCode = r.exitCode;
   } else {
-    console.log('Usage: node server/cli.js doctor [--relays] [--json] [--fix-permissions] | set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key]');
+    console.log('Usage: node server/cli.js doctor [--relays] [--integrity] [--json] [--fix-permissions] | set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key] [--sign-out-everyone] | check-files');
     process.exitCode = 1;
   }
 })().catch((e) => { console.error(e.message); process.exitCode = 1; });

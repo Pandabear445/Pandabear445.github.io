@@ -7,6 +7,14 @@ const log = require('./log');
 
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+// A restore that was cut off leaves this marker (see restoreBackup in backup.js). Starting anyway
+// would run on a data folder that may be missing its database or files while looking fine, so refuse, untouched.
+if (fs.existsSync(path.join(DATA_DIR, 'RESTORE-INCOMPLETE'))) {
+  const err = new Error(`The data folder ${DATA_DIR} holds a restore that didn't finish (see ${path.join(DATA_DIR, 'RESTORE-INCOMPLETE')}). `
+    + 'Delete that folder and restore the backup again into a new, empty one (node server/cli.js restore FILE NEW_DATA_DIR).');
+  err.code = 'HEARTH_RESTORE_INCOMPLETE';
+  throw err;
+}
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DB_FILE = path.join(DATA_DIR, 'hearth.db');
@@ -65,6 +73,10 @@ db.pragma('foreign_keys = ON');
 // next start, instead of leaving it half-changed with the old version number (which could stop it ever starting).
 // So nothing below may use VACUUM or change journal_mode/foreign_keys: SQLite doesn't allow those in a transaction.
 db.exec('BEGIN IMMEDIATE');
+// While this transaction is open, files outside the database that describe it (the audit log's anchor) wait for
+// the commit: written now, a crash before COMMIT would leave them pointing at rows that were rolled back.
+let MIGRATING = true;
+let anchorAfterCommit = null;
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -821,6 +833,7 @@ function readAnchor() {
   return ok ? { keyedFrom: a.keyedFrom, id: a.id, hash: a.hash, valid: true } : { valid: false };
 }
 function writeAnchor(keyedFrom, id, hash) {
+  if (MIGRATING) { anchorAfterCommit = [keyedFrom, id, hash]; return; } // written once the upgrade is committed
   const a = { keyedFrom, id, hash };
   const tmp = `${AUDIT_ANCHOR}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ ...a, mac: anchorMac(a) }), { mode: 0o600 });
@@ -1091,8 +1104,14 @@ CREATE INDEX IF NOT EXISTS idx_bot_deliveries_due ON bot_deliveries(status, next
 CREATE INDEX IF NOT EXISTS idx_bot_deliveries_bot ON bot_deliveries(bot_id, installation_id, created_at);
 `);
 
+// Test hook for the upgrade drill (scripts/upgrade-drill.sh, test/recovery-upgrade.test.js): the process dies here,
+// with every step above done but not committed, exactly like a crash or a power cut in the middle of an upgrade.
+// Only with NODE_ENV=test, so a stray variable on a real server does nothing.
+if (fromVersion < SCHEMA_VERSION && process.env.NODE_ENV === 'test' && process.env.HEARTH_TEST_KILL_IN_MIGRATION === '1') process.kill(process.pid, 'SIGKILL');
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
+MIGRATING = false;
+if (anchorAfterCommit) writeAnchor(...anchorAfterCommit);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
 // hundreds of them, many run per message). Statements are only used with get/all/run (or an iterate() loop that
