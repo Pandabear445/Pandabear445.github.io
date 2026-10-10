@@ -262,7 +262,8 @@ module.exports = function setupUsability(ctx) {
     if (!row || row.status === 'dnd') return false;
     const st = settingsOf(uid);
     if (dndActive(uid, now(), st)) return false;
-    if (['call', 'event', 'tracker'].includes(kind)) return true;
+    // Calls, event reminders, tracker updates (and anything else that isn't a message): only quiet hours apply.
+    if (!['dm', 'group', 'mention', 'everyone', 'reply', 'message'].includes(kind)) return true;
     const t = now();
     const cp = channelId ? prefRow(uid, 'c:' + channelId) : dmId ? prefRow(uid, 'd:' + dmId) : null;
     const sp = serverId ? prefRow(uid, 's:' + serverId) : null;
@@ -382,6 +383,16 @@ module.exports = function setupUsability(ctx) {
     [...new Set(gone.map((g) => g.server_id))].forEach((sid) => emitServer(sid));
   }
   setInterval(endExpired, 60000).unref();
+  // Read markers and preferences for channels and DMs that no longer exist (deleted channels and servers).
+  function sweepStale() {
+    for (const t of [['read_states', 'conv'], ['notify_prefs', 'target']]) {
+      db.prepare(`DELETE FROM ${t[0]} WHERE ${t[1]} LIKE 'c:%' AND NOT EXISTS (SELECT 1 FROM channels WHERE id = substr(${t[0]}.${t[1]}, 3))`).run();
+      db.prepare(`DELETE FROM ${t[0]} WHERE ${t[1]} LIKE 'd:%' AND NOT EXISTS (SELECT 1 FROM dm_channels WHERE id = substr(${t[0]}.${t[1]}, 3))`).run();
+    }
+    db.prepare("DELETE FROM notify_prefs WHERE target LIKE 's:%' AND NOT EXISTS (SELECT 1 FROM servers WHERE id = substr(notify_prefs.target, 3))").run();
+  }
+  setTimeout(() => { try { sweepStale(); } catch (e) { console.error('Read-state cleanup failed:', e.message); } }, 90000).unref();
+  setInterval(() => { try { sweepStale(); } catch (e) { console.error('Read-state cleanup failed:', e.message); } }, 24 * 3600000).unref();
   setTimeout(endExpired, 5000).unref();
   api.get('/servers/:id/timeouts', auth, (req, res) => {
     const s = requirePerm(req.params.id, req.userId, PM.KICK_MEMBERS, 'You need the Kick Members permission.');

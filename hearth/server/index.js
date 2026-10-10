@@ -1184,7 +1184,7 @@ function pushFailed(endpoint) {
 // what: { kind, serverId, channelId, dmId } — checked against each person's notification preferences and Do Not
 // Disturb schedule (server/usability.js), which also decides how much the lock screen shows.
 let USE = null; // server/usability.js
-function pushTo(userIds, payload, what = { kind: 'message' }) {
+function pushTo(userIds, payload, what = { kind: 'other' }) {
   if (!vapid) return;
   const ids = [...new Set(userIds)];
   setImmediate(() => {
