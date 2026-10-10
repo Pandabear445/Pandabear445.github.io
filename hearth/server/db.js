@@ -998,6 +998,24 @@ CREATE TABLE IF NOT EXISTS job_health (
 );
 `);
 
+// v18 (storage): resumable uploads in progress. The bytes wait in data/upload-parts/<id>.part (never served,
+// never backed up) until the whole file is there and its SHA-256 matches; the room it needs is reserved in
+// user_files (kind 'reserved') from the start. See server/storage.js.
+db.exec(`
+CREATE TABLE IF NOT EXISTS upload_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  size INTEGER NOT NULL,
+  received INTEGER NOT NULL DEFAULT 0,
+  chunk_size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_user ON upload_sessions(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_updated ON upload_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_user_files_kind ON user_files(kind);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 

@@ -453,7 +453,7 @@ OLD_TRUST_RULE=0; [ -f server/proxytrust.js ] || OLD_TRUST_RULE=1
 printf '\n%sHearth update%s\n  folder:  %s\n  runs as: %s%s\n  current: %s\n\n' "$c_b" "$c_0" "$DIR" "$MODE" "${UNIT:+ ($UNIT)}" "$(version)"
 
 # Enough room for the unpacked update, the backup and (Docker) the new image?
-NEED_MB=$(( $(du -sm --exclude=uploads --exclude=backups --exclude=downloads data 2>/dev/null | cut -f1 || echo 0) + 400 ))
+NEED_MB=$(( $(du -sm --exclude=uploads --exclude=upload-parts --exclude=backups --exclude=downloads data 2>/dev/null | cut -f1 || echo 0) + 400 ))
 [ "$MODE" = docker ] && NEED_MB=$((NEED_MB + 600))
 HAVE_MB="$(free_mb "$DIR")"
 if [ "${HAVE_MB:-0}" -lt "$NEED_MB" ]; then
@@ -507,7 +507,7 @@ step "Switching over (people with Hearth open see \"Updatingâ€¦\" for a moment)â
 T0=$(date +%s%N)
 stop_app
 mkdir -p "$BK/data"
-rsync -a --exclude uploads --exclude backups --exclude downloads data/ "$BK/data/"
+rsync -a --exclude uploads --exclude upload-parts --exclude backups --exclude downloads data/ "$BK/data/"
 if [ "$MODE" != docker ]; then
   rsync -a "${RSYNC_EXCLUDES[@]}" "$NEW/" "$DIR/"
   if [ -d node_modules ]; then mv node_modules "$BK/node_modules"; fi
