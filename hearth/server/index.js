@@ -246,11 +246,12 @@ function serverCommon(s) {
   return out;
 }
 // What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
-function serializeServer(s, uid, common = serverCommon(s)) {
-  const myBase = perms.base(s, uid);
+// ev: permissions already worked out for many members at once (perms.forServer), when there is one.
+function serializeServer(s, uid, common = serverCommon(s), ev = null) {
+  const myBase = ev ? ev.base(uid) : perms.base(s, uid);
   const manage = (myBase & (PM.MANAGE_ROLES | PM.MANAGE_CHANNELS)) !== 0;
   const channels = common.channels
-    .map((c) => ({ c, p: perms.channel(s, c, uid) }))
+    .map((c) => ({ c, p: ev ? ev.channel(c, uid) : perms.channel(s, c, uid) }))
     .filter(({ p }) => p & PM.VIEW_CHANNEL)
     .map(({ c, p }) => ({
       ...serializeChannel(c), perms: p,
@@ -274,7 +275,17 @@ const emitServer = (serverId) => {
   const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
   if (!online.length) return;
   const common = serverCommon(row);
-  online.forEach((uid) => io.to(`user:${uid}`).emit('server:update', serializeServer(row, uid, common)));
+  // What a member sees depends only on their permissions (server-wide and in each channel), so everyone whose
+  // permissions come out the same gets the same update: it's built and encoded once per group, not once per
+  // member (in a big server that was most of the work, for the same few variants over and over).
+  const ev = perms.forServer(row, online);
+  const groups = new Map();
+  for (const uid of online) {
+    const key = [ev.base(uid), ...common.channels.map((c) => ev.channel(c, uid))].join(',');
+    if (!groups.has(key)) groups.set(key, { uid, rooms: [] });
+    groups.get(key).rooms.push(`user:${uid}`);
+  }
+  for (const g of groups.values()) io.to(g.rooms).emit('server:update', serializeServer(row, g.uid, common, ev));
 };
 // Permissions are checked when someone joins a call, and again here after anything that can change them: whoever
 // can no longer see the channel or connect to it (or is no longer a member) leaves the call, and anyone whose
@@ -420,8 +431,9 @@ const serverOf = (c) => db.prepare('SELECT * FROM servers WHERE id = ?').get(c.s
 function toChannel(c, except) {
   const srv = serverOf(c);
   if (!srv || !perms.restricted(srv, c)) return except ? except.to(`server:${c.server_id}`) : io.to(`server:${c.server_id}`);
+  const ev = perms.forServer(srv); // every member's permissions in one go, not three queries per member
   const rooms = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id)
-    .filter((u) => perms.channel(srv, c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
+    .filter((u) => ev.channel(c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
   return rooms.length ? (except ? except.to(rooms) : io.to(rooms)) : { emit() {} };
 }
 const isBlocked = (a, b) => !!db.prepare('SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)').get(a, b, b, a);
