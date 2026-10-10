@@ -2,12 +2,12 @@
 // health endpoints, alerts (dedup, cooldown, caps) and the doctor command.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { spawnSync, spawn } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { startServer, newIp, hex, sleep } = require('./helpers');
+const { startServer, hex, sleep } = require('./helpers');
 
 const ROOT = path.join(__dirname, '..');
 const log = require('../server/log');
@@ -92,8 +92,7 @@ test('jobs: a job that throws (sync or async) is caught, recorded, and the proce
   jobs.setOnFailure((r) => failed.push([r.name, r.failures]));
   jobs.setOnRecover((r) => recovered.push(r.name));
   let syncFail = true;
-  let out;
-  out = capture(() => {
+  capture(() => {
     const a = jobs.every('t.sync', 20, () => { if (syncFail) throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' }); }, { firstDelay: 0 });
     const b = jobs.every('t.async', 20, async () => { throw new Error('async nope'); }, { firstDelay: 0 });
     setTimeout(() => { a.stop(); b.stop(); }, 5000).unref();
@@ -114,11 +113,10 @@ test('jobs: a job that throws (sync or async) is caught, recorded, and the proce
   assert.equal(jobs.statusOf(s), 'ok');
   // A run still going when the next is due is skipped, not stacked.
   let running = 0; let maxRunning = 0;
-  out = capture(() => { const c = jobs.every('t.slow', 10, async () => { running++; maxRunning = Math.max(maxRunning, running); await sleep(60); running--; }, { firstDelay: 0 }); setTimeout(() => c.stop(), 200).unref(); });
+  capture(() => { const c = jobs.every('t.slow', 10, async () => { running++; maxRunning = Math.max(maxRunning, running); await sleep(60); running--; }, { firstDelay: 0 }); setTimeout(() => c.stop(), 200).unref(); });
   await sleep(250);
   assert.equal(maxRunning, 1);
   assert.ok(jobs.get('t.slow').skipped > 0);
-  void out;
 });
 
 // ------------------------------------------------------------------ alerts on their own
@@ -432,8 +430,6 @@ test('doctor: broken data folders fail with exit 2; warnings exit 1; repairs onl
   } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
 });
 
-// A long-running server's own spawn check: the request logger and jobs don't break normal use (a smoke test of
-// sockets, uploads and messages through the access log is covered by the rest of the suite running on this build).
 test('server: the access log can be turned down to errors only', async () => {
   const srv = await startServer({ LOG_FORMAT: 'json', LOG_ACCESS: 'errors' });
   try {
@@ -445,4 +441,3 @@ test('server: the access log can be turned down to errors only', async () => {
     assert.ok(all.some((l) => l.reqId === 'loud-401' && l.status === 401 && l.outcome === 'denied'));
   } finally { await srv.stop(); }
 });
-void spawn; void newIp;
