@@ -79,9 +79,10 @@ module.exports = function setupAccounts(ctx) {
     await transport.sendMail({ from: c.from, to, subject, text });
   }
   // Security notices ("your password was changed") go to the account's confirmed email, if it has one.
-  function notify(row, what, text) {
+  // footer: the closing line (alerts to the owner, server/alerts.js, aren't about something "you" did).
+  function notify(row, what, text, { footer = 'If this wasn\'t you, reset your password right away and tell the server owner.' } = {}) {
     if (!row || !row.email || !row.email_verified || !mailReady()) return;
-    sendMail({ to: row.email, subject: `${brandName()}: ${what}`, text: `${text}\n\nIf this wasn't you, reset your password right away and tell the server owner.` }).catch(() => {});
+    sendMail({ to: row.email, subject: `${brandName()}: ${what}`, text: footer ? `${text}\n\n${footer}` : text }).catch(() => {});
   }
   const mask = (email) => { if (!email) return ''; const [u, d] = email.split('@'); return `${u.slice(0, 1)}${'•'.repeat(Math.max(1, Math.min(6, u.length - 1)))}@${d}`; };
 
@@ -144,7 +145,7 @@ module.exports = function setupAccounts(ctx) {
   };
   // Outstanding reset links stop working: after a password change, and when the email changes or goes away.
   const dropResetLinks = (uid) => db.prepare("DELETE FROM auth_tokens WHERE user_id = ? AND kind = 'reset'").run(uid);
-  setInterval(() => db.prepare('DELETE FROM auth_tokens WHERE expires_at < ?').run(now()), 3600000).unref();
+  require('./jobs').every('accounts.token_purge', 3600000, () => db.prepare('DELETE FROM auth_tokens WHERE expires_at < ?').run(now()));
 
   // Before setting up two-factor (it isn't on yet, so the password is all there is to check).
   async function checkPassword(req, row, authKey) {

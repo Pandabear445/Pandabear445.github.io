@@ -10,6 +10,8 @@
 // customer.subscription.updated / .deleted, invoice.paid) arrive at /api/pay/memberships and are checked
 // against their signing secret.
 const crypto = require('crypto');
+const log = require('./log');
+const jobs = require('./jobs');
 
 module.exports = function setupMemberships(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
@@ -105,7 +107,7 @@ module.exports = function setupMemberships(ctx) {
       const role = roleRow(sid, rid);
       if (!role) continue;
       // Moderator powers can't be bought: a tier role that got them later (an edit, an override) isn't handed out.
-      if (want.has(rid) && !has.has(rid) && powerful(role)) { console.warn(`Not giving the membership role "${role.name}": it has moderator powers.`); continue; }
+      if (want.has(rid) && !has.has(rid) && powerful(role)) { log.warn('memberships', 'role_withheld', { msg: `Not giving the membership role "${role.name}": it has moderator powers.` }); continue; }
       if (want.has(rid) && !has.has(rid)) { db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(sid, uid, rid); changed = true; }
       if (!want.has(rid) && has.has(rid)) { db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(sid, uid, rid); changed = true; }
     }
@@ -399,7 +401,7 @@ module.exports = function setupMemberships(ctx) {
   function onLeave(sid, uid) {
     const subs = db.prepare("SELECT stripe_sub FROM memberships WHERE server_id = ? AND user_id = ? AND status IN ('active', 'past_due', 'pending') AND cancel_at_end = 0").all(sid, uid);
     for (const { stripe_sub: sub } of subs) {
-      stripe('POST', `/v1/subscriptions/${encodeURIComponent(sub)}`, { cancel_at_period_end: true }).then((x) => applySubscription(x)).catch((e) => console.warn('Couldn’t cancel a membership:', e.message));
+      stripe('POST', `/v1/subscriptions/${encodeURIComponent(sub)}`, { cancel_at_period_end: true }).then((x) => applySubscription(x)).catch((e) => log.warn('memberships', 'cancel_failed', { err: e, msg: 'Couldn’t cancel a membership.' }));
     }
   }
   // A server is being deleted: end everyone's membership now (there's nothing left to pay for). The membership rows
@@ -424,7 +426,7 @@ module.exports = function setupMemberships(ctx) {
     if (done) db.prepare('DELETE FROM membership_cancellations WHERE stripe_sub = ?').run(p.stripe_sub);
     else {
       db.prepare('UPDATE membership_cancellations SET attempts = attempts + 1, last_error = ?, tried_at = ? WHERE stripe_sub = ?').run(String(error).slice(0, 300), now(), p.stripe_sub);
-      console.warn('Couldn’t end a membership of a deleted server (trying again later):', error);
+      log.warn('memberships', 'cancel_retry', { msg: `Couldn’t end a membership of a deleted server (trying again later): ${error}` });
     }
     return done;
   }
@@ -463,8 +465,8 @@ module.exports = function setupMemberships(ctx) {
       try { applySubscription(await stripe('GET', `/v1/subscriptions/${encodeURIComponent(sub)}`)); } catch { /* next time */ }
     }
   }
-  setInterval(() => { reconcile().catch(() => {}); retryCancellations().catch(() => {}); }, 3600000).unref();
-  setTimeout(() => { retryCancellations().catch(() => {}); }, 5000).unref();
+  jobs.every('memberships.reconcile', 3600000, reconcile);
+  jobs.every('memberships.retry_cancellations', 3600000, retryCancellations, { firstDelay: 5000 });
 
   return { offers, syncRoles, onLeave, onServerDeleted, usable, POWERFUL, tierForRole, retryCancellations };
 };

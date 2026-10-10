@@ -79,8 +79,7 @@ module.exports = function setupMoney(ctx) {
     const due = db.prepare('SELECT id FROM users WHERE supporter = 1 AND supporter_until IS NOT NULL AND supporter_until < ?').all(now());
     for (const r of due) { db.prepare('UPDATE users SET supporter = 0 WHERE id = ?').run(r.id); broadcastUser(r.id); }
   }
-  setInterval(expire, 3600000).unref();
-  setTimeout(expire, 20000).unref();
+  require('./jobs').every('money.supporter_expiry', 3600000, expire, { firstDelay: 20000 });
 
   const safeEq = (a, b) => { const x = Buffer.from(String(a)); const y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 

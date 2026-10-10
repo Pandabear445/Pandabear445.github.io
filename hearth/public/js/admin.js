@@ -7,7 +7,7 @@ import { renderDoc, render as md } from './markdown.js';
 import { rankRelays, relayTime } from './relays.js';
 
 // [key, label, icon, lowest role that sees it]. The server enforces the same rules.
-const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
+const TABS = [['overview', 'Overview', 'home', 1], ['online', 'Online', 'people', 1], ['reports', 'Reports', 'shield', 1], ['users', 'Users', 'user', 1], ['servers', 'Servers', 'compass', 2], ['security', 'Security', 'lock', 2], ['admins', 'Team & roles', 'star', 1], ['registration', 'Registration & Terms', 'book', 2], ['log', 'Audit log', 'file', 1], ['regions', 'Regions', 'globe', 2], ['health', 'Health', 'chart', 2], ['money', 'Money', 'coin', 2], ['owner', 'Owner', 'flame', 3]];
 export const RANK = { moderator: 1, admin: 2, owner: 3 };
 // Security groups three pages under one tab: protection (sign everyone out, blocked IPs, sign-in attempts),
 // storage & limits, and broadcast.
@@ -76,7 +76,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       k === 'reports' && openReports ? h('span', { class: 'badge inline' }, openReports) : null)));
     clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
     const page = tab === 'security' ? secSub : tab;
-    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
+    ({ overview, online, reports, users, servers, security, storage, broadcast, admins, registration, log, regions, health: healthPage, money, owner })[page]().catch((e) => clear(body).append(h('p', { class: 'form-error' }, e.message)));
   };
   // Security's sub-tabs stay on top of whichever page is showing (pages redraw the body themselves).
   const subBar = h('div', { class: 'set-subtabs admin-subtabs', role: 'tablist' });
@@ -400,6 +400,64 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   }
 
   // ---------------------------------------------------------------- regions (call relays near people)
+  // Health: what /api/admin/health reports, as cards (ok / needs a look / broken), the background jobs, and alerts.
+  async function healthPage() {
+    const d = await api('GET', '/admin/health');
+    if (tab !== 'health') return;
+    const LABEL = { ok: 'OK', degraded: 'Needs a look', fail: 'Broken', unknown: 'Unknown' };
+    const tag = (st) => h('span', { class: `badge-tag ${st === 'ok' ? 'ok' : st === 'fail' ? 'bad' : st === 'degraded' ? 'warn' : ''}` }, LABEL[st] || st);
+    const card = (label, st, value, sub) => h('div', { class: `stat${st === 'fail' ? ' warn' : st === 'degraded' ? ' degraded' : ''}` },
+      h('span', { class: 'stat-label' }, label, ' ', tag(st)), h('strong', null, value), sub ? h('span', { class: 'stat-sub' }, sub) : null);
+    const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+    const B = d.backups; const N = d.newsbot; const R = d.regions; const P = d.process;
+    const backupWhy = { backups_off: 'automatic backups are off', restore_test_failed: 'the newest backup failed its restore test', no_backup_yet: 'none made yet', backup_late: 'the daily backup is late', backup_stale: 'no backup for over two days', backup_fresh: '' }[B.code];
+    const newsWhy = { worker_never_ran: 'the feed worker hasn’t run', worker_stuck: 'the feed worker stopped', worker_late: 'the feed worker is late', feeds_failing: 'most feeds are failing' }[N.code];
+    const alerts = d.alerts;
+    const saveAlerts = async (patch) => {
+      try {
+        const off = (patch.enabled === false && alerts.enabled) || (patch.email === false && alerts.email);
+        const r = off ? await withPassword((x) => api('PUT', '/admin/alerts', { ...patch, ...x }), { title: 'Confirm turning alerts off', text: 'Turning alerts off needs your password.' }) : await api('PUT', '/admin/alerts', patch);
+        if (r) toast('Saved.');
+      } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+      healthPage();
+    };
+    const cooldown = h('input', { class: 'input', type: 'number', min: '1', max: '10080', value: alerts.cooldownMin, style: { width: '90px' } });
+    clear(body).append(
+      h('div', { class: 'admin-head' }, h('h3', null, 'Health ', tag(d.status)), h('span', { class: 'field-hint' }, `Checked ${ago(d.checkedAt)} · refreshes every 15 seconds`)),
+      h('div', { class: 'stats' },
+        card('Database', d.database.status, `version ${d.database.schema ?? '?'}`, d.database.status === 'ok' ? 'answering' : `expected version ${d.database.expectedSchema}`),
+        card('Data folder', d.dataDir.status, d.dataDir.status === 'ok' ? 'writable' : 'not writable', ''),
+        card('Disk', d.disk.status, d.disk.total ? `${pct(d.disk.free, d.disk.total)}% free` : 'unknown', d.disk.total ? `${fmtSize(d.disk.free)} of ${fmtSize(d.disk.total)}` : ''),
+        card('Backups', B.status, B.newest ? ago(B.newest.at) : 'none yet', [backupWhy, B.lastRestoreTest ? `restore test ${B.lastRestoreTest.ok ? 'passed' : 'FAILED'} ${ago(B.lastRestoreTest.at)}` : 'no restore test yet', B.offsiteConfigured ? (B.offsite ? `off-site ${B.offsite.ok ? 'ok' : 'FAILED'}` : 'off-site: not yet') : 'no off-site copy'].filter(Boolean).join(' · ')),
+        card('News bot', N.status, N.worker && N.worker.lastOk ? `ran ${ago(N.worker.lastOk)}` : 'not run yet', [newsWhy, `${N.feeds} feeds${N.feedsWithErrors ? `, ${N.feedsWithErrors} failing` : ''} · ${N.trackers} trackers`].filter(Boolean).join(' · ')),
+        card('Relay regions', R.status, R.regions.length ? `${R.regions.length - R.down} of ${R.regions.length} up` : 'none', R.regions.map((r) => `${r.name}: ${r.alive ? 'up' : r.installed ? `down since ${ago(r.lastSeen)}` : 'not installed'}`).join(' · ')),
+        card('Responsiveness', P.status, `${P.lagP99Ms} ms`, `worst ${P.lagMaxMs} ms in the last minute · ${fmtSize(P.rss)} memory`),
+        card('Background jobs', d.jobs.status, d.jobs.failing.length ? `${d.jobs.failing.length} need a look` : 'all fine', d.jobs.failing.join(', ')),
+        card('Sign-in attempts', d.security.status, `${d.security.authFails10m} failed`, `in 10 minutes · ${d.security.errors10m} server errors`),
+        card('Running', 'ok', dur(P.uptime * 1000), `v${P.version} · database ${d.database.schema} · Node ${P.node}`)),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Background jobs'), h('span', { class: 'field-hint' }, 'A job failing three times in a row counts as broken')),
+      h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row head' }, h('span', null, 'Job'), h('span', null, 'Status'), h('span', null, 'Last run'), h('span', null, 'Last success'), h('span', null, 'Last error')),
+        ...d.jobList.map((j) => h('div', { class: 'adm-row' },
+          h('span', { class: 'mono' }, j.name), h('span', null, tag(j.status), j.failures ? h('span', { class: 'stat-sub' }, ` ${j.failures} in a row`) : null),
+          h('span', null, ago(j.lastRun)), h('span', null, ago(j.lastOk)),
+          h('span', { class: 'stat-sub' }, j.lastError ? `${ago(j.lastErrorAt)}: ${j.lastError}` : '')))),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Alerts'), h('span', { class: 'field-hint' }, 'Sent to the owner’s confirmed email and shown here live. Never includes messages or secrets.')),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Alerts'), h('span', { class: 'field-hint' }, 'Failed backups and restore tests, jobs that keep failing, relay outages, low disk, repeated errors and sign-in floods.')),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.enabled, onchange: (e) => saveAlerts({ enabled: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Email the owner'), h('span', { class: 'field-hint' }, 'Needs email set up in Owner → Email and a confirmed address on the owner’s account.')),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.email, onchange: (e) => saveAlerts({ email: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+      h('div', { class: 'row gap' }, h('span', null, 'The same alert at most once every'), cooldown, h('span', null, 'minutes'),
+        h('button', { class: 'btn', onclick: () => saveAlerts({ cooldownMin: +cooldown.value }) }, 'Save'),
+        h('button', { class: 'btn ghost', onclick: async () => { try { const r = await api('POST', '/admin/alerts/test'); toast(r.result === 'sent' ? 'Test alert sent.' : r.result === 'off' ? 'Alerts are off.' : 'Held back: too many alerts lately.'); healthPage(); } catch (e) { toast(e.message, 'error'); } } }, 'Send a test alert')),
+      alerts.recent.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row head' }, h('span', null, 'When'), h('span', null, 'Alert'), h('span', null, 'Details')),
+        ...alerts.recent.map((a) => h('div', { class: 'adm-row' }, h('span', null, ago(a.at)), h('span', null, h('span', { class: `badge-tag ${a.severity === 'critical' ? 'bad' : 'warn'}` }, a.severity === 'critical' ? 'Urgent' : 'Warning'), ' ', a.title),
+          h('span', { class: 'stat-sub' }, a.detail, a.held ? ` (${a.held} more held back)` : '')))) : h('p', { class: 'muted-p' }, 'No alerts yet.'));
+    clearInterval(timer);
+    timer = setInterval(() => { if (tab === 'health' && document.contains(body)) healthPage().catch(() => {}); else clearInterval(timer); }, 15000);
+  }
+
   async function regions() {
     const d = await api('GET', '/admin/regions');
     const showCommand = (title, command) => modal({

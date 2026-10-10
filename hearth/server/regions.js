@@ -374,5 +374,5 @@ echo "If this VPS provider has its own firewall (in their control panel), open U
     return out;
   }
 
-  return { liveRelays, copyBackup, backupPublicKey };
+  return { liveRelays, copyBackup, backupPublicKey, isAlive };
 };

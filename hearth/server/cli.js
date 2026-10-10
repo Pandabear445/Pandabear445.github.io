@@ -12,11 +12,16 @@
 //                                                  unpack it into an empty folder; then point DATA_DIR there (or
 //                                                  move it to data/) and start Hearth. KEY = the 64-character backup
 //                                                  key, if this machine doesn't have the original data/backup.key.
+// Checking an install (server/doctor.js; read-only unless a --fix flag is given):
+//   node server/cli.js doctor [--relays] [--integrity] [--json] [--fix-permissions]
+//                                                  exit status 0 = all passed, 1 = warnings, 2 = failures
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
 const [cmd, a, b, c] = process.argv.slice(2);
+// Output piped into something that stops reading (| head) isn't an error worth a stack trace.
+process.stdout.on('error', (e) => { if (e.code === 'EPIPE') process.exit(process.exitCode || 0); });
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const keyFrom = (hex) => {
   if (hex) { if (!/^[0-9a-f]{64}$/i.test(hex.trim())) throw new Error('The backup key is 64 hex characters.'); return Buffer.from(hex.trim(), 'hex'); }
@@ -83,8 +88,16 @@ const settings = () => {
     console.log(`Restored ${entries.length} files into ${path.resolve(b)}. Start Hearth with DATA_DIR=${path.resolve(b)} (or move it to data/).`);
     const warn = newerWarning(BK.schemaOf(path.join(path.resolve(b), 'hearth.db')));
     if (warn) { console.error(warn); process.exitCode = 2; }
+  } else if (cmd === 'doctor') {
+    // Same .env as the server reads, so the checks see the configuration Hearth runs with.
+    require('dotenv').config({ quiet: true });
+    const flags = new Set(process.argv.slice(3));
+    const { runDoctor, printReport } = require('./doctor');
+    const r = await runDoctor({ dataDir: path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data')), flags });
+    if (flags.has('--json')) console.log(JSON.stringify(r, null, 2)); else printReport(r);
+    process.exitCode = r.exitCode;
   } else {
-    console.log('Usage: node server/cli.js set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key]');
+    console.log('Usage: node server/cli.js doctor [--relays] [--json] [--fix-permissions] | set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key]');
     process.exitCode = 1;
   }
 })().catch((e) => { console.error(e.message); process.exitCode = 1; });

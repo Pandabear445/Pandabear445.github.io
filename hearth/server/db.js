@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
+const log = require('./log');
 
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
@@ -15,7 +16,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -45,7 +46,7 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
   const changedAt = Math.max(st.mtimeMs, st.ctimeMs);
   for (const f of fs.readdirSync(dir)) if (f.startsWith('hearth-before-') && f.endsWith('.partial')) fs.rmSync(path.join(dir, f), { force: true });
   const fresh = settled && fs.readdirSync(dir).find((f) => f.startsWith(prefix) && f.endsWith('.db') && fs.statSync(path.join(dir, f)).mtimeMs > changedAt);
-  if (fresh) console.log(`The database was already backed up before this upgrade: ${path.join(dir, fresh)}`);
+  if (fresh) log.info('db', 'upgrade_backup', { msg: `The database was already backed up before this upgrade: ${path.join(dir, fresh)}` });
   else {
     // VACUUM INTO makes a consistent copy through SQLite (even if something else has the file open). It's written
     // under a temporary name first, so a copy that was cut short is never taken for a complete one.
@@ -54,7 +55,7 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
       db.prepare('VACUUM INTO ?').run(`${file}.partial`);
       fs.renameSync(`${file}.partial`, file);
     } catch (e) { fs.rmSync(`${file}.partial`, { force: true }); throw e; }
-    console.log(`Backed up the database before upgrading: ${file}`);
+    log.info('db', 'upgrade_backup', { msg: `Backed up the database before upgrading: ${file}`, outcome: 'ok' });
   }
 }
 db.pragma('foreign_keys = ON');
@@ -903,7 +904,7 @@ function auditVerify() {
     for (const r of db.prepare('SELECT * FROM admin_log WHERE hash IS NOT NULL ORDER BY id').iterate()) if (r.hash === auditMac(r.prev_hash, r)) { firstKeyed = r.id; break; }
   }
   AUDIT_FROM = anchored ? anchor.keyedFrom : set !== null ? set : firstKeyed !== null ? firstKeyed : head.id + 1;
-  if (firstKeyed !== null) console.error(`The audit log has entries keyed by this server from #${firstKeyed}, but the record of where they start was deleted outside Hearth.`);
+  if (firstKeyed !== null) log.warn('db', 'audit_anchor', { msg: `The audit log has entries keyed by this server from #${firstKeyed}, but the record of where they start was deleted outside Hearth.` });
   else if (!marked) db.prepare('INSERT INTO instance_settings (key, value) VALUES (?, ?)').run('auditKeyedFrom', `${AUDIT_FROM}.${auditMacOf(`keyed-from|${AUDIT_FROM}`)}`);
   // Keyed hashing starts now, and the log says so in a keyed entry, with the date. Someone who wipes the markers to
   // pass edited entries off as old ones can't avoid a new one of these, dated when they did it (and listed as a
@@ -976,6 +977,25 @@ CREATE TABLE IF NOT EXISTS server_key_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(server_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
+`);
+
+// v18 (observability): the health of each background job (server/jobs.js), saved so `node server/cli.js doctor`
+// can report it from another process and it survives a restart. Names and timings only, never job data.
+db.exec(`
+CREATE TABLE IF NOT EXISTS job_health (
+  name TEXT PRIMARY KEY,
+  every_ms INTEGER,
+  last_run INTEGER,
+  last_ok INTEGER,
+  last_error TEXT,
+  last_error_at INTEGER,
+  last_error_category TEXT,
+  failures INTEGER NOT NULL DEFAULT 0,
+  runs INTEGER NOT NULL DEFAULT 0,
+  total_failures INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER,
+  updated_at INTEGER NOT NULL
+);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
