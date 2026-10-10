@@ -342,7 +342,7 @@ test('files-2: deleting a server removes its emoji, banner and background files 
   const th = JSON.parse(srv.sql('SELECT theme FROM servers WHERE id = ?', s.id)[0].theme);
   const urls = [srv.sql('SELECT url FROM emojis WHERE server_id = ?', s.id)[0].url, th.banner, th.background.image, srv.sql('SELECT icon FROM servers WHERE id = ?', s.id)[0].icon];
   for (const u of urls) assert.equal((await srv.call('GET', u)).status, 200);
-  assert.equal((await as(srv, a, 'DELETE', `/servers/${s.id}`)).status, 200);
+  assert.equal((await as(srv, a, 'DELETE', `/servers/${s.id}`, { authKey: a.authKey })).status, 200);
   await sleep(150);
   for (const u of urls) assert.equal((await srv.call('GET', u)).status, 404, `${u} removed`);
   assert.equal(srv.sql('SELECT COUNT(*) n FROM user_files WHERE user_id = ?', a.id)[0].n, 0, 'quota freed');

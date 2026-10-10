@@ -73,7 +73,7 @@ before(async () => {
   });
   await new Promise((r) => push.listen(0, '127.0.0.1', r));
   pushPort = push.address().port;
-  srv = await startServer({ NODE_EXTRA_CA_CERTS: path.join(certDir, 'cert.pem'), NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost' });
+  srv = await startServer({ PUSH_ALLOW_PRIVATE: '1', NODE_EXTRA_CA_CERTS: path.join(certDir, 'cert.pem'), NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost' });
   boss = srv.owner;
   server = (await as(boss, 'POST', '/servers', { name: 'HQ' })).json;
   general = server.channels.find((c) => c.type === 'text');
