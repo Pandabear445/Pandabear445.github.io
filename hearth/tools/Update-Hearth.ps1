@@ -128,17 +128,36 @@ try {
 } catch { Fail "Couldn't open $Zip as a zip file." }
 if (-not $looksRight) { Fail "$Zip doesn't look like a Hearth update (no hearth/server/index.js inside)." }
 
+# Its SHA-256: compared with update.zip.sha256 when that file is next to it (published with each release), and
+# handed to the server, which checks the upload against it before unpacking or running anything from it.
+$sum = (Get-FileHash -Algorithm SHA256 -LiteralPath $Zip).Hash.ToLower()
+$sumFile = "$Zip.sha256"
+if (Test-Path -LiteralPath $sumFile) {
+  $first = [string](Get-Content -LiteralPath $sumFile -TotalCount 1)
+  $want = ($first.Trim() -split '\s+')[0].ToLower()
+  if ($want -ne $sum) { Fail "$Zip doesn't match $([IO.Path]::GetFileName($sumFile)): it's damaged or not the published update. Nothing was uploaded." }
+  Say "[OK] Checksum matches ($sum)." Green
+} else {
+  Say "SHA-256 of this update: $sum (no .sha256 file next to it to compare with)." Gray
+}
+
 # ---------------------------------------------------------------- upload + install
+# Upload into a private folder on the server (mktemp: only this account can open it), not a fixed /tmp name
+# that another account could create first and swap before it runs as root.
+$dir = ((& ssh @sshOpts -p $cfg.port $target 'mktemp -d') | Out-String).Trim()
+if ($dir -notmatch '^/[A-Za-z0-9._/-]+$') { Fail "Couldn't make a temporary folder on the server. Check the server address and your connection." }
 Say ''
 Say "Uploading $([IO.Path]::GetFileName($Zip))..." Yellow
-& scp @sshOpts -P $cfg.port $Zip "${target}:/tmp/hearth-update.zip"
+& scp @sshOpts -P $cfg.port $Zip "${target}:$dir/update.zip"
 if ($LASTEXITCODE -ne 0) { Fail 'Upload failed. Check the server address and your connection.' }
 
 Say 'Connecting to the server to install it. If it asks, type your server password (nothing shows while you type).' Yellow
 Say '(The server backs up first and rolls back by itself if anything goes wrong.)' Gray
 Say ''
-$remote = "command -v unzip >/dev/null 2>&1 || { ${sudo}apt-get update -qq && ${sudo}apt-get install -y -qq unzip; } >/dev/null 2>&1; " +
-          "unzip -p /tmp/hearth-update.zip hearth/scripts/hearth-update.sh > /tmp/hearth-update.sh && ${sudo}bash /tmp/hearth-update.sh /tmp/hearth-update.zip"
+# The folder goes away afterwards; 12 = the upload isn't the file checked above.
+$remote = "trap 'rm -rf $dir' EXIT; command -v unzip >/dev/null 2>&1 || { ${sudo}apt-get update -qq && ${sudo}apt-get install -y -qq unzip; } >/dev/null 2>&1; " +
+          "cd $dir || exit 13; echo '$sum  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 12; " +
+          "unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 11; ${sudo}bash hearth-update.sh $dir/update.zip"
 & ssh @sshOpts -t -p $cfg.port $target $remote
 $code = $LASTEXITCODE
 Say ''
@@ -154,6 +173,7 @@ switch ($code) {
   255 { Say "Couldn't log in to the server (wrong password, or the connection dropped)." Red }
   127 { Say "A command was missing on the server (see the message above)." Red }
   11  { Say "The zip you chose doesn't contain the updater (scripts/hearth-update.sh). Use the newest Hearth download." Red }
+  12  { Say "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again." Red }
   default { Say "The update stopped on the server. Your site is still on the previous version (or was rolled back)." Red }
 }
 $logFile = Join-Path $here 'last-update-log.txt'

@@ -8,7 +8,13 @@
 #   sign Android builds with your own key (see hearth/mobile/README.md). Without them a key is generated once
 #   and kept in the Actions cache. With them, a Google Play bundle (.aab) is built too.
 #   Optional secrets VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR: copy the installers to your server's
-#   data/downloads folder, where they show up on https://your-server/download.
+#   data/downloads folder, where they show up on https://your-server/download. Use a user that can only write
+#   that folder (not root). Optional VPS_HOST_FINGERPRINT (the server's SHA-256 SSH host key fingerprint) makes
+#   the copy refuse any other machine.
+#
+#   Security: every job only gets read access to the repository, except "release" (it creates the GitHub
+#   release). Actions are pinned to exact commits (the comment says which version; Dependabot updates them),
+#   checkouts don't keep the token, and the Android build installs exactly what's in its package-lock.json.
 #
 #   Code signing (all optional; builds stay unsigned without them; step-by-step guide: hearth/docs/SIGNING.md):
 #     Windows, Azure Artifact Signing: secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET and
@@ -34,12 +40,13 @@ on:
   workflow_dispatch:
     inputs:
       server:
-        description: 'Server address baked into these builds (leave empty to ask on first launch)'
+        description: 'Server address baked into these builds (empty: the HEARTH_SERVER variable, else the one in the app config files)'
         required: false
         default: ''
 
+# Least privilege: read-only unless a job says otherwise.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: hearth-apps-${{ github.ref }}
@@ -55,13 +62,18 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read # SignPath fetches the unsigned build (an artifact of this run) with this job's token
     defaults:
       run:
         working-directory: hearth/desktop
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Set the version (from the tag, or Hearth's own version)
@@ -110,7 +122,7 @@ jobs:
       - name: Hand the app to SignPath
         id: unsigned-app
         if: steps.signing.outputs.method == 'signpath'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-windows-unsigned-app
           path: hearth/desktop/dist/win-unpacked/Hearth.exe
@@ -140,7 +152,7 @@ jobs:
       - name: Hand the installer to SignPath
         id: unsigned-setup
         if: steps.signing.outputs.method == 'signpath'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-windows-unsigned-setup
           path: hearth/desktop/dist/Hearth-Setup-*.exe
@@ -176,7 +188,7 @@ jobs:
             if ($s.Status -ne 'Valid') { $bad = $true }
           }
           if ($bad) { Write-Host "::error::An .exe is not validly signed."; exit 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-desktop-${{ runner.os }}
           path: |
@@ -196,12 +208,14 @@ jobs:
     env:
       HAS_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       # Capacitor 8 (Android 16 / API 36, which Google Play requires) builds with Java 21.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: 21
@@ -209,6 +223,8 @@ jobs:
         id: v
         run: |
           if [[ "$GITHUB_REF" == refs/tags/app-v* ]]; then v="${GITHUB_REF_NAME#app-v}"; else v="$(node -p "require('../package.json').version")"; fi
+          # It goes into build.gradle and file names below: only plain version characters.
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$ ]] || { echo "::error::Not a version number: $v"; exit 1; }
           echo "name=$v" >> "$GITHUB_OUTPUT"
           # Android (and Google Play) only accept an update whose versionCode is higher than the installed one:
           # (major*100 + minor) * 100000 + this workflow's run number. 1.21.x → 121xxxxx, always going up.
@@ -219,8 +235,12 @@ jobs:
       - name: Bake in the server address
         if: env.SERVER != ''
         run: node -e "const f='www/config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
-      - run: npm install --no-audit --no-fund
+      # Exactly the versions in package-lock.json (Dependabot keeps them current).
+      - run: npm ci --no-audit --no-fund
       - name: Create the Android project
+        env:
+          VERSION_NAME: ${{ steps.v.outputs.name }}
+          VERSION_CODE: ${{ steps.v.outputs.code }}
         run: |
           npx cap add android
           cp native/MainActivity.java android/app/src/main/java/app/hearth/mobile/MainActivity.java
@@ -233,8 +253,8 @@ jobs:
           dependencies { implementation "androidx.webkit:webkit:\$androidxWebkitVersion" }
           android {
               defaultConfig {
-                  versionCode ${{ steps.v.outputs.code }}
-                  versionName "${{ steps.v.outputs.name }}"
+                  versionCode $VERSION_CODE
+                  versionName "$VERSION_NAME"
               }
               signingConfigs {
                   hearth {
@@ -249,7 +269,7 @@ jobs:
           EOF
       - name: App icon
         continue-on-error: true
-        run: npx --yes @capacitor/assets@3 generate --android --assetPath resources --iconBackgroundColor '#100e16' --iconBackgroundColorDark '#100e16' --splashBackgroundColor '#100e16' --splashBackgroundColorDark '#100e16'
+        run: npx --no -- capacitor-assets generate --android --assetPath resources --iconBackgroundColor '#100e16' --iconBackgroundColorDark '#100e16' --splashBackgroundColor '#100e16' --splashBackgroundColorDark '#100e16'
       - run: npx cap sync android
 
       - name: Signing key from secrets
@@ -265,7 +285,7 @@ jobs:
           fi
       - name: Saved signing key
         if: steps.secretkey.outputs.found != '1'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.hearth-android-key
           key: hearth-android-key-v1
@@ -288,18 +308,20 @@ jobs:
           HEARTH_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'hearth' }}
           HEARTH_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
           BUNDLE: ${{ steps.secretkey.outputs.found == '1' && 'bundleRelease' || '' }}
+          VERSION_NAME: ${{ steps.v.outputs.name }}
+          VERSION_CODE: ${{ steps.v.outputs.code }}
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleRelease ${BUNDLE:+"$BUNDLE"}
           mkdir -p ../dist ../play
-          cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-${{ steps.v.outputs.name }}.apk"
-          if [ -n "$BUNDLE" ]; then cp app/build/outputs/bundle/release/app-release.aab "../play/Hearth-${{ steps.v.outputs.name }}-${{ steps.v.outputs.code }}.aab"; fi
-      - uses: actions/upload-artifact@v4
+          cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-$VERSION_NAME.apk"
+          if [ -n "$BUNDLE" ]; then cp app/build/outputs/bundle/release/app-release.aab "../play/Hearth-$VERSION_NAME-$VERSION_CODE.aab"; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-android
           path: hearth/mobile/dist/*.apk
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.secretkey.outputs.found == '1'
         with:
           name: hearth-android-play-bundle
@@ -324,53 +346,57 @@ jobs:
     needs: [desktop, android]
     if: startsWith(github.ref, 'refs/tags/app-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # the only job that writes: it creates the GitHub release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
       - name: Leave out the Google Play bundle (it isn't installable by itself)
         run: rm -f dist/*.aab
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true
 
-  # Only release builds reach everyone's apps: tags, the default branch and manual runs (never feature branches,
-  # whose Windows builds aren't signed when signing goes through SignPath).
+  # Only release builds reach everyone's apps (the desktop app updates itself from this folder): tags and the
+  # default branch, whether pushed or run by hand. Never another branch, not even by a manual run.
   publish-to-vps:
     needs: [desktop, android]
     if: >-
       always() && (needs.desktop.result == 'success' || needs.android.result == 'success') &&
-      (startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch')
+      (startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     env:
       HAS_VPS: ${{ secrets.VPS_HOST != '' }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: env.HAS_VPS == 'true'
         with:
           path: dist
           merge-multiple: true
       - name: Copy installers to the server
         if: env.HAS_VPS == 'true'
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
           source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb,dist/*.apk,dist/*.blockmap,dist/latest*.yml'
           target: ${{ secrets.VPS_DOWNLOADS_DIR }}
           strip_components: 1
       - name: Keep only the two newest of each installer on the server
         if: env.HAS_VPS == 'true'
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
         env:
           DIR: ${{ secrets.VPS_DOWNLOADS_DIR }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
           envs: DIR
           script: |
             cd "$DIR" || exit 0

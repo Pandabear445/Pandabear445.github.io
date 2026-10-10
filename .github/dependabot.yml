@@ -22,7 +22,7 @@ updates:
       desktop-minor-patch:
         update-types: [minor, patch]
 
-  # Android app (Capacitor). No lockfile here, so Dependabot updates the version ranges in package.json.
+  # Android app (Capacitor, plus the icon generator), with its lockfile: CI installs exactly these versions.
   - package-ecosystem: npm
     directory: /hearth/mobile
     schedule: { interval: weekly, day: monday }

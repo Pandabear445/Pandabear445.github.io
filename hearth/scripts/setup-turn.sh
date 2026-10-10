@@ -81,6 +81,8 @@ no-tlsv1
 no-tlsv1_1
 no-multicast-peers
 no-loopback-peers
+# Calls only relay UDP; refusing TCP relays (RFC 6062) removes a way to reach TCP services through the relay.
+no-tcp-relay
 # Never relay into private or internal networks (blocks a well-known TURN abuse).
 denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255

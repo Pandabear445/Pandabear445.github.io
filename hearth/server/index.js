@@ -363,18 +363,33 @@ function areFriends(a, b) {
 
 // ---------------------------------------------------------------- app + uploads
 const app = express();
-// Real client IPs: by default we trust X-Forwarded-For only when the request comes from a local/private
-// address (Caddy/nginx on this machine or in Docker). Set TRUST_PROXY to override.
-const TRUSTED_PROXY = process.env.TRUST_PROXY || 'loopback, linklocal, uniquelocal';
-app.set('trust proxy', TRUSTED_PROXY);
+// Real client IPs: X-Forwarded-For only counts when the request comes from a proxy we trust. By default that's
+// this machine only (Caddy/nginx on the same host); docker-compose.yml names its own Caddy. See proxytrust.js.
+const { trustProxySetting, clientIp } = require('./proxytrust');
+try {
+  app.set('trust proxy', trustProxySetting(process.env.TRUST_PROXY));
+} catch (e) {
+  throw new Error(`TRUST_PROXY=${process.env.TRUST_PROXY} isn't valid (${e.message}). Use your proxy's addresses or subnets, a number of proxies, or false.`);
+}
 app.disable('x-powered-by');
 const PRIVATE_IP = /^(::1|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|f[cd][0-9a-f]{2}:|fe80:|::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.))/i;
 const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/, '').slice(0, 64);
+// Behind a proxy (HTTPS=false) on another address (an older docker-compose.yml, nginx in its own container)
+// whose header we now ignore: say so once in the log, so a site where everyone suddenly shares one address is
+// easy to fix. (Not with HTTPS on: there's no proxy then, and the header can only come from a visitor.)
+let xffIgnoredNoted = false;
+function noteIgnoredXff(remote, xff) {
+  if (USE_HTTPS || xffIgnoredNoted || !xff || !PRIVATE_IP.test(String(remote || ''))) return;
+  if (app.get('trust proxy fn')(String(remote), 0)) return;
+  xffIgnoredNoted = true;
+  console.warn(`  X-Forwarded-For from ${cleanIp(remote)} was ignored (TRUST_PROXY doesn't include it). If that's your reverse proxy, set TRUST_PROXY=${cleanIp(remote)} in .env so visitors' real addresses are used.`);
+}
 // Behind a proxy (HTTPS=false), refuse plain-HTTP requests that come straight from the internet, so nobody
 // can bypass the proxy's HTTPS and send login tokens unencrypted. ALLOW_DIRECT_HTTP=true turns this off.
 const directGuard = (remote) => USE_HTTPS || process.env.ALLOW_DIRECT_HTTP === 'true' || PRIVATE_IP.test(String(remote || ''));
 app.use((req, res, next) => {
   if (!directGuard(req.socket.remoteAddress)) return res.status(403).type('text').send('Please use the https:// address of this server.');
+  noteIgnoredXff(req.socket.remoteAddress, req.headers['x-forwarded-for']);
   next();
 });
 // Stripe signs the exact bytes it sends, so keep them for that one route.
@@ -2723,6 +2738,9 @@ api.post('/admin/giphy/test', auth, wrap(async (req, res) => {
 // (valid 12 hours), so the relay can't be used by outsiders. Set up with scripts/setup-turn.sh.
 const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || '').split(',').map((x) => x.trim()).filter(Boolean);
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
+// The older static TURN_USERNAME/TURN_CREDENTIAL still work, but then every signed-in user (and every former
+// member) holds the same relay password, forever. Say so, so it gets replaced by the shared-secret mode.
+if (process.env.TURN_USERNAME && !turnSecret()) console.warn('  TURN_USERNAME/TURN_CREDENTIAL hand everyone the same relay password that never expires. Use TURN_SECRET instead (sudo bash scripts/setup-turn.sh sets it all up).');
 // Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
 // entry with a region name, so the app can measure which answer fastest and use those.
 const REG = require('./regions')({ api, app, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, newId, DATA_DIR, ROOT: path.join(__dirname, '..') });
@@ -2881,13 +2899,10 @@ api.post('/terms/accept', auth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- moderation helpers
+// Same rule as req.ip (TRUST_PROXY), so a live connection can't claim an address that HTTP wouldn't accept.
 function socketIp(socket) {
   const remote = socket.handshake.address || (socket.request && socket.request.socket.remoteAddress);
-  if (PRIVATE_IP.test(String(remote || ''))) {
-    const xff = String(socket.handshake.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
-    for (let i = xff.length - 1; i >= 0; i--) if (!PRIVATE_IP.test(xff[i])) return cleanIp(xff[i]);
-  }
-  return cleanIp(remote);
+  return cleanIp(clientIp(remote, socket.handshake.headers['x-forwarded-for'], app.get('trust proxy fn')));
 }
 // The audit log: staff actions and security events on accounts (password changes and resets, two-factor,
 // sessions, deletions). Append-only — the database refuses to edit or delete entries (see db.js), and each

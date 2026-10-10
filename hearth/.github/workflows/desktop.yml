@@ -3,6 +3,10 @@
 #   Result: installers attached to a GitHub release (tags only) and as workflow artifacts.
 #   Optional: set the VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR secrets to also copy the
 #   installers to your server's data/downloads folder, where they show up on https://your-server/download.
+#   Use a user that can only write that folder (not root); optional VPS_HOST_FINGERPRINT (the server's SHA-256
+#   SSH host key fingerprint) makes the copy refuse any other machine.
+#   Security: read-only token except for the release job, actions pinned to exact commits, and the exact
+#   library versions from package-lock.json.
 name: Desktop app
 
 on:
@@ -11,12 +15,13 @@ on:
   workflow_dispatch:
     inputs:
       server:
-        description: 'Server address baked into this build (leave empty to ask on first launch)'
+        description: 'Server address baked into this build (empty: the HEARTH_SERVER variable, else the one in hearth.config.json)'
         required: false
         default: ''
 
+# Least privilege: read-only unless a job says otherwise.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -29,10 +34,12 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: 20
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
       - name: Set version from tag
         if: startsWith(github.ref, 'refs/tags/desktop-v')
         shell: bash
@@ -43,12 +50,12 @@ jobs:
         env:
           SERVER: ${{ github.event.inputs.server || vars.HEARTH_SERVER }}
         run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
-      - run: npm install
+      - run: npm ci --no-audit --no-fund
       - name: Build installers
         run: npx electron-builder --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-${{ matrix.os }}
           path: |
@@ -63,34 +70,39 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/desktop-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # the only job that writes: it creates the GitHub release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true
 
+  # Installers reach everyone's apps from there: tags and the default branch only.
   publish-to-vps:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/desktop-v') || github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     env:
       HAS_VPS: ${{ secrets.VPS_HOST != '' }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: env.HAS_VPS == 'true'
         with:
           path: dist
           merge-multiple: true
       - name: Copy installers to the server
         if: env.HAS_VPS == 'true'
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
           source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb'
           target: ${{ secrets.VPS_DOWNLOADS_DIR }}
           strip_components: 1

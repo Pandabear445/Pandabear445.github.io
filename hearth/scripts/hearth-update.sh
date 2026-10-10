@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hearth updater — installs an update zip on this server, safely.
 #
-#   hearth-update /tmp/hearth-update.zip     install an update
+#   hearth-update path/to/update.zip         install an update (checked against update.zip.sha256 next to it)
 #   hearth-update --rollback [backup]        go back to the version before the last update (or a chosen backup)
 #   hearth-update --status                   where Hearth is, how it runs, its version, health, backups, disk space
 #   hearth-update --logs                     Hearth's last 80 log lines (handy when reporting a problem)
@@ -16,8 +16,12 @@
 #   5. Swaps to the new version and checks it actually answers. If not, it rolls back by itself.
 set -Eeuo pipefail
 
-BACKUP_ROOT=/root/hearth-backups
-CONF=/etc/hearth-update.conf
+# Where backups, the remembered install folder, this script's installed copy and the lock live. (The variables
+# only exist so the tests can run this script in a scratch folder; sudo doesn't pass them through.)
+BACKUP_ROOT="${HEARTH_BACKUP_ROOT:-/root/hearth-backups}"
+CONF="${HEARTH_UPDATE_CONF:-/etc/hearth-update.conf}"
+BIN="${HEARTH_UPDATE_BIN:-/usr/local/bin/hearth-update}"
+LOCK="${HEARTH_UPDATE_LOCK:-/run/lock/hearth-update.lock}"
 KEEP=5
 
 c_y=$'\033[1;33m'; c_g=$'\033[1;32m'; c_r=$'\033[1;31m'; c_b=$'\033[1m'; c_0=$'\033[0m'
@@ -52,7 +56,8 @@ if [ "$ACTION" = update ] || [ "$ACTION" = rollback ]; then
   printf 'Hearth updater started %s (log: %s)\n' "$(date)" "$LOG"
   # Only one update at a time (a double-click or a second terminal can't start another one halfway through).
   if command -v flock >/dev/null 2>&1; then
-    { exec 9>/run/lock/hearth-update.lock; } 2>/dev/null || exec 9>/tmp/hearth-update.lock
+    # (Fallback: root's own backup folder, never a fixed name in /tmp that another account could plant.)
+    { exec 9>"$LOCK"; } 2>/dev/null || exec 9>"$BACKUP_ROOT/.update.lock"
     flock -n 9 || die "Another update is already running on this server. Wait for it to finish, then try again."
   fi
 fi
@@ -79,7 +84,7 @@ need unzip; need rsync; need curl
 
 # Keep a copy of this script at /usr/local/bin/hearth-update so "hearth-update --rollback" always works.
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-if [ "$SELF" != /usr/local/bin/hearth-update ] && [ -f "$SELF" ]; then cp "$SELF" /usr/local/bin/hearth-update && chmod +x /usr/local/bin/hearth-update; fi
+if [ "$SELF" != "$BIN" ] && [ -f "$SELF" ]; then cp "$SELF" "$BIN" && chmod +x "$BIN"; fi
 
 # ---------------------------------------------------------------- find the install
 find_install() {
@@ -138,6 +143,37 @@ plain_pid() {
   done
   return 0
 }
+
+# Plain mode (started by hand with npm start / node): Hearth usually runs as an ordinary user. Restart it as
+# that same user, never as root, or an update would quietly turn it into a root process (and its new files in
+# data/ would be root's). Whose it is: the running process's owner, or else data/'s.
+# The program files keep their owner: when they're that user's (the usual case), that user also installs the
+# libraries, so their install scripts never run as root. Root-owned program files stay root's.
+RUN_AS=root; STAGE_AS=root; RUN_PFX=(); STAGE_PFX=()
+# Sets PFX to the command prefix that runs something as account $1. setpriv becomes the command itself, so
+# nothing stays behind as root; runuser where there's no setpriv.
+prefix_for() {
+  local pw gid home
+  pw="$(getent passwd "$1" || true)"
+  [ -n "$pw" ] || die "Couldn't look up the account $1 (Hearth runs as it)."
+  gid="$(cut -d: -f4 <<< "$pw")"; home="$(cut -d: -f6 <<< "$pw")"
+  if command -v setpriv >/dev/null 2>&1; then PFX=(env HOME="$home" setpriv --reuid="$1" --regid="$gid" --init-groups --)
+  else PFX=(runuser -u "$1" -- env HOME="$home"); fi
+}
+if [ "$MODE" = plain ] && { [ "$ACTION" = update ] || [ "$ACTION" = rollback ]; }; then
+  owner=""; pid="$(plain_pid)"; pid="${pid%%$'\n'*}"
+  [ -n "$pid" ] && owner="$(stat -c %U "/proc/$pid" 2>/dev/null || true)"
+  [ -n "$owner" ] || owner="$(stat -c %U data 2>/dev/null || echo root)"
+  [ "$owner" != UNKNOWN ] || die "Hearth runs as a user ID that has no account name, so it can't be restarted as that user. Give data/ to a real account first."
+  if [ "$owner" = root ]; then
+    warn "Hearth runs as root. It will be restarted the same way; to give it its own user, see scripts/harden-vps.sh."
+  else
+    RUN_AS="$owner"; prefix_for "$RUN_AS"; RUN_PFX=("${PFX[@]}")
+    if [ "$(stat -c %U . 2>/dev/null || true)" = "$RUN_AS" ]; then STAGE_AS="$RUN_AS"; STAGE_PFX=("${PFX[@]}"); fi
+  fi
+fi
+# Runs a command as the owner of the program files (root in Docker, systemd and pm2 modes, as before).
+as_stager() { ${STAGE_PFX[@]+"${STAGE_PFX[@]}"} "$@"; }
 stop_app() {
   case $MODE in
     docker) $DC stop hearth >/dev/null 2>&1 || true ;;
@@ -151,7 +187,14 @@ start_app() {
     docker) $DC up -d --no-deps --no-build hearth >/dev/null 2>&1 ;;
     systemd) systemctl start "$UNIT" ;;
     pm2) pm2 restart hearth >/dev/null ;;
-    plain) nohup node server/index.js >> hearth.log 2>&1 < /dev/null & disown ;;
+    plain)
+      # In a folder Hearth's user owns, the log is opened as that user too, so root never writes through a
+      # hearth.log that was swapped for a link to somewhere else. (exec: nothing stays behind as root.)
+      if [ "$STAGE_AS" = "$RUN_AS" ]; then
+        ( exec ${RUN_PFX[@]+"${RUN_PFX[@]}"} sh -c 'exec nohup node server/index.js >> hearth.log 2>&1 < /dev/null' ) & disown
+      else
+        ( exec ${RUN_PFX[@]+"${RUN_PFX[@]}"} nohup node server/index.js >> hearth.log 2>&1 < /dev/null ) & disown
+      fi ;;
   esac
 } 9>&- # Hearth (or a pm2 daemon) must not inherit the update lock, or the next update would think one is still running.
 show_logs() {
@@ -176,14 +219,14 @@ healthy() { # $1 = attempts, 2 s apart (default 45 = 90 s)
   done
   return 1
 }
-install_deps() { [ "$MODE" = docker ] && return 0; npm ci --omit=dev --no-audit --no-fund >/dev/null 2>&1 || npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1; }
+install_deps() { [ "$MODE" = docker ] && return 0; as_stager npm ci --omit=dev --no-audit --no-fund >/dev/null 2>&1 || as_stager npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1; }
 # Non-Docker: build the new version's libraries in a staging folder, so the live site is untouched
 # until everything is ready. If the library list didn't change, reuse the current ones (no download).
 prepare_stage() { # $1 = staging dir, $2 = log file
   if cmp -s "$DIR/package-lock.json" "$1/package-lock.json" && [ -d "$DIR/node_modules" ]; then
-    cp -a "$DIR/node_modules" "$1/node_modules"; return 0
+    as_stager cp -a "$DIR/node_modules" "$1/node_modules"; return 0
   fi
-  (cd "$1" && npm ci --omit=dev --no-audit --no-fund) > "$2" 2>&1
+  (cd "$1" && as_stager npm ci --omit=dev --no-audit --no-fund) > "$2" 2>&1
 }
 RSYNC_EXCLUDES=(--exclude /data --exclude '/data-backup*' --exclude /.env --exclude /node_modules --exclude /hearth.log
   --exclude /docker-compose.yml --exclude /deploy/Caddyfile --exclude /desktop/hearth.config.json --exclude /.git)
@@ -318,8 +361,22 @@ if [ "$ACTION" = rollback ]; then
 fi
 
 # ---------------------------------------------------------------- update
-ZIP="${ARG:-/tmp/hearth-update.zip}"
+# Always an explicit path: a default like /tmp/hearth-update.zip could be a file another account left there.
+[ -n "$ARG" ] || die "Which update? Usage: hearth-update path/to/update.zip"
+ZIP="$ARG"
 [ -f "$ZIP" ] || die "Update file not found: $ZIP"
+# Compare the update with its SHA-256 when there's one to compare with: update.zip.sha256 next to it (made with
+# each release by scripts/make-update-zip.sh; the update tools write it from the file you confirmed on your
+# computer). A mismatch stops here, before anything is unpacked or run.
+SUM="$(sha256sum "$ZIP" | cut -d' ' -f1)"
+if [ -f "$ZIP.sha256" ]; then
+  WANT="$(tr -d '\r' < "$ZIP.sha256" | awk 'NR == 1 { print tolower($1) }')"
+  [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || die "$ZIP.sha256 doesn't contain a SHA-256 checksum."
+  [ "$WANT" = "$SUM" ] || die "$ZIP doesn't match its checksum ($ZIP.sha256): it's damaged or not the published update. Nothing was changed."
+  ok "Checksum matches ($SUM)."
+else
+  warn "No $(basename "$ZIP").sha256 next to the update, so it can't be checked. Its SHA-256 is $SUM: compare it with the one published for this release."
+fi
 unzip -Z1 "$ZIP" 'hearth/server/index.js' >/dev/null 2>&1 || die "$ZIP doesn't look like a Hearth update."
 
 printf '\n%sHearth update%s\n  folder:  %s\n  runs as: %s%s\n  current: %s\n\n' "$c_b" "$c_0" "$DIR" "$MODE" "${UNIT:+ ($UNIT)}" "$(version)"
@@ -338,7 +395,10 @@ unzip -q "$ZIP" -d "$WORK"
 NEW="$WORK/hearth"
 ok "New version: $(version "$NEW")"
 # Keep the updater itself up to date too (when run as "hearth-update <zip>", the old copy is what's running).
-if [ -f "$NEW/scripts/hearth-update.sh" ]; then cp "$NEW/scripts/hearth-update.sh" /usr/local/bin/hearth-update && chmod +x /usr/local/bin/hearth-update; fi
+if [ -f "$NEW/scripts/hearth-update.sh" ]; then cp "$NEW/scripts/hearth-update.sh" "$BIN" && chmod +x "$BIN"; fi
+# Plain mode with the program files owned by Hearth's user: that user prepares the new version, and the files
+# it ends up with stay that user's, as they were before the update.
+if [ "$STAGE_AS" != root ]; then chmod 711 "$WORK"; chown -R "$STAGE_AS:" "$NEW"; fi
 
 BK="$BACKUP_ROOT/$(date +%F-%H%M%S)"
 mkdir -p "$BK"
