@@ -120,6 +120,35 @@ try {
   await settle(p, 1500);
   say('history: after jumping back to the latest', await counts());
 
+  // ------------------------------------------------------------------ new messages arriving while reading the latest
+  // 100 messages posted through the API (the same ciphertext again, so they decrypt); counts how much of the list
+  // is torn down and rebuilt per arrival, and how long each takes to appear.
+  const token = await p.evaluate(() => localStorage.getItem('hearth.token'));
+  const db1 = H.srv.db();
+  const last = db1.prepare('SELECT * FROM messages ORDER BY id DESC LIMIT 1').get();
+  db1.close();
+  await p.evaluate(() => {
+    window.__removed = 0;
+    window.__mo = new MutationObserver((list) => { for (const m of list) window.__removed += m.removedNodes.length; });
+    window.__mo.observe(document.querySelector('#messages'), { childList: true });
+  });
+  const arrive = [];
+  for (let i = 0; i < 100; i++) {
+    const t0 = Date.now();
+    const r = await H.srv.api('POST', `/channels/${last.channel_id}/messages`, { token, body: { ciphertext: last.ciphertext, epoch: last.epoch }, ip: `198.18.9.${1 + (i % 200)}` });
+    // The server allows 25 messages per 10 s per session: wait and try again, outside the timing.
+    if (r.status === 429) { await new Promise((res) => setTimeout(res, 2000)); i--; continue; }
+    if (r.status !== 200) { say('incoming: posting failed', `${r.status} ${r.text.slice(0, 120)}`); break; }
+    const id = r.json.id || (r.json.message && r.json.message.id);
+    await p.waitForSelector(`#messages .msg[data-mid="${id}"]`, { timeout: 5000 });
+    arrive.push(Date.now() - t0);
+  }
+  if (arrive.length) {
+    say('incoming: message on screen after posting, ms', stats(arrive));
+    say('incoming: list nodes removed during 100 arrivals', await p.evaluate(() => window.__removed));
+    say('incoming: after 100 arrivals', await counts());
+  }
+
   // ------------------------------------------------------------------ a 1,000-member server
   const db2 = H.srv.db();
   const server = db2.prepare('SELECT server_id FROM members WHERE user_id = ?').get(ids.uid).server_id;

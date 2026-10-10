@@ -133,7 +133,7 @@
   --line-2: rgb(40 20 80 / .16);
   --hover: rgb(40 20 80 / .045);
   --active: rgb(40 20 80 / .085);
-  --accent-ink: color-mix(in oklab, var(--accent) 58%, #000);
+  --accent-ink: color-mix(in oklab, var(--accent) 68%, #000);
   --focus: var(--accent-ink);
   /* Status colours dark enough to stand out on pale panels (3:1, like other UI parts). */
   --ok: #2e965f;
