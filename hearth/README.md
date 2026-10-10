@@ -353,6 +353,14 @@ The `mobile/` folder is an Android app (Capacitor) that opens your server, like 
 - **Calls go through a relay when they can't connect directly** (this server's, if you ran `setup-turn.sh`, or a region's). The relay only forwards encrypted packets.
 - Behind strict networks (some offices, mobile carriers), add a TURN server (see below) so video can always connect.
 
+### Calls that survive hiccups
+
+If your connection to the server drops mid-call, the call keeps going (audio usually flows straight between
+participants) and Hearth rejoins by itself. Others see you as "reconnecting" for up to 18 seconds (`VOICE_GRACE_MS`).
+After a server restart, everyone rejoins automatically. The call bar always shows the real state, and **Call
+diagnostics** (the ⓘ button in a call) shows round trip, loss, jitter, path type and relay for your own connections.
+Developers: `npm run test:voice` runs a two-browser call test. See `docs/VOICE.md`.
+
 ## Voice not working?
 
 Voice goes directly between people's browsers (peer to peer). Most home connections work with the default STUN servers. If someone can join a channel but nobody can hear them (or the panel stays on "Connecting…"), their network is blocking direct connections and you need a **TURN relay**:
@@ -445,7 +453,10 @@ Hearth makes two kinds of backup by itself every day (Admin → Owner → Backup
   ```bash
   node server/cli.js restore hearth-2026-….hbk /opt/hearth/data <backup key>
   ```
-  Then start Hearth (for a different folder, set `DATA_DIR`). `node server/cli.js verify-backup <file> <key>` checks a backup without restoring it, and `node server/cli.js backup` makes one from the command line. Both warn when a backup comes from a newer Hearth; `restore` still restores it but exits with code 2, because this version won't start on it until you install that newer version.
+  Then start Hearth (for a different folder, set `DATA_DIR`). `node server/cli.js verify-backup <file> <key>` checks a backup without restoring it, and `node server/cli.js backup` makes one from the command line. `verify-backup` warns when a backup comes from a newer Hearth; `restore` refuses it (exit code 2) and restores nothing: install that newer version first.
+- **Restore safely**: `restore` only writes into an empty folder. While it runs, the folder holds `RESTORE-INCOMPLETE`, and Hearth won't start on a folder that has it, so an interrupted restore can't pass for a complete one. Exit code 3 means some files the database refers to aren't in the backup (they're listed); `node server/cli.js check-files` gives the same report for any data folder.
+- **After a break-in**, add `--sign-out-everyone` to `restore`: sessions signed out after the backup was made would otherwise work again.
+- **Full guide**, including what each kind of account recovery can and can't bring back: [docs/RECOVERY.md](docs/RECOVERY.md). `node scripts/recovery-drill.js` and `bash scripts/upgrade-drill.sh` prove it end to end.
 - **Lost the owner's account?** `node server/cli.js set-owner <username>` makes another account the owner. It works while Hearth is running, refuses deleted, bot and suspended accounts, drops the new owner's other staff role, and is written to the audit log (`ownership_set_cli`).
 
 **Database copies** (`data/backups/*.db`) are for undoing an update on this machine. They're as sensitive as the database itself, so they never leave the server and can't be downloaded. Copies made before upgrades (`hearth-before-v*.db`) are never deleted automatically; remove old ones by hand once you're happy with an upgrade.
@@ -553,6 +564,51 @@ Bot posts come from public feeds, so they aren't end-to-end encrypted (the serve
 **Search (Ctrl+K).** Messages are end-to-end encrypted, so search runs on your device: the app fetches messages page by page, decrypts them, and matches your words there. Each click checks up to 1,000 messages, newest first; **Search further back** continues. Filters: `from:@username`, `from:me`, `in:#channel`, `in:@username`, `before:` / `after:` / `during:` a date (`2025-05-31`), month or year, `has:file` / `has:image` / `has:link`, `is:edited` / `is:pinned`, `"exact phrase"`; several words must all appear. Recent searches stay in this browser and can be turned off.
 
 The server never receives the words, phrases or `has:`/`is:` filters. It sees that you searched, when, where (a channel, DM, server or everything), whose messages and which dates, and how far back you went. Details: [SECURITY.md](SECURITY.md) row 69.
+
+## Never lose your place
+
+- **Unread badges and a "New messages" line** that follow you across devices, **Jump to first unread**, Mark as
+  read/unread, and **drafts** that survive reloads (kept only on your device).
+- **Saved messages** synced to all your devices, with private notes only you can read.
+- **Notifications your way:** all, mentions only or nothing per server, channel and DM; mute for a while; ignore
+  @everyone; quiet hours on a schedule. Push follows these too, and lock screens just say "New message" unless you
+  choose otherwise.
+- **Export my data** (Settings → Privacy & safety, needs your password): a zip of your account and every message you
+  can read, decrypted on your device.
+- **Moderation:** slow mode, timeouts (members can read but not post or talk), pin history. Pinning in a server
+  channel needs Manage Messages. See `docs/FEATURES.md`.
+
+## Big files and storage
+
+Files over 8 MB upload in resumable pieces: you see real progress, can cancel, and a dropped connection carries on
+where it stopped. Videos and songs can seek, pictures open in a gallery, and files that were deleted say so plainly.
+*Settings → Storage* shows what you use and your biggest files (names come from your own encrypted messages, not the
+server). Admins get *Admin → Security → Storage & limits*: space per person and per server, uploads in progress, free
+disk, and "Clean up orphans now" (password required, logged). See `docs/STORAGE.md`.
+
+## Bots
+
+Servers can add bots: programs that post messages, offer slash commands and hear about events through signed
+webhooks, with only the access the server approves. Bots can't read people's messages (those stay end-to-end
+encrypted); they only see text someone sends them with a slash command, after a warning. Bot messages aren't
+end-to-end encrypted and are marked that way. Make one in Server settings → Bots; admins choose who may (Admin →
+Owner). Developer guide: `docs/BOTS.md`; example: `scripts/example-bot.js`. `BOT_WEBHOOK_ALLOW_PRIVATE=1` allows
+webhooks to private addresses (for bots on your own network).
+
+## Monitoring and troubleshooting
+
+Hearth logs one JSON line per event (set `LOG_FORMAT=pretty` for readable lines). Secrets, tokens and message content
+are never logged, and IP addresses are cut to their network (`LOG_FULL_IP=true` keeps them). Every response carries an
+`X-Request-Id` to search the log by.
+
+- `GET /api/health/live`: the process is up (use it for Docker/systemd health checks).
+- `GET /api/health/ready`: ready for people (database, data folder, schema, maintenance, disk). `200` or `503`.
+- Admin → **Health**: background jobs, the news bot, relays, backups and restore tests, disk, responsiveness, and
+  alerts to the owner by email.
+- `node server/cli.js doctor`: read-only checks of your install, exit 0/1/2. Add `--relays` to test relays, or
+  `--fix-permissions` to tighten key file permissions.
+
+See `docs/OPERATIONS.md`.
 
 ## Server folders
 

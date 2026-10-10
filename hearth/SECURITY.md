@@ -27,6 +27,9 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | **SMTP password, API keys, payment secrets** | Server database or `.env` | In the database, sealed with `data/secret.key`: the SMTP password, the GIPHY, KLIPY, Last.fm and RAWG keys, the Ko-fi token, both Stripe webhook signing secrets and the memberships Stripe key. **The call relay (TURN) secret is stored in plain text**, because the relay setup scripts read it. Never in git. |
 | **Study tools data** (decks, assignments, timer settings, stats) | Server database, as ciphertext only | Encrypted on your device with a key derived from your identity key (ECDH with itself → HKDF → AES-256-GCM). Each item is bound to its id and kind, so the server can't swap them. For reminders, the server stores only a time. |
 | **Server folders, tracked feeds** | Server database | Not encrypted: they're personal settings the server needs (folders) or acts on (it fetches the feeds). They're only shown to the account itself. |
+| **Saved messages, read markers, notification settings** | Server database | Message ids, times and settings only. Notes on saved messages are encrypted on your device with a key only you can derive. Drafts stay in your browser and are deleted when you send or sign out. |
+| **Bot tokens and webhook secrets** | Server database | Tokens are stored only as SHA-256 hashes and shown once; webhook signing secrets are sealed with `data/secret.key`. |
+| **Server logs** | stdout (journald, Docker logs) | Structured lines with secrets, tokens, message content and ciphertext redacted; IPs truncated unless `LOG_FULL_IP=true`. |
 | **Public pictures** (avatars, banners, backgrounds, server icons, emoji, the GIF library) | `data/uploads`, readable by anyone with the link | Not encrypted: everyone is meant to see them. The server strips hidden metadata (EXIF and GPS position, XMP, IPTC, comments, data after the image) from JPEG, PNG and WebP uploads before storing them. GIF comments, profile songs' tags and pictures uploaded before this version keep theirs. |
 | **Backups** | `data/backups/encrypted/*.hbk`, plus off-site copies | Encrypted with a separate backup key, made tamper-evident in chunks, and restore-tested when made. The plain snapshot a backup is made from only ever sits in the private folder `data/backups/.tmp`, and is deleted afterwards. |
 | **The audit log** | Server database, plus `data/audit-anchor.json` | Append-only (the database refuses edits and deletes). Each entry is chained with an HMAC keyed from `data/secret.key`, and the newest entry is recorded in `data/audit-anchor.json`. Anyone without that key can't edit, delete or cut off entries unnoticed. Someone with root (the database and the key) can still rewrite it. |
@@ -119,6 +122,25 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 69 | Searching messages leaks the words | The server builds no search index and never receives the search words, quoted phrases or `has:`/`is:` filters. The app calls `GET /api/search/messages` with only scope, author, time window, cursor and limit, and gets back the same ciphertext the history endpoints return. Access is re-checked on every request; cursors only mark a position. Limits: 200 per page, 100 conversations per page for `all`/server scope, 60 searches a minute. The server learns that you searched, when, which scope/author/time window, and how far back you paged | `search.test.js`, `search-query.test.js` |
 | 70 | Profile CSS or status leaks | Custom profile CSS can't cover the rest of the app or the close button, mask text or rename the app's animations. "Last seen" is a day only, and hidden while you're invisible and between people who blocked each other. Profile edits are rate limited, and profile changes reach only people who share a server, a friendship or a DM with you | `client-hardening.test.js` › xss-1…, xss-2…, xss-5… |
 | 71 | Huge pages stall the server | History and thread pages hold 1 to 100 messages whatever is asked; big threads open and delete a page at a time; study sync comes in pages of a few MB and is limited by requests and by data | `data-hardening.test.js` › message pages hold 1 to 100…, › a thread with more replies…, › study sync… |
+| 72 | Fill the disk or get past the storage limit with unfinished or parallel uploads | The whole size is reserved against the quota and daily limit before the first byte; at most 4 unfinished uploads each; they expire after a day idle and the room comes back | `storage.test.js` › storage-5, -6, -8 |
+| 73 | Tamper with or touch someone else's upload | Only its owner can see, add to, finish or cancel it (404 for everyone else, admins included); chunks go in order and are size-capped; a file is stored only if its SHA-256 matches, and appears all at once | `storage.test.js` › storage-1, -2, -3, -7 |
+| 74 | A deleted file keeps being served | 404 by every route (plain, Range, conditional, HEAD) for the file and its thumbnail; encrypted files are revalidated every time and never cached by proxies | `storage.test.js` › storage-9 |
+| 75 | An admin cleanup deletes files still in use | Only files nothing in the database points at, older than a grace period; needs the password again; audit-logged; refuses if any message can't be checked | `storage.test.js` › storage-10 |
+| 76 | Unfinished uploads leak through backups | Unfinished uploads live outside `uploads/` and are never in a backup; finished files are | `storage.test.js` › storage-13 |
+| 77 | A bot (or its stolen token) tries to read people's messages or act outside its grant | Bots get metadata only, never message text, and nothing about channels outside their allow-list. Every call and event checks the approved scopes and channels. Wrong, revoked or rotated tokens get 401; tokens in URLs are refused. Tokens are stored hashed, shown once, and creating, rotating and revoking them is audit-logged | `bots.test.js` |
+| 78 | A bot's webhook is pointed inside the network (SSRF), or forged webhooks are sent to a bot | Webhooks are https only through the outbound guard; private and loopback addresses are refused when saved and when used. Each delivery is HMAC-signed over the timestamp and body, with a 5-minute replay window | `bots.test.js`, `bots-example.test.js` |
+| 79 | Restore interrupted, damaged or from a newer version | Never leaves a data folder that looks complete: Hearth refuses to start on a half-restored one; a newer backup is refused; damaged files are detected | `recovery-backup.test.js` |
+| 80 | Restoring after a break-in | `restore --sign-out-everyone` ends every session in the restored copy | `recovery-backup.test.js`, `recovery-drill.test.js` |
+| 81 | Crash in the middle of an upgrade | Nothing changes; the next start finishes it; the audit log still verifies | `recovery-upgrade.test.js`, `integration.test.js`, `scripts/upgrade-drill.sh` |
+| 82 | Removed member | Can't read anything sent after removal (new key, even with the database); keeps what they had (not retroactive) | `recovery-drill.test.js` |
+| 83 | Someone reads or changes another person's saved messages, read markers or notification settings | Every route uses only the caller's own rows; places you're not in are refused | `usability.test.js` |
+| 84 | A stolen session exports everything | Starting an export needs the password (and the 2FA code when it's on), is audit-logged, and gives a 30-minute token tied to that session; the server only hands out ciphertext | `usability.test.js` › export |
+| 85 | A phone's lock screen leaks who wrote and where | Pushes never contain message text; by default they say only "New message". Muted conversations and quiet hours get no push | `usability.test.js` › push |
+| 86 | A timed-out member keeps posting, or a moderator times out someone above them | The server refuses posts, edits, reactions, votes and typing until the timeout ends, even after rejoining; Kick Members and role order are required; it's audit-logged | `usability.test.js` › timeouts |
+| 87 | Secrets end up in the server log | Session tokens, `authKey`s, passwords, recovery keys, cookies, Authorization headers, ciphertext and request bodies are redacted centrally; the access log records route templates (never URLs) and a keyed hash of the user id; IPs are cut to /24 or /48 unless `LOG_FULL_IP=true` | `observability.test.js` |
+| 88 | Health checks leak internals, or a background job takes the server down | `/api/health/live` and `/ready` say only ok/degraded/fail and short codes; `/api/admin/health` is for instance admins. Job errors are caught, recorded and alerted, never fatal; a client hanging up mid-request can't crash the access log | `observability.test.js` |
+| 89 | Someone takes over a dropped call place | Rejoining a call after a dropped connection only works from the same session, within the grace window, re-checks permissions, and ends as soon as that session is signed out | `voice-reliability.test.js` |
+| 90 | The server slips an unlisted listener into a call | The app warns when it has a live call connection to someone the server never listed, and closes connections to people it stops listing after 20 s. A server that lists the extra participant openly is not detected (§4) | `voice-reliability.test.js`, `npm run test:voice` › hidden listener |
 
 ## 4. What each adversary can still do (honest limits)
 
@@ -197,6 +219,20 @@ Found a problem? Please tell the server owner privately (not in a public channel
   are kept only in that in-memory log (the last 500 events). Staff actions and account security events go to the
   audit log.
 
+- **Bot messages and slash-command text aren't end-to-end encrypted.** What you type after a bot's command goes to
+  that bot's operator (the app warns first), and the bot's posts are readable by the server.
+- **Reading habits are metadata.** The server knows how far you've read in each conversation, which message ids you
+  saved, your mute choices and quiet hours, and who was mentioned, but not what any message says.
+- **Uploaded files are served without sign-in, by design.** Blob names are random and the contents are ciphertext
+  whose key is only inside the message. Profile pictures and server images are not encrypted.
+- **Calls:** ICE candidates are not signed, so a malicious server can reroute or disrupt a call (not decrypt it).
+  The server decides who is in a call; an extra participant it lists openly is not detected. Media is DTLS-SRTP
+  between participants, with no extra media end-to-end layer yet (see `docs/VOICE.md` for the staged design).
+- **A plain restore brings back sessions** that were signed out after the backup was made. After a break-in, restore
+  with `--sign-out-everyone`.
+- **Monitoring is per process.** Job health, alert counters and the security log live in one server; Hearth can't
+  report that it is down itself, so point an external monitor at `/api/health/ready`.
+
 ## 5. Running it safely (infrastructure)
 
 ```
@@ -244,7 +280,14 @@ Internet ─► VPS firewall (ufw: 22, 80, 443, relay ports) ─► Caddy (HTTPS
 - **Keep the backup key somewhere else** (Admin → Owner → "Show backup key", which needs your password and is
   logged). Never store it next to the backups.
 - **Restore on a new machine**: `node server/cli.js restore <file.hbk> <empty-folder> <backup-key>`, then start
-  Hearth with `DATA_DIR` pointing there. A backup from a newer Hearth gets a warning: install that version first.
+  Hearth with `DATA_DIR` pointing there. `restore` only writes into an empty folder and refuses a backup from a newer
+  Hearth (exit 2). While it runs the folder holds `RESTORE-INCOMPLETE`, and Hearth won't start on a folder that has it.
+  Add `--sign-out-everyone` after a break-in.
+- **Missing files are reported, not hidden**: a backup made while files the database refers to are missing still
+  completes and lists them (CLI exit 3, audit entry `backup_files_missing`); `node server/cli.js check-files` gives the
+  same report for any data folder. A failed backup (disk full, for example) leaves nothing behind and is audit-logged.
+- **Drills**: `node scripts/recovery-drill.js` and `bash scripts/upgrade-drill.sh` prove recovery and upgrades end to
+  end; see `docs/RECOVERY.md`.
 - **Plain database copies** (`data/backups/*.db`, for undoing updates) never leave the server and can't be
   downloaded.
 
