@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { readLimited, cancel: cancelBody } = require('./fetchlimit');
+const netguard = require('./netguard');
 
 const env = process.env;
 const BASE = {
@@ -52,15 +53,21 @@ module.exports = function setupActivity(ctx) {
   const rawgKey = () => getSetting('rawgKey') || env.RAWG_API_KEY || '';
 
   // Follows up to 3 redirects itself, checking every hop, so a redirect can't send this server somewhere else.
-  async function safeFetch(url, ok, opts = {}) {
-    let u = url;
-    for (let hop = 0; hop < 4; hop++) {
-      if (!ok(u)) return null;
-      const r = await fetch(u, { ...opts, redirect: 'manual' });
-      if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { u = new URL(r.headers.get('location'), u).href; continue; }
-      return r;
+  // Each hop also goes through the outbound guard (netguard.js): the host's addresses must be public and the
+  // connection is pinned to them, and the answer is read with a size cap. Hosts an admin listed themselves in
+  // ART_PROXY_EXTRA_HOSTS may be on the local network.
+  async function safeFetch(url, ok, { signal, headers, maxBytes = 8 * 1024 * 1024, truncate = false } = {}) {
+    let r;
+    try {
+      r = await netguard.request(url, { allowUrl: (x) => ok(x.href), allowPrivate: (x) => EXTRA_ART_HOSTS.includes(x.host), maxRedirects: 3, timeout: 15000, signal, headers, maxBytes, truncate });
+    } catch (e) {
+      if (e.code === 'NOT_ALLOWED' || e.code === 'REDIRECTS' || e.code === 'BAD_URL' || e.code === 'BAD_PROTOCOL') return null;
+      throw e;
     }
-    return null;
+    // Callers read it like a fetch() answer.
+    const h = new Headers();
+    for (const [k, v] of Object.entries(r.headers)) [].concat(v).forEach((x) => h.append(k, String(x)));
+    return new Response([101, 204, 205, 304].includes(r.status) ? null : r.body, { status: r.status, headers: h });
   }
   async function getJson(url, { timeout = 8000, headers = {} } = {}) {
     const ctl = new AbortController();
@@ -75,7 +82,7 @@ module.exports = function setupActivity(ctx) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), timeout);
     try {
-      const r = await safeFetch(url, (x) => { try { const h = new URL(x); return h.protocol === 'https:' && okHost(h.hostname); } catch { return false; } }, { signal: ctl.signal, headers: { 'User-Agent': UA, Accept: 'text/html' } });
+      const r = await safeFetch(url, (x) => { try { const h = new URL(x); return h.protocol === 'https:' && okHost(h.hostname); } catch { return false; } }, { signal: ctl.signal, headers: { 'User-Agent': UA, Accept: 'text/html' }, maxBytes: 1024 * 1024, truncate: true });
       if (!r || !r.ok) return '';
       const reader = r.body.getReader(); let out = ''; const dec = new TextDecoder();
       while (out.length < 400000) { const { done, value } = await reader.read(); if (done) break; out += dec.decode(value, { stream: true }); }
@@ -100,7 +107,7 @@ module.exports = function setupActivity(ctx) {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 10000);
       try {
-        const r = await safeFetch(url, artAllowed, { signal: ctl.signal, headers: { 'User-Agent': UA } });
+        const r = await safeFetch(url, artAllowed, { signal: ctl.signal, headers: { 'User-Agent': UA }, maxBytes: 6 * 1024 * 1024 });
         const type = r ? (r.headers.get('content-type') || '').split(';')[0] : '';
         if (!r || !r.ok || !/^image\//.test(type)) { if (r) cancelBody(r.body); return null; }
         // Read with a running count: a huge picture is dropped as soon as it passes 6 MB, never held whole.

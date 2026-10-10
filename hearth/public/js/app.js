@@ -356,6 +356,9 @@ async function finishLogin(res, privateKey) {
 }
 
 async function logout() {
+  // This browser stops getting notifications for the account (the server drops the subscription too), and
+  // doesn't pass them on to whoever signs in here next. Never holds up signing out for more than a moment.
+  if (localStorage.getItem('hearth.push') === 'on' && 'serviceWorker' in navigator) await Promise.race([disablePush().catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
   try { await api('POST', '/auth/logout'); } catch { /* ignore */ }
   if (voice) await voice.leave().catch(() => {});
   setToken('');

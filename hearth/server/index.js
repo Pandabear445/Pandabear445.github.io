@@ -879,6 +879,12 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   const ids = db.prepare(`SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL ${where}`).all(userId, ...args).map((r) => r.id);
   if (!ids.length) return 0;
   db.prepare(`UPDATE sessions SET revoked_at = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL ${where}`).run(t, reason, userId, ...args);
+  // Their push notifications stop too (a signed-out laptop shouldn't keep showing who messaged you). Ones
+  // saved before subscriptions recorded their session can't be told apart, so they go as well; the app
+  // turns push back on for the sessions still signed in the next time it starts.
+  const dropPush = db.prepare('DELETE FROM push_subs WHERE user_id = ? AND session_id = ?');
+  ids.forEach((sid) => dropPush.run(userId, sid));
+  db.prepare('DELETE FROM push_subs WHERE user_id = ? AND session_id IS NULL').run(userId);
   const gone = new Set(ids);
   if (io) io.in(`user:${userId}`).fetchSockets().then((socks) => socks.forEach((x) => { if (gone.has(x.data.sid)) { x.emit('session:revoked', { reason }); x.disconnect(true); } })).catch(() => {});
   return ids.length;
@@ -930,6 +936,7 @@ api.use((req, res, next) => {
 // ---------------------------------------------------------------- public config
 // ---------------------------------------------------------------- installable app: push, manifest, service worker, downloads
 const webpush = require('web-push');
+const netguard = require('./netguard');
 let vapid = null;
 try {
   const VAPID_FILE = path.join(DATA_DIR, 'vapid.json');
@@ -940,30 +947,150 @@ try {
 } catch (e) { console.warn('Push notifications are off:', e.message); vapid = null; }
 
 const nameOf = (uid) => { const r = getUserRow(uid); return r ? (parseProfile(r).displayName || r.username) : 'Someone'; };
-// Notify people who have no Hearth window open. Message contents are end-to-end encrypted, so the
-// notification only says who and where — never what.
-function pushTo(userIds, payload) {
-  if (!vapid) return;
-  for (const uid of new Set(userIds)) {
-    if ((onlineSockets.get(uid) || new Set()).size) continue;
-    const row = getUserRow(uid);
-    if (!row || row.status === 'dnd') continue;
-    for (const sub of db.prepare('SELECT * FROM push_subs WHERE user_id = ?').all(uid)) {
-      webpush.sendNotification({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys) }, JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' })
-        .catch((err) => { if (err.statusCode === 404 || err.statusCode === 410) db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(sub.endpoint); });
+// A push endpoint is a web address the app hands us, so sending to it is an outbound request like a feed and
+// goes through netguard (public addresses only, pinned, with a deadline and a cap on the answer).
+// PUSH_ALLOW_PRIVATE=1 is for tests, or a push service on your own network.
+const PUSH_ALLOW_PRIVATE = process.env.PUSH_ALLOW_PRIVATE === '1';
+const PUSH_MAX_PER_USER = 10; // phones, browsers, desktop apps; turning push on somewhere new drops the oldest
+const PUSH_TIMEOUT_MS = 10000;
+// Sending is shared out fairly, so an account whose push services never answer can't hold up everyone else's
+// notifications: the people with something waiting take turns, and only so many sends are in flight at once
+// for the whole server, for one person's devices, and to one push service.
+const PUSH_CONCURRENCY = 16;
+const PUSH_PER_USER = 2;
+const PUSH_PER_HOST = 8;
+const PUSH_WAITING_PER_USER = 30; // past this, the oldest notification still waiting for that person goes
+const PUSH_QUEUE_MAX = 5000; // for everyone together (a push service that's down, a flood)
+// A push service that times out or can't be reached sits out a while after each failure in a row (1, 2, 4…
+// minutes, at most an hour) and is dropped after this many. The app turns push on again when it next starts.
+const PUSH_MAX_FAILS = 8;
+const pushWaiting = new Map(); // user id → jobs waiting, oldest first; the Map's order is whose turn is next
+const pushBusy = { total: 0, user: new Map(), host: new Map() };
+let pushWaitingCount = 0;
+const bump = (m, k, d) => { const n = (m.get(k) || 0) + d; if (n > 0) m.set(k, n); else m.delete(k); };
+const pushHost = (endpoint) => { try { return new URL(endpoint).hostname.toLowerCase(); } catch { return ''; } };
+const dropPushSub = (endpoint) => db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(endpoint);
+const pushUserOk = (row) => !!row && !row.deleted_at && !stillSuspended(row);
+// A subscription belongs to the session that turned it on: once that session is signed out, revoked or
+// expired, the device gets nothing more. Subscriptions saved before sessions were recorded go along with the
+// account's sessions as a whole (and are dropped when any of them is signed out; the app re-subscribes).
+function pushSubLive(uid, sub, t = now()) {
+  if (sub.session_id) return sessionLive(db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(sub.session_id, uid), t);
+  return db.prepare('SELECT * FROM sessions WHERE user_id = ? AND revoked_at IS NULL').all(uid).some((x) => sessionLive(x, t));
+}
+function pushSubsFor(uid) {
+  const t = now();
+  return db.prepare('SELECT * FROM push_subs WHERE user_id = ? ORDER BY created_at DESC').all(uid).filter((sub) => {
+    if (!pushSubLive(uid, sub, t)) { dropPushSub(sub.endpoint); return false; }
+    return !(sub.retry_at > t); // sitting out after failed sends
+  }).slice(0, PUSH_MAX_PER_USER);
+}
+function queuePush(uid, sub, payload) {
+  let jobs = pushWaiting.get(uid);
+  // A newer notification for the same device and conversation takes the place of one still waiting (the
+  // device would replace it on screen anyway), so a flood of messages is still one send per device.
+  const same = jobs && jobs.find((j) => j.endpoint === sub.endpoint && j.payload.tag === payload.tag);
+  if (same) { same.payload = payload; return; }
+  if (!jobs) {
+    if (pushWaitingCount >= PUSH_QUEUE_MAX) return;
+    jobs = []; pushWaiting.set(uid, jobs);
+  } else if (jobs.length >= PUSH_WAITING_PER_USER) { jobs.shift(); pushWaitingCount--; } else if (pushWaitingCount >= PUSH_QUEUE_MAX) return;
+  jobs.push({ uid, endpoint: sub.endpoint, host: pushHost(sub.endpoint), payload });
+  pushWaitingCount++;
+}
+function pumpPush() {
+  for (let started = true; started && pushBusy.total < PUSH_CONCURRENCY;) {
+    started = false;
+    // One send per person per round, in turn.
+    for (const [uid, jobs] of [...pushWaiting]) {
+      if (pushBusy.total >= PUSH_CONCURRENCY) break;
+      if ((pushBusy.user.get(uid) || 0) >= PUSH_PER_USER) continue;
+      const i = jobs.findIndex((j) => (pushBusy.host.get(j.host) || 0) < PUSH_PER_HOST);
+      if (i < 0) continue;
+      const [job] = jobs.splice(i, 1);
+      pushWaitingCount--;
+      pushWaiting.delete(uid);
+      if (jobs.length) pushWaiting.set(uid, jobs); // back of the line
+      pushBusy.total++; bump(pushBusy.user, uid, 1); bump(pushBusy.host, job.host, 1);
+      started = true;
+      sendPush(job).catch(() => {}).finally(() => {
+        pushBusy.total--; bump(pushBusy.user, uid, -1); bump(pushBusy.host, job.host, -1);
+        setImmediate(pumpPush);
+      });
     }
   }
 }
+async function sendPush({ uid, endpoint, payload }) {
+  // Checked again now, not only when it was queued: a device signed out (or an account suspended) while this
+  // waited gets nothing.
+  const sub = db.prepare('SELECT * FROM push_subs WHERE endpoint = ? AND user_id = ?').get(endpoint, uid);
+  if (!sub || !pushUserOk(getUserRow(uid)) || sub.retry_at > now()) return;
+  if (!pushSubLive(uid, sub)) { dropPushSub(endpoint); return; }
+  let details;
+  // web-push only encrypts the payload and signs the VAPID header here; the request itself goes through
+  // netguard, never through web-push's own (unguarded, unbounded) https.request.
+  try {
+    details = webpush.generateRequestDetails({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys) }, JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' });
+  } catch { dropPushSub(sub.endpoint); return; } // keys that can never work
+  try {
+    const r = await netguard.request(details.endpoint, { method: details.method, headers: details.headers, body: details.body, protocols: ['https:'], allowPrivate: PUSH_ALLOW_PRIVATE,
+      maxRedirects: 0, timeout: PUSH_TIMEOUT_MS, maxBytes: 64 * 1024, truncate: true, decompress: false });
+    if (r.status === 404 || r.status === 410) dropPushSub(sub.endpoint); // the browser unsubscribed
+    else if (sub.fails) db.prepare('UPDATE push_subs SET fails = 0, retry_at = NULL WHERE endpoint = ?').run(sub.endpoint);
+  } catch (e) {
+    // Its host now points inside a private network (or it was never a usable address): stop trying it.
+    if (['PRIVATE', 'BAD_URL', 'BAD_PROTOCOL'].includes(e.code)) dropPushSub(sub.endpoint);
+    else if (e.code === 'TIMEOUT' || e.code === 'NETWORK') pushFailed(sub.endpoint);
+  }
+}
+function pushFailed(endpoint) {
+  db.prepare('UPDATE push_subs SET fails = fails + 1 WHERE endpoint = ?').run(endpoint);
+  const row = db.prepare('SELECT fails FROM push_subs WHERE endpoint = ?').get(endpoint);
+  if (!row) return;
+  if (row.fails >= PUSH_MAX_FAILS) { dropPushSub(endpoint); return; }
+  db.prepare('UPDATE push_subs SET retry_at = ? WHERE endpoint = ?').run(now() + Math.min(60000 * 2 ** (row.fails - 1), 3600000), endpoint);
+}
+// Notify people who have no Hearth window open. Message contents are end-to-end encrypted, so the
+// notification only says who and where — never what. It's worked out after the request that caused it has
+// been answered and sent a few at a time, so a big group or a slow push service never holds anyone up.
+function pushTo(userIds, payload) {
+  if (!vapid) return;
+  const ids = [...new Set(userIds)];
+  setImmediate(() => {
+    for (const uid of ids) {
+      if ((onlineSockets.get(uid) || new Set()).size) continue;
+      const row = getUserRow(uid);
+      if (!row || row.status === 'dnd' || !pushUserOk(row)) continue;
+      for (const sub of pushSubsFor(uid)) queuePush(uid, sub, payload);
+    }
+    pumpPush();
+  });
+}
 api.get('/push/key', (req, res) => res.json({ publicKey: vapid ? vapid.publicKey : null }));
-api.post('/push/subscribe', auth, (req, res) => {
+api.post('/push/subscribe', auth, wrap(async (req, res) => {
   const sub = (req.body || {}).subscription || {};
   if (!vapid) fail(400, 'Push notifications are turned off on this server.');
-  if (typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || sub.endpoint.length > 1000) fail(400, 'Bad subscription.');
+  if (typeof sub.endpoint !== 'string' || sub.endpoint.length > 1000) fail(400, 'Bad subscription.');
   if (!sub.keys || typeof sub.keys.p256dh !== 'string' || typeof sub.keys.auth !== 'string') fail(400, 'Bad subscription.');
-  db.prepare('INSERT OR REPLACE INTO push_subs (endpoint, user_id, keys, ua, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh.slice(0, 200), auth: sub.keys.auth.slice(0, 100) }), String(req.headers['user-agent'] || '').slice(0, 300), now());
+  rateLimit('pushsub-any:' + req.userId, 60, 3600000);
+  // The app turns push on again each time it starts. An endpoint this account already has was checked when it
+  // was saved (and every send checks it again), so only new ones are looked up and count toward this limit.
+  if (!db.prepare('SELECT 1 FROM push_subs WHERE endpoint = ? AND user_id = ?').get(sub.endpoint, req.userId)) {
+    rateLimit('pushsub:' + req.userId, 10, 3600000);
+    // Push services are public https sites. (Each send checks again, pinned, since DNS answers can change.)
+    try { await netguard.checkPublicUrl(sub.endpoint, { protocols: ['https:'], allowPrivate: PUSH_ALLOW_PRIVATE }); } catch (e) { fail(400, e.code === 'NOT_FOUND' ? 'Bad subscription: its push service couldn’t be found.' : 'Bad subscription.'); }
+  }
+  db.transaction(() => {
+    // Saving it again keeps its count of failed sends: subscribing again doesn't restart a dead push service's back-off.
+    db.prepare(`INSERT INTO push_subs (endpoint, user_id, keys, ua, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, keys = excluded.keys, ua = excluded.ua, created_at = excluded.created_at, session_id = excluded.session_id`)
+      .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh.slice(0, 200), auth: sub.keys.auth.slice(0, 100) }), String(req.headers['user-agent'] || '').slice(0, 300), now(), req.session.id);
+    // Only the newest few per account are kept.
+    db.prepare('DELETE FROM push_subs WHERE user_id = ? AND endpoint NOT IN (SELECT endpoint FROM push_subs WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)')
+      .run(req.userId, req.userId, PUSH_MAX_PER_USER);
+  })();
   res.json({ ok: true });
-});
+}));
 api.post('/push/unsubscribe', auth, (req, res) => {
   db.prepare('DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?').run(String((req.body || {}).endpoint || ''), req.userId);
   res.json({ ok: true });

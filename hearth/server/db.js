@@ -711,6 +711,15 @@ DELETE FROM event_rsvps WHERE NOT EXISTS
   (SELECT 1 FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE e.id = event_rsvps.event_id AND m.user_id = event_rsvps.user_id);
 `);
 
+// v17 (outbound): a push subscription remembers the session that turned it on, so signing that session out
+// (or revoking it, a password change, a suspension) stops its notifications. Older rows have none.
+addColumn('push_subs', 'session_id', 'TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
+// …and how many sends to it failed in a row (its push service timed out or couldn't be reached), and when
+// it may be tried again, so a dead or hostile push service sits out instead of holding up everyone's sends.
+addColumn('push_subs', 'fails', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('push_subs', 'retry_at', 'INTEGER');
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
 // Reuse compiled SQL statements instead of compiling the same query on every request (there are
