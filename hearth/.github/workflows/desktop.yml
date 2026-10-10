@@ -3,10 +3,12 @@
 #   Result: installers attached to a GitHub release (tags only) and as workflow artifacts.
 #   Optional: set the VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR secrets to also copy the
 #   installers to your server's data/downloads folder, where they show up on https://your-server/download.
-#   Use a user that can only write that folder (not root); optional VPS_HOST_FINGERPRINT (the server's SHA-256
-#   SSH host key fingerprint) makes the copy refuse any other machine.
-#   Security: read-only token except for the release job, actions pinned to exact commits, and the exact
-#   library versions from package-lock.json.
+#   Use a user that can only write that folder (not root). With them, VPS_HOST_FINGERPRINT is required too: the
+#   server's SSH host key fingerprint (on the server: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, the
+#   SHA256:... part), so the copy refuses any other machine.
+#   Security: read-only token except for the release job, actions pinned to exact commits, the exact library
+#   versions from package-lock.json, and the server copy uses the runner's own ssh/scp (no third-party code
+#   ever handles VPS_SSH_KEY).
 name: Desktop app
 
 on:
@@ -95,14 +97,49 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The runner's own OpenSSH does the copy: no third-party action (or the image or download one could swap in
+      # without a new commit) ever sees VPS_SSH_KEY. ssh only talks to the machine whose host key matches
+      # VPS_HOST_FINGERPRINT, which is required: without it nothing is copied.
       - name: Copy installers to the server
         if: env.HAS_VPS == 'true'
-        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          fingerprint: ${{ secrets.VPS_HOST_FINGERPRINT }}
-          source: 'dist/*.exe,dist/*.dmg,dist/*.AppImage,dist/*.deb'
-          target: ${{ secrets.VPS_DOWNLOADS_DIR }}
-          strip_components: 1
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST_FINGERPRINT: ${{ secrets.VPS_HOST_FINGERPRINT }}
+          VPS_DOWNLOADS_DIR: ${{ secrets.VPS_DOWNLOADS_DIR }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/vps-ssh"
+          mkdir -p "$ssh_dir"
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$ssh_dir/key"
+          want="$(printf '%s' "$VPS_HOST_FINGERPRINT" | tr -d ' \r\n')"
+          want="${want#SHA256:}"
+          want="${want%%=*}"
+          if [ -z "$want" ]; then
+            echo "::error::Add the secret VPS_HOST_FINGERPRINT: the server's SSH host key fingerprint (on the server: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, the SHA256:... part). Nothing was copied."
+            exit 1
+          fi
+          # Ask the server for its host keys and keep only the one with the pinned fingerprint. ssh then refuses
+          # any machine that can't prove it holds that key.
+          : > "$ssh_dir/known_hosts"
+          ssh-keyscan -T 20 -- "$VPS_HOST" 2>/dev/null > "$ssh_dir/offered" || true
+          while IFS= read -r line; do
+            case "$line" in '' | '#'*) continue ;; esac
+            printf '%s\n' "$line" > "$ssh_dir/one"
+            fp="$(ssh-keygen -lf "$ssh_dir/one" 2>/dev/null | awk '{ print $2 }')" || fp=""
+            fp="${fp#SHA256:}"
+            if [ -n "$fp" ] && [ "${fp%%=*}" = "$want" ]; then printf '%s\n' "$line" >> "$ssh_dir/known_hosts"; fi
+          done < "$ssh_dir/offered"
+          if [ ! -s "$ssh_dir/known_hosts" ]; then
+            echo "::error::$VPS_HOST didn't show the host key that VPS_HOST_FINGERPRINT names (or couldn't be reached). Nothing was copied."
+            exit 1
+          fi
+          shopt -s nullglob
+          files=(dist/*.exe dist/*.dmg dist/*.AppImage dist/*.deb)
+          if [ ${#files[@]} -eq 0 ]; then echo "No installers to copy."; exit 0; fi
+          host="$VPS_HOST"
+          case "$host" in *:*) host="[$host]" ;; esac
+          scp -i "$ssh_dir/key" -o IdentitiesOnly=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes -o ConnectTimeout=20 -- "${files[@]}" "$VPS_USER@$host:$VPS_DOWNLOADS_DIR/"

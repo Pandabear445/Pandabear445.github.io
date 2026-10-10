@@ -3,7 +3,8 @@
 #                  HTTPS=false
 #                  HEARTH_BIND=127.0.0.1     <- port 3000 then only answers on this machine itself
 #                then: docker compose --profile domain up -d
-#                (Visitors' real addresses reach Hearth through Caddy: see TRUST_PROXY below. Nothing to set.)
+#                (Visitors' real addresses reach Hearth through Caddy: see TRUST_PROXY below. Nothing to set,
+#                unless your proxy isn't this file's Caddy: then set TRUST_PROXY in .env to its address or subnet.)
 #
 # How it's locked down:
 #  - Hearth runs as uid 1000 (not root), on a read-only filesystem: it can only write ./data and a small /tmp.
@@ -14,7 +15,8 @@
 #    route to the internet; only Caddy's ports 80/443 face the internet.
 #  - Visitors' addresses (IP bans, per-network limits, the audit log): Hearth only believes the X-Forwarded-For
 #    header when it comes from the private "proxy" network, where only Caddy and Hearth live. Someone reaching
-#    port 3000 directly (LAN, Docker's port forwarding) can't claim to be someone else.
+#    port 3000 directly (LAN, Docker's port forwarding) can't claim to be someone else. Never set TRUST_PROXY to
+#    a number or to Docker's gateway (x.x.x.1) while port 3000 is reachable from other machines.
 #  - hearth-perms runs once at start-up: older images wrote ./data as root, so it hands the folder to uid 1000
 #    (only what isn't already) and exits. It can change file owners and nothing else.
 #  - Logs are rotated (3 x 10 MB per container), so a flood of requests can't fill the disk.
@@ -55,9 +57,10 @@ services:
     environment:
       DATA_DIR: /data
       # HTTPS: "false"
-      # Only Caddy, on the "proxy" network below, may tell Hearth who a visitor is. Keep this equal to that
-      # network's subnet. It wins over a TRUST_PROXY line in .env (older instructions said TRUST_PROXY=1).
-      TRUST_PROXY: "10.231.47.0/28"
+      # Who may tell Hearth a visitor's address: by default only Caddy, on the "proxy" network below (keep the
+      # default equal to that network's subnet). A proxy of your own instead (nginx on this machine, Traefik, a
+      # tunnel): put TRUST_PROXY=<its address or subnet> in .env, which replaces this default.
+      TRUST_PROXY: "${TRUST_PROXY:-10.231.47.0/28}"
     ports:
       # Quick start: reachable on every interface (LAN, or the internet if you forward the port).
       # Behind Caddy: put HEARTH_BIND=127.0.0.1 in .env so only this machine can reach it directly.

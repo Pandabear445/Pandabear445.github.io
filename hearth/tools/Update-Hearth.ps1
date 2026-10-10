@@ -142,22 +142,27 @@ if (Test-Path -LiteralPath $sumFile) {
 }
 
 # ---------------------------------------------------------------- upload + install
-# Upload into a private folder on the server (mktemp: only this account can open it), not a fixed /tmp name
-# that another account could create first and swap before it runs as root.
-$dir = ((& ssh @sshOpts -p $cfg.port $target 'mktemp -d') | Out-String).Trim()
-if ($dir -notmatch '^/[A-Za-z0-9._/-]+$') { Fail "Couldn't make a temporary folder on the server. Check the server address and your connection." }
+# Upload under a random name into the server account's home folder (no other account can write there), never a
+# fixed /tmp name that another account could create first and swap before it runs as root. The install login
+# then moves it into a private mktemp folder and checks it against the SHA-256 above before anything is unpacked
+# or run. Two logins in all (with a password, you type it twice).
+$up = '.hearth-upload-' + [guid]::NewGuid().ToString('N').Substring(0, 16) + '.zip'
 Say ''
-Say "Uploading $([IO.Path]::GetFileName($Zip))..." Yellow
-& scp @sshOpts -P $cfg.port $Zip "${target}:$dir/update.zip"
+Say "Uploading $([IO.Path]::GetFileName($Zip))... If it asks, type your server password (nothing shows while you type)." Yellow
+& scp @sshOpts -P $cfg.port $Zip "${target}:$up"
 if ($LASTEXITCODE -ne 0) { Fail 'Upload failed. Check the server address and your connection.' }
 
-Say 'Connecting to the server to install it. If it asks, type your server password (nothing shows while you type).' Yellow
+Say 'Connecting to the server to install it. If it asks, type your server password again.' Yellow
 Say '(The server backs up first and rolls back by itself if anything goes wrong.)' Gray
 Say ''
-# The folder goes away afterwards; 12 = the upload isn't the file checked above.
-$remote = "trap 'rm -rf $dir' EXIT; command -v unzip >/dev/null 2>&1 || { ${sudo}apt-get update -qq && ${sudo}apt-get install -y -qq unzip; } >/dev/null 2>&1; " +
-          "cd $dir || exit 13; echo '$sum  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 12; " +
-          "unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 11; ${sudo}bash hearth-update.sh $dir/update.zip"
+# On the server. 90-92 mean the updater never started: 90 = the upload isn't the file checked above, 91 = no
+# updater in the zip, 92 = no private folder. The updater's own exit codes in that range are passed on as 1.
+# (`$ is a $ for the server's shell, not for PowerShell.)
+$remote = "D=`$(mktemp -d) || exit 92; trap 'rm -rf `$D' EXIT; mv ~/$up `$D/update.zip || exit 92; cd `$D || exit 92; " +
+          "command -v unzip >/dev/null 2>&1 || { ${sudo}apt-get update -qq && ${sudo}apt-get install -y -qq unzip; } >/dev/null 2>&1; " +
+          "echo '$sum  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 90; " +
+          "unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 91; " +
+          "${sudo}bash hearth-update.sh `$D/update.zip; c=`$?; case `$c in 9[0-2]) c=1 ;; esac; exit `$c"
 & ssh @sshOpts -t -p $cfg.port $target $remote
 $code = $LASTEXITCODE
 Say ''
@@ -168,12 +173,16 @@ if ($code -eq 0) {
   Say '     Changed your mind? Double-click Rollback-Hearth.bat.' Gray
   Done 0
 }
-# Explain the failure in plain words, then fetch the server's log so it can be shared.
+# The updater never started: say why (its log on the server would be from an earlier update).
+switch ($code) {
+  90 { Fail "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again." }
+  91 { Fail "The zip you chose doesn't contain the updater (scripts/hearth-update.sh). Nothing was installed; use the newest Hearth download." }
+  92 { Fail "Couldn't set the upload aside in a private folder on the server (is its disk full?). Nothing was installed." }
+}
+# Anything else: explain it in plain words, then fetch the server's log so it can be shared.
 switch ($code) {
   255 { Say "Couldn't log in to the server (wrong password, or the connection dropped)." Red }
   127 { Say "A command was missing on the server (see the message above)." Red }
-  11  { Say "The zip you chose doesn't contain the updater (scripts/hearth-update.sh). Use the newest Hearth download." Red }
-  12  { Say "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again." Red }
   default { Say "The update stopped on the server. Your site is still on the previous version (or was rolled back)." Red }
 }
 $logFile = Join-Path $here 'last-update-log.txt'

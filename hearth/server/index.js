@@ -365,7 +365,7 @@ function areFriends(a, b) {
 const app = express();
 // Real client IPs: X-Forwarded-For only counts when the request comes from a proxy we trust. By default that's
 // this machine only (Caddy/nginx on the same host); docker-compose.yml names its own Caddy. See proxytrust.js.
-const { trustProxySetting, clientIp } = require('./proxytrust');
+const { trustProxySetting, clientIp, ignoredXffHint, netContext } = require('./proxytrust');
 try {
   app.set('trust proxy', trustProxySetting(process.env.TRUST_PROXY));
 } catch (e) {
@@ -375,14 +375,18 @@ app.disable('x-powered-by');
 const PRIVATE_IP = /^(::1|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|f[cd][0-9a-f]{2}:|fe80:|::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.))/i;
 const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/, '').slice(0, 64);
 // Behind a proxy (HTTPS=false) on another address (an older docker-compose.yml, nginx in its own container)
-// whose header we now ignore: say so once in the log, so a site where everyone suddenly shares one address is
-// easy to fix. (Not with HTTPS on: there's no proxy then, and the header can only come from a visitor.)
-let xffIgnoredNoted = false;
+// whose header we now ignore: say so in the log, so a site where everyone suddenly shares one address is
+// easy to fix. (Not with HTTPS on: there's no proxy then, and the header can only come from a visitor.) The
+// advice never suggests trusting Docker's gateway on its own, which every visitor to port 3000 can come from.
+// Once per address (a few at most), so a direct visitor arriving first can't hide the line about the real proxy.
+const xffIgnoredNoted = new Set();
 function noteIgnoredXff(remote, xff) {
-  if (USE_HTTPS || xffIgnoredNoted || !xff || !PRIVATE_IP.test(String(remote || ''))) return;
+  if (USE_HTTPS || !xff || !PRIVATE_IP.test(String(remote || ''))) return;
+  const ip = cleanIp(remote);
+  if (xffIgnoredNoted.has(ip) || xffIgnoredNoted.size >= 5) return;
   if (app.get('trust proxy fn')(String(remote), 0)) return;
-  xffIgnoredNoted = true;
-  console.warn(`  X-Forwarded-For from ${cleanIp(remote)} was ignored (TRUST_PROXY doesn't include it). If that's your reverse proxy, set TRUST_PROXY=${cleanIp(remote)} in .env so visitors' real addresses are used.`);
+  xffIgnoredNoted.add(ip);
+  console.warn(`  ${ignoredXffHint(ip, netContext())}`);
 }
 // Behind a proxy (HTTPS=false), refuse plain-HTTP requests that come straight from the internet, so nobody
 // can bypass the proxy's HTTPS and send login tokens unencrypted. ALLOW_DIRECT_HTTP=true turns this off.

@@ -55,16 +55,24 @@ if [ -f "$ZIP.sha256" ]; then
 else
   echo "SHA-256 of this update: $SUM (no $(basename "$ZIP").sha256 next to it to compare with)."
 fi
-# Upload into a private folder on the server (mktemp: only this account can open it), not a fixed /tmp name
-# that another account could create first and swap before it runs as root.
-D="$(ssh "${OPTS[@]}" -p "$PORT" "$T" 'mktemp -d' | tr -d '\r')" || true
-[[ "$D" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Couldn't make a temporary folder on the server."; exit 1; }
+# Upload under a random name into the server account's home folder (no other account can write there), never a
+# fixed /tmp name that another account could create first and swap before it runs as root. The install login
+# then moves it into a private mktemp folder and checks it against the SHA-256 above before anything is unpacked
+# or run. Two logins in all (with a password, you type it twice).
+UP=".hearth-upload-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').zip"
+[[ "$UP" =~ ^\.hearth-upload-[0-9a-f]{16}\.zip$ ]] || { echo "Couldn't pick a name for the upload."; exit 1; }
 echo "Uploading $(basename "$ZIP")…"
-scp "${OPTS[@]}" -P "$PORT" "$ZIP" "$T:$D/update.zip"
+scp "${OPTS[@]}" -P "$PORT" "$ZIP" "$T:$UP" || { echo "The upload failed. Check the server address and your connection."; exit 1; }
 code=0
-# On the server: the folder goes away afterwards; 12 = the upload isn't the file checked above.
-ssh "${OPTS[@]}" -t -p "$PORT" "$T" "trap 'rm -rf $D' EXIT; command -v unzip >/dev/null 2>&1 || { ${SUDO}apt-get update -qq && ${SUDO}apt-get install -y -qq unzip; } >/dev/null 2>&1; cd $D || exit 13; echo '$SUM  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 12; unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 11; ${SUDO}bash hearth-update.sh $D/update.zip" || code=$?
-if [ "$code" -eq 12 ]; then echo "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again."; exit 12; fi
+# On the server. 90-92 mean the updater never started: 90 = the upload isn't the file checked above, 91 = no
+# updater in the zip, 92 = no private folder. The updater's own exit codes in that range are passed on as 1.
+ssh "${OPTS[@]}" -t -p "$PORT" "$T" "D=\$(mktemp -d) || exit 92; trap 'rm -rf \$D' EXIT; mv ~/$UP \$D/update.zip || exit 92; cd \$D || exit 92; command -v unzip >/dev/null 2>&1 || { ${SUDO}apt-get update -qq && ${SUDO}apt-get install -y -qq unzip; } >/dev/null 2>&1; echo '$SUM  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 90; unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 91; ${SUDO}bash hearth-update.sh \$D/update.zip; c=\$?; case \$c in 9[0-2]) c=1 ;; esac; exit \$c" || code=$?
+case "$code" in
+  90) echo "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again."; exit 90 ;;
+  91) echo "$(basename "$ZIP") doesn't contain the updater (hearth/scripts/hearth-update.sh). Nothing was installed; use the newest Hearth update."; exit 91 ;;
+  92) echo "Couldn't set the upload aside in a private folder on the server (is its disk full?). Nothing was installed."; exit 92 ;;
+esac
+# Anything else came from the updater (or the connection): its log says what happened.
 if [ "$code" -ne 0 ]; then
   LOGF="$(dirname "$0")/last-update-log.txt"
   ssh "${OPTS[@]}" -p "$PORT" "$T" "${SUDO}cat /root/hearth-backups/last-update.log 2>/dev/null || echo '(no log on the server - the updater never started)'" > "$LOGF" || true
