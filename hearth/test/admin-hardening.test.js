@@ -250,15 +250,15 @@ test('admin-6: assigning a payment and memberships settings are logged; new Stri
 test('admin-6: GIF, relay, activity and region settings changes are logged too', async () => {
   assert.equal((await as(admin, 'PATCH', '/admin/settings', { giphyRating: 'pg' })).status, 200);
   assert.match(logRows('gif_settings').pop().detail, /giphyRating/);
-  assert.equal((await as(admin, 'PUT', '/admin/turn', { urls: 'turn:198.51.100.3:3478' })).status, 200);
-  assert.match(logRows('turn_settings').pop().detail, /urls/);
+  assert.equal((await as(admin, 'PUT', '/admin/turn', { urls: 'turn:198.51.100.3:3478', authKey: admin.authKey })).status, 200);
+  assert.match(logRows('turn_settings').pop().detail, /relays: turn:198\.51\.100\.3:3478/);
   assert.equal((await as(admin, 'PATCH', '/admin/activity', { rawgKey: '' })).status, 200);
   assert.match(logRows('activity_settings').pop().detail, /rawgKey/);
-  const reg = await as(admin, 'POST', '/admin/regions', { name: 'Frankfurt', origin: 'https://chat.example.test' });
+  const reg = await as(admin, 'POST', '/admin/regions', { name: 'Frankfurt', origin: 'https://chat.example.test', authKey: admin.authKey });
   assert.equal(reg.status, 200, reg.text);
-  assert.equal(logRows('region_added').pop().detail, 'Frankfurt');
-  assert.equal((await as(admin, 'DELETE', `/admin/regions/${reg.json.region.id}`)).status, 200);
-  assert.equal(logRows('region_removed').pop().detail, 'Frankfurt');
+  assert.match(logRows('region_added').pop().detail, /^Frankfurt/);
+  assert.equal((await as(admin, 'DELETE', `/admin/regions/${reg.json.region.id}`, { authKey: admin.authKey })).status, 200);
+  assert.match(logRows('region_deleted').pop().detail, /^Frankfurt/);
 });
 
 // ------------------------------------------------------------------ files-8: API keys and webhook secrets sealed at rest
@@ -357,7 +357,7 @@ test('data-8: deleting a server while Stripe is down keeps its subscriptions to 
   const { creator, server, sub } = await creatorSetup();
   stripeDown = true;
   try {
-    assert.equal((await as(creator, 'DELETE', `/servers/${server.id}`)).status, 200);
+    assert.equal((await as(creator, 'DELETE', `/servers/${server.id}`, { authKey: creator.authKey })).status, 200);
     for (let i = 0; i < 40 && !stripeCalls.some((c) => c.method === 'DELETE' && c.url === `/v1/subscriptions/${sub}`); i++) await sleep(50);
     assert.ok(stripeCalls.some((c) => c.method === 'DELETE' && c.url === `/v1/subscriptions/${sub}`), 'tried right away');
     await sleep(200);
@@ -661,7 +661,7 @@ test('data-8: deleting a server with more than 50 memberships ends all of them r
   assert.equal(list.length, 130);
   stripeDelay = 5;
   try {
-    assert.equal((await as(big.creator, 'DELETE', `/servers/${big.server.id}`)).status, 200);
+    assert.equal((await as(big.creator, 'DELETE', `/servers/${big.server.id}`, { authKey: big.creator.authKey })).status, 200);
     assert.equal(await untilCancelled(list), 0, 'every subscription ended, none left waiting');
   } finally { stripeDelay = 0; }
 });
@@ -671,10 +671,10 @@ test('data-8: a server deleted while another one’s memberships are still being
   const listA = await moreSubs(a, 59); const listB = await moreSubs(b, 2);
   stripeDelay = 20;
   try {
-    assert.equal((await as(a.creator, 'DELETE', `/servers/${a.server.id}`)).status, 200);
+    assert.equal((await as(a.creator, 'DELETE', `/servers/${a.server.id}`, { authKey: a.creator.authKey })).status, 200);
     await sleep(100);
     assert.ok(listA.some((s) => subs.get(s).status !== 'canceled'), 'still working through the first server');
-    assert.equal((await as(b.creator, 'DELETE', `/servers/${b.server.id}`)).status, 200);
+    assert.equal((await as(b.creator, 'DELETE', `/servers/${b.server.id}`, { authKey: b.creator.authKey })).status, 200);
     assert.equal(await untilCancelled([...listA, ...listB]), 0);
   } finally { stripeDelay = 0; }
   assert.equal((await as(admin, 'GET', '/admin/memberships')).json.stats.pendingCancellations, 0);

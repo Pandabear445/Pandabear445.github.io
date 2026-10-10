@@ -54,14 +54,8 @@ const settings = () => {
       try { (JSON.parse(get('admins') || '[]') || []).forEach((id) => { roles[id] = 'admin'; }); } catch { /* none */ }
     }
     if (roles[r.id]) { delete roles[r.id]; set('staffRoles', JSON.stringify(roles)); }
-    // On the audit log like an in-app handover (append-only, hash-chained; see auditLog in index.js).
-    const { auditHash } = require('./db');
-    db.transaction(() => {
-      const last = db.prepare('SELECT id, hash FROM admin_log ORDER BY id DESC LIMIT 1').get() || { id: 0, hash: '' };
-      const e = { id: last.id + 1, admin_id: null, action: 'ownership_set_cli', target: r.id, detail: r.username, ip: null, created_at: Date.now() };
-      db.prepare('INSERT INTO admin_log (id, admin_id, action, target, detail, ip, created_at, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(e.id, e.admin_id, e.action, e.target, e.detail, e.ip, e.created_at, last.hash || '', auditHash(last.hash || '', e));
-    })();
+    // On the audit log like an in-app handover (append-only, keyed hash chain and anchor; see auditAppend in db.js).
+    require('./db').auditAppend({ admin_id: null, action: 'ownership_set_cli', target: r.id, detail: r.username, ip: null });
     console.log(`${r.username} owns this server now (they see it after reloading the app).${before && before !== r.id ? ' The previous owner is no longer staff unless they had a role besides owner: check Admin → Team & roles.' : ''}`);
   } else if (cmd === 'backup') {
     const BK = require('./backup');

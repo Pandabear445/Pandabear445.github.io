@@ -106,7 +106,7 @@ describe('ADMIN_USERS names and the owner', () => {
 
   test('handing ownership over still works, and the CLI can name a new owner', async () => {
     const heir = await srv.register('heir' + hex(3));
-    const t = await as(srv, srv.owner, 'POST', '/admin/owner', { userId: heir.id });
+    const t = await as(srv, srv.owner, 'POST', '/admin/owner', { userId: heir.id, authKey: srv.owner.authKey });
     assert.equal(t.status, 200, t.text);
     assert.equal(await role(srv, heir), 'owner');
     assert.equal(await role(srv, srv.owner), 'admin');
@@ -124,7 +124,7 @@ describe('ADMIN_USERS names and the owner', () => {
 
   test('the CLI won’t make a suspended account the owner, and drops the new owner’s other staff role', async () => {
     const mod = await srv.register('mod' + hex(3));
-    assert.equal((await as(srv, srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator' })).status, 200);
+    assert.equal((await as(srv, srv.owner, 'PUT', '/admin/staff', { userId: mod.id, role: 'moderator', authKey: srv.owner.authKey })).status, 200);
     assert.equal((await as(srv, srv.owner, 'POST', `/admin/users/${mod.id}/suspend`, { reason: 'x' })).status, 200);
     // A suspended owner couldn't sign in, and nobody outranks the owner to lift it: the server would have no owner.
     const sus = cliSetOwner(srv, mod.username);
