@@ -13,6 +13,7 @@ import { prepareImage, makeQueue, whenVisible } from './media.js';
 import { isUploadUrl, safeDownloadHref } from './attachments.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
+import { openCallDiagnostics } from './call-diagnostics.js';
 import { createSecure } from './secure.js';
 import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
@@ -34,6 +35,7 @@ import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './a
 // ======================================================================= state
 const S = {
   watch: {}, // call room -> shared video (watch together)
+  regionWarned: new Set(), // calls already told that their pinned region is offline
   config: null,
   me: null,
   privateKey: null,
@@ -409,12 +411,25 @@ function startApp() {
     // Lets the speaking detector ignore people whose mic is off (their state comes from the server).
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
     socket,
-    getIceServers: () => chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks, voice && voice.channelId ? callRegion(voice.channelId) : null),
+    // automatic: the call's region relay didn't answer, so this app falls back to the nearest relays (voice.js).
+    getIceServers: ({ automatic = false } = {}) => {
+      const room = voice && voice.channelId;
+      const pinned = room && !automatic ? callRegion(room) : null;
+      // Pinned to a region that's offline right now: automatic relays are used instead. Say so, once per call.
+      if (pinned && !callRegions().some((r) => r.id === pinned) && !S.regionWarned.has(room)) {
+        S.regionWarned.add(room);
+        setTimeout(() => toast(`This call\u2019s region (${regionName(pinned)}) is offline, so your connection uses automatic relays.`), 0);
+      }
+      return chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks, pinned);
+    },
+    myId: () => S.me && S.me.id,
+    onNotice: (text, kind) => toast(text, kind),
+    onRegion: (room, region, version) => applyCallRegion({ room, region, version }),
     ensureIce: () => freshIce(),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
-    onChange: () => { shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
+    onChange: () => { if (!voice.channelId) S.regionWarned.clear(); shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
     onSpeaking: (id, on) => {
       const uid = id === 'me' ? S.me.id : id;
       // Never show someone as speaking while they're muted or deafened, whatever audio arrives.
@@ -424,6 +439,14 @@ function startApp() {
     },
   });
 
+  // Test and support hook, off unless turned on on this device: the call engine, for the voice test harness.
+  try {
+    if (localStorage.getItem('hearth.voiceDebug') === '1') {
+      window.__hearthVoice = voice;
+      window.__hearthCallRegion = (room) => { const t = room.startsWith('dm:') ? S.dms.find((x) => x.id === room.slice(3)) : channelById(room); return t ? { region: t.region || null, version: t.regionVersion || 0 } : null; };
+    }
+  } catch { /* storage off */ }
+
   socket.on('connect', async () => {
     try {
       // Back after a restart: same version → carry on; new version → switch to it.
@@ -432,6 +455,7 @@ function startApp() {
         if (cfg && cfg.version && S.config.version && cfg.version !== S.config.version) return onNewVersion(cfg.version);
       }
       await loadBootstrap();
+      if (voice.channelId && S.voice[voice.channelId]) voice.setListed(S.voice[voice.channelId].map((u) => u.userId));
       hideUpdating();
       $('#app').classList.remove('loading');
       $('#conn-banner').hidden = true;
@@ -684,9 +708,11 @@ function startApp() {
     if (channelId.startsWith('dm:') && voice.channelId === channelId) {
       const had = (S.voice[channelId] || []).some((u) => u.userId !== S.me.id);
       const has = users.some((u) => u.userId !== S.me.id);
-      if (had && !has) { setTimeout(() => { if (voice.channelId === channelId && !(S.voice[channelId] || []).some((u) => u.userId !== S.me.id)) { voice.leave(); playSound('selfLeave'); toast('Call ended.'); } }, 1500); }
+      // (Still connected to them: the server may just have restarted, and they'll be back in a moment.)
+      if (had && !has) { setTimeout(() => { if (voice.channelId === channelId && !(S.voice[channelId] || []).some((u) => u.userId !== S.me.id) && !voice.peers.size) { voice.leave(); playSound('selfLeave'); toast('Call ended.'); } }, 1500); }
     }
     S.voice[channelId] = users;
+    if (voice.channelId === channelId) voice.setListed(users.map((u) => u.userId));
     users.filter((u) => u.muted || u.deafened).forEach((u) => { if (S.speaking.delete(u.userId)) $$(`[data-speak="${u.userId}"]`).forEach((el) => el.classList.remove('speaking')); });
     if (voice.channelId === channelId) {
       const after = users.map((u) => u.userId);
@@ -969,14 +995,32 @@ function regionMenuItems(room) {
 }
 function onCallRegion(p) {
   if (!p || typeof p.room !== 'string') return;
-  if (p.room.startsWith('dm:')) { const d = S.dms.find((x) => x.id === p.room.slice(3)); if (d) d.region = p.region; }
-  else { const c = channelById(p.room); if (c) c.region = p.region; }
-  if (voice && voice.channelId === p.room) {
-    voice.switchNetwork();
+  const before = S.callNet && S.callNet.room === p.room ? S.callNet.region : undefined;
+  applyCallRegion(p);
+  if (voice && voice.channelId === p.room && p.by && before !== undefined && before !== S.callNet.region) {
     const who = p.by === S.me.id ? 'You' : displayName(getUser(p.by));
     toast(`${who} moved the call to ${p.region ? regionName(p.region) : 'automatic region'}. Everyone is switching over.`);
   }
+}
+// Two people switching at once: the server keeps the last one and numbers every change, so a change older than the
+// one we have (announcements can arrive out of order) is ignored and everyone ends up on the server's choice.
+// True when it changed anything.
+function applyCallRegion({ room, region = null, version }) {
+  const target = room.startsWith('dm:') ? S.dms.find((x) => x.id === room.slice(3)) : channelById(room);
+  if (!target) return false;
+  const known = target.regionVersion || 0;
+  if (typeof version === 'number' && version < known) return false;
+  const changed = (target.region || null) !== (region || null);
+  target.region = region || null;
+  if (typeof version === 'number') target.regionVersion = version;
+  // The call's connections follow the region they were made with: rebuild them when that's no longer the one.
+  // (Compared with what they use rather than with the channel, which a server update may have changed already.)
+  if (voice && voice.channelId === room) {
+    if (!S.callNet || S.callNet.room !== room) S.callNet = { room, region: region || null };
+    else if (S.callNet.region !== (region || null)) { S.callNet.region = region || null; voice.switchNetwork(); }
+  }
   renderVoicePanel();
+  return changed;
 }
 const textChannel = (server) => server.channels.find((c) => c.type === 'text');
 
@@ -1641,20 +1685,25 @@ function renderVoicePanel() {
   if (!voice || !voice.channelId) { el.hidden = true; return; }
   el.hidden = false;
   const room = voice.channelId;
-  const q = voice.connectionQuality();
+  // What the call engine says, never a guess: "Connected" only while every connection's media is up.
+  const st = voice.status();
   const others = (S.voice[room] || []).filter((x) => x.userId !== S.me.id).length;
-  const label = q === 'failed' ? 'Connection trouble' : q === 'connecting' ? 'Connecting\u2026' : room.startsWith('dm:') && !others ? 'Calling\u2026' : 'In call';
+  const label = st.state === 'connected' && room.startsWith('dm:') && !others ? 'Calling\u2026' : st.label;
+  const q = { ok: 'connected', bad: 'failed', warn: 'warn' }[st.tone] || 'connecting';
   const ch = !room.startsWith('dm:') && channelById(room);
   const srv = ch && serverOfChannel(ch.id);
   const where = room.startsWith('dm:') ? `Call with ${roomTitle(room)}` : srv ? (isGroup(srv) ? groupName(srv) : `${ch.name} \u00b7 ${srv.name}`) : '';
   const go = () => goToCall(room);
   el.append(
     h('div', { class: 'vp-top' },
-      h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}` }, label), h('button', { class: 'vp-where', onclick: go }, where)),
+      h('div', { class: 'vp-info' }, h('div', { class: `vp-status q-${q}`, role: 'status', 'aria-live': 'polite', 'data-tip': st.detail, dataset: { callState: st.state } }, label), h('button', { class: 'vp-where', onclick: go }, where)),
       callRegions().length ? h('button', {
         class: `vp-region${callRegion(room) ? ' pinned' : ''}`, 'data-pop-anchor': '', 'data-tip': 'Call region: everyone in the call switches together',
         onclick: (e) => menu(e.currentTarget, regionMenuItems(room), { align: 'end' }),
       }, icon('globe'), h('span', null, callRegion(room) ? regionName(callRegion(room)) : 'Auto')) : null),
+    // Anything but a healthy call says what's going on, and a call that couldn't be restored can be retried.
+    st.tone === 'warn' || st.tone === 'bad' ? h('div', { class: `vp-detail ${st.tone}` }, h('span', null, st.detail),
+      st.state === 'failed' ? h('button', { class: 'btn sm primary', onclick: () => voice.retry().catch((e) => toast(e.name === 'NotAllowedError' ? 'Allow microphone access in your browser to join.' : e.message, 'error')) }, 'Retry') : null) : null,
     h('div', { class: 'vp-controls' },
       ibtn(voice.muted ? 'micOff' : 'mic', voice.muted ? 'Unmute' : 'Mute', toggleMute, { cls: voice.muted ? 'off' : '' }),
       ibtn(voice.camStream ? 'video' : 'videoOff', voice.camStream ? 'Turn camera off' : 'Turn camera on', toggleCamera, { cls: voice.camStream ? 'on' : '' }),
@@ -5336,8 +5385,14 @@ function tileEl(room, t, big) {
       ibtn('maximize', 'Fullscreen', () => (document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen().catch(() => {})), { cls: 'sm' })));
   }
   const ps = !t.me && t.kind !== 'screen' && voice && voice.channelId === room ? voice.peerState(t.u.id) : null;
-  if (ps === 'connecting') el.append(h('div', { class: 'cs-conn' }, h('span', { class: 'spinner' }), 'Connecting\u2026'));
-  if (ps === 'failed') el.append(h('div', { class: 'cs-conn bad', 'data-tip': 'Their network or yours blocks direct calls. The server admin can fix this by setting up the call relay (scripts/setup-turn.sh).' }, icon('shield'), 'Can\u2019t connect'));
+  // Their app lost the server (the server keeps their place for a few seconds): say so rather than "connected".
+  if (t.kind !== 'screen' && t.st.reconnecting && ps !== 'failed') el.append(h('div', { class: 'cs-conn warn' }, h('span', { class: 'spinner' }), 'Reconnecting\u2026'));
+  else if (ps === 'connecting') el.append(h('div', { class: 'cs-conn' }, h('span', { class: 'spinner' }), 'Connecting\u2026'));
+  else if (ps === 'reconnecting') el.append(h('div', { class: 'cs-conn warn' }, h('span', { class: 'spinner' }), 'Reconnecting\u2026'));
+  if (ps === 'failed') {
+    el.append(h('div', { class: 'cs-conn bad', 'data-tip': 'Their network or yours blocks direct calls. The server admin can fix this by setting up the call relay (scripts/setup-turn.sh).' }, icon('shield'), 'Can\u2019t connect',
+      h('button', { class: 'link-btn', onclick: () => { voice.retryPeer(t.u.id).catch(() => {}); renderCallStages(); } }, 'Retry')));
+  }
   el.append(h('div', { class: 'cs-name' }, t.kind === 'screen' ? icon('monitor', 'ic') : null, h('span', null, name),
     t.kind !== 'screen' && t.st.deafened ? icon('headphonesOff', 'ic flag') : t.kind !== 'screen' && t.st.muted ? icon('micOff', 'ic flag') : null));
   if (!t.me && t.kind !== 'screen' && voice && voice.channelId === room) {
@@ -5379,8 +5434,16 @@ function fillStage(el) {
   let spot = stageSpotlight.get(room);
   if (!tiles.some((t) => t.key === spot)) spot = (tiles.find((t) => t.kind === 'screen') || {}).key || null;
   const people = (S.voice[room] || []).length;
-  const head = h('div', { class: 'cs-head' }, h('span', { class: 'cs-live' }, people ? `${people} in call` : 'Call'),
-    el.classList.contains('compact') ? ibtn(el.classList.contains('tall') ? 'chevron' : 'maximize', el.classList.contains('tall') ? 'Smaller' : 'Bigger', () => { el.classList.toggle('tall'); fillStage(el); }, { cls: 'sm' }) : null);
+  const mine = voice && voice.channelId === room;
+  // In the call: its real state (never "connected" while the media isn't). Otherwise just who's there.
+  const st = mine ? voice.status() : null;
+  const live = st && st.state !== 'connected' ? `${st.label}${people ? ` \u00b7 ${people} in call` : ''}` : people ? `${people} in call` : 'Call';
+  const head = h('div', { class: 'cs-head' }, h('span', { class: `cs-live${st ? ` st-${st.tone}` : ''}`, role: mine ? 'status' : null, 'data-tip': st ? st.detail : null, dataset: { callState: st ? st.state : '' } }, live),
+    h('span', { class: 'cs-head-tools' },
+      mine ? ibtn('info', 'Call diagnostics', () => openCallDiagnostics(diagCtx()), { cls: 'sm' }) : null,
+      el.classList.contains('compact') ? ibtn(el.classList.contains('tall') ? 'chevron' : 'maximize', el.classList.contains('tall') ? 'Smaller' : 'Bigger', () => { el.classList.toggle('tall'); fillStage(el); }, { cls: 'sm' }) : null));
+  // Connections the server never listed in this call: someone may be listening in without showing up.
+  const hidden = mine ? voice.unlistedPeers().filter((p) => p.neverListed) : [];
   const body = spot
     ? h('div', { class: 'cs-spot' }, tileEl(room, tiles.find((t) => t.key === spot), true), h('div', { class: 'cs-strip' }, tiles.filter((t) => t.key !== spot).map((t) => tileEl(room, t, false))))
     : h('div', { class: `cs-grid n${Math.min(tiles.length, 9)}` }, tiles.map((t) => tileEl(room, t, false)));
@@ -5393,7 +5456,8 @@ function fillStage(el) {
   } else if (host) { host.remove(); host = null; }
   syncWatchDock();
   [...el.children].forEach((c) => { if (c !== host) c.remove(); });
-  const rest = [tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)];
+  const warn = hidden.length ? h('p', { class: 'cs-hidden-peers', role: 'alert' }, `Warning: you\u2019re connected to ${hidden.map((p) => displayName(getUser(p.userId))).join(', ')}, who the server doesn\u2019t list in this call. Leave the call if you didn\u2019t expect them.`) : null;
+  const rest = [warn, tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)].filter(Boolean);
   if (host) { if (!host.parentNode) el.append(host); el.insertBefore(head, host); el.append(...rest); el.classList.add('watching'); }
   else { el.append(head, ...rest); el.classList.remove('watching'); }
 }
@@ -5565,6 +5629,8 @@ function watchChips(text) {
   }, icon('play'), `Watch together${links.length > 1 ? ` · ${watchKind(link) || 'video'}` : ''}`)));
 }
 function renderCallStages() { $$('.call-stage').forEach(fillStage); }
+// What the diagnostics panel needs: names, and the relays' region names (never their addresses).
+const diagCtx = () => ({ voice, name: (id) => displayName(getUser(id)), relays: (S.iceServers || []).filter((e) => e.region).map((e) => ({ urls: e.urls, region: e.region })), region: () => (voice && voice.channelId ? regionName(callRegion(voice.channelId)) : '') });
 
 async function joinRoom(room, { video = false } = {}) {
   try {
