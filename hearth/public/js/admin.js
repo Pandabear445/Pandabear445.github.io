@@ -640,6 +640,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       sw('Profile comment walls', 'comments'),
       sw('Custom CSS on profile pages', 'customCss', 'Turned off, everyone\u2019s page shows without their CSS (it\u2019s kept, not deleted).'),
       h('div', { class: 'kv' }, h('span', null, 'Who can create servers'), h('div', { class: 'chips' }, [['everyone', 'Everyone'], ['staff', 'Staff only']].map(([k, l]) => h('button', { class: `chip${o.features.createServers === k ? ' active' : ''}`, onclick: () => save({ features: { createServers: k } }) }, l)))),
+      h('div', { class: 'kv' }, h('span', null, 'Who can make bots'), h('div', { class: 'chips' }, [['admins', 'Admins'], ['staff', 'Staff'], ['everyone', 'Everyone']].map(([k, l]) => h('button', { class: `chip${(o.features.createBots || 'admins') === k ? ' active' : ''}`, onclick: () => save({ features: { createBots: k } }) }, l)))),
+      h('p', { class: 'field-hint' }, 'Bots are made in Server settings \u2192 Bots. Any server owner can add listed bots to their own server, with the access they approve.'),
 
       h('div', { class: 'admin-head' }, h('h3', null, 'Funding and supporters')),
       h('p', { class: 'field-hint' }, 'Show people what the server costs and where to chip in (Ko-fi, Patreon, Open Collective, Stripe link\u2026). It appears as a small card on everyone\u2019s Home screen that they can hide. Mark people who chip in as supporters under Users: they get a \uD83D\uDC9C badge and, if you like, more storage.'),

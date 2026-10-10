@@ -2607,3 +2607,32 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .mb-row .ic { color: var(--accent); }
 .admin-subtabs .set-subtab { display: inline-flex; align-items: center; gap: 6px; }
 .admin-subtabs .set-subtab .ic { width: 15px; height: 15px; }
+
+/* ------------------------------------------------------------------ bots (bots.js) */
+.adm-row.bot-row { grid-template-columns: minmax(0, 2fr) minmax(90px, auto) auto auto; }
+.bot-row .bot-tag { margin-left: 6px; }
+.bot-scopes { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; }
+.bot-scope { font: 600 11.5px/1.6 var(--mono, monospace); padding: 0 7px; border-radius: 6px; background: var(--hover); border: 1px solid var(--line); }
+.bot-scope.fresh { border-color: var(--accent); }
+.bot-perm { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; }
+.bot-perm input { margin-top: 3px; }
+.bot-perm .toggle-label { font-family: var(--mono, monospace); display: inline-flex; gap: 8px; align-items: center; }
+.bot-channels { display: flex; flex-wrap: wrap; gap: 4px 14px; padding-left: 26px; max-height: 180px; overflow-y: auto; }
+.bot-mine { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+.bot-mine > summary { cursor: pointer; padding: 2px 0; }
+.bot-mine > .stack { margin-top: 10px; }
+.cmd-bar { padding: 0 16px 6px; }
+.cmd-bar[hidden] { display: none; }
+.cmd-hint { display: grid; gap: 4px; padding: 8px 12px; border-radius: 10px; font-size: 13px; background: var(--hover); border: 1px solid var(--line-2); }
+.cmd-hint .bot-tag { margin-left: 6px; }
+.cmd-warn { display: flex; align-items: center; gap: 8px; color: var(--accent); font-weight: 600; }
+.cmd-warn .ic { width: 15px; height: 15px; flex: none; }
+.eph-list { display: grid; gap: 6px; padding: 0 16px; }
+.eph-list:empty { display: none; }
+.eph-msg { padding: 8px 12px; border-radius: 10px; border: 1px dashed var(--line-2); background: var(--hover); }
+.eph-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.eph-head .ic { width: 16px; height: 16px; }
+.eph-head .field-hint { flex: 1; }
+@media (max-width: 600px) { .adm-row.bot-row { grid-template-columns: 1fr; } }
+.bots-panel { flex: none; gap: 12px; }
+.bot-scopes { min-width: 0; max-width: 100%; }
