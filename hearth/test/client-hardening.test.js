@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const { startServer, newIp, sleep } = require('./helpers');
 
@@ -116,6 +116,26 @@ test('xss-5: profile updates reach co-members and friends once (coalesced), neve
   } finally { [m, f, s, self].forEach((x) => x.s.close()); }
 });
 
+test('xss-5: deleting an account still tells former co-members and friends (worked out before they stop sharing anything)', async () => {
+  const alice = await srv.register(); const member = await srv.register(); const friend = await srv.register(); const stranger = await srv.register();
+  await shareServer(member, alice);
+  await befriend(friend, alice);
+  const [m, f, s] = await Promise.all([listener(member), listener(friend), listener(stranger)]);
+  try {
+    await sleep(1200);
+    const r = await as(alice, 'DELETE', '/me', { authKey: alice.authKey, confirm: alice.username });
+    assert.equal(r.status, 200, r.text);
+    await sleep(1600);
+    for (const [who, x] of [['co-member', m], ['friend', f]]) {
+      const got = x.for(alice.id);
+      assert.equal(got.length, 1, `the ${who} hears about it once`);
+      assert.equal(got[0].profile.displayName, 'Deleted user', `the ${who}'s app shows "Deleted user"`);
+      assert.equal(got[0].avatar || null, null);
+    }
+    assert.equal(s.for(alice.id).length, 0, 'someone who never shared anything with her still gets nothing');
+  } finally { [m, f, s].forEach((x) => x.s.close()); }
+});
+
 test('xss-5: profile writes are rate limited (shared across profile, page, song and media)', async () => {
   const flooder = await srv.register();
   const codes = [];
@@ -178,6 +198,8 @@ test('xss-4/infra-6: main.js uses exact checks everywhere and handles redirects'
   assert.doesNotMatch(main, /\.startsWith\(\s*(o|origin)\s*\)/, 'no prefix comparisons against the server origin');
   assert.doesNotMatch(main, /startsWith\('file:'\)/, 'no "any file: page" trust');
   assert.match(main, /on\('will-redirect'/, 'main-frame redirects are checked');
+  const redirect = main.slice(main.indexOf("on('will-redirect'"), main.indexOf("on('did-fail-load'"));
+  assert.match(redirect, /elsewhere\(e, url\);[\s\S]*!onServerPage\(\)\) loadConnect\(redirectedAway\(url\)\)/, 'a refused redirect with no page showing yet lands on the connect screen, not an empty window');
   assert.match(main, /on\('will-navigate'[\s\S]{0,120}isServer\(url\) \|\| isConnectScreen\(url\)/);
   assert.match(main, /const fromOurPage = \(e\) => fromMainWindow\(e\) && \(isServer\(/);
   assert.match(main, /const fromConnectScreen = \(e\) => fromMainWindow\(e\) && isConnectScreen\(/);
@@ -227,7 +249,12 @@ test('infra-2: the screen list goes to the app\'s own picker window, never to th
   assert.doesNotMatch(handler, /pickSource|getSources/, 'the handler never picks by itself');
   assert.doesNotMatch(main, /useSystemPicker/, 'the app\'s picker on every system');
   const choose = main.slice(main.indexOf('async function chooseScreen'), main.indexOf('app.whenReady().then(() => {\n  session.defaultSession.setPermissionRequestHandler'));
-  assert.match(choose, /if \(pendingShare !== mine\) return;[\s\S]*win\.webContents\.reload\(\)/, 'a capture the display-media handler never saw (the old API) ends with a reload');
+  assert.match(choose, /if \(pendingShare !== mine\) return;[\s\S]*restartPage\(\)/, 'a capture the display-media handler never saw (the old API) ends with a restart of the page');
+  // ...which the page can't refuse or put off: its renderer is stopped (not asked to unload), then reloaded
+  const restart = main.slice(main.indexOf('function restartPage'), main.indexOf('async function chooseScreen'));
+  assert.match(restart, /wc\.once\('render-process-gone', again\)[\s\S]*wc\.forcefullyCrashRenderer\(\)/, 'stops the renderer, reloads once it is gone');
+  assert.match(restart, /wc\.reload\(\)/);
+  assert.match(main, /win\.webContents\.on\('will-prevent-unload', \(e\) => e\.preventDefault\(\)\)/, 'a "Leave site?" handler can\'t cancel a reload, close or quit');
   assert.doesNotMatch(main, /send\('screen-pick'/, 'no window list or previews sent to the page');
   assert.doesNotMatch(main, /'screen-picked'/, 'the page can\'t answer for the person');
   assert.match(main, /preload: path\.join\(__dirname, 'picker-preload\.js'\)/);
@@ -238,6 +265,61 @@ test('infra-2: the screen list goes to the app\'s own picker window, never to th
   const picker = read('desktop', 'picker.html');
   assert.match(picker, /Content-Security-Policy" content="default-src 'none'; img-src data:/);
   assert.doesNotMatch(picker, /innerHTML/, 'window titles are shown as text');
+});
+
+// The real desktop app in Electron, when it's installed (desktop/node_modules, or HEARTH_ELECTRON=<binary>).
+// Linux without a display needs xvfb-run.
+function findElectron() {
+  const env = process.env.HEARTH_ELECTRON;
+  if (env) return fs.existsSync(env) ? env : null;
+  try { const bin = require(require.resolve('electron', { paths: [DESKTOP] })); return typeof bin === 'string' && fs.existsSync(bin) ? bin : null; } catch { return null; }
+}
+const ELECTRON = findElectron();
+const NEEDS_XVFB = process.platform === 'linux' && !process.env.DISPLAY;
+const electronSkip = !ELECTRON ? 'Electron is not installed (npm install in desktop/, or set HEARTH_ELECTRON)'
+  : NEEDS_XVFB && spawnSync('xvfb-run', ['--help'], { stdio: 'ignore' }).error ? 'no display and no xvfb-run' : false;
+test('infra-2: in Electron, a hostile page can\'t keep an old-style desktop capture, block a reload or leave an empty window', { skip: electronSkip, timeout: 180000 }, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-desk-'));
+  try {
+    const appDir = path.join(tmp, 'app');
+    fs.cpSync(DESKTOP, appDir, { recursive: true, filter: (src) => !/[\\/](node_modules|dist)$/.test(src) });
+    const cfg = JSON.parse(fs.readFileSync(path.join(appDir, 'hearth.config.json'), 'utf8'));
+    fs.writeFileSync(path.join(appDir, 'hearth.config.json'), JSON.stringify({ ...cfg, defaultServer: '', lockServer: false, autoUpdate: false }));
+    const args = [...(process.getuid && process.getuid() === 0 ? ['--no-sandbox'] : []), '-r', path.join(__dirname, 'desktop-harness.js'), appDir];
+    const [cmd, argv] = NEEDS_XVFB ? ['xvfb-run', ['-a', '-s', '-screen 0 1280x800x24', ELECTRON, ...args]] : [ELECTRON, args];
+    const env = { ...process.env, HEARTH_UD: path.join(tmp, 'userdata') };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const output = await new Promise((resolve) => {
+      // Its own process group, so a stuck run can be stopped whole (xvfb-run, Xvfb, Electron and its helpers).
+      const child = spawn(cmd, argv, { detached: true, env });
+      let text = '';
+      child.stdout.on('data', (d) => { text += d; });
+      child.stderr.on('data', (d) => { text += d; });
+      const stop = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+      const kill = setTimeout(() => { stop(); resolve(text); }, 150000);
+      child.on('exit', () => { clearTimeout(kill); setTimeout(() => { stop(); resolve(text); }, 500); });
+    });
+    const line = output.split('\n').find((l) => l.startsWith('RESULT '));
+    assert.ok(line, `no result from Electron:\n${output.slice(-3000)}`);
+    const r = JSON.parse(line.slice(7));
+    assert.equal(r.error, undefined, r.error);
+    assert.equal(r.connect && r.onServer, true, 'connected to the fake server');
+    // legit use: getDisplayMedia goes through the picker and keeps sharing, no reload
+    assert.equal(r.gdmPicker, true);
+    assert.equal(r.gdm, 'shared');
+    assert.equal(r.gdmAfter, 'same page, live', 'normal screen sharing carries on');
+    // the old API: the person's pick, then the capture ends although the page refuses to unload and busy-loops
+    assert.equal(r.legacyPicker, true, 'the old API still goes through the picker first');
+    assert.equal(r.legacy, 'captured');
+    assert.equal(r.legacyReloaded, true, 'the page was loaded again');
+    assert.equal(r.legacyAfter, 'fresh page');
+    assert.ok(r.lastBeatMs === null || r.lastBeatMs < 5000, `the capture ended within the hand-off time (last live report ${r.lastBeatMs} ms after the pick)`);
+    // "Leave site?" can't keep the person on the page either
+    assert.equal(r.changeServer, true, 'Change server works from a page that refuses to unload');
+    // a start page redirecting elsewhere: opened in the browser once, and the connect screen says why
+    assert.deepEqual(r.redirectOpened, ['http://sso.example.invalid/login']);
+    assert.match(r.redirectError || '', /sent the app on to sso\.example\.invalid/);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
 // ------------------------------------------------------------------ infra-1: signed updates
@@ -430,7 +512,8 @@ test('xss-1: in the browser, page CSS can\'t cover the close button, mask text o
     const evil = '.mys-page{contain:none;isolation:auto}.mys-wrap{z-index:auto}'
       + '.mys-comment-open{position:fixed;inset:0;z-index:99999;background:#100e16;-webkit-text-security:disc;animation:spin 1s infinite}'
       + '.mys-comment-open::before{content:"Session expired - enter your password"}'
-      + '@keyframes spin{to{opacity:0}}';
+      + '@keyframes spin{to{opacity:0}}'
+      + '@keyframes mask{from,to{-webkit-text-security:disc}}.mys-chip{animation:mask 1s infinite}'; // masking from an animation frame
     assert.equal((await as(mallory, 'PUT', '/me/page', { css: evil })).status, 200);
 
     const name = `vis${crypto.randomBytes(3).toString('hex')}`;
@@ -454,6 +537,7 @@ test('xss-1: in the browser, page CSS can\'t cover the close button, mask text o
         btn: box(btn), shell: box(document.querySelector('.mys-shell')), vw: innerWidth, vh: innerHeight,
         closeHit: !!(hit && hit.closest('.mys-close')), boxesOnPage: document.querySelectorAll('.mys-page textarea, .mys-page input').length,
         security: getComputedStyle(btn).webkitTextSecurity, animation: getComputedStyle(btn).animationName,
+        chipSecurity: getComputedStyle(document.querySelector('.mys-chip')).webkitTextSecurity, chipAnimation: getComputedStyle(document.querySelector('.mys-chip')).animationName,
         style: [...document.querySelectorAll('.mys-page style')].map((s) => s.textContent).join('\n'),
       };
     });
@@ -462,6 +546,11 @@ test('xss-1: in the browser, page CSS can\'t cover the close button, mask text o
     assert.ok(r.btn[0] >= r.shell[0] - 1 && r.btn[1] >= r.shell[1] - 1 && r.btn[0] + r.btn[2] <= r.shell[0] + r.shell[2] + 1 && r.btn[1] + r.btn[3] <= r.shell[1] + r.shell[3] + 1, 'and inside the page\'s box');
     assert.equal(r.boxesOnPage, 0, 'no text box on the styled page');
     assert.notEqual(r.security, 'disc', 'no password-style masking');
+    assert.match(r.chipAnimation, /^pg[0-9a-z]+-mask$/, 'the page\'s masking animation is applied (renamed)...');
+    assert.notEqual(r.chipSecurity, 'disc', '...but can\'t mask text from its keyframes either');
+    const scoped = await page.evaluate(async () => (await import('/js/page.js')).scopeCss('@keyframes m{from,to{-webkit-text-security:disc;opacity:.5}}@media (min-width:1px){@keyframes n{to{-webkit-text-security:square}}}.x{color:red}', '.s'));
+    assert.doesNotMatch(scoped, /text-security/, scoped);
+    assert.match(scoped, /opacity: 0\.5/, 'the rest of the frame stays');
     assert.doesNotMatch(r.style, /@keyframes spin\b/, 'the app\'s own "spin" is not redefined');
     assert.match(r.style, /@keyframes pg[0-9a-z]+-spin/);
     assert.match(r.animation, /^pg[0-9a-z]+-spin$/, 'the page\'s own animation still runs under its new name');

@@ -228,6 +228,10 @@ function createWindow() {
     }
   });
   win.on('closed', () => { win = null; });
+  // A page can't stop the app from leaving it ("Leave site?" / beforeunload): the reload that ends an
+  // old-style screen capture (chooseScreen) must happen, and so must closing, quitting and changing server.
+  // Hearth's own pages never ask.
+  win.webContents.on('will-prevent-unload', (e) => e.preventDefault());
   // A reload or a new page starts outside any call until the page says otherwise. The server being down
   // behind a proxy (Caddy answers 502 while Hearth restarts) gets the "can't reach" screen too.
   win.webContents.on('did-navigate', (e, url, code) => {
@@ -255,6 +259,9 @@ function createWindow() {
     const mainFrame = e && typeof e.isMainFrame === 'boolean' ? e.isMainFrame : legacyMainFrame;
     if (!mainFrame || isServer(url) || isHttpsUpgrade(url, serverOrigin())) return;
     elsewhere(e, url);
+    // Nothing of the server's was showing yet (the app starting, Retry, Connect): without this the window
+    // would stay empty. The connect screen says what happened, so the person can try again or switch servers.
+    setImmediate(() => { if (win && !win.isDestroyed() && !onServerPage()) loadConnect(redirectedAway(url)); });
   });
   win.webContents.on('did-fail-load', (e, code, desc, url, isMain) => {
     if (!isMain || code === -3) return; // -3: the load was replaced by another one
@@ -291,6 +298,14 @@ function connectQuery(extra) {
 }
 function loadConnect(error = '') {
   win.loadFile(path.join(__dirname, 'connect.html'), { query: connectQuery({ error }) });
+}
+// What the connect screen says when the server sent the app somewhere else (a sign-in page in front of it, say).
+function redirectedAway(url) {
+  let host = '';
+  try { const u = new URL(url); if (/^https?:$/.test(u.protocol)) host = u.host; } catch { /* not a web address */ }
+  return host
+    ? `Your server sent the app on to ${host}, which was opened in your browser instead. The app only shows your Hearth server’s own pages.`
+    : 'Your server sent the app to an address it can’t open. The app only shows your Hearth server’s own pages.';
 }
 // The server didn't answer: a friendly screen that keeps trying and comes back by itself.
 function loadOffline(reason = '') {
@@ -391,9 +406,19 @@ function resetPermissions() {
 // desktop at once, without the display-media handler. So the person picks what to share right at that
 // permission (the picker below); getDisplayMedia then carries on into the display-media handler, which shares
 // exactly that choice. If that handler doesn't follow within a few seconds, it was the old kind of request,
-// which Hearth never makes: the page is reloaded, which ends that capture.
+// which Hearth never makes: the page's renderer is stopped and the page loaded again, which ends that capture.
 let pendingShare = null; // { origin, source, at }: the person's choice, waiting for the display-media handler
 const SHARE_HANDOFF_MS = 3000;
+// Stopping the renderer process (rather than asking the page to reload) means nothing the page runs can keep
+// the capture going: not a "Leave site?" handler, a busy loop or a worker. Once it's gone, the page loads
+// again in a new one (a reload sent any sooner is lost with the old process).
+function restartPage() {
+  if (!win || win.isDestroyed()) return;
+  const wc = win.webContents;
+  const again = () => setImmediate(() => { if (!wc.isDestroyed()) wc.reload(); });
+  wc.once('render-process-gone', again);
+  try { wc.forcefullyCrashRenderer(); } catch { wc.removeListener('render-process-gone', again); wc.reload(); }
+}
 async function chooseScreen(origin) {
   if (pendingShare && Date.now() - pendingShare.at < SHARE_HANDOFF_MS) return false; // one share at a time
   const sources = await desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 } });
@@ -405,7 +430,7 @@ async function chooseScreen(origin) {
   setTimeout(() => {
     if (pendingShare !== mine) return; // taken by the display-media handler, as it should be
     pendingShare = null;
-    if (win && !win.isDestroyed() && isServer(win.webContents.getURL())) win.webContents.reload();
+    if (win && !win.isDestroyed() && isServer(win.webContents.getURL())) restartPage();
   }, SHARE_HANDOFF_MS);
   return true;
 }
@@ -429,8 +454,10 @@ app.whenReady().then(() => {
   // Screen sharing: Electron has no built-in picker, so the app shows its own (picker.html, a local window
   // the server's page can't see or script; see chooseScreen above), on every system: macOS's own picker
   // would come after the app's and skip this handler. The server's page only asks to share: it never gets
-  // the list of windows or their previews, and only the person's choice in the picker is shared. On
-  // Windows the computer's audio can be shared too.
+  // the list of windows or their previews, and nothing is shared until the person picks. getDisplayMedia
+  // shares exactly that pick; the old getUserMedia desktop capture (which Hearth never uses) gets the whole
+  // screen, but only until chooseScreen stops the page, about 3 seconds later. On Windows the computer's
+  // audio can be shared too.
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     // The callback may be called once; null means "no" (an empty object throws in current Electron).
     let answered = false;

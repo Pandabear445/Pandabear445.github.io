@@ -83,16 +83,18 @@ export function scopeCss(css, scope) {
     const names = style.getPropertyValue('animation-name');
     if (names && renamed.size) style.setProperty('animation-name', names.split(',').map((n) => renamed.get(n.trim()) || n.trim()).join(', '));
   };
+  // Masking would make the page's text look like a password field: gone from rules and animation frames alike.
+  const unmask = (style) => { style.removeProperty('-webkit-text-security'); return style.cssText; };
   const walk = (rules) => [...rules].map((r) => {
     if (r instanceof CSSStyleRule) {
-      r.style.removeProperty('-webkit-text-security'); // would make the page's text look like a password field
+      unmask(r.style);
       fixAnimations(r.style);
       return bad.test(r.style.cssText) || !r.style.cssText ? '' : `${sel(r.selectorText)} { ${r.style.cssText} }`;
     }
     if (r instanceof CSSMediaRule) return `@media ${r.conditionText || r.media.mediaText} { ${walk(r.cssRules)} }`;
     if (isKeyframes(r)) {
       if (bad.test(r.cssText)) return '';
-      const inner = [...r.cssRules].map((k) => `${k.keyText} { ${k.style.cssText} }`).join(' ');
+      const inner = [...r.cssRules].map((k) => `${k.keyText} { ${unmask(k.style)} }`).join(' ');
       return `@keyframes ${renamed.get(r.name)} { ${inner} }`;
     }
     return '';

@@ -123,7 +123,7 @@ export function desktopSettingsSection({ h, section, toggle, field, toast }) {
     }
     body.append(h('div', { class: 'stack tight' },
       h('span', { class: 'toggle-label' }, `Hearth for ${isMac ? 'Mac' : D.platform === 'win32' ? 'Windows' : 'Linux'} · version ${s.version}`),
-      sup.updates || ready ? null : h('span', { class: 'field-hint' }, isMac ? 'Get new versions from your server’s download page.' : 'Updates install automatically in the installed app.'),
+      sup.updates || ready ? null : h('span', { class: 'field-hint' }, isMac ? 'Get new versions from your server’s download page.' : 'In the installed app, Hearth downloads updates and asks before installing them.'),
       // Newer apps say whether they check the publisher's signature on updates (older ones don't report it).
       sup.updates && 'updatesSigned' in s ? h('span', { class: 'field-hint' }, s.updatesSigned
         ? 'Hearth only installs updates signed by its publisher, and asks you first.'

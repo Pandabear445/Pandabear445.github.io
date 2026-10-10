@@ -4722,7 +4722,7 @@ function showAppUpdate(version) {
   const bar = h('div', { class: 'update-bar app-update', role: 'status' }, icon('download'),
     h('span', null, `The ${S.config.name || 'Hearth'} app ${version ? `${version} ` : ''}is ready to install.`),
     h('button', { class: 'btn primary sm', onclick: async () => { if (voice && voice.channelId && !(await confirmDialog({ title: 'Restart now?', text: 'Restarting leaves your call. It takes a few seconds.', confirm: 'Restart' }))) return; installUpdate(); } }, 'Restart now'),
-    ibtn('close', 'Later (it installs when you quit)', () => bar.remove(), { cls: 'sm' }));
+    ibtn('close', 'Later (restart from Settings \u2192 Apps & devices when you\u2019re ready)', () => bar.remove(), { cls: 'sm' }));
   document.body.append(bar);
 }
 function setupServiceWorker() {

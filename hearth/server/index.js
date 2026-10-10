@@ -1073,6 +1073,8 @@ api.delete('/me', auth, wrap(async (req, res) => {
   if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
   const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
   if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
+  // Who has them on screen, worked out before their servers and friendships go: they all see "Deleted user".
+  const audience = userAudience(row.id);
   revokeSessions(row.id, { reason: 'account_deleted' });
   for (const m of db.prepare('SELECT s.id, s.kind, s.owner_id FROM members m JOIN servers s ON s.id = m.server_id WHERE m.user_id = ?').all(row.id)) {
     if (m.kind === 'group' && m.owner_id === row.id) {
@@ -1099,7 +1101,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
   })();
   files.forEach((f) => removeUpload(f));
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
-  broadcastUser(row.id);
+  broadcastUser(row.id, audience);
   io.in(`user:${row.id}`).disconnectSockets(true);
   auditLog(req, 'account_deleted', row.id, row.username);
   ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
@@ -1171,23 +1173,27 @@ function userAudience(userId) {
     UNION SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END FROM dm_channels WHERE user_a = ? OR user_b = ?`).all(userId, userId, userId, userId, userId, userId);
   return [...rooms, ...peers.map((p) => `user:${p.id}`)];
 }
-const userUpdateQueue = new Set();
+const userUpdateQueue = new Map(); // user id -> rooms told on top of whoever shares something with them then
 let userUpdateTimer = null;
 function flushUserUpdates() {
   userUpdateTimer = null;
-  const ids = [...userUpdateQueue];
+  const queued = [...userUpdateQueue];
   userUpdateQueue.clear();
-  for (const id of ids) {
+  for (const [id, extra] of queued) {
     const row = getUserRow(id);
-    const rooms = row ? userAudience(id) : [];
+    const rooms = row ? [...new Set([...extra, ...userAudience(id)])] : [];
     if (rooms.length) io.to(rooms).except(`user:${id}`).emit('user:update', publicUser(row));
   }
 }
-function broadcastUser(userId) {
+// audience: rooms worked out before a change that also ends what they shared (deleting an account leaves every
+// server and friendship first), so the people who still have that person on screen hear about it too.
+function broadcastUser(userId, audience) {
   const row = getUserRow(userId);
   if (!row) return;
   io.to(`user:${userId}`).emit('user:update', selfUser(row)); // their own apps: right away
-  userUpdateQueue.add(userId);
+  const rooms = userUpdateQueue.get(userId) || new Set();
+  if (Array.isArray(audience)) audience.forEach((r) => rooms.add(r));
+  userUpdateQueue.set(userId, rooms);
   if (!userUpdateTimer) userUpdateTimer = setTimeout(flushUserUpdates, 1000);
 }
 // Profile edits: plenty for a person saving changes, not enough to flood the instance from a script.
