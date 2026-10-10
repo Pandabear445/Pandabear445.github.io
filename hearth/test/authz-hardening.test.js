@@ -474,10 +474,12 @@ test('authz-11: only someone who could join a call can decline it', async () => 
   const r = await emitAck(es, 'call:decline', { room: lounge.id });
   assert.ok(r.error, 'refused');
   assert.ok((await emitAck(es, 'call:decline', { room: 'dm:nope' })).error);
+  // A server voice channel never rings anyone, so even a member has nothing to decline there (voice-5 in
+  // voice-hardening.test.js covers declining a group call that did ring).
   const ms = await sock(member);
-  assert.equal((await emitAck(ms, 'call:decline', { room: lounge.id })).ok, true);
+  assert.ok((await emitAck(ms, 'call:decline', { room: lounge.id })).error);
   await sleep(300);
-  assert.deepEqual(declined.map((d) => d.userId), [member.id], 'only the member’s decline arrives');
+  assert.deepEqual(declined, [], 'no fake "declined" reaches the call');
   await emitAck(bs, 'voice:leave', {});
   bs.close(); es.close(); ms.close();
 });

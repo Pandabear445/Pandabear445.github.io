@@ -1638,7 +1638,13 @@ function instanceTab(app) {
         field('Relay addresses', turnUrlsIn, 'Comma-separated, e.g. turn:203.0.113.7:3478?transport=udp,turn:203.0.113.7:3478?transport=tcp'),
         field('Shared secret', turnSecretIn, 'The static-auth-secret from coturn. Leave empty to keep the current one.'),
         h('div', { class: 'row gap' },
-          h('button', { class: 'btn primary', onclick: async () => { await api('PUT', '/admin/turn', { urls: turnUrlsIn.value, ...(turnSecretIn.value.trim() ? { secret: turnSecretIn.value.trim() } : {}) }); toast('Saved.'); draw(); } }, 'Save'),
+          // The relay secret and addresses decide where everyone's calls are relayed: saving needs your password again.
+          h('button', { class: 'btn primary', onclick: async () => {
+            try {
+              const r = await confirmedCall(app, (x) => api('PUT', '/admin/turn', { urls: turnUrlsIn.value, ...(turnSecretIn.value.trim() ? { secret: turnSecretIn.value.trim() } : {}), ...x }), { title: 'Save relay settings', button: 'Save' });
+              if (r) { toast('Saved.'); draw(); }
+            } catch (e) { quiet(e); }
+          } }, 'Save'),
           h('button', { class: 'btn ghost', onclick: () => testRelay(relayResult) }, 'Test relay')),
         relayResult)
     );

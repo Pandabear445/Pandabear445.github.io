@@ -18,7 +18,8 @@ import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, c
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
-import { rankRelays, chooseIce, relayTime } from './relays.js';
+import { rankRelays, chooseIce, relayTime, iceStale } from './relays.js';
+import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
 import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
@@ -410,6 +411,7 @@ function startApp() {
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
     socket,
     getIceServers: () => chooseIce(S.iceServers || S.config.iceServers || [], S.relayRanks, voice && voice.channelId ? callRegion(voice.channelId) : null),
+    ensureIce: () => freshIce(),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
@@ -441,19 +443,18 @@ function startApp() {
   });
   socket.on('connect_error', (e) => {
     if (e.message === 'maintenance') { api('GET', '/config').then((c) => showUpdating('Down for maintenance', c.maintenance || 'Back soon.')).catch(() => {}); return; }
-    if (e.message === 'unauthorized') logout();
-    else if (!S.restarting) $('#conn-banner').hidden = false;
+    if (e.message !== 'unauthorized' && !S.restarting) $('#conn-banner').hidden = false; // 'unauthorized': signed out (below)
   });
-  socket.on('disconnect', (reason) => {
-    if (S.restarting) return; // expected: the server is restarting for an update
-    if (reason === 'io server disconnect') return logout(); // session was revoked
-    $('#conn-banner').hidden = false;
-  });
-  // This device was signed out from somewhere else (Settings → Sessions, a password change or reset, staff).
-  socket.on('session:revoked', ({ reason } = {}) => {
-    const why = { password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on', expired: 'Your sign-in expired', account_deleted: 'This account was deleted' }[reason];
-    sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
-    logout();
+  // Signed out from somewhere else (Settings → Sessions, a password change or reset, staff), or this device isn't
+  // let back in. Any other connection the server closes (too many events at once, say) just reconnects.
+  watchConnection(socket, {
+    paused: () => !!S.restarting, // expected: the server is restarting for an update
+    onDown: () => { $('#conn-banner').hidden = false; },
+    onSignedOut: (reason) => {
+      const why = { password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on', expired: 'Your sign-in expired', account_deleted: 'This account was deleted' }[reason];
+      if (reason !== 'unauthorized') sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
+      logout();
+    },
   });
   socket.on('server:restarting', () => showUpdating());
   socket.on('server:maintenance', ({ text }) => showUpdating('Down for maintenance', text || 'Back soon.'));
@@ -711,6 +712,18 @@ function startApp() {
   document.querySelector('.nav-scrim').addEventListener('click', () => document.body.classList.remove('nav-open'));
   $('#sidebar').append(resizeHandle('sidebar'));
 }
+
+// Relay logins run out 12 to 18 hours after they're handed out, and an app can stay open for days without
+// reconnecting. So new ones are fetched before a call when they're about to run out, and checked every
+// 10 minutes in the background (calls in progress switch to them too).
+async function freshIce() {
+  if (!iceStale(S.iceServers)) return;
+  try {
+    S.iceServers = await api('GET', '/ice');
+    if (voice) voice.updateIceServers();
+  } catch { /* keep the old ones: the next check is soon */ }
+}
+setInterval(() => { if (S.me) freshIce(); }, 10 * 60000);
 
 async function loadBootstrap() {
   const b = await api('GET', '/bootstrap');

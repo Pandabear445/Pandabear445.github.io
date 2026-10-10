@@ -405,11 +405,15 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('p', { class: 'field-hint' }, 'The link works for 24 hours. It installs the call relay with this server\u2019s secret and a tiny check-in that reports here every minute. Within a minute of finishing, the region shows as online and calls start using it.'),
         h('p', { class: 'field-hint' }, 'If the VPS provider has a firewall in its control panel, open UDP + TCP 3478 and UDP 49160\u201349400 there.')),
     });
+    // An install command carries this server's relay secret, so making one asks for your password again.
+    const withPassword = (fn) => (confirm ? confirm(fn, { title: 'Confirm it\u2019s you', text: 'The install command carries this server\u2019s relay secret.' }) : fn({}));
     const add = () => {
       const name = h('input', { class: 'input', maxlength: '40', placeholder: 'e.g. Frankfurt, US West, Singapore' });
       modal({ title: 'Add a region', size: 'sm', body: h('div', { class: 'stack' }, field('Name', name, 'Shown to you here and to people choosing a relay.')),
         actions: [{ label: 'Cancel' }, { label: 'Get install command', kind: 'primary', action: async () => {
-          const r = await api('POST', '/admin/regions', { name: name.value.trim(), origin: location.origin });
+          if (!name.value.trim()) throw new Error('Give the region a name, like "Frankfurt" or "US West".');
+          const r = await withPassword((x) => api('POST', '/admin/regions', { name: name.value.trim(), origin: location.origin, ...x }));
+          if (!r) return false;
           regions(); setTimeout(() => showCommand(`Set up ${r.region.name}`, r.command), 150);
         } }] });
     };
@@ -438,7 +442,12 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
             !r.backup ? 'Backups: reinstall to add backup space' : !r.backup.ready ? 'Backups: no backup space (needs SSH)'
               : `Backups: ${r.backup.files} cop${r.backup.files === 1 ? 'y' : 'ies'}, ${fmtMb(r.backup.usedMb)} (${fmtMb(r.backup.freeMb)} free)${r.backup.last ? (r.backup.last.ok ? ` \u00b7 last copy ${ago(r.backup.last.at)} \u2713` : ' \u00b7 last copy FAILED') : ' \u00b7 waiting for the next backup'}`),
           h('span', { class: 'row gap tight' },
-            h('button', { class: 'btn ghost sm', onclick: async () => { const x = await api('POST', `/admin/regions/${r.id}/reinstall`, { origin: location.origin }); showCommand(`Reinstall ${r.name}`, x.command); } }, r.waitingForInstall ? 'Install command' : 'Reinstall'),
+            h('button', { class: 'btn ghost sm', onclick: async () => {
+              try {
+                const x = await withPassword((y) => api('POST', `/admin/regions/${r.id}/reinstall`, { origin: location.origin, ...y }));
+                if (x) showCommand(`Reinstall ${r.name}`, x.command);
+              } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+            } }, r.waitingForInstall ? 'Install command' : 'Reinstall'),
             h('button', { class: 'btn ghost sm danger-text', onclick: async () => { if (await confirmDialog({ title: `Remove ${r.name}?`, text: 'Calls stop using it right away. The VPS keeps running until you cancel it with your provider.', confirm: 'Remove', danger: true })) { await api('DELETE', `/admin/regions/${r.id}`); regions(); } } }, 'Remove'))))),
       d.regions.length ? '' : h('p', { class: 'field-hint' }, 'No regions yet.'),
       h('div', { class: 'admin-head' }, h('h3', null, 'Which relay is nearest to me?')),
