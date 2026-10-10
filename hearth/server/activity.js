@@ -12,6 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 
 const env = process.env;
 const BASE = {
@@ -101,9 +102,10 @@ module.exports = function setupActivity(ctx) {
       try {
         const r = await safeFetch(url, artAllowed, { signal: ctl.signal, headers: { 'User-Agent': UA } });
         const type = r ? (r.headers.get('content-type') || '').split(';')[0] : '';
-        if (!r || !r.ok || !/^image\//.test(type)) return null;
-        const buf = Buffer.from(await r.arrayBuffer());
-        if (buf.length > 6 * 1024 * 1024) return null;
+        if (!r || !r.ok || !/^image\//.test(type)) { if (r) cancelBody(r.body); return null; }
+        // Read with a running count: a huge picture is dropped as soon as it passes 6 MB, never held whole.
+        const buf = await readLimited(r, 6 * 1024 * 1024);
+        if (!buf) return null;
         fs.writeFileSync(file, buf); fs.writeFileSync(file + '.type', type);
         return { file, type };
       } catch { return null; } finally { clearTimeout(t); inflight.delete(key); }

@@ -13,6 +13,8 @@ const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash } = 
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
+const { stripFile, ImageRejected } = require('./imagemeta');
+const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 const perms = makePerms(db);
 
 // ---------------------------------------------------------------- config
@@ -489,11 +491,46 @@ function quotaOf(uid) {
   return { ...lim, quotaMb, dailyMb: exempt ? 0 : lim.dailyMb, used: usedBytes(uid), today: dayBytes(uid), blocked: !!(row && row.uploads_blocked), exempt };
 }
 const fmtMb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
+// The final word on quota and daily allowance, once the file's real size is known. Uploads that ran at the same
+// time all started from the same "used" figure; this runs (with recordFile right after it) without any await in
+// between, so whichever finishes first takes the room and the others are refused.
+function overLimit(uid, q, size) {
+  if (q.quotaMb) {
+    const used = usedBytes(uid);
+    if (used + size > q.quotaMb * MB) return new HttpError(413, `That would go over your storage limit. You have ${fmtMb(Math.max(0, q.quotaMb * MB - used))} left of ${q.quotaMb} MB.`, 'quota');
+  }
+  if (q.dailyMb) {
+    const today = dayBytes(uid);
+    if (today + size > q.dailyMb * MB) return new HttpError(413, `That would go over today\u2019s upload limit. You have ${fmtMb(Math.max(0, q.dailyMb * MB - today))} left today.`, 'quota');
+  }
+  return null;
+}
+// Public pictures lose their hidden metadata (EXIF, GPS position, XMP…) before anyone can download them;
+// see server/imagemeta.js. That runs in a worker thread, so a big (or hostile) picture can't hold up the server.
+// A picture that can't be cleaned is refused rather than kept with its metadata.
+async function stripUploadedImage(file) {
+  try {
+    const size = await stripFile(file.path);
+    if (size != null) file.size = size;
+  } catch (e) {
+    if (e instanceof ImageRejected) throw new HttpError(400, 'That picture couldn\u2019t be checked for hidden data (like a GPS position), so it wasn\u2019t saved. Save it again as a normal JPG or PNG and try once more.', 'bad_image');
+    throw new HttpError(503, 'Pictures can\u2019t be saved right now. Try again in a moment.');
+  }
+}
+// Text fields that come with an upload (a name, a crop, a title…). Without these limits multer keeps any number
+// of fields of up to 1 MB each in memory, so a single request could use up the server's memory.
+const FORM_LIMITS = { fields: 8, fieldSize: 16 * 1024, parts: 10 };
+const FORM_ERRORS = new Set(['LIMIT_FIELD_COUNT', 'LIMIT_FIELD_VALUE', 'LIMIT_FIELD_KEY', 'LIMIT_PART_COUNT']);
+const MAX_PARALLEL_UPLOADS = 4; // per person; the app sends files one after another
+const uploading = new Map(); // userId -> uploads in progress
+const PUBLIC_KINDS = new Set(['image', 'gif']); // pictures anyone can download: their metadata is removed
 // Wraps multer: refuses blocked accounts, caps the size at whatever is smallest of the per-file limit,
 // the space left in the person's quota and what's left of today's allowance, and records the file.
 // If the request then fails, the file is removed again so it doesn't count against anyone.
+// kind: file (encrypted attachments), image, song, or gif (the server's GIF library, LIB_MAX_MB each).
 function limited(kind, base, field) {
   const perFile = { file: 'fileMb', image: 'imageMb', song: 'songMb' }[kind];
+  const label = { file: 'Files', image: 'Images', song: 'Songs', gif: 'GIFs for the library' }[kind];
   return (req, res, next) => {
     // Counted before the file is received, so a flood never reaches the disk.
     try {
@@ -504,24 +541,59 @@ function limited(kind, base, field) {
     } catch (e) { return next(e); }
     const q = quotaOf(req.userId);
     if (q.blocked) return next(new HttpError(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.'));
-    const fileCap = q[perFile] * MB + (kind === 'file' ? MB : 0); // encrypted attachments carry a little overhead
+    const perFileMb = kind === 'gif' ? LIB_MAX_MB : q[perFile];
+    const fileCap = perFileMb * MB + (kind === 'file' ? MB : 0); // encrypted attachments carry a little overhead
     const quotaLeft = q.quotaMb ? q.quotaMb * MB - q.used : Infinity;
     const dayLeft = q.dailyMb ? q.dailyMb * MB - q.today : Infinity;
     if (quotaLeft <= 0) return next(new HttpError(413, `You\u2019ve used all ${q.quotaMb} MB of your storage. Delete some old files or ask an admin for more room.`, 'quota'));
     if (dayLeft <= 0) return next(new HttpError(413, `You\u2019ve reached today\u2019s upload limit (${q.dailyMb} MB per day). Try again tomorrow.`, 'quota'));
+    // A few uploads at a time per person, so parallel requests can't fill the disk before the quota check below.
+    const busy = uploading.get(req.userId) || 0;
+    if (busy >= MAX_PARALLEL_UPLOADS) return next(new HttpError(429, 'Wait for your other uploads to finish, then try again.', 'busy'));
+    uploading.set(req.userId, busy + 1);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      const n = (uploading.get(req.userId) || 1) - 1;
+      if (n > 0) uploading.set(req.userId, n); else uploading.delete(req.userId);
+    };
+    res.once('close', release); // also when the sender hangs up halfway
     const cap = Math.max(1, Math.floor(Math.min(fileCap, quotaLeft, dayLeft)));
-    multer({ ...base, limits: { fileSize: cap, files: 1 } }).single(field)(req, res, (err) => {
+    multer({ ...base, limits: { ...FORM_LIMITS, fileSize: cap, files: 1 } }).single(field)(req, res, (err) => {
+      if (err) release();
       if (err && err.code === 'LIMIT_FILE_SIZE') {
-        if (cap >= fileCap) return next(new HttpError(413, `That file is too big. ${{ file: 'Files', image: 'Images', song: 'Songs' }[kind]} can be up to ${q[perFile]} MB.`));
+        if (cap >= fileCap) return next(new HttpError(413, `That file is too big. ${label} can be up to ${perFileMb} MB.`));
         if (cap >= dayLeft) return next(new HttpError(413, `That would go over today\u2019s upload limit. You have ${fmtMb(dayLeft)} left today.`, 'quota'));
         return next(new HttpError(413, `That would go over your storage limit. You have ${fmtMb(quotaLeft)} left of ${q.quotaMb} MB.`, 'quota'));
       }
+      if (err && FORM_ERRORS.has(err.code)) return next(new HttpError(400, 'That upload has more (or longer) form fields than this server accepts.', 'form_limit'));
       if (err) return next(err);
-      if (req.file) {
-        recordFile(req.userId, req.file.filename, kind === 'file' ? 'attachment' : kind, req.file.size);
-        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + req.file.filename); });
-      }
-      next();
+      const file = req.file;
+      if (!file) { release(); return next(); }
+      // Still counted as in progress while the picture is cleaned, so the disk can't fill up meanwhile.
+      const cleaned = PUBLIC_KINDS.has(kind) && file.path ? stripUploadedImage(file) : Promise.resolve();
+      cleaned.then(() => {
+        release();
+        try {
+          // No await from here to recordFile(): see overLimit().
+          const over = overLimit(req.userId, q, file.size);
+          if (over) {
+            if (file.path) fs.promises.unlink(file.path).catch(() => {});
+            return next(over);
+          }
+          recordFile(req.userId, file.filename, kind === 'file' ? 'attachment' : kind, file.size);
+        } catch (e) {
+          if (file.path) fs.promises.unlink(file.path).catch(() => {});
+          return next(e);
+        }
+        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + file.filename); });
+        next();
+      }, (e) => {
+        release();
+        if (file.path) fs.promises.unlink(file.path).catch(() => {});
+        next(e);
+      });
     });
   };
 }
@@ -564,12 +636,45 @@ function removeMessageFiles(messageIds) {
       .forEach((m) => (unseal(m.body).attachments || []).forEach((a) => removeUpload(a.url)));
   }
 }
+// Everything that hangs off messages: their files, reactions and poll votes. These tables have no foreign key to
+// the messages (channel and DM messages share them), so every way of deleting messages calls this first.
+function forgetMessages(messageIds) {
+  if (!messageIds.length) return;
+  removeMessageFiles(messageIds);
+  for (let i = 0; i < messageIds.length; i += 500) {
+    const ids = messageIds.slice(i, i + 500);
+    const q = ids.map(() => '?').join(',');
+    for (const t of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${t} WHERE message_id IN (${q})`).run(...ids);
+  }
+}
+// Before a server or group is deleted: its messages' files, reactions and votes, and its own pictures (icon,
+// banner, background, emoji). The database cascade removes the rows, but not files or quota bookkeeping.
+function purgeServerContent(s) {
+  forgetMessages(db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(s.id).map((r) => r.id));
+  const th = themeOf(s);
+  [s.icon, th.banner, th.background && th.background.image, ...db.prepare('SELECT url FROM emojis WHERE server_id = ?').all(s.id).map((e) => e.url)]
+    .forEach((u) => { if (typeof u === 'string') removeUpload(u); });
+}
 // Blobs uploaded but never attached to a message (abandoned sends) are removed after a day.
 setInterval(() => {
   const old = db.prepare('SELECT name FROM blobs WHERE message_id IS NULL AND created_at < ?').all(Date.now() - 24 * 3600 * 1000);
   old.forEach((b) => removeUpload('/uploads/' + b.name));
   if (old.length) db.prepare('DELETE FROM blobs WHERE message_id IS NULL AND created_at < ?').run(Date.now() - 24 * 3600 * 1000);
 }, 3600 * 1000).unref();
+// Leftovers whose message is gone: from before the cleanup above existed (groups that emptied out, for example).
+// Once shortly after start, then daily.
+function sweepOrphans() {
+  const gone = (t) => `${t}.message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages WHERE id = ${t}.message_id) AND NOT EXISTS (SELECT 1 FROM dm_messages WHERE id = ${t}.message_id)`;
+  const blobs = db.prepare(`SELECT name FROM blobs WHERE ${gone('blobs')}`).all();
+  blobs.forEach((b) => removeUpload('/uploads/' + b.name));
+  if (blobs.length) db.prepare(`DELETE FROM blobs WHERE ${gone('blobs')}`).run();
+  for (const t of ['reactions', 'poll_votes', 'poll_closed']) db.prepare(`DELETE FROM ${t} WHERE ${gone(t)}`).run();
+  return blobs.length;
+}
+setTimeout(() => {
+  try { sweepOrphans(); } catch (e) { console.error('Orphan cleanup failed:', e.message); }
+  setInterval(() => { try { sweepOrphans(); } catch (e) { console.error('Orphan cleanup failed:', e.message); } }, 24 * 3600 * 1000).unref();
+}, +(process.env.ORPHAN_SWEEP_DELAY_MS || 2 * 60 * 1000)).unref();
 
 app.get('/uploads/:file', (req, res) => {
   const f = req.params.file;
@@ -1138,8 +1243,10 @@ api.delete('/me', auth, wrap(async (req, res) => {
       if (next) db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(next.user_id, m.id);
     }
     removeMember(m.id, row.id);
-    if (m.kind === 'group' && !db.prepare('SELECT 1 FROM members WHERE server_id = ?').get(m.id)) db.prepare('DELETE FROM servers WHERE id = ?').run(m.id);
-    else emitServer(m.id);
+    if (m.kind === 'group' && !db.prepare('SELECT 1 FROM members WHERE server_id = ?').get(m.id)) {
+      purgeServerContent(db.prepare('SELECT * FROM servers WHERE id = ?').get(m.id));
+      db.prepare('DELETE FROM servers WHERE id = ?').run(m.id);
+    } else emitServer(m.id);
   }
   const files = [row.avatar, row.banner, row.background, row.song, row.page_bg];
   const friends = db.prepare('SELECT requester_id, addressee_id FROM friendships WHERE requester_id = ? OR addressee_id = ?').all(row.id, row.id);
@@ -1380,7 +1487,14 @@ api.patch('/servers/:id', auth, (req, res) => {
   const onlyOrder = Object.keys(body).every((k) => k === 'categoryOrder');
   if (srv.kind !== 'group' && !can(srv, req.userId, onlyOrder ? PM.MANAGE_CHANNELS : PM.MANAGE_SERVER)) fail(403, 'You need the Manage Server permission.');
   if (body.description !== undefined) db.prepare('UPDATE servers SET description = ? WHERE id = ?').run(String(body.description || '').slice(0, 300), srv.id);
-  if (body.theme && typeof body.theme === 'object') db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(cleanTheme(body.theme, themeOf(srv))), srv.id);
+  if (body.theme && typeof body.theme === 'object') {
+    const cur = themeOf(srv);
+    const next = cleanTheme(body.theme, cur);
+    db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(next), srv.id);
+    // Switching the background from a picture to colours drops the picture: remove its file too.
+    const oldImage = cur.background && cur.background.image;
+    if (oldImage && oldImage !== (next.background && next.background.image)) removeUpload(oldImage);
+  }
   if (Array.isArray(body.categoryOrder)) {
     const order = [...new Set(body.categoryOrder.map((c) => String(c).trim().slice(0, 32)).filter(Boolean))].slice(0, 50);
     db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify(order), srv.id);
@@ -1422,11 +1536,9 @@ api.delete('/servers/:id', auth, wrap(async (req, res) => {
     const m = voiceChannels.get(c.id);
     if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
   });
-  removeMessageFiles(db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(s.id).map((r) => r.id));
-  db.prepare('DELETE FROM reactions WHERE message_id IN (SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?)').run(s.id);
+  purgeServerContent(s);
   MEMB.onServerDeleted(s.id);
   db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
-  removeUpload(s.icon);
   io.to(`server:${s.id}`).emit('server:remove', { serverId: s.id });
   io.in(`server:${s.id}`).socketsLeave(`server:${s.id}`);
   auditLog(req, 'server_deleted', s.id, s.name);
@@ -1442,8 +1554,10 @@ api.post('/servers/:id/leave', auth, (req, res) => {
   } else if (s.owner_id === req.userId) fail(400, 'Owners cannot leave their own server. Delete it or hand it off first.');
   removeMember(s.id, req.userId);
   const left = db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n;
-  if (s.kind === 'group' && !left) db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
-  else emitServer(s.id);
+  if (s.kind === 'group' && !left) {
+    purgeServerContent(s);
+    db.prepare('DELETE FROM servers WHERE id = ?').run(s.id);
+  } else emitServer(s.id);
   res.json({ ok: true });
 });
 
@@ -1747,8 +1861,7 @@ api.delete('/channels/:id', auth, (req, res) => {
   const c = requireManageableChannel(req.params.id, req.userId);
   const m = voiceChannels.get(c.id);
   if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
-  removeMessageFiles(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
-  db.prepare('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?)').run(c.id);
+  forgetMessages(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
   db.prepare('DELETE FROM channels WHERE id = ?').run(c.id);
   emitServer(c.server_id);
   res.json({ ok: true });
@@ -1879,9 +1992,8 @@ api.delete('/messages/:id', auth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (m.author_id !== req.userId && !canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You can only delete your own messages.');
   const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((r) => r.id)];
-  removeMessageFiles(ids);
+  forgetMessages(ids);
   const q = ids.map(() => '?').join(',');
-  db.prepare(`DELETE FROM reactions WHERE message_id IN (${q})`).run(...ids);
   db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
   toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   if (m.thread_id) toChannel(c).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
@@ -2051,8 +2163,7 @@ api.delete('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
   if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
   const d = requireDm(m.dm_id, req.userId);
-  removeMessageFiles([m.id]);
-  db.prepare('DELETE FROM reactions WHERE message_id = ?').run(m.id);
+  forgetMessages([m.id]);
   db.prepare('DELETE FROM dm_messages WHERE id = ?').run(m.id);
   io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit('dm:delete', { id: m.id, dmId: d.id });
   res.json({ ok: true });
@@ -2282,10 +2393,13 @@ function isAnimatedImage(buf) {
 }
 const EMOJI_MAX = 2 * 1024 * 1024;
 const emojiName = (n) => String(n || '').trim().replace(/[^A-Za-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 32);
-function addEmoji(s, name, url, animated, userId) {
+function checkEmojiRoom(s, name) {
   if (name.length < 2) fail(400, 'Emoji names need at least 2 letters, numbers or underscores.');
   if (db.prepare('SELECT COUNT(*) AS n FROM emojis WHERE server_id = ?').get(s.id).n >= 200) fail(400, 'A server can have up to 200 emoji.');
   if (db.prepare('SELECT 1 FROM emojis WHERE server_id = ? AND name = ?').get(s.id, name)) fail(409, `There's already an emoji called :${name}:.`);
+}
+function addEmoji(s, name, url, animated, userId) {
+  checkEmojiRoom(s, name);
   const id = newId();
   db.prepare('INSERT INTO emojis (id, server_id, name, url, animated, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, url, animated ? 1 : 0, userId, now());
   emitServer(s.id);
@@ -2309,14 +2423,22 @@ api.post('/servers/:id/emojis/from-giphy', auth, wrap(async (req, res) => {
   if (!/^[A-Za-z0-9]{4,40}$/.test(gid)) fail(400, 'Pick a GIF.');
   const name = emojiName((req.body || {}).name);
   if (name.length < 2) fail(400, 'Give the emoji a name.');
+  // The cheap checks come first, so a request that can't succeed never costs a GIPHY/KLIPY call or a download.
+  rateLimit('giphyemoji:' + req.userId, 20, 10 * 60000);
+  checkEmojiRoom(s, name);
+  const q = quotaOf(req.userId);
+  if (q.blocked) fail(403, 'Uploads are turned off for your account. Ask an admin if you think that\u2019s a mistake.');
   const pickR = await gifForEmoji(gid);
   if (!pickR) fail(400, 'That GIF is too big to use as an emoji. Try another one.');
-  const media = new URL(pickR.url);
-  if (!(MEDIA_HOSTS.test(media.hostname) || EXTRA_MEDIA_HOSTS.includes(media.host))) fail(400, 'Unexpected GIF location.');
-  const r = await fetch(media);
-  if (!r.ok) fail(502, 'Couldn\u2019t download that GIF from GIPHY.');
-  const buf = Buffer.from(await r.arrayBuffer());
-  if (buf.length > EMOJI_MAX) fail(400, 'That GIF is too big to use as an emoji.');
+  let media;
+  try { media = new URL(pickR.url); } catch { fail(400, 'Unexpected GIF location.'); }
+  const r = await fetchGifMedia(media, AbortSignal.timeout(15000)).catch(() => fail(502, 'Couldn\u2019t download that GIF from GIPHY.'));
+  if (!r) fail(400, 'Unexpected GIF location.');
+  if (!r.ok) { cancelBody(r.body); fail(502, 'Couldn\u2019t download that GIF from GIPHY.'); }
+  const buf = await readLimited(r, EMOJI_MAX).catch(() => fail(502, 'Couldn\u2019t download that GIF from GIPHY.'));
+  if (!buf) fail(400, 'That GIF is too big to use as an emoji.');
+  const over = overLimit(req.userId, q, buf.length);
+  if (over) throw over;
   const file = `${newId()}${crypto.randomBytes(8).toString('hex')}.gif`;
   fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
   recordFile(req.userId, file, 'emoji', buf.length);
@@ -2742,7 +2864,11 @@ api.get('/gifs', auth, wrap(async (req, res) => {
   if (req.query.source === 'library' || !gifKey() || Date.now() < gifLimitedUntil) {
     return res.json({ ...librarySearch({ q, sticker: type === 'stickers', offset: parseInt(pos, 10) || 0 }), library: true, limited: Date.now() < gifLimitedUntil && req.query.source !== 'library' });
   }
-  try { res.json(await gifSearch({ q, type, pos })); } catch (e) {
+  try {
+    const found = await gifSearch({ q, type, pos });
+    rememberServedGifs(found.items, q, type === 'stickers');
+    res.json(found);
+  } catch (e) {
     if (e.code !== 'gif_limit' && !(e.status >= 500)) throw e;
     res.json({ ...librarySearch({ q, sticker: type === 'stickers', offset: 0 }), library: true, limited: true });
   }
@@ -2785,15 +2911,35 @@ function imageDims(buf) {
   if (buf.length > 30 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 12, 16) === 'VP8X') return [1 + buf.readUIntLE(24, 3), 1 + buf.readUIntLE(27, 3)];
   return [0, 0];
 }
-function addToLibrary({ buf, ext, title, tags, sticker, source, sourceId, userId }) {
-  const file = `${newId()}${crypto.randomBytes(6).toString('hex')}${ext}`;
-  fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
-  const [w, hgt] = imageDims(buf);
+// Adds a GIF to the library: either bytes downloaded from a provider (buf) or a file already uploaded to
+// UPLOAD_DIR (file + size, recorded in user_files by limited() so it counts toward the uploader's storage).
+function addToLibrary({ buf, file, size, ext, title, tags, sticker, source, sourceId, userId }) {
+  let head = buf;
+  if (buf) {
+    file = fileName(ext);
+    fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
+    size = buf.length;
+  } else {
+    head = Buffer.alloc(32);
+    const fd = fs.openSync(path.join(UPLOAD_DIR, file), 'r');
+    try { head = head.subarray(0, fs.readSync(fd, head, 0, 32, 0)); } finally { fs.closeSync(fd); }
+  }
+  const [w, hgt] = imageDims(head);
   const id = newId();
-  db.prepare(`INSERT INTO gif_library (id, file, title, tags, width, height, size, sticker, source, source_id, added_by, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, file, String(title || '').slice(0, 120), cleanTags(title || '', tags || ''), w, hgt, buf.length, sticker ? 1 : 0, source, sourceId || null, userId || null, now());
+  try {
+    db.prepare(`INSERT INTO gif_library (id, file, title, tags, width, height, size, sticker, source, source_id, added_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, file, String(title || '').slice(0, 120), cleanTags(title || '', tags || ''), w, hgt, size, sticker ? 1 : 0, source, sourceId || null, userId || null, now());
+  } catch (e) {
+    if (buf) fs.promises.unlink(path.join(UPLOAD_DIR, file)).catch(() => {}); // e.g. two people sent the same new GIF at once
+    throw e;
+  }
   trimLibrary();
   return db.prepare('SELECT * FROM gif_library WHERE id = ?').get(id);
+}
+// Removes a library GIF and its file (and its storage bookkeeping, if someone uploaded it).
+function removeLibraryGif(g) {
+  db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
+  removeUpload('/uploads/' + g.file);
 }
 // Over the size the admin allows: the least used GIFs that were collected automatically go first.
 function trimLibrary() {
@@ -2802,34 +2948,50 @@ function trimLibrary() {
   if (total <= cap) return;
   for (const g of db.prepare("SELECT id, file, size FROM gif_library ORDER BY (source = 'upload') ASC, uses ASC, created_at ASC LIMIT 200").all()) {
     if (total <= cap) break;
-    db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
-    fs.promises.unlink(path.join(UPLOAD_DIR, g.file)).catch(() => {});
+    removeLibraryGif(g);
     total -= g.size;
   }
 }
 const uploadGif = {
-  storage: multer.memoryStorage(),
+  storage: diskStorage,
   fileFilter: (req, file, cb) => (['.gif', '.webp', '.png'].includes(safeExt(file.originalname)) && /^image\//.test(file.mimetype) ? cb(null, true) : cb(new HttpError(400, 'Use a GIF, animated WebP or PNG.'))),
 };
 api.get('/gifs/library', auth, (req, res) => {
   const total = db.prepare('SELECT COUNT(*) n, COALESCE(SUM(size), 0) bytes FROM gif_library').get();
   res.json({ count: total.n, bytes: total.bytes, capMb: libraryCapMb(), who: libraryWho(), learn: libraryLearn(), canAdd: libraryWho() === 'everyone' || isStaff(req.userId) });
 });
+// Library uploads go through limited() like every other upload: they count toward the uploader's storage and
+// daily allowance, and an admin's "delete their files" removes them too.
 api.post('/gifs/library', auth, (req, res, next) => {
-  if (libraryWho() === 'staff' && !isStaff(req.userId)) return next(new HttpError(403, 'Only staff can add GIFs to this server\u2019s library.'));
-  if (quotaOf(req.userId).blocked) return next(new HttpError(403, 'Uploads are turned off for your account.'));
-  multer({ ...uploadGif, limits: { fileSize: LIB_MAX_MB * MB, files: 1 } }).single('file')(req, res, (err) => {
-    if (err && err.code === 'LIMIT_FILE_SIZE') return next(new HttpError(413, `GIFs for the library can be up to ${LIB_MAX_MB} MB.`));
-    next(err);
-  });
-}, (req, res) => {
+  try {
+    if (!features().gifs) fail(404, 'GIFs are turned off on this server.');
+    if (libraryWho() === 'staff' && !isStaff(req.userId)) fail(403, 'Only staff can add GIFs to this server\u2019s library.');
+    rateLimit('giflib:' + req.userId, 60, 3600000); // before the file is received
+    next();
+  } catch (e) { next(e); }
+}, limited('gif', uploadGif, 'file'), (req, res) => {
   if (!req.file) fail(400, 'Choose a GIF.');
-  rateLimit('giflib:' + req.userId, 60, 3600000);
   const b = req.body || {};
   checkWords(b.title, b.tags);
-  const g = addToLibrary({ buf: req.file.buffer, ext: safeExt(req.file.originalname) || '.gif', title: b.title, tags: b.tags, sticker: b.sticker === 'true', source: 'upload', userId: req.userId });
+  const g = addToLibrary({ file: req.file.filename, size: req.file.size, title: b.title, tags: b.tags, sticker: b.sticker === 'true', source: 'upload', userId: req.userId });
   res.json(libOut(g));
 });
+// GIFs this server recently found for someone (provider search results), so a GIF that's sent can be checked
+// against what the provider really returned: its address, title and the search it came from. The app only says
+// which one was picked; it can't choose what gets stored or how it's tagged.
+const servedGifs = new Map(); // `${provider}|${id}` -> { url, title, q, sticker, at }
+function rememberServedGifs(items, q, sticker) {
+  const provider = gifProvider();
+  const at = Date.now();
+  for (const g of items || []) {
+    if (!g || !g.id || typeof g.url !== 'string') continue;
+    const key = `${provider}|${g.id}`;
+    servedGifs.delete(key); // keep the map in "last seen" order
+    servedGifs.set(key, { url: g.url, title: String(g.title || ''), q, sticker, at });
+  }
+  while (servedGifs.size > 5000) servedGifs.delete(servedGifs.keys().next().value);
+}
+const learning = new Set(); // downloads in progress, so one GIF sent twice at once is fetched once
 // Someone sent a GIF: count it (library GIFs) or, if allowed, keep a copy of a KLIPY/GIPHY one.
 api.post('/gifs/used', auth, wrap(async (req, res) => {
   const b = req.body || {};
@@ -2842,26 +3004,33 @@ api.post('/gifs/used', auth, wrap(async (req, res) => {
   const source = gifProvider();
   const have = db.prepare('SELECT id FROM gif_library WHERE source = ? AND source_id = ?').get(source, b.id);
   if (have) { db.prepare('UPDATE gif_library SET uses = uses + 1, last_used = ? WHERE id = ?').run(now(), have.id); return res.json({ ok: true }); }
+  // Only a GIF this server found for someone in the last few hours, at the address the provider gave for it.
+  // Its title and tags come from the provider and the search, and go through the word filter like uploads.
+  const key = `${source}|${b.id}`;
+  const seen = servedGifs.get(key);
+  if (!seen || seen.url !== b.url || Date.now() - seen.at > 6 * 3600000 || learning.has(key)) return res.json({ ok: true });
   let u;
-  try { u = new URL(b.url); } catch { return res.json({ ok: true }); }
-  if (!(u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname))) return res.json({ ok: true });
+  try { u = new URL(seen.url); } catch { return res.json({ ok: true }); }
+  if (!gifHostOk(u)) return res.json({ ok: true });
+  try { checkWords(seen.title, seen.q); } catch { return res.json({ ok: true }); }
   res.json({ ok: true }); // the download happens in the background
+  learning.add(key);
   try {
-    const r = await fetch(u, { headers: { 'User-Agent': 'Hearth' }, signal: AbortSignal.timeout(15000) });
-    const type = r.headers.get('content-type') || '';
-    if (!r.ok || !/^image\/(gif|webp|png)/.test(type)) return;
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > LIB_MAX_MB * MB) return;
+    const r = await fetchGifMedia(u, AbortSignal.timeout(15000));
+    const type = (r && r.headers.get('content-type')) || '';
+    if (!r || !r.ok || !/^image\/(gif|webp|png)/.test(type)) { if (r) cancelBody(r.body); return; }
+    const buf = await readLimited(r, LIB_MAX_MB * MB);
+    if (!buf) return;
     const ext = type.includes('webp') ? '.webp' : type.includes('png') ? '.png' : '.gif';
-    addToLibrary({ buf, ext, title: b.title, tags: b.query, sticker: !!b.sticker, source, sourceId: b.id, userId: null });
-  } catch { /* not important */ }
+    // added_by: who caused it to be stored, so admins can trace (and clear) what an account added.
+    addToLibrary({ buf, ext, title: seen.title, tags: seen.q, sticker: seen.sticker, source, sourceId: b.id, userId: req.userId });
+  } catch { /* not important */ } finally { learning.delete(key); }
 }));
 api.delete('/gifs/library/:id', auth, (req, res) => {
   if (!isStaff(req.userId)) fail(403, 'Only staff can remove GIFs from the library.');
   const g = db.prepare('SELECT * FROM gif_library WHERE id = ?').get(String(req.params.id).replace(/^lib:/, ''));
   if (!g) fail(404, 'Already gone.');
-  db.prepare('DELETE FROM gif_library WHERE id = ?').run(g.id);
-  fs.promises.unlink(path.join(UPLOAD_DIR, g.file)).catch(() => {});
+  removeLibraryGif(g);
   adminLog(req, 'gif_removed', g.id, g.title);
   res.json({ ok: true });
 });
@@ -2881,6 +3050,22 @@ api.put('/admin/gif-library', auth, (req, res) => {
 // hosts are allowed, so this can't be used as an open proxy.
 const MEDIA_HOSTS = /^(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)$/i;
 const EXTRA_MEDIA_HOSTS = (process.env.GIF_PROXY_EXTRA_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean);
+const gifHostOk = (u) => (u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname)) || EXTRA_MEDIA_HOSTS.includes(u.host);
+const GIF_MEDIA_MAX = 20 * 1024 * 1024;
+// Fetches GIF media, following up to 3 redirects itself and checking each one, so a redirect can't send this
+// server anywhere but the GIF providers' media hosts. null if it leads elsewhere.
+async function fetchGifMedia(u, signal) {
+  let target = u;
+  for (let hop = 0; hop < 4; hop++) {
+    if (!gifHostOk(target)) return null;
+    const r = await fetch(target, { signal, redirect: 'manual', headers: { 'User-Agent': 'Hearth' } });
+    const loc = r.status >= 300 && r.status < 400 ? r.headers.get('location') : null;
+    if (!loc) return r;
+    await cancelBody(r.body);
+    try { target = new URL(loc, target); } catch { return null; }
+  }
+  return null;
+}
 // The token belongs to one sign-in session: it stops working when that session ends (log out, revoked, expired)
 // or the account is suspended or deleted, not just after its 7 days.
 const mediaSig = (uid, sid, exp) => crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${sid}|${exp}`).digest('base64url').slice(0, 22);
@@ -2902,23 +3087,27 @@ app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
   if (!checkMediaToken(req.query.t)) return res.status(403).end();
   let u;
   try { u = new URL(String(req.query.u || '')); } catch { return res.status(400).end(); }
-  if (!(u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname)) && !EXTRA_MEDIA_HOSTS.includes(u.host)) return res.status(400).end();
+  if (!gifHostOk(u)) return res.status(400).end();
   rateLimit('gifmedia:' + req.ip, 600, 60000);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 15000);
   try {
-    const r = await fetch(u, { signal: ctl.signal, headers: { 'User-Agent': 'Hearth' } });
+    const r = await fetchGifMedia(u, ctl.signal);
+    if (!r) return res.status(502).end();
     const type = r.headers.get('content-type') || '';
-    if (!r.ok || !/^(image|video)\//.test(type)) return res.status(502).end();
+    if (!r.ok || !/^(image|video)\//.test(type)) { cancelBody(r.body); return res.status(502).end(); }
     const len = +(r.headers.get('content-length') || 0);
-    if (len > 20 * 1024 * 1024) return res.status(413).end();
+    if (len > GIF_MEDIA_MAX) { cancelBody(r.body); return res.status(413).end(); }
     res.setHeader('Content-Type', type);
     if (len) res.setHeader('Content-Length', String(len));
     res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
-    const { Readable } = require('stream');
-    Readable.fromWeb(r.body).on('error', () => res.destroy()).pipe(res);
+    const { Readable, Transform, pipeline } = require('stream');
+    // The size limit holds even when the provider doesn't say the size up front: past it, the copy stops.
+    let sent = 0;
+    const cap = new Transform({ transform(chunk, enc, cb) { sent += chunk.length; if (sent > GIF_MEDIA_MAX) cb(new Error('too big')); else cb(null, chunk); } });
+    pipeline(Readable.fromWeb(r.body), cap, res, () => {});
   } catch { if (!res.headersSent) res.status(502).end(); } finally { clearTimeout(timer); }
 }));
 
@@ -3418,17 +3607,15 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   if (m) {
     const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(m.channel_id);
     const ids = [m.id, ...db.prepare('SELECT id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.id)];
-    removeMessageFiles(ids);
+    forgetMessages(ids);
     const q = ids.map(() => '?').join(',');
-    db.prepare(`DELETE FROM reactions WHERE message_id IN (${q})`).run(...ids);
     db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...ids);
     if (c) toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   } else {
     const d = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
     if (!d) fail(404, 'Message already gone.');
     const dm = db.prepare('SELECT * FROM dm_channels WHERE id = ?').get(d.dm_id);
-    removeMessageFiles([d.id]);
-    db.prepare('DELETE FROM reactions WHERE message_id = ?').run(d.id);
+    forgetMessages([d.id]);
     db.prepare('DELETE FROM dm_messages WHERE id = ?').run(d.id);
     if (dm) io.to([`user:${dm.user_a}`, `user:${dm.user_b}`]).emit('dm:delete', { id: d.id, dmId: dm.id });
   }
@@ -3512,9 +3699,7 @@ api.delete('/admin/servers/:id', auth, adminOnly, (req, res) => {
   const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(req.params.id);
   if (!srv) fail(404, 'Server not found.');
   const memberIds = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(srv.id).map((r) => r.user_id);
-  const ids = db.prepare('SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.server_id = ?').all(srv.id).map((r) => r.id);
-  if (ids.length) removeMessageFiles(ids);
-  removeUpload(srv.icon);
+  purgeServerContent(srv);
   MEMB.onServerDeleted(srv.id);
   db.prepare('DELETE FROM servers WHERE id = ?').run(srv.id);
   memberIds.forEach((u) => io.to(`user:${u}`).emit('server:remove', { serverId: srv.id }));
@@ -3891,6 +4076,8 @@ api.delete('/admin/users/:id/files', auth, adminOnly, (req, res) => {
   const r = requireOutranks(req, req.params.id);
   const files = db.prepare('SELECT name FROM user_files WHERE user_id = ?').all(r.id);
   files.forEach((f) => removeUpload('/uploads/' + f.name));
+  // GIFs they put in the server's library (uploaded, or collected from what they sent).
+  db.prepare('SELECT id, file FROM gif_library WHERE added_by = ?').all(r.id).forEach((g) => removeLibraryGif(g));
   db.prepare('UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, page_bg = NULL WHERE id = ?').run(r.id);
   db.prepare('DELETE FROM blobs WHERE uploader_id = ?').run(r.id);
   broadcastUser(r.id);
@@ -4110,6 +4297,18 @@ function indexOldFiles() {
     db.prepare('SELECT created_by, url FROM emojis').all().forEach((e) => add(e.created_by, e.url, 'emoji'));
   })();
   setSetting('filesIndexed', '1');
+}
+// One-time: GIFs people uploaded to the server's GIF library before library uploads counted toward storage, so
+// they count (and show under "GIF library" in Storage) like the ones uploaded since. Learned GIFs aren't anyone's
+// upload and stay uncounted. The original upload time is kept, so they don't use up today's allowance.
+function indexLibraryUploads() {
+  if (getSetting('gifLibraryIndexed')) return;
+  const add = db.prepare('INSERT OR IGNORE INTO user_files (name, user_id, kind, size, created_at) VALUES (?, ?, ?, ?, ?)');
+  db.transaction(() => {
+    db.prepare("SELECT g.file, g.added_by, g.size, g.created_at FROM gif_library g JOIN users u ON u.id = g.added_by WHERE g.source = 'upload'").all()
+      .forEach((g) => { if (fs.existsSync(path.join(UPLOAD_DIR, path.basename(g.file)))) add.run(path.basename(g.file), g.added_by, 'gif', g.size, g.created_at); });
+  })();
+  setSetting('gifLibraryIndexed', '1');
 }
 
 // ---------------------------------------------------------------- errors + SPA fallback
@@ -4485,6 +4684,7 @@ function setupSockets(server) {
   else server = http.createServer(app);
   setupSockets(server);
   try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
+  try { indexLibraryUploads(); } catch (e) { console.error('Could not index GIF library uploads:', e.message); }
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
     console.log(`\n  ${INSTANCE_NAME} is running.\n`);

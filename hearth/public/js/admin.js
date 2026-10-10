@@ -278,7 +278,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       const inp = h('input', { class: 'input', type: 'number', min: '0', step: '1', value: String(L[k]), oninput: (e) => { L[k] = e.target.value; } });
       return h('label', { class: 'field' }, h('span', { class: 'field-label' }, label), h('div', { class: 'row gap tight' }, inp, h('span', { class: 'stat-sub' }, 'MB')), hint ? h('span', { class: 'field-hint' }, hint) : null);
     };
-    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji' };
+    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji', gif: 'GIF library' };
     const words = h('textarea', { class: 'input', rows: '5', placeholder: 'one word or phrase per line' });
     words.value = (st.words || []).join('\n');
     clear(body).append(

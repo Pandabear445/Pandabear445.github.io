@@ -5,6 +5,7 @@
 // - encrypts/decrypts channel messages and DMs, and signs/verifies voice handshakes
 import * as E2EE from './e2ee.js';
 import { api } from './api.js';
+import { cleanFiles } from './attachments.js';
 
 // A poll inside a message: question, 2–10 options, single or multiple choice. Anything else is dropped.
 function cleanPoll(p) {
@@ -230,7 +231,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     try {
       const author = await userWithKeys(authorId);
       const { payload, verified } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: author.signPublicKey, text });
-      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), verified: verified && !keyChanged(author) };
+      return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), verified: verified && !keyChanged(author) };
     } catch {
       return { error: true, t: '', f: [] };
     }
@@ -238,7 +239,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   async function decryptChannelMessage(m) {
     if (m.dec && !m.dec.pending) return;
-    if (m.legacy) m.dec = { t: m.content || '', f: m.attachments || [], legacy: true, verified: true, embed: m.embed || null, bot: !!m.bot };
+    if (m.legacy) m.dec = { t: m.content || '', f: cleanFiles(m.attachments), legacy: true, verified: true, embed: m.embed || null, bot: !!m.bot };
     else {
       // If a key arrives while we're decrypting, try again so we never keep a stale "waiting" result.
       for (let i = 0; i < 3; i++) {
@@ -275,7 +276,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const peer = await dmPeer(dmId);
       trust(peer);
       const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub: peer.publicKey, dmId, authorId, text });
-      return { t: String(payload.t || ''), f: Array.isArray(payload.f) ? payload.f : [], p: cleanPoll(payload.p), legacyFormat: !!legacy };
+      return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), legacyFormat: !!legacy };
     } catch {
       return { error: true, t: '', f: [] };
     }

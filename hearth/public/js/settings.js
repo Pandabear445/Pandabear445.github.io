@@ -440,7 +440,7 @@ function accountTab(app) {
     const MB = 1024 * 1024;
     const mb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
     const pct = q.quotaMb ? Math.min(100, (q.used / (q.quotaMb * MB)) * 100) : 0;
-    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji' };
+    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji', gif: 'GIF library' };
     clear(storage).append(
       q.blocked ? h('p', { class: 'key-bar bad' }, icon('ban'), 'An admin has turned off uploads for your account.') : null,
       h('div', { class: 'kv' }, h('span', null, 'Used'), h('strong', null, q.quotaMb ? `${mb(q.used)} of ${q.quotaMb} MB` : `${mb(q.used)} (no limit)`)),

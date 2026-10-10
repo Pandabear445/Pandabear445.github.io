@@ -10,6 +10,7 @@ import { openCropper } from './cropper.js';
 import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
 import { prepareImage, makeQueue, whenVisible } from './media.js';
+import { isUploadUrl, safeDownloadHref } from './attachments.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
 import { createSecure } from './secure.js';
@@ -2593,6 +2594,7 @@ function openForward(m) {
 // ======================================================================= attachments + media viewer
 const blobCache = new Map();
 function decryptedUrl(m, f) {
+  if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn\u2019t on this server.'));
   if (!blobCache.has(f.url)) {
     const job = (async () => {
       const res = await fetch(f.url).catch(() => { throw new Error('Couldn\u2019t reach the server. Check your connection and try again.'); });
@@ -2617,7 +2619,9 @@ async function downloadAttachment(m, f, btn) {
   if (btn) { btn.disabled = true; btn.classList.add('busy'); }
   try {
     const enc = !!f.k || !!m.dmId;
-    const href = enc ? await decryptedUrl(m, f) : f.url;
+    // Only ever a decrypted copy or a file on this server: never a jump to another site.
+    const href = safeDownloadHref(enc ? await decryptedUrl(m, f) : f.url, location.origin);
+    if (!href) throw new Error('This file isn\u2019t on this server.');
     const a = h('a', { href, download: f.name || 'file' });
     document.body.append(a); a.click(); a.remove();
   } catch (e) {
@@ -2632,7 +2636,10 @@ function mediaDownloadBtn(m, f) {
 }
 const loadQueue = makeQueue(3);
 function attachmentEl(f, m) {
-  if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : Promise.resolve(f.url)));
+  // Unencrypted entries (older messages) load straight from this server; anything else was dropped when the
+  // message was decrypted (see attachments.js), and is refused here too.
+  const direct = () => (isUploadUrl(f.url) ? Promise.resolve(f.url) : Promise.reject(new Error('This file isn\u2019t on this server.')));
+  if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : direct()));
   const enc = !!f.k || !!m.dmId;
   const type = f.type || '';
   const media = /^image\//.test(type) ? 'img' : /^video\//.test(type) ? 'video' : /^audio\//.test(type) ? 'audio' : null;
@@ -2648,7 +2655,7 @@ function attachmentEl(f, m) {
       holder.style.aspectRatio = `${f.w} / ${f.h}`;
       holder.classList.add('sized');
     }
-    const full = () => (enc ? decryptedUrl(m, f) : Promise.resolve(f.url));
+    const full = () => (enc ? decryptedUrl(m, f) : direct());
     if (media === 'img') {
       el._full = full;
       el.addEventListener('click', () => openViewer(el, { name: f.name, download: () => downloadAttachment(m, f) }));
@@ -2667,7 +2674,7 @@ function attachmentEl(f, m) {
           holder.append(again);
         });
     };
-    if (enc || f.th) whenVisible(holder, load); else el.src = f.url;
+    if (enc || f.th || !isUploadUrl(f.url)) whenVisible(holder, load); else el.src = f.url;
     return holder;
   }
   // The whole card downloads the file, not just the button.
