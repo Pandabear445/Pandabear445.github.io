@@ -4806,7 +4806,9 @@ function makeEncryptedBackup() {
     const b = await BK.createBackup({ db, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR, outDir: ENC_DIR, tmpDir: BACKUP_TMP });
     let verified;
     try { verified = { ...(await BK.verifyBackup(b.file, BK.loadKey(DATA_DIR), BACKUP_DIR)), at: now() }; } catch (e) { verified = { ok: false, error: e.message, at: now() }; }
-    saveBackupStatus(b.name, { verified });
+    saveBackupStatus(b.name, { verified, missing: b.missing.length });
+    // Files the database refers to that weren't on disk: the backup is still made (see docs/RECOVERY.md), and says so.
+    if (b.missing.length) { console.error(`Backup ${b.name}: ${b.missing.length} file(s) the database refers to were missing: ${b.missing.slice(0, 10).join(', ')}`); auditLog(null, 'backup_files_missing', null, `${b.name}: ${b.missing.length} missing (${b.missing.slice(0, 5).join(', ')}${b.missing.length > 5 ? ', …' : ''})`); }
     if (!verified.ok) { console.error(`Encrypted backup ${b.name} FAILED its restore test: ${verified.error}`); auditLog(null, 'backup_restore_test_failed', null, `${b.name}: ${verified.error}`); return { ...b, verified }; }
     const offsite = await BK.uploadOffsite(b.file);
     if (!offsite.skipped) {
@@ -4831,9 +4833,15 @@ const backupInfo = () => ({ backups: listBackups(), encrypted: listEncBackups(),
   regionCopies: db.prepare('SELECT name, stats FROM regions').all().map((r) => { try { const b = JSON.parse(r.stats || '{}').backup; return b && b.ready ? r.name : null; } catch { return null; } }).filter(Boolean) });
 api.post('/admin/backups', auth, ownerOnly, wrap(async (req, res) => {
   rateLimit('backup:' + req.userId, 6, 3600000);
-  const b = await makeEncryptedBackup();
-  auditLog(req, 'backup_made', null, `${b.name}${b.verified && b.verified.ok ? ', restore test passed' : ', RESTORE TEST FAILED'}`);
-  res.json({ name: b.name, verified: b.verified, offsite: b.offsite, ...backupInfo() });
+  let b;
+  try { b = await makeEncryptedBackup(); } catch (e) {
+    // Nothing is left behind (createBackup removes its .part), and it's never reported as a backup.
+    console.error('Encrypted backup failed:', e.message);
+    auditLog(req, 'backup_failed', null, e.message);
+    fail(500, ['ENOSPC', 'EDQUOT'].includes(e.code) ? 'The backup failed because the disk is full. Nothing was saved. Free some space and try again.' : 'The backup failed. Nothing was saved. The server log says why.', 'backup_failed');
+  }
+  auditLog(req, 'backup_made', null, `${b.name}${b.verified && b.verified.ok ? ', restore test passed' : ', RESTORE TEST FAILED'}${b.missing.length ? `, ${b.missing.length} file(s) missing` : ''}`);
+  res.json({ name: b.name, verified: b.verified, offsite: b.offsite, missing: b.missing, ...backupInfo() });
 }));
 api.post('/admin/backups/:name/verify', auth, ownerOnly, wrap(async (req, res) => {
   rateLimit('backupverify:' + req.userId, 20, 3600000);

@@ -6,6 +6,14 @@ const Database = require('better-sqlite3');
 
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+// A restore that was cut off leaves this marker (see restoreBackup in backup.js). Starting anyway
+// would run on a data folder that may be missing its database or files while looking fine, so refuse, untouched.
+if (fs.existsSync(path.join(DATA_DIR, 'RESTORE-INCOMPLETE'))) {
+  const err = new Error(`The data folder ${DATA_DIR} holds a restore that didn't finish (see ${path.join(DATA_DIR, 'RESTORE-INCOMPLETE')}). `
+    + 'Delete that folder and restore the backup again into a new, empty one (node server/cli.js restore FILE NEW_DATA_DIR).');
+  err.code = 'HEARTH_RESTORE_INCOMPLETE';
+  throw err;
+}
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const DB_FILE = path.join(DATA_DIR, 'hearth.db');
@@ -978,6 +986,10 @@ CREATE INDEX IF NOT EXISTS idx_server_key_reports_user ON server_key_reports(ser
 CREATE INDEX IF NOT EXISTS idx_server_epochs_created ON server_epochs(server_id, created_at);
 `);
 
+// Test hook for the upgrade drill (scripts/upgrade-drill.sh, test/recovery-upgrade.test.js): the process dies here,
+// with every step above done but not committed, exactly like a crash or a power cut in the middle of an upgrade.
+// Only with NODE_ENV=test, so a stray variable on a real server does nothing.
+if (fromVersion < SCHEMA_VERSION && process.env.NODE_ENV === 'test' && process.env.HEARTH_TEST_KILL_IN_MIGRATION === '1') process.kill(process.pid, 'SIGKILL');
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 
