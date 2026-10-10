@@ -284,7 +284,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       const inp = h('input', { class: 'input', type: 'number', min: '0', step: '1', value: String(L[k]), oninput: (e) => { L[k] = e.target.value; } });
       return h('label', { class: 'field' }, h('span', { class: 'field-label' }, label), h('div', { class: 'row gap tight' }, inp, h('span', { class: 'stat-sub' }, 'MB')), hint ? h('span', { class: 'field-hint' }, hint) : null);
     };
-    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji', gif: 'GIF library' };
+    const kinds = { attachment: 'Files in messages', image: 'Pictures (avatars, banners, icons\u2026)', song: 'Profile songs', emoji: 'Emoji', gif: 'GIF library', reserved: 'Uploads in progress' };
+    const report = h('div', { class: 'stack' }, h('p', { class: 'field-hint' }, 'Loading the storage report\u2026'));
+    storageReport(report);
     const words = h('textarea', { class: 'input', rows: '5', placeholder: 'one word or phrase per line' });
     words.value = (st.words || []).join('\n');
     clear(body).append(
@@ -311,6 +313,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', null, `${fmtSize(r.bytes)}${r.quotaMb ? ` / ${r.quotaMb} MB` : ''}`, r.blocked ? h('span', { class: 'badge-tag bad' }, 'Uploads off') : null),
           h('span', { class: 'stat-sub' }, ago(r.last)),
           h('button', { class: 'btn ghost sm', onclick: () => r.user && openUser(r.user.id) }, 'Manage')))),
+      report,
       ...gifSection,
       h('div', { class: 'admin-head' }, h('h3', null, 'Word filter')),
       h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so they can\u2019t be filtered.'),
@@ -319,6 +322,58 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         try { const r = await api('PUT', '/admin/words', { words: words.value }); toast(`Word filter saved (${r.words.length}).`); } catch (e) { toast(e.message, 'error'); }
       } }, 'Save word filter')));
   }
+
+  // Where the space goes (per server, direct messages, uploads in progress) and files nothing uses any more. The
+  // list of leftovers is only a report until "Clean up" (password again, logged); the server works it out again
+  // then, from what the database says is in use, and never deletes a file something still points at.
+  async function storageReport(box) {
+    let r;
+    try { r = await api('GET', `/admin/storage/report?graceHours=${encodeURIComponent(grace)}`); } catch (e) { clear(box).append(h('p', { class: 'form-error' }, e.message)); return; }
+    const o = r.orphans;
+    const graceIn = h('input', { class: 'input', type: 'number', min: '1', step: '1', value: String(grace), style: { width: '90px' } });
+    const clean = h('button', { class: 'btn danger', disabled: !o.count && !o.staleRows && !o.deadBlobRows }, 'Clean up orphans now');
+    clean.onclick = async () => {
+      clean.disabled = true;
+      try {
+        const x = await withPassword((y) => api('POST', '/admin/storage/cleanup', { graceHours: grace, ...y }),
+          { title: 'Clean up unused files', text: `Deletes ${o.count} files (${fmtSize(o.bytes)}) that nothing uses and that are older than ${grace} hours. This can\u2019t be undone.` });
+        if (x) { toast(`Removed ${x.files} files (${fmtSize(x.bytes)}).`); storageReport(box); }
+      } catch (e) { if (!e.cancelled) toast(e.message, 'error'); } finally { clean.disabled = false; }
+    };
+    const serverName = (x) => (x.server.kind === 'group' ? `${x.server.name || 'Group chat'} (group)` : x.server.name || 'Deleted server');
+    clear(box).append(...[
+      h('div', { class: 'admin-head' }, h('h3', null, 'Where the space goes')),
+      h('div', { class: 'stats' },
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'All files'), h('strong', null, fmtSize(r.total.bytes)), h('span', { class: 'stat-sub' }, `${r.total.files} files`)),
+        r.free != null ? h('div', { class: `stat${r.free < 2 * 1024 ** 3 ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Free disk space'), h('strong', null, fmtSize(r.free)), r.diskTotal ? h('span', { class: 'stat-sub' }, `of ${fmtSize(r.diskTotal)}`) : null) : null,
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Direct messages'), h('strong', null, fmtSize(r.dms.bytes)), h('span', { class: 'stat-sub' }, `${r.dms.files} files`)),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploads in progress'), h('strong', null, String(r.uploads.count)), h('span', { class: 'stat-sub' }, `${fmtSize(r.uploads.received)} of ${fmtSize(r.uploads.reserved)} received`)),
+        h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploaded, not posted yet'), h('strong', null, fmtSize(r.pending.bytes)), h('span', { class: 'stat-sub' }, `${r.pending.files} files, removed after a day`)),
+        h('div', { class: `stat${o.count ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Unused files'), h('strong', null, fmtSize(o.bytes)), h('span', { class: 'stat-sub' }, `${o.count} files`))),
+      h('p', { class: 'field-hint' }, 'Files in messages are end-to-end encrypted: the server sees only their sizes and which conversation they were posted in, never their names or contents.'),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Servers using the most space')),
+      r.topServers.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row three head' }, h('span', null, 'Server'), h('span', null, 'Files'), h('span', null, 'Size')),
+        ...r.topServers.map((x) => h('div', { class: 'adm-row three' }, h('strong', null, serverName(x)), h('span', null, String(x.files)), h('span', null, fmtSize(x.bytes)))))
+        : h('p', { class: 'field-hint' }, 'No files in servers yet.'),
+      r.uploads.list.length ? h('div', { class: 'admin-head' }, h('h3', null, 'Uploads in progress')) : null,
+      r.uploads.list.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row three head' }, h('span', null, 'Person'), h('span', null, 'Received'), h('span', null, 'Last activity')),
+        ...r.uploads.list.map((x) => h('div', { class: 'adm-row three' }, userCell(x.user, openUser), h('span', null, `${fmtSize(x.received)} of ${fmtSize(x.size)}`),
+          h('span', { class: 'stat-sub' }, `${ago(x.updatedAt)} \u00b7 expires ${fmtStamp(x.expiresAt)}`)))) : null,
+      h('div', { class: 'admin-head' }, h('h3', null, 'Unused files')),
+      h('p', { class: 'field-hint' }, 'Files nothing points at any more (left behind by crashes, older versions or removed data), plus storage records for files that are already gone. Only files older than the grace period are counted, so uploads that are just being sent are never touched.'),
+      o.unverifiable ? h('p', { class: 'key-bar bad' }, icon('ban'), `${o.unverifiable} older messages couldn\u2019t be opened with this server\u2019s key, so it can\u2019t tell which files they use. Cleanup is off until that\u2019s sorted out.`) : null,
+      o.files.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row three head' }, h('span', null, 'File'), h('span', null, 'Size'), h('span', null, 'Last changed')),
+        ...o.files.slice(0, 20).map((f) => h('div', { class: 'adm-row three' }, h('span', { class: 'mono' }, f.name), h('span', null, fmtSize(f.size)), h('span', { class: 'stat-sub' }, `${ago(f.modifiedAt)}${f.tracked ? '' : ' \u00b7 not counted to anyone'}`))),
+        o.files.length > 20 ? h('div', { class: 'adm-row' }, h('span', { class: 'stat-sub' }, `\u2026and ${o.count - 20} more`)) : null)
+        : h('p', { class: 'field-hint' }, 'No unused files. \uD83C\uDF89'),
+      (o.staleRows || o.deadBlobRows) ? h('p', { class: 'field-hint' }, `${o.staleRows} storage records (${fmtSize(o.staleBytes)}) for files already gone, and ${o.deadBlobRows} attachment records whose message was deleted.`) : null,
+      h('div', { class: 'row gap' }, h('label', { class: 'row gap tight' }, h('span', { class: 'stat-sub' }, 'Grace period'), graceIn, h('span', { class: 'stat-sub' }, 'hours')),
+        h('button', { class: 'btn ghost sm', onclick: () => { grace = Math.max(1, Math.round(+graceIn.value) || 24); storageReport(box); } }, 'Check again'), clean)].filter(Boolean));
+  }
+  let grace = 24;
 
   async function broadcast() {
     const cfg = await api('GET', '/config');

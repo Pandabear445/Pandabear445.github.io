@@ -618,3 +618,280 @@ test('storage-13: backups include finished blobs and never unfinished uploads', 
   } finally { fs.rmSync(out, { recursive: true, force: true }); }
   await as(u, 'DELETE', `/uploads/${s.id}`);
 });
+
+// ------------------------------------------------------------------ storage-14: the real app, in Chromium
+// Runs where Playwright and Chromium are installed (PLAYWRIGHT_MODULE and CHROMIUM_PATH point to them);
+// skipped elsewhere.
+const { pathToFileURL } = require('node:url');
+const PW = process.env.PLAYWRIGHT_MODULE || '/opt/node22/lib/node_modules/playwright/index.mjs';
+const CHROME = process.env.CHROMIUM_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+const havePlaywright = fs.existsSync(PW) && fs.existsSync(CHROME);
+// STORAGE_SHOTS=<folder> saves screenshots of each step, for looking at the UI by eye.
+const shot = (page, name) => (process.env.STORAGE_SHOTS ? page.screenshot({ path: path.join(process.env.STORAGE_SHOTS, `${name}.png`) }) : null);
+async function browserUser(browser, name) {
+  const context = await browser.newContext({ acceptDownloads: true });
+  await context.route('**/*', (route) => (new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort()));
+  const page = await context.newPage();
+  await page.goto(srv.base + '/');
+  await page.click('#to-register');
+  await page.fill('#register-form input[name=username]', name);
+  await page.fill('#register-form input[name=password]', 'correct horse battery');
+  await page.fill('#register-form input[name=confirm]', 'correct horse battery');
+  await page.check('#register-form input[name=tos]');
+  await page.click('#register-form button[type=submit]');
+  await page.waitForSelector('#app:not([hidden]):not(.loading)', { timeout: 60000 });
+  const token = await page.evaluate(() => localStorage.getItem('hearth.token'));
+  const me = (await srv.api('GET', '/bootstrap', { token, ip: '127.0.0.1' })).json.me;
+  return { context, page, token, ip: '127.0.0.1', id: me.id };
+}
+test('storage-14 in Chromium: a 30 MB file uploads with progress, is cancelled halfway, sent again, and the other person downloads the same bytes', { skip: !havePlaywright && 'Playwright not installed' }, async () => {
+  const { chromium } = await import(pathToFileURL(PW).href);
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--proxy-server=direct://'] });
+  const original = crypto.randomBytes(30 * MB);
+  try {
+    assert.equal((await setLimits({ fileMb: 40 })).status, 200);
+    const alice = await browserUser(browser, 'pwalice');
+    const bob = await browserUser(browser, 'pwbob');
+    const server = (await as(alice, 'POST', '/servers', { name: 'Big files' })).json;
+    const channel = server.channels.find((c) => c.type === 'text');
+    const { code } = (await as(alice, 'POST', `/servers/${server.id}/invites`, {})).json;
+    assert.equal((await as(bob, 'POST', `/invites/${code}/join`)).status, 200);
+    for (const u of [alice, bob]) { await u.page.reload(); await u.page.waitForSelector('#app:not([hidden]):not(.loading)'); }
+    // Both apps online: the server key is made and handed to Bob.
+    let epoch = 0;
+    for (let i = 0; i < 300; i++) {
+      epoch = srv.sql('SELECT key_epoch FROM servers WHERE id = ?', server.id)[0].key_epoch;
+      if (epoch > 0 && srv.sql('SELECT COUNT(*) n FROM server_keys WHERE server_id = ? AND epoch = ? AND user_id = ?', server.id, epoch, bob.id)[0].n) break;
+      await sleep(100);
+    }
+    assert.ok(epoch > 0, 'the channel has a key');
+    for (const u of [alice, bob]) await u.page.evaluate((id) => { location.hash = '#c/' + id; }, channel.id);
+    await alice.page.waitForSelector('.composer textarea');
+
+    // Slow the chunks down (like a home connection), so there's time to cancel halfway.
+    let chunks = 0;
+    await alice.context.route('**/api/uploads/*?offset=*', async (route) => { chunks++; await sleep(350); return route.continue(); });
+    await alice.page.setInputFiles('.composer input[type=file]', { name: 'holiday.mov.bin', mimeType: 'application/octet-stream', buffer: original });
+    await alice.page.click('.composer .send-btn');
+    await alice.page.waitForSelector('.upload-status:not([hidden])', { timeout: 30000 });
+    // Real progress: the bar moves and the text counts up.
+    await alice.page.waitForFunction(() => parseFloat(document.querySelector('.upload-status .bar').style.width) >= 25, null, { timeout: 60000 });
+    const progressText = await alice.page.textContent('.upload-status .upload-text');
+    await shot(alice.page, '1-uploading');
+    assert.match(progressText, /Uploading holiday\.mov\.bin .* of 30\.0 MB \(\d+%\)/, progressText);
+    const sessionsMidway = srv.sql('SELECT size, received FROM upload_sessions WHERE user_id = ?', alice.id);
+    assert.equal(sessionsMidway.length, 1, 'a resumable upload is under way');
+    assert.ok(sessionsMidway[0].received > 0 && sessionsMidway[0].received < sessionsMidway[0].size);
+    await alice.page.click('.upload-status .upload-cancel');
+    await alice.page.waitForSelector('.upload-status[hidden]', { state: 'attached', timeout: 20000 });
+    await alice.page.waitForFunction(() => [...document.querySelectorAll('.toast')].some((t) => /Upload cancelled/.test(t.textContent)), null, { timeout: 10000 });
+    assert.ok(await alice.page.isVisible('.pending-name:text("holiday.mov.bin")'), 'the file is back in the box, ready to send again');
+    await shot(alice.page, '2-cancelled');
+    for (let i = 0; i < 50 && srv.sql('SELECT COUNT(*) n FROM upload_sessions WHERE user_id = ?', alice.id)[0].n; i++) await sleep(100);
+    assert.equal(srv.sql('SELECT COUNT(*) n FROM upload_sessions WHERE user_id = ?', alice.id)[0].n, 0, 'cancelling told the server');
+    assert.equal((await as(alice, 'GET', '/me/storage')).json.used, 0, 'and the reserved room is free again');
+    assert.equal(srv.sql('SELECT COUNT(*) n FROM blobs WHERE uploader_id = ?', alice.id)[0].n, 0, 'nothing half-sent became a file');
+    assert.equal(await alice.page.$eval('.composer', (c) => c.querySelectorAll('.msg').length), 0);
+
+    // Send it again, this time to the end. The connection drops once on the way (the third chunk fails): the app
+    // says so, waits, asks the server where it got to, and carries on by itself.
+    const before = chunks;
+    await alice.context.unroute('**/api/uploads/*?offset=*');
+    let puts = 0;
+    await alice.context.route('**/api/uploads/*?offset=*', (route) => (++puts === 3 ? route.abort('connectionreset') : route.continue()));
+    await alice.page.click('.composer .send-btn');
+    await alice.page.waitForSelector('.upload-status.retrying', { timeout: 30000 });
+    assert.match(await alice.page.textContent('.upload-status .upload-text'), /Connection lost\. Trying again in \d+ s/);
+    await shot(alice.page, '2b-retrying');
+    await alice.page.waitForFunction(() => [...document.querySelectorAll('#messages .att-file .att-name')].some((n) => n.textContent === 'holiday.mov.bin'), null, { timeout: 120000 });
+    assert.ok(before >= 2, `chunks were sent before cancelling (${before})`);
+    assert.ok(puts > 8, `the upload carried on after the dropped chunk (${puts} chunk requests)`);
+    const blobs = srv.sql('SELECT b.name, uf.size FROM blobs b JOIN user_files uf ON uf.name = b.name WHERE b.uploader_id = ? AND b.message_id IS NOT NULL', alice.id);
+    assert.equal(blobs.length, 1);
+    assert.equal(blobs[0].size, original.length + 28, 'the ciphertext: 12-byte IV + the file + 16-byte tag');
+    assert.ok(!fs.readFileSync(path.join(srv.dir, 'uploads', blobs[0].name)).includes(original.subarray(0, 64)), 'stored encrypted');
+    assert.equal(srv.sql('SELECT COUNT(*) n FROM upload_sessions WHERE user_id = ?', alice.id)[0].n, 0);
+
+    // Bob sees the file card (name, size, kind) and downloads it: the same bytes.
+    await bob.page.waitForFunction(() => [...document.querySelectorAll('#messages .att-file .att-name')].some((n) => n.textContent === 'holiday.mov.bin'), null, { timeout: 60000 });
+    const card = await bob.page.textContent('#messages .att-file');
+    await shot(bob.page, '3-file-card');
+    assert.match(card, /30\.0 MB/);
+    assert.match(card, /BIN file/);
+    assert.ok(!/Copy link/.test(card), 'no link to copy for an encrypted file');
+    const [dl] = await Promise.all([bob.page.waitForEvent('download', { timeout: 120000 }), bob.page.click('#messages .att-file .btn')]);
+    assert.equal(dl.suggestedFilename(), 'holiday.mov.bin');
+    const saved = path.join(srv.dir, 'bob-download.bin');
+    await dl.saveAs(saved);
+    const got = fs.readFileSync(saved);
+    assert.equal(got.length, original.length);
+    assert.ok(got.equals(original), 'byte for byte the same');
+    fs.rmSync(saved);
+
+    // An admin removes Alice's files (the message stays): after a reload, Bob's download says plainly that the
+    // file is gone, instead of failing with a retry that can never work.
+    assert.equal((await as(owner, 'DELETE', `/admin/users/${alice.id}/files`)).status, 200);
+    assert.equal(await bob.page.evaluate(async (u) => (await fetch(u)).status, '/uploads/' + blobs[0].name), 404);
+    await bob.page.reload(); await bob.page.waitForSelector('#app:not([hidden]):not(.loading)');
+    await bob.page.evaluate((id) => { location.hash = '#c/' + id; }, channel.id);
+    await bob.page.waitForSelector('#messages .att-file .btn', { timeout: 30000 });
+    await bob.page.click('#messages .att-file .btn');
+    await bob.page.waitForSelector('#messages .att-file.gone .att-gone', { timeout: 20000 });
+    assert.match(await bob.page.textContent('#messages .att-file.gone'), /no longer available/);
+    await shot(bob.page, '4-gone');
+  } finally {
+    await browser.close();
+    await setLimits(DEFAULT_LIMITS);
+  }
+});
+
+// A small PNG of one colour (w x h), for the gallery.
+function png(w, h, rgb) {
+  const zlib = require('node:zlib');
+  const { crc32 } = require('../server/imagemeta');
+  const chunk = (type, data) => {
+    const head = Buffer.alloc(8); head.writeUInt32BE(data.length, 0); head.write(type, 4, 'latin1');
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), data])), 0);
+    return Buffer.concat([head, data, crc]);
+  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(w * 3).map((_, i) => rgb[i % 3])]);
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(Buffer.concat(Array(h).fill(row)))), chunk('IEND', Buffer.alloc(0))]);
+}
+test('storage-15 in Chromium: pictures open in a gallery with next/previous, videos and songs play from decrypted copies, big videos wait for a click', { skip: !havePlaywright && 'Playwright not installed' }, async () => {
+  const { chromium } = await import(pathToFileURL(PW).href);
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--proxy-server=direct://'] });
+  try {
+    const alice = await browserUser(browser, 'pwmedia1');
+    const bob = await browserUser(browser, 'pwmedia2');
+    const server = (await as(alice, 'POST', '/servers', { name: 'Gallery' })).json;
+    const channel = server.channels.find((c) => c.type === 'text');
+    const { code } = (await as(alice, 'POST', `/servers/${server.id}/invites`, {})).json;
+    assert.equal((await as(bob, 'POST', `/invites/${code}/join`)).status, 200);
+    for (const u of [alice, bob]) { await u.page.reload(); await u.page.waitForSelector('#app:not([hidden]):not(.loading)'); }
+    for (let i = 0; i < 300; i++) {
+      const epoch = srv.sql('SELECT key_epoch FROM servers WHERE id = ?', server.id)[0].key_epoch;
+      if (epoch > 0 && srv.sql('SELECT COUNT(*) n FROM server_keys WHERE server_id = ? AND epoch = ? AND user_id = ?', server.id, epoch, bob.id)[0].n) break;
+      await sleep(100);
+    }
+    for (const u of [alice, bob]) await u.page.evaluate((id) => { location.hash = '#c/' + id; }, channel.id);
+    await alice.page.waitForSelector('.composer textarea');
+    const files = [
+      { name: 'red.png', mimeType: 'image/png', buffer: png(40, 30, [220, 30, 30]) },
+      { name: 'green.png', mimeType: 'image/png', buffer: png(30, 40, [30, 200, 30]) },
+      { name: 'blue.png', mimeType: 'image/png', buffer: png(50, 20, [30, 30, 220]) },
+      { name: 'clip.webm', mimeType: 'video/webm', buffer: crypto.randomBytes(200 * 1024) },
+      { name: 'song.mp3', mimeType: 'audio/mpeg', buffer: crypto.randomBytes(100 * 1024) },
+      { name: 'notes.pdf', mimeType: 'application/pdf', buffer: crypto.randomBytes(5000) },
+    ];
+    await alice.page.setInputFiles('.composer input[type=file]', files);
+    await alice.page.click('.composer .send-btn');
+    await alice.page.waitForFunction(() => document.querySelectorAll('#messages .att-img').length === 3, null, { timeout: 60000 });
+    // A big video in its own message: it waits for a click instead of downloading 21 MB by itself.
+    const big = crypto.randomBytes(21 * MB);
+    await alice.page.setInputFiles('.composer input[type=file]', { name: 'long.mp4', mimeType: 'video/mp4', buffer: big });
+    await alice.page.click('.composer .send-btn');
+
+    const p = bob.page;
+    await p.waitForFunction(() => [...document.querySelectorAll('#messages .att-img')].filter((i) => i.src.startsWith('blob:')).length === 3, null, { timeout: 60000 });
+    await p.waitForFunction(() => { const v = document.querySelector('#messages video.att-video:not([hidden])'); return v && v.src.startsWith('blob:'); }, null, { timeout: 30000 });
+    await p.waitForFunction(() => { const a = document.querySelector('#messages audio.att-audio'); return a && a.src.startsWith('blob:'); }, null, { timeout: 30000 });
+    const fileCard = await p.textContent('#messages .att-file');
+    assert.match(fileCard, /notes\.pdf/); assert.match(fileCard, /PDF document/); assert.match(fileCard, /4\.9 KB/);
+    // The decrypted pictures are the real ones (decoded at their sizes).
+    const sizes = await p.$$eval('#messages .att-img', (els) => els.map((e) => [e.naturalWidth, e.naturalHeight]));
+    assert.deepEqual(sizes, [[40, 30], [30, 40], [50, 20]]);
+    await shot(p, '5-media');
+
+    // The gallery: opens on the clicked picture, next/previous with the arrow keys and buttons, wraps around.
+    await p.click('#messages .att-img >> nth=1');
+    await p.waitForSelector('.viewer');
+    const where = () => p.textContent('.viewer-count');
+    assert.equal(await where(), '2 / 3');
+    assert.equal(await p.textContent('.viewer-name'), 'green.png');
+    await p.keyboard.press('ArrowRight');
+    assert.equal(await where(), '3 / 3');
+    assert.equal(await p.textContent('.viewer-name'), 'blue.png');
+    await p.keyboard.press('ArrowRight');
+    assert.equal(await where(), '1 / 3');
+    await p.click('.viewer-nav.prev');
+    assert.equal(await where(), '3 / 3');
+    await p.waitForFunction(() => document.querySelector('.viewer-img').src.startsWith('blob:'));
+    await shot(p, '6-gallery');
+    await p.keyboard.press('Escape');
+    await p.waitForSelector('.viewer', { state: 'detached' });
+
+    // The big video: a "Play video · 21.0 MB" button, nothing downloaded until it's pressed.
+    await p.waitForSelector('#messages .att-play', { timeout: 60000 });
+    assert.match(await p.textContent('#messages .att-play'), /Play video · 21\.0 MB/);
+    const name = srv.sql("SELECT b.name FROM blobs b JOIN user_files uf ON uf.name = b.name WHERE b.uploader_id = ? AND uf.size > ?", alice.id, 20 * MB)[0].name;
+    const fetched = await p.evaluate((n) => performance.getEntriesByType('resource').filter((e) => e.name.includes(n)).length, name);
+    assert.equal(fetched, 0, 'not downloaded by itself');
+    await p.click('#messages .att-play');
+    await p.waitForFunction(() => [...document.querySelectorAll('#messages video.att-video')].filter((v) => v.src.startsWith('blob:')).length === 2, null, { timeout: 60000 });
+    await shot(p, '7-big-video');
+
+    // Settings → Storage (Alice): her biggest files by name (taken from the messages her app can open), sizes, where.
+    const a = alice.page;
+    await a.click('#user-panel button[aria-label="Settings"]');
+    await a.click('.set-nav-btn:has-text("Security")');
+    await a.click('.set-subtab:text-is("Storage")');
+    await a.waitForFunction(() => [...document.querySelectorAll('.file-row-name')].some((n) => n.textContent === 'long.mp4'), null, { timeout: 20000 })
+      .catch(async (e) => { await shot(a, '8-settings-storage-failed'); console.log(await a.$$eval('.file-row-text', (els) => els.map((x) => x.textContent))); throw e; });
+    const rows = await a.$$eval('.file-row-text', (els) => els.map((e) => e.textContent));
+    assert.match(rows[0], /^long\.mp4.*21\.0 MB.*#general · Gallery/, rows[0]);
+    assert.ok(rows.some((r) => r.startsWith('clip.webm')), rows.join('\n'));
+    await shot(a, '8-settings-storage');
+    await a.keyboard.press('Escape');
+
+    // Admin → Security → Storage & limits: the report, with the per-server list.
+    assert.equal((await as(owner, 'PUT', '/admin/staff', { userId: alice.id, role: 'admin', authKey: owner.authKey })).status, 200);
+    await a.reload(); await a.waitForSelector('#app:not([hidden]):not(.loading)');
+    await a.click('.rail-btn[aria-label="Admin"]');
+    await a.click('.admin-tab:has-text("Security"), button:has-text("Security") >> nth=0');
+    await a.click('.set-subtab:has-text("Storage & limits")');
+    await a.waitForSelector('h3:has-text("Where the space goes")', { timeout: 20000 });
+    const adminText = await a.textContent('.admin-body, main, body');
+    assert.match(adminText, /Servers using the most space/);
+    assert.match(adminText, /Gallery/);
+    assert.match(adminText, /Clean up orphans now/);
+    await a.locator('h3:has-text("Where the space goes")').scrollIntoViewIfNeeded();
+    await shot(a, '9-admin-storage');
+  } finally {
+    await browser.close();
+  }
+});
+
+// ------------------------------------------------------------------ storage-16: the app's file helpers
+test('storage-16: the decrypted-file cache revokes old copies once over budget; file kinds and labels', async () => {
+  globalThis.localStorage = globalThis.localStorage || { getItem: () => null, setItem() {}, removeItem() {} };
+  const F = await import(pathToFileURL(path.join(ROOT, 'public', 'js', 'files.js')).href);
+  const { resolveObjectURL } = require('node:buffer');
+  const c = F.makeUrlCache(1000);
+  const a = c.put('a', new Blob([Buffer.alloc(400)]));
+  const b = c.put('b', new Blob([Buffer.alloc(400)]));
+  assert.ok(resolveObjectURL(a) && resolveObjectURL(b));
+  assert.equal(c.get('a'), a, 'a is now the most recently used');
+  const d = c.put('d', new Blob([Buffer.alloc(400)]));
+  assert.equal(c.get('b'), null, 'the least recently used went');
+  assert.equal(resolveObjectURL(b), undefined, '…and its memory was released');
+  assert.ok(resolveObjectURL(a) && resolveObjectURL(d));
+  assert.equal(c.size, 800);
+  c.drop('a');
+  assert.equal(resolveObjectURL(a), undefined);
+  c.release();
+  assert.equal(resolveObjectURL(d), undefined);
+  assert.equal(c.count, 0);
+
+  assert.equal(F.mediaKind('image/png'), 'img');
+  assert.equal(F.mediaKind('video/mp4'), 'video');
+  assert.equal(F.mediaKind('audio/mpeg'), 'audio');
+  assert.equal(F.mediaKind('', 'clip.mp4'), 'video', 'older entries without a type');
+  for (const t of ['text/html', 'application/pdf', '', 'application/octet-stream']) assert.equal(F.mediaKind(t, 'x.bin'), null, t);
+  assert.equal(F.typeLabel('application/pdf', 'a.PDF'), 'PDF document');
+  assert.equal(F.typeLabel('', 'archive.zip'), 'ZIP archive');
+  assert.equal(F.typeLabel('application/octet-stream', 'blob.xyz'), 'XYZ file');
+  assert.equal(F.typeLabel('', 'noext'), 'File');
+  assert.equal(F.CHUNKED_ABOVE, 8 * MB);
+  assert.equal(await F.sha256Hex(Buffer.from('abc')), sha(Buffer.from('abc')));
+});

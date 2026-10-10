@@ -74,7 +74,7 @@ const TAB_GROUPS = [
 ];
 const SUBTABS = {
   profile: [['profile', 'Profile card'], ['page', 'Profile page'], ['activity', 'Games & music']],
-  account: [['account', 'Security & storage'], ['sessions', 'Signed-in devices']],
+  account: [['account', 'Security & storage'], ['storage', 'Storage'], ['sessions', 'Signed-in devices']],
   appearance: [['appearance', 'Theme'], ['layout', 'Layout']],
 };
 const parentTab = (k) => Object.keys(SUBTABS).find((p) => SUBTABS[p].some(([s]) => s === k)) || k;
@@ -139,8 +139,8 @@ export function openSettings(app, tab = 'profile') {
         class: `set-subtab${k === current ? ' active' : ''}`, role: 'tab', 'aria-selected': String(k === current), onclick: () => go(k),
       }, label))));
     }
-    const views = { study: studyTab, keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
-    content.append(views[current](app, (d) => { dirty = d; }));
+    const views = { study: studyTab, keybinds: keybindsTab, activity: activityTab, page: pageEditorTab, instance: instanceTab, apps: appsTab, layout: layoutTab, profile: profileTab, account: accountTab, storage: storageTab, sessions: sessionsTab, voice: voiceTab, appearance: appearanceTab, chat: chatTab, notifications: notificationsTab, privacy: privacyTab, servers: serversTab };
+    content.append(views[current](app, (d) => { dirty = d; }, go));
     content.scrollTop = 0;
   };
   draw();
@@ -402,7 +402,7 @@ function profileTab(app, setDirty) {
 }
 
 // ------------------------------------------------------------------ account tab
-function accountTab(app) {
+function accountTab(app, setDirty, go) {
   const S = app.S;
   const fp = h('code', { class: 'fingerprint' }, '…');
   E2EE.keyFingerprint(S.me).then((f) => { fp.textContent = f; }).catch(() => { fp.textContent = 'Unavailable'; });
@@ -440,14 +440,15 @@ function accountTab(app) {
     const MB = 1024 * 1024;
     const mb = (b) => `${(b / MB).toFixed(b < 10 * MB ? 1 : 0)} MB`;
     const pct = q.quotaMb ? Math.min(100, (q.used / (q.quotaMb * MB)) * 100) : 0;
-    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji', gif: 'GIF library' };
-    clear(storage).append(
+    const kinds = { attachment: 'Files in messages', image: 'Pictures', song: 'Songs', emoji: 'Emoji', gif: 'GIF library', reserved: 'Uploads in progress' };
+    clear(storage).append(...[
       q.blocked ? h('p', { class: 'key-bar bad' }, icon('ban'), 'An admin has turned off uploads for your account.') : null,
       h('div', { class: 'kv' }, h('span', null, 'Used'), h('strong', null, q.quotaMb ? `${mb(q.used)} of ${q.quotaMb} MB` : `${mb(q.used)} (no limit)`)),
       q.quotaMb ? h('div', { class: `storage-bar${pct > 90 ? ' warn' : ''}` }, h('i', { style: { width: `${pct}%` } })) : null,
       h('div', { class: 'kv' }, h('span', null, 'Uploaded today'), h('strong', null, q.dailyMb ? `${mb(q.today)} of ${q.dailyMb} MB` : mb(q.today))),
       h('div', { class: 'kv' }, h('span', null, 'Largest file'), h('strong', null, `${q.fileMb} MB (pictures ${q.imageMb} MB, songs ${q.songMb} MB)`)),
-      ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))));
+      ...q.byKind.map((k) => h('div', { class: 'kv' }, h('span', null, kinds[k.kind] || k.kind), h('span', null, `${k.files} \u00b7 ${mb(k.bytes)}`))),
+      go ? h('button', { class: 'btn ghost sm', onclick: () => go('storage') }, 'See your biggest files') : null].filter(Boolean));
   }).catch((e) => clear(storage).append(h('p', { class: 'form-error' }, e.message)));
 
   // Change your display name: what people see in chats and member lists (doesn't have to be unique).
@@ -1276,6 +1277,73 @@ const agoText = (t) => {
   return new Date(t).toLocaleDateString();
 };
 const ENDED = { logged_out: 'Logged out', revoked: 'Signed out from another device', password_changed: 'Signed out: password changed', password_reset: 'Signed out: password reset', '2fa_enabled': 'Signed out: two-factor turned on', staff: 'Signed out by a server admin', suspended: 'Signed out: account suspended', expired: 'Expired', signed_out: 'Signed out' };
+// Settings → Storage: how much room you use, your biggest files and uploads that haven't finished.
+// The server knows only sizes, dates and where a file was posted. Names come from the encrypted messages, so
+// they're shown for files in conversations this device can open (and "Encrypted file" otherwise).
+function storageTab(app) {
+  const MB = 1024 * 1024;
+  const size = (b) => (b < MB ? `${Math.max(1, Math.round(b / 1024))} KB` : b < 1024 * MB ? `${(b / MB).toFixed(1)} MB` : `${(b / 1024 / MB).toFixed(2)} GB`);
+  const summary = h('div', { class: 'stack' }, h('span', { class: 'field-hint' }, 'Loading\u2026'));
+  const files = h('div', { class: 'stack' });
+  const uploads = h('div', { class: 'stack' });
+  const KIND = { image: 'Picture', song: 'Profile song', emoji: 'Emoji', gif: 'GIF library' };
+  const where = (f) => {
+    const w = f.where;
+    if (!w) return KIND[f.kind] || 'File';
+    if (w.type === 'unsent') return 'Uploaded, not sent (removed after a day)';
+    if (w.type === 'dm') return 'In a direct message';
+    const s = (app.S.servers || []).find((x) => x.id === w.serverId);
+    const c = s && (s.channels || []).find((x) => x.id === w.channelId);
+    return s ? (s.kind === 'group' ? 'In a group chat' : `In #${c ? c.name : 'a channel'} \u00b7 ${s.name}`) : 'In a server you\u2019ve left';
+  };
+  async function load() {
+    let q; let mine;
+    try { [q, mine] = await Promise.all([api('GET', '/me/storage'), api('GET', '/me/storage/files')]); } catch (e) { clear(summary).append(h('p', { class: 'form-error' }, e.message)); return; }
+    const pct = q.quotaMb ? Math.min(100, (q.used / (q.quotaMb * MB)) * 100) : 0;
+    // (Element.append would print a null as "null": h() skips them.)
+    clear(summary).append(...[
+      q.blocked ? h('p', { class: 'key-bar bad' }, icon('ban'), 'An admin has turned off uploads for your account.') : null,
+      h('div', { class: 'kv' }, h('span', null, 'Used'), h('strong', null, q.quotaMb ? `${size(q.used)} of ${q.quotaMb} MB` : `${size(q.used)} (no limit)`)),
+      q.quotaMb ? h('div', { class: `storage-bar${pct > 90 ? ' warn' : ''}` }, h('i', { style: { width: `${pct}%` } })) : null,
+      h('div', { class: 'kv' }, h('span', null, 'Uploaded today'), h('strong', null, q.dailyMb ? `${size(q.today)} of ${q.dailyMb} MB` : size(q.today))),
+      h('div', { class: 'kv' }, h('span', null, 'Largest file'), h('strong', null, `${q.fileMb} MB`))].filter(Boolean));
+    clear(files);
+    if (!mine.files.length) files.append(h('p', { class: 'field-hint' }, 'You haven\u2019t uploaded anything yet.'));
+    const rows = mine.files.map((f) => {
+      const name = h('strong', { class: 'file-row-name' }, f.kind === 'attachment' ? 'Encrypted file' : (KIND[f.kind] || 'File'));
+      const show = f.where && f.where.messageId ? h('button', { class: 'btn ghost sm', onclick: () => { app.showMessage(f.where); } }, 'Show') : null;
+      files.append(h('div', { class: 'file-row' }, icon(f.kind === 'attachment' ? 'lock' : 'image'),
+        h('span', { class: 'file-row-text' }, name, h('span', { class: 'field-hint' }, `${size(f.size)} \u00b7 ${new Date(f.createdAt).toLocaleDateString()} \u00b7 ${where(f)}`)), show));
+      return { f, name };
+    });
+    // Names, a few at a time (each may need its message fetched and opened).
+    (async () => {
+      for (const { f, name } of rows.filter((r) => r.f.kind === 'attachment').slice(0, 25)) {
+        try {
+          const info = await app.fileInfo(f.url, f.where);
+          if (info && info.name) name.textContent = info.preview ? `${info.name} (preview)` : info.name;
+        } catch { /* left as "Encrypted file" */ }
+      }
+    })();
+    clear(uploads);
+    if (!mine.uploads.length) uploads.append(h('p', { class: 'field-hint' }, 'None right now.'));
+    mine.uploads.forEach((u) => uploads.append(h('div', { class: 'file-row' }, icon('download'),
+      h('span', { class: 'file-row-text' }, h('strong', null, `${size(u.received)} of ${size(u.size)}`),
+        h('span', { class: 'field-hint' }, `Started ${new Date(u.createdAt).toLocaleString()} \u00b7 removed if nothing more arrives by ${new Date(u.expiresAt).toLocaleString()}`)),
+      h('button', { class: 'btn ghost sm danger-text', onclick: async () => {
+        try { await api('DELETE', `/uploads/${encodeURIComponent(u.id)}`); toast('Upload cancelled. Its room is free again.'); load(); } catch (e) { toast(e.message, 'error'); }
+      } }, 'Cancel'))));
+  }
+  load();
+  return h('div', { class: 'set-form narrow' },
+    h('h2', { class: 'set-title' }, 'Storage'),
+    section('Your storage', summary),
+    section('Biggest files', h('p', { class: 'muted-p' }, 'Your files are end-to-end encrypted: the server knows their sizes but not their names. Names show here for files in conversations this device can open.'), files),
+    section('Uploads in progress', h('p', { class: 'muted-p' }, 'Big files go up in pieces, so a dropped connection doesn\u2019t start them over. Unfinished ones are removed after a day without progress.'), uploads),
+    section('What happens to your files',
+      h('p', { class: 'muted-p' }, 'Deleting a message deletes its files straight away. So does deleting a server or group, for every message in it. When you leave a server, the files you posted stay there for the others. Deleting your account removes your profile pictures and song; the messages you sent stay (still encrypted), with their files.')));
+}
+
 function sessionsTab(app) {
   const list = h('div', { class: 'stack' }, h('span', { class: 'spinner' }));
   const ended = h('div', { class: 'stack' });

@@ -11,6 +11,7 @@ import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
 import { prepareImage, makeQueue, whenVisible } from './media.js';
 import { isUploadUrl, safeDownloadHref } from './attachments.js';
+import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, mediaKind, typeLabel } from './files.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
 import { createSecure } from './secure.js';
@@ -134,6 +135,8 @@ export const app = {
   unblock: (id) => toggleBlock(id, false),
   openAdmin: () => setView({ type: 'admin', tab: 'overview' }),
   study: () => study,
+  fileInfo: (url, where) => fileInfo(url, where),
+  showMessage: (where) => (where && where.messageId ? jumpToMessage(where.type === 'dm' ? 'd:' + where.dmId : 'c:' + where.channelId, where.messageId) : null),
 };
 
 // ======================================================================= boot
@@ -363,6 +366,7 @@ async function logout() {
   if (voice) await voice.leave().catch(() => {});
   setToken('');
   localStorage.removeItem('hearth.userId');
+  fileUrls.release(); // decrypted files in memory
   sec.reset();
   await E2EE.clearKeys();
   location.href = '/';
@@ -2500,6 +2504,22 @@ async function jumpToMessage(key, id) {
   const again = $(`#messages [data-mid="${id}"]`);
   if (again) flash(again); else toast('That message was deleted.');
 }
+// Settings → Storage: the name and type of one of your files. The server only knows sizes and where it was posted;
+// the name is inside the encrypted message, so it comes from a message this app has open, or fetches and opens now.
+async function fileInfo(url, where) {
+  const look = (list) => {
+    for (const m of list || []) for (const f of filesOf(m)) { if (f.url === url) return f; if (f.th && f.th.url === url) return { ...f, preview: true }; }
+    return null;
+  };
+  for (const st of Object.values(S.msgs)) { const f = look(st.list); if (f) return f; }
+  const key = where && where.messageId ? (where.type === 'dm' ? 'd:' + where.dmId : where.type === 'channel' ? 'c:' + where.channelId : null) : null;
+  if (!key) return null;
+  const res = await api('GET', `${msgUrl(key)}?around=${encodeURIComponent(where.messageId)}`);
+  const m = (res.messages || []).find((x) => x.id === where.messageId);
+  if (!m) return null;
+  await decryptMessage(m);
+  return look([m]);
+}
 async function jumpToMessageId(id) {
   try {
     const loc = await api('GET', `/messages/${id}/locate`);
@@ -2623,41 +2643,74 @@ function openForward(m) {
 }
 
 // ======================================================================= attachments + media viewer
-const blobCache = new Map();
-function decryptedUrl(m, f) {
-  if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn\u2019t on this server.'));
-  if (!blobCache.has(f.url)) {
+// Decrypted files are blob: URLs, kept in a bounded cache (files.js makeUrlCache) so a long session full of
+// photos and videos doesn't keep every one in memory: the least recently used are revoked once they're off screen.
+const fileUrls = makeUrlCache();
+const fileJobs = new Map(); // url -> { job, listeners }: downloads in progress, shared by everyone asking
+const AUTOLOAD_MAX = 20 * 1024 * 1024; // bigger videos and songs wait for a click instead of downloading by themselves
+function decryptedUrl(m, f, { onProgress } = {}) {
+  if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn’t on this server.'));
+  const ready = fileUrls.get(f.url);
+  if (ready) return Promise.resolve(ready);
+  if (!fileJobs.has(f.url)) {
+    const listeners = new Set();
     const job = (async () => {
-      const res = await fetch(f.url).catch(() => { throw new Error('Couldn\u2019t reach the server. Check your connection and try again.'); });
-      if (res.status === 404) throw new Error('This file was deleted.');
-      if (!res.ok) throw new Error(`The server couldn\u2019t send this file (${res.status}). Try again in a moment.`);
-      const plain = await sec.decryptAttachment(m, f, await res.arrayBuffer());
-      return URL.createObjectURL(new Blob([plain], { type: f.type || 'application/octet-stream' }));
+      // f.size is the plain size; the ciphertext adds a 12-byte IV and a 16-byte tag.
+      const buf = await download(f.url, { expected: f.size ? f.size + 28 : 0, onProgress: (x) => listeners.forEach((fn) => fn(x)) });
+      const plain = await sec.decryptAttachment(m, f, buf);
+      return fileUrls.put(f.url, new Blob([plain], { type: f.type || 'application/octet-stream' }));
     })();
-    blobCache.set(f.url, job);
+    fileJobs.set(f.url, { job, listeners });
     // A failed try isn't remembered: the next click fetches again instead of failing straight away.
-    job.catch(() => { if (blobCache.get(f.url) === job) blobCache.delete(f.url); });
+    job.then(() => fileJobs.delete(f.url), () => fileJobs.delete(f.url));
   }
-  return blobCache.get(f.url);
+  const entry = fileJobs.get(f.url);
+  if (onProgress) entry.listeners.add(onProgress);
+  return entry.job;
 }
+function forgetFile(...urls) { urls.forEach((u) => { if (u) fileUrls.drop(u); }); }
 function fileIcon(type, name) {
   if (/^image\//.test(type)) return 'image';
   if (/pdf|text|document|msword|sheet|presentation/.test(type) || /\.(pdf|txt|md|docx?|xlsx?|pptx?|csv)$/i.test(name)) return 'file';
   return 'file';
 }
+const goneText = 'This file is no longer available';
 async function downloadAttachment(m, f, btn) {
   if (btn && btn.disabled) return;
+  const label = btn && !btn.classList.contains('att-dl') ? btn.lastChild : null;
+  const before = label && label.nodeType === 3 ? label.textContent : null;
   if (btn) { btn.disabled = true; btn.classList.add('busy'); }
   try {
     const enc = !!f.k || !!m.dmId;
+    // Big files show how far the download has got on the button.
+    const onProgress = before != null && (f.size || 0) > 2 * 1024 * 1024 ? (x) => { label.textContent = `${Math.round(x * 100)}%`; } : null;
     // Only ever a decrypted copy or a file on this server: never a jump to another site.
-    const href = safeDownloadHref(enc ? await decryptedUrl(m, f) : f.url, location.origin);
-    if (!href) throw new Error('This file isn\u2019t on this server.');
+    const href = safeDownloadHref(enc ? await decryptedUrl(m, f, { onProgress }) : f.url, location.origin);
+    if (!href) throw new Error('This file isn’t on this server.');
     const a = h('a', { href, download: f.name || 'file' });
     document.body.append(a); a.click(); a.remove();
   } catch (e) {
-    toast(`Couldn\u2019t download ${f.name || 'the file'}: ${e.message}`, 'error');
-  } finally { if (btn) { btn.disabled = false; btn.classList.remove('busy'); } }
+    if (e.code === 'gone') {
+      const card = btn && btn.closest('.att-file, .att-media');
+      if (card) markGone(card);
+      toast(`${f.name || 'This file'} is no longer available.`, 'error');
+    } else toast(`Couldn’t download ${f.name || 'the file'}: ${e.message}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
+    if (before != null) label.textContent = before;
+  }
+}
+// A file that was deleted (with its message, its server, or by an admin) says so plainly, instead of a retry
+// button that can never work.
+function markGone(card) {
+  card.classList.remove('loading', 'locked', 'failed');
+  card.classList.add('gone');
+  card.querySelectorAll('.att-retry, .att-dl, .att-play, img, video, audio').forEach((x) => x.remove());
+  const btn = card.querySelector('.btn');
+  if (btn) btn.remove();
+  if (card.querySelector('.att-gone')) return;
+  const text = card.querySelector('.att-file-text');
+  if (text) text.append(h('span', { class: 'att-gone' }, goneText)); else card.append(h('div', { class: 'att-gone' }, icon('file', 'ic'), goneText));
 }
 // A small "Download" button on photos, videos and audio, which otherwise have no way to save them.
 function mediaDownloadBtn(m, f) {
@@ -2669,11 +2722,11 @@ const loadQueue = makeQueue(3);
 function attachmentEl(f, m) {
   // Unencrypted entries (older messages) load straight from this server; anything else was dropped when the
   // message was decrypted (see attachments.js), and is refused here too.
-  const direct = () => (isUploadUrl(f.url) ? Promise.resolve(f.url) : Promise.reject(new Error('This file isn\u2019t on this server.')));
+  const direct = () => (isUploadUrl(f.url) ? Promise.resolve(f.url) : Promise.reject(new Error('This file isn’t on this server.')));
   if (f.voice) return voiceEl(f, () => ((f.k || m.dmId) ? decryptedUrl(m, f) : direct()));
   const enc = !!f.k || !!m.dmId;
   const type = f.type || '';
-  const media = /^image\//.test(type) ? 'img' : /^video\//.test(type) ? 'video' : /^audio\//.test(type) ? 'audio' : null;
+  const media = mediaKind(type, f.name);
   if (media) {
     const el = media === 'img'
       ? h('img', { class: 'att-img', alt: f.name || 'Image', tabindex: '0', role: 'button', 'aria-label': `Open ${f.name || 'image'}` })
@@ -2686,38 +2739,61 @@ function attachmentEl(f, m) {
       holder.style.aspectRatio = `${f.w} / ${f.h}`;
       holder.classList.add('sized');
     }
-    const full = () => (enc ? decryptedUrl(m, f) : direct());
+    const meter = h('div', { class: 'att-meter', hidden: true }, h('i'));
+    const onProgress = (x) => { meter.hidden = x >= 1; meter.firstChild.style.width = `${Math.round(x * 100)}%`; };
+    const full = () => (enc ? decryptedUrl(m, f, { onProgress }) : direct());
     if (media === 'img') {
       el._full = full;
       el.addEventListener('click', () => openViewer(el, { name: f.name, download: () => downloadAttachment(m, f) }));
       el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.click(); });
     }
-    if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
-    holder.append(mediaDownloadBtn(m, f));
+    if (media === 'audio') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name, h('span', { class: 'att-size' }, fmtSize(f.size || 0))));
+    holder.append(meter, mediaDownloadBtn(m, f));
     // Load only when it scrolls near the screen, a few at a time; images show the small thumbnail first.
     const load = () => {
       holder.classList.add('loading');
       const want = media === 'img' && f.th ? () => decryptedUrl(m, { ...f.th, type: 'image/webp' }) : full;
       loadQueue(want).then((u) => { el.src = u; holder.classList.remove('locked', 'loading', 'failed'); })
-        .catch(() => {
-          holder.classList.remove('loading'); holder.classList.add('failed');
-          const again = h('button', { class: 'att-retry', onclick: (e) => { e.stopPropagation(); again.remove(); blobCache.delete(f.url); if (f.th) blobCache.delete(f.th.url); load(); } }, icon('arrowDown'), 'Couldn\u2019t load \u2014 tap to retry');
+        .catch((e) => {
+          holder.classList.remove('loading');
+          if (e && e.code === 'gone') return markGone(holder);
+          holder.classList.add('failed');
+          const again = h('button', { class: 'att-retry', onclick: (ev) => { ev.stopPropagation(); again.remove(); load(); } }, icon('arrowDown'), 'Couldn’t load — tap to retry');
           holder.append(again);
         });
     };
-    if (enc || f.th || !isUploadUrl(f.url)) whenVisible(holder, load); else el.src = f.url;
+    // Big videos and songs wait for a click (with the size on the button), then download with a progress bar.
+    if (enc && media !== 'img' && (f.size || 0) > AUTOLOAD_MAX) {
+      holder.classList.remove('locked');
+      holder.classList.add('click-to-load');
+      el.hidden = true;
+      const play = h('button', { class: 'att-play', type: 'button', onclick: (e) => {
+        e.stopPropagation(); play.remove(); el.hidden = false; holder.classList.remove('click-to-load');
+        loadQueue(full, { front: true }).then((u) => { el.src = u; if (media === 'video') el.play().catch(() => {}); })
+          .catch((err) => { if (err && err.code === 'gone') markGone(holder); else { toast(err.message, 'error'); holder.append(play); el.hidden = true; holder.classList.add('click-to-load'); } });
+      } }, icon(media === 'video' ? 'play' : 'music'), h('span', null, `${media === 'video' ? 'Play video' : 'Play audio'} · ${fmtSize(f.size)}`));
+      holder.append(play);
+      if (media === 'video') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
+    } else if (enc || f.th || !isUploadUrl(f.url)) whenVisible(holder, load); else el.src = f.url;
     return holder;
   }
-  // The whole card downloads the file, not just the button.
+  // Anything the app can't show: a card with the name, size and kind of file. The whole card downloads it.
   const btn = h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => { e.stopPropagation(); downloadAttachment(m, f, btn); } }, icon('download'), 'Download');
+  // Only files stored as they are (older, unencrypted messages) have a link worth sharing: an encrypted file's
+  // address leads to scrambled bytes, and its key is only in the message.
+  const link = !enc && isUploadUrl(f.url)
+    ? h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => { e.stopPropagation(); copyText(new URL(f.url, location.origin).href); toast('Link copied.'); } }, icon('link'), 'Copy link') : null;
   return h('div', { class: 'att-file', title: `Download ${f.name || 'file'}`, onclick: () => downloadAttachment(m, f, btn) },
     h('span', { class: 'att-file-badge' }, icon(fileIcon(type, f.name || ''), 'ic'), h('span', null, ((f.name || '').split('.').pop() || 'file').slice(0, 4).toUpperCase())),
-    h('div', { class: 'att-file-text' }, h('span', { class: 'att-name', title: f.name }, f.name || 'file'), h('span', { class: 'att-size' }, fmtSize(f.size || 0), enc ? h('span', { class: 'att-enc' }, icon('lock', 'ic'), 'Encrypted') : null)),
-    btn);
+    h('div', { class: 'att-file-text' }, h('span', { class: 'att-name', title: f.name }, f.name || 'file'),
+      h('span', { class: 'att-size' }, fmtSize(f.size || 0), h('span', { class: 'att-kind' }, typeLabel(type, f.name || '')), enc ? h('span', { class: 'att-enc' }, icon('lock', 'ic'), 'Encrypted') : null)),
+    link, btn);
 }
 
 function openViewer(fromImg, { name, download } = {}) {
-  const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src);
+  // Every picture in the conversation loaded so far, including those not scrolled into view yet (they load as
+  // you reach them here).
+  const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src || i._full);
   let idx = Math.max(0, imgs.indexOf(fromImg));
   let scale = 1; let tx = 0; let ty = 0;
   const img = h('img', { class: 'viewer-img', alt: '' });
@@ -2728,9 +2804,14 @@ function openViewer(fromImg, { name, download } = {}) {
   const show = (i) => {
     idx = (i + imgs.length) % imgs.length;
     const src = imgs[idx];
-    img.src = src.src; // thumbnail (instant)…
+    if (src.src) img.src = src.src; // thumbnail (instant)…
+    else img.removeAttribute('src');
     stage.classList.add('loading-full');
-    if (src._full) src._full().then((u) => { if (imgs[idx] === src) { img.src = u; } }).catch(() => {}).finally(() => stage.classList.remove('loading-full'));
+    if (src._full) {
+      src._full().then((u) => { if (imgs[idx] === src) { img.src = u; } })
+        .catch((e) => { if (imgs[idx] === src && e && e.code === 'gone') caption.textContent = `${caption.textContent} \u2014 no longer available`; })
+        .finally(() => { if (imgs[idx] === src) stage.classList.remove('loading-full'); });
+    }
     else stage.classList.remove('loading-full');
     const nm = src.closest('.att-media') ? src.closest('.att-media').dataset.name : src.alt;
     caption.textContent = nm || 'Image';
@@ -3205,6 +3286,13 @@ function createComposer({ id, key, threadId, placeholder }) {
   ta.placeholder = placeholder || placeholderFor(k);
   ta.value = drafts.get(k + (threadId() || '')) || '';
   const extras = h('div', { class: 'composer-extras' });
+  // Upload progress for the message being sent: kept across redraws of the extras, with a Cancel button.
+  const upText = h('span', { class: 'upload-text' });
+  const upCancel = h('button', { class: 'btn ghost sm upload-cancel', type: 'button' }, 'Cancel');
+  const upStatus = h('div', { class: 'upload-status', hidden: true, role: 'status', 'aria-live': 'polite' },
+    h('div', { class: 'upload-progress' }, h('div', { class: 'bar' })), h('div', { class: 'upload-line' }, upText, upCancel));
+  let uploading = null; // the AbortController of the upload in progress
+  upCancel.addEventListener('click', () => { if (uploading) uploading.abort(); });
   const typing = h('div', { class: 'typing', 'aria-live': 'polite', dataset: { key: k } });
   const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: () => { addFiles(fileIn.files); fileIn.value = ''; } });
   const sendBtn = h('button', { class: 'send-btn', 'data-tip': P.chat.enterToSend ? 'Send (Enter)' : 'Send (Ctrl+Enter)', 'aria-label': 'Send message', onclick: () => send() }, icon('send'));
@@ -3364,7 +3452,7 @@ function createComposer({ id, key, threadId, placeholder }) {
         h('span', { class: 'pending-size' }, fmtSize(p.file.size)),
         h('button', { class: 'pending-x', 'aria-label': `Remove ${p.file.name}`, 'data-tip': 'Remove', onclick: () => { if (p.url) URL.revokeObjectURL(p.url); state.pending.splice(i, 1); renderExtras(); update(); } }, icon('close'))))));
     }
-    extras.append(h('div', { class: 'upload-progress', hidden: true }, h('div', { class: 'bar' })));
+    extras.append(upStatus);
     const blockedNote = blockedDmNotice();
     const kk = key();
     const ch = kk && kk.startsWith('c:') ? channelById(kk.slice(2)) : null;
@@ -3405,10 +3493,23 @@ function createComposer({ id, key, threadId, placeholder }) {
     return queue;
   }
   async function deliver({ kk, tid, text, files, replyTo, nonce, poll }) {
-    const bar = extras.querySelector('.upload-progress');
-    const setProgress = (f) => { if (!bar) return; bar.hidden = f >= 1; bar.firstChild.style.width = Math.round(f * 100) + '%'; };
+    const bar = upStatus.querySelector('.bar');
+    const totalBytes = files.reduce((a, p) => a + (p.file ? p.file.size : 0), 0);
+    let retrying = null;
+    const setProgress = (f) => {
+      upStatus.hidden = !files.length || f >= 1;
+      bar.style.width = Math.round(f * 100) + '%';
+      if (!retrying) upText.textContent = `Uploading ${files.length === 1 ? files[0].file.name : `${files.length} files`} — ${fmtSize(Math.round(f * totalBytes))} of ${fmtSize(totalBytes)} (${Math.round(f * 100)}%)`;
+    };
+    const onStatus = ({ retrying: r, wait }) => {
+      retrying = r ? wait : null;
+      upStatus.classList.toggle('retrying', !!r);
+      if (r) upText.textContent = `Connection lost. Trying again in ${Math.max(1, Math.round(wait / 1000))} s… (nothing sent so far is lost)`;
+    };
+    const ctl = files.length ? new AbortController() : null;
+    uploading = ctl;
     try {
-      const f = await uploadEncryptedFiles(kk, files, setProgress);
+      const f = await uploadEncryptedFiles(kk, files, setProgress, { signal: ctl && ctl.signal, onStatus });
       const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}) }, replyTo, nonce);
       files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
       playSound('sent');
@@ -3421,10 +3522,14 @@ function createComposer({ id, key, threadId, placeholder }) {
       dropPendingSend(nonce);
       const wait = /in (\d+)s/.exec(e.message || '');
       if (e.code === 'slowmode' && wait) startSlow(+wait[1]);
-      toast(e.message, 'error');
+      if (e.cancelled) toast('Upload cancelled. Your message and files are back in the box.');
+      else toast(e.message, 'error');
       // Give the words back so nothing is lost (unless they've already typed something new).
       if (!poll && !files.some((f) => f.voice) && !ta.value.trim() && key() === kk) { ta.value = text; if (!state.pending.length) state.pending = files; renderExtras(); autosize(); update(); }
-    } finally { setProgress(1); }
+    } finally {
+      if (uploading === ctl) uploading = null;
+      setProgress(1);
+    }
   }
   setTimeout(() => { autosize(); update(); }, 0);
   return { el, state, focus: () => ta.focus(), addFiles, setReply, renderExtras, send };
@@ -3472,7 +3577,9 @@ function blockedDmNotice() {
 }
 
 // ---- sending (every file gets its own random key, carried inside the encrypted message)
-async function uploadEncryptedFiles(key, files, onProgress) {
+// Small files go up in one request; bigger ones (CHUNKED_ABOVE) in resumable chunks that survive a dropped
+// connection (files.js). onStatus reports "connection lost, retrying"; signal cancels.
+async function uploadEncryptedFiles(key, files, onProgress, { signal, onStatus } = {}) {
   if (!files.length) return [];
   if (key.startsWith('c:')) await sec.ready(serverOfChannel(key.slice(2)).id);
   const compress = P.chat.compressImages !== false;
@@ -3483,12 +3590,12 @@ async function uploadEncryptedFiles(key, files, onProgress) {
   let done = 0;
   onProgress(0);
   const send = async (blobLike, weight) => {
+    if (signal && signal.aborted) throw Object.assign(new Error('Upload cancelled.'), { cancelled: true });
     const { blob, k } = await E2EE.encryptFile(await blobLike.arrayBuffer());
-    const fd = new FormData();
-    fd.append('file', new Blob([blob]), 'blob.bin');
-    const res = await upload('/upload/encrypted', fd, (x) => onProgress((done + x * weight) / total));
+    const progress = (x) => onProgress((done + x * weight) / total);
+    const url = blob.byteLength > CHUNKED_ABOVE ? await uploadResumable(blob, { onProgress: progress, onStatus, signal }) : await uploadSimple(blob, { onProgress: progress, signal });
     done += weight;
-    return { url: res.url, k };
+    return { url, k };
   };
   const out = [];
   for (const p of prepared) {
