@@ -13,7 +13,7 @@ const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash } = 
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
-const { stripImageMetadata } = require('./imagemeta');
+const { stripFile, ImageRejected } = require('./imagemeta');
 const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 const perms = makePerms(db);
 
@@ -503,15 +503,16 @@ function overLimit(uid, q, size) {
   return null;
 }
 // Public pictures lose their hidden metadata (EXIF, GPS position, XMP…) before anyone can download them;
-// see server/imagemeta.js. Written to a temporary name first, so a failure never leaves half a file.
-function stripUploadedImage(file) {
+// see server/imagemeta.js. That runs in a worker thread, so a big (or hostile) picture can't hold up the server.
+// A picture that can't be cleaned is refused rather than kept with its metadata.
+async function stripUploadedImage(file) {
   try {
-    const clean = stripImageMetadata(fs.readFileSync(file.path));
-    if (!clean) return;
-    fs.writeFileSync(file.path + '.tmp', clean);
-    fs.renameSync(file.path + '.tmp', file.path);
-    file.size = clean.length;
-  } catch { fs.promises.unlink(file.path + '.tmp').catch(() => {}); }
+    const size = await stripFile(file.path);
+    if (size != null) file.size = size;
+  } catch (e) {
+    if (e instanceof ImageRejected) throw new HttpError(400, 'That picture couldn\u2019t be checked for hidden data (like a GPS position), so it wasn\u2019t saved. Save it again as a normal JPG or PNG and try once more.', 'bad_image');
+    throw new HttpError(503, 'Pictures can\u2019t be saved right now. Try again in a moment.');
+  }
 }
 // Text fields that come with an upload (a name, a crop, a title…). Without these limits multer keeps any number
 // of fields of up to 1 MB each in memory, so a single request could use up the server's memory.
@@ -557,7 +558,7 @@ function limited(kind, base, field) {
     res.once('close', release); // also when the sender hangs up halfway
     const cap = Math.max(1, Math.floor(Math.min(fileCap, quotaLeft, dayLeft)));
     multer({ ...base, limits: { ...FORM_LIMITS, fileSize: cap, files: 1 } }).single(field)(req, res, (err) => {
-      release();
+      if (err) release();
       if (err && err.code === 'LIMIT_FILE_SIZE') {
         if (cap >= fileCap) return next(new HttpError(413, `That file is too big. ${label} can be up to ${perFileMb} MB.`));
         if (cap >= dayLeft) return next(new HttpError(413, `That would go over today\u2019s upload limit. You have ${fmtMb(dayLeft)} left today.`, 'quota'));
@@ -565,17 +566,31 @@ function limited(kind, base, field) {
       }
       if (err && FORM_ERRORS.has(err.code)) return next(new HttpError(400, 'That upload has more (or longer) form fields than this server accepts.', 'form_limit'));
       if (err) return next(err);
-      if (req.file) {
-        if (PUBLIC_KINDS.has(kind) && req.file.path) stripUploadedImage(req.file);
-        const over = overLimit(req.userId, q, req.file.size);
-        if (over) {
-          if (req.file.path) fs.promises.unlink(req.file.path).catch(() => {});
-          return next(over);
+      const file = req.file;
+      if (!file) { release(); return next(); }
+      // Still counted as in progress while the picture is cleaned, so the disk can't fill up meanwhile.
+      const cleaned = PUBLIC_KINDS.has(kind) && file.path ? stripUploadedImage(file) : Promise.resolve();
+      cleaned.then(() => {
+        release();
+        try {
+          // No await from here to recordFile(): see overLimit().
+          const over = overLimit(req.userId, q, file.size);
+          if (over) {
+            if (file.path) fs.promises.unlink(file.path).catch(() => {});
+            return next(over);
+          }
+          recordFile(req.userId, file.filename, kind === 'file' ? 'attachment' : kind, file.size);
+        } catch (e) {
+          if (file.path) fs.promises.unlink(file.path).catch(() => {});
+          return next(e);
         }
-        recordFile(req.userId, req.file.filename, kind === 'file' ? 'attachment' : kind, req.file.size);
-        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + req.file.filename); });
-      }
-      next();
+        res.on('finish', () => { if (res.statusCode >= 400) removeUpload('/uploads/' + file.filename); });
+        next();
+      }, (e) => {
+        release();
+        if (file.path) fs.promises.unlink(file.path).catch(() => {});
+        next(e);
+      });
     });
   };
 }
@@ -3974,6 +3989,18 @@ function indexOldFiles() {
   })();
   setSetting('filesIndexed', '1');
 }
+// One-time: GIFs people uploaded to the server's GIF library before library uploads counted toward storage, so
+// they count (and show under "GIF library" in Storage) like the ones uploaded since. Learned GIFs aren't anyone's
+// upload and stay uncounted. The original upload time is kept, so they don't use up today's allowance.
+function indexLibraryUploads() {
+  if (getSetting('gifLibraryIndexed')) return;
+  const add = db.prepare('INSERT OR IGNORE INTO user_files (name, user_id, kind, size, created_at) VALUES (?, ?, ?, ?, ?)');
+  db.transaction(() => {
+    db.prepare("SELECT g.file, g.added_by, g.size, g.created_at FROM gif_library g JOIN users u ON u.id = g.added_by WHERE g.source = 'upload'").all()
+      .forEach((g) => { if (fs.existsSync(path.join(UPLOAD_DIR, path.basename(g.file)))) add.run(path.basename(g.file), g.added_by, 'gif', g.size, g.created_at); });
+  })();
+  setSetting('gifLibraryIndexed', '1');
+}
 
 // ---------------------------------------------------------------- errors + SPA fallback
 api.use((req, res) => res.status(404).json({ error: 'Not found.' }));
@@ -4344,6 +4371,7 @@ function setupSockets(server) {
   else server = http.createServer(app);
   setupSockets(server);
   try { indexOldFiles(); } catch (e) { console.error('Could not index existing uploads:', e.message); }
+  try { indexLibraryUploads(); } catch (e) { console.error('Could not index GIF library uploads:', e.message); }
   server.listen(PORT, HOST, () => {
     const scheme = USE_HTTPS ? 'https' : 'http';
     console.log(`\n  ${INSTANCE_NAME} is running.\n`);

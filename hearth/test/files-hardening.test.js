@@ -12,7 +12,7 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 const { pathToFileURL } = require('node:url');
 const { startServer, sleep } = require('./helpers');
-const { stripImageMetadata, tiffOrientation, crc32 } = require('../server/imagemeta');
+const { stripImageMetadata, stripFile, ImageRejected, tiffOrientation, crc32 } = require('../server/imagemeta');
 
 // ------------------------------------------------------------------ picture fixtures
 // A 12x8 JPEG made by Chromium (it carries an ICC colour profile in APP2, which must survive).
@@ -92,6 +92,40 @@ function pngChunks(buf) {
 function fakeGif(bytes = 2000) { const b = Buffer.alloc(bytes, 0x20); Buffer.from('GIF89a').copy(b, 0); b.writeUInt16LE(40, 6); b.writeUInt16LE(30, 8); return b; }
 const PNG = makePng();
 const has = (buf, s) => buf.includes(Buffer.from(s, 'latin1'));
+const webpCh = (t, d) => { const h = Buffer.alloc(8); h.write(t, 0, 'latin1'); h.writeUInt32LE(d.length, 4); return Buffer.concat([h, d, Buffer.alloc(d.length & 1)]); };
+// WebP with a VP8X header (alpha, EXIF and XMP flags), EXIF with orientation 6, XMP and some "image data".
+function webpWithMeta() {
+  const vp8x = Buffer.alloc(10); vp8x[0] = 0x0c | 0x10; vp8x.writeUIntLE(4, 4, 3); vp8x.writeUIntLE(2, 7, 3);
+  const body = Buffer.concat([webpCh('VP8X', vp8x), webpCh('EXIF', exifTiff(6)), webpCh('XMP ', Buffer.from('<x:xmpmeta>SECRET</x:xmpmeta>')),
+    webpCh('ALPH', Buffer.from('alpha!')), webpCh('VP8 ', Buffer.from('imagedata'.repeat(20)))]);
+  const riff = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), body]); riff.writeUInt32LE(riff.length - 8, 4);
+  return riff;
+}
+// Files no camera makes: millions of empty blocks, which used to keep the server busy for seconds and use hundreds
+// of MB of memory while it looked for metadata.
+const MIB = 1024 * 1024;
+function manyBlockJpeg(bytes) {
+  const n = Math.floor((bytes - 12) / 4);
+  const b = Buffer.alloc(8 + n * 4 + 2);
+  b.writeUInt32BE(0xffd8fffe, 0); b.writeUInt16BE(4, 4); b.write('hi', 6, 'latin1'); // start of image, a comment
+  for (let k = 0; k < n; k++) b.writeUInt32BE(0xffe30002, 8 + k * 4); // empty APP3 blocks
+  b.writeUInt16BE(0xffd9, 8 + n * 4);
+  return b;
+}
+function manyChunkPng(bytes) {
+  const n = Math.floor((bytes - 8) / 12);
+  const b = Buffer.alloc(8 + n * 12);
+  PNG.copy(b, 0, 0, 8);
+  for (let k = 0; k < n; k++) b.write(k % 2 ? 'tEXt' : 'abCd', 8 + k * 12 + 4, 'latin1'); // empty chunks, kept and dropped in turn
+  return b;
+}
+function manyChunkWebp(bytes) {
+  const n = Math.floor((bytes - 12) / 8);
+  const b = Buffer.alloc(12 + n * 8);
+  b.write('RIFF', 0, 'latin1'); b.writeUInt32LE(b.length - 8, 4); b.write('WEBP', 8, 'latin1');
+  for (let k = 0; k < n; k++) b.write(k % 2 ? 'XMP ' : 'ANMF', 12 + k * 8, 'latin1');
+  return b;
+}
 
 // ------------------------------------------------------------------ multipart
 function multipart({ field = 'file', filename = 'a.bin', type = 'application/octet-stream', bytes, fields = [] }) {
@@ -436,6 +470,128 @@ test('files-6: profile and server pictures are stored without their GPS position
   assert.ok(fs.readFileSync(fileOf(srv, p.json.background)).equals(PNG));
 });
 
+// ------------------------------------------------------------------ review-1/2: the stripper itself can't be used against the server
+test('review-1: pictures made of millions of tiny blocks are refused straight away, without piling up memory', () => {
+  for (const [kind, buf] of [['JPEG', manyBlockJpeg(11.5 * MIB)], ['PNG', manyChunkPng(11.5 * MIB)], ['WebP', manyChunkWebp(7.5 * MIB)]]) {
+    const heap = process.memoryUsage().heapUsed;
+    const t = Date.now();
+    assert.throws(() => stripImageMetadata(buf), ImageRejected, kind);
+    const ms = Date.now() - t;
+    assert.ok(ms < 1000, `${kind}: ${ms} ms (it took about 2 s before)`);
+    assert.ok(process.memoryUsage().heapUsed - heap < 64 * MIB, `${kind}: no per-block copies`);
+  }
+  // A real picture with a lot of blocks (a few hundred, like a progressive JPEG) is still cleaned normally.
+  const at = 4 + JPEG.readUInt16BE(4);
+  const blocks = Buffer.alloc(300 * 4); for (let k = 0; k < 300; k++) blocks.writeUInt32BE(0xffe30002, k * 4);
+  const busy = Buffer.concat([jpegWithMeta(6).subarray(0, at), blocks, jpegWithMeta(6).subarray(at)]);
+  const out = stripImageMetadata(busy);
+  assert.ok(out && !has(out, 'SECRET'));
+  assert.equal(jpegSegments(out).filter((x) => x.marker === 0xe3).length, 300, 'other blocks are kept');
+  // Long runs of escaped bytes in the image data are fine too (and quick).
+  const scan = Buffer.alloc(11.5 * MIB);
+  JPEG.copy(scan, 0, 0, JPEG.indexOf(Buffer.from([0xff, 0xda])));
+  for (let p = JPEG.indexOf(Buffer.from([0xff, 0xda])); p < scan.length; p += 2) { scan[p] = 0xff; scan[p + 1] = 0; }
+  const sos = JPEG.indexOf(Buffer.from([0xff, 0xda]));
+  JPEG.copy(scan, sos, sos, sos + 2 + JPEG.readUInt16BE(sos + 2));
+  scan.writeUInt16BE(0xffd9, scan.length - 2);
+  const t = Date.now();
+  assert.equal(stripImageMetadata(Buffer.concat([scan, Buffer.from('TRAILER')])).length, scan.length);
+  assert.ok(Date.now() - t < 1000);
+});
+
+test('review-2: a cut-off or slightly damaged photo still loses its metadata; the rest is kept as it is', () => {
+  const full = jpegWithMeta(6);
+  // Cut off part way through the image data (no end-of-image marker), as an interrupted transfer leaves it.
+  const cut = full.subarray(0, full.indexOf(Buffer.from('SECRET-TRAILER', 'latin1')) - 12);
+  const out = stripImageMetadata(cut);
+  assert.ok(out, 'cleaned, not kept as it was');
+  for (const x of ['SECRET', 'http://ns.adobe.com/xap', 'Photoshop 3.0']) assert.equal(has(out, x), false, x);
+  assert.equal(tiffOrientation(jpegSegments(out).find((x) => x.marker === 0xe1).body.subarray(6)), 6, 'orientation kept');
+  const tail = cut.subarray(cut.indexOf(Buffer.from([0xff, 0xda])));
+  assert.ok(out.subarray(out.length - tail.length).equals(tail), 'the image data is copied byte for byte');
+  // Stray bytes between blocks (decoders skip them, so the picture still shows): before the EXIF block, and later.
+  const at = 4 + JPEG.readUInt16BE(4);
+  for (const where of [at, full.indexOf(Buffer.from([0xff, 0xfe]))]) {
+    const padded = Buffer.concat([full.subarray(0, where), Buffer.from([0, 0]), full.subarray(where)]);
+    const clean = stripImageMetadata(padded);
+    assert.ok(clean && !has(clean, 'SECRET'), `stray bytes at ${where}`);
+    assert.deepEqual(jpegSegments(clean).filter((x) => x.marker !== 0xe1).map((x) => x.marker), jpegSegments(JPEG).map((x) => x.marker));
+  }
+  // Both at once, and stray FF 00 pairs (also skipped by decoders).
+  const both = Buffer.concat([full.subarray(0, at), Buffer.from([0x12, 0xff, 0x00, 0x34]), cut.subarray(at)]);
+  assert.equal(has(stripImageMetadata(both), 'SECRET'), false);
+  // PNG cut off in its image data: the metadata chunks before it still go.
+  const png = pngWithMeta();
+  const pngOut = stripImageMetadata(png.subarray(0, png.length - 20));
+  assert.ok(pngOut && !has(pngOut, 'SECRET'));
+  assert.ok(pngOut.subarray(pngOut.length - 30).equals(png.subarray(png.length - 50, png.length - 20)));
+  // WebP whose size says more than the file holds: cleaned, and still exactly as much "missing" as before.
+  const webp = webpWithMeta();
+  const webpOut = stripImageMetadata(webp.subarray(0, webp.length - 30));
+  assert.ok(webpOut && !has(webpOut, 'SECRET') && !has(webpOut, 'XMP '));
+  assert.equal(webpOut.readUInt32LE(4) - (webpOut.length - 8), 30);
+  assert.equal(webpOut[20], 0x10 | 0x08, 'alpha and the small orientation EXIF block');
+  // Nothing to remove: still left alone (and a file that isn't a picture at all is not this code's business).
+  assert.equal(stripImageMetadata(JPEG.subarray(0, 300)), null);
+  assert.equal(stripImageMetadata(Buffer.from('just some text')), null);
+});
+
+test('review-1: uploads are cleaned in a worker thread, in place and in order; one that can’t be finished is refused', async () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'hearth-strip-'));
+  try {
+    const files = [jpegWithMeta(6), PNG, pngWithMeta(), Buffer.from('not a picture'), manyBlockJpeg(64 * 1024)].map((b, k) => {
+      const f = path.join(dir, `f${k}`); fs.writeFileSync(f, b); return f;
+    });
+    const res = await Promise.allSettled(files.map((f) => stripFile(f)));
+    assert.equal(res[0].value, fs.statSync(files[0]).size);
+    assert.equal(has(fs.readFileSync(files[0]), 'SECRET'), false);
+    assert.equal(res[1].value, null, 'nothing to remove: the file is not touched');
+    assert.ok(fs.readFileSync(files[1]).equals(PNG));
+    assert.equal(has(fs.readFileSync(files[2]), 'SECRET'), false);
+    assert.equal(res[3].value, null);
+    assert.ok(res[4].reason instanceof ImageRejected, 'the many-block file is refused');
+    // The worker gives up on a picture after IMAGE_STRIP_LIMIT_MS: here 1 ms, so every one is refused in turn, and
+    // nothing is left half-written.
+    const mod = require.resolve('../server/imagemeta');
+    const saved = require.cache[mod];
+    delete require.cache[mod];
+    process.env.IMAGE_STRIP_LIMIT_MS = '1';
+    let impatient;
+    try { impatient = require('../server/imagemeta'); } finally { delete process.env.IMAGE_STRIP_LIMIT_MS; require.cache[mod] = saved; }
+    fs.writeFileSync(files[0], jpegWithMeta(6));
+    const slow = await Promise.allSettled([files[0], files[2]].map((f) => impatient.stripFile(f)));
+    assert.ok(slow.every((r) => r.status === 'rejected' && r.reason instanceof impatient.ImageRejected), String(slow.map((r) => r.status)));
+    await sleep(200);
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp')), []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('review-1: a hostile many-block upload is refused and the server keeps answering while it is checked', async () => {
+  const u = await srv.register('blockflood');
+  const uploads = () => fs.readdirSync(path.join(srv.dir, 'uploads')).length;
+  const before = uploads();
+  const lat = [];
+  let stop = false;
+  const poll = (async () => { while (!stop) { const t = Date.now(); await srv.api('GET', '/config'); lat.push(Date.now() - t); await sleep(5); } })();
+  const r = await post(srv, u, '/me/media/avatar', { filename: 'evil.jpg', type: 'image/jpeg', bytes: manyBlockJpeg(11.5 * MIB), fields: [['crop', '{}']] });
+  // The review's case: a server banner sent by someone who isn't even a member.
+  const s = (await as(srv, owner, 'POST', '/servers', { name: 'Not yours' })).json;
+  const r2 = await post(srv, u, `/servers/${s.id}/media/banner`, { filename: 'evil.jpg', type: 'image/jpeg', bytes: manyBlockJpeg(11.5 * MIB) });
+  // GIF library uploads go through the same check.
+  const r3 = await post(srv, u, '/gifs/library', { filename: 'evil.png', type: 'image/png', bytes: manyChunkPng(7 * MIB) });
+  stop = true;
+  await poll;
+  assert.ok(lat.length > 0 && Math.max(...lat) < 750, `/api/config took up to ${Math.max(...lat)} ms (about 2 s before)`);
+  for (const x of [r, r2, r3]) { assert.equal(x.status, 400, x.text); assert.equal(x.json.code, 'bad_image'); }
+  await sleep(150);
+  assert.equal(uploads(), before, 'nothing left on disk');
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM user_files WHERE user_id = ?', u.id)[0].n, 0, 'no storage used');
+  // A normal photo right after: cleaned and stored.
+  const ok = await post(srv, u, '/me/media/avatar', { filename: 'me.jpg', type: 'image/jpeg', bytes: jpegWithMeta(6), fields: [['crop', '{}']] });
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(has(fs.readFileSync(fileOf(srv, ok.json.avatar)), 'SECRET'), false);
+});
+
 // ------------------------------------------------------------------ files-5 / xss-3: attachment addresses
 test('files-5/xss-3: attachment entries from encrypted messages only keep files on this server', async () => {
   const A = await import(pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'attachments.js')).href);
@@ -464,6 +620,32 @@ test('files-5/xss-3: attachment entries from encrypted messages only keep files 
   const secure = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'secure.js'), 'utf8');
   assert.equal((secure.match(/f: cleanFiles\(/g) || []).length, 3);
   assert.doesNotMatch(secure, /Array\.isArray\(payload\.f\) \? payload\.f/);
+});
+
+// The browser test below checks the real app, but only where Playwright is installed. This always runs: the app must
+// keep sending every attachment address through those checks before loading, showing or downloading it.
+test('review-3 (files-5/xss-3): the app only loads, shows or downloads attachments through the same-server checks', () => {
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  const fn = (name) => {
+    const start = app.search(new RegExp(`^(async )?function ${name}\\(`, 'm'));
+    assert.ok(start >= 0, `${name} is in app.js`);
+    return app.slice(start, app.indexOf('\n}\n', start) + 2);
+  };
+  assert.match(app, /^import \{[^}]*\bisUploadUrl\b[^}]*\bsafeDownloadHref\b[^}]*\} from '\.\/attachments\.js';$/m);
+  // Fetching (and decrypting) a file: refused for anything but /uploads/<name>, before any request is made.
+  assert.match(fn('decryptedUrl'), /^function decryptedUrl\(m, f\) \{\n\s*if \(!isUploadUrl\(f\.url\)\) return Promise\.reject\(/);
+  // Downloads: only a decrypted copy (blob: of this app) or a file on this server, never a jump to another site.
+  const dl = fn('downloadAttachment');
+  assert.match(dl, /const href = safeDownloadHref\([^;]*, location\.origin\);\n\s*if \(!href\) throw /);
+  assert.doesNotMatch(dl, /href: f\.url|location\.href =|window\.open\(/);
+  // Pictures, videos, audio and voice messages: unencrypted ones load straight from this server only.
+  const el = fn('attachmentEl');
+  assert.match(el, /const direct = \(\) => \(isUploadUrl\(f\.url\) \? Promise\.resolve\(f\.url\) : Promise\.reject\(/);
+  assert.equal((el.match(/Promise\.resolve\(f\.url\)/g) || []).length, 1, 'only through direct()');
+  assert.match(el, /voiceEl\(f, \(\) => \(\(f\.k \|\| m\.dmId\) \? decryptedUrl\(m, f\) : direct\(\)\)\)/);
+  assert.match(el, /const full = \(\) => \(enc \? decryptedUrl\(m, f\) : direct\(\)\);/);
+  assert.equal((el.match(/\.src = f\.url/g) || []).length, 1);
+  assert.match(el, /if \(enc \|\| f\.th \|\| !isUploadUrl\(f\.url\)\) whenVisible\(holder, load\); else el\.src = f\.url;/);
 });
 
 // ------------------------------------------------------------------ files-10 / ssrf-3: proxies
@@ -566,10 +748,42 @@ test('data-5: leftovers from earlier versions (blobs, reactions, votes of delete
   assert.equal(srv.sql('SELECT COUNT(*) n FROM blobs WHERE name = ?', path.basename(keep))[0].n, 1);
 });
 
+// ------------------------------------------------------------------ review-4: GIF library uploads from before
+test('review-4: GIF library uploads from older versions are counted toward their uploader’s storage once, after an update', async () => {
+  const u = await srv.register('oldgifs');
+  // As an older version left them: library rows and their files, but no storage rows. An upload, a learned GIF
+  // (nobody's upload) and an upload by an account that no longer exists.
+  const longAgo = Date.now() - 30 * 86400000;
+  const add = (source, by, bytes) => {
+    const file = `old${crypto.randomBytes(8).toString('hex')}.gif`;
+    fs.writeFileSync(path.join(srv.dir, 'uploads', file), fakeGif(bytes));
+    srv.sql('INSERT INTO gif_library (id, file, title, size, source, source_id, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      crypto.randomBytes(8).toString('hex'), file, 'old', bytes, source, source === 'upload' ? null : file, by, longAgo);
+    return file;
+  };
+  const mine = add('upload', u.id, 3000);
+  const learned = add('klipy', u.id, 4000);
+  const ghost = add('upload', 'no-such-account', 5000);
+  srv.sql("DELETE FROM instance_settings WHERE key = 'gifLibraryIndexed'");
+  await srv.restart();
+  assert.deepEqual(srv.sql('SELECT name, kind, size, created_at FROM user_files WHERE user_id = ?', u.id), [{ name: mine, kind: 'gif', size: 3000, created_at: longAgo }]);
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM user_files WHERE name IN (?, ?)', learned, ghost)[0].n, 0);
+  const st = (await as(srv, u, 'GET', '/me/storage')).json;
+  assert.equal(st.used, 3000);
+  assert.equal(st.today, 0, 'the original upload time is kept: today’s allowance isn’t used up');
+  assert.deepEqual(st.byKind, [{ kind: 'gif', files: 1, bytes: 3000 }]);
+  // Only once: a later restart doesn't count it again (or bring back a row that was cleared).
+  srv.sql('DELETE FROM user_files WHERE name = ?', mine);
+  await srv.restart();
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM user_files WHERE name = ?', mine)[0].n, 0);
+  assert.equal(srv.sql("SELECT value FROM instance_settings WHERE key = 'gifLibraryIndexed'")[0].value, '1');
+});
+
 // ------------------------------------------------------------------ the real client in a browser (when available)
-// Runs where Playwright and its Chromium are installed (the development container); skipped elsewhere.
-const PW = '/opt/node22/lib/node_modules/playwright/index.mjs';
-const CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+// Runs where Playwright and its Chromium are installed (the development container, or wherever PLAYWRIGHT_MODULE
+// and CHROMIUM_PATH point: Playwright's index.mjs and a Chromium executable); skipped elsewhere.
+const PW = process.env.PLAYWRIGHT_MODULE || '/opt/node22/lib/node_modules/playwright/index.mjs';
+const CHROME = process.env.CHROMIUM_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const havePlaywright = fs.existsSync(PW) && fs.existsSync(CHROME);
 test('files-5/xss-3 + files-6 in Chromium: attacker attachment URLs are never loaded or opened; stripped photos still display upright', { skip: !havePlaywright && 'Playwright not installed' }, async () => {
   const https = require('node:https');
@@ -583,7 +797,7 @@ test('files-5/xss-3 + files-6 in Chromium: attacker attachment URLs are never lo
   });
   await new Promise((r) => evil.listen(0, '127.0.0.1', r));
   const ep = evil.address().port;
-  const { chromium } = await import(PW);
+  const { chromium } = await import(pathToFileURL(PW).href);
   const browser = await chromium.launch({ executablePath: CHROME, args: ['--proxy-server=direct://', '--host-resolver-rules=MAP evil.example 127.0.0.1'] });
   try {
     globalThis.window = globalThis.window || { crypto: globalThis.crypto, hashwasm: require('hash-wasm') };
