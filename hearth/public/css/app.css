@@ -606,6 +606,18 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .saved-meta { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--muted); }
 .saved-text { color: var(--msg-text); overflow-wrap: anywhere; margin-top: 2px; }
 .saved-actions { display: flex; flex-direction: column; gap: 2px; }
+.saved-row.unavailable { opacity: .75; }
+.saved-av-empty { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; background: var(--active); color: var(--muted); flex: none; }
+.saved-av-empty .ic { width: 18px; height: 18px; }
+.saved-note { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; padding: 6px 8px; border-radius: 8px; background: var(--active); color: var(--text-2); font-size: 13px; overflow-wrap: anywhere; }
+.saved-note .ic { width: 14px; height: 14px; flex: none; margin-top: 2px; }
+.saved-more { display: flex; justify-content: center; margin: 12px 0; }
+.pin-history { margin: 12px; font-size: 13px; color: var(--text-2); }
+.pin-history summary { cursor: pointer; font-weight: 600; }
+.pin-history ul { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.export-progress { height: 6px; background: var(--active); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+.export-progress[hidden] { display: none; }
+.export-progress .bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
 .quick-list { display: flex; flex-direction: column; gap: 2px; max-height: 46vh; overflow-y: auto; }
 .quick-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 10px; text-align: left; }
 .quick-row:hover { background: var(--hover); }
@@ -656,6 +668,19 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 }
 .jump-latest[hidden] { display: none; }
 .jump-latest .ic { width: 15px; height: 15px; }
+.unread-bar {
+  position: absolute; top: 8px; left: 16px; right: 16px; z-index: 4; display: flex; align-items: stretch; border-radius: 10px; overflow: hidden;
+  background: var(--accent); color: var(--on-accent); font-size: 13px; box-shadow: var(--pop-shadow); animation: rise .2s var(--ease);
+}
+.unread-bar[hidden] { display: none; }
+.unread-bar button { color: inherit; display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; }
+.unread-bar button:hover { background: rgb(0 0 0 / .12); }
+.unread-bar .ic { width: 14px; height: 14px; }
+.unread-jump { flex: 1; min-width: 0; text-align: left; }
+.unread-jump span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.unread-jump strong { margin-left: auto; white-space: nowrap; }
+.unread-mark { border-left: 1px solid rgb(0 0 0 / .15); white-space: nowrap; font-weight: 600; }
+@media (max-width: 520px) { .unread-jump span { display: none; } .unread-bar { left: 8px; right: 8px; } }
 
 /* messages: comfortable (default) */
 .msg {

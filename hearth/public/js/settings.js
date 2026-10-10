@@ -7,6 +7,7 @@ import { profileCard, FONT_STACKS, cropStyle, customFxLayer } from './profile-ui
 import { pageEditorTab } from './page.js';
 import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
+import { runExport, EXPORT_LIMITS, quietNow } from './usability.js';
 import { androidApp } from './android.js';
 import { desktopSettingsSection } from './desktop-settings.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
@@ -1211,23 +1212,61 @@ function notificationsTab(app) {
       }, 'For DMs and @mentions while this tab is in the background. Do Not Disturb silences them.'),
       state),
     soundsSection(),
-    section('Push (when Hearth is closed)', pushToggleRow(app)),
+    quietHoursSection(app),
+    section('Push (when Hearth is closed)', pushToggleRow(app), previewsRow(app)),
     perServerNotifications(app),
   );
+}
+// Quiet hours: Do Not Disturb on a schedule. The server follows it for push; this app follows it for sounds
+// and pop-ups. Days are when a quiet period starts (22:00–07:00 on Friday covers Saturday morning).
+function quietHoursSection(app) {
+  const st = app.S.notifySettings || {};
+  const d = { on: false, start: '22:00', end: '08:00', days: [0, 1, 2, 3, 4, 5, 6], ...(st.dnd || {}) };
+  const status = h('p', { class: 'field-hint', 'aria-live': 'polite' });
+  const drawStatus = () => { status.textContent = d.on ? (quietNow({ ...st, dnd: d }) ? 'Quiet hours are on right now.' : 'Not in quiet hours right now.') : ''; };
+  const save = async (patch) => {
+    Object.assign(d, patch);
+    try { await app.setNotifySettings({ dnd: d }); drawStatus(); } catch (e) { toast(e.message, 'error'); }
+  };
+  const start = h('input', { class: 'input sm', type: 'time', value: d.start, 'aria-label': 'Quiet hours start', onchange: (e) => e.target.value && save({ start: e.target.value }) });
+  const end = h('input', { class: 'input sm', type: 'time', value: d.end, 'aria-label': 'Quiet hours end', onchange: (e) => e.target.value && save({ end: e.target.value }) });
+  const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const days = h('div', { class: 'chips', role: 'group', 'aria-label': 'Days' }, DAYS.map((label, i) => {
+    const b = h('button', { type: 'button', class: `chip${d.days.includes(i) ? ' active' : ''}`, 'aria-pressed': String(d.days.includes(i)), onclick: () => {
+      const on = !d.days.includes(i);
+      const next = on ? [...d.days, i].sort() : d.days.filter((x) => x !== i);
+      b.classList.toggle('active', on); b.setAttribute('aria-pressed', String(on));
+      save({ days: next });
+    } }, label);
+    return b;
+  }));
+  drawStatus();
+  return section('Quiet hours',
+    toggle('Do Not Disturb on a schedule', !!d.on, (v) => save({ on: v }), 'No sounds, pop-ups or push notifications during these hours. Messages still arrive and show as unread.'),
+    h('div', { class: 'row gap' }, h('span', null, 'From'), start, h('span', null, 'to'), end),
+    days, status);
+}
+// What a phone's lock screen shows. Pushes never contain message text (the server can't read it); this decides
+// whether they say who and where, or just "New message".
+function previewsRow(app) {
+  const st = app.S.notifySettings || {};
+  return toggle('Show who and where on the lock screen', st.previews === 'names', async (v) => {
+    try { await app.setNotifySettings({ previews: v ? 'names' : 'hidden' }); toast(v ? 'Push notifications now show the sender and conversation.' : 'Push notifications now just say \u201cNew message\u201d.'); } catch (e) { toast(e.message, 'error'); }
+  }, 'Off by default: notifications on your phone or computer only say \u201cNew message\u201d. Message text is never sent, either way.');
 }
 function perServerNotifications(app) {
   const servers = app.S.servers.filter((s) => s.kind !== 'group');
   if (!servers.length) return null;
   return section('Per server',
-    h('p', { class: 'set-sub' }, 'DMs and replies to you always notify unless you mute that conversation. Channels can override these from their right-click menu.'),
+    h('p', { class: 'set-sub' }, 'DMs and replies to you always notify unless you mute that conversation. Channels can override these from their right-click menu. These follow you to all your devices, and push notifications follow them too.'),
     ...servers.map((s) => {
-      const sel = h('select', { class: 'input sm', 'aria-label': `Notifications for ${s.name}`, onchange: (e) => {
-        const p = app.P.notify;
-        if (e.target.value === 'all') delete p['s:' + s.id]; else p['s:' + s.id] = e.target.value;
-        app.P.notify = p; app.rerender();
-      } }, h('option', { value: 'all' }, 'All messages'), h('option', { value: 'mentions' }, 'Only @mentions'), h('option', { value: 'muted' }, 'Muted'));
-      sel.value = app.P.notify['s:' + s.id] || 'all';
-      return h('div', { class: 'kv' }, h('span', null, s.name), sel);
+      const pref = app.S.notifyPrefs['s:' + s.id] || {};
+      const cur = pref.level && pref.level !== 'default' ? (pref.level === 'none' ? 'muted' : pref.level) : 'default';
+      const sel = h('select', { class: 'input sm', 'aria-label': `Notifications for ${s.name}`, onchange: (e) => app.setNotify('s:' + s.id, e.target.value) },
+        h('option', { value: 'default' }, 'Pings (default)'), h('option', { value: 'all' }, 'All messages'), h('option', { value: 'mentions' }, 'Only @mentions'), h('option', { value: 'muted' }, 'Nothing'));
+      sel.value = cur;
+      const everyone = h('label', { class: 'row gap tight field-hint' }, h('input', { type: 'checkbox', checked: !!pref.suppressEveryone, onchange: (e) => app.setNotify('s:' + s.id, undefined, { suppressEveryone: e.target.checked }) }), 'Ignore @everyone');
+      return h('div', { class: 'kv' }, h('span', null, s.name), h('span', { class: 'row gap' }, everyone, sel));
     }));
 }
 
@@ -1413,8 +1452,38 @@ function privacyTab(app) {
     section('Blocked people',
       h('p', { class: 'set-sub' }, 'Blocked people can\u2019t DM you or send friend requests. Their messages in shared servers are hidden behind a click. They aren\u2019t notified.'),
       blockedHost),
+    exportSection(app),
   );
 }
+// Export my data: your account, profile, servers and every message you can decrypt, as JSON plus attachments in a
+// zip. The server sends ciphertext; it's decrypted and packed on this device. Starting needs your password.
+function exportSection(app) {
+  const status = h('p', { class: 'field-hint', 'aria-live': 'polite' });
+  const bar = h('div', { class: 'export-progress', hidden: true }, h('div', { class: 'bar' }));
+  let ctl = null;
+  const cancel = h('button', { class: 'btn ghost sm', hidden: true, onclick: () => ctl && ctl.abort() }, 'Cancel');
+  const start = h('button', { class: 'btn', onclick: async () => {
+    let res;
+    try { res = await confirmedCall(app, (x) => api('POST', '/me/export', x), { title: 'Export your data', text: 'This makes a zip of your account and the messages you can read, on this device.', button: 'Start export' }); } catch (e) { quiet(e); return; }
+    if (!res) return;
+    ctl = new AbortController();
+    start.disabled = true; cancel.hidden = false; bar.hidden = false;
+    try {
+      const { blob, manifest } = await runExport({ token: res.token, S: app.S, sec: app.sec, decryptMessage: app.decryptMessage, signal: ctl.signal,
+        onProgress: (text, f) => { status.textContent = text; bar.firstChild.style.width = Math.round(f * 100) + '%'; } });
+      const url = URL.createObjectURL(blob);
+      h('a', { href: url, download: `hearth-export-${app.S.me.username}-${new Date().toISOString().slice(0, 10)}.zip` }).click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      status.textContent = `Done: ${manifest.totals.messages.toLocaleString()} messages and ${manifest.totals.attachments} files (${fmtBytes(blob.size)}).${manifest.skipped.length ? ` ${manifest.skipped.length} item(s) were skipped; see manifest.json.` : ''}`;
+    } catch (e) { status.textContent = ctl.signal.aborted ? 'Export cancelled.' : `The export stopped: ${e.message}`; }
+    start.disabled = false; cancel.hidden = true; bar.hidden = true; ctl = null;
+  } }, icon('download'), 'Export my data');
+  return section('Your data',
+    h('p', { class: 'set-sub' }, 'Download a copy of your account, profile, the servers and groups you\u2019re in, and every message you can read (with attachments), as JSON files in a zip. It\u2019s put together on this device after decrypting, so the server never sees it. Other people\u2019s private details aren\u2019t included.'),
+    h('p', { class: 'field-hint' }, `Up to ${EXPORT_LIMITS.messages.toLocaleString()} messages and ${fmtBytes(EXPORT_LIMITS.attachmentBytes)} of attachments. Keep the page open while it runs.`),
+    h('div', { class: 'row gap' }, start, cancel), bar, status);
+}
+const fmtBytes = (n) => (n >= 1073741824 ? `${(n / 1073741824).toFixed(1)} GB` : n >= 1048576 ? `${Math.round(n / 1048576)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 // ------------------------------------------------------------------ games & music tab
 function activityTab(app) {

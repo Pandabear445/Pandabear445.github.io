@@ -1108,6 +1108,72 @@ CREATE INDEX IF NOT EXISTS idx_bot_deliveries_bot ON bot_deliveries(bot_id, inst
 // with every step above done but not committed, exactly like a crash or a power cut in the middle of an upgrade.
 // Only with NODE_ENV=test, so a stray variable on a real server does nothing.
 if (fromVersion < SCHEMA_VERSION && process.env.NODE_ENV === 'test' && process.env.HEARTH_TEST_KILL_IN_MIGRATION === '1') process.kill(process.pid, 'SIGKILL');
+
+// v18 (usability): saved messages, read state, notification preferences, pin history and member timeouts.
+// Saved messages and read state hold message ids only (a saved item's note is end-to-end encrypted, x1:, like
+// study data). mention_marks records who a message pings (the ids the sender's app already sends for push), so
+// mention counts survive a reload; user_id '*' is @everyone. Timeouts are their own table so leaving and
+// rejoining a server doesn't clear one.
+db.exec(`
+CREATE TABLE IF NOT EXISTS saved_messages (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  note TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_saved_messages_time ON saved_messages(user_id, created_at);
+CREATE TABLE IF NOT EXISTS read_states (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conv TEXT NOT NULL,
+  last_read_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, conv)
+);
+CREATE TABLE IF NOT EXISTS mention_marks (
+  message_id TEXT NOT NULL,
+  conv TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  PRIMARY KEY (message_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mention_marks_conv ON mention_marks(conv, user_id, message_id);
+CREATE TABLE IF NOT EXISTS notify_prefs (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'default',
+  mute_until INTEGER,
+  suppress_everyone INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, target)
+);
+CREATE INDEX IF NOT EXISTS idx_notify_prefs_target ON notify_prefs(target, level);
+CREATE TABLE IF NOT EXISTS user_prefs (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  data TEXT NOT NULL DEFAULT '{}',
+  read_baseline TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pin_log (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  user_id TEXT,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pin_log_channel ON pin_log(channel_id, created_at);
+CREATE TABLE IF NOT EXISTS member_timeouts (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  until INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  by_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

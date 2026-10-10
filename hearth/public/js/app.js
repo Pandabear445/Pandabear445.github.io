@@ -32,6 +32,7 @@ import { createRecall } from './recall-host.js';
 import { openMemberships, membershipsTab } from './memberships.js';
 import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
+import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, quietNow } from './usability.js';
 
 // ======================================================================= state
 const S = {
@@ -53,6 +54,11 @@ const S = {
   previews: {},         // conversation key -> decrypted preview text
   unread: new Set(),
   mentions: new Map(),
+  lastRead: {},         // conversation key -> last message id read (kept on the server, synced across devices)
+  lastIds: {},          // conversation key -> newest message id we know of
+  notifyPrefs: {},      // 's:'|'c:'|'d:' key -> { level, muteUntil, suppressEveryone } (on the server)
+  notifySettings: { dnd: { on: false }, previews: 'hidden' },
+  savedIds: new Set(),  // saved messages (ids only; on the server)
   typing: {},
   speaking: new Set(),
 };
@@ -98,14 +104,11 @@ const P = {
   set favorites(v) { LS.set(mine('favs'), v); },
   get collapsed() { return LS.get(mine('collapsed'), {}); },
   set collapsed(v) { LS.set(mine('collapsed'), v); },
-  get notify() { return LS.get(mine('notify'), {}); },
-  set notify(v) { LS.set(mine('notify'), v); },
-  get lastRead() { return LS.get(mine('lastRead'), {}); },
-  set lastRead(v) { LS.set(mine('lastRead'), v); },
+  // Notification levels by key ('all' | 'mentions' | 'muted'), from the preferences kept on the server.
+  get notify() { const out = {}; for (const [k, v] of Object.entries(S.notifyPrefs)) if (v.level !== 'default') out[k] = v.level === 'none' ? 'muted' : v.level; return out; },
+  get lastRead() { return S.lastRead; },
   get inbox() { return LS.get(mine('inbox'), []); },
   set inbox(v) { LS.set(mine('inbox'), v.slice(0, 200)); },
-  get saved() { return LS.get(mine('saved'), []); },
-  set saved(v) { LS.set(mine('saved'), v.slice(0, 500)); },
   get lastChannel() { return LS.get(mine('lastChannel'), {}); },
   set lastChannel(v) { LS.set(mine('lastChannel'), v); },
   get chat() { return { enterToSend: true, embeds: true, markdown: true, jumbo: true, ...LS.get('hearth.chat', {}) }; },
@@ -138,6 +141,9 @@ export const app = {
   study: () => study,
   fileInfo: (url, where) => fileInfo(url, where),
   showMessage: (where) => (where && where.messageId ? jumpToMessage(where.type === 'dm' ? 'd:' + where.dmId : 'c:' + where.channelId, where.messageId) : null),
+  setNotify: (key, level, extra) => setNotify(key, level, extra),
+  setNotifySettings: (body) => setNotifySettings(body),
+  decryptMessage: (m) => decryptMessage(m),
 };
 
 // ======================================================================= boot
@@ -368,6 +374,7 @@ async function logout() {
   setToken('');
   localStorage.removeItem('hearth.userId');
   fileUrls.release(); // decrypted files in memory
+  clearAllDrafts(); // unsent words stay with the account, not the next person on this browser
   sec.reset();
   await E2EE.clearKeys();
   location.href = '/';
@@ -574,6 +581,16 @@ function startApp() {
     if (!S.view.serverId) renderSidebar();
   });
   socket.on('rail:update', ({ rail }) => folders.applyRemote(rail));
+  // Read markers, notification preferences and saved messages changed on another of your devices.
+  socket.on('read:update', (st) => onReadUpdate(st));
+  socket.on('notify:update', (r) => applyNotifyPref(r));
+  socket.on('notify:settings', (st) => { S.notifySettings = st; });
+  socket.on('saved:update', (p) => { if (p.saved) S.savedIds.add(p.messageId); else S.savedIds.delete(p.messageId); if (S.view.type === 'saved') later(renderMain); });
+  socket.on('timeout:update', ({ serverId, until }) => {
+    const sv = S.servers.find((x) => x.id === serverId);
+    if (!sv) return;
+    toast(until ? `You\u2019re timed out in ${sv.name} until ${fmtStamp(until)}. You can still read.` : `Your timeout in ${sv.name} is over.`);
+  });
   socket.on('study:changed', (p) => { if (S.me.studyEnabled) study.onRemoteChange(p); });
   socket.on('study:enabled', ({ enabled }) => { S.me.studyEnabled = enabled; if (!S.view.serverId) renderSidebar(); });
   socket.on('updates:new', (p) => { updates.onNew(p); if (S.view.type === 'updates') renderMain(); });
@@ -716,7 +733,7 @@ function startApp() {
   });
 
   window.addEventListener('focus', () => { markRead(currentKey()); });
-  window.addEventListener('pagehide', () => { if (voice && voice.channelId) socket.emit('voice:leave', {}); });
+  window.addEventListener('pagehide', () => { drafts.flush(); if (voice && voice.channelId) socket.emit('voice:leave', {}); });
   window.addEventListener('hashchange', () => openLinkFromHash());
   document.addEventListener('keydown', globalKeys);
   document.querySelector('.nav-scrim').addEventListener('click', () => document.body.classList.remove('nav-open'));
@@ -747,8 +764,11 @@ function rememberE2eeSince(t) {
 }
 
 async function loadBootstrap() {
+  // Read markers, notification preferences and saved ids come alongside, so unread badges are right at start.
+  const extras = Promise.all(['/me/unread', '/me/notify', '/me/saved/ids'].map((p) => api('GET', p).catch(() => null)));
   const b = await api('GET', '/bootstrap');
   S.me = b.me;
+  drafts = createDrafts(S.me.id);
   S.mediaToken = b.mediaToken;
   S.iceServers = b.iceServers;
   // With relays in several regions, find the nearest ones in the background (cached for 6 hours).
@@ -769,6 +789,7 @@ async function loadBootstrap() {
   if (S.view.serverId && !S.servers.find((s) => s.id === S.view.serverId)) S.view = { type: 'home' };
   if (S.view.dmId && !S.dms.find((d) => d.id === S.view.dmId)) S.view = { type: 'home' };
   if (!S.view.serverId && !S.view.dmId && !['friends', 'saved', 'people'].includes(S.view.type)) S.view = { type: 'home' };
+  applyUserState(await extras);
   renderAll();
   loadPreviews();
   if (!S.remindersOn) { S.remindersOn = true; startReminders(); }
@@ -999,7 +1020,11 @@ function setView(v) {
   if (S.panel === null && P.showMembers && wideEnoughForPanel() && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
   document.body.classList.remove('nav-open');
   if (v.type === 'channel') { const lc = P.lastChannel; lc[v.serverId] = v.channelId; P.lastChannel = lc; }
-  S.unreadMarker = S.unread.has(currentKey()) ? currentKey() : null;
+  // Where "New messages" goes: the read marker as it was when you opened the conversation.
+  const ck = currentKey();
+  S.unreadMarker = ck && S.unread.has(ck) ? ck : null;
+  S.markerId = S.unreadMarker ? S.lastRead[ck] || '0' : null;
+  S.markerCount = S.unreadMarker ? S.unreadCounts && S.unreadCounts[ck] || 0 : 0;
   renderAll();
   markRead(currentKey());
 }
@@ -1034,20 +1059,89 @@ function openMessages() {
 
 // ======================================================================= unread + notification levels
 // Levels: 'all' | 'mentions' | 'muted'. Channels inherit from their server unless set.
+// The preferences live on the server (so push follows them too) and sync to your other devices. 'none' there
+// is 'muted' here; "mute for a while" (muteUntil) counts as muted until it runs out.
+const mutedFor = (p) => !!(p && p.muteUntil && p.muteUntil > Date.now());
 function notifyLevel(key) {
-  const p = P.notify;
-  if (p[key] && p[key] !== 'default') return p[key];
-  if (key.startsWith('c:')) {
-    const s = serverOfChannel(key.slice(2));
-    if (s && p['s:' + s.id]) return p['s:' + s.id];
-  }
-  return 'all';
+  const own = S.notifyPrefs[key];
+  const srv = key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
+  const sp = srv ? S.notifyPrefs['s:' + srv.id] : null;
+  if (mutedFor(own) || mutedFor(sp)) return 'muted';
+  const pick = (p) => (p && p.level !== 'default' ? p.level : null);
+  const lvl = pick(own) || pick(sp) || 'all';
+  return lvl === 'none' ? 'muted' : lvl;
 }
-function setNotify(key, level) {
-  const p = P.notify;
-  if (level === 'default') delete p[key]; else p[key] = level;
-  P.notify = p;
-  renderSidebar(); renderRail(); renderHeader();
+// Does @everyone ping me here? Not when I've switched that off for the channel or its server.
+function everyoneMuted(key) {
+  const srv = key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
+  return !!((S.notifyPrefs[key] || {}).suppressEveryone || (srv && (S.notifyPrefs['s:' + srv.id] || {}).suppressEveryone));
+}
+function applyNotifyPref(r) {
+  if (!r || !r.target) return;
+  if (r.level === 'default' && !r.muteUntil && !r.suppressEveryone) delete S.notifyPrefs[r.target];
+  else S.notifyPrefs[r.target] = { level: r.level, muteUntil: r.muteUntil || null, suppressEveryone: !!r.suppressEveryone };
+  later(renderSidebar); later(renderRail); later(renderHeader);
+}
+async function setNotify(key, level, extra = {}) {
+  const body = { ...extra };
+  if (level !== undefined) body.level = level === 'muted' ? 'none' : level;
+  try { applyNotifyPref(await api('PUT', `/me/notify/${key}`, body)); } catch (e) { toast(e.message, 'error'); }
+}
+async function setNotifySettings(body) {
+  const r = await api('PUT', '/me/notify-settings', body);
+  S.notifySettings = { dnd: r.dnd, tz: r.tz, previews: r.previews };
+  return r;
+}
+// Do Not Disturb: the status, or quiet hours right now.
+const quiet = () => S.me.status === 'dnd' || quietNow(S.notifySettings);
+// Unread state, preferences and saved ids from the server, at start-up.
+function applyUserState([unread, notify, savedIds]) {
+  if (notify) { S.notifyPrefs = notify.prefs || {}; S.notifySettings = notify.settings || S.notifySettings; migrateLocalNotify(); syncTimeZone(); }
+  if (savedIds) { S.savedIds = new Set(savedIds); migrateLocalSaved(); }
+  if (unread) { S.unreadCounts = {}; for (const [conv, st] of Object.entries(unread.states || {})) applyReadState(conv, st); }
+  updateTitle();
+}
+function applyReadState(conv, st) {
+  if (!st) return;
+  if (st.lastReadId) S.lastRead[conv] = st.lastReadId;
+  if (st.lastId) S.lastIds[conv] = st.lastId;
+  (S.unreadCounts ||= {})[conv] = st.unread || 0;
+  if (st.unread > 0) S.unread.add(conv); else S.unread.delete(conv);
+  if (st.mentions > 0 && notifyLevel(conv) !== 'muted') S.mentions.set(conv, st.mentions); else S.mentions.delete(conv);
+}
+// Read on another device (or another tab): same badges here, and its notifications go away.
+function onReadUpdate(st) {
+  if (!st || !st.conv) return;
+  applyReadState(st.conv, st);
+  if (!st.unread) closeNotifications(st.conv);
+  updateTitle(); later(renderRail); later(renderSidebar);
+  if (S.view.type === 'home') later(renderMain);
+}
+// Preferences and saved messages used to be kept only in this browser. The first time this device sees the
+// server's (empty) copy, it hands its own over (ids and levels only: the saved text it kept is deleted).
+function migrateLocalNotify() {
+  const k = mine('notify');
+  let old = null;
+  try { old = JSON.parse(localStorage.getItem(k) || 'null'); } catch { /* none */ }
+  if (!old || typeof old !== 'object') return;
+  localStorage.removeItem(k); lsCache.delete(k);
+  if (Object.keys(S.notifyPrefs).length) return;
+  for (const [key, lvl] of Object.entries(old).slice(0, 100)) if (/^[scd]:/.test(key) && ['all', 'mentions', 'muted'].includes(lvl)) setNotify(key, lvl);
+}
+function migrateLocalSaved() {
+  const k = mine('saved');
+  let old = null;
+  try { old = JSON.parse(localStorage.getItem(k) || 'null'); } catch { /* none */ }
+  localStorage.removeItem(mine('lastRead')); lsCache.delete(mine('lastRead'));
+  if (!Array.isArray(old)) return;
+  localStorage.removeItem(k); lsCache.delete(k);
+  for (const it of old.slice(0, 200).reverse()) if (it && it.msgId && !S.savedIds.has(it.msgId)) api('PUT', `/me/saved/${it.msgId}`, {}).then(() => S.savedIds.add(it.msgId)).catch(() => {});
+}
+// Quiet hours follow your clock: the server needs your time zone to know when they start.
+function syncTimeZone() {
+  let tz = '';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { /* unknown */ }
+  if (tz && tz !== S.notifySettings.tz) setNotifySettings({ tz }).catch(() => {});
 }
 const isMuted = (key) => notifyLevel(key) === 'muted';
 function serverUnread(s) {
@@ -1058,8 +1152,16 @@ function serverUnread(s) {
     mentions += S.mentions.get(k) || 0;
     if (S.unread.has(k) && notifyLevel(k) === 'all') unread = true;
   }
-  if (P.notify['s:' + s.id] === 'muted') unread = false;
+  if (notifyLevel('s:' + s.id) === 'muted') unread = false;
   return { unread, mentions };
+}
+// The read marker is saved on the server (a moment after it moves, so scrolling through a busy channel is one
+// request), which tells your other devices.
+const readSync = new Map(); // key -> timer
+function syncRead(key, messageId, unread = false) {
+  clearTimeout(readSync.get(key));
+  const go = () => { readSync.delete(key); api('POST', '/me/read', { conv: key, messageId, ...(unread ? { unread: true } : {}) }).catch(() => {}); };
+  if (unread) go(); else readSync.set(key, setTimeout(go, 600));
 }
 function markRead(key) {
   if (!key || document.hidden) return;
@@ -1067,27 +1169,43 @@ function markRead(key) {
   const lastId = st && st.list.length && !st.hasNewer ? st.list[st.list.length - 1].id : null;
   const badges = S.unread.has(key) || S.mentions.has(key);
   // Called on every scroll near the bottom: only do the work when something actually changes.
-  if (!badges && (!lastId || P.lastRead[key] === lastId)) return;
-  if (lastId && P.lastRead[key] !== lastId) {
-    const lr = P.lastRead;
-    lr[key] = lastId;
-    P.lastRead = lr;
-  }
+  if (!badges && (!lastId || (S.lastRead[key] && S.lastRead[key] >= lastId))) return;
+  if (lastId && !(S.lastRead[key] && S.lastRead[key] >= lastId)) { S.lastRead[key] = lastId; syncRead(key, lastId); }
   // Only unread dots and mention counts show in the server bar and channel list.
   if (!badges) return;
   S.unread.delete(key);
   S.mentions.delete(key);
+  if (S.unreadCounts) S.unreadCounts[key] = 0;
+  closeNotifications(key);
   updateTitle();
   later(renderRail);
   later(renderSidebar);
 }
+// "Mark as read" from a menu: up to the newest message we know of, loaded or not.
+function markConvRead(key) {
+  const st = S.msgs[key];
+  const lastId = (st && st.list.length && !st.hasNewer && st.list[st.list.length - 1].id) || S.lastIds[key];
+  if (lastId) { S.lastRead[key] = lastId; syncRead(key, lastId); }
+  S.unread.delete(key); S.mentions.delete(key);
+  if (S.unreadCounts) S.unreadCounts[key] = 0;
+  if (S.unreadMarker === key) { S.unreadMarker = null; if (currentKey() === key) renderMessages(false); }
+  closeNotifications(key);
+  renderSidebar(); renderRail(); updateTitle();
+}
+async function markServerRead(server) {
+  server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); });
+  renderAll(); updateTitle();
+  try { (await api('POST', `/servers/${server.id}/read`)).states.forEach((st) => applyReadState(st.conv, st)); } catch (e) { toast(e.message, 'error'); }
+}
 function markUnread(key, msgId) {
-  const lr = P.lastRead;
   const store = S.msgs[key];
   const i = store ? store.list.findIndex((m) => m.id === msgId) : -1;
-  lr[key] = i > 0 ? store.list[i - 1].id : '0';
-  P.lastRead = lr;
+  const id = i > 0 ? store.list[i - 1].id : '0';
+  S.lastRead[key] = id;
   S.unread.add(key);
+  S.unreadMarker = key; S.markerId = id;
+  S.markerCount = store ? store.list.filter((m) => m.id > id && m.authorId !== S.me.id).length : 0;
+  syncRead(key, id, true);
   updateTitle(); renderRail(); renderSidebar();
   if (currentKey() === key) renderMessages(false);
 }
@@ -1253,7 +1371,7 @@ const study = createRecall({ S, onEnabled: () => { if (!S.view.serverId) renderS
 const folders = createFolders({
   S, servers: () => realServers(), favorites: () => new Set(P.favorites.filter((f) => f.startsWith('s:')).map((f) => f.slice(2))),
   rerender: () => renderRail(), serverUnread: (s) => serverUnread(s), setNotify: (k, v) => setNotify(k, v), railSide: () => railSide(),
-  markServerRead: (server) => { server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); }); renderAll(); },
+  markServerRead: (server) => markServerRead(server),
   serverIcon: (s) => serverIconEl(s),
 });
 function renderRail() {
@@ -1417,8 +1535,8 @@ function dmMenuItems(d) {
   const fav = P.favorites.includes('d:' + d.id);
   return [
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('d:' + d.id) },
-    { label: 'Mark as read', icon: 'check', action: () => { S.unread.delete('d:' + d.id); S.mentions.delete('d:' + d.id); renderSidebar(); renderRail(); updateTitle(); } },
-    notifyItem('d:' + d.id),
+    { label: 'Mark as read', icon: 'check', action: () => markConvRead('d:' + d.id) },
+    ...notifyItems('d:' + d.id),
     '-',
     { label: 'View profile', icon: 'user', action: () => openProfileModal(u.id) },
     { label: 'Verify encryption', icon: 'shield', action: () => openSafetyNumber(u) },
@@ -1429,7 +1547,7 @@ function groupMenuItems(g) {
   const fav = P.favorites.includes('g:' + g.id);
   return [
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('g:' + g.id) },
-    c ? notifyItem('c:' + c.id) : null,
+    ...(c ? [{ label: 'Mark as read', icon: 'check', action: () => markConvRead('c:' + c.id) }, ...notifyItems('c:' + c.id)] : []),
     { label: 'Rename group', icon: 'edit', action: () => renameGroup(g) },
     { label: 'Change group picture', icon: 'image', action: () => changeGroupIcon(g) },
     { label: 'Add people', icon: 'userPlus', action: () => openNewConversation(g) },
@@ -1438,9 +1556,21 @@ function groupMenuItems(g) {
     { label: 'Leave group', icon: 'logout', danger: true, action: () => leaveServer(g) },
   ];
 }
-function notifyItem(key) {
-  const muted = isMuted(key);
-  return { label: muted ? 'Unmute' : 'Mute', icon: muted ? 'bell' : 'bellOff', action: () => setNotify(key, muted ? 'default' : 'muted') };
+// Mute for a while or until turned back on; muted shows how long is left.
+const MUTE_FOR = [['For 15 minutes', 15], ['For 1 hour', 60], ['For 8 hours', 480], ['For 24 hours', 1440]];
+function muteLeft(key) {
+  const p = S.notifyPrefs[key];
+  if (p && p.muteUntil > Date.now()) return `until ${fmtStamp(p.muteUntil)}`;
+  return p && p.level === 'none' ? 'until you turn it back on' : '';
+}
+function notifyItems(key) {
+  if (isMuted(key) && S.notifyPrefs[key]) {
+    const left = muteLeft(key);
+    return [{ label: 'Unmute', icon: 'bell', hint: left, action: () => setNotify(key, S.notifyPrefs[key].level === 'none' ? 'default' : undefined, { muteUntil: null }) }];
+  }
+  return [{ header: 'Mute' },
+    ...MUTE_FOR.map(([l, min]) => ({ label: l, icon: 'bellOff', action: () => setNotify(key, undefined, { muteUntil: Date.now() + min * 60000 }) })),
+    { label: 'Until I turn it back on', icon: 'bellOff', action: () => setNotify(key, 'muted') }];
 }
 
 // ---- server sidebar with categories
@@ -1537,12 +1667,15 @@ function channelMenuItems(c, server) {
   const admin = isAdmin(server);
   const edit = canEditChannel(server, c);
   const roles = canEditChannelPerms(server, c);
-  const lvl = P.notify[k] || 'default';
+  const pk = S.notifyPrefs[k];
+  const lvl = pk && pk.level !== 'default' ? (pk.level === 'none' ? 'muted' : pk.level) : 'default';
   return [
-    c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => { S.unread.delete(k); S.mentions.delete(k); renderSidebar(); renderRail(); updateTitle(); } } : null,
+    c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => markConvRead(k) } : null,
     ...(c.type === 'voice' && callRegions().length ? [...regionMenuItems(c.id), '-'] : []),
     c.type === 'text' ? { header: 'Notifications' } : null,
-    ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
+    ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
+    c.type === 'text' ? { label: 'Ignore @everyone and @here', checked: !!(pk && pk.suppressEveryone), action: () => setNotify(k, undefined, { suppressEveryone: !(pk && pk.suppressEveryone) }) } : null,
+    ...(c.type === 'text' ? notifyItems(k) : []),
     '-',
     { label: 'Copy channel link', icon: 'link', action: () => { copyText(`${location.origin}/#c/${c.id}`); toast('Link copied.'); } },
     edit ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
@@ -1846,7 +1979,7 @@ function renderHeader() {
       headTools(h('button', { class: 'btn ghost sm', onclick: () => updates.trackDialog(() => renderMain()) }, icon('plus'), 'Track something')));
   } else if (v.type === 'saved') {
     head.append(h('div', { class: 'head-title' }, icon('bookmark', 'ic head-ic'), h('h1', null, 'Saved messages')),
-      headTools(h('span', { class: 'head-note' }, 'Saved on this device only')));
+      headTools(h('span', { class: 'head-note' }, 'Synced to your devices. Only you can see them.')));
   } else if (server) {
     head.append(h('div', { class: 'head-title' }, h('h1', null, server.name)));
   }
@@ -1855,9 +1988,11 @@ function encBadge(onclick, tip = 'End-to-end encrypted. Click for details.') {
   return h('button', { class: 'head-badge e2ee', 'data-tip': tip, 'aria-label': tip, onclick }, icon('lock'));
 }
 function notifyMenu(key) {
-  const lvl = P.notify[key] || 'default';
+  const pk = S.notifyPrefs[key];
+  const lvl = pk && pk.level !== 'default' ? (pk.level === 'none' ? 'muted' : pk.level) : 'default';
   return [{ header: 'Notify me about' },
-    ...[['default', 'Server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing (mute)']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(key, v) }))];
+    ...[['default', 'Server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing (mute)']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(key, v) })),
+    ...(pk && pk.muteUntil > Date.now() ? [{ label: 'Unmute', icon: 'bell', hint: muteLeft(key), action: () => setNotify(key, undefined, { muteUntil: null }) }] : [])];
 }
 
 // ---- Home: a quick launchpad, not a wall of content
@@ -2045,26 +2180,77 @@ function friendsView() {
   return wrap;
 }
 
+// Saved messages: kept on the server as message ids (plus a note encrypted with your own key), so they follow
+// you to every device. Each one is fetched and decrypted here; one you can't see anymore says so.
+let vaultKeyP = null;
+const myVaultKey = () => (vaultKeyP ||= E2EE.vaultKey(S.privateKey, S.me.publicKey));
+async function openNote(it) {
+  if (!it.note) return '';
+  try { return (await E2EE.openVault(await myVaultKey(), 'saved', it.messageId, it.note)).n || ''; } catch { return ''; }
+}
 function savedView() {
-  const wrap = h('div', { class: 'saved' });
-  const list = P.saved;
-  if (!list.length) {
-    wrap.append(h('div', { class: 'empty-state' }, h('h3', null, 'Nothing saved yet'),
-      h('p', null, 'Hover a message and choose More \u2192 Save message to keep it here. Saved messages stay on this device.')));
-    return wrap;
-  }
-  for (const it of list) {
-    const u = getUser(it.authorId);
-    wrap.append(h('div', { class: 'saved-row' },
-      avatarEl(u, 36),
-      h('div', { class: 'saved-body' },
-        h('div', { class: 'saved-meta' }, nameEl(u), h('span', null, `${it.where} \u00b7 ${fmtStamp(it.createdAt)}`)),
-        h('div', { class: 'saved-text md' , html: md(it.text || (it.files ? 'Attachment' : ''), { mentionName: S.me.username }) })),
-      h('div', { class: 'saved-actions' },
-        ibtn('arrowUp', 'Jump to message', () => jumpToMessageId(it.msgId)),
-        ibtn('trash', 'Remove from saved', () => { P.saved = P.saved.filter((x) => x.msgId !== it.msgId); renderMain(); }))));
-  }
+  const wrap = h('div', { class: 'saved', 'aria-busy': 'true' }, h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
+  const state = { items: [], hasMore: false };
+  const draw = () => {
+    wrap.removeAttribute('aria-busy');
+    clear(wrap);
+    if (!state.items.length) {
+      wrap.append(h('div', { class: 'empty-state' }, h('h3', null, 'Nothing saved yet'),
+        h('p', null, 'Hover a message and choose More \u2192 Save message to keep it here. Saved messages follow you to all your devices.')));
+      return;
+    }
+    for (const it of state.items) {
+      const m = it.message;
+      if (!m) {
+        wrap.append(h('div', { class: 'saved-row unavailable' }, h('div', { class: 'saved-av-empty' }, icon('bookmark')),
+          h('div', { class: 'saved-body' }, h('div', { class: 'saved-meta' }, h('span', null, `Saved ${fmtStamp(it.savedAt)}`)),
+            h('div', { class: 'saved-text muted-p' }, 'This message is no longer available. It was deleted, or you can\u2019t see that conversation anymore.'),
+            it.noteText ? h('div', { class: 'saved-note' }, icon('edit'), it.noteText) : null),
+          h('div', { class: 'saved-actions' }, ibtn('trash', 'Remove from saved', () => unsave(it.messageId)))));
+        continue;
+      }
+      const u = getUser(m.authorId);
+      const text = readable(m) ? textOf(m) || (filesOf(m).length ? '_Attachment_' : m.dec && m.dec.p ? `\uD83D\uDCCA ${m.dec.p.q}` : '') : '';
+      wrap.append(h('div', { class: 'saved-row', dataset: { saved: it.messageId } },
+        avatarEl(u, 36),
+        h('div', { class: 'saved-body' },
+          h('div', { class: 'saved-meta' }, nameEl(u), h('span', null, `${whereLabel(m)} \u00b7 ${fmtStamp(m.createdAt)}`)),
+          readable(m) ? h('div', { class: 'saved-text md', html: md(text, { mentionName: S.me.username }) }) : h('div', { class: 'saved-text muted-p' }, 'Can\u2019t decrypt this message on this device yet.'),
+          it.noteText ? h('div', { class: 'saved-note' }, icon('edit'), it.noteText) : null),
+        h('div', { class: 'saved-actions' },
+          ibtn('arrowUp', 'Jump to message', () => jumpToMessageId(it.messageId)),
+          ibtn('edit', it.noteText ? 'Edit note' : 'Add a note', () => editSavedNote(it)),
+          ibtn('trash', 'Remove from saved', () => unsave(it.messageId)))));
+    }
+    if (state.hasMore) wrap.append(h('div', { class: 'saved-more' }, h('button', { class: 'btn ghost', onclick: () => load(state.items[state.items.length - 1].savedAt) }, 'Show older')));
+  };
+  const load = async (before) => {
+    try {
+      const res = await api('GET', `/me/saved?limit=50${before ? `&before=${before}` : ''}`);
+      await Promise.all(res.items.map(async (it) => { if (it.message) await decryptMessage(it.message); it.noteText = await openNote(it); }));
+      state.items = before ? [...state.items, ...res.items] : res.items;
+      state.hasMore = res.hasMore;
+      if (S.view.type === 'saved') draw();
+    } catch (e) { clear(wrap).append(h('p', { class: 'sidebar-empty' }, e.message)); }
+  };
+  load();
   return wrap;
+}
+async function unsave(id) {
+  try { await api('DELETE', `/me/saved/${id}`); S.savedIds.delete(id); toast('Removed from saved.'); if (S.view.type === 'saved') renderMain(); } catch (e) { toast(e.message, 'error'); }
+}
+function editSavedNote(it) {
+  const inp = h('textarea', { class: 'input', rows: '3', maxlength: '500', placeholder: 'Why you saved it, a to-do\u2026' });
+  inp.value = it.noteText || '';
+  modal({ title: it.noteText ? 'Edit note' : 'Add a note', size: 'sm',
+    body: h('div', { class: 'stack' }, field('Note', inp, 'Only you can read it: it\u2019s encrypted on this device before it\u2019s saved.')),
+    actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: async () => {
+      const n = inp.value.trim();
+      const note = n ? await E2EE.sealVault(await myVaultKey(), 'saved', it.messageId, { n }) : null;
+      await api('PUT', `/me/saved/${it.messageId}`, { note });
+      toast('Note saved.');
+      if (S.view.type === 'saved') renderMain();
+    } }] });
 }
 
 // ======================================================================= conversation view
@@ -2074,12 +2260,13 @@ function chatView() {
   scroller.addEventListener('scroll', onMessagesScroll);
   scroller.addEventListener('click', onMessageAreaClick);
   const jump = h('button', { class: 'jump-latest', id: 'jump-latest', hidden: true, onclick: () => jumpToLatest() }, icon('arrowDown'), 'Jump to latest');
+  const unreadBar = h('div', { class: 'unread-bar', id: 'unread-bar', role: 'status', hidden: true });
   const key = currentKey();
   const comp = createComposer({ id: 'main', key: () => currentKey(), threadId: () => null });
   composers.main = comp;
   const room = S.view.type === 'dm' ? dmRoom(S.view.dmId) : callRoomFor(currentServer());
   if (room && ((S.voice[room] || []).length || (voice && voice.channelId === room))) wrap.append(callStage(room, { compact: true }));
-  wrap.append(scroller, jump, comp.el);
+  wrap.append(unreadBar, scroller, jump, comp.el);
   wrap.addEventListener('dragover', (e) => { e.preventDefault(); wrap.classList.add('dropping'); });
   wrap.addEventListener('dragleave', (e) => { if (!wrap.contains(e.relatedTarget)) wrap.classList.remove('dropping'); });
   wrap.addEventListener('drop', (e) => { e.preventDefault(); wrap.classList.remove('dropping'); comp.addFiles(e.dataTransfer.files); });
@@ -2278,7 +2465,7 @@ function renderMessages(stick) {
     return;
   }
   if (!store.hasMore) sc.append(welcomeBlock());
-  const lastRead = P.lastRead[key];
+  const lastRead = S.unreadMarker === key ? S.markerId : null;
   let newShown = false;
   let prev = null;
   for (const m of store.list) {
@@ -2286,8 +2473,8 @@ function renderMessages(stick) {
       sc.append(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
       prev = null;
     }
-    if (!newShown && lastRead && m.id > lastRead && m.authorId !== S.me.id && S.unreadMarker === key) {
-      sc.append(h('div', { class: 'new-div', role: 'separator', 'aria-label': 'New messages' }, h('span', null, 'New')));
+    if (!newShown && lastRead && m.id > lastRead && m.authorId !== S.me.id) {
+      sc.append(h('div', { class: 'new-div', role: 'separator', 'aria-label': 'New messages', id: 'new-div' }, h('span', null, 'New messages')));
       newShown = true;
       prev = null;
     }
@@ -2302,7 +2489,34 @@ function renderMessages(stick) {
   if (!store.hasNewer) redrawPendingSends(key);
   const jl = $('#jump-latest');
   if (jl) jl.hidden = !store.hasNewer;
+  renderUnreadBar();
   renderTyping();
+}
+// "12 new messages since 3:04 PM · Jump to first unread · Mark as read", above the messages while there's a
+// "New messages" line in this conversation.
+function renderUnreadBar() {
+  const bar = $('#unread-bar');
+  if (!bar) return;
+  const key = currentKey();
+  clear(bar);
+  const store = S.msgs[key];
+  const n = S.unreadMarker === key ? Math.max(S.markerCount || 0, store ? store.list.filter((m) => m.id > S.markerId && m.authorId !== S.me.id).length : 0) : 0;
+  bar.hidden = !n;
+  if (!n) return;
+  const first = store && store.list.find((m) => m.id > S.markerId && m.authorId !== S.me.id);
+  bar.append(h('button', { class: 'unread-jump', onclick: () => jumpToFirstUnread() }, icon('arrowUp'),
+    h('span', null, `${n >= 100 ? '99+' : n} new message${n === 1 ? '' : 's'}${first ? ` since ${fmtTime(first.createdAt)}` : ''}`), h('strong', null, 'Jump to first unread')),
+  h('button', { class: 'unread-mark', onclick: () => markConvRead(key) }, 'Mark as read', icon('check')));
+}
+async function jumpToFirstUnread() {
+  const key = currentKey();
+  if (S.unreadMarker !== key) return;
+  const store = S.msgs[key];
+  const loadedFrom = store && store.list.length ? store.list[0].id : null;
+  // The first unread message isn't loaded yet (lots of new messages): load the page around the marker.
+  if (!loadedFrom || loadedFrom > S.markerId) await loadMessages(key, { around: S.markerId });
+  const div = $('#new-div');
+  if (div) div.scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
 }
 function welcomeBlock() {
   if (S.view.type === 'dm') {
@@ -2460,9 +2674,10 @@ function authorMayPingEveryone(m) {
 function messageMenuItems(m, ctx) {
   const mine = m.authorId === S.me.id;
   const ok = readable(m);
-  const saved = P.saved.some((x) => x.msgId === m.id);
+  const saved = S.savedIds.has(m.id);
   const server = m.serverId && S.servers.find((s) => s.id === m.serverId);
-  const canPin = m.dmId || isGroup(server) || mine || canModerate(m);
+  // Pins are the channel's notice board: in servers they need Manage Messages, even for your own messages.
+  const canPin = m.dmId || isGroup(server) || canModerate(m);
   return [
     { label: 'Add reaction', icon: 'smile', action: () => { const el = $(`[data-mid="${m.id}"] .msg-tools .tool:nth-child(2)`); emojiPicker(el || $('#main'), (em) => react(m, em)); } },
     ok ? { label: 'Reply', icon: 'reply', action: () => startReply(m, ctx) } : null,
@@ -2607,14 +2822,12 @@ function whereLabel(m) {
   const c = channelById(m.channelId);
   return s && c ? `#${c.name} \u00b7 ${s.name}` : 'Channel';
 }
-function toggleSaved(m) {
-  const list = P.saved;
-  if (list.some((x) => x.msgId === m.id)) { P.saved = list.filter((x) => x.msgId !== m.id); toast('Removed from saved.'); }
-  else {
-    list.unshift({ msgId: m.id, authorId: m.authorId, text: textOf(m), files: filesOf(m).length, createdAt: m.createdAt, where: whereLabel(m), savedAt: Date.now() });
-    P.saved = list;
-    toast('Saved. Find it under Home \u2192 Saved messages.');
-  }
+async function toggleSaved(m) {
+  const was = S.savedIds.has(m.id);
+  try {
+    if (was) { await api('DELETE', `/me/saved/${m.id}`); S.savedIds.delete(m.id); toast('Removed from saved.'); }
+    else { await api('PUT', `/me/saved/${m.id}`, {}); S.savedIds.add(m.id); toast('Saved. Find it under Home \u2192 Saved messages.'); }
+  } catch (e) { toast(e.message, 'error'); }
   if (S.view.type === 'saved') renderMain();
 }
 function startReply(m, ctx = 'main') {
@@ -2910,18 +3123,32 @@ async function onNewMessage(key, m) {
   }
   const t = S.typing[key];
   if (t && t.has(m.authorId)) { clearTimeout(t.get(m.authorId)); t.delete(m.authorId); if (currentKey() === key) renderTyping(); }
-  if (m.authorId === S.me.id) { if (!S.view.serverId) later(renderSidebar); return; }
+  if (!m.threadId && !(S.lastIds[key] && S.lastIds[key] >= m.id)) S.lastIds[key] = m.id;
+  // Your own message (from here or another device) means you've read the conversation up to it.
+  if (m.authorId === S.me.id) {
+    S.lastRead[key] = m.id;
+    if (S.unread.delete(key) | S.mentions.delete(key)) { closeNotifications(key); updateTitle(); later(renderRail); }
+    if (!S.view.serverId || S.view.serverId === m.serverId) later(renderSidebar);
+    return;
+  }
   const viewing = currentKey() === key && !document.hidden;
   const level = notifyLevel(key);
   const isDm = key.startsWith('d:') || isGroup(S.servers.find((x) => x.id === m.serverId));
-  const mentioned = mentionsMe(m);
+  const kind = mentionKind(m);
+  // @everyone you've chosen to ignore here isn't a ping.
+  const mentioned = !!kind && !(kind === 'everyone' && everyoneMuted(key));
   const repliedToMe = m.reply && m.reply.authorId === S.me.id;
   if (!viewing) {
     S.unread.add(key);
+    if (S.unreadCounts) S.unreadCounts[key] = (S.unreadCounts[key] || 0) + 1;
     if ((isDm || mentioned || repliedToMe) && level !== 'muted' && !S.blocked.has(m.authorId)) {
       S.mentions.set(key, (S.mentions.get(key) || 0) + 1);
-      if (S.me.status !== 'dnd') { playSound(mentionKind(m) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); if (!document.hasFocus()) flashTaskbar(); }
-    } else if (level === 'all' && !S.blocked.has(m.authorId) && S.me.status !== 'dnd') playSound('message');
+      // Several tabs open: only the first to claim this message makes a sound and shows it.
+      if (!quiet()) claimOnce(m.id).then((mineToShow) => { if (!mineToShow) return; playSound((mentioned && kind) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); if (!document.hasFocus()) flashTaskbar(); });
+    } else if (level === 'all' && !S.blocked.has(m.authorId) && !quiet()) claimOnce(m.id).then((ok) => { if (ok) playSound('message'); });
+  } else {
+    // Reading along at the bottom: the marker follows (and your other devices clear their badge).
+    later(() => { const sc = currentKey() === key && $('#messages'); if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160) markRead(key); });
   }
   if ((mentioned || repliedToMe) && !S.blocked.has(m.authorId)) {
     addInbox({
@@ -2944,6 +3171,7 @@ function notify(author, body, key) {
     const priv = key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)));
     const shown = priv && isSharing() && !shareAllowed.has(key) ? 'New message (hidden while you share your screen)' : body.slice(0, 140);
     const n = new Notification(displayName(author), { body: shown, icon: author.avatar || undefined, tag: key });
+    rememberNotification(key, n);
     n.onclick = () => { window.focus(); if (window.hearthDesktop) window.hearthDesktop.focus(); if (key.startsWith('d:')) openDm(key.slice(2)); else { const s = serverOfChannel(key.slice(2)); if (s) openChannel(key.slice(2), s.id); } n.close(); };
   } catch { /* ignore */ }
 }
@@ -3045,7 +3273,7 @@ async function onThreadMessage(m) {
   }
   if (m.authorId !== S.me.id && (mentionsMe(m) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId)) {
     addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${displayName(getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140) });
-    if (S.me.status !== 'dnd' && notifyLevel('c:' + m.channelId) !== 'muted') playSound(mentionKind(m) || 'reply');
+    if (!quiet() && notifyLevel('c:' + m.channelId) !== 'muted') claimOnce(m.id).then((ok) => { if (ok) playSound(mentionKind(m) || 'reply'); });
   }
 }
 async function onThreadUpdate(m) {
@@ -3164,12 +3392,27 @@ function memberMenuItems(server, u) {
   }
   if (!me && !isOwnerTarget && theirTop < myTop) {
     if (can(server, PERMS.KICK_MEMBERS) || can(server, PERMS.BAN_MEMBERS)) items.push('-');
+    if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Time out ${displayName(u)}\u2026`, icon: 'timer', action: () => openTimeout(server, u) });
     if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Kick ${displayName(u)}`, icon: 'logout', danger: true, action: async () => {
       if (await confirmDialog({ title: `Kick ${displayName(u)}?`, text: 'They can rejoin with an invite. The server\u2019s encryption key is replaced automatically so they can\u2019t read new messages.', confirm: 'Kick', danger: true })) api('DELETE', `/servers/${server.id}/members/${u.id}`).catch((e) => toast(e.message, 'error'));
     } });
     if (can(server, PERMS.BAN_MEMBERS)) items.push({ label: `Ban ${displayName(u)}`, icon: 'ban', danger: true, action: () => openBan(server, u) });
   }
   return items;
+}
+// Timeouts: they keep reading but can't post, react or talk until it ends. The server checks permissions and
+// role order again, and logs it.
+function openTimeout(server, u) {
+  const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional \u2014 they\u2019re told the reason' });
+  const len = h('select', { class: 'input', 'aria-label': 'How long' },
+    [[5, '5 minutes'], [10, '10 minutes'], [60, '1 hour'], [1440, '1 day'], [10080, '1 week'], [40320, '28 days']].map(([v, l]) => h('option', { value: String(v) }, l)));
+  len.value = '60';
+  modal({ title: `Time out ${displayName(u)}?`, size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They can still read, but can\u2019t send messages, react, start threads or talk in calls until it ends.'), field('For', len), field('Reason', reason)),
+    actions: [
+      { label: 'Remove timeout', action: () => api('DELETE', `/servers/${server.id}/members/${u.id}/timeout`).then(() => toast('Timeout removed.')) },
+      { label: 'Cancel' },
+      { label: 'Time out', kind: 'danger', action: () => api('POST', `/servers/${server.id}/members/${u.id}/timeout`, { minutes: Number(len.value), reason: reason.value }).then((r) => toast(`${displayName(u)} is timed out until ${fmtStamp(r.until)}.`)) }] });
 }
 function openBan(server, u) {
   const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional — only moderators see it' });
@@ -3199,6 +3442,7 @@ async function pinsPanel(el) {
     await Promise.all(pins.map(decryptMessage));
     if (currentKey() !== key || panelMode() !== 'pins') return;
     clear(list);
+    if (key.startsWith('c:')) pinHistory(el, key.slice(2));
     if (!pins.length) { list.append(h('div', { class: 'panel-empty' }, icon('pin'), h('p', null, 'No pinned messages yet. Pin important messages from the \u22ef menu so everyone can find them.'))); return; }
     pins.forEach((m) => {
       const u = getUser(m.authorId);
@@ -3210,6 +3454,16 @@ async function pinsPanel(el) {
           ibtn('close', 'Unpin', () => togglePin(m), { cls: 'sm' }))));
     });
   } catch (e) { clear(list).append(h('p', { class: 'sidebar-empty' }, e.message)); }
+}
+// Who pinned and unpinned what in this channel, newest first (kept by the server).
+async function pinHistory(el, channelId) {
+  try {
+    const log = await api('GET', `/channels/${channelId}/pins/log`);
+    if (!log.length || currentKey() !== 'c:' + channelId || panelMode() !== 'pins') return;
+    el.append(h('details', { class: 'pin-history' }, h('summary', null, 'Pin history'),
+      h('ul', null, log.slice(0, 20).map((x) => h('li', null, nameEl(getUser(x.userId)), ` ${x.action === 'pin' ? 'pinned' : 'unpinned'} a message \u00b7 ${fmtStamp(x.at)} `,
+        h('button', { class: 'link-btn', onclick: () => jumpToMessage('c:' + channelId, x.messageId) }, 'Jump'))))));
+  } catch { /* the pins still show */ }
 }
 function threadPanel(el) {
   const t = S.threads[S.thread.rootId];
@@ -3293,7 +3547,8 @@ const SLASH = createSlash({
   members: (s) => (s.memberIds || []).map(getUser),
   onEphemeral: () => { if (composers.main) composers.main.renderEph(); },
 });
-const drafts = new Map();
+// What you were typing, per conversation (and thread): kept on this device across reloads (see usability.js).
+let drafts = createDrafts('signed-out');
 let lastTypingSent = 0;
 function createComposer({ id, key, threadId, placeholder }) {
   const state = { replyTo: null, pending: [] };
@@ -3514,7 +3769,9 @@ function createComposer({ id, key, threadId, placeholder }) {
     ta.disabled = !!blockedNote || !!noSend;
     box.querySelector('.attach').hidden = !!ch && !canIn(ch, PERMS.ATTACH_FILES);
     if (blockedNote) extras.append(blockedNote);
-    if (noSend) extras.append(h('div', { class: 'key-bar' }, icon('lock'), h('span', null, threadId() ? 'You can read this thread but not reply.' : `You can read #${ch.name} but you don\u2019t have permission to send messages here.`)));
+    const to = ch && (serverOfChannel(ch.id) || {}).timeout;
+    if (noSend && to && to.until > Date.now()) extras.append(h('div', { class: 'key-bar' }, icon('timer'), h('span', null, `You\u2019re timed out until ${fmtStamp(to.until)}${to.reason ? ` (${to.reason})` : ''}. You can still read.`)));
+    else if (noSend) extras.append(h('div', { class: 'key-bar' }, icon('lock'), h('span', null, threadId() ? 'You can read this thread but not reply.' : `You can read #${ch.name} but you don\u2019t have permission to send messages here.`)));
     ta.placeholder = noSend ? 'Read only' : placeholder || placeholderFor(kk);
     slowNote.hidden = !(ch && ch.slowmode > 0 && !canIn(ch, PERMS.MANAGE_MESSAGES));
     if (!slowNote.hidden && !slowUntil) slowNote.textContent = `Slowmode is on: one message every ${fmtDuration(ch.slowmode)}`;
@@ -3688,7 +3945,9 @@ async function sendTo(key, threadId, payload, replyTo, nonce) {
     if (!server) throw new Error('Channel not found.');
     return withKeyRetry(server.id, async () => {
       const { ciphertext, epoch } = await sec.encryptChannel(server.id, channelId, payload);
-      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), nonce });
+      // @everyone / @here: the server checks the sender may use it, then counts and pushes it as a ping.
+      const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || '')) ? true : undefined;
+      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), everyone, nonce });
     });
   }
   const ciphertext = await sec.encryptDm(key.slice(2), payload);
@@ -4560,7 +4819,8 @@ function backFromStripe() {
 function serverMenuItems(server) {
   const admin = isAdmin(server);
   const fav = P.favorites.includes('s:' + server.id);
-  const lvl = P.notify['s:' + server.id] || 'all';
+  const sp = S.notifyPrefs['s:' + server.id];
+  const lvl = sp && sp.level !== 'default' ? (sp.level === 'none' ? 'muted' : sp.level) : 'all';
   return [
     can(server, PERMS.CREATE_INVITE) ? { label: 'Invite people', icon: 'userPlus', action: () => openInvite(server) } : null,
     canManageServer(server) ? { label: 'Server settings', icon: 'gear', action: () => openServerSettings(server) } : null,
@@ -4571,12 +4831,14 @@ function serverMenuItems(server) {
     ...folders.serverMenuExtras(server),
     '-',
     { header: 'Notifications' },
-    ...[['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Muted']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify('s:' + server.id, v === 'all' ? 'default' : v) })),
+    ...[['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify('s:' + server.id, v === 'all' ? 'default' : v) })),
+    { label: 'Ignore @everyone and @here', checked: !!(sp && sp.suppressEveryone), action: () => setNotify('s:' + server.id, undefined, { suppressEveryone: !(sp && sp.suppressEveryone) }) },
+    ...notifyItems('s:' + server.id),
     '-',
     admin ? { label: 'Create channel', icon: 'plus', action: () => openCreateChannel(server, 'text') } : null,
     admin ? { label: 'Create category', icon: 'folderPlus', action: () => openCreateCategory(server) } : null,
     { label: 'Encryption details', icon: 'lock', action: () => openServerSecurity(server) },
-    { label: 'Mark server as read', icon: 'check', action: () => { server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); }); renderAll(); } },
+    { label: 'Mark server as read', icon: 'check', action: () => markServerRead(server) },
     !isOwner(server) ? '-' : null,
     !isOwner(server) ? { label: 'Leave server', icon: 'logout', danger: true, action: () => leaveServer(server) } : null,
   ];
