@@ -473,6 +473,8 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .vc-user .uname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .vc-flags { display: inline-flex; color: var(--danger); }
 .ic.flag { width: 15px; height: 15px; color: var(--danger); }
+/* server-muted by a moderator: the same icon, boxed so it reads differently from muting yourself */
+.server-muted { display: inline-flex; padding: 1px; border-radius: 4px; background: color-mix(in oklab, var(--danger) 22%, transparent); }
 
 /* compact call bar + profile */
 #voice-panel {
@@ -716,6 +718,16 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .msg.flash { animation: flash 2s ease; }
 @keyframes flash { 0%, 50% { background: rgb(var(--accent-rgb) / .2); } 100% { background: transparent; } }
 .msg-gutter { grid-area: gutter; display: flex; justify-content: center; padding-top: 2px; }
+/* bulk delete: a checkbox on each message while picking */
+.messages.selecting .msg { padding-left: 40px; }
+.msg-select { position: absolute; left: 14px; top: 6px; width: 17px; height: 17px; margin: 0; accent-color: var(--danger); cursor: pointer; }
+.msg-select:disabled { cursor: not-allowed; opacity: .45; }
+.msg.selected { background: color-mix(in oklab, var(--danger) 10%, transparent); box-shadow: inset 2px 0 0 var(--danger); }
+.select-bar { flex: none; display: flex; align-items: center; gap: 8px; margin: 0 16px 6px; padding: 8px 10px 8px 14px; border-radius: 10px; background: rgb(var(--elev)); border: 1px solid var(--line-2); font-size: 13.5px; }
+.select-bar[hidden] { display: none; }
+.select-bar .sel-count { flex: 1; min-width: 0; font-weight: 600; }
+.select-bar .sel-hint { font-weight: 400; color: var(--muted); }
+@media (max-width: 520px) { .select-bar .sel-hint { display: none; } }
 .msg-av { height: 40px; border-radius: 50%; }
 .msg-hover-time { font-size: 10.5px; color: var(--muted); opacity: 0; line-height: 22px; white-space: nowrap; }
 .msg:hover .msg-hover-time { opacity: 1; }

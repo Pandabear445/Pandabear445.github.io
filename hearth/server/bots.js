@@ -136,31 +136,50 @@ module.exports = function setupBots(ctx) {
   function envelope(type, bot, inst, data, id = newId()) {
     return { id, body: JSON.stringify({ v: 1, id, type, createdAt: now(), botId: bot.id, installationId: inst ? inst.id : null, serverId: inst ? inst.server_id : null, data }) };
   }
-  function enqueue(type, bot, inst, data) {
+  function store(type, bot, inst, data) {
     const e = envelope(type, bot, inst, data);
     db.prepare('INSERT INTO bot_deliveries (id, bot_id, installation_id, server_id, type, body, status, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?)')
       .run(e.id, bot.id, inst ? inst.id : null, inst ? inst.server_id : null, type, e.body, now(), now());
-    setImmediate(pumpSafely);
     return e.id;
+  }
+  function enqueue(type, bot, inst, data) {
+    const id = store(type, bot, inst, data);
+    pumpSoon();
+    return id;
   }
   // Something happened in a server: tell every installation allowed to know. `channel` is the channel it
   // happened in (checked against each installation's allow-list); `actorId` is who did it (a bot never hears
   // about its own actions, so a bot answering an event can't set off an endless loop with itself).
-  function event(type, serverId, data, { channel = null, actorId = null } = {}) {
+  function listeners(type, serverId, { channel = null, actorId = null } = {}) {
     const scope = EVENTS[type];
-    if (scope === undefined || type === 'command.invoked') return;
+    if (scope === undefined || type === 'command.invoked') return [];
     const rows = db.prepare(`SELECT i.* FROM bot_installations i JOIN bots b ON b.id = i.bot_id
         WHERE i.server_id = ? AND i.enabled = 1 AND b.disabled = 0 AND b.webhook_url IS NOT NULL`).all(serverId);
-    if (!rows.length) return;
+    if (!rows.length) return [];
     const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
+    const out = [];
     for (const inst of rows) {
       if (inst.bot_id === actorId) continue;
       if (scope && !hasScope(inst, scope)) continue;
       const wanted = inst.events ? parseList(inst.events) : null;
       if (wanted && !wanted.includes(type)) continue;
       if (channel && !channelAllowed(inst, channel, srv)) continue;
-      enqueue(type, botRow(inst.bot_id), inst, data);
+      out.push({ bot: botRow(inst.bot_id), inst });
     }
+    return out;
+  }
+  function event(type, serverId, data, opts = {}) {
+    for (const { bot, inst } of listeners(type, serverId, opts)) enqueue(type, bot, inst, data);
+  }
+  // The same event many times over from one channel (a moderator's bulk delete, a ban's message cleanup): who may
+  // hear it is worked out once, every delivery is written in one transaction, and the sender wakes up once.
+  // One at a time, thousands of these kept the server busy for seconds.
+  function events(type, serverId, list, opts = {}) {
+    if (!list.length) return;
+    const to = listeners(type, serverId, opts);
+    if (!to.length) return;
+    db.transaction(() => { for (const { bot, inst } of to) for (const data of list) store(type, bot, inst, data); })();
+    pumpSoon();
   }
 
   // One POST to the bot's webhook. Resolves { ok, status, error }; never throws.
@@ -193,6 +212,10 @@ module.exports = function setupBots(ctx) {
   // The wake-ups (after a send, at the next retry) run it as a safe job too: a database error is logged and shown
   // in Admin → Health instead of stopping the server.
   const pumpSafely = jobs.job('bots.deliveries', pump);
+  // Wake-ups asked for in the same turn (sends finishing together, a burst of new events) share one pump: each
+  // pump reads the due deliveries, and thousands of them after a moderator's bulk delete kept the server busy.
+  let soon = false;
+  const pumpSoon = () => { if (soon) return; soon = true; setImmediate(() => { soon = false; pumpSafely(); }); };
   function pump() {
     if (pumping) { again = true; return; }
     pumping = true;
@@ -236,7 +259,7 @@ module.exports = function setupBots(ctx) {
     } finally {
       sending.delete(d.id);
       inflight.set(d.bot_id, inflight.get(d.bot_id) - 1);
-      setImmediate(pumpSafely);
+      pumpSoon();
     }
   }
   // Also on a timer (a safe job: errors are logged and counted in Admin → Health), in case a wake-up was missed.
@@ -264,7 +287,7 @@ module.exports = function setupBots(ctx) {
     let n = 0;
     const list = Array.isArray(ids) ? ids.slice(0, 100).map(String) : db.prepare("SELECT id FROM bot_deliveries WHERE installation_id = ? AND status = 'dead'").all(inst.id).map((r) => r.id);
     db.transaction(() => list.forEach((id) => { n += st.run(now(), id, inst.id).changes; }))();
-    setImmediate(pumpSafely);
+    pumpSoon();
     return n;
   }
   const clearDead = (inst) => db.prepare("DELETE FROM bot_deliveries WHERE installation_id = ? AND status = 'dead'").run(inst.id).changes;
@@ -933,7 +956,7 @@ module.exports = function setupBots(ctx) {
   });
   api.delete('/servers/:id/bots/:botId/deliveries/dead', auth, limitUi, (req, res) => res.json({ cleared: clearDead(managedInstall(req)) }));
 
-  return { event, serverBots, botPost, SCOPES, EVENTS, sign, pump };
+  return { event, events, serverBots, botPost, SCOPES, EVENTS, sign, pump };
 };
 module.exports.sign = sign;
 module.exports.SCOPES = SCOPES;

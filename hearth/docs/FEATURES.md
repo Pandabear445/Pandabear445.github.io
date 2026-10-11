@@ -150,10 +150,37 @@ is encrypted or assembled on the device.
   - A timed-out member keeps reading. They can't post, edit, react, start threads, vote, type, invite or speak in
     calls. This is applied in `perms.js` (`TALK` bits removed in `base` and `channel`, and a channel override
     can't give them back), so every existing permission check enforces it. Their app shows the composer as
-    read-only, with the end time.
+    read-only, with the end time. A timed-out moderator also can't use the moderator toolkit (voice moderation,
+    bulk delete, a ban's message cleanup) until it ends; kicks, plain bans and single deletes work as before.
   - Timeouts are kept in their own table, so leaving and rejoining doesn't clear one.
   - Moderators can list active timeouts (`GET /servers/:id/timeouts`). In the app, the member menu has
     "Time out…".
+- **Moderator toolkit** (later): voice moderation, ban with cleanup and bulk delete.
+  - Two new permissions: **Mute Members** (`1 << 17`) and **Move Members** (`1 << 18`). Move Members is
+    channel-scoped (it can be given in one voice channel only). Mute Members is server-wide only, because a server
+    mute holds in every voice channel. Neither can be on a role that's sold as a membership.
+  - `POST /servers/:id/voice/:uid/disconnect` and `/move { channelId }` (Move Members in the channel they're in,
+    and for a move in the destination too, which they must be allowed to connect to); `POST`/`DELETE
+    /servers/:id/voice/:uid/mute` (Mute Members server-wide, whether or not they're in a call). Role order as for
+    timeouts; never the owner or yourself; not in group chats; not while you're timed out. Audit log:
+    `voice_disconnect`, `voice_move`, `voice_mute`, `voice_unmute`.
+  - Server mutes are kept in `voice_mutes` until lifted, so leaving the call or the server doesn't clear one. They
+    never apply to the owner, and a transfer (yours or the instance staff's) drops the new owner's. People with
+    Mute Members get `voiceMutes` (user ids) with the server, so the app can show and lift a mute outside calls
+    (member menu, Server settings → Members). How the apps enforce them is in `docs/VOICE.md` (section 6).
+  - `POST /servers/:id/bans` takes `deleteHours`: 0 (default), 1, 24 or 168. Their messages in every channel of
+    the server from that window go, channel by channel in slices of 500, each slice in one transaction, letting
+    other requests in between slices. A thread they started goes with other people's replies only if the
+    moderator has Manage Messages in that channel and every other replier is below them (as bulk delete would);
+    otherwise it stays. The answer is `{ deleted, replies, kept }`, and so is the audit entry
+    (`ban_messages_deleted`). Refused while the moderator is timed out (a plain ban isn't).
+  - `POST /channels/:id/messages/bulk-delete` with `{ ids: [...] }` (up to 100) or `{ count: 1–100 }` (the newest
+    messages). Manage Messages in the channel; messages older than 14 days can't be picked; messages by people at
+    or above your highest role are kept (the answer says how many). One transaction, one
+    `message:delete-bulk { channelId, messages: [{ id, threadId }] }` event per channel, one audit log entry
+    (`messages_bulk_deleted`). Like a single delete, thread replies, files, reactions and poll votes go too, and bots
+    get `message.deleted` for each message (written in one transaction per channel, `BOTS.events`). Refused while
+    you're timed out.
 - **Reports**:
   - Reporters can see the status of their own reports (`GET /me/reports`, without staff notes).
   - Reporting the same message again while the first report is still open returns the existing report
@@ -174,6 +201,10 @@ is encrypted or assembled on the device.
 | `GET /channels/:id/pins/log` | can view channel | newest 50 |
 | `GET /servers/:id/timeouts` | Kick Members | |
 | `POST/DELETE /servers/:id/members/:uid/timeout` | Kick Members + role order | audit-logged; 30/min |
+| `POST /servers/:id/voice/:uid/disconnect`, `/move` | Move Members (per channel) + role order | audit-logged; 60/min |
+| `POST/DELETE /servers/:id/voice/:uid/mute` | Mute Members (server-wide) + role order | audit-logged; 60/min |
+| `POST /channels/:id/messages/bulk-delete` | Manage Messages in the channel | 100 messages, 14 days; audit-logged; 10/min |
+| `POST /servers/:id/bans` `{ userId, reason, deleteHours }` | Ban Members + role order | cleanup audit-logged; 30/min |
 | `GET /me/reports` | session | your own only |
 | `POST /me/export` | **step-up** | audit-logged; 5/hour |
 | `GET /me/export/account`, `GET /me/export/messages` | session + export token from the same session | 600 pages/min |
@@ -192,6 +223,7 @@ Socket events go only to `user:<you>`: `saved:update`, `read:update`, `notify:up
 | `user_prefs` | user, JSON (quiet hours, time zone, previews), read baseline | no |
 | `pin_log` | channel, message, who, pin or unpin, time | no |
 | `member_timeouts` | server, user, until, reason, by whom | the reason a moderator typed |
+| `voice_mutes` | server, user, by whom, when | no |
 
 Rows in `mention_marks` are deleted with their messages (`forgetMessages`, `deleteMessageTree`, the orphan
 sweep). Read markers and preferences for deleted channels, DMs and servers are swept daily.

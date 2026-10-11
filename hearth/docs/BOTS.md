@@ -140,7 +140,7 @@ each attempt), `X-Hearth-Signature: v1=<hex>`, `Content-Type: application/json`.
 | Type | Needs | `data` |
 |---|---|---|
 | `message.created` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo` |
-| `message.deleted` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, threadId, deletedBy` |
+| `message.deleted` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, threadId, deletedBy` (one per message, also for a moderator's bulk delete and a ban's message cleanup) |
 | `reaction.added` | `messages.read.metadata`, channel allowed | `messageId, channelId, userId, emoji` |
 | `member.joined` | `members.read` | `serverId, userId, joinedAt` |
 | `member.left` | `members.read` | `serverId, userId` |

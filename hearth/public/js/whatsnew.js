@@ -1,6 +1,12 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.29.0', items: [
+    'Webhooks: give a channel a webhook address (channel settings \u2192 Webhooks) and paste it into Uptime Kuma, Home Assistant, Grafana, GitHub or anything that posts to Discord or Slack. Posts show as the webhook, marked as not end-to-end encrypted, and can\u2019t ping anyone unless you allow it.',
+    'Pick your roles: moderators can let members choose roles themselves (ping roles like @game-night, pronouns, colors, opt-in channels) from the server menu or the start of any channel.',
+    'Repeating events: every week, every 2 weeks or every month, at the same local time even when the clocks change, and in your calendar with every date.',
+    'Moderator tools: disconnect, move or server-mute people in voice (new Move Members and Mute Members permissions), delete a banned person\u2019s messages from the last hour, day or week, and delete up to 100 recent messages at once.',
+  ] },
   { version: '1.28.2', items: [
     'Privacy: call relays (including other regions\u2019 relays) no longer get your account id, just a stand-in name that stays the same for you. They still see your IP address, as before.',
   ] },

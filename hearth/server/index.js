@@ -124,6 +124,8 @@ const voiceChannels = new Map(); // channelId -> Map(userId -> { socketId, sid, 
 // Coming back with the same sign-in within it resumes the call where it was; after it, they've left.
 const VOICE_GRACE_MS = Math.max(1000, Math.min(60000, Number(process.env.VOICE_GRACE_MS) || 18000));
 const userVoice = new Map(); // userId -> channelId
+// People a moderator just disconnected or moved: their app's automatic rejoin can't put them back (see voice:join).
+const voiceEvicted = new Map(); // userId -> { room, to, until }
 
 const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(userId).size > 0;
 // Games/music people are playing (server/activity.js fills these in once everything it needs exists).
@@ -311,6 +313,10 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
   if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
   const to = USE && out.kind !== 'group' ? USE.timeoutOf(s.id, uid) : null;
   if (to) out.timeout = { until: to.until, reason: to.reason };
+  // People a moderator server-muted, for those who can lift it (the member menu offers "Remove server mute" even
+  // when they aren't in a call). It includes people who left, since the mute waits for them if they come back.
+  // Depends only on the permission, so emitServer's grouping still holds.
+  if (out.kind !== 'group' && (myBase & PM.MUTE_MEMBERS)) out.voiceMutes = [...voiceMutedSet(s)];
   return out;
 }
 // Everyone gets their own view (private channels and permissions differ per person). Every change to roles,
@@ -340,23 +346,34 @@ const emitServer = (serverId) => {
 // Permissions are checked when someone joins a call, and again here after anything that can change them: whoever
 // can no longer see the channel or connect to it (or is no longer a member) leaves the call, and anyone whose
 // permission to talk changed is told, so their app turns the mic off (or allows it again).
+// A server mute (moderator toolkit) counts as not being allowed to speak, wherever they are in the server.
 function recheckVoice(srv) {
   if (!voiceChannels.size) return;
+  let muted = null;
   for (const c of db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'voice'").all(srv.id)) {
     const m = voiceChannels.get(c.id);
     if (!m) continue;
+    muted ||= voiceMutedSet(srv);
     for (const [uid, st] of [...m]) {
       const p = isMember(srv.id, uid) ? perms.channel(srv, c, uid) : 0;
       if (!(p & PM.CONNECT)) { leaveVoice(uid, true); continue; }
-      const speak = !!(p & PM.SPEAK);
-      if (speak === st.speak) continue;
+      const serverMuted = muted.has(uid);
+      const speak = !!(p & PM.SPEAK) && !serverMuted;
+      if (speak === st.speak && serverMuted === !!st.serverMuted) continue;
+      // serverMuted is only in the event when it changed (a role change alone says just canSpeak, as before).
+      const told = serverMuted !== !!st.serverMuted ? { serverMuted } : {};
       st.speak = speak;
+      st.serverMuted = serverMuted;
       if (!speak) st.muted = true;
-      io.to(st.socketId).emit('voice:perms', { channelId: c.id, canSpeak: speak });
+      io.to(st.socketId).emit('voice:perms', { channelId: c.id, canSpeak: speak, ...told });
       emitVoiceState(c.id);
     }
   }
 }
+// Server-muted people (voice_mutes). Never the owner: a mute placed before they were handed the server would
+// otherwise stay forever, since nobody can act on the owner (transfers also drop it).
+const voiceMutedSet = (srv) => new Set(db.prepare('SELECT user_id FROM voice_mutes WHERE server_id = ? AND user_id != ?').all(srv.id, srv.owner_id).map((r) => r.user_id));
+const isVoiceMuted = (srv, uid) => uid !== srv.owner_id && !!db.prepare('SELECT 1 FROM voice_mutes WHERE server_id = ? AND user_id = ?').get(srv.id, uid);
 
 function reactionsFor(ids) {
   const map = {};
@@ -449,10 +466,21 @@ function relationshipFor(row, userId) {
   };
 }
 
+// serverMuted: true (only sent then): a moderator muted them for the server, which is shown to everyone who can
+// see the channel. Whether someone may speak at all isn't: it would tell everyone who is timed out.
 function voiceStateList(channelId) {
   const m = voiceChannels.get(channelId);
   if (!m) return [];
-  return [...m.entries()].map(([userId, s]) => ({ userId, muted: s.muted, deafened: s.deafened, video: !!s.video, screen: !!s.screen, reconnecting: !!s.reconnecting }));
+  return [...m.entries()].map(([userId, s]) => ({ userId, muted: s.muted, deafened: s.deafened, video: !!s.video, screen: !!s.screen, reconnecting: !!s.reconnecting,
+    ...(s.serverMuted ? { serverMuted: true } : {}) }));
+}
+// People in a call who may not talk there (server-muted, timed out, or no Speak in that channel). Their own app
+// keeps the mic off, and every other app in the call drops whatever audio still arrives from them, so a modified
+// app can't force itself to be heard. Only the people in the call get this list (voice:silenced, and the answer
+// to voice:join), since it says who is timed out.
+function voiceSilenced(room) {
+  const m = voiceChannels.get(room);
+  return m ? [...m.entries()].filter(([, s]) => s.speak === false).map(([userId]) => userId) : [];
 }
 
 // ---------------------------------------------------------------- access checks
@@ -845,6 +873,107 @@ function deleteMessageTree(id) {
     db.prepare('DELETE FROM messages WHERE id = ? OR thread_id = ?').run(id, id);
   })();
   files.forEach((u) => removeUpload(u));
+}
+// Many channel messages at once (bulk delete, a ban's cleanup), deleted the way deleteMessageTree deletes one:
+// thread replies go with the message that starts the thread, and so do files, reactions and poll votes. One
+// transaction, files removed once it has committed, and one event per channel instead of one per message (bots
+// still get message.deleted for each one, written in one go: BOTS.events).
+//   rows: [{ id, channel_id, thread_id, author_id }] (at most a few hundred; callers go in slices)
+// Returns { messages: rows deleted, replies: other thread replies that went with them }.
+function purgeChannelMessages(rows, actorId) {
+  if (!rows.length) return { messages: 0, replies: 0 };
+  const slices = (list) => { const out = []; for (let i = 0; i < list.length; i += 500) out.push(list.slice(i, i + 500)); return out; };
+  const marks = (n) => Array(n).fill('?').join(',');
+  const all = new Set(rows.map((r) => r.id));
+  for (const part of slices(rows.map((r) => r.id))) db.prepare(`SELECT id FROM messages WHERE thread_id IN (${marks(part.length)})`).all(...part).forEach((r) => all.add(r.id));
+  const every = slices([...all]);
+  const files = [];
+  for (const part of every) {
+    db.prepare(`SELECT name FROM blobs WHERE message_id IN (${marks(part.length)})`).all(...part).forEach((b) => files.push('/uploads/' + b.name));
+    // Older, server-encrypted messages keep their attachment list in the sealed body.
+    db.prepare(`SELECT body FROM messages WHERE id IN (${marks(part.length)}) AND ciphertext IS NULL`).all(...part)
+      .forEach((m) => (unseal(m.body).attachments || []).forEach((a) => files.push(a.url)));
+  }
+  db.transaction(() => {
+    for (const part of every) {
+      const q = marks(part.length);
+      db.prepare(`DELETE FROM blobs WHERE message_id IN (${q})`).run(...part);
+      for (const t of ['reactions', 'poll_votes', 'poll_closed', 'mention_marks']) db.prepare(`DELETE FROM ${t} WHERE message_id IN (${q})`).run(...part);
+      db.prepare(`DELETE FROM messages WHERE id IN (${q})`).run(...part);
+    }
+  })();
+  files.forEach((u) => removeUpload(u));
+  const byChannel = new Map();
+  for (const r of rows) { if (!byChannel.has(r.channel_id)) byChannel.set(r.channel_id, []); byChannel.get(r.channel_id).push(r); }
+  for (const [chId, list] of byChannel) {
+    const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(chId);
+    if (!c) continue;
+    const room = toChannel(c);
+    // Open apps drop them all and redraw once (the batched form of message:delete).
+    room.emit('message:delete-bulk', { channelId: c.id, messages: list.map((r) => ({ id: r.id, threadId: r.thread_id || null })) });
+    // Threads that are still there but lost replies: their reply counts.
+    for (const rootId of new Set(list.filter((r) => r.thread_id && !all.has(r.thread_id)).map((r) => r.thread_id))) {
+      room.emit('thread:update', { rootId, channelId: c.id, threadCount: 0, ...threadInfo({ id: rootId }) });
+    }
+    BOTS.events('message.deleted', c.server_id, list.map((r) => ({ messageId: r.id, channelId: c.id, authorId: r.author_id, threadId: r.thread_id || null, deletedBy: actorId })), { channel: c, actorId });
+  }
+  return { messages: rows.length, replies: all.size - rows.length };
+}
+// Whose messages a moderator may delete along with others (bulk delete, a ban's cleanup): their own, and those
+// of people below their highest role. Never the owner's; people who left the server count as below (they have
+// no roles here). Remembers each answer, for one request.
+function belowMe(s, actorId) {
+  const myTop = perms.top(s, actorId);
+  const seen = new Map();
+  return (a) => {
+    if (!seen.has(a)) seen.set(a, a === actorId || (a !== s.owner_id && (!isMember(s.id, a) || perms.top(s, a) < myTop)));
+    return seen.get(a);
+  };
+}
+// The roots (messages that start a thread) among `rows` and who else replied in them: rootId -> Set(author ids).
+function otherRepliers(rows) {
+  const out = new Map();
+  const roots = rows.filter((r) => !r.thread_id).map((r) => r.id);
+  for (let i = 0; i < roots.length; i += 500) {
+    const part = roots.slice(i, i + 500);
+    for (const x of db.prepare(`SELECT DISTINCT thread_id, author_id FROM messages WHERE thread_id IN (${part.map(() => '?').join(',')})`).all(...part)) {
+      if (!out.has(x.thread_id)) out.set(x.thread_id, new Set());
+      out.get(x.thread_id).add(x.author_id);
+    }
+  }
+  return out;
+}
+// A ban's cleanup: what someone wrote in this server's channels since `since`, channel by channel in slices of
+// 500, letting other requests in between slices. Their own messages go wherever they are. A thread they started
+// takes other people's replies with it, so it only goes where the moderator could have deleted it with bulk
+// delete: Manage Messages in that channel and every other reply by someone below them. Otherwise it stays (their
+// replies elsewhere still go). Returns { messages, replies, kept }.
+async function purgeRecentBy(s, userId, since, actorId) {
+  const below = belowMe(s, actorId);
+  const pick = db.prepare(`SELECT id, channel_id, thread_id, author_id, created_at FROM messages
+    WHERE channel_id = ? AND author_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 500`);
+  const out = { messages: 0, replies: 0, kept: 0 };
+  for (const c of db.prepare('SELECT * FROM channels WHERE server_id = ?').all(s.id)) {
+    let at = [since, ''];
+    let manage = null;
+    const mayTake = () => (manage ??= canIn(s, c, actorId, PM.MANAGE_MESSAGES));
+    for (;;) {
+      const rows = pick.all(c.id, userId, ...at);
+      if (!rows.length) break;
+      at = [rows[rows.length - 1].created_at, rows[rows.length - 1].id];
+      const others = otherRepliers(rows);
+      const doomed = rows.filter((r) => {
+        const who = others.get(r.id);
+        if (!who || [...who].every((a) => a === userId)) return true;
+        return mayTake() && [...who].every((a) => a === userId || below(a));
+      });
+      const done = purgeChannelMessages(doomed, actorId);
+      out.messages += done.messages; out.replies += done.replies; out.kept += rows.length - doomed.length;
+      if (rows.length < 500) break;
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+  return out;
 }
 // Blobs uploaded but never attached to a message (abandoned sends) are removed after a day.
 jobs.every('uploads.unlinked_cleanup', 3600 * 1000, () => {
@@ -2147,6 +2276,8 @@ api.post('/servers/:id/transfer', auth, wrap(async (req, res) => {
   const s = requireOwner(req.params.id, req.userId);
   if (!isMember(s.id, to)) fail(404, 'That person is not in this server.');
   db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(to, s.id);
+  // Nobody can act on the owner, so a server mute they had would never be lifted.
+  db.prepare('DELETE FROM voice_mutes WHERE server_id = ? AND user_id = ?').run(s.id, to);
   emitServer(s.id);
   const toName = (getUserRow(to) || {}).username || to;
   auditLog(req, 'server_transferred', s.id, `${s.name} \u2192 ${toName}`);
@@ -2652,6 +2783,43 @@ api.delete('/messages/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// Bulk delete (Manage Messages): up to 100 messages from the last 14 days, picked one by one (ids) or the most
+// recent ones in the channel (count). As with a single delete, a thread's replies go with the message that starts
+// it. Messages by people at or above your highest role stay (so does a thread with replies by them), and the
+// answer says how many. One audit log entry for the lot.
+const BULK_MAX = 100;
+const BULK_DAYS = 14;
+const MSG_ID = /^[A-Za-z0-9_-]{1,64}$/;
+api.post('/channels/:id/messages/bulk-delete', auth, (req, res) => {
+  rateLimit('bulkdel:' + req.userId, 10, 60000);
+  const c = requireChannel(req.params.id, req.userId);
+  const s = serverOf(c);
+  if (!canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission here.');
+  if (perms.timedOut(s.id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
+  if (c.type !== 'text') fail(400, 'Only text channels have messages to delete.');
+  const b = req.body || {};
+  const since = now() - BULK_DAYS * 86400000;
+  const cols = 'id, channel_id, thread_id, author_id, created_at';
+  let rows;
+  if (b.ids !== undefined) {
+    if (!Array.isArray(b.ids) || !b.ids.length || b.ids.length > BULK_MAX || !b.ids.every((x) => typeof x === 'string' && MSG_ID.test(x))) fail(400, `Pick from 1 to ${BULK_MAX} messages.`);
+    rows = db.prepare(`SELECT ${cols} FROM messages WHERE channel_id = ? AND id IN (SELECT value FROM json_each(?))`).all(c.id, JSON.stringify([...new Set(b.ids)]));
+    if (rows.some((r) => r.created_at < since)) fail(400, `Messages older than ${BULK_DAYS} days can\u2019t be deleted in bulk. Delete them one at a time.`);
+  } else {
+    const n = Number(b.count);
+    if (!Number.isInteger(n) || n < 1 || n > BULK_MAX) fail(400, `Pick from 1 to ${BULK_MAX} messages.`);
+    rows = db.prepare(`SELECT ${cols} FROM messages WHERE channel_id = ? AND thread_id IS NULL AND created_at >= ? ORDER BY id DESC LIMIT ?`).all(c.id, since, n);
+  }
+  const below = belowMe(s, req.userId);
+  const others = otherRepliers(rows);
+  const doomed = rows.filter((r) => below(r.author_id) && [...(others.get(r.id) || [])].every(below));
+  const out = purgeChannelMessages(doomed, req.userId);
+  if (out.messages) {
+    auditLog(req, 'messages_bulk_deleted', c.id, `${out.messages} message${out.messages === 1 ? '' : 's'}${out.replies ? ` (and ${out.replies} thread repl${out.replies === 1 ? 'y' : 'ies'})` : ''} in #${c.name} in server "${s.name}" (${s.id})`);
+  }
+  res.json({ ok: true, deleted: out.messages, replies: out.replies, kept: rows.length - doomed.length });
+});
+
 api.get('/messages/:id/thread', auth, (req, res) => {
   const root = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!root || root.thread_id) fail(404, 'Thread not found.');
@@ -3039,23 +3207,120 @@ api.get('/servers/:id/bans', auth, (req, res) => {
   res.json(db.prepare('SELECT user_id, reason, banned_by, created_at FROM bans WHERE server_id = ? ORDER BY created_at DESC').all(s.id)
     .map((b) => ({ user: publicUser(getUserRow(b.user_id)), reason: b.reason, bannedBy: b.banned_by, createdAt: b.created_at })));
 });
-api.post('/servers/:id/bans', auth, (req, res) => {
+// deleteHours (optional): also delete their messages in this server's channels from the last 1, 24 or 168 hours
+// (7 days), the way the moderator toolkit's bulk delete does: files, reactions and thread replies go with them,
+// but a thread with replies the moderator couldn't delete themselves stays (purgeRecentBy). The ban itself is
+// done before the cleanup starts; the answer comes once it's finished.
+const BAN_CLEANUP_HOURS = [0, 1, 24, 168];
+api.post('/servers/:id/bans', auth, wrap(async (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.BAN_MEMBERS, 'You need the Ban Members permission.');
+  rateLimit('ban:' + req.userId, 30, 60000);
   const uid = String((req.body || {}).userId || '');
+  const hours = (req.body || {}).deleteHours === undefined ? 0 : Number(req.body.deleteHours);
+  if (!BAN_CLEANUP_HOURS.includes(hours)) fail(400, 'Their messages can be deleted from the last hour, 24 hours or 7 days (or not at all).');
   if (!getUserRow(uid) || uid === s.owner_id || uid === req.userId) fail(400, 'You can\u2019t ban that person.');
   if (isMember(s.id, uid) && perms.top(s, uid) >= perms.top(s, req.userId)) fail(403, 'You can only ban people whose highest role is below yours.');
+  // The moderator toolkit waits while you're timed out (like posting does); a plain ban doesn't, as before.
+  if (hours && perms.timedOut(s.id, req.userId)) fail(403, 'You\u2019re timed out in this server for now, so you can\u2019t delete their messages.', 'timed_out');
   db.prepare('INSERT OR REPLACE INTO bans (server_id, user_id, banned_by, reason, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, uid, req.userId, String((req.body || {}).reason || '').slice(0, 300), now());
   // Invites a banned person made stop working too: they could have handed them to a new account.
   db.prepare('DELETE FROM invites WHERE server_id = ? AND creator_id = ?').run(s.id, uid);
   if (isMember(s.id, uid)) removeMember(s.id, uid);
   emitServer(s.id);
-  res.json({ ok: true });
-});
+  const out = hours ? await purgeRecentBy(s, uid, now() - hours * 3600000, req.userId) : { messages: 0, replies: 0, kept: 0 };
+  if (hours) {
+    const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+    auditLog(req, 'ban_messages_deleted', uid, `${n(out.messages, 'message', 'messages')}${out.replies ? ` (and ${n(out.replies, 'thread reply', 'thread replies')} by others)` : ''}`
+      + `${out.kept ? `, ${n(out.kept, 'thread', 'threads')} kept (replies by people the moderator can\u2019t delete)` : ''} from the last ${hours === 1 ? 'hour' : hours === 24 ? '24 hours' : '7 days'}, banned from server "${s.name}" (${s.id})`);
+  }
+  res.json({ ok: true, deleted: out.messages, replies: out.replies, kept: out.kept });
+}));
 api.delete('/servers/:id/bans/:uid', auth, (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.BAN_MEMBERS, 'You need the Ban Members permission.');
   db.prepare('DELETE FROM bans WHERE server_id = ? AND user_id = ?').run(s.id, req.params.uid);
   res.json({ ok: true });
 });
+
+// ---------------------------------------------------------------- voice moderation
+// Disconnect, move and server-mute people in voice (moderator toolkit). Move Members is checked in the voice
+// channel the person is in (and, for a move, in the one they go to), so it can be given per voice channel. A
+// server mute holds in every voice channel of the server, so Mute Members is a server-wide permission only: a
+// grant in one channel would let someone place a server-wide mute they couldn't lift anywhere else. Like every
+// other action on a member: only on people below your highest role, never the owner, not while you're timed out,
+// and each one goes in the audit log. A server mute is carried out by the apps: the muted person's app keeps their
+// mic off, and every other app in the call drops their audio (voice:silenced). Audio goes straight between the
+// people in a call, so the server can't silence it itself.
+const VOICE_EVICT_MS = 120000; // longer than an app keeps trying to rejoin after a dropped connection (voice.js REJOIN)
+function voiceModTarget(req, bit, name, { serverWide = false } = {}) {
+  rateLimit('voicemod:' + req.userId, 60, 60000);
+  const s = requireServer(req.params.id, req.userId);
+  if (s.kind === 'group') fail(400, 'Group chats don\u2019t have voice moderation.');
+  // Allowed somewhere (server-wide or, for Move Members, in a voice channel): otherwise the answer is the same
+  // whoever it's about.
+  if (!can(s, req.userId, bit) && (serverWide || !db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'voice'").all(s.id).some((c) => canIn(s, c, req.userId, bit)))) {
+    fail(403, `You need the ${name} permission.`);
+  }
+  if (perms.timedOut(s.id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
+  const uid = String(req.params.uid || '');
+  if (uid === req.userId) fail(400, 'You can\u2019t do that to yourself.');
+  if (!isMember(s.id, uid)) fail(404, 'That person is not in this server.');
+  if (uid === s.owner_id) fail(403, 'You can\u2019t do that to the owner.');
+  if (perms.top(s, uid) >= perms.top(s, req.userId)) fail(403, 'You can only do that to people whose highest role is below yours.');
+  // The voice channel of this server they're in right now (one you can't see counts as none).
+  const room = userVoice.get(uid);
+  const c = room && !String(room).startsWith('dm:') ? db.prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?').get(room, s.id) : null;
+  const state = c && voiceChannels.get(c.id)?.get(uid);
+  if (!state || !canIn(s, c, req.userId, PM.VIEW_CHANNEL)) return { s, uid, c: null, state: null };
+  return { s, uid, c, state };
+}
+function evictFromVoice(uid, room, to = null) {
+  const until = Date.now() + VOICE_EVICT_MS;
+  voiceEvicted.set(uid, { room, to, until });
+  setTimeout(jobs.job('voice.evict_end', () => { if (voiceEvicted.get(uid)?.until === until) voiceEvicted.delete(uid); }), VOICE_EVICT_MS + 100).unref?.();
+}
+const notInVoice = () => fail(404, 'They aren\u2019t in a voice channel you can see.');
+api.post('/servers/:id/voice/:uid/disconnect', auth, (req, res) => {
+  const { s, uid, c } = voiceModTarget(req, PM.MOVE_MEMBERS, 'Move Members');
+  if (!c) notInVoice();
+  if (!canIn(s, c, req.userId, PM.MOVE_MEMBERS)) fail(403, `You need the Move Members permission in #${c.name}.`);
+  evictFromVoice(uid, c.id);
+  leaveVoice(uid, true, 'moderator');
+  auditLog(req, 'voice_disconnect', uid, `from #${c.name} in server "${s.name}" (${s.id})`);
+  res.json({ ok: true });
+});
+api.post('/servers/:id/voice/:uid/move', auth, (req, res) => {
+  const { s, uid, c, state } = voiceModTarget(req, PM.MOVE_MEMBERS, 'Move Members');
+  if (!c) notInVoice();
+  const to = db.prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?').get(String((req.body || {}).channelId || ''), s.id);
+  if (!to || !canIn(s, to, req.userId, PM.VIEW_CHANNEL)) fail(404, 'Channel not found.');
+  if (to.type !== 'voice') fail(400, 'Pick a voice channel.');
+  if (to.id === c.id) fail(400, 'They\u2019re already in that channel.');
+  if (!canIn(s, c, req.userId, PM.MOVE_MEMBERS) || !canIn(s, to, req.userId, PM.MOVE_MEMBERS)) fail(403, `You need the Move Members permission in #${c.name} and #${to.name}.`);
+  if (!canIn(s, to, uid, PM.CONNECT)) fail(403, `They can\u2019t connect to #${to.name}.`);
+  // Out of the old channel here and now; their app joins the new one (the same checks as any join run again).
+  const socketId = state.socketId;
+  evictFromVoice(uid, c.id, to.id);
+  leaveVoice(uid);
+  io.to(socketId).emit('voice:moved', { channelId: c.id, to: to.id, serverId: s.id });
+  auditLog(req, 'voice_move', uid, `from #${c.name} to #${to.name} in server "${s.name}" (${s.id})`);
+  res.json({ ok: true });
+});
+// Server mute: for the whole server, until lifted (leaving the call or the server doesn't end it), whether or not
+// they're in a call right now. Moderators' apps get the list of server-muted members with the server
+// (serializeServer), so they can see and lift a mute outside calls too.
+function setVoiceMute(req, res, on) {
+  const { s, uid, c } = voiceModTarget(req, PM.MUTE_MEMBERS, 'Mute Members', { serverWide: true });
+  const changed = on
+    ? db.prepare('INSERT OR IGNORE INTO voice_mutes (server_id, user_id, by_id, created_at) VALUES (?, ?, ?, ?)').run(s.id, uid, req.userId, now()).changes
+    : db.prepare('DELETE FROM voice_mutes WHERE server_id = ? AND user_id = ?').run(s.id, uid).changes;
+  if (changed) {
+    auditLog(req, on ? 'voice_mute' : 'voice_unmute', uid, `in server "${s.name}" (${s.id})${c ? `, while in #${c.name}` : ''}`);
+    emitServer(s.id); // recheckVoice tells their app and everyone in the call; moderators get the new list
+  }
+  res.json({ ok: true, serverMuted: on });
+}
+api.post('/servers/:id/voice/:uid/mute', auth, (req, res) => setVoiceMute(req, res, true));
+api.delete('/servers/:id/voice/:uid/mute', auth, (req, res) => setVoiceMute(req, res, false));
 
 // ---------------------------------------------------------------- custom emoji
 // Animated emoji: GIF, animated WebP and APNG all keep animating. We look inside the file rather than
@@ -4481,6 +4746,7 @@ api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
   if (!row) fail(404, 'No account with that username.');
   if (!isMember(srv.id, row.id)) fail(400, `${row.username} isn\u2019t a member of ${srv.name}.`);
   db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(row.id, srv.id);
+  db.prepare('DELETE FROM voice_mutes WHERE server_id = ? AND user_id = ?').run(srv.id, row.id); // as in POST /servers/:id/transfer
   emitServer(srv.id);
   adminLog(req, 'server_transferred', srv.id, `${srv.name} \u2192 ${row.username}`);
   res.json({ ok: true });
@@ -5339,6 +5605,7 @@ function roomRegion(room) {
   return { region: (row && row.rtc_region) || null, regionVersion: (row && row.rtc_region_v) || 0 };
 }
 function emitVoiceState(room) {
+  io.to(`voice:${room}`).emit('voice:silenced', { channelId: room, userIds: voiceSilenced(room) });
   const payload = { channelId: room, users: voiceStateList(room) };
   const d = dmOfRoom(room);
   if (d) return io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit('voice:state', payload);
@@ -5421,7 +5688,8 @@ const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 
 
 // Takes someone out of the voice room they're in (and ends the room's watch-together when it empties).
 // notifyUser: also tell their app (voice:kicked), e.g. when they lost access to the channel.
-function leaveVoice(userId, notifyUser = false) {
+// by: who took them out, when it wasn't the server itself ('moderator'), so their app can say so.
+function leaveVoice(userId, notifyUser = false, by = null) {
   const channelId = userVoice.get(userId);
   if (!channelId) return;
   const m = voiceChannels.get(channelId);
@@ -5433,7 +5701,7 @@ function leaveVoice(userId, notifyUser = false) {
     const sock = io.sockets.sockets.get(state.socketId);
     if (sock) sock.leave(`voice:${channelId}`);
     io.to(`voice:${channelId}`).emit('voice:peer-left', { socketId: state.socketId, userId });
-    if (notifyUser) io.to(state.socketId).emit('voice:kicked', { channelId });
+    if (notifyUser) io.to(state.socketId).emit('voice:kicked', by ? { channelId, by } : { channelId });
   }
   emitVoiceState(channelId);
   // Caller hung up before anyone answered (or everyone left): stop the other phones ringing.
@@ -5567,7 +5835,7 @@ function setupSockets(server) {
 
     socket.on('voice:join', guard((p = {}) => {
       const roomId = String(p.channelId || '');
-      let room; let vp = PM.CONNECT | PM.SPEAK;
+      let room; let vp = PM.CONNECT | PM.SPEAK; let serverMuted = false;
       if (roomId.startsWith('dm:')) {
         const d = requireDm(roomId.slice(3), uid);
         if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t call this person.');
@@ -5575,9 +5843,22 @@ function setupSockets(server) {
       } else {
         const c = requireChannel(roomId, uid);
         if (c.type !== 'voice') fail(400, 'Not a voice channel.');
-        vp = perms.channel(serverOf(c), c, uid);
+        const srv = serverOf(c);
+        vp = perms.channel(srv, c, uid);
         if (!(vp & PM.CONNECT)) fail(403, 'You don\u2019t have permission to join this voice channel.');
+        serverMuted = isVoiceMuted(srv, uid);
+        if (serverMuted) vp &= ~PM.SPEAK;
         room = c.id;
+      }
+      // A moderator just took them out of this call (or moved them): the app's automatic rejoin after a dropped
+      // connection doesn't bring them back. Joining again on purpose still works.
+      const out = voiceEvicted.get(uid);
+      if (out && out.until > Date.now()) {
+        if (p.resume && out.room === room) {
+          if (out.to) return { error: 'A moderator moved you to another voice channel.', movedTo: out.to };
+          fail(403, 'A moderator disconnected you from this call.');
+        }
+        if (!p.resume) voiceEvicted.delete(uid);
       }
       const c = { id: room };
       // The call's region and its version: an app joining late uses the one that's active now, even if what it
@@ -5595,7 +5876,7 @@ function setupSockets(server) {
           if (old) old.leave(`voice:${room}`);
         }
         const speak = !!(vp & PM.SPEAK);
-        Object.assign(prev, { socketId: socket.id, reconnecting: false, grace: null, speak, muted: !!p.muted || !speak, deafened: !!p.deafened, video: !!p.video, screen: !!p.screen });
+        Object.assign(prev, { socketId: socket.id, reconnecting: false, grace: null, speak, serverMuted, muted: !!p.muted || !speak, deafened: !!p.deafened, video: !!p.video, screen: !!p.screen });
         socket.join(`voice:${room}`);
         const m = voiceChannels.get(room);
         const peers = [...m.entries()].filter(([userId]) => userId !== uid).map(([userId, s]) => ({ userId, socketId: s.socketId, reconnecting: !!s.reconnecting }));
@@ -5603,7 +5884,7 @@ function setupSockets(server) {
         socket.to(`voice:${room}`).emit('voice:peer-joined', { userId: uid, socketId: socket.id, resumed: true });
         emitVoiceState(room);
         if (watchRooms.has(room)) socket.emit('watch:state', { room, state: watchOut(room) });
-        return { ok: true, peers, canSpeak: speak, resumed: true, ...where };
+        return { ok: true, peers, canSpeak: speak, ...(serverMuted ? { serverMuted } : {}), silenced: voiceSilenced(room), resumed: true, ...where };
       }
       if (userVoice.has(uid)) {
         const prev = voiceChannels.get(userVoice.get(uid))?.get(uid);
@@ -5614,7 +5895,7 @@ function setupSockets(server) {
       const peers = [...m.entries()].map(([userId, s]) => ({ userId, socketId: s.socketId, reconnecting: !!s.reconnecting }));
       // speak: whether they may talk here (the app keeps the mic off without it; recheckVoice keeps it current).
       const speak = !!(vp & PM.SPEAK);
-      m.set(uid, { socketId: socket.id, sid: socket.data.sid, muted: !!p.muted || !speak, deafened: !!p.deafened, video: false, screen: false, speak, reconnecting: false, grace: null });
+      m.set(uid, { socketId: socket.id, sid: socket.data.sid, muted: !!p.muted || !speak, deafened: !!p.deafened, video: false, screen: false, speak, serverMuted, reconnecting: false, grace: null });
       userVoice.set(uid, c.id);
       socket.join(`voice:${c.id}`);
       // Anyone still connected to this person from before (their app reloaded, or the server restarted) moves
@@ -5631,7 +5912,7 @@ function setupSockets(server) {
         ring.forEach((u) => io.to(`user:${u}`).emit('call:ring', { room: c.id, dmId: d ? d.id : null, serverId: ch ? ch.server_id : null, from: uid, video: !!p.video }));
         if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/', generic: 'Incoming call' }, { kind: 'call' });
       }
-      return { ok: true, peers, canSpeak: speak, ...where };
+      return { ok: true, peers, canSpeak: speak, ...(serverMuted ? { serverMuted } : {}), silenced: voiceSilenced(c.id), ...where };
     }));
 
     socket.on('voice:signal', guard((p = {}) => {

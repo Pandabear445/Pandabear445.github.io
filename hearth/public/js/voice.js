@@ -42,7 +42,7 @@ const hasWindow = typeof window !== 'undefined';
 const md = () => (typeof navigator !== 'undefined' && navigator.mediaDevices) || null;
 
 export class Voice {
-  constructor({ socket, getIceServers, ensureIce, onChange, onSpeaking, signSdp, verifySdp, onSecurityWarning, isPeerMuted, onNotice, onRegion, myId }) {
+  constructor({ socket, getIceServers, ensureIce, onChange, onSpeaking, signSdp, verifySdp, onSecurityWarning, isPeerMuted, onNotice, onRegion, onMoved, myId }) {
     this.socket = socket;
     this.isPeerMuted = isPeerMuted;
     // Offers/answers are signed with the sender's signing key and checked before use. The DTLS
@@ -57,6 +57,7 @@ export class Voice {
     this.onSpeaking = onSpeaking || (() => {});
     this.onNotice = onNotice || (() => {}); // something the person should be told (a device went away, say)
     this.onRegion = onRegion || (() => {}); // the server's current region for the call we joined
+    this.onMoved = onMoved || (() => {}); // a moderator moved us to another voice channel: app.js joins it
     this.myId = myId || (() => null);
     this.channelId = null;
     this.peers = new Map(); // socketId -> { pc, pcId, remotePc, userId, socketId, initiator, audio, pending: [], … }
@@ -67,6 +68,10 @@ export class Voice {
     this.pttTimer = null;
     this.deafened = localStorage.getItem('hearth.deafened') === '1';
     this.volumes = JSON.parse(localStorage.getItem('hearth.volumes') || '{}');
+    // People in the call whose audio this app drops: server-muted by a moderator, or not allowed to speak there.
+    // Their own app keeps their mic off; this is what keeps a modified app from being heard anyway.
+    this.silenced = new Set();
+    this.serverMuted = false; // a moderator muted us in this server
     this.speaking = new Map();
     this.meters = new Map();
     this.audioCtx = null;
@@ -97,14 +102,38 @@ export class Voice {
     socket.on('voice:signal', (p) => this.queueSignal(p));
     socket.on('voice:peer-left', ({ socketId } = {}) => this.closePeer(socketId, 'left the call'));
     socket.on('voice:peer-joined', (p) => this.onPeerJoined(p || {}));
-    socket.on('voice:kicked', () => { if (this.channelId) { this.log('Removed from the call by the server'); this.cleanup(); } });
-    // Someone changed what this person may do in the channel: without Speak, the mic goes off and stays off.
-    socket.on('voice:perms', ({ channelId, canSpeak } = {}) => {
+    socket.on('voice:kicked', ({ by } = {}) => {
+      if (!this.channelId) return;
+      this.log(by === 'moderator' ? 'Disconnected by a moderator' : 'Removed from the call by the server');
+      this.cleanup();
+      if (by === 'moderator') this.onNotice('A moderator disconnected you from the call.');
+    });
+    // A moderator moved us: the server already took us out of this channel, so no leave is sent; app.js joins the new one.
+    socket.on('voice:moved', ({ channelId, to, serverId } = {}) => {
+      if (!this.channelId || channelId !== this.channelId || !to) return;
+      this.log('Moved to another channel by a moderator');
+      this.cleanup();
+      this.onMoved(to, serverId);
+    });
+    // Someone changed what this person may do in the channel (or a moderator muted them for the server): without
+    // Speak, the mic goes off and stays off.
+    socket.on('voice:perms', ({ channelId, canSpeak, serverMuted } = {}) => {
       if (!this.channelId || channelId !== this.channelId) return;
       this.canSpeak = canSpeak !== false;
       this.speakLocked = canSpeak === false || this.noMic;
       if (this.speakLocked && !this.muted) { this.muted = true; this.applyLocalTrackState(); this.sendState(); }
+      if (serverMuted !== undefined && !!serverMuted !== this.serverMuted) {
+        this.serverMuted = !!serverMuted;
+        this.onNotice(this.serverMuted ? 'A moderator muted you in this server. You can still listen.'
+          : canSpeak === false ? 'A moderator lifted your server mute, but your roles still don\u2019t allow speaking in this channel.'
+            : 'A moderator unmuted you. Unmute when you\u2019re ready to talk.');
+      }
       this.onChange();
+    });
+    // Who in this call every app drops audio from (server-muted, timed out, or no Speak here). Only the people in
+    // the call are sent this.
+    socket.on('voice:silenced', ({ channelId, userIds } = {}) => {
+      if (this.channelId && channelId === this.channelId && Array.isArray(userIds)) this.setSilenced(userIds);
     });
     socket.on('disconnect', () => this.onSocketDown());
     socket.on('connect', () => this.onSocketUp());
@@ -218,8 +247,11 @@ export class Voice {
       if (res.regionVersion !== undefined) this.onRegion(channelId, res.region || null, res.regionVersion);
       // Listen-only channel for this person: keep the mic off until they move somewhere they can speak.
       this.canSpeak = res.canSpeak !== false;
+      this.serverMuted = !!res.serverMuted;
+      this.setSilenced(Array.isArray(res.silenced) ? res.silenced : []);
       this.speakLocked = res.canSpeak === false || this.noMic;
       if (this.speakLocked) { this.muted = true; this.applyLocalTrackState(); this.emit('voice:update', { muted: true, deafened: this.deafened }); }
+      if (this.serverMuted) this.onNotice('A moderator muted you in this server. You can listen, but not talk.');
       this.watch('me', this.rawStream);
       this.setState('connecting');
       this.addListeners();
@@ -280,6 +312,8 @@ export class Voice {
     this.attempt++;
     if (this.state !== 'idle' && this.state !== 'leaving') this.setState('leaving');
     this.speakLocked = false;
+    this.serverMuted = false;
+    this.silenced = new Set();
     this.releaseMedia();
     this.removeListeners();
     this.channelId = null;
@@ -348,6 +382,12 @@ export class Voice {
     if (a !== this.attempt || !this.socket.connected || this.state !== 'reconnecting') return;
     const res = await this.emit('voice:join', { channelId: this.channelId, resume: true, muted: this.muted, deafened: this.deafened, video: !!this.camStream, screen: !!this.screenStream });
     if (a !== this.attempt || this.state !== 'reconnecting') return;
+    if (res.error && res.movedTo) {
+      // A moderator moved us while the connection was down: go where they put us.
+      this.cleanup();
+      this.onMoved(res.movedTo, null);
+      return;
+    }
     if (res.error) {
       // Our own timeout or "slow down": try again a little later. Anything else is the server saying no.
       if (!res.timeout && res.error !== 'Slow down.') return this.fail(res.error, { retriable: false });
@@ -361,6 +401,8 @@ export class Voice {
     this.log(res.resumed ? 'Rejoined: the server kept our place' : 'Rejoined as a new member (the server had forgotten the call)');
     if (res.regionVersion !== undefined) this.onRegion(this.channelId, res.region || null, res.regionVersion);
     this.canSpeak = res.canSpeak !== false;
+    this.serverMuted = !!res.serverMuted;
+    this.setSilenced(Array.isArray(res.silenced) ? res.silenced : []);
     this.speakLocked = res.canSpeak === false || this.noMic;
     this.setState('connecting');
     const listed = new Map((res.peers || []).map((p) => [p.userId, p]));
@@ -406,6 +448,13 @@ export class Voice {
     for (const p of this.peers.values()) {
       if (this.listed.has(p.userId)) { p.everListed = true; p.unlistedSince = null; } else if (!p.unlistedSince) p.unlistedSince = t;
     }
+  }
+  // Who the server says is server-muted or may not speak here (voice:silenced, and the answer to voice:join).
+  setSilenced(userIds) {
+    const next = new Set(userIds);
+    if (next.size === this.silenced.size && [...next].every((id) => this.silenced.has(id))) return;
+    this.silenced = next;
+    this.applyPeerAudio();
   }
   // Connections to people the server doesn't list. Someone never listed at all is the one to worry about: an
   // extra listener the server added without telling anyone (docs/VOICE.md, section 6).
@@ -675,7 +724,7 @@ export class Voice {
           document.getElementById('audio-sink').append(peer.screenAudio);
         }
         peer.screenAudio.srcObject = new MediaStream([e.track]);
-        peer.screenAudio.muted = this.deafened;
+        peer.screenAudio.muted = this.peerAudioOff(userId);
         peer.screenAudio.volume = this.volumeFor(userId);
         peer.screenAudio.play().catch(() => {});
         return;
@@ -688,7 +737,7 @@ export class Voice {
         document.getElementById('audio-sink').append(peer.audio);
       }
       peer.audio.srcObject = stream;
-      peer.audio.muted = this.deafened;
+      peer.audio.muted = this.peerAudioOff(userId);
       peer.audio.volume = this.volumeFor(userId);
       const prefs = JSON.parse(localStorage.getItem('hearth.audio') || '{}');
       if (prefs.outputId && peer.audio.setSinkId) peer.audio.setSinkId(prefs.outputId).catch(() => {});
@@ -947,9 +996,14 @@ export class Voice {
     localStorage.setItem('hearth.muted', this.muted ? '1' : '0');
     localStorage.setItem('hearth.deafened', this.deafened ? '1' : '0');
     this.applyLocalTrackState();
-    for (const p of this.peers.values()) { if (p.audio) p.audio.muted = this.deafened; if (p.screenAudio) p.screenAudio.muted = this.deafened; }
+    this.applyPeerAudio();
     this.sendState();
     this.onChange();
+  }
+  // Someone's audio plays unless we're deafened or they're silenced (server-muted, or not allowed to speak there).
+  peerAudioOff(userId) { return this.deafened || this.silenced.has(userId); }
+  applyPeerAudio() {
+    for (const p of this.peers.values()) { if (p.audio) p.audio.muted = this.peerAudioOff(p.userId); if (p.screenAudio) p.screenAudio.muted = this.peerAudioOff(p.userId); }
   }
 
   volumeFor(userId) { return this.volumes[userId] ?? 1; }

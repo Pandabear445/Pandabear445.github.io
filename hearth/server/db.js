@@ -25,7 +25,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -1188,6 +1188,18 @@ CREATE TABLE IF NOT EXISTS member_timeouts (
   PRIMARY KEY (server_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
+`);
+
+// Server mutes (moderator toolkit): someone a moderator muted in voice for everyone. It stays when they leave the
+// call or the server and come back, until a moderator lifts it; it goes with the server or the account.
+db.exec(`
+CREATE TABLE IF NOT EXISTS voice_mutes (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  by_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
 `);
 
 // v18 (voice reliability): a version number for each call's region. Every change bumps it, so when two people

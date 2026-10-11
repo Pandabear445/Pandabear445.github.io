@@ -554,6 +554,45 @@ async function voiceCall(t) {
   }
 }
 
+// ------------------------------------------------------------------ moderator toolkit: server mute in and out of a call, bulk delete
+async function moderatorTools(t) {
+  const { alice, bob } = t.people;
+  const bobInCall = () => alice.$('#sidebar-body .vc-user', { hasText: 'bob' });
+  // Server mute from the voice channel's list: bob's app is told and keeps his mic off; alice sees him marked.
+  await bobInCall().click({ button: 'right' });
+  await alice.menuItem('Server mute').click();
+  await bob.toast('A moderator muted you in this server');
+  await bobInCall().locator('.server-muted').waitFor();
+  await bob.$('#voice-panel button[aria-label="Unmute"]').click();
+  await bob.toast('You can listen, but not talk');
+  // The mute outlasts the call, and a moderator can still see and lift it from the member list once he's gone.
+  await bob.$('#voice-panel button[aria-label="Leave call"]').click();
+  await bobInCall().waitFor({ state: 'detached' });
+  await alice.openChannel('general');
+  await bob.openChannel('general');
+  await alice.member('bob').click({ button: 'right' });
+  await alice.menuItem('Remove server mute').click();
+  await alice.toast('bob can talk again.');
+  // Bulk delete: pick two messages and delete them for everyone at once.
+  await alice.send('Spam number one');
+  await alice.send('Spam number two');
+  await bob.message('Spam number two').waitFor();
+  // Esc stops picking, even with focus on the bar's own buttons.
+  await alice.messageAction('Spam number one', 'Select messages to delete…');
+  await alice.$('#select-bar button', { hasText: 'Cancel' }).focus();
+  await alice.page.keyboard.press('Escape');
+  await alice.$('#select-bar').waitFor({ state: 'hidden' });
+  await alice.messageAction('Spam number one', 'Select messages to delete…');
+  await alice.message('Spam number two').locator('.msg-select').check();
+  await alice.$('#select-bar button', { hasText: 'Delete 2' }).click();
+  await alice.modal('Delete 2 messages?').locator('.modal-foot .btn.danger').click();
+  await alice.toast('Deleted 2 messages.');
+  for (const p of [alice, bob]) await p.message('Spam number').first().waitFor({ state: 'detached' });
+  check(!(await alice.$('#select-bar:not([hidden])').count()), 'Picking messages should end once they are deleted.');
+  // Back to the call for the next flow.
+  for (const p of [alice, bob]) { await p.channelRow('Lounge').locator('.ch-main').click(); await p.$('.voice-room .cs-controls').waitFor(); }
+}
+
 async function watchTogether(t) {
   const { alice, bob } = t.people;
   await alice.$('.voice-room .cs-controls button[aria-label="Watch together"]').click();
@@ -1113,6 +1152,7 @@ export const FLOWS = [
   ['self-assign roles: marked in the role editor, picked by a member, opens a private channel', selfRoles],
   ['events: a weekly event, RSVP, stop it repeating', events],
   ['voice: two people connected in a call', voiceCall],
+  ['moderator toolkit: server mute in and out of a call, bulk delete', moderatorTools],
   ['watch together: start, pause for everyone, stop; leave the call', watchTogether],
   ['dm call: ring, accept, hang up, decline', dmCall],
   ['group chat: create, talk both ways, call rings', groupChat],

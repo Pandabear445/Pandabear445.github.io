@@ -4,7 +4,7 @@ export const PERMS = {
   MENTION_EVERYONE: 1 << 4, MANAGE_MESSAGES: 1 << 5, CONNECT: 1 << 6, SPEAK: 1 << 7,
   CREATE_INVITE: 1 << 8, KICK_MEMBERS: 1 << 9, BAN_MEMBERS: 1 << 10, MANAGE_CHANNELS: 1 << 11,
   MANAGE_ROLES: 1 << 12, MANAGE_SERVER: 1 << 13, MANAGE_EMOJIS: 1 << 14, CREATE_THREADS: 1 << 15,
-  EMBED_LINKS: 1 << 16, ADMINISTRATOR: 1 << 30,
+  EMBED_LINKS: 1 << 16, MUTE_MEMBERS: 1 << 17, MOVE_MEMBERS: 1 << 18, ADMINISTRATOR: 1 << 30,
 };
 const P = PERMS;
 export const PERM_GROUPS = [
@@ -32,6 +32,8 @@ export const PERM_GROUPS = [
   ['Voice', [
     ['CONNECT', 'Connect', 'Join voice channels.', true],
     ['SPEAK', 'Speak', 'Talk in voice channels (otherwise listen only).', true],
+    ['MUTE_MEMBERS', 'Mute members', 'Server-mute people below them: nobody hears them in any voice channel here until it\u2019s lifted.', false],
+    ['MOVE_MEMBERS', 'Move members', 'Disconnect people below them from voice, or move them to another voice channel. Can be given per voice channel.', false],
   ]],
   ['Advanced', [
     ['ADMINISTRATOR', 'Administrator', 'Every permission, everywhere, and bypasses channel restrictions. Give this carefully.', false],

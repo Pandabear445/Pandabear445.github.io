@@ -460,6 +460,13 @@ function startApp() {
     myId: () => S.me && S.me.id,
     onNotice: (text, kind) => toast(text, kind),
     onRegion: (room, region, version) => applyCallRegion({ room, region, version }),
+    // A moderator moved us to another voice channel: join it (and follow it on screen if we were looking at the call).
+    onMoved: (to) => {
+      const c = channelById(to); const srv = c && serverOfChannel(to);
+      if (!c || !srv) { toast('A moderator moved you out of the call.'); return; }
+      toast(`A moderator moved you to ${c.name}.`);
+      joinVoice(c, srv, { stay: S.view.type !== 'voice' });
+    },
     ensureIce: () => freshIce(),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
@@ -721,12 +728,9 @@ function startApp() {
 
   socket.on('message:new', (m) => { if (!S.me) return; if (m.threadId) onThreadMessage(m); else onNewMessage('c:' + m.channelId, m); });
   socket.on('message:update', (m) => { if (m.threadId) onThreadUpdate(m); else onUpdateMessage('c:' + m.channelId, m); });
-  socket.on('message:delete', ({ id, channelId, threadId }) => {
-    if (threadId) {
-      const t = S.threads[threadId];
-      if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); if (S.thread && S.thread.rootId === threadId) renderPanel(); }
-    } else onDeleteMessage('c:' + channelId, id);
-  });
+  socket.on('message:delete', ({ id, channelId, threadId }) => onDeleteChannelMessages(channelId, [{ id, threadId }]));
+  // Bulk delete and a ban's cleanup: many at once, one redraw.
+  socket.on('message:delete-bulk', ({ channelId, messages } = {}) => { if (Array.isArray(messages)) onDeleteChannelMessages(channelId, messages); });
   socket.on('thread:update', ({ rootId, channelId, threadCount, threadLastAt }) => {
     const store = S.msgs['c:' + channelId];
     const m = store && store.list.find((x) => x.id === rootId);
@@ -1379,6 +1383,8 @@ function globalKeys(e) {
   if (e.key === 'Escape' && !document.querySelector('.modal-backdrop, .popover')) {
     // Phones: the navigation drawer closes first, and focus goes back to the button that opened it.
     if (document.body.classList.contains('nav-open')) { document.body.classList.remove('nav-open'); const t = $('.nav-toggle'); if (t) t.focus(); }
+    // Picking messages to delete ends first (wherever focus is: often the bar's own buttons), and only that.
+    else if (S.select) { e.preventDefault(); endSelect({ refocus: true }); }
     else if (S.editing) { S.editing = null; renderMessages(false); }
     else if (composers.main && composers.main.state.replyTo) composers.main.setReply(null);
     else if (S.panel === 'thread') closeThread();
@@ -1781,6 +1787,7 @@ function channelMenuItems(c, server) {
     roles ? { label: 'Make private', icon: 'lock', action: () => quickOverride(server, c, 'private') } : null,
     admin ? { label: 'Move up', icon: 'arrowUp', action: () => moveChannel(server, c, -1) } : null,
     admin ? { label: 'Move down', icon: 'arrowDown', action: () => moveChannel(server, c, 1) } : null,
+    c.type === 'text' && canIn(c, PERMS.MANAGE_MESSAGES) ? { label: 'Delete recent messages\u2026', icon: 'trash', danger: true, action: () => openPurgeRecent(c) } : null,
     edit ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
   ];
 }
@@ -1839,14 +1846,17 @@ function renderSidebarVoiceUsers() {
   $$('[data-vc-users]').forEach((el) => {
     clear(el);
     const list = S.voice[el.dataset.vcUsers] || [];
+    const server = serverOfChannel(el.dataset.vcUsers);
     for (const st of list) {
       const u = getUser(st.userId);
       const av = avatarEl(u, 22);
       av.dataset.speak = u.id;
       if (S.speaking.has(u.id)) av.classList.add('speaking');
-      el.append(h('button', { class: 'vc-user', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'right') },
+      el.append(h('button', { class: 'vc-user', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'right'),
+        oncontextmenu: server ? (e) => contextMenu(e, memberMenuItems(server, u)) : null },
         av, nameEl(u),
-        h('span', { class: 'vc-flags' }, st.deafened ? icon('headphonesOff', 'ic flag') : st.muted ? icon('micOff', 'ic flag') : null)));
+        h('span', { class: 'vc-flags' }, st.serverMuted ? h('span', { class: 'server-muted', 'data-tip': 'Server muted by a moderator', role: 'img', 'aria-label': 'Server muted' }, icon('micOff', 'ic flag'))
+          : st.deafened ? icon('headphonesOff', 'ic flag') : st.muted ? icon('micOff', 'ic flag') : null)));
     }
   });
   $$('.ch-row').forEach((r) => r.classList.toggle('connected', !!voice && r.dataset.cid === voice.channelId));
@@ -1873,7 +1883,7 @@ function renderUserPanel() {
       ibtn('gear', 'Settings', () => openSettings(app))),
   );
 }
-function toggleMute() { if (!voice || !voice.channelId) return; if (voice.speakLocked && voice.muted) { toast('You can listen here, but your roles don\u2019t allow speaking in this channel.'); return; } voice.setMuted(!voice.muted); playSound(voice.muted ? 'mute' : 'unmute'); renderUserPanel(); }
+function toggleMute() { if (!voice || !voice.channelId) return; if (voice.speakLocked && voice.muted) { toast(voice.serverMuted ? 'A moderator muted you in this server. You can listen, but not talk.' : 'You can listen here, but your roles don\u2019t allow speaking in this channel.'); return; } voice.setMuted(!voice.muted); playSound(voice.muted ? 'mute' : 'unmute'); renderUserPanel(); }
 function toggleDeafen() { if (!voice || !voice.channelId) return; voice.setDeafened(!voice.deafened); playSound(voice.deafened ? 'deafen' : 'undeafen'); renderUserPanel(); }
 
 // Compact call bar docked above your profile while you're in voice.
@@ -2371,12 +2381,14 @@ function chatView() {
   messageListKeys(scroller);
   const jump = h('button', { class: 'jump-latest', id: 'jump-latest', hidden: true, onclick: () => jumpToLatest() }, icon('arrowDown'), 'Jump to latest');
   const unreadBar = h('div', { class: 'unread-bar', id: 'unread-bar', role: 'status', hidden: true });
+  const selectBar = h('div', { class: 'select-bar', id: 'select-bar', role: 'region', 'aria-label': 'Selected messages', hidden: true });
   const key = currentKey();
+  if (S.select && S.select.key !== key) S.select = null; // selecting is per channel
   const comp = createComposer({ id: 'main', key: () => currentKey(), threadId: () => null });
   composers.main = comp;
   const room = S.view.type === 'dm' ? dmRoom(S.view.dmId) : callRoomFor(currentServer());
   if (room && ((S.voice[room] || []).length || (voice && voice.channelId === room))) wrap.append(callStage(room, { compact: true }));
-  wrap.append(unreadBar, scroller, jump, comp.el);
+  wrap.append(unreadBar, scroller, jump, selectBar, comp.el);
   wrap.addEventListener('dragover', (e) => { e.preventDefault(); wrap.classList.add('dropping'); });
   wrap.addEventListener('dragleave', (e) => { if (!wrap.contains(e.relatedTarget)) wrap.classList.remove('dropping'); });
   wrap.addEventListener('drop', (e) => { e.preventDefault(); wrap.classList.remove('dropping'); comp.addFiles(e.dataTransfer.files); });
@@ -2642,6 +2654,7 @@ function renderMessages(stick) {
   const jl = $('#jump-latest');
   if (jl) jl.hidden = !store.hasNewer;
   renderUnreadBar();
+  renderSelectBar();
   ensureCurrentMessage(sc);
   renderTyping();
 }
@@ -2723,9 +2736,105 @@ function messageEl(m, prev, ctx = 'main') {
     el.classList.add('blocked');
     el.append(h('div', { class: 'msg-gutter' }), h('div', { class: 'msg-body' }, h('div', { class: 'blocked-note' }, icon('ban'), 'Message from someone you blocked. ',
       h('button', { class: 'link-btn', onclick: () => { el._reveal = true; const fresh = messageElRevealed(m, prev, ctx); el.replaceWith(fresh); } }, 'Show'))));
-    return el;
+    return selectBox(el, m, ctx);
   }
-  return fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text });
+  return selectBox(fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }), m, ctx);
+}
+// ---- bulk delete (Manage Messages): pick messages in a channel, or delete the most recent ones
+const BULK_MAX = 100;
+const BULK_DAYS = 14;
+// Older than bulk delete reaches (the server refuses those): they're deleted one at a time.
+const tooOldForBulk = (m) => Date.now() - new Date(m.createdAt).getTime() > BULK_DAYS * 86400000;
+function selectBox(el, m, ctx) {
+  const sel = S.select;
+  if (!sel || ctx !== 'main' || sel.key !== keyOfMessage(m)) return el;
+  const who = displayName(getUser(m.authorId));
+  const old = tooOldForBulk(m);
+  const on = sel.ids.has(m.id);
+  el.classList.toggle('selected', on);
+  el.prepend(h('input', {
+    type: 'checkbox', class: 'msg-select', checked: on, disabled: old,
+    'aria-label': old ? `Message from ${who}: older than ${BULK_DAYS} days, delete it on its own` : `Select message from ${who}`,
+    'data-tip': old ? `Older than ${BULK_DAYS} days: delete it on its own` : null,
+    onchange: (e) => toggleSelect(m, e.target, el),
+  }));
+  if (el.tabIndex !== 0) roveMessage(el, false); // only the current message's checkbox is in the Tab order
+  return el;
+}
+function toggleSelect(m, box, el) {
+  const sel = S.select;
+  if (!sel) return;
+  if (box.checked && !sel.ids.has(m.id) && sel.ids.size >= BULK_MAX) { box.checked = false; toast(`You can delete up to ${BULK_MAX} messages at once.`); return; }
+  if (box.checked) sel.ids.add(m.id); else sel.ids.delete(m.id);
+  el.classList.toggle('selected', box.checked);
+  renderSelectBar();
+}
+function redrawKeepingScroll() {
+  const sc = $('#messages');
+  const top = sc ? sc.scrollTop : 0;
+  renderMessages(false);
+  if (sc) sc.scrollTop = top;
+}
+function startSelect(m) {
+  // The message it started from is ticked, unless it's too old to go in bulk (then nothing is, yet).
+  S.select = { key: keyOfMessage(m), ids: new Set(tooOldForBulk(m) ? [] : [m.id]) };
+  redrawKeepingScroll();
+  const box = $(`#messages [data-mid="${m.id}"] .msg-select`);
+  if (box) box.focus({ preventScroll: true });
+}
+// refocus: focus was likely on the selection bar, which goes away: put it back on the message list.
+function endSelect({ refocus = false } = {}) {
+  if (!S.select) return;
+  const inBar = refocus && document.activeElement && document.activeElement.closest && document.activeElement.closest('#select-bar, .msg-select');
+  S.select = null;
+  redrawKeepingScroll();
+  if (inBar || (refocus && document.activeElement === document.body)) {
+    const sc = $('#messages');
+    const cur = sc && sc.querySelector('.msg[tabindex="0"]');
+    if (cur || sc) (cur || sc).focus({ preventScroll: true });
+  }
+}
+function renderSelectBar() {
+  const bar = $('#select-bar');
+  if (!bar) return;
+  const sel = S.select && S.select.key === currentKey() ? S.select : null;
+  const sc = $('#messages');
+  if (sc) sc.classList.toggle('selecting', !!sel);
+  clear(bar);
+  bar.hidden = !sel;
+  if (!sel) return;
+  const n = sel.ids.size;
+  bar.append(h('span', { class: 'sel-count', role: 'status', 'aria-live': 'polite' }, `${n} selected`, h('span', { class: 'sel-hint' }, ` \u00b7 up to ${BULK_MAX}, from the last ${BULK_DAYS} days`)),
+    h('button', { class: 'btn ghost sm', onclick: () => endSelect({ refocus: true }) }, 'Cancel'),
+    h('button', { class: 'btn danger sm', disabled: !n, onclick: () => deleteSelected() }, icon('trash'), n ? `Delete ${n}` : 'Delete'));
+}
+const bulkDone = (r) => `Deleted ${r.deleted} message${r.deleted === 1 ? '' : 's'}.${r.kept ? ` ${r.kept} by people at or above your highest role ${r.kept === 1 ? 'was' : 'were'} kept.` : ''}`;
+async function deleteSelected() {
+  const sel = S.select;
+  if (!sel || !sel.ids.size) return;
+  // Anything that turned 14 days old while it was ticked is left out (the server would refuse the whole lot).
+  const store = S.msgs[sel.key];
+  for (const id of [...sel.ids]) { const m = store && store.list.find((x) => x.id === id); if (m && tooOldForBulk(m)) sel.ids.delete(id); }
+  renderSelectBar();
+  const n = sel.ids.size;
+  if (!n) { toast(`Messages older than ${BULK_DAYS} days can\u2019t be deleted in bulk. Delete them one at a time.`, 'error'); return; }
+  if (!await confirmDialog({ title: `Delete ${n} message${n === 1 ? '' : 's'}?`, text: 'They\u2019re deleted for everyone, with their files and thread replies. Messages by people at or above your highest role are kept. This can\u2019t be undone.', confirm: 'Delete', danger: true })) return;
+  try {
+    const r = await api('POST', `/channels/${encodeURIComponent(sel.key.slice(2))}/messages/bulk-delete`, { ids: [...sel.ids] });
+    toast(bulkDone(r));
+    endSelect({ refocus: true });
+  } catch (e) { toast(e.message, 'error'); }
+}
+function openPurgeRecent(c) {
+  const count = h('input', { class: 'input', type: 'number', min: '1', max: String(BULK_MAX), step: '1', value: '20', inputmode: 'numeric' });
+  modal({ title: `Delete recent messages in #${c.name}?`, size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `The newest messages in this channel from the last ${BULK_DAYS} days go for everyone, with their files and thread replies. Messages by people at or above your highest role are kept. This can\u2019t be undone.`),
+      field(`How many (up to ${BULK_MAX})`, count)),
+    actions: [{ label: 'Cancel' }, { label: 'Delete', kind: 'danger', action: async () => {
+      const n = Number(count.value);
+      if (!Number.isInteger(n) || n < 1 || n > BULK_MAX) throw new Error(`Pick a number from 1 to ${BULK_MAX}.`);
+      toast(bulkDone(await api('POST', `/channels/${encodeURIComponent(c.id)}/messages/bulk-delete`, { count: n })));
+    } }] });
 }
 function messageElRevealed(m, prev, ctx) {
   const el = h('div', { class: 'msg', dataset: { mid: m.id, ctx }, tabindex: '-1' });
@@ -2918,6 +3027,7 @@ function messageMenuItems(m, ctx) {
     { label: 'Copy message link', icon: 'link', action: () => { copyText(messageLink(m)); toast('Message link copied. It only works for people who can see this conversation.'); } },
     mine && ok ? { label: 'Edit message', icon: 'edit', hint: '\u2191', action: () => { S.editing = m.id; replaceMessageEl(m); } } : null,
     mine || canModerate(m) ? { label: 'Delete message', icon: 'trash', danger: true, action: () => deleteMessage(m) } : null,
+    canModerate(m) && ctx === 'main' && !m.threadId && !S.select && !tooOldForBulk(m) ? { label: 'Select messages to delete\u2026', icon: 'check', action: () => startSelect(m) } : null,
     !mine && readable(m) ? { label: 'Report message', icon: 'shield', danger: true, action: () => openReport({ message: m, ctx }) } : null,
   ];
 }
@@ -3422,12 +3532,25 @@ async function onUpdateMessage(key, m) {
   if (S.editing === m.id) S.editing = null;
   replaceMessageEl(m);
 }
+// Channel messages deleted (one, or a batch): thread replies leave their thread, the rest leave the channel.
+function onDeleteChannelMessages(channelId, list) {
+  const top = [];
+  const threads = new Set();
+  for (const { id, threadId } of list) {
+    const t = threadId && S.threads[threadId];
+    if (threadId) { if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); threads.add(threadId); } } else top.push(id);
+  }
+  if (S.thread && threads.has(S.thread.rootId)) renderPanel();
+  if (top.length) onDeleteMessage('c:' + channelId, top);
+}
 function onDeleteMessage(key, id) {
   const store = S.msgs[key];
   if (!store) return;
-  store.list = store.list.filter((x) => x.id !== id);
-  store.list.forEach((x) => { if (x.reply && x.reply.id === id) x.reply = null; });
-  if (S.thread && S.thread.rootId === id) closeThread();
+  const gone = new Set(Array.isArray(id) ? id : [id]);
+  store.list = store.list.filter((x) => !gone.has(x.id));
+  store.list.forEach((x) => { if (x.reply && gone.has(x.reply.id)) x.reply = null; });
+  if (S.select && S.select.key === key) { for (const x of gone) S.select.ids.delete(x); renderSelectBar(); }
+  if (S.thread && gone.has(S.thread.rootId)) closeThread();
   if (currentKey() === key) {
     const sc = $('#messages');
     const top = sc ? sc.scrollTop : 0;
@@ -3630,6 +3753,7 @@ function memberMenuItems(server, u) {
     }
   }
   if (!me && !isOwnerTarget && theirTop < myTop) {
+    items.push(...voiceModItems(server, u));
     if (can(server, PERMS.KICK_MEMBERS) || can(server, PERMS.BAN_MEMBERS)) items.push('-');
     if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Time out ${displayName(u)}\u2026`, icon: 'timer', action: () => openTimeout(server, u) });
     if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Kick ${displayName(u)}`, icon: 'logout', danger: true, action: async () => {
@@ -3655,8 +3779,46 @@ function openTimeout(server, u) {
 }
 function openBan(server, u) {
   const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional — only moderators see it' });
-  modal({ title: `Ban ${displayName(u)}?`, size: 'sm', body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They\u2019re removed now and can\u2019t rejoin, even with an invite, until someone unbans them.'), field('Reason', reason)),
-    actions: [{ label: 'Cancel' }, { label: 'Ban', kind: 'danger', action: () => api('POST', `/servers/${server.id}/bans`, { userId: u.id, reason: reason.value }).then(() => toast(`${displayName(u)} is banned.`)) }] });
+  // Cleanup after a raid or a spammer: their messages in this server's channels from that window go too.
+  const wipe = h('select', { class: 'input', 'aria-label': 'Delete their messages from the last' },
+    [[0, 'Don\u2019t delete any'], [1, 'Last hour'], [24, 'Last 24 hours'], [168, 'Last 7 days']].map(([v, l]) => h('option', { value: String(v) }, l)));
+  modal({ title: `Ban ${displayName(u)}?`, size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They\u2019re removed now and can\u2019t rejoin, even with an invite, until someone unbans them.'), field('Reason', reason),
+      field('Delete their messages', wipe, 'From every channel in this server, with their files. A thread they started goes with its replies, unless it has replies you couldn\u2019t delete yourself. This can\u2019t be undone.')),
+    actions: [{ label: 'Cancel' }, { label: 'Ban', kind: 'danger', action: () => api('POST', `/servers/${server.id}/bans`, { userId: u.id, reason: reason.value, deleteHours: Number(wipe.value) })
+      .then((r) => toast((r.deleted ? `${displayName(u)} is banned and ${r.deleted} of their message${r.deleted === 1 ? ' was' : 's were'} deleted.` : `${displayName(u)} is banned.`)
+        + (r.kept ? ` ${r.kept} thread${r.kept === 1 ? '' : 's'} they started ${r.kept === 1 ? 'was' : 'were'} kept: ${r.kept === 1 ? 'it has' : 'they have'} replies you can\u2019t delete.` : ''))) }] });
+}
+// Voice moderation: server mute (Mute Members, for the whole server, whether or not they're in a call right now),
+// and, for someone in one of this server's voice channels you can see, move and disconnect (Move Members in that
+// channel). The server checks it all again.
+// (The server sends moderators the list of server-muted members; a call's own list says so too.)
+const isServerMuted = (server, u) => (server.voiceMutes || []).includes(u.id)
+  || (server.channels || []).some((c) => (S.voice[c.id] || []).some((x) => x.userId === u.id && x.serverMuted));
+function voiceModItems(server, u) {
+  if (isGroup(server)) return [];
+  const vc = (server.channels || []).find((c) => c.type === 'voice' && (S.voice[c.id] || []).some((x) => x.userId === u.id));
+  const name = displayName(u);
+  const run = (p, done) => p.then(() => toast(done)).catch((e) => toast(e.message, 'error'));
+  const out = [];
+  if (can(server, PERMS.MUTE_MEMBERS)) {
+    out.push(isServerMuted(server, u)
+      ? { label: 'Remove server mute', icon: 'mic', action: () => run(api('DELETE', `/servers/${server.id}/voice/${u.id}/mute`), `${name} can talk again.`) }
+      : { label: 'Server mute', icon: 'micOff', action: () => run(api('POST', `/servers/${server.id}/voice/${u.id}/mute`), `${name} is muted for everyone in this server.`) });
+  }
+  if (vc && canIn(vc, PERMS.MOVE_MEMBERS)) {
+    const dest = server.channels.filter((c) => c.type === 'voice' && c.id !== vc.id && canIn(c, PERMS.MOVE_MEMBERS));
+    if (dest.length) out.push({ label: 'Move to another voice channel\u2026', icon: 'speaker', action: () => openMoveVoice(server, u, vc, dest) });
+    out.push({ label: 'Disconnect from voice', icon: 'phoneOff', danger: true, action: () => run(api('POST', `/servers/${server.id}/voice/${u.id}/disconnect`), `${name} was disconnected from ${vc.name}.`) });
+  }
+  return out.length ? ['-', { header: vc ? `Voice \u2014 ${vc.name}` : 'Voice' }, ...out] : [];
+}
+function openMoveVoice(server, u, from, dest) {
+  const to = h('select', { class: 'input', 'aria-label': 'Voice channel' }, dest.map((c) => h('option', { value: c.id }, c.name)));
+  modal({ title: `Move ${displayName(u)}?`, size: 'sm',
+    body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `They leave ${from.name} and join the channel you pick, if they\u2019re allowed to connect there.`), field('Move to', to)),
+    actions: [{ label: 'Cancel' }, { label: 'Move', kind: 'primary', action: () => api('POST', `/servers/${server.id}/voice/${u.id}/move`, { channelId: to.value })
+      .then(() => toast(`${displayName(u)} was moved to ${(dest.find((c) => c.id === to.value) || {}).name || 'another channel'}.`)) }] });
 }
 
 function dmProfilePanel(el) {
@@ -5291,7 +5453,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['overview', 'Overview', 'info', (s) => can(s, PERMS.MANAGE_SERVER)],
     ['appearance', 'Appearance', 'palette', (s) => can(s, PERMS.MANAGE_SERVER)],
     ['roles', 'Roles', 'shield', (s) => can(s, PERMS.MANAGE_ROLES)],
-    ['members', 'Members', 'people', (s) => can(s, PERMS.MANAGE_ROLES) || can(s, PERMS.KICK_MEMBERS) || can(s, PERMS.BAN_MEMBERS)],
+    ['members', 'Members', 'people', (s) => can(s, PERMS.MANAGE_ROLES) || can(s, PERMS.KICK_MEMBERS) || can(s, PERMS.BAN_MEMBERS) || can(s, PERMS.MUTE_MEMBERS)],
     ['emoji', 'Emoji', 'smile', (s) => can(s, PERMS.MANAGE_EMOJIS)],
     ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bots', 'Bots', 'bot', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
@@ -5469,16 +5631,29 @@ function openServerSettings(server, startTab = 'overview') {
     const drawList = () => {
       clear(listEl);
       const term = q.value.trim().toLowerCase();
+      const muted = new Set(s.voiceMutes || []);
       s.memberIds.map(getUser).filter((u) => !term || u.username.toLowerCase().includes(term) || displayName(u).toLowerCase().includes(term)).forEach((u) => {
         const rs = memberRoles(s, u.id);
         add(listEl, h('div', { class: 'ss-row' }, avatarEl(u, 32, { status: true, meId: S.me.id }),
-          h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id) }), h('span', null, u.username + (s.ownerId === u.id ? ' \u00b7 Owner' : ''))),
+          h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id) }), h('span', null, u.username + (s.ownerId === u.id ? ' \u00b7 Owner' : '') + (muted.has(u.id) ? ' \u00b7 Server muted' : ''))),
           h('span', { class: 'role-chips' }, ...rs.map((r) => h('span', { class: 'role-chip', style: r.color ? { '--rc': r.color } : null }, r.icon ? r.icon + ' ' : '', r.name))),
           ibtn('more', 'Manage', (e) => menu(e.currentTarget, memberMenuItems(s, u), { align: 'end' }), { cls: 'sm', attrs: { 'data-pop-anchor': '' } })));
       });
     };
     q.addEventListener('input', drawList);
     drawList();
+    // Everyone a moderator server-muted (people with Mute Members get this list), with a way to lift it, since
+    // outside a call nothing else shows it.
+    const mutedNow = (s.voiceMutes || []).filter((id) => s.memberIds.includes(id));
+    if (mutedNow.length) {
+      // Only someone below you can be unmuted by you (the server checks it again).
+      const top = (id) => (s.ownerId === id ? Infinity : Math.max(0, ...memberRoles(s, id).map((r) => r.position)));
+      add(body, h('h3', null, `Server muted \u2014 ${mutedNow.length}`), h('p', { class: 'muted-p' }, 'Nobody hears them in this server\u2019s voice channels until the mute is lifted.'),
+        h('div', { class: 'stack tight' }, mutedNow.map(getUser).map((u) => h('div', { class: 'ss-row' }, avatarEl(u, 30), h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id) }), h('span', null, u.username)),
+          top(u.id) < top(S.me.id)
+            ? h('button', { class: 'btn ghost sm', 'aria-label': `Remove server mute for ${displayName(u)}`, onclick: () => run(() => api('DELETE', `/servers/${s.id}/voice/${u.id}/mute`), `${displayName(u)} can talk again.`) }, 'Remove mute')
+            : h('span', { class: 'field-hint' }, 'Above your highest role')))));
+    }
     add(body, h('h3', null, `Members \u2014 ${s.memberIds.length}`), h('div', { class: 'friends-search' }, icon('search'), q), listEl);
   }
 
@@ -5665,7 +5840,7 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   const tabs = h('div', { class: 'seg' });
   const body = h('div', { class: 'stack' });
   const scoped = PERM_GROUPS.flatMap(([, l]) => l).filter(([k]) => (c.type === 'voice'
-    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MANAGE_CHANNELS', 'MANAGE_ROLES']
+    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MOVE_MEMBERS', 'MANAGE_CHANNELS', 'MANAGE_ROLES']
     : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES']).includes(k));
   const label = (o) => {
     if (o.type === 'member') return displayName(getUser(o.id));
@@ -6058,7 +6233,8 @@ function tileEl(room, t, big) {
       h('button', { class: 'link-btn', onclick: () => { voice.retryPeer(t.u.id).catch(() => {}); renderCallStages(); } }, 'Retry')));
   }
   el.append(h('div', { class: 'cs-name' }, t.kind === 'screen' ? icon('monitor', 'ic') : null, h('span', null, name),
-    t.kind !== 'screen' && t.st.deafened ? icon('headphonesOff', 'ic flag') : t.kind !== 'screen' && t.st.muted ? icon('micOff', 'ic flag') : null));
+    t.kind !== 'screen' && t.st.serverMuted ? h('span', { class: 'server-muted', 'data-tip': 'Server muted by a moderator', role: 'img', 'aria-label': 'Server muted' }, icon('micOff', 'ic flag'))
+      : t.kind !== 'screen' && t.st.deafened ? icon('headphonesOff', 'ic flag') : t.kind !== 'screen' && t.st.muted ? icon('micOff', 'ic flag') : null));
   if (!t.me && t.kind !== 'screen' && voice && voice.channelId === room) {
     el.addEventListener('contextmenu', (e) => {
       e.preventDefault();

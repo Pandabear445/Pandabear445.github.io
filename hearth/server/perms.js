@@ -20,6 +20,9 @@ const PERMS = {
   MANAGE_EMOJIS: 1 << 14,
   CREATE_THREADS: 1 << 15,
   EMBED_LINKS: 1 << 16,
+  // Voice moderation: server-mute people for everyone, and disconnect them or move them to another voice channel.
+  MUTE_MEMBERS: 1 << 17,
+  MOVE_MEMBERS: 1 << 18,
   ADMINISTRATOR: 1 << 30,
 };
 const ALL = Object.values(PERMS).reduce((a, b) => a | b, 0);
@@ -27,14 +30,18 @@ const P = PERMS;
 const DEFAULT_EVERYONE = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
   | P.CONNECT | P.SPEAK | P.CREATE_INVITE | P.CREATE_THREADS;
 // Permissions that only make sense per channel (used to validate overrides). Create Invite isn't one: invites
-// are for the whole server, so a per-channel toggle would look like it does something when it doesn't.
+// are for the whole server, so a per-channel toggle would look like it does something when it doesn't. Nor is
+// Mute Members: a server mute holds in every voice channel. Move Members is: it's checked in the voice channel the
+// person is in (and, for a move, the one they go to).
 const CHANNEL_SCOPED = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
-  | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES;
+  | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES
+  | P.MOVE_MEMBERS;
 // What everyone in a group chat can do. Only its owner manages it (adds channels, deletes other people's
 // messages…); renaming it and changing its picture are allowed to everyone by those routes themselves.
 const GROUP_MEMBER = DEFAULT_EVERYONE | P.MENTION_EVERYONE;
 // What a member who is timed out can't do until it ends: anything that posts or speaks. Reading, joining a call
-// to listen and leaving still work. Owners and Administrators can't be timed out (the route refuses them).
+// to listen and leaving still work. Owners and Administrators can't be timed out (the route refuses them). The
+// moderator toolkit's routes (voice moderation, bulk delete, a ban's message cleanup) also wait for it to end.
 const TALK = P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.MENTION_EVERYONE | P.CREATE_THREADS | P.SPEAK | P.EMBED_LINKS | P.CREATE_INVITE;
 
 function makePerms(db) {

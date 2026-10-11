@@ -25,12 +25,14 @@ Signaling goes over the app's Socket.IO connection.
 
 | Event | Direction | What it does |
 |---|---|---|
-| `voice:join { channelId, muted, deafened, video, resume? }` | client → server | Access checks (DM: participant and not blocked; channel: `requireChannel`, voice type, CONNECT). Answers `{ peers: [{ userId, socketId, reconnecting }], canSpeak, region, regionVersion, resumed? }`. |
+| `voice:join { channelId, muted, deafened, video, resume? }` | client → server | Access checks (DM: participant and not blocked; channel: `requireChannel`, voice type, CONNECT). Answers `{ peers: [{ userId, socketId, reconnecting }], canSpeak, serverMuted?, silenced, region, regionVersion, resumed? }`. A resume within two minutes of a moderator disconnecting or moving you is refused (with `movedTo` after a move). |
 | `voice:peer-joined { userId, socketId, resumed }` | server → room | Someone (re)joined. Anyone still connected to them from before moves that connection to the new socket. |
 | `voice:signal { to, data }` | client → server → peer | Relayed only between two sockets in the same room; the server sets `from` and `userId` itself. `data` carries an SDP (signed), an ICE candidate, or a restart/reset request, plus the connection ids `pc`/`topc` (below). |
 | `voice:update` | client → server | Mute, deafen, video, screen flags. |
-| `voice:state { channelId, users }` | server → viewers | Who is in the call, with flags and `reconnecting`. |
-| `voice:peer-left`, `voice:kicked`, `voice:perms` | server → clients | Someone left; you were removed; your Speak permission changed. |
+| `voice:state { channelId, users }` | server → viewers | Who is in the call, with flags and `reconnecting`; `serverMuted: true` for people a moderator muted (section 6). |
+| `voice:silenced { channelId, userIds }` | server → room | Only to the people in the call: who may not talk there (server-muted, timed out or no Speak). Every app drops their audio (section 6). Not in `voice:state`, which everyone who can see the channel gets, because it would show who is timed out. |
+| `voice:peer-left`, `voice:kicked { by? }`, `voice:perms { canSpeak, serverMuted? }` | server → clients | Someone left; you were removed (`by: 'moderator'` for a moderator's disconnect); your Speak permission or server mute changed. |
+| `voice:moved { channelId, to, serverId }` | server → client | A moderator moved you: the server already took you out of `channelId`; the app joins `to` (every join check runs again). |
 | `voice:leave` | client → server | Hang up (also accepted for a place kept after a dropped connection, from the same session). |
 | `call:region { room, region, version, by }` | server → room | The call's region changed (section 3). |
 
@@ -253,6 +255,24 @@ kept place, signing the session out ends it immediately, and a resume runs every
 on the server: a malicious server can keep someone connected by not sending `voice:peer-left` (but it then has to
 keep listing them, or the 20 s unlisted rule closes the connection). There is no call key to rotate: each
 connection's keys come from its own DTLS handshake and die with it.
+
+**Moderators: disconnect, move and server mute.** People with Move Members can disconnect someone from a voice
+channel or move them to another one. It's checked in the channel the person is in (and, for a move, in the one they
+go to), so it can be given per voice channel. People with Mute Members can mute someone for the whole server; that
+is a server-wide permission only, since the mute holds in every voice channel (a grant in one channel could
+otherwise place a mute its holder couldn't lift anywhere else). All of it works only on people below the moderator's
+highest role, never on the owner, not while the moderator is timed out, and every action goes in the audit log. A
+disconnect or move takes the person out of the call on the server, like a kick from the call; their app's automatic
+rejoin after a dropped connection is refused for two minutes (a deliberate rejoin works: use a ban, a timeout or a
+Connect deny to keep someone out). A **server mute** lasts until someone with Mute Members lifts it, across leaving
+and rejoining, in or out of a call (moderators' apps get the list of server-muted members with the server). The
+owner is never muted, and a transfer of the server drops the new owner's mute. Because audio goes directly between
+the people in a call, the server can't cut it off itself, so it is carried out by the apps: the muted person's app
+keeps their mic off (the same lock as a missing Speak permission), and every other app in the call drops the audio,
+including screen-share sound, of anyone the server lists in `voice:silenced` (server-muted, timed out, or without
+Speak there). Only the people in the call get that list. A modified app can still send audio, but honest apps won't
+play it. A malicious server could of course mute or unmute anyone it likes; that is no different from it
+controlling who is in the call.
 
 **What a compromised relay can do.** Everything any relay can (above): see metadata, drop or delay packets, end
 calls through it. It can't decrypt or inject media (SRTP is authenticated). A compromised **region** VPS also holds
