@@ -104,6 +104,15 @@ Each item is checked by `npm run test:a11y` unless marked otherwise.
   The custom status dialog's "Clear after" choice has a label, and the line saying when it clears is a polite live
   region.
 - Form errors are text, tied to their field. Key-change warnings use a shield icon plus a label.
+- The word filter (`wordfilter-app.js`) says what it did in words: a hidden message is a row "Hidden by your word
+  filter" (or "this server's") with a **Show** button; a blurred one has a real button on top ("Blurred by … word
+  filter · Show") and its content is `inert` until then, so screen readers don't read out what's blurred and
+  nothing in it takes focus. A hidden row names who wrote it (unless the row above does), and the next message
+  never groups under it, so a screen reader hears the right author. Hidden rows follow the one-Tab-stop rule of the
+  message list: their Show button is only in the Tab order on the current message. The list box marks itself
+  `aria-invalid` while an entry is wrong, the problems are a polite live list under it, and the **Try it** result is
+  a polite live region. After Save, focus goes back to the Save button (the section is drawn again); a change saved
+  on another device while you type here is a status note with a button, not a silent redraw.
 
 ### Labels
 - The suite checks every visible interactive element on every screen it opens. Each needs an accessible name; it

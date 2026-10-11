@@ -366,6 +366,8 @@ function serverCommon(s) {
     // This server sells memberships (the app shows "Memberships" in its menu); owners see the tab either way.
     memberships: s.kind !== 'group' && MEMB.offers(s.id),
     membershipsOn: s.kind !== 'group' && MEMB.usable(),
+    // The server's suggested word filter (server/wordfilter.js): plain text every member's app applies, or null.
+    wordFilter: WFILTER ? WFILTER.publicOf(s) : null,
   };
   if ((s.kind || 'server') === 'group') {
     const last = groupLastRow(channels);
@@ -407,7 +409,7 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
   const out = {
     id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: common.memberIds, nicknames: common.nicknames,
     roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder.filter((k) => cats.has(k)),
-    bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
+    bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn, wordFilter: common.wordFilter,
   };
   if (myBase & PM.MANAGE_ROLES) out.soldRoles = common.soldRoles;
   if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
@@ -1698,6 +1700,7 @@ let SELF = null; // server/selfroles.js
 let PRES = null; // server/presence.js
 let SCHED = null; // server/scheduled.js
 let NICK = null; // server/nicknames.js
+let WFILTER = null; // server/wordfilter.js
 // What someone is called in a server's notifications: their nickname there, else their display name.
 const nameIn = (serverId, uid) => (NICK && NICK.nicknameOf(serverId, uid)) || nameOf(uid);
 function pushTo(userIds, payload, what = { kind: 'other' }) {
@@ -2164,7 +2167,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
       last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
-    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps', 'word_filters']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
     db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0, status_expires_at = NULL WHERE id = ?").run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
@@ -6259,6 +6262,10 @@ SCHED = require('./scheduled')({ api, auth, db, fail, rateLimit, limitMessages, 
 // Per-server nicknames (server/nicknames.js).
 NICK = require('./nicknames')({ api, auth, db, fail, rateLimit, limitNet, requireServer, isMember, perms, PM, ALL: ALL_PERMS, checkWords, requireUnlocked,
   serverAudit, getIo: () => io });
+// Word filters (server/wordfilter.js): each person's own list (sealed, only their apps can read it) and a server's
+// suggested one (plain). Matching happens only in the apps.
+WFILTER = require('./wordfilter')({ api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, serverAudit, getIo: () => io,
+  emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();

@@ -1552,6 +1552,19 @@ CREATE TABLE IF NOT EXISTS key_vouches (
   PRIMARY KEY (user_id, server_id)
 );`);
 
+// v19 (word filters): server/wordfilter.js. word_filters holds each person's own list, sealed by their app with their
+// personal vault key (ciphertext only: the server never sees a word of it); data NULL once they delete it. A server's
+// suggested list is plain text in servers.word_filter ({ words, action, updatedAt } as JSON, NULL for none): every
+// member's app reads it, and matching happens only on their devices.
+db.exec(`
+CREATE TABLE IF NOT EXISTS word_filters (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  data TEXT,
+  updated_at INTEGER NOT NULL
+);
+`);
+addColumn('servers', 'word_filter', 'TEXT');
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

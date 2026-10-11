@@ -6,8 +6,9 @@
 // changes (self-picked ones marked as such), nicknames (server/nicknames.js: old and new, which every member could
 // see anyway; not shown once that person's account is deleted), roles, channels, channel permissions, invites,
 // emoji, webhooks, bots,
-// voice moderation, moderators deleting other people's messages (one at a time or in bulk), pins, server settings
-// and ownership. Many of these also go to the instance audit log (admin_log) as before; this is the server's own copy.
+// voice moderation, moderators deleting other people's messages (one at a time or in bulk), pins, server settings,
+// the server's suggested word filter (server/wordfilter.js: what was added and removed) and ownership. Many of
+// these also go to the instance audit log (admin_log) as before; this is the server's own copy.
 //   - Metadata only: who, what, to whom, where and when. Never what a message said (the server can't read it anyway).
 //   - Read by people with View Audit Log, Administrators and the owner. A channel's name is shown only to readers who
 //     can see that channel now, and what an entry says about a channel they can't see (its old name, its webhooks,
@@ -66,7 +67,7 @@ const ACTIONS = [
   'message_delete', 'message_bulk_delete', 'message_pin', 'message_unpin',
   'invite_create', 'invite_revoke', 'emoji_create', 'emoji_rename', 'emoji_delete',
   'webhook_create', 'webhook_update', 'webhook_rotate', 'webhook_delete', 'bot_add', 'bot_update', 'bot_remove',
-  'voice_disconnect', 'voice_move', 'voice_mute', 'voice_unmute',
+  'voice_disconnect', 'voice_move', 'voice_mute', 'voice_unmute', 'word_filter_update',
 ];
 // Detail keys that hold a channel ({ id, name, private }), shown only to readers who can see it.
 const CHANNEL_KEYS = ['channel', 'toChannel'];
@@ -74,6 +75,35 @@ const CHANNEL_KEYS = ['channel', 'toChannel'];
 const SAFE_KEYS = ['count', 'replies', 'kept', 'type', 'thread', 'staff'];
 // Report categories instance staff handle alone: the evidence isn't passed around any further.
 const STAFF_ONLY = ['child_safety'];
+
+// Long lists are cut (the entry says how many more there were) and so are long strings, so one entry stays small.
+// Still too long (long items in a list): fewer items from each list, the count of the rest kept, until it fits, so
+// an entry always says as much as it can and never less than its counts and plain values.
+const DETAIL_MAX = 8000;
+function trim(d) {
+  const out = {};
+  const lists = [];
+  for (const [k, v] of Object.entries(d || {})) {
+    if (v === undefined) continue;
+    if (Array.isArray(v)) { out[k] = v.slice(0, 25); if (v.length > 25) out[`${k}More`] = v.length - 25; lists.push([k, v.length]); }
+    else if (typeof v === 'string') out[k] = v.slice(0, 300);
+    else out[k] = v;
+  }
+  let json = JSON.stringify(out);
+  for (const n of [12, 6, 3, 1, 0]) {
+    if (json.length <= DETAIL_MAX) return json;
+    for (const [k, len] of lists) {
+      out[k] = out[k].slice(0, n);
+      if (len > out[k].length) out[`${k}More`] = len - out[k].length;
+    }
+    json = JSON.stringify(out);
+  }
+  if (json.length <= DETAIL_MAX) return json;
+  // Something else is too long: keep what's small (numbers, flags, short words) and say it was cut.
+  const small = { truncated: true };
+  for (const [k, v] of Object.entries(out)) if (typeof v === 'number' || typeof v === 'boolean' || (typeof v === 'string' && v.length <= 64)) small[k] = v;
+  return JSON.stringify(small);
+}
 
 module.exports = function setupServerAudit(ctx) {
   // keptSql: db.js's serverAuditKeptSql, the moderation kinds the 50,000 ceiling leaves alone.
@@ -95,18 +125,6 @@ module.exports = function setupServerAudit(ctx) {
   // A channel as entries keep it: its name then, and whether some members couldn't see it (then only people who
   // can see it now, or Administrators once it's gone, read the name).
   const channelRef = (s, c) => (c ? { id: c.id, name: c.name, ...(perms.restricted(s, c) ? { private: true } : {}) } : null);
-  // Long lists are cut (the entry says how many more there were) and so are long strings, so one entry stays small.
-  function trim(d) {
-    const out = {};
-    for (const [k, v] of Object.entries(d || {})) {
-      if (v === undefined) continue;
-      if (Array.isArray(v)) { out[k] = v.slice(0, 25); if (v.length > 25) out[`${k}More`] = v.length - 25; }
-      else if (typeof v === 'string') out[k] = v.slice(0, 300);
-      else out[k] = v;
-    }
-    const json = JSON.stringify(out);
-    return json.length <= 8000 ? json : JSON.stringify({ truncated: true });
-  }
   // Adds an entry. server: a servers row or id; actorId: who did it (null: Hearth itself, or instance staff, which
   // the detail says with staff: true); targetId: the person, role, channel, emoji, invite code or webhook it was done
   // to; channelId: the channel it happened in, if any. Group chats have no audit log. A failure here is logged and
@@ -427,3 +445,5 @@ module.exports = function setupServerAudit(ctx) {
 
   return { record, recordCapped, channelRef, watch, prune, mayRead, shares, memberServer, reportChanged, ACTIONS };
 };
+// Exported for the tests (test/wordfilter.test.js).
+module.exports.trimDetail = trim;

@@ -70,7 +70,9 @@ Suggested order:
 ## Not recommended, and why
 
 - **Server-side AutoMod or content scanning.** It would need the server to read end-to-end encrypted text. Only a
-  client-side word list that hides messages on each reader's device is compatible.
+  client-side word list that hides messages on each reader's device is compatible, and that is what Hearth has (the
+  word filter in 1.29: your own encrypted list, plus a server's suggested list members can turn off; FEATURES.md).
+  It can't block a message from being posted, and shouldn't pretend to.
 - **Federation, or Matrix/Discord bridges.** A bridge must decrypt to relay messages, which drops end-to-end
   encryption. It is also XL work with a large attack surface.
 - **An SFU for big calls, or Go Live, before media E2EE.** Without SFrame (VOICE.md stages 2–4) the media server

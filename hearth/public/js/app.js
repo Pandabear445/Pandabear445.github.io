@@ -45,6 +45,7 @@ import { createScheduled } from './scheduled.js';
 import { bindNew, bindEdit, describe as describeBinding, createVersions, createCopies, createOriginals, noteMessage, bindingState } from './binding.js';
 import { trackViewport } from './viewport.js';
 import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel, onlyPresenceChanged } from './presence.js';
+import { createWordFilter, filterLabel, previewLabel } from './wordfilter-app.js';
 
 // ======================================================================= state
 const S = {
@@ -93,6 +94,8 @@ let hadController = false; // was a service worker already in charge when the pa
 let voice;
 let away = null; // automatic Away (presence.js)
 const sec = createSecure({ S, onKeysChanged, onKeyWarning });
+// Word filter (wordfilter-app.js): your own list and your servers' suggested ones, applied on this device only.
+const WF = createWordFilter({ S, vaultKey: () => myVaultKey(), serverOf: (m) => msgServer(m), onChange: () => wordFilterChanged() });
 const fetchingUsers = new Set();
 
 // ---- per-device preferences
@@ -181,6 +184,7 @@ export const app = {
   setNotify: (key, level, extra) => setNotify(key, level, extra),
   setNotifySettings: (body) => setNotifySettings(body),
   decryptMessage: (m) => decryptMessage(m),
+  wordFilter: WF,
 };
 
 // ======================================================================= boot
@@ -818,6 +822,7 @@ function startApp() {
   });
   // A nickname set, changed or removed in one of your servers (server/nicknames.js).
   socket.on('member:nick', ({ serverId, userId, nickname } = {}) => applyNick(serverId, userId, typeof nickname === 'string' ? nickname : null));
+  WF.listen(socket); // your word filter saved on another device, a server's suggested list changed
   socket.on('channel:create', (ch) => {
     const s = S.servers.find((x) => x.id === ch.serverId);
     if (s && !s.channels.find((c) => c.id === ch.id)) s.channels.push(ch);
@@ -970,6 +975,8 @@ let clockWarned = false;
 async function loadBootstrap() {
   // Read markers, notification preferences and saved ids come alongside, so unread badges are right at start.
   const extras = Promise.all(['/me/unread', '/me/notify', '/me/saved/ids'].map((p) => api('GET', p).catch(() => null)));
+  // Your word filter comes alongside too, and is opened before anything is drawn, so nothing it hides shows first.
+  const filterList = api('GET', '/me/word-filter').catch(() => null);
   const asked = Date.now();
   const b = await api('GET', '/bootstrap');
   // How far this device's clock is from the server's (at most a day either way), for disappearing messages and the
@@ -1008,6 +1015,8 @@ async function loadBootstrap() {
   if (S.view.dmId && !S.dms.find((d) => d.id === S.view.dmId)) S.view = { type: 'home' };
   if (!S.view.serverId && !S.view.dmId && !['friends', 'saved', 'people'].includes(S.view.type)) S.view = { type: 'home' };
   applyUserState(await extras);
+  const savedFilter = await filterList;
+  if (savedFilter) await WF.apply(savedFilter, { quiet: true }).catch(() => {});
   renderAll();
   loadPreviews();
   SCHED.load(); // your scheduled messages (after the keys above: some may need re-encrypting)
@@ -1152,6 +1161,9 @@ function previewText(m, group = false) {
   if (!m.dec || m.dec.error) return 'Encrypted message';
   if (m.dec.pending) return 'Waiting for key…';
   const who = m.authorId === S.me.id ? 'You: ' : group ? `${displayName(getUser(m.authorId))}: ` : '';
+  // The word filter covers previews and notifications too: they say it's hidden instead of what it says.
+  const wf = WF.check(m);
+  if (wf) return who + previewLabel(wf);
   const t = (m.dec.t || '').replace(/\s+/g, ' ').trim();
   return who + (t || ((m.dec.f || []).length ? 'Sent an attachment' : ''));
 }
@@ -3129,11 +3141,14 @@ function savedView() {
       }
       const u = getUser(m.authorId);
       const text = readable(m) ? textOf(m) || (filesOf(m).length ? '_Attachment_' : m.dec && m.dec.p ? `\uD83D\uDCCA ${m.dec.p.q}` : '') : '';
+      const wf = WF.isShown(m.id) ? null : WF.check(m); // your word filter covers saved messages too
       wrap.append(h('div', { class: 'saved-row', dataset: { saved: it.messageId } },
         avatarEl(u, 36),
         h('div', { class: 'saved-body' },
           h('div', { class: 'saved-meta' }, nameEl(u), h('span', null, `${whereLabel(m)} \u00b7 ${fmtStamp(m.createdAt)}`)),
-          readable(m) ? h('div', { class: 'saved-text md', html: md(text, { mentionName: S.me.username }) }) : h('div', { class: 'saved-text muted-p' }, 'Can\u2019t decrypt this message on this device yet.'),
+          !readable(m) ? h('div', { class: 'saved-text muted-p' }, 'Can\u2019t decrypt this message on this device yet.')
+            : wf ? h('div', { class: 'saved-text' }, h('em', null, previewLabel(wf)))
+              : h('div', { class: 'saved-text md', html: md(text, { mentionName: S.me.username }) }),
           it.noteText ? h('div', { class: 'saved-note' }, icon('edit'), it.noteText) : null),
         h('div', { class: 'saved-actions' },
           ibtn('arrowUp', 'Jump to message', () => jumpToMessageId(it.messageId)),
@@ -3419,6 +3434,8 @@ async function decryptAll(key) {
   if (store) await Promise.all(store.list.map(decryptMessage));
 }
 const textOf = (m) => (m.dec && m.dec.t) || '';
+// A message's words for a snippet (the inbox): the word filter's note instead, when it hides or blurs the message.
+const snippetOf = (m, n) => { const wf = WF.check(m); return wf ? previewLabel(wf) : textOf(m).slice(0, n); };
 const filesOf = (m) => (m.dec && m.dec.f) || [];
 const linksOf = (m) => (m.dec && m.dec.l) || []; // link previews the sender built (already checked by secure.js)
 const readable = (m) => !!m.dec && !m.dec.error && !m.dec.pending;
@@ -3620,13 +3637,15 @@ function refreshWelcomeRoles(server) {
 function messageEl(m, prev, ctx = 'main') {
   const author = getUser(m.authorId);
   const mine = m.authorId === S.me.id;
-  const isGrouped = grouped(m, prev);
+  // A message the word filter hides shows no name, so the next one from the same person starts its own group (with
+  // their name) rather than sitting under whoever spoke before.
+  const isGrouped = grouped(m, prev) && !hiddenByFilter(prev);
   const text = textOf(m);
   const mentioned = !mine && mentionsMe(m);
   const replying = composers[ctx] && composers[ctx].state.replyTo && composers[ctx].state.replyTo.id === m.id;
   const el = h('div', {
     class: `msg${isGrouped ? ' grouped' : ''}${mentioned ? ' mentioned' : ''}${replying ? ' replying' : ''}${m.pinnedAt ? ' pinned' : ''}`,
-    dataset: { mid: m.id, ctx }, tabindex: '-1',
+    dataset: { mid: m.id, ctx, wf: filterState(m, prev) }, tabindex: '-1',
     oncontextmenu: (e) => { if (!e.target.closest('a, .md-code, .md-pre') || e.shiftKey) contextMenu(e, messageMenuItems(m, ctx)); },
   });
   if (S.blocked.has(m.authorId) && !el._reveal) {
@@ -3635,7 +3654,54 @@ function messageEl(m, prev, ctx = 'main') {
       h('button', { class: 'link-btn', onclick: () => { el._reveal = true; const fresh = messageElRevealed(m, prev, ctx); el.replaceWith(fresh); } }, 'Show'))));
     return selectBox(el, m, ctx);
   }
-  return selectBox(fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }), m, ctx);
+  // The word filter (wordfilter-app.js): hidden behind a row with Show, or blurred like a spoiler (fillMessage).
+  // Never your own messages, and not once you've chosen to see it.
+  const wf = veiled(m);
+  if (wf && wf.action === 'hide') return selectBox(filteredEl(el, m, prev, ctx, wf, { author, isGrouped, text }), m, ctx);
+  return selectBox(fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text, blur: wf }), m, ctx);
+}
+// What the word filter does to a message here: null, or { action, by } (wordfilter-app.js check). Never your own
+// messages, nor one you chose to see.
+const veiled = (m) => (!m || m.authorId === S.me.id || WF.isShown(m.id) ? null : WF.check(m));
+const hiddenByFilter = (m) => { const r = veiled(m); return !!r && r.action === 'hide'; };
+// The message a reply quotes, through the filter too.
+const veiledQuote = (m) => (m.reply && !WF.isShown(m.reply.id) ? WF.check({ authorId: m.reply.authorId, dec: m.reply.dec, serverId: m.serverId, channelId: m.channelId, dmId: m.dmId }) : null);
+// Everything about the word filter a message row was drawn with (kept on it as data-wf): a list change redraws only
+// the rows where this changed, so nothing else on screen (an edit being typed, an open poll) is touched.
+const filterState = (m, prev) => { const a = veiled(m); const q = veiledQuote(m); return `${a ? a.action : ''}|${q ? q.action : ''}|${grouped(m, prev) && hiddenByFilter(prev) ? 1 : 0}`; };
+// What a reply bar or reminder quotes from a message: the filter's note instead of words it hides or blurs.
+const quoteOf = (m, fallback = 'Attachment') => { const wf = veiled(m); return wf ? previewLabel(wf) : textOf(m) || fallback; };
+// "Show" on a hidden or blurred message: drawn in full, and the message after it drawn again (it may now group).
+function revealFiltered(m) {
+  WF.reveal(m.id);
+  replaceMessageEl(m);
+  redrawFilterChanges();
+}
+// While a hidden message is drawn out of sight (filteredEl): what its pictures would load, instead of waiting for them
+// to come on screen themselves.
+let lazyLoads = null;
+const loadWhenVisible = (el, fn) => (lazyLoads ? lazyLoads.push(fn) : whenVisible(el, fn));
+// A message the word filter hides: one row that says so, with Show. The message is still drawn behind it, out of
+// sight, and loads what it would have shown (its pictures, a poll's votes) when its row comes near the screen like any
+// other: the server sees the same requests either way, so it can't tell that anything was hidden.
+function filteredEl(el, m, prev, ctx, wf, o) {
+  const loads = [];
+  lazyLoads = loads;
+  let shadow;
+  try { shadow = fillMessage(h('div'), m, prev, ctx, { ...o, mine: false }); } finally { lazyLoads = null; }
+  for (const img of shadow.querySelectorAll('img[loading="lazy"]')) {
+    const src = img.getAttribute('src') || '';
+    if (src && !src.startsWith('data:')) loads.push(() => { const i = new Image(); i.referrerPolicy = 'no-referrer'; i.src = src; });
+  }
+  el.classList.add('filtered');
+  // Who wrote it, unless the row above already says (the words are what's hidden, not the person).
+  const who = o.isGrouped ? null : h('strong', { class: 'filtered-who' }, nameInMsg(m, o.author));
+  el.append(h('div', { class: 'msg-gutter' }), h('div', { class: 'msg-body' }, h('div', { class: 'filtered-note' }, icon('eyeOff'), who, who ? ' · ' : null, `${filterLabel(wf)}. `,
+    h('button', { class: 'link-btn', type: 'button', onclick: () => revealFiltered(m) }, 'Show'))));
+  if (loads.length) whenVisible(el, () => loads.forEach((f) => f()));
+  // One message at a time is in the Tab order (roveMessage): this row's Show button too.
+  roveMessage(el, false);
+  return el;
 }
 // ---- bulk delete (Manage Messages): pick messages in a channel, or delete the most recent ones
 const BULK_MAX = 100;
@@ -3749,7 +3815,7 @@ function messageElRevealed(m, prev, ctx) {
   const el = h('div', { class: 'msg', dataset: { mid: m.id, ctx }, tabindex: '-1' });
   return fillMessage(el, m, prev, ctx, { author: getUser(m.authorId), mine: false, isGrouped: false, text: textOf(m) });
 }
-function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
+function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text, blur = null }) {
   // In a server, people go by their nicknames there (none in DMs and group chats).
   const server = msgServer(m);
   const bind = bindingOfMessage(m);
@@ -3757,9 +3823,12 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const ru = getUser(m.reply.authorId);
     const rd = m.reply.dec;
     const rtext = rd && !rd.error && !rd.pending ? rd.t : '';
+    // The quoted message goes through the word filter too (it's someone's words shown here).
+    const rwf = veiledQuote(m);
     el.append(h('button', { class: 'msg-reply', 'aria-label': `Replying to ${nameInServer(server, ru)}. Jump to original.`, onclick: () => jumpToMessage(keyOfMessage(m), m.reply.id) },
       h('span', { class: 'reply-spine' }), avatarEl(ru, 16), nameEl(ru, { cls: 'reply-name', server }),
-      h('span', { class: 'reply-text', html: rtext ? md(rtext, { inline: true }) : '<em>Attachment or encrypted message</em>' })));
+      rwf ? h('span', { class: 'reply-text' }, h('em', null, previewLabel(rwf)))
+        : h('span', { class: 'reply-text', html: rtext ? md(rtext, { inline: true }) : '<em>Attachment or encrypted message</em>' })));
   } else if (m.replyTo || (bind && bind.notes.includes('replyGone'))) {
     // Also when its sender replied to a message that was gone by the time it was posted (the server rightly leaves
     // the reply out then): no flag for that, unless the server can still find the original (bindingOfMessage).
@@ -3791,21 +3860,33 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     // A message that's only an image link shows just the picture, once the picture is really shown.
     const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length && embedDecision(text.trim(), m) === 'show';
     const embed = m.dec && m.dec.embed;
+    // Blurred by the word filter: what the message shows goes under a blur, with a button on top to show it. Inert
+    // until then, so nothing in it can be clicked, focused or read out by accident. It's laid out as usual, so its
+    // pictures load as they would (the server can't tell).
+    const out = blur ? h('div', { class: 'wf-blur-inner', inert: true }) : body;
     if (text && !hideText && !(embed && text === embed.title)) {
       const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: senderMayPingEveryone(m) }) : escapeText(text);
-      body.append(h('div', { class: `msg-text${chat.jumbo && isJumbo(text) ? ' jumbo' : ''}`, html: html + (m.editedAt ? '<span class="edited" title="Edited">(edited)</span>' : '') }));
+      out.append(h('div', { class: `msg-text${chat.jumbo && isJumbo(text) ? ' jumbo' : ''}`, html: html + (m.editedAt ? '<span class="edited" title="Edited">(edited)</span>' : '') }));
     }
     // A link preview built by the sender: it came inside the encrypted message, so nothing is fetched to show it.
     const links = chat.linkCards !== false && senderMayEmbed(m) ? linksOf(m) : [];
-    if (links.length) body.append(h('div', { class: 'msg-links' }, links.map(linkCardEl)));
+    if (links.length) out.append(h('div', { class: 'msg-links' }, links.map(linkCardEl)));
+    // Image links wait for a click unless they load from here or you chose Always (embedEl). Blurred, the Load button
+    // is under the blur with the rest; hidden, the row drawn out of sight (filteredEl) has only the placeholder, so a
+    // picture from another site loads for it only when it would have loaded anyway.
     const embeds = chat.embeds ? extractImageUrls(text).filter((u) => !links.some((l) => l.url === u) && embedDecision(u, m) !== 'skip') : [];
-    if (embeds.length) body.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => embedEl(u, m))));
-    if (m.dec && m.dec.p) body.append(pollEl(m));
+    if (embeds.length) out.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => embedEl(u, m))));
+    if (m.dec && m.dec.p) out.append(pollEl(m));
     const files = filesOf(m);
-    if (files.length) body.append(h('div', { class: 'msg-files' }, files.map((f) => attachmentEl(f, m))));
+    if (files.length) out.append(h('div', { class: 'msg-files' }, files.map((f) => attachmentEl(f, m))));
     const wc = watchChips(text);
-    if (wc) body.append(wc);
-    if (embed) body.append(newsCard(embed));
+    if (wc) out.append(wc);
+    if (embed) out.append(newsCard(embed));
+    if (blur) {
+      // A click anywhere on it shows it, like a spoiler; the button is the same thing for keyboards and screen readers.
+      body.append(h('div', { class: 'wf-blur', onclick: () => revealFiltered(m) }, out,
+        h('button', { class: 'wf-blur-show', type: 'button' }, icon('eyeOff'), h('span', null, `${filterLabel(blur)} · Show`))));
+    }
     const flag = postFlag(m, author);
     if (flag) body.append(h('div', { class: 'msg-flag', 'data-tip': flag.tip }, flag.label));
     // Opened or signed with a key that isn't the person's current, trusted one (secure.js keysOf).
@@ -4041,9 +4122,10 @@ function messageMenuItems(m, ctx) {
     canPin ? { label: m.pinnedAt ? 'Unpin message' : 'Pin message', icon: 'pin', action: () => togglePin(m) } : null,
     ok ? { label: saved ? 'Remove from saved' : 'Save message', icon: 'bookmark', action: () => toggleSaved(m) } : null,
     ctx === 'main' ? { label: 'Mark unread', icon: 'eye', action: () => markUnread(keyOfMessage(m), m.id) } : null,
-    ...(ok ? remindItems(m, keyOfMessage(m), textOf(m) || (m.dec && m.dec.p ? `Poll: ${m.dec.p.q}` : 'Attachment')) : []),
+    ...(ok ? remindItems(m, keyOfMessage(m), quoteOf(m, m.dec && m.dec.p ? `Poll: ${m.dec.p.q}` : 'Attachment')) : []),
     '-',
-    ok && textOf(m) ? { label: 'Copy text', icon: 'copy', action: () => { copyText(textOf(m)); toast('Copied.'); } } : null,
+    // Not while the word filter hides or blurs it: Show first.
+    ok && textOf(m) && !veiled(m) ? { label: 'Copy text', icon: 'copy', action: () => { copyText(textOf(m)); toast('Copied.'); } } : null,
     { label: 'Copy message link', icon: 'link', action: () => { copyText(messageLink(m)); toast('Message link copied. It only works for people who can see this conversation.'); } },
     mine && ok ? { label: 'Edit message', icon: 'edit', hint: '\u2191', action: () => { S.editing = m.id; replaceMessageEl(m); } } : null,
     mine || canModerate(m) ? { label: 'Delete message', icon: 'trash', danger: true, action: () => deleteMessage(m) } : null,
@@ -4053,6 +4135,30 @@ function messageMenuItems(m, ctx) {
 }
 const messageLink = (m) => `${location.origin}/#m/${m.id}`;
 
+// A word filter list changed (yours, here or on another device, or a server's): what it changes on screen is drawn
+// again. Only message rows whose filtering changed are redrawn, never one being edited, so scroll, focus and
+// anything being typed stay; previews and lists are redone.
+function wordFilterChanged() {
+  if (!S.me || !S.serversLoaded) return;
+  later(redrawFiltered);
+}
+function redrawFiltered() {
+  redrawFilterChanges();
+  const mode = panelMode();
+  if (mode === 'pins' || mode === 'threads') renderPanel();
+  if (S.view.type === 'saved') renderMain();
+  loadPreviews();
+}
+function redrawFilterChanges() {
+  const lists = { main: (S.msgs[currentKey()] || { list: [] }).list, thread: threadList() };
+  for (const el of $$('.msg[data-mid][data-wf]')) {
+    const list = lists[el.dataset.ctx || 'main'] || [];
+    const i = list.findIndex((x) => x.id === el.dataset.mid);
+    if (!el.isConnected || i < 0 || S.editing === list[i].id) continue;
+    // (replaceMessageEl draws it after the message before it in the list, so that's what it's compared with.)
+    if (el.dataset.wf !== filterState(list[i], i > 0 ? list[i - 1] : null)) replaceMessageEl(list[i]);
+  }
+}
 function replaceMessageEl(m) {
   $$(`[data-mid="${m.id}"]`).forEach((el) => {
     const ctx = el.dataset.ctx || 'main';
@@ -4408,7 +4514,7 @@ function attachmentEl(f, m) {
       } }, icon(media === 'video' ? 'play' : 'music'), h('span', null, `${media === 'video' ? 'Play video' : 'Play audio'} · ${fmtSize(f.size)}`));
       holder.append(play);
       if (media === 'video') holder.prepend(h('div', { class: 'att-audio-name' }, icon('file', 'ic'), f.name));
-    } else if (enc || f.th || !isUploadUrl(f.url)) whenVisible(holder, load); else el.src = f.url;
+    } else if (enc || f.th || !isUploadUrl(f.url)) loadWhenVisible(holder, load); else el.src = f.url;
     return holder;
   }
   // Anything the app can't show: a card with the name, size and kind of file. The whole card downloads it.
@@ -4594,7 +4700,7 @@ async function onNewMessage(key, m) {
     addInbox({
       type: mentioned ? 'mention' : 'reply', userId: m.authorId, msgId: m.id,
       title: `${nameInMsg(m, getUser(m.authorId))} ${mentioned ? 'mentioned you' : 'replied to you'} in ${whereLabel(m)}`,
-      text: textOf(m).slice(0, 140), ...expOf(m),
+      text: snippetOf(m, 140), ...expOf(m),
     });
   }
   // Reading this very channel: nothing in the server bar or channel list changes.
@@ -4808,7 +4914,7 @@ async function onThreadMessage(m) {
   // (After it's in the thread: the timer looks there for the soonest deadline.)
   if (disappears(m)) armClientExpiry();
   if (m.authorId !== S.me.id && (mentionsMe(m) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId)) {
-    addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${nameInMsg(m, getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140), ...expOf(m) });
+    addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${nameInMsg(m, getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: snippetOf(m, 140), ...expOf(m) });
     if (!quiet() && notifyLevel('c:' + m.channelId) !== 'muted') claimOnce(m.id).then((ok) => { if (ok) playSound(mentionKind(m) || 'reply'); });
   }
 }
@@ -5117,9 +5223,11 @@ async function pinsPanel(el) {
     const pinServer = key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
     pins.forEach((m) => {
       const u = getUser(m.authorId);
+      const wf = WF.isShown(m.id) ? null : WF.check(m); // the word filter covers pins too
       list.append(h('div', { class: 'pin-card' },
         h('div', { class: 'pin-meta' }, avatarEl(u, 20), nameEl(u, { server: pinServer }), h('span', null, fmtStamp(m.createdAt))),
-        h('div', { class: 'pin-text', html: readable(m) ? md(textOf(m) || (filesOf(m).length ? '_Attachment_' : ''), { mentionName: S.me.username }) : '<em>Encrypted message</em>' }),
+        wf ? h('div', { class: 'pin-text' }, h('em', null, previewLabel(wf)))
+          : h('div', { class: 'pin-text', html: readable(m) ? md(textOf(m) || (filesOf(m).length ? '_Attachment_' : ''), { mentionName: S.me.username }) : '<em>Encrypted message</em>' }),
         h('div', { class: 'pin-actions' },
           h('button', { class: 'btn ghost sm', onclick: () => jumpToMessage(key, m.id) }, 'Jump'),
           ibtn('close', 'Unpin', () => togglePin(m), { cls: 'sm' }))));
@@ -5343,7 +5451,8 @@ function threadCard(t) {
   const tServer = msgServer(t.root);
   const flag = readable(t.root) ? postFlag(t.root, author) : null;
   const text = readable(t.root) ? textOf(t.root) : '';
-  const preview = h('span', { class: 'thread-card-text', html: text
+  const wf = WF.isShown(t.root.id) ? null : WF.check(t.root);
+  const preview = wf ? h('span', { class: 'thread-card-text' }, h('em', null, previewLabel(wf))) : h('span', { class: 'thread-card-text', html: text
     ? md(text, { inline: true, mentionName: S.me.username, everyone: senderMayPingEveryone(t.root) })
     : readable(t.root) && filesOf(t.root).length ? '<em>Attachment</em>' : '<em>Encrypted message</em>' });
   // The card is one button: links and spoilers in the preview are plain text (open the thread to use them).
@@ -5760,7 +5869,7 @@ function createComposer({ id, key, threadId, placeholder }) {
       const ru = getUser(state.replyTo.authorId);
       extras.append(h('div', { class: 'reply-bar' }, icon('reply', 'ic'),
         h('span', { class: 'reply-bar-text' }, 'Replying to ', h('strong', null, nameInMsg(state.replyTo, ru)),
-          h('span', { class: 'reply-bar-quote' }, (textOf(state.replyTo) || 'Attachment').slice(0, 120))),
+          h('span', { class: 'reply-bar-quote' }, quoteOf(state.replyTo).slice(0, 120))),
         ibtn('close', 'Cancel reply (Esc)', () => setReply(null), { cls: 'sm' })));
     }
     // A preview belongs to the conversation it was made in, and goes when previews stop being allowed here.
@@ -6612,7 +6721,9 @@ function openSearch({ scope = null } = {}) {
     const u = getUser(m.authorId);
     const files = filesOf(m);
     const deleted = gone.has(m.id);
-    const body = tab === 'files' ? files.map((f) => f.name).join(', ') : SQ.excerpt(textOf(m), q);
+    // Found, but the word filter hides or blurs it: the result says so instead of quoting it (open it to show it).
+    const wf = WF.isShown(m.id) ? null : WF.check(m);
+    const body = wf ? '' : tab === 'files' ? files.map((f) => f.name).join(', ') : SQ.excerpt(textOf(m), q);
     const badges = [];
     if (files.length) {
       const img = files.some(SQ.isImageFile);
@@ -6625,7 +6736,7 @@ function openSearch({ scope = null } = {}) {
       cls: `search-msg${deleted ? ' gone' : ''}`, disabled: deleted, av: avatarEl(u, 30),
       title: h('span', null, h('strong', null, nameInMsg(m, u)), h('span', { class: 'search-where' }, ` · ${whereLabel(m)}`)),
       sub: deleted ? h('span', { class: 'search-gone' }, 'This message was deleted after the search found it, or you can’t see it any more.')
-        : body ? marked(body) : h('em', null, files.length ? 'Only attachments' : 'No text'),
+        : wf ? h('em', { class: 'wf-hidden-text' }, previewLabel(wf)) : body ? marked(body) : h('em', null, files.length ? 'Only attachments' : 'No text'),
       badges: deleted ? [] : badges,
       meta: h('time', { datetime: new Date(m.createdAt).toISOString(), title: new Date(m.createdAt).toLocaleString() }, fmtStamp(m.createdAt)),
       action: () => openResult(m, key),
@@ -7313,6 +7424,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['reports', 'Reports', 'shield', (s) => canSeeReports(s)],
     ['audit', 'Audit log', 'file', (s) => !isGroup(s) && can(s, PERMS.VIEW_AUDIT_LOG)],
     ['invites', 'Invites', 'link', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
+    ['wordfilter', 'Word filter', 'eyeOff', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
   ];
@@ -7335,6 +7447,7 @@ function openServerSettings(server, startTab = 'overview') {
     clear(body);
     ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bots: (sv) => botsTab(sv, body, { confirm: (fn, opts) => confirmedCall(app, fn, opts) }), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger,
       audit: (sv) => auditTab(sv, body, { memberIds: sv.memberIds, userOf: (id) => S.users[id] || null }),
+      wordfilter: (sv) => WF.serverTab(sv, body),
       reports: (sv) => reportsTab(sv, body, { jumpTo: (id) => { mdl.close(); jumpToMessageId(id); } }) })[tab](s);
   };
 

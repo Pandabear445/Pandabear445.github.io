@@ -1224,3 +1224,155 @@ deletes its scheduled messages and their files at once.
   minutes late, the app asks before sending it.
 - *Export my data* doesn't include scheduled messages that haven't gone out yet.
 - Server backups taken while a message waits keep its ciphertext until they rotate out.
+
+## Word filter
+
+Hide or blur messages with words you'd rather not see. Messages are end-to-end encrypted, so a filter on the server
+can't work (NEXT.md, "Not recommended"): the matching runs only in each reader's app, which never tells the server
+what matched. Code: `public/js/wordfilter.js` (the matching, no page around it), `public/js/wordfilter-app.js` (the
+lists, what's hidden or blurred, the settings), `server/wordfilter.js` (where the lists are kept), and the drawing in
+`public/js/app.js` (`messageEl`, `filteredEl`, `fillMessage`).
+
+**Two lists.**
+
+- **Yours** (Settings → Privacy & safety → Word filter). Sealed by your app with your personal vault key (the one
+  saved-message notes and scheduled messages use; only your identity key can make it), bound to your account
+  (`hearth-vault|wordfilter|<your id>`), padded to 8 KB steps so its size says little about its length, and synced
+  to your devices. The server stores ciphertext only. It applies everywhere: server channels, voice channels' chats,
+  threads, DMs and group chats. Each save seals a number one higher than any this device has seen (`n`), and the
+  device keeps the highest-numbered sealed copy it has opened or saved (`localStorage` `hearth.wordFilter.<id>`,
+  ciphertext only). If the server later answers with a lower number or no list at all, that device keeps using its
+  own copy and Privacy & safety says so ("Save this device's copy again" puts it back), so a server can't quietly
+  roll back or strip someone's list. Saving from the editor is made against the version it showed (`base`): a list
+  saved on another device meanwhile is refused (409 `stale`) and shown, never overwritten. A live change redraws an
+  open editor if nothing was typed in it, and otherwise says so above the Save button.
+- **A server's suggested list** (Server settings → Word filter, for people with **Manage Server**: it applies in
+  every channel, like the server's name, so Manage Messages isn't enough). Plain text that every member can see
+  (Privacy & safety lists it behind "Show the list"); members' apps apply it in that server's channels, voice
+  channels' chats and threads, never in DMs. Each member can turn it off for themselves; which servers they turned
+  off is inside their sealed list, so the server doesn't learn that either. It's a suggestion: it doesn't stop
+  anyone from posting anything, and the UI says so on both pages. Group chats have none.
+
+**Matching** (`wordfilter.js`): whole words, any capitalization; a phrase is its words in a row, whatever spaces or
+punctuation sit between them; `*` stands for any letters inside one word (`cat*`, `*cat`, `c*t`) and never reaches
+into the next one. An entry in a script written without spaces (Han, Hiragana, Katakana, Thai, Lao, Khmer, Myanmar)
+matches anywhere inside a run of text, as if it had a `*` at each end (not counted against the four). No other
+syntax, and entries are never turned into regular expressions: each word is compared with a small walk whose cost
+is the word's length times the entry's. Both the list and the text are folded the same way first: NFKC, small
+capitals and letters in black circles and squares (🅒, 🅲) read as plain letters (flag letters stay flags), lower
+case, marks dropped from Latin, Greek and Cyrillic letters (other scripts keep theirs), `ß ø ł đ ð ħ ı ŧ æ œ þ` read
+as plain letters and `ς` as `σ`, default-ignorable and format characters removed (zero-width spaces and joiners,
+soft hyphens, direction marks, variation selectors, tags, fillers), Cyrillic and Greek look-alikes (`а с е о р х…`)
+read as the Latin letters they look like in every word on both sides, letters spelled out one at a time with short
+gaps on one line (`c a t`, `c.a.t`) also read as one word, and a letter written three or more times matching it
+written once or twice in the entry (`caaat`), while a doubled letter isn't stretched (`god` doesn't catch `good`,
+and so `caat` doesn't catch `cat`). Because look-alikes are read alike everywhere, mixing scripts in a word gets
+nowhere either way (`сat` with a Cyrillic с, `пидоp` with a Latin p, `xуй`). A word written wholly in one script only
+stands for an entry in another in context, so ordinary words aren't hidden: look-alike-only Cyrillic or Greek words
+count as Latin when the message has no other Cyrillic or Greek letters (`сат` in English text is `cat`, but `но`,
+`как`, `не`, `рот` in Russian sentences aren't `ho`, `kak`, `he`, `pot`), and a Latin word counts for a Cyrillic or
+Greek entry when the message is otherwise written in that script (`Закрой pot` is `рот`; `I like pot` isn't). The
+text is read twice when its formatting changes it: as typed and as shown (`markdown.js` applied, tags removed), so
+`c**at**`, `c*at*`, `ca~~t~~`, `` c`at` `` and `c||at||` are `cat` too. Digits or symbols standing for letters
+(`c4t`) aren't guessed at.
+
+**Cost.** Each different word in a message is prepared once and compared with each entry's word at most once. An
+entry starting with a word without `*` is found by a `Map` lookup of that word; the others by looking up each stretch
+of a text word as long as an entry's needed letters (the longest run of letters it can't do without), so the work
+goes with the text, not the list. Before a walk, a word must have those letters, start and end with what the entry
+starts and ends with, and be long enough. A word longer than 256 characters (a link, a pasted key) is compared by
+its first and last 128 with a break no letter matches between them, so whatever matches there matches the whole
+word too. And each message gets a budget of 1,000,000 steps per list (a walk costs its length times the entry
+word's, plus a little per comparison): a message that would take more counts as matching, so it's hidden or blurred
+with Show one click away, rather than slipping through or freezing the app. Honest long messages with large lists
+use a small part of it; the worst lists and messages found in review (up to 6.5 s each before) now take tens of
+milliseconds.
+
+**Limits**: 200 entries per list, 60 characters, 5 words and 4 `*`'s per entry, at least 2 letters or numbers, and
+a `*` inside a word (not on its own). Entries lose invisible, format and direction characters (the matcher ignores
+them anyway, and in a list they could make an entry read as another, like `‮emit` showing as "time"); one with half a
+character (a lone surrogate) is refused. The app shows what's wrong with each entry as you type, refuses to save
+until it's fixed, and has a **Try it** box that runs the list as typed (and as shown). The server checks a server's
+list by the same rules, folding the same way (`cleanList` mirrors `parseEntry`; a test runs both over the same
+entries), and says which entry is wrong; a sealed personal list is at most 96 KB. Text past 50,000 characters isn't
+looked at (more than the app ever sends).
+
+**What a match does.** Each list says **Hide** (a row "Hidden by your word filter" or "…by this server's word filter"
+with **Show**) or **Blur** (the words, link previews, pictures, polls and files under a blur with a button on top;
+`inert` until shown, so nothing in it can be clicked, focused or read out). Hiding wins when both lists match. Your
+own messages are never filtered. **Show** lasts until the page reloads. A hidden row names its author unless the row
+above already does, and the next message never groups under a hidden one, so nothing reads as someone else's;
+after **Show** the next one is drawn again (it may group now). Hidden rows are out of the Tab order like any message
+that isn't the current one. Everywhere else a message appears, a match says "Hidden by … word filter" instead of
+quoting it: reply quotes, the reply bar, reminders, search results, conversation previews, the notifications the app
+shows, the inbox, pins, saved messages and the Threads panel; **Copy text** isn't offered until Show. When a list
+changes, only the message rows whose filtering changed are drawn again (each row keeps what it was drawn with in
+`data-wf`), never one being edited, so an open edit and anything else on screen stay as they are. What's checked is everything a
+message shows as text: its words, link previews' title, description and site name, a poll's question and options, a
+bot's card, and file names.
+
+**What the server learns.** Nothing about matches: the lists are fetched whole, matching and Show stay on the device,
+and a hidden message is still drawn out of sight so it loads what it would have shown (its pictures, a poll's votes)
+when its row comes near the screen, like any other; a blurred one is laid out as usual. So downloads look the same
+whether or not anything was hidden. Push notifications sent by the server never had message text in them.
+
+| Route | Auth | Notes |
+|---|---|---|
+| `GET /me/word-filter` | session | `{ data, updatedAt }`, your own only; 120/min |
+| `PUT /me/word-filter` `{ data, base? }` | session | `data` an `x1:` string (≤ 96 KB, else 413) or `null` to delete; `base` the version the app last saw, a newer one is refused with 409 `stale` (the app reloads it); 30/min, 300/hour, 120/min per network; live `wordfilter:changed { updatedAt, from }` to your own apps |
+| `GET /servers/:id/word-filter` | member | `{ words, action, updatedAt }`; 400 for a group chat |
+| `PUT /servers/:id/word-filter` `{ words, action }` | Manage Server | `words` an array or the text as typed (lines or commas; `[]` clears it), `action` `hide` or `blur`; 400 `bad_entry` naming the entry; an unchanged list writes nothing; audit-logged as `word_filter_update` (`added`, `removed`, `count`, `action`; a detail too long to keep loses list items, never its counts, and the log never reads a cut entry as "cleared"); live `server:wordfilter { serverId, wordFilter }` to the server's room; 20/min, 100/hour, 60/min per network |
+
+Every member's copy of a server carries `wordFilter` (`{ words, action, updatedAt }`, or null).
+
+**Data model** (v19): `word_filters` (user, `data` sealed or NULL, `updated_at`), deleted with the account;
+`servers.word_filter` (JSON, NULL for none).
+
+**Tests**
+
+- `test/wordfilter.test.js` (31 tests): whole words and phrases; wildcards; NFKC, styled and circled letters,
+  accents, strike-through and Zalgo marks, zero-width and joiner characters, soft hyphen, direction overrides,
+  variation selectors, Cyrillic look-alikes (mixed and whole-word) while real Cyrillic words and Devanagari keep
+  their spelling; spelled-out and stretched letters, within reason; list checks and caps (and that the server uses
+  the same rules); hostile entries (regex syntax is plain text) and the worst lists against the worst texts finishing
+  quickly, the text cap; link preview, poll, card and file-name text; the app module run in Node with the real vault
+  encryption (sealed and padded, bound to the account, opened on another device of the same account and not by
+  another key; never your own messages; your list everywhere, a server's only in that server and not after you turn
+  it off; hiding beats blurring; a stale save refused and reloaded); the server list's permissions (Manage Server,
+  not Manage Messages, not outsiders, not group chats), limits and bad input, audit entries with what was added and
+  removed, live updates, an unchanged save writing nothing; the personal list's validation, size cap, per-account
+  reads, stale saves, live event to your other apps, deletion and removal with the account; and a static check that
+  no route takes anything about matches. Added in review: look-alikes inside Cyrillic and Greek words (`пидоp`,
+  `xуй`, `μαλάκaς`) while ordinary Russian sentences aren't caught by `ho`, `kak`, `he`, `pot`, `coke`; small
+  capitals and black-boxed letters; Chinese, Japanese and Thai inside runs of text; formatting (`c**at**`, `c||at||`
+  and the rest); the doubled-letter trade-off; the review's worst lists and texts each finishing fast, the budget
+  counting as a match, an honest long text with a clumsy list staying inside it; invisible, direction and half
+  characters in entries; the server and the app agreeing on a corpus of odd entries; an editor's stale save refused
+  with the other device's change kept; a rolled-back or stripped sealed list ignored by a device that saw a newer
+  one; news of this device's own save loading nothing, and another device's during a save loading after it; half characters refused by the server with the audit entry complete; audit trimming keeping counts; and an
+  old cut entry never reading as "cleared".
+- Browser flow (`npm run test:e2e`, "word filter"): Alice's list refuses a lone `*` as she types, the Try it box
+  catches "T A M A R I L L O S" and "ta\*\*marillos\*\*", and the server holds it sealed; Bob's "tämarillos" is hidden on
+  her screen behind Show (never on his), his next message still shows his name and the hidden row names him,
+  replying to it from its menu quotes the filter's note in the reply bar, search says it's hidden instead of quoting
+  it, and Show reveals it (and the next message groups under it again); Bob sets a blurring list for the server while
+  Alice has an edit open, the audit log has it, his next match is blurred (inert) on her screen at once, and her edit
+  is as she typed it; she reads the server's list and turns it off for herself, and the blur goes.
+
+**Known limitations**
+
+- It changes what you see, not what's sent. A server's list is a suggestion members can turn off, and people can
+  always spell around a word list (digits for letters, words split other ways). Moderation still needs moderators.
+- A message already on screen when a list changes is redrawn; one already notified isn't recalled.
+- A letter written exactly twice isn't read as once (that would make `god` catch `good`): add that spelling, or use
+  a `*`. A Cyrillic or Greek word spelled wholly in Latin letters in an otherwise Latin message (`cyka`) isn't read as
+  the Cyrillic entry, so ordinary English words aren't hidden by look-alike entries; flag letters (🇨🇦) aren't read
+  as letters.
+- A word longer than 256 characters is compared by its start and end only, and a message that would cost more than
+  the budget counts as matching (it's hidden or blurred; Show is one click).
+- The rollback check needs a device that has already seen the newer list: a newly signed-in device takes what the
+  server gives it.
+- **Show** isn't remembered after a reload, and turning a list off for one conversation isn't possible (only for a
+  server).
+- Your list is sealed with your identity key: if a password reset makes a new identity, the old list can't be opened
+  and the next save starts a new one (the settings page says so).

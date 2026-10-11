@@ -2839,6 +2839,102 @@ async function resetVerify(t) {
   await bob.message('Dana, verified again: lychee').waitFor();
 }
 
+// ------------------------------------------------------------------ 29. word filter
+// Alice keeps her own list (Privacy & safety), tried in its box before saving (formatting doesn't get around it); the
+// server only gets it sealed. Bob's message with a disguised word on it is hidden behind "Show" on her screen (never
+// on his, it's his own): his next message still shows his name, replying to the hidden one quotes the filter's note,
+// and search finds it without quoting it. Bob, the owner, suggests a list for the server (Server settings → Word
+// filter): her app blurs a match live, the edit she has open is left alone, and the audit log has the change. She
+// looks at that list and turns it off for herself, and the blur goes.
+async function wordFilter(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+
+  await alice.openSettings('Privacy & safety');
+  const mine = alice.$('#word-filter');
+  const box = mine.locator('textarea.wf-list');
+  await box.fill('tamarillo*\n*');
+  await mine.locator('.wf-errors li', { hasText: 'goes inside a word' }).waitFor();
+  await box.fill('tamarillo*');
+  await mine.locator('.wf-try input').fill('Fresh T A M A R I L L O S here');
+  await mine.locator('.wf-try-out', { hasText: 'Hidden: it matches “tamarillo*”' }).waitFor();
+  await mine.locator('.wf-try input').fill('Fresh ta**marillos** here');
+  await mine.locator('.wf-try-out', { hasText: 'Hidden: it matches “tamarillo*”' }).waitFor();
+  await mine.locator('.btn.primary', { hasText: 'Save word filter' }).click();
+  await alice.toast('Word filter saved.');
+  await alice.closeSettings();
+  const stored = await alice.page.evaluate(async () => (await fetch('/api/me/word-filter', { headers: { Authorization: 'Bearer ' + localStorage.getItem('hearth.token') } })).json());
+  check(/^x1:/.test(stored.data || '') && !/tamarillo/i.test(stored.data), 'The server should only have Alice’s word filter sealed.');
+
+  await bob.send('Have you tried tämarillos? Delicious');
+  const hidden = alice.$('#messages .msg.filtered', { hasText: 'Hidden by your word filter' });
+  await hidden.waitFor();
+  check(!(await alice.message('Delicious').count()), 'Alice should not see the words of a message her filter hides.');
+  check(!(await bob.$('#messages .msg.filtered, #messages .wf-blur').count()), 'Your own messages are never filtered.');
+  // Bob's next message isn't grouped under a hidden one: it shows his name, not whoever spoke before.
+  await bob.send('Just kidding');
+  const next = alice.message('Just kidding');
+  await next.waitFor();
+  check(await next.locator('.msg-head').count() === 1 && await hidden.locator('.filtered-who').count() === 1, 'Messages around a hidden one should show who wrote them.');
+  // Replying to it from its menu quotes the filter's note, not the words.
+  await hidden.click({ button: 'right' });
+  await alice.menuItem('Reply').click();
+  await alice.$('.reply-bar', { hasText: 'Hidden by your word filter' }).waitFor();
+  check(!(await alice.$('.reply-bar', { hasText: 'Delicious' }).count()), 'The reply bar should not quote a hidden message.');
+  await alice.$('#composer-input').press('Escape');
+  // Search finds it, but says it's hidden instead of quoting it.
+  await alice.page.keyboard.press('Control+k');
+  await alice.$('.search-modal input.search-main').fill('delicious');
+  await alice.$('.search-modal .search-msg', { hasText: 'Hidden by your word filter' }).waitFor();
+  check(!(await alice.$('.search-modal .search-msg', { hasText: 'tämarillos' }).count()), 'Search results should not quote a hidden message.');
+  await alice.page.keyboard.press('Escape');
+  await alice.page.waitForSelector('.search-modal', { state: 'detached' });
+  await hidden.locator('button', { hasText: 'Show' }).click();
+  await alice.message('Delicious').waitFor();
+  // Shown, it heads its group again: the next message joins it.
+  await alice.page.waitForFunction(() => [...document.querySelectorAll('#messages .msg[data-mid]')].some((e) => e.textContent.includes('Just kidding') && e.classList.contains('grouped')));
+
+  // An edit Alice has open is left as she typed it when a list changes (only rows whose filtering changes redraw).
+  await alice.send('Some words of mine');
+  await alice.messageAction('Some words of mine', 'Edit message');
+  const edit = alice.$('#messages textarea.edit-input');
+  await edit.fill('Some words of mine, not saved yet');
+
+  // Bob suggests a list for the server; it blurs on Alice's screen as soon as he saves it.
+  await bob.serverMenu('Server settings');
+  const ss = bob.page.locator('.modal.server-settings');
+  await ss.locator('.ss-tab', { hasText: exact('Word filter') }).click();
+  await ss.locator('.wf-note', { hasText: 'isn’t secret' }).waitFor();
+  await ss.locator('textarea.wf-list').fill('rambutan');
+  await ss.locator('.chips .chip', { hasText: 'Blur them' }).click();
+  await ss.locator('.btn.primary', { hasText: 'Save word filter' }).click();
+  await bob.toast('Word filter saved.');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: 'changed the server’s suggested word filter (1 entry)' }).waitFor();
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+  await bob.send('The rambutan season is here');
+  const blurred = alice.$('#messages .msg', { has: alice.page.locator('.wf-blur-show', { hasText: 'Blurred by this server’s word filter' }) });
+  await blurred.waitFor();
+  check(await blurred.locator('.wf-blur-inner[inert]').count() === 1, 'A blurred message should stay inert until shown.');
+  check(await edit.inputValue() === 'Some words of mine, not saved yet', 'A list change should leave an open edit alone.');
+  await edit.press('Escape');
+
+  // Alice reads the server's list and turns it off for herself: the blur goes.
+  await alice.openSettings('Privacy & safety');
+  const theirs = alice.$('#word-filter .wf-server', { hasText: `Use ${SERVER}’s list` });
+  await theirs.locator('details.wf-words summary').click();
+  await theirs.locator('.wf-word-list', { hasText: 'rambutan' }).waitFor();
+  await theirs.locator('.switch').click();
+  await alice.toast(`${SERVER}’s word filter is off for you.`);
+  await alice.closeSettings();
+  await alice.page.waitForFunction(() => !document.querySelector('#messages .wf-blur'));
+  await alice.message('The rambutan season is here').waitFor();
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -2879,4 +2975,5 @@ export const FLOWS = [
   ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
   ['message binding: nothing earlier flagged; a reply moved, a message re-dated, replayed and rolled back in the database are each flagged after a reload, with details; deleting a copy clears the other', messageBinding],
   ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
+  ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off', wordFilter],
 ];

@@ -1609,6 +1609,8 @@ function privacyTab(app) {
     section('Blocked people',
       h('p', { class: 'set-sub' }, 'Blocked people can\u2019t DM you or send friend requests. Their messages in shared servers are hidden behind a click. They aren\u2019t notified.'),
       blockedHost),
+    // Your word filter and the lists your servers suggest (wordfilter-app.js).
+    app.wordFilter ? app.wordFilter.settingsSection() : null,
     exportSection(app),
   );
 }
@@ -1647,7 +1649,7 @@ function exportSection(app) {
     ctl = new AbortController();
     start.disabled = true; cancel.hidden = false; bar.hidden = false;
     try {
-      const { blob, manifest } = await runExport({ token: res.token, S: app.S, sec: app.sec, decryptMessage: app.decryptMessage, signal: ctl.signal,
+      const { blob, manifest } = await runExport({ token: res.token, S: app.S, sec: app.sec, decryptMessage: app.decryptMessage, signal: ctl.signal, wordFilter: app.wordFilter ? app.wordFilter.exportable() : null,
         onProgress: (text, f) => { status.textContent = text; bar.firstChild.style.width = Math.round(f * 100) + '%'; } });
       const url = URL.createObjectURL(blob);
       h('a', { href: url, download: `hearth-export-${app.S.me.username}-${new Date().toISOString().slice(0, 10)}.zip` }).click();

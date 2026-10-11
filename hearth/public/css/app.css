@@ -2921,3 +2921,33 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .di-groups { display: flex; flex-direction: column; gap: 10px; }
 .di-groups h4 { margin: 0 0 3px; font-size: 13.5px; }
 .warn-box.bad { background: rgb(239 84 102 / .1); border-color: rgb(239 84 102 / .35); }
+/* Word filter (public/js/wordfilter-app.js): a hidden message's row, a blurred one, and the settings */
+.msg.filtered .filtered-note { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: 13px; font-style: italic; }
+.filtered-note .ic { width: 14px; height: 14px; }
+.filtered-note .link-btn { font-style: normal; }
+.filtered-note .filtered-who { font-style: normal; font-weight: 600; color: var(--text-2); }
+.wf-blur { position: relative; min-height: 2.2em; border-radius: 8px; overflow: hidden; cursor: pointer; }
+.wf-blur-inner { filter: blur(7px); user-select: none; pointer-events: none; }
+.wf-blur-show {
+  position: absolute; inset: 0; margin: auto; width: fit-content; height: fit-content; max-width: calc(100% - 8px);
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  background: rgb(var(--text-rgb) / .88); color: rgb(var(--bg)); font-size: 12.5px; font-weight: 600;
+}
+.wf-blur-show:hover, .wf-blur-show:focus-visible { background: rgb(var(--text-rgb)); }
+.wf-blur-show .ic { width: 14px; height: 14px; flex: none; }
+.wf-hidden-text { color: var(--muted); }
+.wf-list { min-height: 120px; font-family: var(--mono); font-size: 13px; }
+.wf-errors { margin: 0; padding-left: 18px; color: var(--danger); font-size: 12.5px; }
+.wf-errors:empty { display: none; }
+.wf-count { display: block; }
+.wf-try-out { margin: 0; font-size: 13px; color: var(--text-2); }
+.wf-try-out:empty { display: none; }
+.wf-try-out.hit { color: var(--text); font-weight: 600; }
+.wf-note { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 10px 12px; border-radius: 10px; background: rgb(var(--accent-rgb) / .08); border: 1px solid rgb(var(--accent-rgb) / .25); font-size: 13.5px; }
+.wf-note .ic { width: 16px; height: 16px; flex: none; margin-top: 2px; }
+.wf-note.bad { background: rgb(239 84 102 / .1); border-color: rgb(239 84 102 / .35); }
+.wf-servers { display: flex; flex-direction: column; gap: 10px; }
+.wf-servers .set-h { font-size: 14px; margin: 6px 0 0; }
+.wf-server { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; }
+.wf-words > summary { cursor: pointer; color: var(--accent-ink); font-size: 13px; font-weight: 600; width: fit-content; }
+.wf-word-list { margin: 6px 0 0; font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }

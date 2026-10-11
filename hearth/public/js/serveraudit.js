@@ -64,7 +64,7 @@ export const AUDIT_KINDS = [
   ['invites', 'Invites', ['invite_create', 'invite_revoke']],
   ['emoji', 'Emoji', ['emoji_create', 'emoji_rename', 'emoji_delete']],
   ['integrations', 'Webhooks and bots', ['webhook_create', 'webhook_update', 'webhook_rotate', 'webhook_delete', 'bot_add', 'bot_update', 'bot_remove']],
-  ['server', 'Server settings', ['server_update', 'server_transfer']],
+  ['server', 'Server settings', ['server_update', 'server_transfer', 'word_filter_update']],
 ];
 
 // A person as the log's users map has them (they may have left the server since).
@@ -204,6 +204,18 @@ export function sentence(e, users) {
       return [out];
     }
     case 'server_transfer': return [[who, ' made ', them, ' the owner', d.from ? ` (it was ${nameOf(users, d.from)})` : '']];
+    // The server's suggested word filter (server/wordfilter.js): what was added and removed, and what it does now.
+    case 'word_filter_update': {
+      const words = (xs, more) => `${list((xs || []).map(quoted))}${more ? ` and ${more} more` : ''}`;
+      const bits = [];
+      if ((d.added || []).length) bits.push(`Added ${words(d.added, d.addedMore)}.`);
+      if ((d.removed || []).length) bits.push(`Removed ${words(d.removed, d.removedMore)}.`);
+      if (d.action && d.action.to) bits.push(d.action.to === 'blur' ? 'Members’ apps blur matching messages.' : 'Members’ apps hide matching messages.');
+      // An entry whose details were too long to keep (only older ones lost even the count): never read as "cleared".
+      if (d.truncated && typeof d.count !== 'number') return [[who, ' changed the server’s suggested word filter (details too long to keep)']];
+      if (!d.count) return [[who, ' cleared the server’s suggested word filter'], bits.join(' ') || null];
+      return [[who, ` changed the server’s suggested word filter (${plural(d.count, 'entry', 'entries')})`], bits.join(' ') || null];
+    }
     default: return [[who, ` ${String(e.action || '').replace(/_/g, ' ')}`]];
   }
 }

@@ -341,7 +341,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       report,
       ...gifSection,
       h('div', { class: 'admin-head' }, h('h3', null, 'Word filter')),
-      h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so they can\u2019t be filtered.'),
+      h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so the server can\u2019t filter them: each person, and each server as a suggestion, can set a word filter that their own apps apply (Privacy & safety, Server settings \u2192 Word filter).'),
       words,
       h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: async () => {
         try { const r = await api('PUT', '/admin/words', { words: words.value }); toast(`Word filter saved (${r.words.length}).`); } catch (e) { toast(e.message, 'error'); }

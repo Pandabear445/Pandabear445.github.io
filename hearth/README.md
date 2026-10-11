@@ -248,7 +248,7 @@ The owner (normally the first account created on the server), the admins and mod
 - **Registration & Terms:** switch sign-ups between open, invite-code only and closed in one click (handy during a spam wave), and edit your Terms of Service (everyone is asked to accept changes).
 - **Audit log:** every staff action and account security event (password changes and resets, two-factor on/off, sessions signed out, deleted accounts, backups, and changes to payments, memberships, GIF, music and relay settings and regions), who did it and from which IP. It's append-only: nobody can edit or delete entries. Each entry is signed with a key derived from `data/secret.key`, and the newest one is also recorded in `data/audit-anchor.json`, so the page shows if someone edited, deleted or cut off entries in the database file without that key. Someone with root on the server (the database and the key) could still rewrite it.
 - **Storage & limits:** set the largest file, picture and profile song, a storage limit per person and a daily upload limit (all optional). See total use, today's uploads, free disk space and who uses the most; give one person a bigger (or smaller) limit, turn off someone's uploads, lock someone's profile, delete everything someone uploaded (their GIF-library uploads included) or all their profile comments. People see their own usage under Settings → Security & storage; GIF-library uploads count too. Limits hold even when someone uploads many files at once (at most 4 at a time per person). Admins and the owner aren't held to quotas.
-- **Word filter:** words and phrases that can't be used in names, bios, profile pages and profile comments (chats are end-to-end encrypted, so they can't be filtered).
+- **Word filter:** words and phrases that can't be used in names, bios, profile pages and profile comments. Chats are end-to-end encrypted, so the server can't filter them; each person (and each server, as a suggestion) can set a word filter that their own apps apply instead (see **Word filter** below).
 - **Team & roles:** three staff levels. The **owner** is the only one who can make people **admins** or **moderators**, change or take away those roles, and hand ownership to someone else (you stay on as an admin). Each of those needs your password again (and a two-factor code if it's on), and the old owner is emailed when ownership moves. Who the owner is gets settled once, at the first sign-up (see `ADMIN_USERS` in the settings table), and never moves by itself after that. Lost the owner's account? `node server/cli.js set-owner <username>` names a new owner (see [Backups](#backups)). **Admins** get the whole dashboard and Settings → Instance. **Moderators** get reports, users, who's online and the audit log. Staff can only act on people ranked below them, so a moderator can't suspend an admin and nobody can touch the owner. That covers messages too: staff can't remove messages by staff at or above their rank, and can remove DMs and group-chat messages only when they were reported. Admins can't delete or take over servers the owner owns, delete group chats, or IP-ban the owner's or higher staff's networks. People see the dashboard appear or disappear the moment their role changes.
 - **Moderation tools:** timed suspensions (1 hour, 1 day, 3 days, 1 week, 30 days or until lifted; they end by themselves), private staff notes on any account, "reset profile" for offensive names, pictures and bios, user filters (online, suspended, staff), handing a server to another member when its owner has left, and an emergency "sign everyone out" (staff stay signed in).
 
@@ -933,6 +933,37 @@ they're sent: **off, 1 hour, 1 day, 1 week or 4 weeks**.
   each message is due to disappear. In a server, the audit log also keeps who pinned, unpinned or deleted someone's
   message, whose it was, in which channel and when (never the message itself), for up to a year after the message is
   gone, and people with View Audit Log can read it.
+
+## Word filter
+
+Hide or blur messages with words you'd rather not see. Chats are end-to-end encrypted, so the server can't filter
+them: **your app does, on your device**, and never tells the server what it hid.
+
+- **Your own list:** Settings → **Privacy & safety** → **Word filter**. One word or phrase per line; whole words, any
+  capitalization. A `*` stands for any letters inside a word: `cat*` also catches "category", `*cat` catches
+  "bobcat". Chinese, Japanese and Thai entries match inside longer runs of text, since those languages don't put
+  spaces between words. Accents, fancy Unicode letters (bold, circled, small capitals), look-alike letters from
+  other alphabets (in either direction, without hiding ordinary Russian or Greek words), formatting (`c**at**`),
+  invisible characters, letters spaced out ("c a t") and stretched letters ("caaat") don't get around it. A letter
+  written just twice is read as another word ("god" doesn't catch "good", so "caat" isn't "cat"): add that spelling
+  if it matters. A **Try it** box shows what a message would do before you save. Your list is end-to-end encrypted
+  with your own key and synced to your devices: the server can't read it, and a device that has seen your list
+  notices if the server later hands back an older copy or none (it keeps using its own and says so). It applies
+  everywhere, DMs and group chats included.
+- **Hide or blur:** a hidden message leaves a row "*name* · Hidden by your word filter · Show"; a blurred one shows
+  like a spoiler, once you click it. Previews, notifications, search results, replies quoting it, the reply bar,
+  reminders, pins and saved messages say it's hidden instead of quoting it. Your own messages are never filtered.
+- **A server's suggested list:** people with **Manage Server** can suggest one in Server settings → **Word filter**,
+  hiding or blurring. It isn't secret: every member can read it (Privacy & safety → Word filter shows each server's
+  list behind a click), and every member's app applies it in that server's channels and threads, unless they turn
+  it off for themselves there (that choice is encrypted with their list, so the server doesn't know it either).
+  Changes are in the server's audit log.
+- **What it isn't:** a block. It only changes what each person sees: it doesn't stop anyone from posting those
+  words, a server's list is a suggestion members can turn off, and people can always spell around a list (digits for
+  letters, say). Moderation still needs moderators and reports.
+- Up to 200 entries per list, 60 characters each. Checking a message is bounded, so no list can freeze the app: a
+  message that would take too long to check (only possible with a list built for that) counts as a match, one click
+  from showing.
 
 ## Group chats
 
