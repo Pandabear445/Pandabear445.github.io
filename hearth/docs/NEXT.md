@@ -24,7 +24,7 @@ to small self-hosted communities, adoption, effort in this codebase, fit with en
 | 8 | Recurring events (weekly game night) | quick win | S | Neutral: event text is already stored in plaintext on the server |
 | 9 | Import from Discord: structure first (template link), emoji next, history last | big bet | L | Structure is metadata; imported history must be encrypted on the importer's device and labelled |
 | 10 | Thread unread counts and a list of threads per channel | quick win | M | Fine: read markers are metadata |
-| 11 | Disappearing messages per DM, group and channel | big bet | M | Very good fit; the limit is that the host does the deleting (and backups keep copies until they rotate out) |
+| 11 | Disappearing messages per DM, group and channel | big bet | M | Very good fit; the limit is that the host does the deleting (and backups keep copies until they rotate out). **Built** (schema v19, see FEATURES.md §7); leaving them out of backups, the export checkbox and the Android notification timeout are still to do |
 | 12 | Android: keep calls alive when the phone locks (foreground service); open invite links in the app | platform | M | Neutral |
 
 Suggested order:
@@ -109,3 +109,14 @@ Build-ready designs for the larger picks, each grounded in the current code (wit
 ## Progress
 
 The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-REPORT.md) as they land.
+
+- Pick 9, phase 1 (structure) is in: **Add a server → Import from Discord** takes a pasted server template and
+  shows everything that won't come over before creating ([IMPORT.md](IMPORT.md)). Hearth doesn't fetch template
+  links itself yet: whether Discord serves them without a login is still unconfirmed. Left: that server-side
+  fetch (through `server/netguard.js`) or a bot-token export script, then emoji (phase 2) and history (phase 3).
+
+- Picks 1 and 12 (Android): notifications with the app closed through UnifiedPush, calls kept going with a
+  `microphone` foreground service, and invite links (`hearth://` and verified `https://`) are built (server, page,
+  native code, CI). Waiting on a device test (mobile/README.md, "Not yet tested on a device") before an `app-v*`
+  release. Left for later: the optional built-in Google push flavour, "dismiss" pushes for notifications read
+  elsewhere, and signed payloads (docs/design/ANDROID-PUSH.md §15, §16.2).

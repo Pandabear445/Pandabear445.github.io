@@ -28,6 +28,8 @@ const SQL = {
   da: `SELECT created_at AS t, id FROM dm_messages INDEXED BY idx_dm_messages_author_time WHERE dm_id = ? AND author_id = ? ${RANGE}`,
 };
 
+const { alive } = require('./disappear');
+
 module.exports = function setupSearch(ctx) {
   const { api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor } = ctx;
   const DEFAULT_LIMIT = 100;
@@ -142,7 +144,8 @@ module.exports = function setupSearch(ctx) {
     const messages = [];
     for (const { p, src } of page) {
       const row = rows.get(src.kind + p[1]);
-      if (row) messages.push(src.kind === 'c' ? serializeMessage(row, src.channel, reactions) : serializeDmMessage(row, reactions));
+      // A disappearing message whose time has passed isn't a result, even before the sweep deletes it.
+      if (row && alive(row)) messages.push(src.kind === 'c' ? serializeMessage(row, src.channel, reactions) : serializeDmMessage(row, reactions));
     }
     res.json({ messages, nextCursor: more && page.length ? encodeCursor(page[page.length - 1].p) : null, conversations: chosen.length });
   });

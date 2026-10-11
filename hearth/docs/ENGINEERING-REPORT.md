@@ -675,3 +675,39 @@ CodeQL (`security-extended`, the same queries as CI) was run locally on 1.28.0 w
 Each fix was checked by a fresh CodeQL database and analysis (CodeQL 2.27.2, the same queries as CI). The
 remaining result count is 0, apart from the turned-off rate-limiting rule. On GitHub, alerts close when the
 CodeQL job runs on the default branch with these changes.
+
+## 13. Android: notifications when closed, calls with the screen off, invite links
+
+Built from `docs/design/ANDROID-PUSH.md` (NEXT.md picks 1 and 12). No schema change.
+
+- **Server.** `/push/subscribe` checks the keys (a P-256 point, a 16-byte secret) and takes `replaces`, which
+  deletes the caller's own old address in the same transaction. `PUSH_HOSTS` and `PUSH_PRIVATE_HOSTS` go through
+  netguard at subscribe and on every send. Deviation from the design: a private host is `name:port` (443 by
+  default), because a private address skips netguard's own-address check, so the exception is kept to one service.
+  `sendPush` now treats only 2xx as delivered: 429 waits for `Retry-After` without a failure, everything else backs
+  off and drops after 8 (before, 403/5xx/507 counted as success), with a once-an-hour `push refused` log line by
+  host. Payloads are capped, cleaned of control characters, padded to 256-byte steps and stamped with `at`; call
+  pushes open `#call/<room>`. `/api/config` has `pushNtfy`; `/.well-known/assetlinks.json` vouches for the app
+  (`ANDROID_CERT_SHA256`).
+- **Native.** UnifiedPush connector 3.3.5, read from its published sources before coding: `register` has no
+  `@Throws`, so Java catches `Exception` and checks for `VapidNotValidException`; `PushEndpoint.getTemporary()`
+  exists. `CallService` is a `microphone` foreground service (Android's documented type for communication apps;
+  `phoneCall` needs ConnectionService or the dialer role). Invites are delivered to the open page (`#invite/…`)
+  instead of reloading it, so a call survives; an older page gets the invite page loaded.
+- **Page.** `android-push.js` (pure, tested in Node), `android.js` (bridge, `hello` v2), Android branches in
+  `app.js` push functions, sign-out unregistering, a one-time offer, and `#call/`, `#d/`, `#invite/` links. Hash
+  links now also open on the first start (they used to wait for a reconnect when "What's new" wasn't shown).
+- **Checked here:** `test/android-push.test.js` (20: the fake ntfy decrypts with `http_ece`; javac runs the pure
+  Java), the e2e flow with a simulated bridge, and a local type-check of all native Java against the real
+  Android 16 framework jar, the connector 3.3.5 classes and kotlin-stdlib (AndroidX/Capacitor stubbed), plus the
+  JUnit tests. **Not checked here:** a Gradle build and anything on a device (mobile/README.md).
+- **After review.** Any new page load (*Reload now*, switching server, an error page) stops the call service, and
+  the page also sends `callEnd` on `pagehide`. Opening Hearth while a call push rings cancels it (it's insistent)
+  and opens that call. Deviation from the design: *Change* no longer calls `removeDistributor` first (backing out
+  lost the registration) and no longer goes through Android's `unifiedpush://link` resolution, which answers
+  silently with the default push app: it shows Hearth's own list of every distributor (legacy ones too), and a cancel
+  restores the registration. Turning push on resolves the default first, so backing out of Android's list isn't
+  followed by Hearth's. `#call/` links ring only for a DM call with the other person in it or a group chat's call
+  (the calls the server rings); a link to a server voice channel just opens the server. The lock-screen claim was
+  wrong: Android shows the full notification there unless the phone hides sensitive content, so the call
+  notification's title now follows the previews setting ("In a call" by default), like pushes already did.

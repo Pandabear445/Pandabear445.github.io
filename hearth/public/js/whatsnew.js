@@ -9,6 +9,9 @@ export const CHANGES = [
     'Server audit log (Server settings \u2192 Audit log, with a new View Audit Log permission): who kicked, banned or timed out whom, and who changed roles, channels, permissions and settings, in plain sentences and never what anyone wrote. Reports about messages and members in a server now reach that server\u2019s moderators too (Server settings \u2192 Reports), without the reporter\u2019s name.',
     'Threads you won\u2019t miss: a message that starts a thread shows how many replies are new to you, and the Threads button in a channel lists its threads, newest reply first.',
     'Link previews: paste a link and press Preview to add a card with the page\u2019s title and picture. The card travels inside the encrypted message, so people reading never contact the site. Your server sees the links you preview; choose Ask, Always or Never in Settings \u2192 Chat.',
+    'Disappearing messages: set a timer on a DM, a group chat or a channel (its ⋯ menu) and new messages there disappear for everyone after 1 hour, 1 day, 1 week or 4 weeks, with their files, reactions and pins. Turning it on tells you what it can’t stop, like screenshots and backups.',
+    'Import from Discord (Add a server \u2192 Import from Discord): start a new server with a Discord server\u2019s roles, categories, channels and channel permissions from its server template. Hearth shows you how to copy the template (it never contacts Discord itself), and lists what comes over and what doesn\u2019t before anything is created.',
+    'Android app: notifications even when the app is closed (through a push app such as ntfy), calls that keep going with the screen locked, and invite links that open straight in the app.',
     'For server owners: update zips can now be signed with your own key, and servers that pinned it refuse anything else (docs/SIGNING.md).',
   ] },
   { version: '1.28.2', items: [

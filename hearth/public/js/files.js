@@ -188,7 +188,8 @@ export function makeUrlCache(budget = 256 * 1024 * 1024) {
       trim();
       return url;
     },
-    drop(key) { const v = items.get(key); if (v) { items.delete(key); bytes -= v.size; if (!inUse(v.url)) URL.revokeObjectURL(v.url); } },
+    // force: let go of the decrypted copy even if something still shows it (a disappearing message's file).
+    drop(key, force = false) { const v = items.get(key); if (v) { items.delete(key); bytes -= v.size; if (force || !inUse(v.url)) URL.revokeObjectURL(v.url); } },
     release() { for (const v of items.values()) URL.revokeObjectURL(v.url); items.clear(); bytes = 0; },
     get size() { return bytes; },
     get count() { return items.size; },

@@ -1,17 +1,59 @@
 // Inside the Hearth Android app, gives the page what a phone web view lacks on its own:
-// notifications (window.Notification) and saving files (<a download> links).
+// notifications (window.Notification) and saving files (<a download> links), and with a current app also
+// notifications while it's closed (androidApp.push, see android-push.js), calls that keep going with the
+// screen locked (androidApp.callState) and invite links that open in the app.
 // Does nothing in browsers or the desktop app.
+import { createAndroidPush, safeOpenHash, safeInviteHash } from './android-push.js';
+
 const A = window.HearthAndroid;
-export const androidApp = { on: !!A, version: '', notify: 'default' };
+// push: null until the app says it can (an older app can't). ready: settles once the app answered (or didn't
+// in time). onHangUp: set by app.js; the call notification's Hang up button calls it.
+export const androidApp = { on: !!A, version: '', notify: 'default', push: null, calls: false, ready: Promise.resolve(), onHangUp: null };
 
 if (A) {
   const send = (msg) => { try { A.postMessage(JSON.stringify(msg)); } catch { /* app closing */ } };
+  // Opens a place in the app (a tapped notification, an invite link) through the address's #part, which
+  // app.js follows (now, or once signed in).
+  const go = (hash) => { if (hash && location.hash !== hash) location.hash = hash; };
+  let ready;
+  androidApp.ready = new Promise((r) => { ready = r; setTimeout(r, 1500); });
   A.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
-    if (m.type === 'info') { androidApp.version = m.version || ''; androidApp.notify = m.notify || 'default'; }
+    if (m.type === 'info') {
+      androidApp.version = m.version || '';
+      androidApp.notify = m.notify || 'default';
+      androidApp.calls = m.call === true;
+      if (m.push && typeof m.push === 'object' && !androidApp.push) {
+        androidApp.push = createAndroidPush({ send, initial: m.push });
+        // Signed out while the app was closed: this phone mustn't keep a push address for the old account.
+        if (m.push.state === 'registered' && !localStorage.getItem('hearth.token')) androidApp.push.unregister();
+      }
+      go(safeOpenHash(m.open));
+      go(safeInviteHash(m.invite));
+      ready();
+    } else if (m.type === 'pushState' && androidApp.push) androidApp.push._reply(m);
   };
-  send({ type: 'hello' });
+  // v: 2 tells the app this page takes notification taps and invites in place (older pages get reloaded).
+  send({ type: 'hello', v: 2 });
   androidApp.switchServer = () => send({ type: 'changeServer' });
+  androidApp.cancel = (tag) => send({ type: 'cancel', tag: String(tag) });
+  window.addEventListener('hearth-push', (e) => { if (androidApp.push) androidApp.push._event(e.detail); });
+  window.addEventListener('hearth-open', (e) => go(safeOpenHash(e.detail)));
+  window.addEventListener('hearth-invite', (e) => go(safeInviteHash(e.detail)));
+  window.addEventListener('hearth-hangup', () => { if (typeof androidApp.onHangUp === 'function') androidApp.onHangUp(); });
+
+  // ---- calls: while one is on, the app runs a foreground service (a notification with Hang up) so Android
+  // keeps the call and its microphone going with the screen off or the app in the background.
+  let inCall = false; let callTitle = '';
+  androidApp.callState = ({ inCall: on, title = '' } = {}) => {
+    const t = String(title || '').slice(0, 120);
+    if (on && (!inCall || t !== callTitle)) send({ type: 'callStart', title: t });
+    else if (!on && inCall) send({ type: 'callEnd' });
+    inCall = !!on; callTitle = t;
+  };
+  // Leaving the page (a reload, switching server) ends the call in it: so does the notification. (The app also
+  // stops it when the next page starts loading, in case this message doesn't get out in time.)
+  window.addEventListener('pagehide', () => { if (inCall) { inCall = false; send({ type: 'callEnd' }); } });
 
   // ---- notifications
   const open = new Map();

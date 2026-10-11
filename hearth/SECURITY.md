@@ -16,6 +16,7 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | Asset | Where it lives | How it's protected |
 |---|---|---|
 | **Messages and files** (DMs, server channels, attachments) | Server database and `data/uploads`, as ciphertext only | End-to-end encrypted on the sender's device: AES-256-GCM with a fresh key per message (HKDF-SHA256), the conversation, author and key version bound in. Channel messages and key handoffs are signed (ECDSA P-256). Message text is padded so its length doesn't leak. **File sizes are not hidden:** an encrypted file is its exact size plus 28 bytes. A message's id, reply, thread, time and edit version are not bound in (see §4). |
+| **Disappearing messages** | Server database and `data/uploads` until their time, then deleted (backups made before then keep them until those are pruned) | Each conversation's timer (off, 1 hour, 1 day, 1 week or 4 weeks) is stamped on each message when the server stores it. From then on the server hands it out nowhere, the sweep deletes it with its files, reactions, votes, saved entries and pin history, and the apps hide it at its time by themselves. **The host does the deleting** and anyone can screenshot (§4). |
 | **Passwords** | Never leave the device | Argon2id (64 MiB, 3 passes, per-account salt) in the browser. One half signs in; the server stores only a **bcrypt hash** of it. The other half unlocks your keys and never leaves the device. |
 | **Identity keys** (ECDH P-256 + ECDSA P-256) | Private halves on the server, locked | Locked with AES-256-GCM under the password-derived key. The server can't open them. It hands the locked copy out only after the password: at sign-in, with a reset link, or when you re-confirm (password, plus a two-factor code when that's on). A session token alone doesn't get it. |
 | **Recovery keys** | Only with the person (password manager or paper) | 160 random bits. They lock a second copy of the identity key; the server stores only that locked copy. |
@@ -158,6 +159,12 @@ Found a problem? Please tell the server owner privately (not in a public channel
 | 105 | Thread markers, the Threads list or thread pings reveal a private channel or touch someone else's reading | They're checked like the channel's messages: a channel you can't read answers like one that doesn't exist. A marker is per account, only moves forward and must name a reply in that thread; thread pings are stored only for people who can see the channel, and @everyone in a thread needs Mention Everyone; the list returns ciphertext only and is rate-limited | `threads.test.js` |
 | 106 | A link preview is used for SSRF, to run a page's code, or as a fetching proxy | Only the sender's app asks (`POST /api/link-previews`, signed in), and the server fetches only https on port 443 with a real host name through the outbound guard (public addresses only, DNS pinned, every redirect checked again; 512 KiB page, 2 MiB picture, 10 s). The page's head is read by a linear tokenizer in a worker (2 s), never rendered or run; text is decoded once, stripped and capped; pictures are checked by their bytes. Per-account, per-session, per-network and per-site limits; the owner can turn previews off | `linkpreview.test.js` |
 | 107 | Readers are tracked or misled through a preview card, or one account sees another's previews | The card travels inside the end-to-end encrypted message with its picture as a data: URL, so readers' apps contact neither the site nor the server; readers keep a card only if its URL is a link in the message text and draw it with text nodes, working out the domain line themselves. The preview cache is per account, in memory for at most 10 minutes; previewed links never go to the log | `linkpreview.test.js`, `linkpreview-client.test.js`, e2e › link previews |
+| 108 | Someone changes a conversation's disappearing timer who shouldn't, or floods it | DMs: either person, not after a block either way; group chats: any member; server channels: Manage Channels in that channel. Only the offered choices; 10 changes a minute per person and 10 an hour per person per conversation; every change is logged and shown in the conversation | `disappearing.test.js` |
+| 109 | An expired message is still handed out, or lingers on disk | From its deadline every serving path skips it (history, threads, pins, search, saved, export, quotes, previews, the bot API, `/uploads/` with `no-store` while it lives), and acting on it is 404. A precise timer, a sweep every minute and a run at start-up delete it in indexed batches with its files and everything attached; `secure_delete` and a WAL reset leave no copy in `hearth.db` | `disappearing.test.js` |
+| 110 | A message is stored under a weaker timer than its sender's app encrypted for, or a modified app makes messages vanish instantly | The app sends the timer it encrypted for; a different one in force gets 409 and nothing is stored, and the app re-sends by itself only to a stronger timer. Thread replies never outlive their first message and edits never move a deadline. Apps honour a timer inside a message only if it's one of the offered choices (at least 1 hour) and show a badge | `disappearing.test.js` |
+| 111 | A Discord import grants more than the template did, or overloads the server | Each Discord permission is mapped to Hearth's, and before anything is created the person sees what can't come over and what Hearth allows beyond the template (bundled permissions, per-channel denies it can't apply, @everyone moderator powers); an explicit deny is never turned into an allow. Hearth never contacts Discord: the person pastes the template. Caps on overrides read and made, stored report size and previews per instance, plus per-account and per-network limits | `discord-map.test.js`, `discord-import.test.js` |
+| 112 | Android pushes leak content or let a page fake a call | Pushes carry no message text (the same contentless payloads as web push, padded); the native side shows only what the payload allows and drops anything that didn't decrypt. Push hosts can be restricted (`PUSH_HOSTS`) and go through the outbound guard. A `#call/<room>` link rings only for a DM or group call you're really in, and the 'In a call' notification names the call only if names on the lock screen are on | `android-push.test.js`, e2e |
+| 113 | The Android call service keeps the microphone after a call | The microphone foreground service starts when a call starts and stops when it ends, on page reload or navigation and on `pagehide`. Native behaviour is checked in CI builds only until a device test (mobile/README.md) | `android-push.test.js`, e2e |
 
 ## 4. What each adversary can still do (honest limits)
 
@@ -226,6 +233,14 @@ Found a problem? Please tell the server owner privately (not in a public channel
   installed. Servers with neither OpenSSL 3.0+ nor Node can't check Ed25519 and stay on the checksum. Root on the
   server can change the pinned key. Compare the pinned key (`hearth-update --status`) with the one in the release
   notes.
+- **Disappearing messages are deleted by the host.** A malicious or compromised server can skip deleting, keep
+  copies of the ciphertext or stop the sweep, and anyone whose keys later leak could read those copies (there is no
+  forward secrecy). The server also controls each message's send time, so it can make one look newer and keep it on
+  screen longer. Anyone can screenshot, copy, forward, download, export or report what they see. The server knows
+  each conversation's timer, who changed it and when each message is due to go.
+- **Android notifications (closed app) depend on a push app.** With ntfy (self-hosted or ntfy.sh) or a
+  distributor that uses Google's service, that service sees when a push arrives for the device, not what it says.
+  Native parts of the Android app are only build-checked in CI until they're tested on a real phone.
 - **Link previews show the server the links you preview.** When someone presses Preview (or uses Always mode), the
   server fetches the page for them, so it learns those links, who asked and when, and the size of the encrypted
   message sent just after can tie the link to a conversation. In Always mode that includes links typed and deleted
@@ -303,6 +318,10 @@ Internet ─► VPS firewall (ufw: 22, 80, 443, relay ports) ─► Caddy (HTTPS
 - **Off-site**: set `BACKUP_RCLONE_REMOTE` and each backup is copied with rclone (Backblaze B2, S3, Google Drive,
   SFTP…). With Docker, run rclone on the host over `data/backups/encrypted/` instead, ideally with
   `--include '*.hbk'`.
+- **Disappearing messages** are in every backup made before their time until that backup is pruned (daily
+  encrypted backups, region copies, `hearth-auto-*.db`); off-site rclone copies, `hearth-before-v*.db` and update
+  snapshots keep them until deleted by hand. A restore deletes those already past their time at the first start,
+  before anyone can connect.
 - **Keep the backup key somewhere else** (Admin → Owner → "Show backup key", which needs your password and is
   logged). Never store it next to the backups.
 - **Restore on a new machine**: `node server/cli.js restore <file.hbk> <empty-folder> <backup-key>`, then start

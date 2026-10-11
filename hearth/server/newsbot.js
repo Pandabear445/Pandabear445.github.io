@@ -11,6 +11,7 @@
 const crypto = require('crypto');
 const netguard = require('./netguard');
 const jobs = require('./jobs');
+const DISAPPEAR = require('./disappear');
 
 const BOT_ID = 'newsbot00000000000001';
 const KINDS = {
@@ -247,8 +248,12 @@ module.exports = function setupNewsbot(ctx) {
     if (!c || c.type !== 'text') return false;
     const id = newId();
     const embed = { title: item.title, url: item.link, summary: item.summary, image: item.image, source: item.source || feed.title, date: item.date, kind: feed.kind, feedId: feed.id };
-    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)')
-      .run(id, c.id, BOT_ID, seal({ content: item.title, attachments: [], embed, bot: true }), now());
+    // A disappearing channel's timer covers news posts too (a 1-hour channel shows the last hour of news).
+    const t = now();
+    const expiresAt = DISAPPEAR.stamp({ secs: c.disappear_secs, t });
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id, expires_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?)')
+      .run(id, c.id, BOT_ID, seal({ content: item.title, attachments: [], embed, bot: true }), t, expiresAt);
+    DISAPPEAR.arm(expiresAt);
     toChannel(c).emit('message:new', serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c));
     db.prepare('UPDATE feeds SET posted = posted + 1 WHERE id = ?').run(feed.id);
     return true;

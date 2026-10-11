@@ -227,7 +227,7 @@ them all). `test/quality.test.js` asserts the plans above.
 - **Admin routes.** `/api/admin/servers` and other admin routes count messages per server with a join over all
   messages. They are rarely used and were not measured.
 
-### Threads list and thread unread counts (v20)
+### Threads list and thread unread counts (v19)
 
 The Threads panel (`GET /channels/:id/threads`) lists a channel's threads, the one with the latest reply first.
 Nothing on `messages` gives that order cheaply. Measured in-process on a channel with 5,000 threads and about

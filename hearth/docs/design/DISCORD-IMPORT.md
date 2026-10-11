@@ -1,6 +1,34 @@
 # Design: Import from Discord (structure, then emoji, then history)
 
 Status: proposal for a builder agent. Target: Hearth 1.28.x (`package.json` says 1.28.2; docs/ARCHITECTURE.md still says 1.27.1), schema 18 → 19.
+
+**Built so far:** phase 1, paste path only (`server/discordmap.js`, `server/imports.js`, `public/js/discord-import.js`; user guide in [../IMPORT.md](../IMPORT.md)). Where it differs from this design, and why:
+- Hearth 1.29 has Mute Members, Move Members and View Audit Log (each server's own audit log), so Discord's map to
+  them. The sample's Moderator becomes 919088, not 1584, and View Audit Log is no longer in its "can't bring" list.
+- A Discord bit that a broader Hearth bit covers isn't reported as lost when the role has that bit: Pin Messages and Bypass Slowmode (Manage messages), Timeout Members (Kick), Manage Events and Manage Webhooks (Manage server or channels), Create Expressions (Manage emoji).
+- Use External Emoji is allowed anyway, so it isn't "lost" either.
+- Create Events is "widened": in Hearth anyone who can post makes events. So the sample's @everyone has one widened warning.
+- `invite_override_dropped` became the general note `dropped:<DISCORD_BIT>`, which also covers Mute Members and other server-wide bits in overrides.
+- The tables are a `// v19 (discord import)` block: schema 19 is unreleased and ships them with the rest of 1.29. `messages.import_id` waits for phase 3.
+- There is no `features.discordImport` switch, since Hearth doesn't contact Discord. "Who can create servers" governs imports.
+- Too many channels or categories is a `problems` entry: the preview still shows everything so people can untick, and create refuses.
+- Real Discord category names win over the "Text" and "Voice" groups for uncategorised channels (those become "Text (2)").
+- Names lose control and text-direction characters.
+- "Never grant more" holds where Hearth can express it; where it can't, the preview lists it as widened. Besides the
+  bits Hearth can't withhold, that covers what a Hearth permission bundles that the role lacked (Kick → Timeout
+  Members; Manage channels or server → Manage Webhooks and Manage Events; Manage messages → Pin Messages and Bypass
+  Slowmode; Manage channels in a channel → Bypass Slowmode), per-channel denies of what Hearth only has server-wide
+  (Create Invite, Mute Members) or of those bundled bits, and overrides cut by a limit that denied something.
+- Manage Channel, Manage Permissions or Embed Links granted in one channel to a role (or @everyone) without it
+  server-wide is reported as `dropped:` (the override stays; Hearth honours it only with the server-wide
+  permission, and for Embed Links readers' apps check Show link previews server-wide).
+- Stage speakers: Discord lets someone speak on a stage unasked only with Mute Members there (the rule for
+  unsuppressing yourself), so a role gets Speak on an imported stage only if, after that stage's own overrides, it
+  has Mute Members and Speak. Not "any of Mute, Move or Manage Channels", which let Builder (Manage Channels only)
+  speak, and turned an explicit Speak deny into an allow. A Speak allow for a role that isn't a speaker is removed.
+- Limits added after review: 10,000 overwrites read in all (not 25,000), 5,000 overrides made in all (stage
+  speakers included) as a `too_many_overrides` problem, lists of names in the report cut at 25, the stored report
+  at most 128 KB, and a ceiling of 300 previews and imports per 10 minutes for the instance.
 Pick #9 in `docs/NEXT.md` ("Import from Discord: structure first (template link), emoji next, history last").
 
 Paths are relative to `hearth/`. Every code reference below was checked against the tree. External facts carry their source URLs. Facts I could **not** verify live are marked **(unverified)**: the research environment's proxy blocked `discord.com`, `docs.discord.com`, `support.discord.com` and `cdn.discordapp.com`. I read Discord's API docs from their source repository on GitHub instead.

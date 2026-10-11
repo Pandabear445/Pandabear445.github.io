@@ -184,6 +184,11 @@ epoch) and gives it to everyone still there.
 Messages and attachments inside a backup are still end-to-end encrypted. The backup restores the server, and each
 person's password or recovery key still opens their own data. **A backup can't give anyone back a lost password.**
 
+**Disappearing messages** are in every backup made before their time, with their files, until that backup is pruned
+(or, for off-site and `hearth-before-v*.db` copies, deleted by hand). After a restore, the first start deletes every
+message whose time has passed before anyone can connect, so a restored server never shows them again; ones whose time
+hasn't come yet disappear on schedule.
+
 ### Making a backup
 
 - Daily and automatic (Admin → Owner → Backups), or with "Back up now".

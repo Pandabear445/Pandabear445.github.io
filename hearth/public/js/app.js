@@ -20,7 +20,7 @@ import { createSecure } from './secure.js';
 import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
-import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, repeatLabel, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
+import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, repeatLabel, upcomingSection, onEventStarting, remindItems, startReminders, purgeReminders, reminderDeadlines, stopVoice } from './features.js';
 import { rankRelays, chooseIce, relayTime, iceStale } from './relays.js';
 import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
@@ -36,8 +36,10 @@ import { openRolePicker, pickableRoles, selfAssignProblem, SELF_BLOCKED } from '
 import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
 import { webhooksPanel, onWebhooksUpdate } from './webhooks.js';
 import { initServerAudit, auditTab, reportsTab } from './serveraudit.js';
+import { openDiscordImport } from './discord-import.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
-import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, quietNow } from './usability.js';
+import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
+import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer } from './disappear.js';
 import { trackViewport } from './viewport.js';
 
 // ======================================================================= state
@@ -71,7 +73,10 @@ const S = {
   savedIds: new Set(),  // saved messages (ids only; on the server)
   typing: {},
   speaking: new Set(),
+  clockOffset: 0,       // the server's clock minus this device's (disappearing messages go by the server's time)
 };
+// The server's time now: disappearing messages are hidden by it, whatever this device's clock says.
+const nowServer = () => Date.now() + (S.clockOffset || 0);
 let socket;
 let hadController = false; // was a service worker already in charge when the page loaded?
 let voice;
@@ -141,10 +146,14 @@ export const app = {
   get canInstall() { return !!installPrompt; },
   get isInstalled() { return isStandalone(); },
   push: {
-    supported: () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window && S.config && S.config.pushEnabled,
+    // In the Android app, push goes through the app (a UnifiedPush push app such as ntfy), not the browser's.
+    supported: () => (androidApp.push ? !!(S.config && S.config.pushEnabled) : 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window && S.config && S.config.pushEnabled),
     status: () => pushStatus(),
     enable: () => enablePush(),
     disable: () => disablePush(),
+    // Android app only: pick another push app (resubscribes with the new address).
+    choose: () => enablePush({ choose: true }),
+    get android() { return androidApp.push; },
   },
   openServerSettings: (id) => openServerSettings(S.servers.find((s) => s.id === id)),
   unblock: (id) => toggleBlock(id, false),
@@ -172,6 +181,8 @@ async function init() {
   const m = location.pathname.match(/^\/invite\/([A-Za-z0-9]+)/);
   if (m) { sessionStorage.setItem('hearth.pendingInvite', m[1]); history.replaceState(null, '', '/'); }
   try { S.config = await api('GET', '/config'); } catch { S.config = { name: 'Hearth', iceServers: [] }; }
+  // A disappearing timer inside a message counts only if it's one this server offers (disappear.js).
+  setTimerChoices((S.config.disappearing || {}).choices);
   document.title = S.config.name;
   $$('[data-instance-name]').forEach((el) => { el.textContent = S.config.name; });
   $$('[data-instance-tagline]').forEach((el) => { el.textContent = S.config.tagline || ''; el.hidden = !S.config.tagline; });
@@ -398,8 +409,9 @@ function logout() {
 }
 async function signOutHere() {
   // This browser stops getting notifications for the account (the server drops the subscription too), and
-  // doesn't pass them on to whoever signs in here next. Never holds up signing out for more than a moment.
-  if (localStorage.getItem('hearth.push') === 'on' && 'serviceWorker' in navigator) await Promise.race([disablePush().catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
+  // doesn't pass them on to whoever signs in here next. In the Android app the phone's push registration goes
+  // too. Never holds up signing out for more than a moment.
+  if (androidApp.push || (localStorage.getItem('hearth.push') === 'on' && 'serviceWorker' in navigator)) await Promise.race([disablePush({ signOut: true }).catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
   try { await api('POST', '/auth/logout'); } catch { /* ignore */ }
   if (voice) await voice.leave().catch(() => {});
   setToken('');
@@ -423,7 +435,7 @@ function startApp() {
     changed: (a) => { if (!S.me) return; S.me.activity = a; if (S.users[S.me.id]) S.users[S.me.id].activity = a; renderUserPanel(); },
   });
   initFeatures({
-    S, getUser, displayName, avatarEl, playSound, addInbox,
+    S, getUser, displayName, avatarEl, playSound, addInbox, nowServer,
     jump: (key, id) => jumpToMessage(key, id),
     canManage: (server) => isAdmin(server) || can(server, PERMS.MANAGE_SERVER),
     openChannelOrVoice: (c, server) => (c.type === 'voice' ? joinVoice(c, server) : openChannel(c.id, server.id)),
@@ -448,6 +460,10 @@ function startApp() {
       showUpdate: (version) => showAppUpdate(version),
     }).catch(() => {});
   }
+  androidApp.onHangUp = () => { if (voice && voice.channelId) { voice.leave(); playSound('selfLeave'); } };
+  // A conversation read here (or on another device) also clears the notification the Android app posted for it
+  // while it was closed (same tag).
+  if (androidApp.cancel) alsoCloseNotifications(androidApp.cancel);
   voice = new Voice({
     // Lets the speaking detector ignore people whose mic is off (their state comes from the server).
     isPeerMuted: (userId) => { const st = voice && (S.voice[voice.channelId] || []).find((x) => x.userId === userId); return !!(st && (st.muted || st.deafened)); },
@@ -477,7 +493,13 @@ function startApp() {
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
     verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
     onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
-    onChange: () => { if (!voice.channelId) S.regionWarned.clear(); shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers(); if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader(); reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened }); },
+    onChange: () => {
+      if (!voice.channelId) S.regionWarned.clear();
+      shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers();
+      if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader();
+      reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened });
+      syncCallNotification();
+    },
     onSpeaking: (id, on) => {
       const uid = id === 'me' ? S.me.id : id;
       // Never show someone as speaking while they're muted or deafened, whatever audio arrives.
@@ -655,7 +677,7 @@ function startApp() {
   // Read markers, notification preferences and saved messages changed on another of your devices.
   socket.on('read:update', (st) => onReadUpdate(st));
   socket.on('notify:update', (r) => applyNotifyPref(r));
-  socket.on('notify:settings', (st) => { S.notifySettings = st; });
+  socket.on('notify:settings', (st) => { S.notifySettings = st; syncCallNotification(); });
   socket.on('saved:update', (p) => { if (p.saved) S.savedIds.add(p.messageId); else S.savedIds.delete(p.messageId); if (S.view.type === 'saved') later(renderMain); });
   socket.on('timeout:update', ({ serverId, until }) => {
     const sv = S.servers.find((x) => x.id === serverId);
@@ -743,8 +765,13 @@ function startApp() {
   socket.on('message:new', (m) => { if (!S.me) return; if (m.threadId) onThreadMessage(m); else onNewMessage('c:' + m.channelId, m); });
   socket.on('message:update', (m) => { if (m.threadId) onThreadUpdate(m); else onUpdateMessage('c:' + m.channelId, m); });
   socket.on('message:delete', ({ id, channelId, threadId }) => onDeleteChannelMessages(channelId, [{ id, threadId }]));
-  // Bulk delete and a ban's cleanup: many at once, one redraw.
-  socket.on('message:delete-bulk', ({ channelId, messages } = {}) => { if (Array.isArray(messages)) onDeleteChannelMessages(channelId, messages); });
+  // Bulk delete and a ban's cleanup: many at once, one redraw. Disappearing messages that reached their time come
+  // the same way (expired: true, with a group chat's new last message for its preview).
+  socket.on('message:delete-bulk', ({ channelId, messages, expired, last } = {}) => {
+    if (Array.isArray(messages)) onDeleteChannelMessages(channelId, messages, { expired: !!expired });
+    if (last !== undefined) { const s = serverOfChannel(channelId); if (isGroup(s)) { s.last = last; previewGroup(s).then(() => { if (!S.view.serverId) later(renderSidebar); }); } }
+  });
+  socket.on('disappear:update', (p) => onDisappearUpdate(p));
   socket.on('thread:update', ({ rootId, channelId, threadCount, threadLastAt }) => {
     const store = S.msgs['c:' + channelId];
     const m = store && store.list.find((x) => x.id === rootId);
@@ -776,7 +803,11 @@ function startApp() {
     if (!S.view.serverId) renderSidebar();
   });
   socket.on('dm:update', (m) => onUpdateMessage('d:' + m.dmId, m));
-  socket.on('dm:delete', ({ id, dmId }) => onDeleteMessage('d:' + dmId, id));
+  socket.on('dm:delete', ({ id, dmId, expired, last }) => {
+    onDeleteMessage('d:' + dmId, id, { expired: !!expired });
+    const d = last !== undefined && S.dms.find((x) => x.id === dmId);
+    if (d) { d.last = last; previewDm(d).then(() => { if (!S.view.serverId) later(renderSidebar); }); }
+  });
   socket.on('typing', (p) => {
     const key = p.channelId ? 'c:' + p.channelId : 'd:' + p.dmId;
     const t = (S.typing[key] ||= new Map());
@@ -824,7 +855,9 @@ function startApp() {
     if (S.view.serverId) { const s = currentServer(); if (s && s.kind === 'group') renderHeader(); }
   });
 
-  window.addEventListener('focus', () => { markRead(currentKey()); });
+  window.addEventListener('focus', () => { purgeExpired(); markRead(currentKey()); });
+  // Hidden tabs check their timers only now and then: catch up on disappearing messages as soon as they're back.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) purgeExpired(); });
   window.addEventListener('pagehide', () => { drafts.flush(); if (voice && voice.channelId) socket.emit('voice:leave', {}); });
   window.addEventListener('hashchange', () => openLinkFromHash());
   document.addEventListener('keydown', globalKeys);
@@ -858,7 +891,10 @@ function rememberE2eeSince(t) {
 async function loadBootstrap() {
   // Read markers, notification preferences and saved ids come alongside, so unread badges are right at start.
   const extras = Promise.all(['/me/unread', '/me/notify', '/me/saved/ids'].map((p) => api('GET', p).catch(() => null)));
+  const asked = Date.now();
   const b = await api('GET', '/bootstrap');
+  // How far this device's clock is from the server's (at most a day either way), for disappearing messages.
+  if (Number.isFinite(b.serverNow)) S.clockOffset = Math.max(-86400000, Math.min(86400000, b.serverNow - Math.round((asked + Date.now()) / 2)));
   S.me = b.me;
   drafts = createDrafts(S.me.id);
   S.mediaToken = b.mediaToken;
@@ -887,6 +923,8 @@ async function loadBootstrap() {
   renderAll();
   loadPreviews();
   if (!S.remindersOn) { S.remindersOn = true; startReminders(); }
+  purgeInbox();
+  armClientExpiry();
   if (window.hearthDesktop && window.hearthDesktop.detectActivity) api('GET', '/me/activity-settings').then(startDesktopDetection).catch(() => {});
   if ((b.termsVersion || 0) > (b.tosAccepted || 0)) askToAcceptTerms();
   restoreResume();
@@ -896,18 +934,23 @@ async function loadBootstrap() {
   const open = new URLSearchParams(location.search).get('open');
   if (open) { history.replaceState(null, '', '/' + location.hash); if (open === 'messages') openMessages(); if (open === 'friends') goFriends(); }
   if (localStorage.getItem('hearth.push') === 'on') enablePush({ quiet: true }).catch(() => {});
+  if (androidApp.on) androidPushAtStart();
   const invite = sessionStorage.getItem('hearth.pendingInvite');
   if (invite) { sessionStorage.removeItem('hearth.pendingInvite'); openJoinModal(invite); }
-  else if (!S.whatsNewShown) {
-    S.whatsNewShown = true;
-    const news = unseenChanges(S.config.version);
-    if (news.length) {
-      modal({ title: 'What\u2019s new', size: 'md', className: 'whatsnew',
-        body: h('div', { class: 'stack' }, ...news.map((c) => h('section', null, h('h3', { class: 'set-h' }, `Version ${c.version}`), h('ul', { class: 'perk-list' }, c.items.map((t) => h('li', null, t)))))),
-        actions: [{ label: 'Nice', kind: 'primary' }] });
+  else {
+    if (!S.whatsNewShown) {
+      S.whatsNewShown = true;
+      const news = unseenChanges(S.config.version);
+      if (news.length) {
+        modal({ title: 'What\u2019s new', size: 'md', className: 'whatsnew',
+          body: h('div', { class: 'stack' }, ...news.map((c) => h('section', null, h('h3', { class: 'set-h' }, `Version ${c.version}`), h('ul', { class: 'perk-list' }, c.items.map((t) => h('li', null, t)))))),
+          actions: [{ label: 'Nice', kind: 'primary' }] });
+      }
     }
+    // A link this page was opened with (a tapped notification, an invite in the Android app) opens on the
+    // first start too, not only after a reconnect.
+    if (location.hash) openLinkFromHash();
   }
-  else if (location.hash) openLinkFromHash();
 }
 
 function setUser(u) {
@@ -955,13 +998,17 @@ async function previewDm(d) {
   if (!d.last) { S.previews['d:' + d.id] = ''; return; }
   const m = { ...d.last, dmId: d.id };
   await sec.decryptDmMessage(m);
-  S.previews['d:' + d.id] = previewText(m);
+  // A last message that has disappeared shows nothing (the server sends the one before it with its next update).
+  S.previews['d:' + d.id] = isExpired(m, nowServer()) ? '' : previewText(m);
+  if (disappears(m)) { d.last.dec = m.dec; armClientExpiry(); }
 }
 async function previewGroup(s) {
-  if (s.kind !== 'group' || !s.last) return;
+  if (s.kind !== 'group') return;
+  if (!s.last) { S.previews['g:' + s.id] = ''; return; }
   const m = { ...s.last, serverId: s.id };
   if (m.ciphertext) await sec.decryptChannelMessage(m); else m.dec = { t: '' };
-  S.previews['g:' + s.id] = previewText(m, true);
+  S.previews['g:' + s.id] = isExpired(m, nowServer()) ? '' : previewText(m, true);
+  if (disappears(m)) { s.last.dec = m.dec; armClientExpiry(); }
 }
 function previewText(m, group = false) {
   if (!m.dec || m.dec.error) return 'Encrypted message';
@@ -969,6 +1016,253 @@ function previewText(m, group = false) {
   const who = m.authorId === S.me.id ? 'You: ' : group ? `${displayName(getUser(m.authorId))}: ` : '';
   const t = (m.dec.t || '').replace(/\s+/g, ' ').trim();
   return who + (t || ((m.dec.f || []).length ? 'Sent an attachment' : ''));
+}
+
+// ======================================================================= disappearing messages
+// A conversation ('c:<channel>' | 'd:<dm>') can have a timer: new messages disappear that long after they're sent,
+// for everyone. The server stamps each message's deadline and deletes it then; this app hides it on time by itself
+// (the earlier of the server's deadline and the timer inside the encrypted message, see disappear.js) and lets go of
+// every copy it kept: decrypted files, inbox entries, reminders, notifications, search results.
+
+// The conversation's timer in seconds (0 = off).
+function convSecs(key) {
+  if (!key) return 0;
+  if (key.startsWith('d:')) return (S.dms.find((x) => x.id === key.slice(2)) || {}).disappear || 0;
+  return (channelById(key.slice(2)) || {}).disappear || 0;
+}
+// The choices this server offers (under test it adds a 5-second one).
+const timerChoices = () => (((S.config || {}).disappearing || {}).choices || TIMERS.map(([v]) => v));
+// Who may change it: either person in a DM (not someone they blocked, not a deleted account), anyone in a group chat,
+// and in a server channel people who can edit it (Manage Channels there). The server checks all of this again.
+function mayChangeTimer(key) {
+  if (!key) return false;
+  if (key.startsWith('d:')) { const d = S.dms.find((x) => x.id === key.slice(2)); return !!d && !S.blocked.has(d.userId) && !getUser(d.userId).deleted; }
+  const c = channelById(key.slice(2));
+  const srv = c && serverOfChannel(c.id);
+  return !!c && c.type === 'text' && (isGroup(srv) || canEditChannel(srv, c));
+}
+// The section in a conversation's menu: the choices with the one in force ticked; people who can't change it just
+// see what it is.
+function disappearItems(key) {
+  const secs = convSecs(key);
+  if (!mayChangeTimer(key)) return secs ? ['-', { header: `Disappearing messages: ${disLabel(secs)}` }] : [];
+  return ['-', { header: 'Disappearing messages' }, ...timerChoices().map((v) => ({ label: disLabel(v), checked: secs === v, action: () => setDisappearing(key, v) }))];
+}
+// "your chat with Bob", "Weekend plans", "#general": where a conversation is, in a sentence.
+function convTitle(key) {
+  if (key.startsWith('d:')) { const d = S.dms.find((x) => x.id === key.slice(2)); return d ? `your chat with ${displayName(getUser(d.userId))}` : 'this chat'; }
+  const s = serverOfChannel(key.slice(2));
+  if (isGroup(s)) return groupName(s);
+  const c = channelById(key.slice(2));
+  return c ? `#${c.name}` : 'this channel';
+}
+const timerUrl = (key) => `${key.startsWith('d:') ? '/dms/' : '/channels/'}${encodeURIComponent(key.slice(2))}/disappearing`;
+// Returns whether the timer is now secs: false when they cancelled, or when it failed (shown as a toast, or thrown
+// with raise for a dialog that shows its own errors).
+async function setDisappearing(key, secs, { ask = true, quiet: silent = false, raise = false } = {}) {
+  const prev = convSecs(key);
+  if (secs === prev) return true;
+  // Turning it on says plainly what it does and doesn't do.
+  if (ask && !prev && secs && !(await confirmDialog({
+    title: 'Turn on disappearing messages?',
+    text: `New messages here will disappear for everyone ${disLabel(secs).toLowerCase()} after they’re sent, with their files. Messages already here aren’t affected. This server does the deleting: anyone here can still screenshot, copy, forward or save what they see, and the server’s backups keep copies until they’re rotated out.`,
+    confirm: 'Turn on',
+  }))) return false;
+  try {
+    onDisappearUpdate(await api('PUT', timerUrl(key), { seconds: secs }));
+    if (!silent) toast(secs ? `New messages disappear after ${disLabel(secs).toLowerCase()}.` : 'Disappearing messages are off. Messages sent before still disappear on time.');
+    return true;
+  } catch (e) {
+    if (raise) throw e;
+    toast(e.message, 'error');
+    return false;
+  }
+}
+// Someone changed the timer while we were sending (the server refused with disappear_changed): fetch it.
+async function refreshTimer(key) {
+  const r = await api('GET', timerUrl(key));
+  const store = S.msgs[key];
+  if (store && store.loaded && !store.hasNewer) mergeTimerEvents(store, r.log);
+  onDisappearUpdate({ conv: key, ...(key.startsWith('d:') ? { dmId: key.slice(2) } : { channelId: key.slice(2) }), seconds: r.seconds });
+}
+// A timer change, live (disappear:update) or our own coming back: the setting, the line in the conversation, the
+// header and the composer note.
+function onDisappearUpdate(p) {
+  if (!p || !p.conv || !S.me) return;
+  const key = p.conv;
+  if (p.channelId) { const c = channelById(p.channelId); if (c) c.disappear = p.seconds; }
+  if (p.dmId) { const d = S.dms.find((x) => x.id === p.dmId); if (d) d.disappear = p.seconds; }
+  const store = S.msgs[key];
+  if (p.id && store && store.loaded && !store.hasNewer && !(store.events && store.events.has(p.id))) {
+    mergeTimerEvents(store, [{ id: p.id, by: p.by, secs: p.seconds, prev: p.prev, at: p.at }]);
+    const sc = currentKey() === key && $('#messages');
+    if (sc) {
+      const near = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160;
+      const firstPending = sc.querySelector('.msg.sending');
+      const put = (node) => (firstPending ? sc.insertBefore(node, firstPending) : sc.append(node));
+      // The same as a full redraw draws it: under its own day's divider.
+      if (shownDay(sc, firstPending) !== new Date(p.at).toDateString()) put(dayDivEl(p.at));
+      put(sysLineEl(store.events.get(p.id)));
+      if (near) sc.scrollTop = sc.scrollHeight;
+    }
+  }
+  if (currentKey() === key) {
+    renderHeader();
+    if (composers.main) composers.main.renderExtras();
+    // (A thread's composer can outlive its panel; only the open one is redrawn.)
+    if (composers.thread && S.thread && S.thread.channelId === key.slice(2)) composers.thread.renderExtras();
+  }
+}
+// Timer changes the server handed out with a page of history, kept with the conversation by id. Returns how many
+// are new.
+function mergeTimerEvents(store, list) {
+  if (!Array.isArray(list) || !list.length) return 0;
+  store.events ||= new Map();
+  let n = 0;
+  for (const e of list) {
+    if (!e || typeof e.id !== 'string' || store.events.has(e.id)) continue;
+    store.events.set(e.id, { id: e.id, by: e.by || null, secs: Number(e.secs) || 0, prev: Number(e.prev) || 0, at: Number(e.at) || 0 });
+    n++;
+  }
+  return n;
+}
+// The lines that belong between the messages loaded now, oldest first (the rest show with their part of history).
+function timerLines(store) {
+  if (!store.events || !store.events.size) return [];
+  const first = store.list[0];
+  const last = store.list[store.list.length - 1];
+  return [...store.events.values()].filter((e) => (!store.hasMore || !first || e.at >= first.createdAt) && (!store.hasNewer || !last || e.at <= last.createdAt))
+    .sort((a, b) => a.at - b.at);
+}
+// "Today", "Yesterday", "March 3": the divider before the first message (or timer line) of a day.
+const dayDivEl = (t) => h('div', { class: 'day-div', role: 'separator', dataset: { day: new Date(t).toDateString() } }, h('span', null, fmtDay(t)));
+// The day of the last divider above `before` (or the end of the list), for adding to the bottom live.
+function shownDay(sc, before = null) {
+  for (let el = before ? before.previousElementSibling : sc.lastElementChild; el; el = el.previousElementSibling) if (el.classList.contains('day-div')) return el.dataset.day || null;
+  return null;
+}
+// "Alice turned on disappearing messages: 1 week · 3:04 PM"
+function sysLineEl(e) {
+  const text = sysLineText(e, S.me.id, (id) => displayName(getUser(id)));
+  return h('div', { class: 'sys-line', role: 'note' }, icon('timer'), h('span', null, text),
+    h('time', { datetime: new Date(e.at).toISOString(), title: new Date(e.at).toLocaleString() }, fmtStamp(e.at)));
+}
+// In the header while the timer is on: opens the choices, or says what it is to people who can't change it.
+function timerButton(key) {
+  const secs = convSecs(key);
+  if (!secs) return null;
+  const tip = `Disappearing messages: ${disLabel(secs)}`;
+  return ibtn('timer', tip, (e) => (mayChangeTimer(key) ? menu(e.currentTarget, disappearItems(key).slice(1), { align: 'end' })
+    : toast(`New messages here disappear ${disLabel(secs).toLowerCase()} after they’re sent.`)), { attrs: { 'data-pop-anchor': '' } });
+}
+function timerWelcome(key) {
+  const secs = convSecs(key);
+  return secs ? h('p', { class: 'welcome-note' }, icon('timer'), `Disappearing messages are on: new messages go ${disLabel(secs).toLowerCase()} after they’re sent.`) : null;
+}
+// The small timer on a disappearing message, with when it goes. The "in 20 minutes" part is worked out each time the
+// tooltip shows (it would go stale on a message that stays on screen); the label has the time only.
+function expBadge(m) {
+  const at = deadline(m);
+  if (!Number.isFinite(at)) return null;
+  const note = serverKept(m) ? '. Its sender’s timer is shorter than the server’s; this app goes by the shorter one.' : '';
+  const tip = () => `Disappears ${fmtStamp(at)} (${remaining(at - nowServer())})${note}`;
+  // (This mouseover runs before the tooltip's listener on the document reads data-tip.)
+  return h('span', { class: 'msg-exp', role: 'img', 'aria-label': `Disappears ${fmtStamp(at)}${note}`, 'data-tip': tip(), onmouseover: (e) => { e.currentTarget.dataset.tip = tip(); } }, icon('timer'));
+}
+const expOf = (m) => (disappears(m) ? { exp: deadline(m) } : {});
+
+// ---- hiding them on time
+const expiryListeners = new Set(); // open search windows: (ids) => drop what they found
+let expiryTimer = 0;
+// Messages in a freshly loaded page that are already past their time: never shown. Returns how many.
+function dropExpired(store) {
+  const t = nowServer();
+  const gone = store.list.filter((m) => isExpired(m, t));
+  if (gone.length) {
+    store.list = store.list.filter((m) => !isExpired(m, t));
+    forgetCopies(gone, new Set(gone.map((m) => m.id)));
+  } else if (store.list.some(disappears)) armClientExpiry();
+  return gone.length;
+}
+// One timer for the soonest deadline among everything loaded or kept (at most an hour away: it checks again then).
+function armClientExpiry() {
+  clearTimeout(expiryTimer);
+  if (!S.me) return;
+  const items = [];
+  for (const st of Object.values(S.msgs)) for (const m of st.list) items.push(m);
+  for (const t of Object.values(S.threads)) { if (t.root) items.push(t.root); for (const m of t.list || []) items.push(m); }
+  if (S.threadsPanel) for (const x of S.threadsPanel.items) items.push(x.root);
+  for (const d of S.dms) if (d.last) items.push(d.last);
+  for (const sv of S.servers) if (sv.last) items.push(sv.last);
+  for (const exp of [...P.inbox.map((x) => x.exp), ...reminderDeadlines()]) if (exp) items.push({ expiresAt: exp });
+  const next = nextDeadline(items, nowServer());
+  if (next) expiryTimer = setTimeout(purgeExpired, waitFor(next, nowServer()));
+}
+const newestLive = (key) => { const st = S.msgs[key]; return (st && !st.hasNewer && [...st.list].reverse().find((x) => !x.threadId)) || null; };
+// Everything whose time has come goes: from the conversations, threads, previews, inbox and reminders. The server
+// deletes them at the same moment and says so (message:delete-bulk / dm:delete), which then changes nothing here.
+function purgeExpired() {
+  if (!S.me) return;
+  const t = nowServer();
+  for (const [key, st] of Object.entries(S.msgs)) {
+    const ids = st.list.filter((m) => isExpired(m, t)).map((m) => m.id);
+    if (ids.length) onDeleteMessage(key, ids, { expired: true });
+  }
+  for (const [rootId, th] of Object.entries(S.threads)) {
+    if (!th.root) continue;
+    const replies = (th.list || []).filter((m) => isExpired(m, t)).map((m) => ({ id: m.id, threadId: rootId }));
+    if (replies.length) onDeleteChannelMessages(th.root.channelId, replies, { expired: true });
+    if (isExpired(th.root, t)) { delete S.threads[rootId]; if (S.thread && S.thread.rootId === rootId) closeThread(); }
+  }
+  // Threads in the Threads panel whose first message went (their cards, and their counts in the channel's badge).
+  const tp = S.threadsPanel;
+  const goneRoots = tp ? tp.items.filter((x) => isExpired(x.root, t)).map((x) => x.rootId) : [];
+  if (goneRoots.length) forgetThreads('c:' + tp.channelId, new Set(goneRoots));
+  const sidebar = () => { if (!S.view.serverId) later(renderSidebar); };
+  for (const d of S.dms) if (d.last && isExpired(d.last, t)) { d.last = newestLive('d:' + d.id); previewDm(d).then(sidebar); }
+  for (const g of groups()) if (g.last && isExpired(g.last, t)) { const c = textChannel(g); g.last = c ? newestLive('c:' + c.id) : null; previewGroup(g).then(sidebar); }
+  purgeInbox();
+  purgeReminders();
+  armClientExpiry();
+}
+// A disappearing message went: let go of everything this device kept of it. Its decrypted files (in memory), a voice
+// message playing, the image viewer, a reply or edit in progress, its notification, inbox entries and reminders
+// (which keep its words in this browser's storage) and open search results.
+// key: the conversation they were in, when known (its unread and mention counts are asked for again).
+function forgetCopies(msgs, ids, key = null) {
+  const urls = [];
+  for (const m of msgs) for (const f of filesOf(m)) { urls.push(f.url); if (f.th && f.th.url) urls.push(f.th.url); }
+  stopVoice(urls);
+  urls.forEach((u) => fileUrls.drop(u, true));
+  const v = document.querySelector('.viewer');
+  if (v && v._mids && [...ids].some((id) => v._mids.has(id))) v._close();
+  for (const c of [composers.main, S.thread ? composers.thread : null]) if (c && c.state.replyTo && ids.has(c.state.replyTo.id)) c.setReply(null);
+  if (S.editing && ids.has(S.editing)) { S.editing = null; toast('That message disappeared.'); }
+  closeNotificationFor(ids);
+  purgeInbox(ids);
+  purgeReminders(ids);
+  expiryListeners.forEach((fn) => fn(ids));
+  if (panelMode() === 'pins') later(renderPanel);
+  if (S.view.type === 'saved') later(renderMain);
+  // (Pings in a channel's threads count in its badge too.)
+  if (key ? S.unread.has(key) || S.mentions.has(key) || S.threadMentions.has(key) : S.unread.size || S.mentions.size || S.threadMentions.size) refreshUnreadSoon();
+  armClientExpiry();
+}
+// Unread and mention counts still include messages that have since disappeared: ask the server again, a moment after
+// its sweep, and at most every 30 seconds.
+let unreadTimer = 0;
+let unreadAsked = 0;
+function refreshUnreadSoon() {
+  if (unreadTimer) return;
+  unreadTimer = setTimeout(async () => {
+    unreadTimer = 0;
+    unreadAsked = Date.now();
+    try {
+      applyUserState([await api('GET', '/me/unread'), null, null]);
+      later(renderRail);
+      later(renderSidebar);
+    } catch { /* the next change asks again */ }
+  }, Math.max(1500, 30000 - (Date.now() - unreadAsked)));
 }
 
 // ======================================================================= navigation
@@ -1207,6 +1501,7 @@ async function setNotify(key, level, extra = {}) {
 async function setNotifySettings(body) {
   const r = await api('PUT', '/me/notify-settings', body);
   S.notifySettings = { dnd: r.dnd, tz: r.tz, previews: r.previews };
+  syncCallNotification();
   return r;
 }
 // Do Not Disturb: the status, or quiet hours right now.
@@ -1393,6 +1688,16 @@ function addInbox(entry) {
   list.unshift({ id: Math.random().toString(36).slice(2), at: Date.now(), read: false, ...entry });
   P.inbox = list;
   updateTitle();
+  if (entry.exp) armClientExpiry();
+}
+// Inbox entries keep a copy of a message's words on this device: one for a disappearing message goes with it (exp,
+// in the server's time), and so does one whose message disappeared (gone: ids).
+function purgeInbox(gone = new Set()) {
+  if (!S.me) return;
+  const list = P.inbox;
+  const t = nowServer();
+  const keep = list.filter((x) => !(x.exp && x.exp <= t) && !(x.msgId && gone.has(x.msgId)));
+  if (keep.length !== list.length) { P.inbox = keep; updateTitle(); }
 }
 function openInbox(anchor) {
   let tab = 'all';
@@ -1708,6 +2013,7 @@ function dmMenuItems(d) {
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('d:' + d.id) },
     { label: 'Mark as read', icon: 'check', action: () => markConvRead('d:' + d.id) },
     ...notifyItems('d:' + d.id),
+    ...disappearItems('d:' + d.id),
     '-',
     { label: 'View profile', icon: 'user', action: () => openProfileModal(u.id) },
     { label: 'Verify encryption', icon: 'shield', action: () => openSafetyNumber(u) },
@@ -1718,7 +2024,7 @@ function groupMenuItems(g) {
   const fav = P.favorites.includes('g:' + g.id);
   return [
     { label: fav ? 'Unpin conversation' : 'Pin conversation', icon: 'pin', action: () => toggleFavorite('g:' + g.id) },
-    ...(c ? [{ label: 'Mark as read', icon: 'check', action: () => markConvRead('c:' + c.id) }, ...notifyItems('c:' + c.id)] : []),
+    ...(c ? [{ label: 'Mark as read', icon: 'check', action: () => markConvRead('c:' + c.id) }, ...notifyItems('c:' + c.id), ...disappearItems('c:' + c.id), '-'] : []),
     { label: 'Rename group', icon: 'edit', action: () => renameGroup(g) },
     { label: 'Change group picture', icon: 'image', action: () => changeGroupIcon(g) },
     { label: 'Add people', icon: 'userPlus', action: () => openNewConversation(g) },
@@ -1848,6 +2154,7 @@ function channelMenuItems(c, server) {
     ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
     c.type === 'text' ? { label: 'Ignore @everyone and @here', checked: !!(pk && pk.suppressEveryone), action: () => setNotify(k, undefined, { suppressEveryone: !(pk && pk.suppressEveryone) }) } : null,
     ...(c.type === 'text' ? notifyItems(k) : []),
+    ...(c.type === 'text' ? disappearItems(k) : []),
     '-',
     { label: 'Copy channel link', icon: 'link', action: () => { copyText(`${location.origin}/#c/${c.id}`); toast('Link copied.'); } },
     edit ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
@@ -2113,6 +2420,7 @@ function drawHeader(head) {
         c.topic ? h('span', { class: 'head-topic', title: c.topic }, c.topic) : null),
       headTools(
         encBadge(() => openServerSecurity(server)),
+        timerButton(key),
         ibtn('search', 'Search this channel (Ctrl+K)', () => openSearch({ scope: key })),
         // Notification options live in the ⋯ menu; the bell only shows up as a reminder when it's muted.
         isMuted(key) ? ibtn('bellOff', 'Muted. Click to change.', (e) => menu(e.currentTarget, notifyMenu(key), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }) : null,
@@ -2128,6 +2436,7 @@ function drawHeader(head) {
         h('span', { class: 'head-topic' }, `${server.memberIds.length} members`)),
       headTools(
         encBadge(() => openServerSecurity(server)),
+        timerButton(key),
         call && !inCall ? ibtn('video', 'Start a video call', () => joinRoom(call.id, { video: true })) : null,
         call ? h('button', { class: `btn sm ${inCall ? 'danger' : callers ? 'primary' : 'ghost'}`, onclick: () => (inCall ? voice.leave() : joinRoom(call.id)) },
           icon(inCall ? 'phoneOff' : 'phone'), inCall ? 'Leave call' : callers ? `Join call (${callers})` : 'Call') : null,
@@ -2147,6 +2456,7 @@ function drawHeader(head) {
         sec.keyChanged(u)
           ? h('button', { class: 'head-badge warn', 'data-tip': 'This person\u2019s security key changed. Click to verify.', onclick: () => openSafetyNumber(u) }, icon('shield'), 'Key changed')
           : encBadge(() => openSafetyNumber(u), 'Compare safety numbers'),
+        timerButton(key),
         ...(() => {
           const room = dmRoom(d.id);
           const inCall = voice && voice.channelId === room;
@@ -2182,7 +2492,7 @@ function drawHeader(head) {
       headTools(h('button', { class: 'btn ghost sm', onclick: () => updates.trackDialog(() => renderMain()) }, icon('plus'), 'Track something')));
   } else if (v.type === 'saved') {
     head.append(h('div', { class: 'head-title' }, icon('bookmark', 'ic head-ic'), h('h1', null, 'Saved messages')),
-      headTools(h('span', { class: 'head-note' }, 'Synced to your devices. Only you can see them.')));
+      headTools(h('span', { class: 'head-note' }, 'Synced to your devices. Only you can see them. Saved messages from disappearing conversations disappear with them.')));
   } else if (server) {
     head.append(h('div', { class: 'head-title' }, h('h1', null, server.name)));
   }
@@ -2404,6 +2714,7 @@ function savedView() {
     }
     for (const it of state.items) {
       const m = it.message;
+      if (m && isExpired(m, nowServer())) continue; // disappeared (the server deletes the saved entry too)
       if (!m) {
         wrap.append(h('div', { class: 'saved-row unavailable' }, h('div', { class: 'saved-av-empty' }, icon('bookmark')),
           h('div', { class: 'saved-body' }, h('div', { class: 'saved-meta' }, h('span', null, `Saved ${fmtStamp(it.savedAt)}`)),
@@ -2492,7 +2803,9 @@ async function loadMessages(key, mode = 'latest') {
   let store = S.msgs[key];
   if (mode === 'latest' && store && store.loaded && !store.hasNewer) {
     trimStore(store, 120);
-    await decryptAll(key); return renderMessages(true);
+    await decryptAll(key);
+    dropExpired(store);
+    return renderMessages(true);
   }
   if (!store || (mode === 'latest' && store.hasNewer) || typeof mode === 'object') store = S.msgs[key] = { list: [], hasMore: true, hasNewer: false, loaded: false, loading: false };
   if (store.loading || (mode === 'older' && !store.hasMore) || (mode === 'newer' && !store.hasNewer)) return;
@@ -2511,13 +2824,16 @@ async function loadMessages(key, mode = 'latest') {
     if (mode !== 'newer') store.hasMore = res.hasMore;
     if (mode !== 'older') store.hasNewer = !!res.hasNewer;
     store.loaded = true;
+    const newLines = mergeTimerEvents(store, res.timerEvents);
     await decryptAll(key);
+    // The timer inside a message can say it's gone before the server has deleted it.
+    const hid = dropExpired(store);
     if (currentKey() !== key) return;
     const sc = $('#messages');
     if (mode === 'older') {
       const prevH = sc.scrollHeight;
       const prevTop = sc.scrollTop;
-      if (!prependOlder(sc, store, fresh)) renderMessages(false);
+      if (newLines || hid || !prependOlder(sc, store, fresh)) renderMessages(false);
       sc.scrollTop = sc.scrollHeight - prevH + prevTop;
       dropNewest(sc, store);
     } else if (mode === 'newer') {
@@ -2577,12 +2893,14 @@ function prependOlder(sc, store, fresh) {
   const firstMsg = store.list.find((x) => x.id === first.dataset.mid);
   const older = fresh.filter((m) => !firstMsg || m.id < firstMsg.id).sort((a, b) => (a.id < b.id ? -1 : 1));
   if (fresh.length !== older.length) return false;
+  // A timer line kept from before (a trimmed page) that now falls among these: a full redraw puts it in its place.
+  if (firstMsg && older.length && store.events && [...store.events.values()].some((e) => e.at <= firstMsg.createdAt && (!store.hasMore || e.at >= older[0].createdAt))) return false;
   const frag = document.createDocumentFragment();
   if (!store.hasMore) frag.append(welcomeBlock());
   let prev = null;
   for (const m of older) {
     if (!prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()) {
-      frag.append(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
+      frag.append(dayDivEl(m.createdAt));
       prev = null;
     }
     frag.append(messageEl(m, prev, 'main'));
@@ -2717,12 +3035,16 @@ function renderMessages(stick) {
   if (!store.hasMore) sc.append(welcomeBlock());
   const lastRead = S.unreadMarker === key ? S.markerId : null;
   let newShown = false;
-  let prev = null;
+  let prev = null; // the message above, for grouping (anything drawn in between breaks the group)
+  let day = null; // the day whose divider was drawn last
+  // A divider before the first thing of each day: a timer line gets its own day's, like a message.
+  const dayOf = (t) => { const d = new Date(t).toDateString(); if (d !== day) { sc.append(dayDivEl(t)); day = d; prev = null; } };
+  const lines = timerLines(store);
+  let li = 0;
+  const line = () => { const e = lines[li++]; dayOf(e.at); sc.append(sysLineEl(e)); prev = null; };
   for (const m of store.list) {
-    if (!prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()) {
-      sc.append(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
-      prev = null;
-    }
+    while (li < lines.length && lines[li].at <= m.createdAt) line();
+    dayOf(m.createdAt);
     if (!newShown && lastRead && m.id > lastRead && m.authorId !== S.me.id) {
       sc.append(h('div', { class: 'new-div', role: 'separator', 'aria-label': 'New messages', id: 'new-div' }, h('span', null, 'New messages')));
       newShown = true;
@@ -2731,6 +3053,7 @@ function renderMessages(stick) {
     sc.append(messageEl(m, prev, 'main'));
     prev = m;
   }
+  while (li < lines.length) line();
   if (stick) {
     const marker = sc.querySelector('.new-div');
     if (marker && marker.offsetTop > sc.clientHeight * 0.6) sc.scrollTop = marker.offsetTop - 80;
@@ -2776,13 +3099,15 @@ function welcomeBlock() {
     const u = getUser(d.userId);
     return h('div', { class: 'welcome' }, avatarEl(u, 72), nameEl(u, { tag: 'h2' }),
       h('p', null, `This is the start of your conversation with ${displayName(u)}.`),
-      h('p', { class: 'welcome-note' }, icon('lock'), 'Messages and files here are end-to-end encrypted. Only the two of you can read them.'));
+      h('p', { class: 'welcome-note' }, icon('lock'), 'Messages and files here are end-to-end encrypted. Only the two of you can read them.'),
+      timerWelcome('d:' + d.id));
   }
   const server = currentServer();
   if (isGroup(server)) {
     return h('div', { class: 'welcome' }, groupAvatar(server, 72), h('h2', null, groupName(server)),
       h('p', null, 'This is the start of your group.'),
-      h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only people in this group can read it.'));
+      h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only people in this group can read it.'),
+      timerWelcome(currentKey()));
   }
   const c = server.channels.find((x) => x.id === S.view.channelId);
   const th = server.theme || {};
@@ -2790,7 +3115,8 @@ function welcomeBlock() {
     h('p', null, c.topic || 'This is the start of the channel.'),
     th.welcome ? h('div', { class: 'server-welcome', html: md(th.welcome, { mentionName: S.me.username }) }) : null,
     h('div', { class: 'welcome-roles-slot' }, welcomeRoles(server)),
-    h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only members of this server can read it.'));
+    h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only members of this server can read it.'),
+    timerWelcome('c:' + c.id));
 }
 // "Pick your roles" at the start of a channel, while there's something to pick. Redrawn in place when a role is
 // marked or unmarked (server:update), since the message list itself isn't.
@@ -2947,7 +3273,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       h('span', { class: 'reply-spine' }), avatarEl(ru, 16), nameEl(ru, { cls: 'reply-name' }),
       h('span', { class: 'reply-text', html: rtext ? md(rtext, { inline: true }) : '<em>Attachment or encrypted message</em>' })));
   } else if (m.replyTo) {
-    el.append(h('div', { class: 'msg-reply gone' }, h('span', { class: 'reply-spine' }), 'Original message was deleted'));
+    el.append(h('div', { class: 'msg-reply gone' }, h('span', { class: 'reply-spine' }), 'Original message is no longer available'));
   }
   const gutter = h('div', { class: 'msg-gutter', dataset: { time: fmtTime(m.createdAt) } });
   if (isGrouped) gutter.append(h('time', { class: 'msg-hover-time', datetime: new Date(m.createdAt).toISOString() }, fmtTime(m.createdAt)));
@@ -3023,6 +3349,9 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     fresh ? h('span', { class: `thread-new${pinged ? ' ping' : ''}` }, `${pinged ? '@ ' : ''}${fresh >= 100 ? '99+' : fresh} new`) : null,
     m.threadLastAt ? h('span', null, `Last reply ${relTime(m.threadLastAt)}`) : null, icon('chevronRight')));
   }
+  // A disappearing message shows when it goes: next to its time, or after its text when it's grouped.
+  const exp = expBadge(m);
+  if (exp) (body.querySelector(':scope > .msg-head') || body.querySelector(':scope > .msg-text') || body).append(exp);
   el.append(gutter, body, messageTools(m, ctx));
   roveMessage(el, false);
   return el;
@@ -3211,7 +3540,8 @@ async function jumpToMessageId(id) {
     return jumpToMessage('c:' + loc.channelId, id);
   } catch (e) { toast(e.message, 'error'); }
 }
-// Links: /#m/<messageId> or /#c/<channelId>
+// Links: /#m/<messageId>, /#c/<channelId>, /#d/<dmId>, /#call/<room> (a call notification), /#invite/<code>
+// (an invite link the Android app was opened with).
 function openLinkFromHash() {
   const hsh = location.hash;
   if (!S.me || !hsh) return;
@@ -3221,7 +3551,35 @@ function openLinkFromHash() {
   if (hsh === '#updates') return setView({ type: 'updates' });
   if (hsh === '#study') return setView({ type: 'study' });
   m = hsh.match(/^#c\/([a-z0-9]+)$/i);
-  if (m) { const s = serverOfChannel(m[1]); if (s) openChannel(m[1], s.id); else toast('You don\u2019t have access to that channel.'); }
+  if (m) { const s = serverOfChannel(m[1]); if (s) openChannel(m[1], s.id); else toast('You don\u2019t have access to that channel.'); return; }
+  m = hsh.match(/^#d\/([a-z0-9]{1,64})$/i);
+  if (m) { if (S.dms.find((d) => d.id === m[1])) openDm(m[1]); else toast('That conversation isn\u2019t available.'); return; }
+  m = hsh.match(/^#call\/((?:dm:)?[a-z0-9]{1,64})$/i);
+  if (m) return openCallFromLink(m[1]);
+  m = hsh.match(/^#invite\/([A-Za-z0-9]{2,64})$/);
+  if (m) openJoinModal(m[1]);
+}
+// A call notification was tapped: open the conversation, and ring again if the call is still going (onRing
+// skips calls you're already in, Do Not Disturb and rings already showing). Only calls the server rings ring here
+// (a DM call with the other person in it, a group chat's call), so a #call/ link to a server's voice channel,
+// which anyone can post, never shows a made-up "incoming call" from whoever is sitting in it.
+function openCallFromLink(room) {
+  const inCall = (userId) => (S.voice[room] || []).some((x) => x.userId === userId);
+  let from = null;
+  if (room.startsWith('dm:')) {
+    const d = S.dms.find((x) => x.id === room.slice(3));
+    if (!d) return toast('That call isn\u2019t available.');
+    openDm(d.id);
+    if (d.userId && inCall(d.userId)) from = d.userId;
+  } else {
+    const s = serverOfChannel(room);
+    if (!s) return toast('You don\u2019t have access to that call.');
+    const c = textChannel(s);
+    if (c) openChannel(c.id, s.id);
+    const ch = channelById(room);
+    if (isGroup(s) && ch && ch.type === 'voice') from = ((S.voice[room] || []).find((x) => x.userId !== S.me.id) || {}).userId || null;
+  }
+  if (from && !(voice && voice.channelId === room)) onRing({ room, from, video: false });
 }
 
 // ---- message actions
@@ -3237,11 +3595,12 @@ function editBox(m, ctx) {
     if (!content.trim() && !filesOf(m).length) return deleteMessage(m);
     if (content === textOf(m)) return done();
     try {
-      // The poll and any link preview whose link is still in the text stay with the message (an edit never
-      // fetches a new preview).
+      // Everything else inside the message stays as it was: its poll, its disappearing timer (edits never move
+      // when a message goes) and any link preview whose link is still in the text (an edit never fetches a new
+      // preview).
       const still = linkedUrls(content, { skipSpoilers: true });
       const kept = linksOf(m).filter((x) => still.includes(x.url));
-      const payload = { t: content, f: filesOf(m), ...(m.dec && m.dec.p ? { p: m.dec.p } : {}), ...(kept.length ? { l: kept } : {}) };
+      const payload = { t: content, f: filesOf(m), ...(m.dec && m.dec.p ? { p: m.dec.p } : {}), ...(m.dec && m.dec.x ? { x: m.dec.x } : {}), ...(kept.length ? { l: kept } : {}) };
       if (m.dmId) await api('PATCH', `/dm-messages/${m.id}`, { ciphertext: await encryptFitting(payload, (p) => sec.encryptDm(m.dmId, p)) });
       else {
         await withKeyRetry(m.serverId, async () => {
@@ -3317,7 +3676,8 @@ function openForward(m) {
       } }, d.av.cloneNode(true), h('span', { class: 'quick-text' }, h('strong', null, d.label), h('span', null, d.sub)))));
   };
   input.addEventListener('input', draw);
-  mdl = modal({ title: 'Forward message', size: 'sm', body: h('div', { class: 'stack' }, input, list, note) });
+  const disNote = disappears(m) ? h('p', { class: 'field-hint dis-hint' }, icon('timer'), 'This message is set to disappear. Your copy follows the setting where you send it, and its files stop loading when the original disappears.') : null;
+  mdl = modal({ title: 'Forward message', size: 'sm', body: h('div', { class: 'stack' }, input, list, note, disNote) });
   draw();
   input.focus();
 }
@@ -3328,8 +3688,11 @@ function openForward(m) {
 const fileUrls = makeUrlCache();
 const fileJobs = new Map(); // url -> { job, listeners }: downloads in progress, shared by everyone asking
 const AUTOLOAD_MAX = 20 * 1024 * 1024; // bigger videos and songs wait for a click instead of downloading by themselves
+const goneFile = () => Object.assign(new Error('This file is no longer available.'), { code: 'gone' });
 function decryptedUrl(m, f) {
   if (!isUploadUrl(f.url)) return Promise.reject(new Error('This file isn\u2019t on this server.'));
+  // A disappearing message's files go with it: nothing is fetched or decrypted for one whose time has passed.
+  if (isExpired(m, nowServer())) return Promise.reject(goneFile());
   const ready = fileUrls.get(f.url);
   if (ready) return Promise.resolve(ready);
   if (!fileJobs.has(f.url)) {
@@ -3338,6 +3701,7 @@ function decryptedUrl(m, f) {
       // f.size is the plain size; the ciphertext adds a 12-byte IV and a 16-byte tag.
       const buf = await download(f.url, { expected: f.size ? f.size + 28 : 0, onProgress: (x) => listeners.forEach((fn) => fn(x)) });
       const plain = await sec.decryptAttachment(m, f, buf);
+      if (isExpired(m, nowServer())) throw goneFile(); // it went while downloading: don't keep a copy
       return fileUrls.put(f.url, new Blob([plain], { type: f.type || 'application/octet-stream' }));
     })();
     fileJobs.set(f.url, { job, listeners });
@@ -3536,6 +3900,8 @@ function openViewer(fromImg, { name, download } = {}) {
   const overlay = h('div', { class: 'viewer', role: 'dialog', 'aria-label': 'Image viewer', 'aria-modal': 'true' }, bar, stage,
     imgs.length > 1 ? h('button', { class: 'viewer-nav prev', 'aria-label': 'Previous image', onclick: () => show(idx - 1) }, icon('chevronLeft')) : null,
     imgs.length > 1 ? h('button', { class: 'viewer-nav next', 'aria-label': 'Next image', onclick: () => show(idx + 1) }, icon('chevronRight')) : null);
+  overlay._mids = new Set(imgs.map((i) => (i.closest('[data-mid]') || {}).dataset?.mid).filter(Boolean));
+  overlay._close = close;
   stage.addEventListener('click', (e) => { if (e.target === stage) close(); });
   stage.addEventListener('wheel', (e) => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.15 : 1 / 1.15); }, { passive: false });
   img.addEventListener('dblclick', () => { if (scale > 1) { scale = 1; tx = 0; ty = 0; apply(); } else zoom(2.5); });
@@ -3560,8 +3926,14 @@ async function onNewMessage(key, m) {
   const store = S.msgs[key];
   await decryptMessage(m);
   if (m.nonce) dropPendingSend(m.nonce);
-  if (key.startsWith('d:')) { S.previews[key] = previewText(m); }
-  else {
+  // Already past its time (a timer shorter than the trip here, or a server that held on to it): never shown.
+  if (isExpired(m, nowServer())) return;
+  if (key.startsWith('d:')) {
+    S.previews[key] = previewText(m);
+    // The preview goes at the message's time too, by the timer inside it (the server's copy can't be decrypted there).
+    const d = S.dms.find((x) => x.id === key.slice(2));
+    if (d && d.last && d.last.id === m.id) d.last.dec = m.dec;
+  } else {
     const s = S.servers.find((x) => x.id === m.serverId);
     if (isGroup(s)) { s.last = m; s.lastMessageAt = m.createdAt; S.previews['g:' + s.id] = previewText(m, true); }
   }
@@ -3577,17 +3949,20 @@ async function onNewMessage(key, m) {
       const near = sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160;
       const prev = store.list[store.list.length - 2];
       if (sc) {
-        const newDay = !prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString();
         // Real messages go above any of your own still "sending…".
         const firstPending = sc.querySelector('.msg.sending');
         const put = (node) => (firstPending ? sc.insertBefore(node, firstPending) : sc.append(node));
-        if (newDay) put(h('div', { class: 'day-div', role: 'separator' }, h('span', null, fmtDay(m.createdAt))));
-        put(messageEl(m, newDay ? null : prev, 'main'));
+        const newDay = shownDay(sc, firstPending) !== new Date(m.createdAt).toDateString();
+        if (newDay) put(dayDivEl(m.createdAt));
+        const above = firstPending ? firstPending.previousElementSibling : sc.lastElementChild;
+        put(messageEl(m, newDay || (above && above.classList.contains('sys-line')) ? null : prev, 'main'));
         ensureCurrentMessage(sc);
         if (near || m.authorId === S.me.id) sc.scrollTop = sc.scrollHeight;
       }
     }
   }
+  // Now that it's in the conversation and the preview: the timer looks there for the soonest deadline.
+  if (disappears(m)) armClientExpiry();
   const t = S.typing[key];
   if (t && t.has(m.authorId)) { clearTimeout(t.get(m.authorId)); t.delete(m.authorId); if (currentKey() === key) renderTyping(); }
   if (!m.threadId && !(S.lastIds[key] && S.lastIds[key] >= m.id)) S.lastIds[key] = m.id;
@@ -3611,7 +3986,7 @@ async function onNewMessage(key, m) {
     if ((isDm || mentioned || repliedToMe) && level !== 'muted' && !S.blocked.has(m.authorId)) {
       S.mentions.set(key, (S.mentions.get(key) || 0) + 1);
       // Several tabs open: only the first to claim this message makes a sound and shows it.
-      if (!quiet()) claimOnce(m.id).then((mineToShow) => { if (!mineToShow) return; playSound((mentioned && kind) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key); if (!document.hasFocus()) flashTaskbar(); });
+      if (!quiet()) claimOnce(m.id).then((mineToShow) => { if (!mineToShow) return; playSound((mentioned && kind) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key, m.id); if (!document.hasFocus()) flashTaskbar(); });
     } else if (level === 'all' && !S.blocked.has(m.authorId) && !quiet()) claimOnce(m.id).then((ok) => { if (ok) playSound('message'); });
   } else {
     // Reading along at the bottom: the marker follows (and your other devices clear their badge).
@@ -3621,7 +3996,7 @@ async function onNewMessage(key, m) {
     addInbox({
       type: mentioned ? 'mention' : 'reply', userId: m.authorId, msgId: m.id,
       title: `${displayName(getUser(m.authorId))} ${mentioned ? 'mentioned you' : 'replied to you'} in ${whereLabel(m)}`,
-      text: textOf(m).slice(0, 140),
+      text: textOf(m).slice(0, 140), ...expOf(m),
     });
   }
   // Reading this very channel: nothing in the server bar or channel list changes.
@@ -3631,14 +4006,14 @@ async function onNewMessage(key, m) {
   if ((isDm && !S.view.serverId) || (!isDm && S.view.serverId === m.serverId) || (isDm && isGroup(currentServer()))) later(renderSidebar);
   if (S.view.type === 'home') later(renderMain);
 }
-function notify(author, body, key) {
+function notify(author, body, key, msgId = null) {
   if (!('Notification' in window) || Notification.permission !== 'granted' || (!document.hidden && document.hasFocus())) return;
   if (localStorage.getItem('hearth.notify') === 'off') return;
   try {
     const priv = key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)));
     const shown = priv && isSharing() && !shareAllowed.has(key) ? 'New message (hidden while you share your screen)' : body.slice(0, 140);
     const n = new Notification(displayName(author), { body: shown, icon: author.avatar || undefined, tag: key });
-    rememberNotification(key, n);
+    rememberNotification(key, n, msgId); // a disappearing message's notification closes when it goes
     n.onclick = () => { window.focus(); if (window.hearthDesktop) window.hearthDesktop.focus(); if (key.startsWith('d:')) openDm(key.slice(2)); else { const s = serverOfChannel(key.slice(2)); if (s) openChannel(key.slice(2), s.id); } n.close(); };
   } catch { /* ignore */ }
 }
@@ -3653,22 +4028,29 @@ async function onUpdateMessage(key, m) {
   replaceMessageEl(m);
 }
 // Channel messages deleted (one, or a batch): thread replies leave their thread, the rest leave the channel.
-function onDeleteChannelMessages(channelId, list) {
+// expired: disappearing messages whose time came (this device's copies of them go too, see forgetCopies).
+function onDeleteChannelMessages(channelId, list, { expired = false } = {}) {
   const top = [];
   const threads = new Set();
   const pinged = (S.threadMentions.get('c:' + channelId) || 0) > 0;
   const roots = new Set(list.filter((x) => !x.threadId).map((x) => x.id)); // whole threads going (forgetThreads)
+  const removed = [];
   for (const { id, threadId } of list) {
     const t = threadId && S.threads[threadId];
     if (threadId) {
-      if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); threads.add(threadId); }
+      // (Only when it's still here: this app's own timer may have hidden a disappearing reply already.)
+      if (t) {
+        const had = t.list.find((x) => x.id === id);
+        if (had) { removed.push(had); t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); threads.add(threadId); }
+      }
       // A reply that may have counted here (in its thread's "N new", or as a ping in the channel's badge).
       const st = S.threadState[threadId];
       if (!roots.has(threadId) && (pinged || (st && (st.unread || st.mentions) && (!st.lastReadId || id > st.lastReadId)))) recheckThread(threadId);
     } else top.push(id);
   }
   if (S.thread && threads.has(S.thread.rootId)) renderPanel();
-  if (top.length) onDeleteMessage('c:' + channelId, top);
+  if (top.length) onDeleteMessage('c:' + channelId, top, { expired });
+  if (expired && removed.length) forgetCopies(removed, new Set(removed.map((x) => x.id)), 'c:' + channelId);
 }
 // Replies were deleted that a thread's counts may include: ask the server for its state again (with the channel's
 // thread pings), once per thread, a moment later and at slightly different times on different people's apps. A
@@ -3681,21 +4063,27 @@ function recheckThread(rootId) {
     api('GET', `/messages/${encodeURIComponent(rootId)}/thread?limit=1`).then((r) => applyThreadState(r.state)).catch(() => {});
   }, 300 + Math.floor(Math.random() * 700)));
 }
-function onDeleteMessage(key, id) {
+function onDeleteMessage(key, id, { expired = false } = {}) {
   const gone = new Set(Array.isArray(id) ? id : [id]);
+  // Threads these messages started go with them (their counts, and their cards in the Threads panel).
   if (key.startsWith('c:')) forgetThreads(key, gone);
   const store = S.msgs[key];
-  if (!store) return;
-  store.list = store.list.filter((x) => !gone.has(x.id));
-  store.list.forEach((x) => { if (x.reply && gone.has(x.reply.id)) x.reply = null; });
-  if (S.select && S.select.key === key) { for (const x of gone) S.select.ids.delete(x); renderSelectBar(); }
-  if (S.thread && gone.has(S.thread.rootId)) closeThread();
-  if (currentKey() === key) {
-    const sc = $('#messages');
-    const top = sc ? sc.scrollTop : 0;
-    renderMessages(false);
-    if (sc) sc.scrollTop = top;
+  const removed = store ? store.list.filter((x) => gone.has(x.id)) : [];
+  if (S.thread && gone.has(S.thread.rootId)) { if (expired) delete S.threads[S.thread.rootId]; closeThread(); }
+  if (store) {
+    store.list = store.list.filter((x) => !gone.has(x.id));
+    let quotes = false;
+    store.list.forEach((x) => { if (x.reply && gone.has(x.reply.id)) { x.reply = null; quotes = true; } });
+    if (S.select && S.select.key === key) { for (const x of gone) S.select.ids.delete(x); renderSelectBar(); }
+    // (Already hidden here when this app's own timer got there first: nothing to redraw.)
+    if ((removed.length || quotes) && currentKey() === key) {
+      const sc = $('#messages');
+      const top = sc ? sc.scrollTop : 0;
+      renderMessages(false);
+      if (sc) sc.scrollTop = top;
+    }
   }
+  if (expired) forgetCopies(removed, gone, key);
 }
 function renderTyping() {
   $$('.typing').forEach((el) => {
@@ -3736,6 +4124,9 @@ async function openThread(root, focusId, { from = null } = {}) {
     const res = await api('GET', `/messages/${root.id}/thread?${focusId ? `around=${encodeURIComponent(focusId)}` : 'limit=100'}`);
     const t = { root: res.root, list: res.messages, loaded: true, hasMore: !!res.hasMore, hasNewer: !!res.hasNewer, total: Math.max(res.messages.length, res.root.threadCount || 0) };
     await Promise.all([t.root, ...t.list].map(decryptMessage));
+    t.list = t.list.filter((x) => !isExpired(x, nowServer()));
+    if (isExpired(t.root, nowServer())) throw new Error('That thread no longer exists.');
+    if ([t.root, ...t.list].some(disappears)) setTimeout(armClientExpiry, 0);
     S.threads[root.id] = t;
     // Where you'd read up to before this: the "New" line, which stays put while the thread is open.
     if (S.thread && S.thread.rootId === root.id && res.state && res.state.unread > 0) S.thread.markerId = res.state.lastReadId;
@@ -3786,6 +4177,7 @@ function markThreadRead(rootId) {
 }
 async function onThreadMessage(m) {
   await decryptMessage(m);
+  if (isExpired(m, nowServer())) return;
   const t = S.threads[m.threadId];
   if (t && t.hasNewer && !t.list.find((x) => x.id === m.id)) {
     // Showing an older part of the thread: a new reply doesn't belong right after it. Your own reply takes you to
@@ -3809,8 +4201,10 @@ async function onThreadMessage(m) {
     }
   }
   countThreadReply(m);
+  // (After it's in the thread: the timer looks there for the soonest deadline.)
+  if (disappears(m)) armClientExpiry();
   if (m.authorId !== S.me.id && (mentionsMe(m) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId)) {
-    addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${displayName(getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140) });
+    addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${displayName(getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140), ...expOf(m) });
     if (!quiet() && notifyLevel('c:' + m.channelId) !== 'muted') claimOnce(m.id).then((ok) => { if (ok) playSound(mentionKind(m) || 'reply'); });
   }
 }
@@ -4051,8 +4445,9 @@ async function pinsPanel(el) {
   el.append(list);
   try {
     const url = key.startsWith('c:') ? `/channels/${encodeURIComponent(key.slice(2))}/pins` : `/dms/${encodeURIComponent(key.slice(2))}/pins`;
-    const pins = await api('GET', url);
-    await Promise.all(pins.map(decryptMessage));
+    const all = await api('GET', url);
+    await Promise.all(all.map(decryptMessage));
+    const pins = all.filter((m) => !isExpired(m, nowServer()));
     if (currentKey() !== key || panelMode() !== 'pins') return;
     clear(list);
     if (key.startsWith('c:')) pinHistory(el, key.slice(2));
@@ -4203,14 +4598,26 @@ async function loadThreads(channelId, more = false) {
     await Promise.all(res.threads.map((t) => decryptMessage(t.root)));
     if (S.threadsPanel !== tp) return;
     const have = new Set(tp.items.map((t) => t.rootId));
-    tp.items.push(...res.threads.filter((t) => !have.has(t.rootId)));
+    // A thread whose first message has disappeared (by its own timer, before the server's sweep) isn't listed; one
+    // that will is dropped when it goes (purgeExpired).
+    const live = res.threads.filter((t) => !isExpired(t.root, nowServer()));
+    tp.items.push(...live.filter((t) => !have.has(t.rootId)));
+    if (live.some((t) => disappears(t.root))) setTimeout(armClientExpiry, 0);
     tp.hasMore = !!res.hasMore; tp.next = res.next; tp.error = null;
-    for (const t of res.threads) applyThreadState({ rootId: t.rootId, channelId, unread: t.unread, mentions: t.mentions, lastReadId: t.lastReadId, lastId: t.lastReplyId }, { quiet: true });
-    // The first page carries the channel's thread pings: its badge is right once the panel opens.
-    if (res.threadMentions !== undefined) { setThreadPings('c:' + channelId, res.threadMentions); updateTitle(); later(renderRail); later(renderSidebar); }
+    // Only the listed threads get their state: one left out above (this app's clock or the sender's timer is ahead of
+    // the server's) must not count in the Threads button or the badge again after purgeExpired dropped it.
+    const dropped = res.threads.filter((t) => !live.includes(t));
+    for (const t of dropped) delete S.threadState[t.rootId];
+    for (const t of live) applyThreadState({ rootId: t.rootId, channelId, unread: t.unread, mentions: t.mentions, lastReadId: t.lastReadId, lastId: t.lastReplyId }, { quiet: true });
+    // The first page carries the channel's thread pings (less those in threads left out): its badge is right once the
+    // panel opens.
+    if (res.threadMentions !== undefined) {
+      setThreadPings('c:' + channelId, Math.max(0, res.threadMentions - dropped.reduce((n, t) => n + (t.mentions || 0), 0)));
+      updateTitle(); later(renderRail); later(renderSidebar);
+    }
     // The same threads' lines under their messages, if they're on screen.
     const store = currentKey() === 'c:' + channelId && S.msgs['c:' + channelId];
-    if (store) for (const t of res.threads) { const m = store.list.find((x) => x.id === t.rootId); if (m) replaceMessageEl(m); }
+    if (store) for (const t of live) { const m = store.list.find((x) => x.id === t.rootId); if (m) replaceMessageEl(m); }
   } catch (e) { tp.error = e.message; } finally { tp.loading = false; }
   if (S.threadsPanel === tp) { redrawThreads(); if (S.view.channelId === channelId) renderHeader(); }
 }
@@ -4360,6 +4767,7 @@ function createComposer({ id, key, threadId, placeholder }) {
       sendBtn),
     fileIn);
   const slowNote = h('div', { class: 'slow-note', hidden: true });
+  const disNote = h('div', { class: 'dis-note', hidden: true });
   let slowUntil = 0;
   const startSlow = (secs) => {
     slowUntil = Date.now() + secs * 1000;
@@ -4374,7 +4782,7 @@ function createComposer({ id, key, threadId, placeholder }) {
   // Slash commands (bots.js): the bar with usage and the encryption warning, and bot answers only you can see.
   const cmdBar = h('div', { class: 'cmd-bar', hidden: true });
   const ephBox = h('div', { class: 'eph-list' });
-  const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, ephBox, cmdBar, extras, box, slowNote, typing);
+  const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, ephBox, cmdBar, extras, box, disNote, slowNote, typing);
   const slashChannel = () => { const kk = key(); if (id !== 'main' || !kk || !kk.startsWith('c:')) return null; const s = serverOfChannel(kk.slice(2)); return s && !isGroup(s) ? kk.slice(2) : null; };
   const renderCmdBar = () => {
     const ch = slashChannel();
@@ -4672,6 +5080,9 @@ function createComposer({ id, key, threadId, placeholder }) {
     ta.placeholder = noSend ? 'Read only' : placeholder || placeholderFor(kk);
     slowNote.hidden = !(ch && ch.slowmode > 0 && !canIn(ch, PERMS.MANAGE_MESSAGES));
     if (!slowNote.hidden && !slowUntil) slowNote.textContent = `Slowmode is on: one message every ${fmtDuration(ch.slowmode)}`;
+    const secs = kk ? convSecs(kk) : 0;
+    clear(disNote).hidden = !secs;
+    if (secs) disNote.append(icon('timer'), h('span', null, `New messages disappear after ${disLabel(secs).toLowerCase()}.`));
     update();
   }
   // Sending never blocks typing: the box clears at once, the message shows up right away as
@@ -4712,10 +5123,12 @@ function createComposer({ id, key, threadId, placeholder }) {
     renderExtras(); autosize(); update();
     const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)), (x) => x.toString(16).padStart(2, '0')).join('');
     if (id === 'main' && !tid) showPendingSend(kk, nonce, poll ? `\uD83D\uDCCA ${poll.q}` : files.some((f) => f.voice) ? '\uD83C\uDFA4 Voice message' : text, files.some((f) => f.voice) ? 0 : files.length, replyTo);
-    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState }));
+    // The disappearing timer they wrote it under (the note above the box): a weaker one by the time it goes out asks first.
+    const wrote = convSecs(kk);
+    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState, wrote }));
     return queue;
   }
-  async function deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState }) {
+  async function deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState, wrote }) {
     const bar = upStatus.querySelector('.bar');
     const totalBytes = files.reduce((a, p) => a + (p.file ? p.file.size : 0), 0);
     let retrying = null;
@@ -4733,7 +5146,7 @@ function createComposer({ id, key, threadId, placeholder }) {
     uploading = ctl;
     try {
       const f = await uploadEncryptedFiles(kk, files, setProgress, { signal: ctl && ctl.signal, onStatus });
-      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}), ...(links ? { l: links } : {}) }, replyTo, nonce);
+      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}), ...(links ? { l: links } : {}) }, replyTo, nonce, { wrote });
       files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
       playSound('sent');
       // Normally the live connection delivers it first; this covers a slow or dropped connection.
@@ -4847,7 +5260,8 @@ function mentionedIds(server, text) {
 const CIPHER_MAX = 64000;
 // Encrypts the payload, or if that comes out too long, the same message with less of its link preview: first
 // without the picture, then without the card (linkpreview.js payloadVariants). A message too long even then
-// goes as it is, and the server's usual "too big" answer applies.
+// goes as it is, and the server's usual "too big" answer applies. Everything else in it (the disappearing timer
+// x among them) stays in every variant.
 async function encryptFitting(payload, encrypt) {
   let out;
   for (const p of payloadVariants(payload)) {
@@ -4856,8 +5270,43 @@ async function encryptFitting(payload, encrypt) {
   }
   return out;
 }
-async function sendTo(key, threadId, payload, replyTo, nonce) {
-  const files = (payload.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
+// Disappearing messages: the conversation's timer goes inside the encrypted message (x, so readers' apps hide it on
+// time even if the server doesn't delete it) and alongside it (ttl, so the server stamps the same one). If someone
+// changed the timer meanwhile, the server says so (409 disappear_changed): fetch the new one and send again, once.
+// wrote: the timer in force when they wrote it (pressed Send). Turned off or made longer since, the message isn't
+// sent unless they say so: they wrote it expecting it to disappear.
+async function sendTo(key, threadId, payload, replyTo, nonce, { wrote = convSecs(key) } = {}) {
+  const agreed = await stillSend(key, wrote);
+  try { return await sendOnce(key, threadId, payload, replyTo, nonce); } catch (e) {
+    if (!(e.status === 409 && e.code === 'disappear_changed')) throw e;
+    await refreshTimer(key);
+    await stillSend(key, agreed);
+    return sendOnce(key, threadId, payload, replyTo, nonce);
+  }
+}
+// Asks when the timer got weaker than the one a message was written under. Returns the timer they've now agreed to;
+// throws (not sent) when they'd rather not.
+async function stillSend(key, wrote) {
+  const now = convSecs(key);
+  if (!weakerTimer(wrote, now)) return wrote;
+  const where = convTitle(key);
+  const yes = await confirmDialog(now ? {
+    title: 'Disappearing messages changed',
+    text: `Disappearing messages in ${where} were changed to ${disLabel(now).toLowerCase()} after you wrote your message. Send it anyway? It will disappear after ${disLabel(now).toLowerCase()} instead of ${disLabel(wrote).toLowerCase()}.`,
+    confirm: 'Send anyway',
+  } : {
+    title: 'Disappearing messages turned off',
+    text: `Disappearing messages were turned off in ${where} after you wrote your message. Send it anyway? It won’t disappear.`,
+    confirm: 'Send anyway',
+  });
+  if (!yes) throw Object.assign(new Error('Not sent: disappearing messages changed here.'), { code: 'disappear_weaker' });
+  return now;
+}
+async function sendOnce(key, threadId, payload0, replyTo, nonce) {
+  const files = (payload0.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
+  const ttl = convSecs(key);
+  const { x, ...rest } = payload0;
+  const payload = ttl ? { ...rest, x: ttl } : rest;
   if (key.startsWith('c:')) {
     const channelId = key.slice(2);
     const server = serverOfChannel(channelId);
@@ -4866,11 +5315,11 @@ async function sendTo(key, threadId, payload, replyTo, nonce) {
       const { ciphertext, epoch } = await encryptFitting(payload, (p) => sec.encryptChannel(server.id, channelId, p));
       // @everyone / @here: the server checks the sender may use it, then counts and pushes it as a ping.
       const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || '')) ? true : undefined;
-      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), everyone, nonce });
+      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), everyone, nonce, ttl });
     });
   }
   const ciphertext = await encryptFitting(payload, (p) => sec.encryptDm(key.slice(2), p));
-  return api('POST', `/dms/${key.slice(2)}/messages`, { ciphertext, replyTo, files, nonce });
+  return api('POST', `/dms/${key.slice(2)}/messages`, { ciphertext, replyTo, files, nonce, ttl });
 }
 // "Sending…" copies of your own messages, shown until the real one arrives.
 const pendingSends = new Map(); // nonce -> { key, text, files, replyTo, el }
@@ -5213,6 +5662,9 @@ function openSearch({ scope = null } = {}) {
   let lastHits = 0;
   let closed = false;
   const gone = new Set(); // results deleted (or hidden from us) since the search found them
+  // Disappearing messages that go while this is open: forget the decrypted copies found so far, too.
+  const onExpired = (ids) => { for (const sc of scans.values()) for (const id of ids) sc.items.delete(id); ids.forEach((id) => gone.add(id)); if (!closed) draw(); };
+  expiryListeners.add(onExpired);
   const input = h('input', { class: 'search-main', placeholder: scope ? 'Search this conversation' : 'Search messages, people, channels, servers', 'aria-label': 'Search', autocomplete: 'off', spellcheck: 'false', 'aria-controls': 'search-results', 'aria-autocomplete': 'list' });
   const chipsEl = h('div', { class: 'search-chips' });
   const noteEl = h('div', { class: 'search-note', 'aria-live': 'polite' });
@@ -5296,6 +5748,7 @@ function openSearch({ scope = null } = {}) {
         await Promise.all(res.messages.map((m) => decryptMessage(m).catch(() => {})));
         if (stale()) return;
         for (const m of res.messages) {
+          if (isExpired(m, nowServer())) continue;
           if (readable(m)) sc.items.set(m.id, { m, key: keyOfMessage(m) });
           else sc.unreadable++;
         }
@@ -5321,8 +5774,9 @@ function openSearch({ scope = null } = {}) {
   const viewOf = (m) => ({ text: textOf(m), files: filesOf(m), edited: !!m.editedAt, pinned: !!m.pinnedAt, createdAt: m.createdAt, get imageLinks() { return extractImageUrls(textOf(m)).length; } });
   function messageHits(p) {
     const found = new Map();
+    const t = nowServer();
     const consider = (m, key) => {
-      if (found.has(m.id) || !readable(m) || !inPlace(key, m, p.where) || (p.fromId && m.authorId !== p.fromId)) return;
+      if (found.has(m.id) || !readable(m) || isExpired(m, t) || !inPlace(key, m, p.where) || (p.fromId && m.authorId !== p.fromId)) return;
       if (privateHidden(key) || S.blocked.has(m.authorId)) return;
       if (tab === 'files' && !filesOf(m).length) return;
       if (tab === 'links' && !/https?:\/\//i.test(textOf(m))) return;
@@ -5526,7 +5980,7 @@ function openSearch({ scope = null } = {}) {
       if (rows[sel]) rows[sel].action(); else searchHistory.add(input.value);
     }
   });
-  const mdl = modal({ size: 'search', className: 'search-modal', label: 'Search', onClose: () => { closed = true; }, body: h('div', { class: 'search' },
+  const mdl = modal({ size: 'search', className: 'search-modal', label: 'Search', onClose: () => { closed = true; expiryListeners.delete(onExpired); }, body: h('div', { class: 'search' },
     h('div', { class: 'search-bar' }, icon('search'), input, h('kbd', null, 'Esc'), h('button', { class: 'icon-btn search-close', 'aria-label': 'Close search', onclick: () => mdl.close() }, icon('close'))),
     chipsEl, noteEl, tabsEl, results,
     h('div', { class: 'search-foot' }, h('span', { class: 'search-keys' }, h('kbd', null, '↑'), h('kbd', null, '↓'), ' to move'), h('span', { class: 'search-keys' }, h('kbd', null, 'Enter'), ' to open'),
@@ -5778,7 +6232,9 @@ function openAddServer() {
     title: 'Add a server', size: 'sm',
     body: h('div', { class: 'stack' },
       h('button', { class: 'choice', onclick: () => { m.close(); openCreateServer(); } }, icon('plus', 'ic choice-ic'), h('span', null, h('strong', null, 'Create my own'), h('span', null, 'Start a space for you and your friends.'))),
-      h('button', { class: 'choice', onclick: () => { m.close(); openJoinModal(''); } }, icon('link', 'ic choice-ic'), h('span', null, h('strong', null, 'Join with an invite'), h('span', null, 'Paste an invite link or code from a friend.')))),
+      h('button', { class: 'choice', onclick: () => { m.close(); openJoinModal(''); } }, icon('link', 'ic choice-ic'), h('span', null, h('strong', null, 'Join with an invite'), h('span', null, 'Paste an invite link or code from a friend.'))),
+      h('button', { class: 'choice', onclick: () => { m.close(); openDiscordImport({ S, sec, openServer, back: openAddServer }); } }, icon('download', 'ic choice-ic'),
+        h('span', null, h('strong', null, 'Import from Discord'), h('span', null, 'Start with a Discord server’s roles and channels.')))),
   });
 }
 function openCreateServer() {
@@ -5831,7 +6287,10 @@ function openJoinModal(code) {
     body: h('div', { class: 'stack' }, field('Invite link or code', input), preview,
       // In a browser on a computer: hand the invite to the installed desktop app instead.
       code && !window.hearthDesktop && !/Android|iPhone|iPad/.test(navigator.userAgent)
-        ? h('p', { class: 'field-hint' }, 'Have the desktop app? ', h('a', { href: `hearth://invite/${encodeURIComponent(code)}` }, 'Open this invite in the app')) : null),
+        ? h('p', { class: 'field-hint' }, 'Have the desktop app? ', h('a', { href: `hearth://invite/${encodeURIComponent(code)}` }, 'Open this invite in the app'))
+        // In a phone's browser: the Hearth Android app takes the same link.
+        : code && !androidApp.on && /Android/.test(navigator.userAgent)
+          ? h('p', { class: 'field-hint' }, 'Have the Hearth app? ', h('a', { href: `hearth://invite/${encodeURIComponent(code)}` }, 'Open this invite in the app')) : null),
     actions: [
       { label: 'Cancel' },
       { label: 'Join server', kind: 'primary', action: async () => {
@@ -6374,6 +6833,8 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   const cat = categoryField(server, ch0.category);
   const slow = h('select', { class: 'input' }, [[0, 'Off'], [5, '5 seconds'], [10, '10 seconds'], [30, '30 seconds'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [3600, '1 hour'], [21600, '6 hours']].map(([v, l]) => h('option', { value: String(v) }, l)));
   slow.value = String(ch0.slowmode || 0);
+  const dis = h('select', { class: 'input' }, timerChoices().map((v) => h('option', { value: String(v) }, disLabel(v))));
+  dis.value = String(ch0.disappear || 0);
   const tabs = h('div', { class: 'seg' });
   const body = h('div', { class: 'stack' });
   const scoped = PERM_GROUPS.flatMap(([, l]) => l).filter(([k]) => (c.type === 'voice'
@@ -6392,7 +6853,8 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
     const save = body.closest('.modal') && body.closest('.modal').querySelector('.modal-foot .btn.primary');
     if (save) save.hidden = tab === 'hooks';
     if (tab === 'overview') {
-      body.append(field('Channel name', name), ...(c.type === 'text' ? [field('Topic', topic), field('Slowmode', slow, 'How long people wait between messages. Anyone with Manage Messages skips it.')] : []), field('Category', cat.el));
+      body.append(field('Channel name', name), ...(c.type === 'text' ? [field('Topic', topic), field('Slowmode', slow, 'How long people wait between messages. Anyone with Manage Messages skips it.'),
+        field('Disappearing messages', dis, 'New messages disappear this long after they\u2019re sent. Messages already here aren\u2019t affected.')] : []), field('Category', cat.el));
       return;
     }
     // Webhooks save as you go (webhooks.js). Enter in its fields stays there: the dialog would otherwise take it as
@@ -6443,6 +6905,9 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
         // Each part only when it's yours to change here, so one refusal doesn't stop the other from saving.
         if (mayEdit) await api('PATCH', `/channels/${c.id}`, { name: name.value, topic: topic.value, category: cat.input.value.trim(), slowmode: +slow.value });
         if (mayPerms) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
+        // The timer has its own route, so every change is logged and shown in the channel. Last, so the rest is saved
+        // either way; refused, the dialog shows why and stays open, and cancelling the question keeps it open too.
+        if (mayEdit && c.type === 'text' && +dis.value !== (fresh().disappear || 0) && !(await setDisappearing('c:' + c.id, +dis.value, { quiet: true, raise: true }))) return false;
         toast('Channel saved.');
       } } : null,
     ].filter(Boolean),
@@ -6611,12 +7076,16 @@ function setupServiceWorker() {
 }
 const b64url = (s) => { const p = '='.repeat((4 - (s.length % 4)) % 4); const b = atob((s + p).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, (c) => c.charCodeAt(0)); };
 async function pushStatus() {
+  if (androidApp.on) await androidApp.ready;
   if (!app.push.supported()) return 'unsupported';
+  if (androidApp.push) return androidPushStatus();
   if (Notification.permission === 'denied') return 'blocked';
   const reg = await navigator.serviceWorker.ready;
   return (await reg.pushManager.getSubscription()) ? 'on' : 'off';
 }
-async function enablePush({ quiet = false } = {}) {
+async function enablePush({ quiet = false, choose = false } = {}) {
+  if (androidApp.on) await androidApp.ready;
+  if (androidApp.push && app.push.supported()) return enableAndroidPush({ quiet, choose });
   if (!app.push.supported()) throw new Error(/iPhone|iPad/.test(navigator.userAgent) && !isStandalone() ? 'On iPhone and iPad, add Hearth to your Home Screen first, then turn this on from the app.' : 'This browser doesn\u2019t support push notifications.');
   if (Notification.permission !== 'granted') {
     if (quiet) return;
@@ -6631,11 +7100,74 @@ async function enablePush({ quiet = false } = {}) {
   await api('POST', '/push/subscribe', { subscription: sub.toJSON() });
   localStorage.setItem('hearth.push', 'on');
 }
-async function disablePush() {
-  localStorage.setItem('hearth.push', 'off');
+// signOut: nobody chose "off" (the next person to sign in here can be offered push again).
+async function disablePush({ signOut = false } = {}) {
+  if (signOut) localStorage.removeItem('hearth.push'); else localStorage.setItem('hearth.push', 'off');
+  if (androidApp.push) {
+    const endpoint = localStorage.getItem('hearth.push.endpoint');
+    if (endpoint) await api('POST', '/push/unsubscribe', { endpoint }).catch(() => {});
+    await androidApp.push.unregister();
+    localStorage.removeItem('hearth.push.endpoint');
+    return;
+  }
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();
   if (sub) { await api('POST', '/push/unsubscribe', { endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe(); }
+}
+
+// ---- push in the Android app: the app's push registration (android-push.js), subscribed here like a browser's
+async function androidPushStatus() {
+  const st = await androidApp.push.state();
+  if (st.state === 'blocked' || androidApp.notify === 'denied') return 'blocked';
+  if (st.state === 'registered' && localStorage.getItem('hearth.push') === 'on') return 'on';
+  if (st.state === 'noDistributor') return 'nodistributor';
+  if (st.state === 'failed') return 'failed';
+  return 'off';
+}
+let androidEnabling = 0; // a subscribe in progress: the push app's own change events wait for it
+async function enableAndroidPush(opts = {}) {
+  androidEnabling++;
+  try { await subscribeAndroidPush(opts); } finally { androidEnabling--; }
+}
+async function subscribeAndroidPush({ quiet = false, choose = false } = {}) {
+  if (Notification.permission !== 'granted') {
+    if (quiet) return;
+    if ((await Notification.requestPermission()) !== 'granted') throw new Error('Notifications are turned off for Hearth. Turn them on in Android Settings \u2192 Apps \u2192 Hearth \u2192 Notifications.');
+  }
+  const { publicKey } = await api('GET', '/push/key');
+  let st = await androidApp.push.state();
+  if (choose || st.state !== 'registered' || st.vapid !== String(publicKey || '').replace(/=+$/, '') || !st.p256dh) {
+    // At start-up nothing pops up: no push app list, no questions. Only a tap in Settings (or the offer) does.
+    if (quiet && !st.distributor) return;
+    st = await androidApp.push.register(publicKey, { choose });
+  }
+  const prev = localStorage.getItem('hearth.push.endpoint');
+  await api('POST', '/push/subscribe', { subscription: { endpoint: st.endpoint, keys: { p256dh: st.p256dh, auth: st.auth } }, replaces: prev && prev !== st.endpoint ? prev : undefined });
+  localStorage.setItem('hearth.push.endpoint', st.endpoint);
+  localStorage.setItem('hearth.push', 'on');
+}
+// Once per start: keep the server's copy of this phone's push address current when the push app changes it,
+// and offer push once to someone who never decided.
+let androidPushWatched = false;
+async function androidPushAtStart() {
+  await androidApp.ready;
+  if (!androidApp.push || !app.push.supported() || androidPushWatched) return;
+  androidPushWatched = true;
+  androidApp.push.onChange((st) => {
+    if (localStorage.getItem('hearth.push') !== 'on' || androidEnabling) return;
+    if (st.state === 'registered' && st.endpoint !== localStorage.getItem('hearth.push.endpoint')) enablePush({ quiet: true }).catch(() => {});
+  });
+  // (Not over an update offer, which shares its place on screen: it's offered again next start.)
+  if (localStorage.getItem('hearth.push') !== null || androidApp.notify === 'denied' || document.querySelector('.push-offer, .update-bar')) return;
+  const no = () => { localStorage.setItem('hearth.push', 'off'); bar.remove(); };
+  const bar = h('div', { class: 'push-offer', role: 'status' }, icon('bell'),
+    h('span', null, 'Get notifications when Hearth is closed?'),
+    h('button', { class: 'btn primary sm', onclick: async () => {
+      bar.remove();
+      try { await enablePush(); toast('Notifications are on, even when Hearth is closed.'); } catch (e) { if (e.code !== 'CANCELLED') toast(e.message, 'error'); }
+    } }, 'Turn on'),
+    h('button', { class: 'btn ghost sm', onclick: no }, 'Not now'));
+  document.body.append(bar);
 }
 
 // ======================================================================= Terms of Service
@@ -6710,7 +7242,8 @@ function openReport({ message, user, ctx = 'main' }) {
       message ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'These messages will be shared with the admins'),
         h('label', { class: 'tos-check' }, h('input', { type: 'checkbox', checked: true, onchange: (e) => { includeContext = e.target.checked; drawPreview(); } }), h('span', null, 'Include up to 4 earlier messages for context')),
         preview,
-        h('p', { class: 'field-hint' }, 'Messages are end-to-end encrypted, so admins can only see what you share here.')) : null,
+        h('p', { class: 'field-hint' }, 'Messages are end-to-end encrypted, so admins can only see what you share here.'),
+        disappears(message) ? h('p', { class: 'field-hint dis-hint' }, icon('timer'), `Reporting sends the text of these messages to this Hearth\u2019s staff${shareable ? ` (and ${displayName(target)}\u2019s to the moderators of ${shareable.name}, if you show it to them)` : ''}, who keep it with the report after the messages disappear here.`) : null) : null,
       h('p', { class: 'field-hint' }, 'In danger right now? Contact your local emergency services.')),
     actions: [
       { label: 'Cancel' },
@@ -6748,6 +7281,19 @@ function videoEl(key, track, mirror) {
   return v;
 }
 const stageSpotlight = new Map(); // room -> tile key
+// Android app: keeps the call (and the mic) going with the screen locked, with Hang up in a notification. Also
+// called when the lock-screen setting changes, so the notification's title follows it.
+function syncCallNotification() {
+  if (androidApp.callState && voice) androidApp.callState({ inCall: !!voice.channelId, title: voice.channelId ? callTitle(voice.channelId) : '' });
+}
+// What the Android app's call notification says. Android shows it on the lock screen too (unless the phone is set
+// to hide sensitive content), so it names who or where only with "Show who and where on the lock screen" on, like
+// push notifications (server/usability.js shapePush).
+function callTitle(room) {
+  if ((S.notifySettings || {}).previews !== 'names') return 'In a call';
+  const t = roomTitle(room);
+  return room.startsWith('dm:') ? `Call with ${t}` : t === 'Call' ? 'In a call' : `In a call \u00b7 ${t}`;
+}
 function roomTitle(room) {
   if (room.startsWith('dm:')) { const d = S.dms.find((x) => x.id === room.slice(3)); return d ? displayName(getUser(d.userId)) : 'Call'; }
   const c = channelById(room); const s = c && serverOfChannel(c.id);

@@ -7,6 +7,7 @@ import * as E2EE from './e2ee.js';
 import { api } from './api.js';
 import { cleanFiles } from './attachments.js';
 import { cleanLinks } from './linkpreview.js';
+import { cleanX } from './disappear.js';
 
 // The news bot's account (server/newsbot.js): the only one that still posts plaintext channel messages.
 const NEWS_BOT_ID = 'newsbot00000000000001';
@@ -417,7 +418,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const { payload, signedBy } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: keys.map((k) => k.key), text });
       const how = signedBy ? keys.find((k) => k.key === signedBy).trust : null;
       return {
-        t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), ...linksIn(payload),
+        t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload),
         verified: how === 'now' || how === 'pinned', ...(how && how !== 'now' ? { keyNote: how } : {}),
       };
     } catch {
@@ -503,7 +504,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       for (const { key, trust: how } of await dmKeys(dmId, at)) {
         try {
           const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub: key, dmId, authorId, text });
-          return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), ...linksIn(payload), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
+          return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
         } catch { /* not this key */ }
       }
       throw new Error('Missing key');

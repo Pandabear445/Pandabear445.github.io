@@ -3,6 +3,7 @@ import { h, clear, icon, toast, fmtStamp, fmtDay, fmtTime } from './util.js';
 import { api } from './api.js';
 import { modal, confirmDialog, field, menu } from './ui.js';
 import { icsText } from './ics.js';
+import { deadline } from './disappear.js';
 
 let X = null; // the app's helpers: S, getUser, displayName, avatarEl, socket(), notify, playSound, jump, addInbox, openChannel
 export function initFeatures(ctx) { X = ctx; }
@@ -152,6 +153,17 @@ export function voiceButton(getComposer, onSend) {
   return btn;
 }
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+// Voice messages loaded so far, by file: one from a disappearing message stops when the message goes (the player
+// isn't in the page, so taking the message off the screen alone wouldn't stop it).
+const voiceAudio = new Map(); // file url -> Audio
+export function stopVoice(urls) {
+  for (const u of urls) {
+    const a = voiceAudio.get(u);
+    if (!a) continue;
+    voiceAudio.delete(u);
+    try { a.pause(); a.removeAttribute('src'); a.load(); } catch { /* already stopped */ }
+  }
+}
 // A voice message in the chat: play button, progress and length. The file decrypts when played.
 export function voiceEl(f, getUrl) {
   const audio = new Audio();
@@ -169,7 +181,7 @@ export function voiceEl(f, getUrl) {
   btn.addEventListener('click', async () => {
     if (!loaded) {
       btn.disabled = true;
-      try { audio.src = await getUrl(); loaded = true; } catch { toast('Couldn’t load that voice message.', 'error'); return; } finally { btn.disabled = false; }
+      try { audio.src = await getUrl(); loaded = true; voiceAudio.set(f.url, audio); } catch { toast('Couldn’t load that voice message.', 'error'); return; } finally { btn.disabled = false; }
     }
     document.querySelectorAll('.vm audio').forEach(() => {});
     if (audio.paused) audio.play().catch(() => {}); else audio.pause();
@@ -406,20 +418,37 @@ export function onEventStarting(e) {
 const RKEY = () => `hearth.reminders.${X.S.me.id}`;
 const getR = () => { try { return JSON.parse(localStorage.getItem(RKEY()) || '[]'); } catch { return []; } };
 const setR = (v) => { try { localStorage.setItem(RKEY(), JSON.stringify(v.slice(0, 200))); } catch { /* full */ } };
+// Disappearing messages: deadlines are in the server's time (see app.js nowServer).
+const serverNow = () => (X && X.nowServer ? X.nowServer() : Date.now());
 export function remindItems(m, key, preview) {
-  const at = (ms) => () => { setR([...getR(), { at: Date.now() + ms, key, msgId: m.id, text: preview.slice(0, 140), authorId: m.authorId }]); toast(`Okay — I’ll remind you ${relative(Date.now() + ms)}.`); };
+  // A reminder keeps a copy of the message's words on this device, so it goes when a disappearing message does (exp),
+  // and isn't offered for after that.
+  const exp = deadline(m);
+  const offset = serverNow() - Date.now();
+  const at = (ms) => () => { setR([...getR(), { at: Date.now() + ms, key, msgId: m.id, text: preview.slice(0, 140), authorId: m.authorId, ...(Number.isFinite(exp) ? { exp } : {}) }]); toast(`Okay — I’ll remind you ${relative(Date.now() + ms)}.`); };
+  const before = (ms) => Date.now() + offset + ms < exp;
   const tomorrow9 = () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); };
   const tonight = () => { const d = new Date(); d.setHours(20, 0, 0, 0); return d.getTime() - Date.now(); };
   return [
-    { label: 'Remind me in 20 minutes', icon: 'bell', action: at(20 * 60000) },
-    { label: 'Remind me in 1 hour', icon: 'bell', action: at(3600000) },
-    tonight() > 30 * 60000 ? { label: 'Remind me tonight (8 pm)', icon: 'bell', action: at(tonight()) } : null,
-    { label: 'Remind me tomorrow (9 am)', icon: 'bell', action: at(tomorrow9()) },
+    before(20 * 60000) ? { label: 'Remind me in 20 minutes', icon: 'bell', action: at(20 * 60000) } : null,
+    before(3600000) ? { label: 'Remind me in 1 hour', icon: 'bell', action: at(3600000) } : null,
+    tonight() > 30 * 60000 && before(tonight()) ? { label: 'Remind me tonight (8 pm)', icon: 'bell', action: at(tonight()) } : null,
+    before(tomorrow9()) ? { label: 'Remind me tomorrow (9 am)', icon: 'bell', action: at(tomorrow9()) } : null,
   ];
 }
+// Reminders for messages that disappeared (gone: their ids; or past their exp) are dropped without a word.
+export function purgeReminders(gone = new Set()) {
+  if (!X || !X.S || !X.S.me) return;
+  const all = getR();
+  const t = serverNow();
+  const keep = all.filter((r) => !(r.exp && r.exp <= t) && !gone.has(r.msgId));
+  if (keep.length !== all.length) setR(keep);
+}
+export const reminderDeadlines = () => (X && X.S && X.S.me ? getR().map((r) => r.exp).filter(Boolean) : []);
 export function startReminders() {
   const check = () => {
     if (!X.S.me) return;
+    purgeReminders();
     const all = getR();
     const due = all.filter((r) => r.at <= Date.now());
     if (!due.length) return;

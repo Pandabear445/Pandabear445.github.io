@@ -106,8 +106,9 @@ each event also goes to the server log with the network only.
 
 Everything Hearth does on a timer runs through `server/jobs.js`: rate-limit sweeps, upload clean-up, session
 purge, each server's audit log retention (`serveraudit.prune`), event reminders, the news bot's feed and tracker polling, backups, Last.fm polling, supporter expiry,
-membership reconciliation and retries, the socket session sweep, alert checks, and the small debounced
-broadcasts (presence, profile updates, watch-together).
+membership reconciliation and retries, the socket session sweep, alert checks, disappearing messages
+(`messages.expire`: a precise timer for the next deadline, a safety sweep every `DISAPPEAR_SWEEP_MS`, 60 s by
+default, and a run at start-up), and the small debounced broadcasts (presence, profile updates, watch-together).
 
 A `serveraudit` `hard_cap` warning means one server's audit log passed 200,000 entries and its oldest went,
 moderation entries from the last week included. Normal servers never get near that: look at who wrote the flood
@@ -353,7 +354,55 @@ above it say why), or when the server pins a key but its installed updater can't
 was put back, or it's gone; `--allow-unsigned` goes ahead anyway, with a warning); 90–92 still mean the upload or
 the zip itself was wrong. In all four cases nothing ran.
 
-## 7. What's still missing
+## 7. Self-hosted ntfy for Android notifications
+
+The Android app gets notifications while it's closed through a UnifiedPush push app, usually ntfy, which by default
+uses the public ntfy.sh. That works, but ntfy.sh then learns that a phone gets notifications from your server, and
+when (never what: everything is encrypted for the phone), and it has daily limits. Running your own ntfy next to
+Hearth avoids both. The phone's ntfy app is the same; only its server changes.
+
+1. **Run ntfy** (server 2.12 or newer) behind the same reverse proxy, on its own name, for example in
+   `docker-compose.yml`:
+
+   ```yaml
+     ntfy:
+       image: binwiederhier/ntfy   # pin a version you've checked
+       command: serve
+       restart: unless-stopped
+       volumes: ["./ntfy:/etc/ntfy", "./ntfy-cache:/var/cache/ntfy"]
+   ```
+
+   with `ntfy/server.yml`:
+
+   ```yaml
+   base-url: https://ntfy.example.com
+   behind-proxy: true
+   cache-file: /var/cache/ntfy/cache.db
+   auth-file: /var/cache/ntfy/user.db
+   auth-default-access: deny-all
+   # Every notification comes from Hearth's address: don't rate-limit it like one visitor.
+   visitor-request-limit-exempt-hosts: <your Hearth server's public IP>
+   ```
+
+   and in the Caddyfile `ntfy.example.com { reverse_proxy ntfy:80 }`.
+2. **Access:** Hearth publishes without an account, to topics starting with `up`:
+   `docker compose exec ntfy ntfy access '*' 'up*' write-only`. People's ntfy apps need to read: create a user
+   (`ntfy user add hearth`, then `ntfy access hearth 'up*' read-only`) and have people sign in with it in the ntfy
+   app (Settings → Manage users). Without `deny-all` anyone could use your ntfy for anything.
+3. **Tell Hearth:** `PUSH_NTFY_URL=https://ntfy.example.com` in `.env`. Settings → Apps & devices then tells people
+   to set it as the ntfy app's default server (and to turn notifications off and on once). Optionally
+   `PUSH_HOSTS=…,ntfy.example.com` so Hearth sends nowhere else (list the browser push services your people use too:
+   `fcm.googleapis.com,*.push.services.mozilla.com,*.notify.windows.com,web.push.apple.com`).
+4. **Same machine or LAN:** if `ntfy.example.com` resolves to a private address from where Hearth runs (a Docker
+   network, split DNS), Hearth refuses it like any private address; name it in `PUSH_PRIVATE_HOSTS=ntfy.example.com`
+   (port 443 unless you write `name:port`). Nothing else private is let through.
+
+**Troubleshooting:** the log line `push refused host=ntfy.example.com status=403` means ntfy turned Hearth away
+(the `up*` write rule is missing); `status=507` means nobody listens on that topic any more (the phone unregistered:
+it's dropped after a few tries); `status=429` means ntfy's rate limit (Hearth waits as long as ntfy asks, and keeps
+the phone). Each host and answer is logged at most once an hour, and never the address itself.
+
+## 8. What's still missing
 
 - **Metrics export.** There's no Prometheus/OpenMetrics endpoint. Admin → Health and `/api/admin/health` are
   point-in-time; there's no history beyond the logs.

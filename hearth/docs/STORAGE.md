@@ -101,7 +101,8 @@ the file again (the abandoned session expires by itself).
   (`bytes=-N`), and **416** with `Content-Range: bytes */<size>` for ranges past the end (a malformed range header
   may get 200 or 416). Videos and songs can seek without downloading everything first.
 - **Caching**: encrypted blobs (`.bin`) are `Cache-Control: private, no-cache` with an `ETag`: browsers check back
-  every time (a cheap 304), so a deleted file stops loading at once. Other uploads change name whenever they change,
+  every time (a cheap 304), so a deleted file stops loading at once. A disappearing message's files are `no-store`
+  instead, so browsers and the desktop app don't keep their ciphertext on disk. Other uploads change name whenever they change,
   so they are `private, max-age=31536000, immutable`. `private` keeps shared proxies from storing either.
 - **Headers kept**: `X-Content-Type-Options: nosniff`, a sandbox CSP, `Cross-Origin-Resource-Policy: same-origin`;
   `.bin` and unknown types are `application/octet-stream` with `Content-Disposition: attachment`.
@@ -144,6 +145,7 @@ All decryption happens in the app; the server only ever sends ciphertext.
 | An upload is never finished | Removed after 24 h idle (sweep every 10 min) | Reservation freed |
 | An admin uses "Delete all their files" | Everything they uploaded, attachments included (messages remain and show "no longer available"), their library GIFs, unfinished uploads | Freed |
 | A message is forwarded | The copy points at the same blobs; if the original is deleted, the copy's files show "no longer available" | Counted once, to the uploader |
+| A disappearing message reaches its time | Its files are 404 at once (`blobs.expires_at`, checked on every `.bin` request) and deleted by the `messages.expire` job within a second or two (a minute at most) | Freed |
 
 Leftovers from before these rules existed (blobs whose message is gone) are swept once shortly after start and
 daily (`sweepOrphans`).

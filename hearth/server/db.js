@@ -68,6 +68,10 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
   }
 }
 db.pragma('foreign_keys = ON');
+// v19 (disappearing messages): deleted rows are overwritten with zeros, in their pages and in freed pages, instead of
+// staying readable in the file until the space is reused. Per connection and not saved in the file, so on every start
+// (and outside the upgrade transaction below).
+db.pragma('secure_delete = ON');
 
 // v17 (data): every step from here to the version bump at the end runs in one transaction. An upgrade that's cut
 // short (killed, out of memory, power cut) then leaves the database exactly as it was and simply runs again on the
@@ -1311,6 +1315,67 @@ CREATE INDEX IF NOT EXISTS idx_dm_messages_pins ON dm_messages(dm_id, pinned_at)
 CREATE INDEX IF NOT EXISTS idx_messages_channel_top ON messages(channel_id, id) WHERE thread_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_dm_messages_created ON dm_messages(created_at);
+`);
+
+// v19 (disappearing messages): a timer per conversation (seconds, 0 = off) and a deadline per message, stamped when
+// the server stores it (NULL = never; see server/disappear.js). blobs carry their message's deadline, so /uploads/
+// can refuse an expired file with one lookup. disappear_log is who changed a conversation's timer, from what to what
+// and when (the line the apps show in the conversation); conv is 'c:<channel>' | 'd:<dm>' like read_states, and at
+// most 50 are kept per conversation. The partial indexes only ever hold disappearing messages (the sweep reads them
+// in deadline order); saved_messages and pin_log get an index by message, which the sweep deletes by.
+// Adding a column with a constant default doesn't rewrite the table, so this is quick on a big database.
+addColumn('channels', 'disappear_secs', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('dm_channels', 'disappear_secs', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('messages', 'expires_at', 'INTEGER');
+addColumn('dm_messages', 'expires_at', 'INTEGER');
+addColumn('blobs', 'expires_at', 'INTEGER');
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dm_messages_expires ON dm_messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_saved_messages_message ON saved_messages(message_id);
+CREATE INDEX IF NOT EXISTS idx_pin_log_message ON pin_log(message_id);
+CREATE TABLE IF NOT EXISTS disappear_log (
+  id TEXT PRIMARY KEY,
+  conv TEXT NOT NULL,
+  user_id TEXT,
+  secs INTEGER NOT NULL,
+  prev_secs INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disappear_log_conv ON disappear_log(conv, created_at);
+`);
+
+// v19 (discord import): imports into a server (server/imports.js). Phase 1 writes one 'discord_template' row per
+// server created from a Discord template, with its report (counts, what was skipped and why: names of roles and
+// channels, never file contents), and import_map rows from the template's keys to the roles and channels made.
+// The other kinds, statuses and columns are for the later phases (emoji, then history; docs/design/DISCORD-IMPORT.md),
+// so they won't need a table rebuild. A server's imports go with it.
+db.exec(`
+CREATE TABLE IF NOT EXISTS server_imports (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('discord_template','discord_emoji','discord_history')),
+  status TEXT NOT NULL DEFAULT 'done' CHECK (status IN ('running','done','failed','undone')),
+  source TEXT NOT NULL DEFAULT '',
+  epoch INTEGER,
+  channels TEXT NOT NULL DEFAULT '[]',
+  total INTEGER NOT NULL DEFAULT 0,
+  done INTEGER NOT NULL DEFAULT 0,
+  report TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_server_imports_server ON server_imports(server_id, created_at);
+CREATE TABLE IF NOT EXISTS import_map (
+  import_id TEXT NOT NULL REFERENCES server_imports(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('role','channel','emoji','message')),
+  source_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  PRIMARY KEY (import_id, kind, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_import_map_target ON import_map(kind, target_id);
 `);
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);

@@ -479,10 +479,19 @@ for new personal accounts an Android phone for verification). Internal testing h
 to `(major × 100 + minor) × 100000 + run number`, e.g. `12100457` for Hearth 1.21 in workflow run 457, so it
 always goes up.
 
+**Invite links that open in the app (Android App Links):** an app built for your server (`HEARTH_SERVER`) asks
+Android to open `https://your-server/invite/…` links itself. Android only agrees if your server vouches for the
+app's signing key: set `ANDROID_CERT_SHA256` in the server's `.env` to the key's SHA-256 fingerprint, which
+`keytool -list -v -keystore hearth.jks -alias hearth` prints (the `SHA256:` line, `AB:CD:…`). With Google Play,
+add Play's *app signing key* too (Play Console → your app → App integrity → App signing: the app signing key
+certificate's SHA-256), comma-separated: Play re-signs what it installs. The server then serves `/.well-known/assetlinks.json`.
+The key the workflow keeps in the Actions cache works too, but its fingerprint changes if the cache is lost.
+
 **Things Google's review might flag:** Hearth's Android app lets people trust a self-signed server certificate
 after showing its fingerprint. Google Play's automated checks sometimes flag apps that can accept certificate
 errors. If that happens, servers with a real domain (Caddy) don't need that feature, and it can be left out of
-the Play build.
+the Play build. Play also asks every app with a foreground service to say what it's for: Hearth's `CallService`
+(type `microphone`) keeps a call going while the screen is off; it runs only during a call the person joined.
 
 ---
 

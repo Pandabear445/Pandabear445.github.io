@@ -1,7 +1,7 @@
 // The end-to-end flows, in order: each one builds on what the earlier ones set up (accounts, the server, roles…).
 // Everything goes through the real UI; the only shortcuts are reading state the UI already shows.
 import fs from 'node:fs';
-import { exact, makePng, totp } from './harness.mjs';
+import { exact, makePng, totp, newPassword } from './harness.mjs';
 
 export function check(ok, message) { if (!ok) throw new Error(message); }
 const SERVER = 'E2E Hall';
@@ -759,6 +759,164 @@ async function groupChat(t) {
   }
 }
 
+// ------------------------------------------------------------------ the Android app, with its native half simulated
+// The page as the Hearth Android app shows it. window.HearthAndroid stands in for the app (MainActivity and the
+// UnifiedPush push app): what the page sends it is recorded, and it answers the way the app does. The push
+// address it hands out isn't a real push service, so /api/push/subscribe is answered here and only what the
+// page sends is checked (the server's side has its own tests in test/android-push.test.js).
+function fakeAndroidBridge({ invite }) {
+  if (window.HearthAndroid) return;
+  // Kept across reloads (signing out reloads the page).
+  const log = () => JSON.parse(sessionStorage.getItem('e2e.sent') || '[]');
+  Object.defineProperty(window, '__androidSent', { get: log });
+  const b64u = (n) => { const a = new Uint8Array(n); crypto.getRandomValues(a); return btoa(String.fromCharCode(...a)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+  let n = 0;
+  let st = { type: 'pushState', state: 'none', reason: '', vapid: '', endpoint: '', distributor: '', distributorName: '', distributors: 1 };
+  const bridge = {
+    onmessage: null,
+    postMessage(raw) {
+      const m = JSON.parse(raw);
+      sessionStorage.setItem('e2e.sent', JSON.stringify([...log(), m]));
+      const reply = (o) => setTimeout(() => bridge.onmessage && bridge.onmessage({ data: JSON.stringify(o) }), 5);
+      if (m.type === 'hello') {
+        // An invite link the app was opened with, handed over once (as the app does).
+        const give = invite && !sessionStorage.getItem('e2e.invited');
+        if (give) sessionStorage.setItem('e2e.invited', '1');
+        reply({ type: 'info', version: '1.29.0', notify: 'granted', server: location.origin, call: true, push: { ...st }, ...(give ? { invite } : {}) });
+      } else if (m.type === 'pushState') reply({ ...st });
+      else if (m.type === 'pushRegister' || m.type === 'pushPick') {
+        st = { ...st, state: 'pending', reason: '', vapid: String(m.vapid || '').replace(/=+$/, '') };
+        reply({ ...st });
+        n++;
+        // The push app answers a moment later with a new address and this phone's public keys.
+        setTimeout(() => {
+          st = { ...st, state: 'registered', endpoint: `https://ntfy.example.test/upE2e${n}${b64u(6)}?up=1`, p256dh: 'B' + b64u(66).slice(0, 86), auth: b64u(16), distributor: 'io.heckel.ntfy', distributorName: 'ntfy' };
+          window.dispatchEvent(new CustomEvent('hearth-push', { detail: { ...st } }));
+        }, 60);
+      } else if (m.type === 'pushUnregister') {
+        // Like the UnifiedPush library: unregistering the last registration forgets the push app too.
+        st = { ...st, state: 'none', endpoint: '', p256dh: '', auth: '', distributor: '', distributorName: '' };
+        reply({ ...st });
+      }
+    },
+  };
+  window.HearthAndroid = bridge;
+}
+async function androidApp(t) {
+  const code = t.state.invite.split('/invite/')[1];
+  const droid = await t.open('droid');
+  await droid.register('droid', newPassword());
+  const subs = [];
+  await droid.page.route('**/api/push/subscribe', (route) => { subs.push(route.request().postDataJSON()); route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }); });
+  await droid.context.addInitScript(fakeAndroidBridge, { invite: code });
+  await droid.page.reload();
+  await droid.waitApp();
+  const sent = (type) => droid.page.evaluate((ty) => window.__androidSent.filter((m) => m.type === ty), type);
+  check((await sent('hello')).some((m) => m.v === 2), 'The page should tell the app it takes notification taps and invites in place.');
+
+  // The invite link the app was opened with: the "Join a server" box, without leaving the page.
+  const join = await droid.dialog('Join a server');
+  await join.locator('.invite-preview strong', { hasText: 'E2E Hall' }).waitFor();
+  await join.locator('.modal-foot .btn.primary').click();
+  await droid.page.locator('#sidebar-head .server-head-name', { hasText: exact('E2E Hall') }).waitFor();
+  await droid.noModals();
+
+  // Offered once: notifications when Hearth is closed. The app registers with the server's key; the page
+  // subscribes the address it hands back.
+  const { publicKey } = await droid.page.evaluate(() => fetch('/api/push/key').then((r) => r.json()));
+  await droid.$('.push-offer button', { hasText: 'Turn on' }).click();
+  await droid.toast('Notifications are on, even when Hearth is closed.');
+  const reg = await sent('pushRegister');
+  check(reg.length === 1 && reg[0].vapid === publicKey, 'The app should be asked to register with this server\u2019s VAPID key.');
+  check(subs.length === 1 && /^https:\/\/ntfy\.example\.test\/upE2e1/.test(subs[0].subscription.endpoint) && subs[0].subscription.keys.auth && !subs[0].replaces,
+    `The page should subscribe the app's push address (got ${JSON.stringify(subs[0])}).`);
+
+  // Settings: on, through ntfy; picking the push app again gives a new address, which replaces the old one.
+  await droid.openSettings('Apps & devices');
+  const row = droid.$('.set-content .toggle-row', { hasText: 'Notifications when Hearth is closed' });
+  await row.waitFor();
+  const pushIs = (on) => droid.page.waitForFunction((want) => { const r = [...document.querySelectorAll('.set-content .toggle-row')].find((x) => /when Hearth is closed/.test(x.textContent)); return r && !r.querySelector('input').disabled && r.querySelector('input').checked === want; }, on);
+  const change = () => droid.$('.set-content button', { hasText: exact('Change') });
+  await pushIs(true);
+  await droid.$('.set-content .muted-p', { hasText: 'Push app: ntfy' }).waitFor();
+  await change().click();
+  await droid.toast('Notifications now come through the push app you picked.');
+  check((await sent('pushPick')).length === 1, 'Change should ask the app to show the list of push apps.');
+  check(subs.length === 2 && subs[1].replaces === subs[0].subscription.endpoint && subs[1].subscription.endpoint !== subs[0].subscription.endpoint,
+    'The new push address should replace the old one on the server.');
+  // Turning it off takes the push app row (and Change, which would turn push back on) away at once; turning it
+  // on again brings them back, without reopening Settings.
+  await row.locator('.switch').click();
+  await droid.toast('Notifications when Hearth is closed are off.');
+  await pushIs(false);
+  await change().waitFor({ state: 'detached' });
+  check(!(await droid.$('.set-content .muted-p', { hasText: 'Push app:' }).count()), 'With push off, no push app should be shown.');
+  await row.locator('.switch').click();
+  await droid.toast('Notifications are on, even when Hearth is closed.');
+  await pushIs(true);
+  await change().waitFor();
+  check((await sent('pushPick')).length === 1 && subs.length === 3, 'Turning push on again registers once, without the list of push apps.');
+  await droid.closeSettings();
+
+  // A call starts the app's call notification (it keeps the call going with the screen off). Android shows it on
+  // the lock screen too, so it says only "In a call" until the person chooses to show who and where.
+  const callStarts = () => droid.page.evaluate(() => window.__androidSent.filter((m) => m.type === 'callStart'));
+  await droid.channelRow('Lounge').locator('.ch-main').click();
+  await droid.$('#voice-panel').waitFor();
+  await droid.page.waitForFunction(() => window.__androidSent.some((m) => m.type === 'callStart' && m.title === 'In a call'));
+  check(!(await callStarts()).some((m) => /Lounge/.test(m.title)), 'The call notification should not name the channel by default.');
+  await droid.openSettings('Notifications');
+  await droid.$('.set-content .toggle-row', { hasText: 'Show who and where on the lock screen' }).locator('.switch').click();
+  await droid.toast('Push notifications now show the sender and conversation.');
+  await droid.page.waitForFunction(() => window.__androidSent.some((m) => m.type === 'callStart' && /Lounge/.test(m.title)));
+  await droid.closeSettings();
+  // Its Hang up button leaves the call, which stops it again.
+  await droid.page.evaluate(() => window.dispatchEvent(new CustomEvent('hearth-hangup', { detail: true })));
+  await droid.page.waitForSelector('#voice-panel', { state: 'hidden' });
+  await droid.page.waitForFunction(() => window.__androidSent.some((m) => m.type === 'callEnd'));
+  // Reloading the page in a call (the "Reload now" after an update, say) ends the call, and the notification too.
+  const startsBefore = (await callStarts()).length;
+  const endsBefore = (await sent('callEnd')).length;
+  await droid.$('.cs-controls .btn.primary', { hasText: exact('Join call') }).click(); // still looking at the Lounge
+  await droid.$('#voice-panel').waitFor();
+  await droid.page.waitForFunction((n) => window.__androidSent.filter((m) => m.type === 'callStart').length > n, startsBefore);
+  await droid.page.reload();
+  await droid.waitApp();
+  check((await sent('callEnd')).length === endsBefore + 1, 'Leaving the page during a call should end the app\u2019s call notification.');
+
+  // A #call/ link to a server's voice channel (which anyone can post) opens the server but never shows an
+  // "incoming call" from whoever is sitting in it: only DM and group calls ring.
+  const { alice } = t.people;
+  await alice.railButton(SERVER);
+  await alice.channelRow('Lounge').locator('.ch-main').click();
+  await alice.$('#voice-panel').waitFor();
+  await droid.railButton(SERVER);
+  await droid.$('#sidebar-body .vc-user', { hasText: 'Alice Wonder' }).waitFor();
+  const lounge = await droid.page.evaluate(() => fetch('/api/bootstrap', { headers: { Authorization: 'Bearer ' + localStorage.getItem('hearth.token') } })
+    .then((r) => r.json()).then((b) => b.servers.flatMap((x) => x.channels).find((c) => c.type === 'voice' && c.name === 'Lounge').id));
+  await droid.railButton('Direct messages');
+  await droid.page.evaluate((id) => { location.hash = '#call/' + id; }, lounge);
+  await droid.page.waitForSelector('#composer-input[placeholder="Message #general"]');
+  await droid.page.waitForTimeout(800);
+  check(!(await droid.$('.ring-card').count()), 'A #call/ link to a server voice channel must not ring.');
+  await alice.$('#voice-panel button[aria-label="Leave call"]').click();
+  await alice.page.waitForSelector('#voice-panel', { state: 'hidden' });
+
+  // A tapped notification opens only places inside the app.
+  await droid.page.evaluate(() => window.dispatchEvent(new CustomEvent('hearth-open', { detail: 'https://evil.example/' })));
+  check(droid.page.url().startsWith(t.server.base), 'A notification must never take the app to another site.');
+  await droid.page.evaluate(() => window.dispatchEvent(new CustomEvent('hearth-open', { detail: '/#d/zzzzzz' })));
+  await droid.toast('That conversation isn\u2019t available.');
+
+  // Signing out removes the phone's push registration, and push isn't "off by choice" for the next person.
+  const unregBefore = (await sent('pushUnregister')).length;
+  await droid.logout();
+  check((await sent('pushUnregister')).length > unregBefore, 'Signing out should remove the app\u2019s push registration.');
+  check(await droid.page.evaluate(() => localStorage.getItem('hearth.push') === null && localStorage.getItem('hearth.push.endpoint') === null), 'Signing out should forget push on this device.');
+  await droid.close();
+  delete t.people.droid;
+}
+
 // ------------------------------------------------------------------ 9. changes that need the password again
 async function stepUp(t) {
   const { alice, bob } = t.people;
@@ -1425,12 +1583,180 @@ async function linkPreviews(t) {
   check(!bobAsked.length, `Bob's app should never contact the site or ask about the link (it asked for ${bobAsked.join(', ')}).`);
 }
 
+// ------------------------------------------------------------------ disappearing messages (a DM, 5 seconds: NODE_ENV=test)
+async function disappearing(t) {
+  const { alice, bob } = t.people;
+  for (const [p, other] of [[alice, 'bob'], [bob, 'alice']]) {
+    await p.railButton('Direct messages');
+    await p.dmRow(other).click();
+    await p.page.waitForSelector(`#composer-input[placeholder="Message ${other}"]`);
+  }
+  // Alice turns it on from the conversation's menu; turning it on asks first and says what it can't do.
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('5 seconds').click();
+  const ask = await alice.dialog('Turn on disappearing messages?');
+  check(/screenshot/.test(await ask.innerText()), 'Turning on disappearing messages should say people can still screenshot what they see.');
+  await ask.locator('.modal-foot .btn.primary').click();
+  // Both screens get the line in the conversation, the timer in the header and the note above the box.
+  await alice.$('#messages .sys-line', { hasText: 'You turned on disappearing messages: 5 seconds' }).waitFor();
+  await bob.$('#messages .sys-line', { hasText: 'turned on disappearing messages: 5 seconds' }).waitFor();
+  for (const p of [alice, bob]) {
+    await p.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').waitFor();
+    await p.$('.cw-main .dis-note', { hasText: 'New messages disappear after 5 seconds.' }).waitFor();
+  }
+  // A message with a picture, mentioning bob (so it lands in his inbox too).
+  await alice.$('.cw-main input[type=file]').setInputFiles([{ name: 'secret.png', mimeType: 'image/png', buffer: makePng(40, 30) }]);
+  const sent = alice.page.waitForRequest((r) => /\/api\/dms\/\w+\/messages$/.test(r.url()) && r.method() === 'POST');
+  await alice.send('@bob this one self-destructs: plum');
+  const body = (await sent).postDataJSON();
+  check(body.ttl === 5 && Array.isArray(body.files) && body.files.length, 'The app should send the timer it encrypted for, with the file.');
+  const onBob = bob.message('self-destructs: plum').first();
+  await onBob.locator('.msg-exp').waitFor();
+  await onBob.locator('img.att-img[src^="blob:"]').waitFor({ timeout: 15000 });
+  const inbox = () => bob.page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('hearth.inbox.')).map((k) => localStorage.getItem(k)).join('').includes('plum'));
+  check(await inbox(), 'The mention should be in bob’s inbox while the message is there.');
+  // Five seconds later it's gone from both screens, its file stops loading, and the inbox entry goes too.
+  await bob.message('self-destructs: plum').waitFor({ state: 'detached', timeout: 20000 });
+  await alice.message('self-destructs: plum').waitFor({ state: 'detached', timeout: 20000 });
+  // (Polled briefly: this app hides it by the server's clock, which it only knows to within a few milliseconds.)
+  let status = 0;
+  for (let i = 0; i < 20 && status !== 404; i++) { status = await bob.page.evaluate(async (u) => (await fetch(u)).status, body.files[0]); if (status !== 404) await bob.page.waitForTimeout(100); }
+  check(status === 404, `A disappeared message’s file should no longer load (got ${status}).`);
+  check(!(await inbox()), 'The inbox entry should go with the message.');
+  // Bob turns it off from the header; new messages stay.
+  await bob.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').click();
+  await bob.menuItem('Off').click();
+  await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).waitFor();
+  await alice.$('#main-head button[aria-label^="Disappearing messages"]').waitFor({ state: 'detached' });
+  await alice.send('This one stays: fig');
+  await bob.message('This one stays: fig').waitFor();
+  check(!(await bob.message('This one stays: fig').locator('.msg-exp').count()), 'A message sent with the timer off should not show a timer.');
+  // Drawn again from scratch (away and back): one divider per day, the timer lines included.
+  await alice.railButton('Home');
+  await alice.railButton('Direct messages');
+  await alice.dmRow('bob').click();
+  await alice.page.waitForSelector('#composer-input[placeholder="Message bob"]');
+  await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).waitFor();
+  const days = await alice.page.$$eval('#messages .day-div', (els) => els.map((e) => e.dataset.day));
+  check(days.length && new Set(days).size === days.length, `Each day should have one divider, timer lines or not (got ${days.join(' | ')}).`);
+  // Turned off while bob's message is on its way: he wrote it expecting it to disappear, so it isn't sent unasked.
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('1 hour').click();
+  await (await alice.dialog('Turn on disappearing messages?')).locator('.modal-foot .btn.primary').click();
+  await bob.$('.cw-main .dis-note', { hasText: 'New messages disappear after 1 hour.' }).waitFor();
+  const ttls = [];
+  let hold = true;
+  await bob.page.route('**/api/dms/*/messages', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    ttls.push(route.request().postDataJSON().ttl);
+    try {
+      if (hold) {
+        hold = false;
+        await alice.$('#main-head button[aria-label="Disappearing messages: 1 hour"]').click();
+        await alice.menuItem('Off').click();
+        await bob.$('.cw-main .dis-note').waitFor({ state: 'hidden' });
+      }
+    } finally { await route.continue(); }
+  });
+  const box = bob.$('#composer-input');
+  await box.fill('Written while it said 1 hour: kiwi');
+  await box.press('Enter');
+  const offAsk = await bob.dialog('Disappearing messages turned off');
+  check(/won’t disappear/.test(await offAsk.innerText()), 'Bob should be asked before his message goes out without a timer.');
+  await offAsk.locator('.modal-foot .btn', { hasText: 'Cancel' }).click();
+  await bob.noModals();
+  await bob.toast('Not sent');
+  check(await box.inputValue() === 'Written while it said 1 hour: kiwi', 'The words should be back in bob’s box.');
+  check(ttls.join() === '3600', `Only the first try should have gone out (got ${ttls.join()}).`);
+  check(!(await alice.message('said 1 hour: kiwi').count()), 'Alice should not have it.');
+  await bob.page.unroute('**/api/dms/*/messages');
+  // Sent again under the timer as it is now: no question.
+  await box.press('Enter');
+  await alice.message('said 1 hour: kiwi').first().waitFor();
+  check(!(await bob.$('.modal').count()), 'Sending under the current timer should not ask.');
+  // A server channel (alice owns the server, so she may set it): a message that arrives live goes at its time by the
+  // apps' own timer, even when the server hasn't deleted it (its copy is given an hour more here, so no delete event
+  // comes).
+  for (const p of [alice, bob]) { await p.railButton(SERVER); await p.openChannel('general'); }
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('5 seconds').click();
+  await (await alice.dialog('Turn on disappearing messages?')).locator('.modal-foot .btn.primary').click();
+  await bob.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').waitFor();
+  await alice.send('Gone by the app’s own timer: quince');
+  await bob.message('own timer: quince').first().waitFor();
+  check(t.server.sql('UPDATE messages SET expires_at = expires_at + 3600000 WHERE expires_at > ?', Date.now()).changes === 1, 'The message should be waiting on the server.');
+  await bob.message('own timer: quince').waitFor({ state: 'detached', timeout: 15000 });
+  await alice.message('own timer: quince').waitFor({ state: 'detached', timeout: 15000 });
+  check(t.server.sql('UPDATE messages SET expires_at = ? WHERE expires_at > ?', Date.now() - 1000, Date.now()).changes === 1, 'The server should still have had it: the apps hid it by themselves.');
+  // Off again for the flows after this one.
+  await alice.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').click();
+  await alice.menuItem('Off').click();
+  await bob.$('#main-head button[aria-label^="Disappearing messages"]').waitFor({ state: 'detached' });
+}
+
+// ------------------------------------------------------------------ 21. import a Discord server's structure
+// Bob pastes the sample template (test/fixtures/discord-template.json): the preview says what comes over and what
+// is skipped before anything exists, leaving a role and a channel out updates it, and Create opens the new server.
+async function discordImport(t) {
+  const { bob } = t.people;
+  const template = fs.readFileSync(new URL('../fixtures/discord-template.json', import.meta.url), 'utf8');
+  await bob.railButton('Add a server');
+  await bob.page.locator('.modal .choice', { hasText: 'Import from Discord' }).click();
+  const m = await bob.dialog('Import from Discord');
+  // A template link only gives the address to open in the browser; Hearth doesn't fetch it.
+  await m.locator('.field', { hasText: 'Template link' }).locator('input').fill('https://discord.new/hEaRtHtEsT01');
+  const href = await m.locator('a.di-api-link').getAttribute('href');
+  check(href === 'https://discord.com/api/v10/guilds/templates/hEaRtHtEsT01', `The template link should point at Discord's template address (got ${href}).`);
+  await m.locator('textarea.di-json').fill(template);
+  await m.locator('.modal-foot .btn.primary', { hasText: 'Preview' }).click();
+  const p = bob.modal('Import from Discord');
+  await p.locator('.di-list').first().waitFor();
+  await p.locator('.muted-p', { hasText: 'Creates 6 roles, 4 categories and 11 channels' }).waitFor();
+  // What doesn't come over is listed before creating.
+  const skipped = p.locator('.di-section', { hasText: 'These will be skipped' });
+  for (const text of ['Manage nicknames: Moderator', 'Category Archive: no channels left in it', 'Age-restricted (NSFW) flag: channel-8', 'Verification level']) {
+    await skipped.locator('li', { hasText: text }).waitFor();
+  }
+  await p.locator('.warn-box li', { hasText: 'Read message history (channel-8)' }).waitFor();
+  // Builder's Manage Channels also manages events in Hearth, which it couldn't in Discord: said before creating.
+  await p.locator('.warn-box li', { hasText: 'Manage events (Builder)' }).waitFor();
+  await p.locator('.di-row.di-chan', { hasText: 'Town Hall' }).locator('.di-sub', { hasText: 'Stage' }).waitFor();
+  await p.locator('.di-row.di-chan', { hasText: 'mod-chat' }).locator('.di-lock').waitFor();
+  // Leave a role and a channel out: the server works the plan out again.
+  await p.locator('.di-row', { hasText: 'Muted' }).locator('input[type=checkbox]').uncheck();
+  await p.locator('.di-row.di-chan', { hasText: 'trail-photos' }).locator('input[type=checkbox]').uncheck();
+  await p.locator('.muted-p', { hasText: 'Creates 5 roles, 4 categories and 10 channels' }).waitFor();
+  await p.locator('.field', { hasText: 'Server name' }).locator('input').fill('Pinecone Import');
+  // A slow Create, pressed while a change is still being worked out: nothing turns the button back on meanwhile
+  // (a second press would make a second server).
+  const create = p.locator('.modal-foot .btn.primary', { hasText: 'Create server' });
+  const muted = p.locator('.di-row', { hasText: 'Muted' }).locator('input[type=checkbox]');
+  await bob.page.route('**/api/imports/discord', async (route) => { await new Promise((r) => setTimeout(r, 3000)); await route.continue(); });
+  await muted.check();
+  await muted.uncheck();
+  await create.click();
+  await new Promise((r) => setTimeout(r, 1200));
+  check(await create.isDisabled(), 'Create should stay off while the server is being made.');
+  await bob.page.unroute('**/api/imports/discord');
+  await bob.page.locator('#sidebar-head .server-head-name', { hasText: exact('Pinecone Import') }).waitFor();
+  const done = await bob.dialog('Imported Pinecone Import');
+  await done.locator('li', { hasText: 'Muted: you left it out' }).waitFor();
+  await done.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  await bob.noModals();
+  // 公告 has no letters Hearth keeps, so it's named by its place: 7th, now that trail-photos stayed behind.
+  for (const name of ['welcome', 'announcements', 'mod-chat', 'channel-7', 'Town Hall']) await bob.channelRow(name).waitFor();
+  check(!(await bob.channelRow('trail-photos').count()), 'A channel left out should not be created.');
+  await bob.openChannel('general');
+  await bob.send('First message after the import: pinecone');
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
   ['messages: send, decrypt, edit, react, thread, delete, reply, pin, poll', messages],
   ['webhooks: make one in channel settings, post like Uptime Kuma, no pings', webhooks],
   ['direct messages: both ways, block and unblock, friends', directMessages],
+  ['disappearing messages: turn on in a DM, a picture vanishes on both screens with its file and inbox entry, turn off, day dividers, asked before sending under a weaker timer; a channel message goes by the apps’ own timer', disappearing],
   ['attachments: image preview, byte-exact download, storage', attachments],
   ['pictures: avatar, custom emoji, server icon, GIF library', pictures],
   ['search: Ctrl+K words, from:, jump to the message', search],
@@ -1444,6 +1770,7 @@ export const FLOWS = [
   ['audit log and reports: moderation as sentences, filters, live entries; a report reaches the server’s moderators', auditAndReports],
   ['dm call: ring, accept, hang up, decline', dmCall],
   ['group chat: create, talk both ways, call rings', groupChat],
+  ['android app: push through a push app, call notification and hang up, invite link (native side simulated)', androidApp],
   ['step-up: delete and hand over a server, staff, relay, region, backups, owner', stepUp],
   ['account deletion: a throwaway account deletes itself', deleteAccount],
   ['recovery: recovery key, email, password change, reset by email keeps messages', recovery],
@@ -1454,4 +1781,5 @@ export const FLOWS = [
   ['smoke: every settings, admin and server settings page loads', smoke],
   ['threads: new replies and pings on the message and the Threads button, the Threads panel, read when opened', threads],
   ['link previews: ask, turn down, preview, send; the reader sees the card and never contacts the site; keyboard; editing a link in Always mode', linkPreviews],
+  ['discord import: paste a template, see what is skipped, leave some out, create', discordImport],
 ];

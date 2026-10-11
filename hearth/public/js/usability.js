@@ -61,10 +61,27 @@ export async function claimOnce(id) {
 }
 // Read somewhere else (another tab or device): close what's still on screen for that conversation.
 const shown = new Map(); // tag -> Notification shown by this tab
-export function rememberNotification(tag, n) { if (tag && n) { shown.set(tag, n); n.addEventListener('close', () => { if (shown.get(tag) === n) shown.delete(tag); }); } }
+const shownFor = new Map(); // tag -> the message it shows (a disappearing one closes it when it goes)
+export function rememberNotification(tag, n, msgId = null) {
+  if (!tag || !n) return;
+  shown.set(tag, n);
+  if (msgId) shownFor.set(tag, msgId); else shownFor.delete(tag);
+  n.addEventListener('close', () => { if (shown.get(tag) === n) { shown.delete(tag); shownFor.delete(tag); } });
+}
+// Messages that disappeared: a notification still showing one of them (with its text) goes too.
+export function closeNotificationFor(ids) {
+  const gone = new Set(ids);
+  for (const [tag, id] of [...shownFor]) if (gone.has(id)) { shownFor.delete(tag); closeNotifications(tag); }
+}
+// The Android app's own notifications, including ones it posted while closed (set by app.js; this file has no
+// imports so it stays testable in Node). closeNotifications closes those too, for a read conversation and for a
+// disappearing message that went.
+let closeElsewhere = null;
+export function alsoCloseNotifications(fn) { closeElsewhere = typeof fn === 'function' ? fn : null; }
 export function closeNotifications(tag) {
   const n = shown.get(tag);
   if (n) { try { n.close(); } catch { /* gone */ } shown.delete(tag); }
+  if (closeElsewhere) { try { closeElsewhere(tag); } catch { /* app closing */ } }
   if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
     navigator.serviceWorker.ready.then((reg) => reg.getNotifications({ tag })).then((list) => list.forEach((x) => x.close())).catch(() => {});
   }

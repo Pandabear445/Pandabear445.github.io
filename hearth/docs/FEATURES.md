@@ -74,7 +74,7 @@ is encrypted or assembled on the device.
   - **Mark as read** and **Mark unread** on messages, channels, DMs and group chats, and **Mark server as read**
     (`POST /servers/:id/read`).
 
-### Threads: unread replies and the Threads list (v20)
+### Threads: unread replies and the Threads list (v19)
 Before this, a thread reply counted nowhere: not as unread, not as a mention, and nothing listed a channel's threads.
 - **Each thread has its own read marker**, a `read_states` row keyed `t:<root message id>`. It moves forward only
   (threads have no "Mark unread") and syncs like a channel's: `POST /me/read { conv: 't:<root>', messageId: <a reply
@@ -155,6 +155,16 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
 - **@everyone push**: the app now marks messages that use @everyone, @channel or @here (`everyone: true`). The
   server honours this only from someone with Mention Everyone in that channel, then pushes the members who can
   see the channel. Before this, @everyone never pushed.
+- **Android, with the app closed** (1.29): the Android app gets a Web Push address from a UnifiedPush push app
+  (ntfy, or a self-hosted ntfy: `PUSH_NTFY_URL`) and subscribes it like a browser, so every rule here applies to
+  it unchanged. Notifications go to three channels (Messages, Calls, Events and updates); a call push rings for
+  at most 45 s, and one older than two minutes (`at`, the send time, is in every push) shows as a missed call, in
+  the browser's service worker too. Tapping opens the message, the DM, or the call's conversation with its ring
+  card if the call is still on (`#call/<room>`; only DM and group calls ring, the calls the server rings), and
+  opening the app while a call rings does the same. Reading a conversation in the app also clears the
+  notification posted while it was closed. The "In a call" notification names the call only with "Show who and
+  where on the lock screen" on. Settings → Apps & devices → *Notifications when Hearth is closed*, with the push
+  app's name, *Change*, and how it works; the app offers it once.
 - **Lock-screen privacy**: what a push looked like before is described in the inventory above. Now **previews
   are hidden by default**: a push says only the instance name and "New message" (or "Incoming call", "An event
   is starting soon", "New updates"). Settings → Notifications → "Show who and where on the lock screen" brings
@@ -243,7 +253,7 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
     (`messages_bulk_deleted`). Like a single delete, thread replies, files, reactions and poll votes go too, and bots
     get `message.deleted` for each message (written in one transaction per channel, `BOTS.events`). Refused while
     you're timed out.
-- **Server audit log and report inbox** (v20, `server/serveraudit.js`):
+- **Server audit log and report inbox** (v19, `server/serveraudit.js`):
   - A new permission, **View Audit Log** (`1 << 19`), server-wide; owners and Administrators always have it. It
     counts as a moderator power, so it can't be on a role sold as a membership or one members pick themselves.
   - Every server-scoped moderation action and settings change also goes in that server's own log (`server_audit`):
@@ -309,8 +319,8 @@ The Threads panel follows the channel's existing `message:new` and `thread:updat
 |---|---|---|
 | `saved_messages` | user, message id, optional `x1:` note, time | no |
 | `read_states` | user, conversation key (`c:`, `d:`, `t:<thread root>`, `ct:<channel>` for "its threads read up to"), last-read message id | no |
-| `mention_marks` | message id, conversation (`ct:<channel>` for a thread reply), user id or `*`, thread root (v20) | no (ids the sender's app already sent for push) |
-| `thread_activity` (v20) | thread root, channel, newest reply id | no |
+| `mention_marks` | message id, conversation (`ct:<channel>` for a thread reply), user id or `*`, thread root (v19) | no (ids the sender's app already sent for push) |
+| `thread_activity` (v19) | thread root, channel, newest reply id | no |
 | `notify_prefs` | user, target, level, mute-until, ignore-@everyone | no |
 | `user_prefs` | user, JSON (quiet hours, time zone, previews), read baseline | no |
 | `pin_log` | channel, message, who, pin or unpin, time | no |
@@ -326,7 +336,7 @@ sent. It now keeps that list.
 
 ## 5. Tests
 
-`test/threads.test.js` (10 tests, v20):
+`test/threads.test.js` (10 tests, v19):
 - **Threads list**: latest reply first, paged by `?before=`; reply counts, participants (most recent first, once
   each), the first message as ciphertext; your own replies aren't new to you; bad `before` and limits; voice
   channels refused; an empty channel lists nothing.
@@ -409,7 +419,7 @@ device for one of them. It covers:
 
 - Counts are capped at 100 per conversation (shown as "99+").
 - Thread replies don't make a channel unread (bold): they count in their thread ("2 new" and the Threads panel), and
-  their pings count in the channel's badge (v20).
+  their pings count in the channel's badge (v19).
 - Mention counts depend on the sender's app sending mention ids, as push already did. A modified app could leave
   them out or add extra ones. It can't add ids for people who can't see the channel.
 - The Threads button's dot only knows the threads this app has seen (on the loaded page, live, or in the panel);
@@ -524,3 +534,80 @@ outcome and timing, never the link, host or title.
 - Pages rendered only by JavaScript, or with their tags after 512 KiB, get a title-only card or none. X's embed
   service has been unreliable, so X links often get no card.
 - A message with a picture is about 30 KB of ciphertext instead of about 0.5 KB.
+
+## 7. Disappearing messages (v19)
+
+A timer per conversation; design and research in [design/DISAPPEARING-MESSAGES.md](design/DISAPPEARING-MESSAGES.md).
+What this pass built, and where it differs from that design:
+
+- **Setting it.** `PUT /api/channels/:id/disappearing` and `PUT /api/dms/:id/disappearing` with `{ seconds }`:
+  0, 3600, 86400, 604800 or 2419200 (and 5 under `NODE_ENV=test`), anything else 400 `bad_timer`. DMs: either person,
+  403 after a block either way, 403 `deleted` when the other account is deleted, 404 for outsiders. Group chats: any
+  member. Server channels: Manage Channels in that channel (`requireManageableChannel`), a channel you can't see is
+  404, voice channels 400 `bad_channel`. Limits: 10 changes a minute per person, and 10 an hour per person in each
+  conversation (not one budget for the whole conversation, which one person could use up to lock the timer for
+  everyone else). The same value again changes nothing (no log line, no event). `GET` on the same paths gives `{ seconds, log }` (the last 20
+  changes). Live: `disappear:update { conv, channelId | dmId, id, seconds, prev, by, at }` to whoever can see the
+  conversation (`toChannel`, or both DM users).
+- **Shown.** `disappear_log` keeps who changed what and when (50 per conversation); history pages carry the changes
+  that fall inside them (`timerEvents`) and the apps draw them between the messages, each under its own day's
+  divider. Pages meet without gaps: a `?before=` page ends at its anchor's id time, an `?after=` page starts at its
+  anchor's `created_at`. Channels carry `disappear` in
+  `serializeChannel`, DMs in `serializeDm`. The app adds a timer button to the header, a note above the composer, a
+  line in the welcome block, a badge on each disappearing message, and the choices in the DM, group and channel ⋯
+  menus and in Edit channel. Turning it on asks first and says what it can't do.
+- **Stamped.** Each send stamps `expires_at = created_at + timer` (`DISAPPEAR.stamp`), capped by the thread's first
+  message for replies. Bot posts, webhook posts (`BOTS.botPost`) and the news bot are stamped too; a test checks that
+  every `INSERT INTO messages / dm_messages` in `server/` sets `expires_at`. The app sends `ttl` (the timer it
+  encrypted for) and puts the same timer inside the encrypted payload as `x`, next to the text, files, poll and link
+  preview card (`l`, which a too-long message drops before anything else); a `ttl` that doesn't match gets 409
+  `disappear_changed` and the app fetches the timer and sends again once, by itself only when the new timer is on or
+  shorter than the one the message was written under; turned off or made longer, it asks first ("Send anyway?") and
+  otherwise gives the words back. Apps that send no `ttl` are stamped from the
+  conversation. Edits keep the deadline (and the app keeps `x`, the poll and any link preview whose link is still in
+  the text inside an edited message).
+- **Never served after its time.** History pages, threads, the Threads list (a thread whose first message has gone,
+  or all of whose replies have, isn't listed), a thread's reply count, latest reply, who replied and its unread and
+  ping counts, pins, search, saved, export, reply quotes, DM and group previews, `locate`, the bot API and
+  `/uploads/` (404 for an expired file, `Cache-Control: no-store` for a disappearing one) skip expired rows in SQL
+  (`LIVE`) or with `alive()`, so none of that depends on the sweep having run. Editing, deleting (by its author, a
+  moderator or staff), reacting, pinning, voting, saving, reporting and marking a thread read (or read up to an
+  expired reply) for an expired message are 404. Bulk delete and a ban's cleanup leave expired rows to the sweep: they
+  aren't counted in the answer or in the audit log entry, and an expired reply doesn't hold a thread back. One thing
+  still counts them until the sweep has run: a channel's or DM's own unread and ping counts (normally for a fraction
+  of a second; the app asks for them again when a conversation with unread messages loses some). The sweep's deletes
+  keep `thread_activity` right through the same triggers as any delete, and write nothing to a server's audit log
+  (nobody deleted them; `disappearing.test.js` checks it). Entries written while the message was there stay: the
+  audit log keeps who pinned, unpinned or deleted whose message in which channel, never the message itself, for up
+  to a year.
+- **Deleted.** `server/disappear.js`: a precise timer armed for the earliest deadline (`MIN(expires_at)` over the
+  partial indexes; deadlines past setTimeout's 24.8-day limit wait for the sweep), plus the `messages.expire` sweep
+  every minute (`DISAPPEAR_SWEEP_MS`), plus a run at start-up before the server listens (up to 50,000 rows; a bigger
+  backlog carries on in the background). Batches of 500 per table, 5,000 per run, then `setImmediate`. Each batch
+  deletes the messages with their thread's replies, `blobs` and files (quota freed through `removeUpload`),
+  reactions, poll votes and closure, mention marks, saved entries and pin history, in one transaction; files after
+  the commit.
+- **Announced** with the events a normal delete sends, marked `expired: true`: `message:delete-bulk` (with a group
+  chat's new `last`), `thread:update` for threads that lost replies, `dm:delete` per message (with the DM's new
+  `last`), `saved:update { saved: false }` to everyone who saved one, and bots' `message.deleted` with
+  `deletedBy: null, expired: true`. (The design had new `message:expire` / `dm:expire` events with a fallback for older
+  apps; the moderator toolkit's `message:delete-bulk` landed meanwhile, so older apps already understand these.)
+- **Forensics.** `PRAGMA secure_delete = ON` on the server's connection (deleted rows are zeroed in the file), and
+  `wal_checkpoint(TRUNCATE)` after a sweep that deleted rows, at most every `DISAPPEAR_CHECKPOINT_MS` (10 minutes).
+- **In the apps.** `public/js/disappear.js` (pure, tested under Node) works out a message's deadline: the earlier of
+  `expiresAt` and `createdAt + x`, where `x` counts only if it's one of the timers `/config` offers (so a modified app
+  can't make a message vanish from its readers' screens within seconds, before anyone could report it). `app.js` keeps the server's clock (`serverNow` from `/bootstrap`), hides messages
+  at their deadline with one timer (re-checked at most hourly, and on focus and visibility), and when one goes drops
+  its decrypted files (`fileUrls.drop(…, true)`), stops a voice message playing, closes the image viewer, cancels a
+  reply or edit on it, closes its notification (`closeNotificationFor`), purges inbox entries and reminders that copy
+  its words (`exp` on each), removes it from open search results, and redraws pins and saved. Unread and mention
+  counts are asked for again (`/me/unread`, debounced to at most every 30 seconds) when a conversation with unread
+  messages lost some. A message that arrives live is in the expiry timer as soon as it's in the conversation.
+
+Not built in this pass (the design's later phases): leaving disappearing messages out of backups
+(`BACKUP_DISAPPEARING`, `scrubDisappearing`; backups keep them until they rotate out), the export checkbox (the zip
+includes messages that haven't disappeared yet), the Android notification timeout (`setTimeoutAfter`; until then a
+notification shown while the app was open, or posted from a push while it was closed, stays after it's closed, as the
+README says; while the app runs, `closeNotificationFor` also cancels the app's own notification with that tag through
+`alsoCloseNotifications`), a sender timestamp inside the
+encrypted message (the server still controls `createdAt`), a group-owner lock, a personal default timer, and signed timer changes.

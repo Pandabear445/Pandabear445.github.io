@@ -9,6 +9,7 @@ import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import { runExport, EXPORT_LIMITS, quietNow } from './usability.js';
 import { androidApp } from './android.js';
+import { reasonText } from './android-push.js';
 import { desktopSettingsSection } from './desktop-settings.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
 import { getKeybinds, saveKeybinds, comboLabel, recordCombo, DEFAULT_KEYBINDS } from './keybinds.js';
@@ -1239,7 +1240,7 @@ function notificationsTab(app) {
       state),
     soundsSection(),
     quietHoursSection(app),
-    section('Push (when Hearth is closed)', pushToggleRow(app), previewsRow(app)),
+    section('Push (when Hearth is closed)', ...pushRows(app), previewsRow(app)),
     perServerNotifications(app),
   );
 }
@@ -1682,31 +1683,88 @@ function layoutTab(app) {
 }
 
 // ------------------------------------------------------------------ apps & devices tab
-function pushToggleRow(app) {
+// The push switch and, in the Android app, the push app row under it: each redraws the other after a change, so
+// the push app (and its Change button) shows only while push is on.
+function pushRows(app) {
+  let appRow = null;
+  const toggle = pushToggleRow(app, () => appRow && appRow.redraw());
+  if (androidApp.push) appRow = androidPushAppRow(app, () => toggle.refresh());
+  return [toggle, appRow];
+}
+function pushToggleRow(app, onChanged = () => {}) {
   const note = h('span', { class: 'field-hint' }, 'Checking\u2026');
+  const label = h('span', { class: 'toggle-label' }, androidApp.on ? 'Notifications when Hearth is closed' : 'Push notifications on this device');
   const box = h('input', { type: 'checkbox', disabled: true });
   const row = h('label', { class: 'toggle-row' },
-    h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Push notifications on this device'), note),
+    h('span', { class: 'toggle-text' }, label, note),
     h('span', { class: 'switch' }, box, h('span', { class: 'switch-track' })));
   const refresh = async () => {
     const st = await app.push.status().catch(() => 'unsupported');
+    // In the Android app, through a push app such as ntfy (android-push.js); elsewhere, the browser's own.
+    const inApp = !!app.push.android;
     box.checked = st === 'on';
     box.disabled = st === 'unsupported' || st === 'blocked';
     note.textContent = {
-      on: 'You\u2019ll get notified about DMs, mentions and replies even when Hearth is closed. Notifications say who and where, never what \u2014 messages stay encrypted.',
-      off: 'Get notified about DMs, mentions and replies even when Hearth is closed.',
-      blocked: 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings.',
-      unsupported: /iPhone|iPad/.test(navigator.userAgent) && !app.isInstalled ? 'On iPhone and iPad, add Hearth to your Home Screen first, then turn this on inside the app.'
-        : !(app.S.config && app.S.config.pushEnabled) ? 'Push notifications are turned off on this server.' : 'This browser doesn\u2019t support push notifications.',
-    }[st];
+      on: inApp ? 'You\u2019ll get notifications even after you swipe Hearth away. They say \u201cNew message\u201d (or who, if you show names below), never what a message says.'
+        : 'You\u2019ll get notified about DMs, mentions and replies even when Hearth is closed. Notifications say who and where, never what \u2014 messages stay encrypted.',
+      off: inApp ? 'Get notified about DMs, mentions, replies and calls even after you swipe Hearth away. Needs a push app such as ntfy.'
+        : 'Get notified about DMs, mentions and replies even when Hearth is closed.',
+      nodistributor: reasonText.noDistributor,
+      failed: reasonText[(app.push.android && app.push.android.last && app.push.android.last.reason) || ''] || reasonText.INTERNAL_ERROR,
+      blocked: inApp ? reasonText.blocked : 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings.',
+      unsupported: androidApp.on && !(app.S.config && app.S.config.pushEnabled) ? 'Push notifications are turned off on this server.'
+        : androidApp.on ? 'Update the Hearth app to get notifications after you swipe it away.'
+          : /iPhone|iPad/.test(navigator.userAgent) && !app.isInstalled ? 'On iPhone and iPad, add Hearth to your Home Screen first, then turn this on inside the app.'
+            : !(app.S.config && app.S.config.pushEnabled) ? 'Push notifications are turned off on this server.' : 'This browser doesn\u2019t support push notifications.',
+    }[st] || '';
   };
   box.addEventListener('change', async () => {
     box.disabled = true;
-    try { if (box.checked) await app.push.enable(); else await app.push.disable(); toast(box.checked ? 'Push notifications are on for this device.' : 'Push notifications are off for this device.'); } catch (e) { toast(e.message, 'error'); }
-    refresh();
+    const inApp = !!app.push.android;
+    try {
+      if (box.checked) await app.push.enable(); else await app.push.disable();
+      toast(box.checked ? (inApp ? 'Notifications are on, even when Hearth is closed.' : 'Push notifications are on for this device.') : (inApp ? 'Notifications when Hearth is closed are off.' : 'Push notifications are off for this device.'));
+    } catch (e) { if (e.code !== 'CANCELLED') toast(e.message, 'error'); }
+    await refresh();
+    onChanged();
   });
   refresh();
+  row.refresh = refresh;
   return row;
+}
+// Android app: which push app delivers Hearth's notifications while it's closed, and what that means.
+function androidPushAppRow(app, onChanged = () => {}) {
+  const box = h('div', { class: 'stack' });
+  const cfg = app.S.config || {};
+  let drawing = 0;
+  const draw = async () => {
+    const p = app.push.android;
+    if (!p) return;
+    const mine = ++drawing;
+    // Only while push is on: "Change" re-registers, which would turn push back on for someone who turned it off.
+    const on = (await app.push.status().catch(() => 'off')) === 'on';
+    const st = p.last || {};
+    if (mine !== drawing) return; // a newer redraw started meanwhile
+    clear(box);
+    if (on && st.distributor) {
+      box.append(h('div', { class: 'row gap' },
+        h('span', { class: 'muted-p' }, `Push app: ${st.distributorName || st.distributor}`),
+        h('button', { class: 'btn ghost sm', onclick: async (e) => {
+          e.currentTarget.disabled = true;
+          try { await app.push.choose(); toast('Notifications now come through the push app you picked.'); } catch (x) { if (x.code !== 'CANCELLED') toast(x.message, 'error'); }
+          await draw();
+          onChanged();
+        } }, 'Change')));
+    }
+    box.append(h('p', { class: 'field-hint' }, 'How it works: a push app on your phone (such as ntfy, free on F-Droid and Google Play) keeps one connection open for all your apps and wakes Hearth when something happens. It only passes on notifications encrypted for this phone, and never sees what anyone writes. For notifications without delay, let the push app run without battery limits.'));
+    if (cfg.pushNtfy) {
+      box.append(h('p', { class: 'field-hint' }, 'This server runs its own ntfy, so no outside service is involved: in the ntfy app, open Settings \u2192 Default server and enter ',
+        h('code', null, cfg.pushNtfy), ', then turn notifications off and on here.'));
+    }
+  };
+  draw();
+  box.redraw = draw;
+  return box;
 }
 // In the Android app: notifications come from the app itself while it's open or in the background.
 function androidNotifyRow() {
@@ -1719,6 +1777,7 @@ function androidNotifyRow() {
       : st === 'denied' ? 'Notifications are blocked. Turn them on in Android Settings \u2192 Apps \u2192 Hearth \u2192 Notifications.'
         : 'Allow the app to notify you about new messages.'));
     if (st === 'default') box.append(h('div', null, h('button', { class: 'btn primary', onclick: async () => { await Notification.requestPermission(); draw(); } }, 'Allow notifications')));
+    box.append(h('p', { class: 'field-hint' }, 'Update the Hearth app to get notifications after you swipe it away, and calls that keep going with the screen locked.'));
   };
   draw();
   return box;
@@ -1760,8 +1819,9 @@ function appsTab(app) {
       dl.length || cfg.desktopUrl
         ? h('div', null, h('a', { class: 'btn ghost', href: '/download', target: '_blank', rel: 'noopener' }, icon('download'), 'Download page'))
         : h('p', { class: 'field-hint' }, 'The server owner hasn\u2019t published desktop installers yet.')),
-    androidApp.on ? section('Notifications', androidNotifyRow())
-      : section('Notifications', pushToggleRow(app),
+    // An older Android app can't get notifications while it's closed: it shows its own row and asks to be updated.
+    androidApp.on && !androidApp.push ? section('Notifications', androidNotifyRow())
+      : section('Notifications', ...pushRows(app),
         h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
     section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
       h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download`, 'aria-label': 'Download page link' }),

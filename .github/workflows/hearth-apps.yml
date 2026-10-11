@@ -3,7 +3,8 @@
 #   and from the Actions tab ("Run workflow").
 #   Result: download them from the run's "Artifacts" section, or the release for tags.
 #   Optional repository variable HEARTH_SERVER (e.g. https://chat.example.com): bakes your server's address in
-#   so people don't have to type it.
+#   so people don't have to type it. The Android app then also opens https://that-server/invite/... links itself
+#   (Android App Links: set ANDROID_CERT_SHA256 on the server, see hearth/.env.example).
 #   Optional secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD:
 #   sign Android builds with your own key (see hearth/mobile/README.md). Without them a key is generated once
 #   and kept in the Actions cache. With them, a Google Play bundle (.aab) is built too.
@@ -269,6 +270,9 @@ jobs:
         run: |
           npx cap add android
           cp native/*.java android/app/src/main/java/app/hearth/mobile/
+          # Push while the app is closed (UnifiedPush, an exact version), calls that keep going with the screen
+          # locked, invite links, the status bar icon and the app's unit tests. Fails if the template changed.
+          node scripts/patch-android.js android
           # Microphone and camera for calls and voice messages, notifications for new messages.
           sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />#' android/app/src/main/AndroidManifest.xml
           grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
@@ -337,10 +341,16 @@ jobs:
           VERSION_CODE: ${{ steps.v.outputs.code }}
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease ${BUNDLE:+"$BUNDLE"}
+          ./gradlew --no-daemon assembleRelease testReleaseUnitTest ${BUNDLE:+"$BUNDLE"}
           mkdir -p ../dist ../play
           cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-$VERSION_NAME.apk"
           if [ -n "$BUNDLE" ]; then cp app/build/outputs/bundle/release/app-release.aab "../play/Hearth-$VERSION_NAME-$VERSION_CODE.aab"; fi
+      # What actually went into the APK: the push library's receiver, Hearth's unexported push service, the call
+      # service with its type and permissions, and the invite link filter.
+      - name: Check the merged manifest
+        run: |
+          m=$(grep -rl HearthPushService android/app/build/intermediates --include AndroidManifest.xml | grep -i release | grep -iv unittest | sort | head -1)
+          node scripts/patch-android.js --check-merged "$m"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-android

@@ -1,4 +1,4 @@
-// Each server's own audit log, and its moderators' report inbox (v20).
+// Each server's own audit log, and its moderators' report inbox (v19).
 //
 // Audit log: once a server has more than one moderator, its owner needs to answer "who kicked Sam?" or "who changed
 // #general's permissions?" without asking the instance's staff. Every moderation action and settings change inside

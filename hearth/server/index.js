@@ -31,6 +31,10 @@ const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms }
 const { stripFile, ImageRejected } = require('./imagemeta');
 const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 const recur = require('./recurrence');
+// Disappearing messages (server/disappear.js): alive(row) is false once a message's time has passed, even before the
+// sweep deletes it; LIVE is the same test in SQL (one placeholder: the time now).
+const DISAPPEAR = require('./disappear');
+const { alive, LIVE } = DISAPPEAR;
 const perms = makePerms(db);
 
 // ---------------------------------------------------------------- config
@@ -255,7 +259,7 @@ function emitKeyState(serverId) {
   for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list));
 }
 
-const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
+const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, disappear: c.type === 'text' ? c.disappear_secs || 0 : undefined, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
 const THEME_DEFAULT = { accent: '', banner: '', bannerCrop: null, background: { kind: 'none' }, welcome: '', roleColors: true, iconShape: 'rounded' };
 const themeOf = (s) => { try { return { ...THEME_DEFAULT, ...JSON.parse(s.theme || '{}') }; } catch { return { ...THEME_DEFAULT }; } };
 const NEWS_BOT_ID = require('./newsbot').BOT_ID;
@@ -288,18 +292,26 @@ function serverCommon(s) {
     membershipsOn: s.kind !== 'group' && MEMB.usable(),
   };
   if ((s.kind || 'server') === 'group') {
-    // The newest message, looked up channel by channel (the channel index). Joining on the group's id instead made
-    // SQLite walk every top-level message on the whole instance until it reached one from this group.
-    let last = null;
-    for (const c of channels) {
-      const m = db.prepare('SELECT * FROM messages WHERE channel_id = ? AND thread_id IS NULL ORDER BY id DESC LIMIT 1').get(c.id);
-      if (m && (!last || m.id > last.id)) last = m;
-    }
-    out.last = last ? { id: last.id, authorId: last.author_id, channelId: last.channel_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null;
+    const last = groupLastRow(channels);
+    out.last = groupLastOut(last);
     out.lastMessageAt = last ? last.created_at : s.created_at;
   }
   return out;
 }
+// A group chat's newest message that hasn't disappeared, looked up channel by channel (the channel index). Joining on
+// the group's id instead made SQLite walk every top-level message on the whole instance until it reached one from
+// this group.
+function groupLastRow(channels) {
+  let last = null;
+  const t = now();
+  for (const c of channels) {
+    const m = db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND thread_id IS NULL AND ${LIVE} ORDER BY id DESC LIMIT 1`).get(c.id, t);
+    if (m && (!last || m.id > last.id)) last = m;
+  }
+  return last;
+}
+const groupLastOut = (m) => (m ? { id: m.id, authorId: m.author_id, channelId: m.channel_id, ciphertext: m.ciphertext, createdAt: m.created_at, expiresAt: m.expires_at || null } : null);
+const groupLast = (s) => groupLastOut(groupLastRow(db.prepare('SELECT * FROM channels WHERE server_id = ?').all(s.id)));
 // What one member sees of a server: channels they can view (with their permissions), roles, emoji, theme.
 // ev: permissions already worked out for many members at once (perms.forServer), when there is one.
 function serializeServer(s, uid, common = serverCommon(s), ev = null) {
@@ -404,12 +416,13 @@ function reactionsFor(ids) {
 function serializeMessage(row, channel, reactions) {
   let reply = null;
   if (row.reply_to) {
+    // A quote that has disappeared is gone too (the app says the original is no longer available).
     const r = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.reply_to);
     // createdAt: apps only check a reply against keys its author had when it was written.
-    if (r && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch, createdAt: r.created_at };
-    else if (r) {
+    if (alive(r) && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch, createdAt: r.created_at, expiresAt: r.expires_at || null };
+    else if (alive(r)) {
       const rd = unseal(r.body);
-      reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0, createdAt: r.created_at, ...(rd.bot ? { bot: true } : {}) };
+      reply = { id: r.id, authorId: r.author_id, content: (rd.content || '').slice(0, 140), hasAttachments: (rd.attachments || []).length > 0, createdAt: r.created_at, expiresAt: r.expires_at || null, ...(rd.bot ? { bot: true } : {}) };
     }
   }
   // End-to-end encrypted message: the server only has ciphertext.
@@ -428,20 +441,22 @@ function serializeMessage(row, channel, reactions) {
     pinnedAt: row.pinned_at || null,
     createdAt: row.created_at,
     editedAt: row.edited_at,
+    expiresAt: row.expires_at || null,
     reactions: reactions ? reactions[row.id] || [] : reactionsFor([row.id])[row.id] || [],
   };
 }
+// A thread's reply count and latest reply, leaving out replies whose time has passed (not yet swept).
 function threadInfo(row) {
   if (row.thread_id) return {};
-  const t = db.prepare('SELECT COUNT(*) AS n, MAX(created_at) AS last FROM messages WHERE thread_id = ?').get(row.id);
+  const t = db.prepare(`SELECT COUNT(*) AS n, MAX(created_at) AS last FROM messages WHERE thread_id = ? AND ${LIVE}`).get(row.id, now());
   return t.n ? { threadCount: t.n, threadLastAt: t.last } : {};
 }
 
 function serializeDmMessage(row, reactions) {
   let reply = null;
   if (row.reply_to) {
-    const r = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE id = ?').get(row.reply_to);
-    if (r) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, createdAt: r.created_at };
+    const r = db.prepare('SELECT id, author_id, ciphertext, created_at, expires_at FROM dm_messages WHERE id = ?').get(row.reply_to);
+    if (alive(r)) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, createdAt: r.created_at, expiresAt: r.expires_at || null };
   }
   return {
     id: row.id,
@@ -453,15 +468,18 @@ function serializeDmMessage(row, reactions) {
     pinnedAt: row.pinned_at || null,
     createdAt: row.created_at,
     editedAt: row.edited_at,
+    expiresAt: row.expires_at || null,
     reactions: reactions ? reactions[row.id] || [] : reactionsFor([row.id])[row.id] || [],
   };
 }
 
+// disappear: the conversation's timer in seconds (0 = off). last: the newest message that hasn't disappeared.
 function serializeDm(row, userId) {
-  const last = db.prepare('SELECT id, author_id, ciphertext, created_at FROM dm_messages WHERE dm_id = ? ORDER BY id DESC LIMIT 1').get(row.id);
+  const last = db.prepare(`SELECT id, author_id, ciphertext, created_at, expires_at FROM dm_messages WHERE dm_id = ? AND ${LIVE} ORDER BY id DESC LIMIT 1`).get(row.id, now());
   return {
     id: row.id, userId: row.user_a === userId ? row.user_b : row.user_a, lastMessageAt: row.last_message_at, region: row.rtc_region || null, regionVersion: row.rtc_region_v || 0,
-    last: last ? { id: last.id, authorId: last.author_id, ciphertext: last.ciphertext, createdAt: last.created_at } : null,
+    disappear: row.disappear_secs || 0,
+    last: last ? { id: last.id, authorId: last.author_id, ciphertext: last.ciphertext, createdAt: last.created_at, expiresAt: last.expires_at || null } : null,
   };
 }
 
@@ -827,11 +845,12 @@ function requireUnlocked(uid) {
 
 // Encrypted attachments are opaque blobs. The sender lists the blob URLs (not their contents) when
 // posting, so only the uploader can attach a blob and deleting a message removes its files.
-function attachBlobs(files, userId, messageId) {
+// expiresAt: the message's deadline (disappearing messages), copied so /uploads/ can check a file on its own.
+function attachBlobs(files, userId, messageId, expiresAt = null) {
   if (!Array.isArray(files)) return;
-  const stmt = db.prepare('UPDATE blobs SET message_id = ? WHERE name = ? AND uploader_id = ? AND message_id IS NULL');
+  const stmt = db.prepare('UPDATE blobs SET message_id = ?, expires_at = ? WHERE name = ? AND uploader_id = ? AND message_id IS NULL');
   files.slice(0, 20).forEach((u) => { // up to 10 attachments, each with a thumbnail
-    if (typeof u === 'string' && /^\/uploads\/[a-z0-9]+\.bin$/.test(u)) stmt.run(messageId, path.basename(u), userId);
+    if (typeof u === 'string' && /^\/uploads\/[a-z0-9]+\.bin$/.test(u)) stmt.run(messageId, expiresAt, path.basename(u), userId);
   });
 }
 function removeMessageFiles(messageIds) {
@@ -893,7 +912,12 @@ function purgeChannelMessages(rows, actorId) {
   const slices = (list) => { const out = []; for (let i = 0; i < list.length; i += 500) out.push(list.slice(i, i + 500)); return out; };
   const marks = (n) => Array(n).fill('?').join(',');
   const all = new Set(rows.map((r) => r.id));
-  for (const part of slices(rows.map((r) => r.id))) db.prepare(`SELECT id FROM messages WHERE thread_id IN (${marks(part.length)})`).all(...part).forEach((r) => all.add(r.id));
+  // Replies whose time has passed (disappearing messages the sweep hasn't reached) go too, but aren't counted.
+  const t = now(); let expired = 0;
+  for (const part of slices(rows.map((r) => r.id))) {
+    db.prepare(`SELECT id, expires_at FROM messages WHERE thread_id IN (${marks(part.length)})`).all(...part)
+      .forEach((r) => { if (all.has(r.id)) return; all.add(r.id); if (!alive(r, t)) expired++; });
+  }
   const every = slices([...all]);
   const files = [];
   for (const part of every) {
@@ -925,7 +949,7 @@ function purgeChannelMessages(rows, actorId) {
     }
     BOTS.events('message.deleted', c.server_id, list.map((r) => ({ messageId: r.id, channelId: c.id, authorId: r.author_id, threadId: r.thread_id || null, deletedBy: actorId })), { channel: c, actorId });
   }
-  return { messages: rows.length, replies: all.size - rows.length };
+  return { messages: rows.length, replies: all.size - rows.length - expired };
 }
 // Whose messages a moderator may delete along with others (bulk delete, a ban's cleanup): their own, and those
 // of people below their highest role. Never the owner's; people who left the server count as below (they have
@@ -939,12 +963,14 @@ function belowMe(s, actorId) {
   };
 }
 // The roots (messages that start a thread) among `rows` and who else replied in them: rootId -> Set(author ids).
+// A reply whose time has passed is gone already, so it holds nothing back.
 function otherRepliers(rows) {
   const out = new Map();
   const roots = rows.filter((r) => !r.thread_id).map((r) => r.id);
+  const t = now();
   for (let i = 0; i < roots.length; i += 500) {
     const part = roots.slice(i, i + 500);
-    for (const x of db.prepare(`SELECT DISTINCT thread_id, author_id FROM messages WHERE thread_id IN (${part.map(() => '?').join(',')})`).all(...part)) {
+    for (const x of db.prepare(`SELECT DISTINCT thread_id, author_id FROM messages WHERE thread_id IN (${part.map(() => '?').join(',')}) AND ${LIVE}`).all(...part, t)) {
       if (!out.has(x.thread_id)) out.set(x.thread_id, new Set());
       out.get(x.thread_id).add(x.author_id);
     }
@@ -958,15 +984,16 @@ function otherRepliers(rows) {
 // replies elsewhere still go). Returns { messages, replies, kept }.
 async function purgeRecentBy(s, userId, since, actorId) {
   const below = belowMe(s, actorId);
+  // Disappearing messages whose time has passed are left to the sweep: they're gone already, and aren't counted.
   const pick = db.prepare(`SELECT id, channel_id, thread_id, author_id, created_at FROM messages
-    WHERE channel_id = ? AND author_id = ? AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 500`);
+    WHERE channel_id = ? AND author_id = ? AND (created_at, id) > (?, ?) AND ${LIVE} ORDER BY created_at, id LIMIT 500`);
   const out = { messages: 0, replies: 0, kept: 0 };
   for (const c of db.prepare('SELECT * FROM channels WHERE server_id = ?').all(s.id)) {
     let at = [since, ''];
     let manage = null;
     const mayTake = () => (manage ??= canIn(s, c, actorId, PM.MANAGE_MESSAGES));
     for (;;) {
-      const rows = pick.all(c.id, userId, ...at);
+      const rows = pick.all(c.id, userId, ...at, now());
       if (!rows.length) break;
       at = [rows[rows.length - 1].created_at, rows[rows.length - 1].id];
       const others = otherRepliers(rows);
@@ -1006,6 +1033,11 @@ app.get('/uploads/:file', (req, res) => {
   if (!/^[a-z0-9]+(\.[a-z0-9]{1,8})?$/i.test(f)) return res.sendStatus(404);
   const p = uploadPath(f);
   if (!p || !fs.existsSync(p)) return res.sendStatus(404);
+  const bin = path.extname(f).toLowerCase() === '.bin';
+  // A disappearing message's file: gone once its time has passed (even before the sweep deletes it), and browsers
+  // are asked not to keep a copy on disk meanwhile.
+  const blob = bin ? db.prepare('SELECT expires_at FROM blobs WHERE name = ?').get(f) : null;
+  if (blob && !alive(blob)) return res.sendStatus(404);
   const type = INLINE_TYPES[path.extname(f).toLowerCase()];
   if (type) {
     res.type(type);
@@ -1017,7 +1049,7 @@ app.get('/uploads/:file', (req, res) => {
   // deleted attachment stops loading at once instead of living on in caches. Other uploads (avatars, icons,
   // emoji…) get a new name whenever they change, so they can be cached for good. Either way only the browser
   // keeps a copy (private), never a shared proxy.
-  res.setHeader('Cache-Control', path.extname(f).toLowerCase() === '.bin' ? 'private, no-cache' : 'private, max-age=31536000, immutable');
+  res.setHeader('Cache-Control', blob && blob.expires_at ? 'no-store' : bin ? 'private, no-cache' : 'private, max-age=31536000, immutable');
   res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
   // Range requests (206, 416) come from sendFile, so long videos and songs can seek without downloading it all.
   res.sendFile(p, { acceptRanges: true }, (err) => {
@@ -1065,6 +1097,20 @@ app.get('/sw.js', (req, res) => {
 });
 app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
+// Android App Links: with this file, a phone that has a Hearth app built for this server (HEARTH_SERVER in the
+// apps workflow) opens https://this-server/invite/... links straight in the app instead of the browser. Android
+// only believes it for apps signed with a key listed here: ANDROID_CERT_SHA256 is that key's SHA-256
+// fingerprint (comma-separated for several, e.g. your own key and Google Play's app signing key).
+const CERT_FP = /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/;
+const ANDROID_PACKAGE = /^[a-zA-Z][\w]*(\.[a-zA-Z][\w]*)+$/.test(process.env.ANDROID_PACKAGE || '') ? process.env.ANDROID_PACKAGE : 'app.hearth.mobile';
+const ANDROID_CERTS = String(process.env.ANDROID_CERT_SHA256 || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+if (ANDROID_CERTS.some((f) => !CERT_FP.test(f))) log.warn('android', 'bad_cert_fingerprint', { msg: 'ANDROID_CERT_SHA256 entries look like AB:CD:... (32 pairs); the bad ones are ignored.' });
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  const fps = ANDROID_CERTS.filter((f) => CERT_FP.test(f));
+  if (!fps.length) return res.status(404).json([]);
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.json([{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'android_app', package_name: ANDROID_PACKAGE, sha256_cert_fingerprints: fps } }]);
+});
 // The desktop app's self-updater reads latest.yml (latest-linux.yml…) here, then downloads the installer it
 // names. electron-builder writes these next to the installers; GitHub Actions copies them to data/downloads.
 // latest*.yml.sig is the publisher's signature over latest*.yml (desktop/build/sign-update.js): apps built
@@ -1327,6 +1373,28 @@ const nameOf = (uid) => { const r = getUserRow(uid); return r ? (parseProfile(r)
 // goes through netguard (public addresses only, pinned, with a deadline and a cap on the answer).
 // PUSH_ALLOW_PRIVATE=1 is for tests, or a push service on your own network.
 const PUSH_ALLOW_PRIVATE = process.env.PUSH_ALLOW_PRIVATE === '1';
+// Which push services this server talks to. Browsers bring their maker's (Google, Mozilla, Apple, Microsoft);
+// the Android app brings a UnifiedPush one (ntfy.sh, a self-hosted ntfy, or Google's). Empty PUSH_HOSTS means
+// any public https host. PUSH_HOSTS takes exact names or "*.suffix"; PUSH_PRIVATE_HOSTS names push services on
+// your own network (a self-hosted ntfy on the LAN) that may have private addresses, without opening every
+// private address to PUSH_ALLOW_PRIVATE=1: exact names, on port 443 unless the entry says "name:port". (A
+// private address skips netguard's other checks, so the exception is as narrow as one service.)
+const hostList = (v) => String(v || '').split(',').map((s) => s.trim().toLowerCase().replace(/\.$/, '')).filter(Boolean);
+const bareHost = (u) => u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+const PUSH_HOSTS = hostList(process.env.PUSH_HOSTS);
+// "ntfy.lan", "ntfy.lan:8443", "10.0.0.5", "[fd00::5]:8443" -> "host:port".
+const hostPort = (x) => { const m = /^\[([^\]]+)\](?::(\d+))?$/.exec(x) || /^([^:]+)(?::(\d+))?$/.exec(x); return m ? `${m[1]}:${m[2] || 443}` : `${x}:443`; };
+const PUSH_PRIVATE_HOSTS = new Set(hostList(process.env.PUSH_PRIVATE_HOSTS).filter((x) => !x.includes('*') && !x.includes('/')).map(hostPort));
+const hostMatch = (host, pat) => (pat.startsWith('*.') ? host.endsWith(pat.slice(1)) && host.length > pat.length - 1 : host === pat);
+const pushHostAllowed = (u) => !PUSH_HOSTS.length || PUSH_HOSTS.some((p) => hostMatch(bareHost(u), p));
+const pushPrivateOk = (u) => PUSH_ALLOW_PRIVATE || PUSH_PRIVATE_HOSTS.has(`${bareHost(u)}:${Number(u.port) || 443}`);
+// The operator's own ntfy, offered to the Android app's settings (people point the ntfy app at it).
+const PUSH_NTFY_URL = (() => {
+  if (!process.env.PUSH_NTFY_URL) return null;
+  try { const u = new URL(process.env.PUSH_NTFY_URL); if (u.protocol === 'https:' && !u.username && !u.password) return u.origin; } catch { /* below */ }
+  log.warn('push', 'ntfy_url_ignored', { msg: 'PUSH_NTFY_URL must be an https:// address; it is ignored.' });
+  return null;
+})();
 const PUSH_MAX_PER_USER = 10; // phones, browsers, desktop apps; turning push on somewhere new drops the oldest
 const PUSH_TIMEOUT_MS = 10000;
 // Sending is shared out fairly, so an account whose push services never answer can't hold up everyone else's
@@ -1406,18 +1474,75 @@ async function sendPush({ uid, endpoint, payload }) {
   // web-push only encrypts the payload and signs the VAPID header here; the request itself goes through
   // netguard, never through web-push's own (unguarded, unbounded) https.request.
   try {
-    details = webpush.generateRequestDetails({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys) }, JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' });
+    details = webpush.generateRequestDetails({ endpoint: sub.endpoint, keys: JSON.parse(sub.keys) }, pushBody(payload), { TTL: 6 * 3600, urgency: 'high' });
   } catch { dropPushSub(sub.endpoint); return; } // keys that can never work
+  let r;
   try {
-    const r = await netguard.request(details.endpoint, { method: details.method, headers: details.headers, body: details.body, protocols: ['https:'], allowPrivate: PUSH_ALLOW_PRIVATE,
-      maxRedirects: 0, timeout: PUSH_TIMEOUT_MS, maxBytes: 64 * 1024, truncate: true, decompress: false });
-    if (r.status === 404 || r.status === 410) dropPushSub(sub.endpoint); // the browser unsubscribed
-    else if (sub.fails) db.prepare('UPDATE push_subs SET fails = 0, retry_at = NULL WHERE endpoint = ?').run(sub.endpoint);
+    r = await netguard.request(details.endpoint, { method: details.method, headers: details.headers, body: details.body, protocols: ['https:'], allowPrivate: pushPrivateOk,
+      allowUrl: pushHostAllowed, maxRedirects: 0, timeout: PUSH_TIMEOUT_MS, maxBytes: 64 * 1024, truncate: true, decompress: false });
   } catch (e) {
-    // Its host now points inside a private network (or it was never a usable address): stop trying it.
-    if (['PRIVATE', 'BAD_URL', 'BAD_PROTOCOL'].includes(e.code)) dropPushSub(sub.endpoint);
+    // Its host now points inside a private network, is no longer on PUSH_HOSTS, or was never a usable
+    // address: stop trying it.
+    if (['PRIVATE', 'BAD_URL', 'BAD_PROTOCOL', 'NOT_ALLOWED'].includes(e.code)) dropPushSub(sub.endpoint);
     else if (e.code === 'TIMEOUT' || e.code === 'NETWORK') pushFailed(sub.endpoint);
+    return;
   }
+  const s = r.status;
+  if (s >= 200 && s < 300) { if (sub.fails || sub.retry_at) db.prepare('UPDATE push_subs SET fails = 0, retry_at = NULL WHERE endpoint = ?').run(sub.endpoint); return; }
+  if (s === 404 || s === 410) { dropPushSub(sub.endpoint); return; } // the browser or push app unsubscribed
+  // Too many for now (ntfy.sh allows a few hundred a day): sit out as long as it asks, between a minute and an
+  // hour, without counting it as a failure. A busy day mustn't cost someone their phone's notifications.
+  if (s === 429) {
+    const wait = Math.min(Math.max(retryAfterMs(r.headers['retry-after']) || 5 * 60000, 60000), 3600000);
+    db.prepare('UPDATE push_subs SET retry_at = ? WHERE endpoint = ?').run(now() + wait, sub.endpoint);
+    pushRefused(sub.endpoint, s);
+    return;
+  }
+  // Too big can't happen with pushBody's cap; keep the device, tell the operator.
+  if (s === 413) { pushRefused(sub.endpoint, s); return; }
+  // Anything else is a failure: a redirect (never followed), a refusal (a self-hosted ntfy without a write rule
+  // for "up*" topics, a VAPID key the push service no longer accepts), a server error, or ntfy's 507 (nobody
+  // is listening on that topic any more). Backed off, and dropped after PUSH_MAX_FAILS in a row.
+  pushRefused(sub.endpoint, s);
+  pushFailed(sub.endpoint);
+}
+// Retry-After: seconds, or an HTTP date.
+function retryAfterMs(h) {
+  if (h === undefined || h === null || h === '') return null;
+  const n = Number(h);
+  if (Number.isFinite(n)) return n >= 0 ? n * 1000 : null;
+  const t = Date.parse(String(h));
+  return Number.isFinite(t) ? Math.max(0, t - now()) : null;
+}
+// A push service turning sends away is something the operator can usually fix (an ntfy access rule, a
+// PUSH_HOSTS typo), so it's logged, by host only and at most once an hour per host and answer.
+const pushRefusedAt = new Map();
+function pushRefused(endpoint, status) {
+  const host = pushHost(endpoint);
+  const key = `${host} ${status}`;
+  if (pushRefusedAt.get(key) > now() - 3600000) return;
+  if (pushRefusedAt.size > 500) pushRefusedAt.clear();
+  pushRefusedAt.set(key, now());
+  log.warn('push', status === 413 ? 'too_large' : 'refused', { host, status });
+}
+// The text that gets encrypted for the push service. Title and body are cut to a sane length, and the whole
+// thing is padded with spaces to a multiple of 256 bytes, so the push service (which sees only the encrypted
+// size) can't tell one name's length from another's. It stays far below UnifiedPush's 4096-byte limit.
+const PUSH_STEP = 256;
+const PUSH_MAX_BYTES = 3072;
+// Control characters and lone surrogates would grow sixfold as JSON escapes, so they go first.
+const cutCodePoints = (s, n) => { const a = [...String(s).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/[\ud800-\udfff]/gu, '\ufffd')]; return a.slice(0, n).join(''); };
+function pushBody(payload) {
+  const p = { ...payload };
+  if (typeof p.title === 'string') p.title = cutCodePoints(p.title, 200);
+  if (typeof p.body === 'string') p.body = cutCodePoints(p.body, 300);
+  if (typeof p.generic === 'string') p.generic = cutCodePoints(p.generic, 100);
+  delete p._;
+  const size = (o) => Buffer.byteLength(JSON.stringify(o));
+  // `,"_":""` adds 7 bytes; then one space per byte up to the next step (never past the ceiling).
+  const base = size(p) + 7;
+  const target = Math.min(Math.ceil(base / PUSH_STEP) * PUSH_STEP, PUSH_MAX_BYTES);
+  return JSON.stringify({ ...p, _: ' '.repeat(Math.max(0, target - base)) });
 }
 function pushFailed(endpoint) {
   db.prepare('UPDATE push_subs SET fails = fails + 1 WHERE endpoint = ?').run(endpoint);
@@ -1432,6 +1557,7 @@ function pushFailed(endpoint) {
 // what: { kind, serverId, channelId, dmId } — checked against each person's notification preferences and Do Not
 // Disturb schedule (server/usability.js), which also decides how much the lock screen shows.
 let USE = null; // server/usability.js
+let DIS = null; // server/disappear.js: disappearing messages
 let SELF = null; // server/selfroles.js
 function pushTo(userIds, payload, what = { kind: 'other' }) {
   if (!vapid) return;
@@ -1442,31 +1568,59 @@ function pushTo(userIds, payload, what = { kind: 'other' }) {
       const row = getUserRow(uid);
       if (!row || row.status === 'dnd' || !pushUserOk(row)) continue;
       if (USE && !USE.pushAllowed(uid, what)) continue;
-      const shaped = USE ? USE.shapePush(uid, payload) : payload;
+      // `at`: when the server decided to notify. A push can arrive hours late (a phone that was offline, a
+      // push service's cache); the Android app shows an old call as "Missed call" instead of ringing.
+      const stamped = { ...payload, at: now() };
+      const shaped = USE ? USE.shapePush(uid, stamped) : stamped;
       for (const sub of pushSubsFor(uid)) queuePush(uid, sub, shaped);
     }
     pumpPush();
   });
 }
 api.get('/push/key', (req, res) => res.json({ publicKey: vapid ? vapid.publicKey : null }));
+// The keys a browser (or the Android app's push library) makes for a subscription: an uncompressed P-256
+// public key (65 bytes, 0x04 then x and y) that really is a point on the curve, and a 16-byte secret, both
+// base64url. Anything else could never be encrypted to, so it's refused up front instead of failing every send.
+const B64URL = /^[A-Za-z0-9_-]+={0,2}$/;
+function validPushKeys(keys) {
+  if (!keys || typeof keys.p256dh !== 'string' || typeof keys.auth !== 'string') return false;
+  if (keys.p256dh.length > 100 || keys.auth.length > 32 || !B64URL.test(keys.p256dh) || !B64URL.test(keys.auth)) return false;
+  const pub = Buffer.from(keys.p256dh, 'base64url');
+  if (pub.length !== 65 || pub[0] !== 0x04 || Buffer.from(keys.auth, 'base64url').length !== 16) return false;
+  try {
+    crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: pub.subarray(1, 33).toString('base64url'), y: pub.subarray(33).toString('base64url') }, format: 'jwk' });
+    return true;
+  } catch { return false; } // not on the curve
+}
 api.post('/push/subscribe', auth, wrap(async (req, res) => {
-  const sub = (req.body || {}).subscription || {};
+  const body = req.body || {};
+  const sub = body.subscription || {};
   if (!vapid) fail(400, 'Push notifications are turned off on this server.');
   if (typeof sub.endpoint !== 'string' || sub.endpoint.length > 1000) fail(400, 'Bad subscription.');
-  if (!sub.keys || typeof sub.keys.p256dh !== 'string' || typeof sub.keys.auth !== 'string') fail(400, 'Bad subscription.');
+  if (!validPushKeys(sub.keys)) fail(400, 'Bad subscription.');
+  // replaces: the endpoint this device had before (a push app can hand out a new one), so a phone stays one
+  // device instead of piling up dead ones that push out real ones.
+  const replaces = body.replaces;
+  if (replaces !== undefined && replaces !== null && (typeof replaces !== 'string' || replaces.length > 1000)) fail(400, 'Bad subscription.');
+  // Checked every time, for endpoints already saved too, so tightening PUSH_HOSTS takes effect at once.
+  let u;
+  try { u = netguard.parseUrl(sub.endpoint, { protocols: ['https:'] }); } catch { fail(400, 'Bad subscription.'); }
+  if (!pushHostAllowed(u)) fail(400, 'This server doesn\u2019t send notifications through that push service.');
   rateLimit('pushsub-any:' + req.userId, 60, 3600000);
   // The app turns push on again each time it starts. An endpoint this account already has was checked when it
   // was saved (and every send checks it again), so only new ones are looked up and count toward this limit.
   if (!db.prepare('SELECT 1 FROM push_subs WHERE endpoint = ? AND user_id = ?').get(sub.endpoint, req.userId)) {
     rateLimit('pushsub:' + req.userId, 10, 3600000);
     // Push services are public https sites. (Each send checks again, pinned, since DNS answers can change.)
-    try { await netguard.checkPublicUrl(sub.endpoint, { protocols: ['https:'], allowPrivate: PUSH_ALLOW_PRIVATE }); } catch (e) { fail(400, e.code === 'NOT_FOUND' ? 'Bad subscription: its push service couldn’t be found.' : 'Bad subscription.'); }
+    try { await netguard.checkPublicUrl(sub.endpoint, { protocols: ['https:'], allowPrivate: pushPrivateOk }); } catch (e) { fail(400, e.code === 'NOT_FOUND' ? 'Bad subscription: its push service couldn’t be found.' : 'Bad subscription.'); }
   }
   db.transaction(() => {
+    // Only the caller's own old row, and before the cap below, so the replaced one never pushes out another device.
+    if (typeof replaces === 'string' && replaces !== sub.endpoint) db.prepare('DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?').run(replaces, req.userId);
     // Saving it again keeps its count of failed sends: subscribing again doesn't restart a dead push service's back-off.
     db.prepare(`INSERT INTO push_subs (endpoint, user_id, keys, ua, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, keys = excluded.keys, ua = excluded.ua, created_at = excluded.created_at, session_id = excluded.session_id`)
-      .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh.slice(0, 200), auth: sub.keys.auth.slice(0, 100) }), String(req.headers['user-agent'] || '').slice(0, 300), now(), req.session.id);
+      .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh, auth: sub.keys.auth }), String(req.headers['user-agent'] || '').slice(0, 300), now(), req.session.id);
     // Only the newest few per account are kept.
     db.prepare('DELETE FROM push_subs WHERE user_id = ? AND endpoint NOT IN (SELECT endpoint FROM push_subs WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)')
       .run(req.userId, req.userId, PUSH_MAX_PER_USER);
@@ -1499,6 +1653,7 @@ api.get('/config', (req, res) => {
     announcement: (() => { try { return JSON.parse(getSetting('announcement') || 'null'); } catch { return null; } })(),
     maintenance: maintenance() || null,
     pushEnabled: !!vapid,
+    pushNtfy: PUSH_NTFY_URL, // this server's own ntfy, for the Android app's push settings
     downloads: listDownloads(),
     desktopUrl: process.env.DESKTOP_DOWNLOAD_URL || null,
     name: brand().name,
@@ -1518,6 +1673,7 @@ api.get('/config', (req, res) => {
     imageMb: uploadLimits().imageMb,
     songMb: uploadLimits().songMb,
     iceServers: [iceServers[0]], // STUN only here; TURN relay details are given to signed-in users
+    disappearing: { choices: DISAPPEAR.CHOICES },
     // Tests only (LINK_PREVIEW_ALLOW_PRIVATE): link previews for local stand-in sites on other ports.
     ...(!['', '0'].includes(String(process.env.LINK_PREVIEW_ALLOW_PRIVATE || '').trim()) ? { linkPreviewAnyPort: true } : {}),
   });
@@ -1881,7 +2037,9 @@ api.get('/bootstrap', auth, (req, res) => {
   // No password-locked private key here: a session alone must not be enough to take it away and guess the
   // password offline (POST /me/keys/wrapped hands it out with the password). The signing key's private half
   // is locked with the identity key, not the password, so it can't be guessed at and stays.
-  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid, req.session.id), me: selfUser(me), encSignPrivateKey: me.enc_sign_private_key, e2eeSince: Number(getSetting('e2eeSince')) || 0, servers, dms, relationships, users, voice, keyStates, blocked });
+  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid, req.session.id), me: selfUser(me), encSignPrivateKey: me.enc_sign_private_key, e2eeSince: Number(getSetting('e2eeSince')) || 0, servers, dms, relationships, users, voice, keyStates, blocked,
+    // The server's clock: apps hide disappearing messages by it, whatever the device's own clock says.
+    serverNow: Date.now() });
 });
 
 // ---------------------------------------------------------------- profile
@@ -2698,34 +2856,43 @@ api.delete('/channels/:id', auth, (req, res) => {
 const MAX_MESSAGE = 4000;
 
 // Page through a conversation: newest (default), ?before=id (older), ?after=id (newer) or ?around=id (jump).
+// Messages whose disappearing time has passed are skipped, so a page is full of live ones even before the sweep.
 function pageRows(table, col, containerId, q, extra = '') {
   // Between 1 and 100 (SQLite reads a negative LIMIT as "no limit": the whole history in one go).
   const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 50));
-  const base = `SELECT * FROM ${table} WHERE ${col} = ? ${extra}`;
+  const base = `SELECT * FROM ${table} WHERE ${col} = ? ${extra} AND ${LIVE}`;
+  const t = now();
   if (q.around) {
-    const older = db.prepare(`${base} AND id <= ? ORDER BY id DESC LIMIT 26`).all(containerId, String(q.around));
-    const newer = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT 25`).all(containerId, String(q.around));
+    const older = db.prepare(`${base} AND id <= ? ORDER BY id DESC LIMIT 26`).all(containerId, t, String(q.around));
+    const newer = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT 25`).all(containerId, t, String(q.around));
     return { rows: [...older.reverse(), ...newer], hasMore: older.length === 26, hasNewer: newer.length === 25 };
   }
   if (q.after) {
-    const rows = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT ?`).all(containerId, String(q.after), limit);
-    return { rows, hasMore: true, hasNewer: rows.length === limit };
+    const rows = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT ?`).all(containerId, t, String(q.after), limit);
+    // Where the page before this one ended (its last message's time), so the timer changes in between land here.
+    const from = db.prepare(`SELECT created_at FROM ${table} WHERE id = ? AND ${col} = ?`).get(String(q.after), containerId);
+    return { rows, hasMore: true, hasNewer: rows.length === limit, afterAt: from ? from.created_at : DISAPPEAR.idTime(q.after) };
   }
   const rows = q.before
-    ? db.prepare(`${base} AND id < ? ORDER BY id DESC LIMIT ?`).all(containerId, String(q.before), limit)
-    : db.prepare(`${base} ORDER BY id DESC LIMIT ?`).all(containerId, limit);
+    ? db.prepare(`${base} AND id < ? ORDER BY id DESC LIMIT ?`).all(containerId, t, String(q.before), limit)
+    : db.prepare(`${base} ORDER BY id DESC LIMIT ?`).all(containerId, t, limit);
   return { rows: rows.reverse(), hasMore: rows.length === limit, hasNewer: false };
 }
+// The timer changes inside a history page (the apps draw them between the messages). A ?before= page ends where the
+// page after it began, and an ?after= page begins where the page before it ended, so no change falls between two.
+const timerEvents = (conv, page, q) => DIS.eventsBetween(conv, page.rows, { hasMore: page.hasMore, hasNewer: page.hasNewer,
+  before: q.before && !q.around && !q.after ? String(q.before) : null, afterAt: !q.around && q.after ? page.afterAt : null });
 
 api.get('/channels/:id/messages', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
   // Thread replies live in their thread, not the main channel.
-  const { rows, hasMore, hasNewer } = pageRows('messages', 'channel_id', c.id, req.query, 'AND thread_id IS NULL');
+  const page = pageRows('messages', 'channel_id', c.id, req.query, 'AND thread_id IS NULL');
+  const { rows, hasMore, hasNewer } = page;
   const reactions = reactionsFor(rows.map((r) => r.id));
   const messages = rows.map((r) => serializeMessage(r, c, reactions));
   // Your own unread and ping counts for the threads these messages start ("2 new replies" on each).
   const threads = USE ? USE.threadStates(req.userId, c, messages.filter((m) => m.threadCount).map((m) => m.id)) : {};
-  res.json({ messages, hasMore, hasNewer, threads });
+  res.json({ messages, hasMore, hasNewer, threads, timerEvents: timerEvents('c:' + c.id, page, req.query) });
 });
 
 // Who gets a push for a channel message. The sender's app tells us which members it @mentions
@@ -2802,25 +2969,32 @@ api.post('/channels/:id/messages', auth, (req, res) => {
     if (wait > 0) fail(429, `Slowmode is on. You can send another message in ${wait}s.`, 'slowmode');
   }
   const ep = requireCurrentEpoch(c.server_id, epoch);
+  // The disappearing timer the app encrypted for must be the one in force (it's inside the message too).
+  DIS.checkTtl(req.body, c.disappear_secs);
+  const t = now();
   let replyTo = (req.body || {}).replyTo || null;
-  if (replyTo && !db.prepare('SELECT 1 FROM messages WHERE id = ? AND channel_id = ?').get(replyTo, c.id)) replyTo = null;
+  if (replyTo && !alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND channel_id = ?').get(replyTo, c.id), t)) replyTo = null;
   let threadId = (req.body || {}).threadId || null;
+  let root = null;
   if (threadId) {
-    const root = db.prepare('SELECT id, thread_id FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
-    if (!root || root.thread_id) fail(404, 'That thread no longer exists.');
+    root = db.prepare('SELECT id, thread_id, expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
+    if (!alive(root, t) || root.thread_id) fail(404, 'That thread no longer exists.');
     threadId = root.id; // the stored id, whatever shape the request gave it in
   }
   const id = newId();
+  // A thread reply never outlives the message that starts the thread.
+  const expiresAt = DISAPPEAR.stamp({ secs: c.disappear_secs, t, root });
   db.transaction(() => {
-    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, c.id, req.userId, '', ciphertext, ep, replyTo, now(), threadId);
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, c.id, req.userId, '', ciphertext, ep, replyTo, t, threadId, expiresAt);
     // A reply moves its thread to the top of the channel's Threads list (deleting one is handled in db.js).
     if (threadId) {
       db.prepare(`INSERT INTO thread_activity (root_id, channel_id, last_reply_id) VALUES (?, ?, ?)
         ON CONFLICT(root_id) DO UPDATE SET last_reply_id = excluded.last_reply_id WHERE excluded.last_reply_id > thread_activity.last_reply_id`).run(threadId, c.id, id);
     }
   })();
-  attachBlobs(files, req.userId, id);
+  attachBlobs(files, req.userId, id, expiresAt);
+  DISAPPEAR.arm(expiresAt);
   const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
   withNonce(msg, req.body);
   toChannel(c).emit('message:new', msg);
@@ -2828,14 +3002,14 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   if (USE && !threadId) USE.markSent(req.userId, 'c:' + c.id, id);
   else if (USE) USE.markThreadSent(req.userId, c, threadId, id);
   // Bots get who, where and when: never the text, which is end-to-end encrypted.
-  BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId: req.userId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null }, { channel: c, actorId: req.userId });
+  BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId: req.userId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null, expiresAt }, { channel: c, actorId: req.userId });
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
   res.json(msg);
 });
 
 api.patch('/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
-  if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
+  if (!alive(m) || m.author_id !== req.userId) fail(404, 'Message not found.');
   const c = requireChannel(m.channel_id, req.userId);
   if (perms.timedOut(c.server_id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
   const { ciphertext, epoch } = req.body || {};
@@ -2851,7 +3025,9 @@ api.patch('/messages/:id', auth, (req, res) => {
 
 api.delete('/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
-  if (!m) fail(404, 'Message not found.');
+  // A disappearing message whose time has passed is gone, even before the sweep deletes it: no moderator action
+  // (or audit log entry) for it.
+  if (!alive(m)) fail(404, 'Message not found.');
   const c = requireChannel(m.channel_id, req.userId);
   const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (m.author_id !== req.userId && !canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You can only delete your own messages.');
@@ -2879,17 +3055,20 @@ api.post('/channels/:id/messages/bulk-delete', auth, (req, res) => {
   if (perms.timedOut(s.id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
   if (c.type !== 'text') fail(400, 'Only text channels have messages to delete.');
   const b = req.body || {};
-  const since = now() - BULK_DAYS * 86400000;
+  const t = now();
+  const since = t - BULK_DAYS * 86400000;
   const cols = 'id, channel_id, thread_id, author_id, created_at';
+  // Disappearing messages whose time has passed are gone already (the sweep deletes them): they aren't picked,
+  // counted or put down to the moderator.
   let rows;
   if (b.ids !== undefined) {
     if (!Array.isArray(b.ids) || !b.ids.length || b.ids.length > BULK_MAX || !b.ids.every((x) => typeof x === 'string' && MSG_ID.test(x))) fail(400, `Pick from 1 to ${BULK_MAX} messages.`);
-    rows = db.prepare(`SELECT ${cols} FROM messages WHERE channel_id = ? AND id IN (SELECT value FROM json_each(?))`).all(c.id, JSON.stringify([...new Set(b.ids)]));
+    rows = db.prepare(`SELECT ${cols} FROM messages WHERE channel_id = ? AND id IN (SELECT value FROM json_each(?)) AND ${LIVE}`).all(c.id, JSON.stringify([...new Set(b.ids)]), t);
     if (rows.some((r) => r.created_at < since)) fail(400, `Messages older than ${BULK_DAYS} days can\u2019t be deleted in bulk. Delete them one at a time.`);
   } else {
     const n = Number(b.count);
     if (!Number.isInteger(n) || n < 1 || n > BULK_MAX) fail(400, `Pick from 1 to ${BULK_MAX} messages.`);
-    rows = db.prepare(`SELECT ${cols} FROM messages WHERE channel_id = ? AND thread_id IS NULL AND created_at >= ? ORDER BY id DESC LIMIT ?`).all(c.id, since, n);
+    rows = db.prepare(`SELECT ${cols} FROM messages WHERE channel_id = ? AND thread_id IS NULL AND created_at >= ? AND ${LIVE} ORDER BY id DESC LIMIT ?`).all(c.id, since, t, n);
   }
   const below = belowMe(s, req.userId);
   const others = otherRepliers(rows);
@@ -2904,7 +3083,7 @@ api.post('/channels/:id/messages/bulk-delete', auth, (req, res) => {
 
 api.get('/messages/:id/thread', auth, (req, res) => {
   const root = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
-  if (!root || root.thread_id) fail(404, 'Thread not found.');
+  if (!alive(root) || root.thread_id) fail(404, 'Thread not found.');
   const c = requireChannel(root.channel_id, req.userId);
   // Paged like a channel (newest replies first, ?before=id for older ones): a thread can be any size.
   const { rows, hasMore, hasNewer } = pageRows('messages', 'thread_id', root.id, { limit: '100', ...req.query });
@@ -2917,13 +3096,13 @@ api.get('/messages/:id/thread', auth, (req, res) => {
 
 // Where does a message live? Used by message links, search results and notifications.
 api.get('/messages/:id/locate', auth, (req, res) => {
-  const m = db.prepare('SELECT id, channel_id, thread_id FROM messages WHERE id = ?').get(req.params.id);
-  if (m) {
+  const m = db.prepare('SELECT id, channel_id, thread_id, expires_at FROM messages WHERE id = ?').get(req.params.id);
+  if (alive(m)) {
     const c = requireChannel(m.channel_id, req.userId);
     return res.json({ kind: 'channel', channelId: c.id, serverId: c.server_id, threadId: m.thread_id || null });
   }
-  const dm = db.prepare('SELECT id, dm_id FROM dm_messages WHERE id = ?').get(req.params.id);
-  if (!dm) fail(404, 'That message was deleted or you can\u2019t see it.');
+  const dm = !m && db.prepare('SELECT id, dm_id, expires_at FROM dm_messages WHERE id = ?').get(req.params.id);
+  if (!alive(dm)) fail(404, 'That message was deleted or you can\u2019t see it.');
   requireDm(dm.dm_id, req.userId);
   res.json({ kind: 'dm', dmId: dm.dm_id });
 });
@@ -2934,6 +3113,7 @@ api.get('/messages/:id/locate', auth, (req, res) => {
 const MAX_PINS = 50;
 function pinTarget(id, userId) {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
+  if (m && !alive(m)) fail(404, 'Message not found.');
   if (m) {
     const c = requireChannel(m.channel_id, userId);
     const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
@@ -2941,7 +3121,7 @@ function pinTarget(id, userId) {
     return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at, server: s, channel: c, authorId: m.author_id };
   }
   const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
-  if (!dm) fail(404, 'Message not found.');
+  if (!alive(dm)) fail(404, 'Message not found.');
   const d = requireDm(dm.dm_id, userId);
   if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
   return { table: 'dm_messages', room: [`user:${d.user_a}`, `user:${d.user_b}`], payload: { messageId: dm.id, dmId: d.id }, dmId: d.id, pinned: !!dm.pinned_at };
@@ -2970,13 +3150,13 @@ api.delete('/messages/:id/pin', auth, (req, res) => {
 });
 api.get('/channels/:id/pins', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
-  const rows = db.prepare('SELECT * FROM messages WHERE channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC LIMIT 50').all(c.id);
+  const rows = db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND pinned_at IS NOT NULL AND ${LIVE} ORDER BY pinned_at DESC LIMIT 50`).all(c.id, now());
   const reactions = reactionsFor(rows.map((r) => r.id));
   res.json(rows.map((r) => serializeMessage(r, c, reactions)));
 });
 api.get('/dms/:id/pins', auth, (req, res) => {
   const d = requireDm(req.params.id, req.userId);
-  const rows = db.prepare('SELECT * FROM dm_messages WHERE dm_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC LIMIT 50').all(d.id);
+  const rows = db.prepare(`SELECT * FROM dm_messages WHERE dm_id = ? AND pinned_at IS NOT NULL AND ${LIVE} ORDER BY pinned_at DESC LIMIT 50`).all(d.id, now());
   const reactions = reactionsFor(rows.map((r) => r.id));
   res.json(rows.map((r) => serializeDmMessage(r, reactions)));
 });
@@ -2986,6 +3166,7 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
   const emoji = String((req.body || {}).emoji || '').slice(0, 64);
   if (!emoji) fail(400, 'Pick an emoji.');
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
+  if (m && !alive(m)) fail(404, 'Message not found.');
   let target;
   let payload;
   if (m) {
@@ -2996,7 +3177,7 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
     payload = { messageId: m.id, channelId: c.id };
   } else {
     const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
-    if (!dm) fail(404, 'Message not found.');
+    if (!alive(dm)) fail(404, 'Message not found.');
     const d = requireDm(dm.dm_id, req.userId);
     // After a block, nobody in the conversation can add reactions (taking your own away is still fine).
     const mine = db.prepare('SELECT 1 FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?').get(dm.id, req.userId, emoji);
@@ -3036,9 +3217,10 @@ api.post('/dms', auth, (req, res) => {
 
 api.get('/dms/:id/messages', auth, (req, res) => {
   const d = requireDm(req.params.id, req.userId);
-  const { rows, hasMore, hasNewer } = pageRows('dm_messages', 'dm_id', d.id, req.query);
+  const page = pageRows('dm_messages', 'dm_id', d.id, req.query);
+  const { rows, hasMore, hasNewer } = page;
   const reactions = reactionsFor(rows.map((r) => r.id));
-  res.json({ messages: rows.map((r) => serializeDmMessage(r, reactions)), hasMore, hasNewer });
+  res.json({ messages: rows.map((r) => serializeDmMessage(r, reactions)), hasMore, hasNewer, timerEvents: timerEvents('d:' + d.id, page, req.query) });
 });
 
 api.post('/dms/:id/messages', auth, (req, res) => {
@@ -3049,12 +3231,15 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   if ((getUserRow(d.user_a === req.userId ? d.user_b : d.user_a) || {}).deleted_at) fail(403, 'This account was deleted.', 'deleted');
   const { ciphertext, files } = req.body || {};
   validCipher(ciphertext);
-  let replyTo = (req.body || {}).replyTo || null;
-  if (replyTo && !db.prepare('SELECT 1 FROM dm_messages WHERE id = ? AND dm_id = ?').get(replyTo, d.id)) replyTo = null;
-  const id = newId();
+  DIS.checkTtl(req.body, d.disappear_secs);
   const t = now();
-  db.prepare('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, d.id, req.userId, ciphertext, replyTo, t);
-  attachBlobs(files, req.userId, id);
+  let replyTo = (req.body || {}).replyTo || null;
+  if (replyTo && !alive(db.prepare('SELECT expires_at FROM dm_messages WHERE id = ? AND dm_id = ?').get(replyTo, d.id), t)) replyTo = null;
+  const id = newId();
+  const expiresAt = DISAPPEAR.stamp({ secs: d.disappear_secs, t });
+  db.prepare('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, d.id, req.userId, ciphertext, replyTo, t, expiresAt);
+  attachBlobs(files, req.userId, id, expiresAt);
+  DISAPPEAR.arm(expiresAt);
   pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id, generic: 'New message' }, { kind: 'dm', dmId: d.id });
   if (USE) USE.markSent(req.userId, 'd:' + d.id, id);
   db.prepare('UPDATE dm_channels SET last_message_at = ? WHERE id = ?').run(t, d.id);
@@ -3069,7 +3254,7 @@ api.post('/dms/:id/messages', auth, (req, res) => {
 
 api.patch('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
-  if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
+  if (!alive(m) || m.author_id !== req.userId) fail(404, 'Message not found.');
   const d = requireDm(m.dm_id, req.userId);
   // Editing is sending new words: a block stops it like it stops new messages (deleting your own still works).
   if (isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t message this person.');
@@ -3083,7 +3268,7 @@ api.patch('/dm-messages/:id', auth, (req, res) => {
 
 api.delete('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
-  if (!m || m.author_id !== req.userId) fail(404, 'Message not found.');
+  if (!alive(m) || m.author_id !== req.userId) fail(404, 'Message not found.');
   const d = requireDm(m.dm_id, req.userId);
   forgetMessages([m.id]);
   db.prepare('DELETE FROM dm_messages WHERE id = ?').run(m.id);
@@ -4496,19 +4681,19 @@ api.post('/reports', auth, (req, res) => {
     const id = String(ctx.messageId || '');
     const cm = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
     const dm = !cm && db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
-    if (!cm && !dm) fail(404, 'That message no longer exists.');
+    if (!alive(cm || dm)) fail(404, 'That message no longer exists.');
     let inConvo;
     if (cm) {
       const c = requireChannel(cm.channel_id, req.userId);
       const srv = serverOf(c);
       Object.assign(context, { messageId: id, channelId: c.id, channelName: c.name, serverId: srv.id, serverName: srv.kind === 'group' ? 'Group DM' : srv.name });
-      inConvo = (mid) => db.prepare('SELECT author_id, created_at FROM messages WHERE id = ? AND channel_id = ?').get(mid, c.id);
+      inConvo = (mid) => db.prepare(`SELECT author_id, created_at FROM messages WHERE id = ? AND channel_id = ? AND ${LIVE}`).get(mid, c.id, now());
       targetId = cm.author_id;
       if (srv.kind !== 'group') inServer = srv;
     } else {
       const d = requireDm(dm.dm_id, req.userId);
       Object.assign(context, { messageId: id, dmId: d.id });
-      inConvo = (mid) => db.prepare('SELECT author_id, created_at FROM dm_messages WHERE id = ? AND dm_id = ?').get(mid, d.id);
+      inConvo = (mid) => db.prepare(`SELECT author_id, created_at FROM dm_messages WHERE id = ? AND dm_id = ? AND ${LIVE}`).get(mid, d.id, now());
       targetId = dm.author_id;
     }
     for (const e of (Array.isArray(b.evidence) ? b.evidence : []).slice(0, 25)) {
@@ -4743,7 +4928,8 @@ const inReport = (mid) => !!db.prepare(`SELECT 1 FROM reports r WHERE (CASE WHEN
 api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   const d = !m && db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
-  if (!m && !d) fail(404, 'Message already gone.');
+  // A disappearing message whose time has passed is gone, even before the sweep deletes it.
+  if (!alive(m || d)) fail(404, 'Message already gone.');
   const outranks = (author) => !author || author === req.userId || staffRank(author) < staffRank(req.userId);
   const author = (m || d).author_id;
   if (!outranks(author)) fail(403, `You can’t remove messages by ${staffRole(author) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
@@ -4751,7 +4937,7 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
   const group = !!c && !!db.prepare("SELECT 1 FROM servers WHERE id = ? AND kind = 'group'").get(c.server_id);
   if ((d || group) && !inReport((m || d).id)) fail(403, `${d ? 'Direct messages' : 'Group chat messages'} can only be removed when they were reported.`);
   if (m) {
-    const above = db.prepare('SELECT DISTINCT author_id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.author_id).find((a) => !outranks(a));
+    const above = db.prepare(`SELECT DISTINCT author_id FROM messages WHERE thread_id = ? AND ${LIVE}`).all(m.id, now()).map((x) => x.author_id).find((a) => !outranks(a));
     if (above) fail(403, `This thread has replies by ${staffRole(above) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them has to remove it.`);
     deleteMessageTree(m.id);
     if (c && !group) { const srv = serverOf(c); serverAudit(srv, null, 'message_delete', m.author_id, { channel: chanRef(srv, c), thread: m.thread_id ? true : undefined, staff: true }, c.id); }
@@ -5037,14 +5223,15 @@ api.delete('/profile-comments/:id', auth, (req, res) => {
 // number each person picked, so it can count votes without knowing what they're about.
 // act: voting or ending it, which a block stops in a DM like any other new interaction (reading it still works).
 function pollTarget(messageId, userId, act = false) {
-  const cm = db.prepare('SELECT id, channel_id FROM messages WHERE id = ?').get(messageId);
+  const cm = db.prepare('SELECT id, channel_id, expires_at FROM messages WHERE id = ?').get(messageId);
+  if (cm && !alive(cm)) fail(404, 'That poll no longer exists.');
   if (cm) {
     const c = requireChannel(cm.channel_id, userId);
     if (act && perms.timedOut(c.server_id, userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
     return { emit: (ev, data) => toChannel(c).emit(ev, data) };
   }
-  const dm = db.prepare('SELECT id, dm_id FROM dm_messages WHERE id = ?').get(messageId);
-  if (dm) {
+  const dm = db.prepare('SELECT id, dm_id, expires_at FROM dm_messages WHERE id = ?').get(messageId);
+  if (alive(dm)) {
     const d = requireDm(dm.dm_id, userId);
     if (act && isBlocked(d.user_a, d.user_b)) fail(403, 'You can\u2019t interact with this person.');
     return { emit: (ev, data) => io.to([`user:${d.user_a}`, `user:${d.user_b}`]).emit(ev, data) };
@@ -5415,11 +5602,20 @@ require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, newId, aut
 USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, serverAudit, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
   requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf });
+// Disappearing messages (server/disappear.js): the timer routes, and the job that deletes messages whose time has
+// passed (it runs once right here, before anyone can connect).
+DIS = require('./disappear')({ api, auth, db, fail, rateLimit, newId, now, requireChannel, requireDm, requireManageableChannel, serverOf, isBlocked, getUserRow,
+  // (io is declared further down: during the start-up sweep it doesn't exist yet, and there's nobody to tell.)
+  toChannel: (c) => toChannel(c), getIo: () => { try { return io || null; } catch { return null; } }, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), removeUpload, unseal, threadInfo, groupLast,
+  bots: () => BOTS });
 // Roles members can pick themselves (server/selfroles.js).
 SELF = require('./selfroles')({ api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL: ALL_PERMS, CHANNEL_SCOPED, MEMB,
   emitServer: (sid) => io && emitServer(sid), recheckVoice, serverAudit });
 // Each server's own audit log and its moderators' report inbox (server/serveraudit.js).
 SA = require('./serveraudit')({ api, auth, db, fail, rateLimit, perms, PM, ALL: ALL_PERMS, requireServer, isMember, getIo: () => io, keptSql: serverAuditKeptSql });
+// Start a server from a Discord server template the person pastes (server/imports.js, server/discordmap.js).
+require('./imports')({ api, auth, db, fail, rateLimit, limitNet, newId, now, features, isStaff, ALL: ALL_PERMS, CHANNEL_SCOPED, PM,
+  serializeServer, keyState, getIo: () => io, auditLog, requirePerm });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();
@@ -6070,7 +6266,8 @@ function setupSockets(server) {
         const d = dmOfRoom(c.id);
         const ch = !d && db.prepare('SELECT * FROM channels WHERE id = ?').get(c.id);
         ring.forEach((u) => io.to(`user:${u}`).emit('call:ring', { room: c.id, dmId: d ? d.id : null, serverId: ch ? ch.server_id : null, from: uid, video: !!p.video }));
-        if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/', generic: 'Incoming call' }, { kind: 'call' });
+        // url: tapping it opens the conversation, with the ring card if the call is still on (app.js #call/).
+        if (ring.length) pushTo(ring, { title: nameOf(uid), body: p.video ? 'is video calling you' : 'is calling you', tag: 'call:' + c.id, url: '/#call/' + c.id, generic: 'Incoming call' }, { kind: 'call' });
       }
       return { ok: true, peers, canSpeak: speak, ...(serverMuted ? { serverMuted } : {}), silenced: voiceSilenced(c.id), ...where };
     }));

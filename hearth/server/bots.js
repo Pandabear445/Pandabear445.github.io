@@ -19,6 +19,7 @@
 // See docs/BOTS.md for the developer side.
 const crypto = require('crypto');
 const jobs = require('./jobs');
+const DISAPPEAR = require('./disappear');
 const netguard = require('./netguard');
 
 const SCOPES = {
@@ -397,10 +398,14 @@ module.exports = function setupBots(ctx) {
   // The insert and live update every bot post shares (installed bots here, channel webhooks in webhooks.js).
   // Stored like the news bot's posts: sealed with the server's at-rest key, marked as a bot post. `extra` is
   // anything else the app shows with it (a webhook's name for this post, say).
+  // A disappearing channel's timer covers bot posts too (stamped like everyone's, see server/disappear.js).
   function botPost(authorId, c, content, { replyTo = null, extra = {} } = {}) {
     const id = newId();
-    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL)')
-      .run(id, c.id, authorId, seal({ ...extra, content, attachments: [], bot: true }), replyTo, now());
+    const t = now();
+    const expiresAt = DISAPPEAR.stamp({ secs: c.disappear_secs, t });
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id, expires_at) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?)')
+      .run(id, c.id, authorId, seal({ ...extra, content, attachments: [], bot: true }), replyTo, t, expiresAt);
+    DISAPPEAR.arm(expiresAt);
     const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
     toChannel(c).emit('message:new', serializeMessage(row, c));
     event('message.created', c.server_id, metaOf(row, c), { channel: c, actorId: authorId });
@@ -410,13 +415,14 @@ module.exports = function setupBots(ctx) {
     rateLimit(`botmsg:${bot.id}:${c.id}`, 10, 10000);
     rateLimit('botmsgh:' + bot.id, 1000, 3600000);
     let reply = replyTo ? String(replyTo) : null;
-    if (reply && !db.prepare('SELECT 1 FROM messages WHERE id = ? AND channel_id = ?').get(reply, c.id)) reply = null;
+    if (reply && !DISAPPEAR.alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND channel_id = ?').get(reply, c.id))) reply = null;
     const row = botPost(bot.id, c, content, { replyTo: reply });
     markOk(inst.id);
     return row;
   }
   const isBotUser = (id) => !!(getUserRow(id) || {}).is_bot;
-  const metaOf = (m, c) => ({ messageId: m.id, channelId: c.id, authorId: m.author_id, authorIsBot: isBotUser(m.author_id), createdAt: m.created_at, editedAt: m.edited_at || null, threadId: m.thread_id || null, replyTo: m.reply_to || null });
+  // expiresAt: when a disappearing message goes (null: it doesn't).
+  const metaOf = (m, c) => ({ messageId: m.id, channelId: c.id, authorId: m.author_id, authorIsBot: isBotUser(m.author_id), createdAt: m.created_at, editedAt: m.edited_at || null, threadId: m.thread_id || null, replyTo: m.reply_to || null, expiresAt: m.expires_at || null });
 
   // ------------------------------------------------------------------ the bot API: /api/bot/v1
   const bapi = express.Router();
@@ -468,7 +474,7 @@ module.exports = function setupBots(ctx) {
   }
   const botMessage = (req, id, scope) => {
     const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(String(id));
-    if (!m) fail(404, 'No such message.', 'not_found');
+    if (!DISAPPEAR.alive(m)) fail(404, 'No such message.', 'not_found');
     return { m, ...botChannel(req, m.channel_id, scope) };
   };
   const instOut = (inst) => {
@@ -507,9 +513,10 @@ module.exports = function setupBots(ctx) {
   bapi.get('/channels/:id/messages', (req, res) => {
     const { c, inst } = botChannel(req, req.params.id, 'messages.read.metadata');
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 50));
+    const t = now();
     const rows = req.query.before
-      ? db.prepare('SELECT * FROM messages WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?').all(c.id, String(req.query.before), limit)
-      : db.prepare('SELECT * FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?').all(c.id, limit);
+      ? db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND ${DISAPPEAR.LIVE} AND id < ? ORDER BY id DESC LIMIT ?`).all(c.id, t, String(req.query.before), limit)
+      : db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND ${DISAPPEAR.LIVE} ORDER BY id DESC LIMIT ?`).all(c.id, t, limit);
     markOk(inst.id);
     res.json({ messages: rows.map((m) => metaOf(m, c)) });
   });

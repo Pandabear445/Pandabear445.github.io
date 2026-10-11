@@ -31,6 +31,7 @@
 
 const crypto = require('crypto');
 const jobs = require('./jobs');
+const { alive, LIVE } = require('./disappear');
 
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 const CONV = /^([cd]):([A-Za-z0-9_-]{1,64})$/;
@@ -64,14 +65,17 @@ module.exports = function setupUsability(ctx) {
     if (m[1] === 'c') { const channel = requireChannel(m[2], uid); return { kind: 'c', channel, server: serverOf(channel), conv }; }
     return { kind: 'd', dm: requireDm(m[2], uid), conv };
   }
-  // Where a message lives, if the person can still see it there; null otherwise (never throws).
+  // Where a message lives, if the person can still see it there; null otherwise (never throws). A disappearing
+  // message whose time has passed is gone, even before the sweep deletes it.
   function visibleMessage(uid, messageId) {
     const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
     if (m) {
+      if (!alive(m)) return null;
       try { const c = requireChannel(m.channel_id, uid); return { conv: 'c:' + c.id, row: m, channel: c }; } catch { return null; }
     }
     const d = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(messageId);
     if (d) {
+      if (!alive(d)) return null;
       try { requireDm(d.dm_id, uid); return { conv: 'd:' + d.dm_id, row: d }; } catch { return null; }
     }
     return null;
@@ -140,9 +144,11 @@ module.exports = function setupUsability(ctx) {
     marks: countSql("SELECT 1 FROM mention_marks WHERE conv = ? AND (user_id = ? OR (user_id = '*' AND ? = 1)) AND message_id > ?"),
     marker: 'SELECT last_read_id FROM read_states WHERE user_id = ? AND conv = ?',
     // Threads (idx_messages_thread, idx_mention_marks_thread): the newest reply, unread replies and pings in one.
-    lastT: 'SELECT MAX(id) AS id FROM messages WHERE thread_id = ?',
-    unreadT: countSql('SELECT 1 FROM messages WHERE thread_id = ? AND id > ? AND author_id != ?'),
-    marksT: countSql("SELECT 1 FROM mention_marks WHERE thread_id = ? AND (user_id = ? OR (user_id = '*' AND ? = 1)) AND message_id > ?"),
+    // A reply whose time has passed (a disappearing message the sweep hasn't reached) counts for none of them.
+    lastT: `SELECT id FROM messages WHERE thread_id = ? AND ${LIVE} ORDER BY id DESC LIMIT 1`,
+    unreadT: countSql(`SELECT 1 FROM messages WHERE thread_id = ? AND id > ? AND author_id != ? AND ${LIVE}`),
+    marksT: countSql(`SELECT 1 FROM mention_marks mm WHERE mm.thread_id = ? AND (mm.user_id = ? OR (mm.user_id = '*' AND ? = 1)) AND mm.message_id > ?
+      AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.id = mm.message_id AND x.expires_at <= ?)`),
     // Pings in any of a channel's threads that their thread hasn't been read past (each thread has its own marker).
     // Only the newest THREAD_PING_SCAN of them are looked at: yours and @everyone, merged newest first from two
     // ranges of idx_mention_marks_conv, so the walk stops there however many old, already-read pings pile up.
@@ -150,14 +156,15 @@ module.exports = function setupUsability(ctx) {
         SELECT message_id, thread_id FROM mention_marks WHERE conv = ? AND user_id = ? AND message_id > ?
         UNION ALL SELECT message_id, thread_id FROM mention_marks WHERE conv = ? AND user_id = '*' AND ? = 1 AND message_id > ?
         ORDER BY message_id DESC LIMIT ${THREAD_PING_SCAN}) mm
-      WHERE mm.message_id > COALESCE((SELECT last_read_id FROM read_states WHERE user_id = ? AND conv = 't:' || mm.thread_id), '')`),
+      WHERE mm.message_id > COALESCE((SELECT last_read_id FROM read_states WHERE user_id = ? AND conv = 't:' || mm.thread_id), '')
+        AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.id = mm.message_id AND x.expires_at <= ?)`),
     // Has any thread in the channel had a reply since? (One step in idx_thread_activity_channel. Without one there
     // can't be an unread ping in its threads, so /me/unread skips counting them for most channels.)
     threadsSince: 'SELECT 1 FROM thread_activity WHERE channel_id = ? AND last_reply_id > ? LIMIT 1',
     // The newest message in a channel, thread replies included.
     lastAny: 'SELECT MAX(id) AS id FROM messages WHERE channel_id = ?',
     // Up to 5 people who replied in a thread, the most recent first (from its newest 200 replies).
-    participants: 'SELECT author_id FROM (SELECT author_id, id FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT 200) GROUP BY author_id ORDER BY MAX(id) DESC LIMIT 5',
+    participants: `SELECT author_id FROM (SELECT author_id, id FROM messages WHERE thread_id = ? AND ${LIVE} ORDER BY id DESC LIMIT 200) GROUP BY author_id ORDER BY MAX(id) DESC LIMIT 5`,
   };
   const markerOf = (uid, conv) => (db.prepare(Q.marker).get(uid, conv) || {}).last_read_id || null;
   // @everyone switched off for this channel or its server.
@@ -171,7 +178,7 @@ module.exports = function setupUsability(ctx) {
     return stored && stored > baseline ? stored : baseline;
   }
   const threadMentionsIn = (uid, channelId, floor, suppressAll) => (db.prepare(Q.threadsSince).get(channelId, floor)
-    ? db.prepare(Q.threadMarks).get('ct:' + channelId, uid, floor, 'ct:' + channelId, suppressAll ? 0 : 1, floor, uid).n : 0);
+    ? db.prepare(Q.threadMarks).get('ct:' + channelId, uid, floor, 'ct:' + channelId, suppressAll ? 0 : 1, floor, uid, now()).n : 0);
   // floor: threadFloor() for the channel. Given, the channel's threads add their pings as threadMentions (the app
   // shows them in the channel's badge, apart from the channel's own mentions, which reading the channel clears).
   function convState(uid, conv, lastReadId, { group = false, suppressAll = false, floor = null } = {}) {
@@ -261,14 +268,15 @@ module.exports = function setupUsability(ctx) {
   }
   // A thread's marker (t:<root>): forward only, to one of its replies. Threads have no "Mark unread".
   function readThread(uid, b) {
-    const root = db.prepare('SELECT id, channel_id, thread_id FROM messages WHERE id = ?').get(THREAD.exec(b.conv)[1]);
-    // A thread in a channel you can't read looks exactly like one that doesn't exist.
+    const root = db.prepare('SELECT id, channel_id, thread_id, expires_at FROM messages WHERE id = ?').get(THREAD.exec(b.conv)[1]);
+    // A thread in a channel you can't read looks exactly like one that doesn't exist (so does one whose first
+    // message has disappeared).
     let channel = null;
-    try { channel = root && !root.thread_id ? requireChannel(root.channel_id, uid) : null; } catch { /* not yours to see */ }
+    try { channel = alive(root) && !root.thread_id ? requireChannel(root.channel_id, uid) : null; } catch { /* not yours to see */ }
     if (!channel) fail(404, 'That thread doesn’t exist.');
     if (b.unread === true) fail(400, 'Threads can’t be marked unread.');
     const id = idParam(String(b.messageId || ''));
-    if (!db.prepare('SELECT 1 FROM messages WHERE id = ? AND thread_id = ?').get(id, root.id)) fail(404, 'That message doesn’t exist.');
+    if (!alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND thread_id = ?').get(id, root.id))) fail(404, 'That message doesn’t exist.');
     setRead(uid, 't:' + root.id, id);
     return announceThread(uid, root.id, channel);
   }
@@ -277,11 +285,12 @@ module.exports = function setupUsability(ctx) {
   function threadState(uid, rootId, channel, { floor = threadFloor(uid, channel.id), suppressAll = suppressedAll(uid, channel) } = {}) {
     const own = markerOf(uid, 't:' + rootId);
     const lastReadId = own && own > floor ? own : floor;
-    const lastId = db.prepare(Q.lastT).get(rootId).id || null;
+    const t = now();
+    const lastId = (db.prepare(Q.lastT).get(rootId, t) || {}).id || null;
     const st = { conv: 't:' + rootId, rootId, channelId: channel.id, lastReadId, lastId, unread: 0, mentions: 0 };
     if (!lastId || lastId <= lastReadId) return st;
-    st.unread = db.prepare(Q.unreadT).get(rootId, lastReadId, uid).n;
-    st.mentions = db.prepare(Q.marksT).get(rootId, uid, suppressAll ? 0 : 1, lastReadId).n;
+    st.unread = db.prepare(Q.unreadT).get(rootId, lastReadId, uid, t).n;
+    st.mentions = db.prepare(Q.marksT).get(rootId, uid, suppressAll ? 0 : 1, lastReadId, t).n;
     return st;
   }
   // The states of the threads started by some of a channel's messages (a page of them), by root id.
@@ -360,12 +369,16 @@ module.exports = function setupUsability(ctx) {
     const threads = [];
     for (const r of page) {
       const root = db.prepare('SELECT * FROM messages WHERE id = ? AND channel_id = ? AND thread_id IS NULL').get(r.root_id, c.id);
-      if (!root) continue;
+      // A thread whose first message has disappeared is gone too, even before the sweep deletes it; so is one whose
+      // replies all have (the sweep's deletes take it out of thread_activity). Counts, the latest reply and who
+      // replied leave out replies whose time has passed.
+      if (!alive(root)) continue;
       const msg = serializeMessage(root, c, reactions);
-      const { unread, mentions, lastReadId } = threadState(req.userId, root.id, c, opts);
+      const { unread, mentions, lastReadId, lastId } = threadState(req.userId, root.id, c, opts);
+      if (!lastId) continue;
       threads.push({
-        rootId: root.id, root: msg, replyCount: msg.threadCount || 0, lastReplyId: r.last_reply_id, lastReplyAt: msg.threadLastAt || null,
-        participants: db.prepare(Q.participants).all(root.id).map((p) => p.author_id), unread, mentions, lastReadId,
+        rootId: root.id, root: msg, replyCount: msg.threadCount || 0, lastReplyId: lastId, lastReplyAt: msg.threadLastAt || null,
+        participants: db.prepare(Q.participants).all(root.id, now()).map((p) => p.author_id), unread, mentions, lastReadId,
       });
     }
     // The first page also carries the channel's thread pings, so opening the panel sets the channel's badge right.
@@ -428,7 +441,7 @@ module.exports = function setupUsability(ctx) {
   // instance's name and "New message": not who, not where. Push never carries message text either way.
   function shapePush(uid, payload) {
     if (settingsOf(uid).previews === 'names') return payload;
-    return { title: brandName(), body: payload.generic || 'New activity', tag: payload.tag, url: payload.url };
+    return { title: brandName(), body: payload.generic || 'New activity', tag: payload.tag, url: payload.url, at: payload.at };
   }
   // People who chose "All messages" for this channel or its server (and can see it): they get plain messages too.
   function wantsAll(srv, c) {
@@ -530,9 +543,10 @@ module.exports = function setupUsability(ctx) {
     for (const g of gone) emitTo(g.user_id, 'timeout:update', { serverId: g.server_id, until: null });
     [...new Set(gone.map((g) => g.server_id))].forEach((sid) => emitServer(sid));
   }
-  // Read markers and preferences for channels and DMs that no longer exist (deleted channels and servers).
+  // Read markers, preferences and disappearing-timer history for channels and DMs that no longer exist (deleted
+  // channels and servers).
   function sweepStale() {
-    for (const t of [['read_states', 'conv'], ['notify_prefs', 'target']]) {
+    for (const t of [['read_states', 'conv'], ['notify_prefs', 'target'], ['disappear_log', 'conv']]) {
       db.prepare(`DELETE FROM ${t[0]} WHERE ${t[1]} LIKE 'c:%' AND NOT EXISTS (SELECT 1 FROM channels WHERE id = substr(${t[0]}.${t[1]}, 3))`).run();
       db.prepare(`DELETE FROM ${t[0]} WHERE ${t[1]} LIKE 'd:%' AND NOT EXISTS (SELECT 1 FROM dm_channels WHERE id = substr(${t[0]}.${t[1]}, 3))`).run();
     }
@@ -650,9 +664,11 @@ module.exports = function setupUsability(ctx) {
     if (e.served >= EXPORT_MAX_MESSAGES) fail(413, 'This export reached its size limit.', 'export_limit');
     const n = Math.min(limit, EXPORT_MAX_MESSAGES - e.served);
     // Channels include thread replies (with threadId), so a thread exports with its channel.
+    // Disappearing messages whose time has passed aren't handed out (the sweep deletes them soon).
+    const t = now();
     const rows = a.kind === 'c'
-      ? db.prepare('SELECT * FROM messages WHERE channel_id = ? AND id > ? ORDER BY id ASC LIMIT ?').all(a.channel.id, after, n)
-      : db.prepare('SELECT * FROM dm_messages WHERE dm_id = ? AND id > ? ORDER BY id ASC LIMIT ?').all(a.dm.id, after, n);
+      ? db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND ${LIVE} AND id > ? ORDER BY id ASC LIMIT ?`).all(a.channel.id, t, after, n)
+      : db.prepare(`SELECT * FROM dm_messages WHERE dm_id = ? AND ${LIVE} AND id > ? ORDER BY id ASC LIMIT ?`).all(a.dm.id, t, after, n);
     e.served += rows.length;
     const reactions = reactionsFor(rows.map((r) => r.id));
     res.json({ messages: rows.map((r) => (a.kind === 'c' ? serializeMessage(r, a.channel, reactions) : serializeDmMessage(r, reactions))), hasMore: rows.length === n, served: e.served });

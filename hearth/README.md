@@ -39,7 +39,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Games & music:** show the game you're playing ("Playing ELDEN RING · for 1h 20m") and the song you're listening to (album art, artist, "on Spotify" with an *Open in Spotify* button), in member lists, friends, profile cards and pages. The desktop app detects both by itself (any Steam game plus 60+ popular others like Fortnite, Valorant, League, Minecraft, Roblox; the Spotify app; Apple Music on Mac; any player on Linux). Anywhere else, link Last.fm (works with Spotify, Apple Music, YouTube Music, TIDAL, Deezer) or set it by hand by pasting a song link. Plus **favorite games** (up to 12 covers) and **recently played** with hours. Pictures come from Steam and Wikipedia, cached on your server.
 - **Regions:** each region also keeps copies of your encrypted backups. Add call relays in other parts of the world from Admin → Regions with one install command each; they check in every minute, show their load and traffic, and a call can be switched to any region (🌐 in the call bar, like Discord's region override) and everyone in it moves together; otherwise everyone's app uses the nearest two automatically.
 - **Automatic supporters:** Ko-fi and Stripe payments turn on the 💜 supporter badge and perks (more storage, bigger files) by themselves for as long as someone paid, and count toward the funding card.
-- **Android app:** an APK built by GitHub Actions that opens your server with calls, voice messages, notifications and file saving; works with a self-signed certificate (asks once, like the desktop app).
+- **Android app:** an APK built by GitHub Actions that opens your server with calls, voice messages, notifications and file saving; works with a self-signed certificate (asks once, like the desktop app). Notifications arrive even after you swipe it away (through a push app such as ntfy, no Google needed), calls keep going with the screen locked, and invite links open in the app.
 - **Fast:** messages send instantly (they show as "sending…" until delivered, and you can keep typing), long chats stay light, the app's files are sent compressed, and **Performance mode** (Settings → Appearance) turns off blur, moving backgrounds and decorative animations on slower computers — it switches on by itself on low-powered devices.
 
 No build step, no external services required. One Node process and a SQLite file.
@@ -190,6 +190,25 @@ Open the server name menu → **Server settings** (or **Roles**). Tabs appear ba
 
 Good to know: private channels are enforced by the server — people without access never receive those messages. Like the rest of the server, they're end-to-end encrypted with the server's key, which every member holds, so private channels keep things away from other members by the server's choice rather than by separate encryption. "Speak" is enforced by the apps (listen-only members join muted, and everyone else's app doesn't play audio from someone without Speak or under a server mute), and the server keeps them shown as muted. Permission changes apply mid-call: losing Speak mutes you at once, and losing Connect or View (role edits, role removal, overrides, a membership ending, ownership transfer) takes you out of the call. @everyone and role mentions only notify people in the app when the sender is allowed to use them; that takes Mention @everyone as a server-wide (role) permission, because people's apps can't see channel overrides. Phone push notifications for @mentions go only to people who can see the channel, at most 50 per message, based on the sender's app's list.
 
+## Moving from Discord
+
+**Add a server → Import from Discord** starts a new server with a Discord server's roles, categories, channels and channel permissions:
+
+1. In Discord, copy the server's template link (Server Settings → Server Template).
+2. Paste it into Hearth, which gives you the template's address to open in your browser.
+3. Copy what that page shows and paste it back.
+
+Hearth itself never contacts Discord and never asks for a Discord login. Before anything is made, the preview shows:
+
+- each role with its Hearth permissions;
+- the channels by category;
+- what Hearth will allow that Discord didn't (most importantly, anyone who can see a channel can read all of its history);
+- a full list of what will be skipped: Discord permissions Hearth doesn't have, channel kinds it doesn't have (threads, directories), member-specific permissions, NSFW flags, user limits and server settings.
+
+You can leave out roles or channels, and you own the new server. Where Hearth can't match Discord exactly, it errs toward less, and anything Hearth would allow beyond what Discord did is listed before creating: for example, Kick Members also times people out in Hearth, Manage Channels also manages webhooks and events, and an invite that a channel took away in Discord can't be taken away per channel in Hearth. Members, messages and emoji don't come with it; emoji and message history are later phases.
+
+Limits: 99 roles besides @everyone, 500 channels, 50 categories, 5,000 channel permissions and 5 imported servers an hour; the same people who may create servers may import one. The full mapping is in [docs/IMPORT.md](docs/IMPORT.md).
+
 ## Docker
 
 ```bash
@@ -300,7 +319,9 @@ Hearth is an installable web app. Once your server has a real HTTPS certificate 
 
 Installed apps open in their own window, start instantly from cache, update themselves (users get a "new version ready" prompt), and show an unread badge where the system supports it.
 
-**Push notifications** reach people when Hearth is closed. Each person turns them on per device in *Settings → Apps & devices*. Because messages are end-to-end encrypted, a notification only says who and where (e.g. "Alex mentioned you · #general"), never the message. To work out who was @mentioned, the sender's app tells the server which member IDs it mentions — that's the only extra thing the server learns. Each account can have up to 10 devices with notifications on (turning it on somewhere new drops the oldest). Signing a device out, from that device or from Settings → Sessions, or changing your password, stops its notifications. Logging out turns notifications off in that browser. A device whose push service keeps failing is paused and, after a while, dropped; the app turns notifications back on the next time it starts. Push services must be public `https` addresses (`PUSH_ALLOW_PRIVATE=1` allows one on your own network). The server creates its push keys in `data/vapid.json` on first start; set `VAPID_SUBJECT=mailto:you@yourdomain` in `.env` (Apple's push service rejects placeholder addresses).
+**Push notifications** reach people when Hearth is closed. Each person turns them on per device in *Settings → Apps & devices*. Because messages are end-to-end encrypted, a notification only says who and where (e.g. "Alex mentioned you · #general"), never the message. To work out who was @mentioned, the sender's app tells the server which member IDs it mentions — that's the only extra thing the server learns. Each account can have up to 10 devices with notifications on (turning it on somewhere new drops the oldest). Signing a device out, from that device or from Settings → Sessions, or changing your password, stops its notifications. Logging out turns notifications off in that browser. A device whose push service keeps failing is paused and, after a while, dropped; the app turns notifications back on the next time it starts. Push services must be public `https` addresses; `PUSH_HOSTS` limits them to the ones you name, and `PUSH_PRIVATE_HOSTS` lets one on your own network through (a self-hosted ntfy). The keys a device hands over must be a real P-256 key and a 16-byte secret. A push service that says "too many" (429) is left alone for as long as it asks, without counting against the device; one that refuses or errors is backed off and dropped after 8 failures in a row (the server logs which push service refused, by host, at most once an hour). Every notification is padded to a multiple of 256 bytes before it's encrypted, so a push service can't tell names apart by size. The server creates its push keys in `data/vapid.json` on first start; set `VAPID_SUBJECT=mailto:you@yourdomain` in `.env` (Apple's push service rejects placeholder addresses).
+
+**In the Android app** a browser's push service isn't available, so the app uses [UnifiedPush](https://unifiedpush.org/): a push app on the phone, usually [ntfy](https://ntfy.sh/) (free on F-Droid and Google Play), gives Hearth a Web Push address, and the server sends to it exactly as it sends to a browser: encrypted for that phone, so ntfy only ever carries ciphertext. Settings → Apps & devices → *Notifications when Hearth is closed* (the app also offers it once). It's off until someone turns it on; without a push app, Settings says how to get one. With the public ntfy.sh, ntfy's operator learns when this phone gets a notification from your server (never what it says); to avoid that, run your own ntfy and set `PUSH_NTFY_URL` (see [docs/OPERATIONS.md](docs/OPERATIONS.md#7-self-hosted-ntfy-for-android-notifications)).
 
 ### Desktop app (Windows, macOS, Linux)
 
@@ -346,7 +367,13 @@ Release builds (`app-v*` tags and the default branch) then copy the installers a
 
 ### Android app
 
-The `mobile/` folder is an Android app (Capacitor) that opens your server, like the desktop app: chats, calls, video, voice messages, watch together, notifications while it's open or in the background, and saving files to *Downloads/Hearth*. It works with a self-signed certificate (an IP address like `https://1.2.3.4:3000`): it shows the fingerprint and asks once. It updates whenever you update the server.
+The `mobile/` folder is an Android app (Capacitor) that opens your server, like the desktop app: chats, calls, video, voice messages, watch together, notifications, and saving files to *Downloads/Hearth*. It works with a self-signed certificate (an IP address like `https://1.2.3.4:3000`): it shows the fingerprint and asks once. It updates whenever you update the server.
+
+- **Notifications when it's closed** through a UnifiedPush push app such as ntfy (see *Push notifications* above). They say "New message" or "Incoming call" (or who, if the person shows names); a call older than two minutes shows as a missed call instead of ringing. Tapping one opens the message, the conversation or the call.
+- **Calls keep going with the screen locked** or the app in the background: while you're in a call the app shows an "In a call" notification with *Hang up* (an Android foreground service; it needs the microphone permission, which joining a call asks for).
+- **Invite links open in the app:** `hearth://invite/CODE` on any build, and `https://your-server/invite/CODE` when the app is built for your server (`HEARTH_SERVER`) and the server has `ANDROID_CERT_SHA256` set (Android checks `/.well-known/assetlinks.json`).
+
+Parts of this need a real phone to prove; [mobile/README.md](mobile/README.md#not-yet-tested-on-a-device) lists what CI checks and what it can't.
 
 **Get the APK:** GitHub builds it with the desktop installers — repository **Actions** tab → *Hearth apps* → latest run → *Artifacts* → `hearth-android` (or push a tag `app-v1.17.0` to get a release). Put the `.apk` in `data/downloads/` and the `/download` page offers it to Android visitors. Details, signing and limits: [mobile/README.md](mobile/README.md).
 
@@ -442,7 +469,9 @@ Your browser remembers everyone's keys the first time it sees them. If the serve
 - **Membership is controlled by the server.** A malicious host could add a hidden member to a server, who would then be given the key, or hold back a key change, or roll a key back across a page reload. Apps refuse a current key handed out by someone who isn't a member, won't go back to an older key during a session, and refuse to start if the server lists keys for your own account that your password doesn't unlock. For strong guarantees, compare safety numbers. The same goes for calls: a malicious host could add a hidden listener, since apps trust the server's list of who is in a call.
 - **No forward secrecy for history.** To let your full history follow you to every device, your long-term key can decrypt your past messages. If someone gets both your password and the server's data, they can read your history. Changing your password locks the same key with the new password; it doesn't replace the key. (Signal makes the opposite trade-off.)
 - **Metadata isn't hidden** — see the table above. Run the server on hardware you control and use HTTPS.
-- **Other sites can see your IP address** when the app loads its fonts (Google Fonts), picture links in messages (turn off Settings → Chat → "Show image links as previews"), direct video files in watch together, and the YouTube, Vimeo and Twitch players. GIFs, news pictures and game and music art go through the server instead. Link preview cards load nothing at all: their picture is inside the message.
+- **Disappearing messages are deleted by the server** (see [Disappearing messages](#disappearing-messages)): backups
+  made before a message's time keep it until they rotate out, and anyone can screenshot or copy what they see.
+- **Other sites can see your IP address** when the app loads its fonts (Google Fonts), picture links in messages (turn off Settings → Chat → "Show image links as previews"), direct video files in watch together, and the YouTube, Vimeo and Twitch players. GIFs, news pictures and game and music art go through the server instead. Link preview cards load nothing at all: their picture is inside the message (so it disappears with a disappearing message, too).
 - Treat a self-hosted server like any small website: keep the machine updated and use `REGISTRATION_CODE` or `REGISTRATION_OPEN=false` if you don't want strangers signing up.
 
 ---
@@ -468,6 +497,10 @@ Hearth makes two kinds of backup by itself every day (Admin → Owner → Backup
 - **After a break-in**, add `--sign-out-everyone` to `restore`: sessions signed out after the backup was made would otherwise work again.
 - **Full guide**, including what each kind of account recovery can and can't bring back: [docs/RECOVERY.md](docs/RECOVERY.md). `node scripts/recovery-drill.js` and `bash scripts/upgrade-drill.sh` prove it end to end.
 - **Lost the owner's account?** `node server/cli.js set-owner <username>` makes another account the owner. It works while Hearth is running, refuses deleted, bot and suspended accounts, drops the new owner's other staff role, and is written to the audit log (`ownership_set_cli`).
+
+**Disappearing messages** are in every backup made before their time, until that backup is pruned (or, for
+off-site and `hearth-before-v*.db` copies, deleted by hand). Restoring an older backup deletes the ones whose time has
+passed at the first start, before anyone can connect.
 
 **Database copies** (`data/backups/*.db`) are for undoing an update on this machine. They're as sensitive as the database itself, so they never leave the server and can't be downloaded. Copies made before upgrades (`hearth-before-v*.db`) are never deleted automatically; remove old ones by hand once you're happy with an upgrade.
 
@@ -495,7 +528,12 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `STUN_URLS` | Google STUN | Comma-separated STUN servers |
 | `TURN_URL` / `TURN_SECRET` | — | TURN relay for calls and its shared secret (coturn's `static-auth-secret`); `scripts/setup-turn.sh` sets these up in the app instead |
 | `TURN_USERNAME` / `TURN_CREDENTIAL` | — | Legacy: one relay password for everyone that never expires (the server warns). Use `TURN_SECRET` |
-| `PUSH_ALLOW_PRIVATE` | off | `1` allows push endpoints on private/LAN addresses (tests, or a push service on your own network) |
+| `PUSH_ALLOW_PRIVATE` | off | `1` allows push endpoints on private/LAN addresses (tests only; for one push service on your network use `PUSH_PRIVATE_HOSTS`) |
+| `PUSH_HOSTS` | any public host | Comma-separated push service hosts the server will subscribe and send to: exact names or `*.suffix` (e.g. `fcm.googleapis.com,*.push.services.mozilla.com,*.notify.windows.com,web.push.apple.com,ntfy.sh`) |
+| `PUSH_PRIVATE_HOSTS` | — | Push services on your own network that may have private addresses (a self-hosted ntfy): exact names, port 443 unless given (`ntfy.lan:8443`) |
+| `PUSH_NTFY_URL` | — | Your own ntfy (`https://…` only): the Android app's settings tell people to use it |
+| `ANDROID_CERT_SHA256` | — | SHA-256 fingerprint(s) of the key the Android app is signed with: lets an app built for this server open `https://…/invite/…` links (served as `/.well-known/assetlinks.json`) |
+| `ANDROID_PACKAGE` | `app.hearth.mobile` | The Android app's package name, for the same file |
 | `OUTBOUND_BLOCK` | — | Comma-separated addresses or ranges (CIDR) that feeds, pictures, link previews and push may never reach, on any port. For example this server's public IP when it's behind NAT, or your router's |
 | `LINK_PREVIEWS` | `true` | `false` starts with link previews switched off (the owner can switch them in Admin → Owner → Features) |
 | `LINK_PREVIEW_ACCEPT_LANGUAGE` | `en` | The language sites are asked for when this server fetches a page for a preview (the same for everyone, so it doesn't single anyone out) |
@@ -511,6 +549,8 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `API_RATE_LIMIT` | `1200` | Requests a minute one signed-in account can make in all (the sensitive routes have tighter limits of their own); `0` turns it off |
 | `BACKUP_KEY` | `data/backup.key` | 64 hex characters: the key encrypted backups use (made automatically if not set) |
 | `BACKUP_RCLONE_REMOTE` | — | Copy every encrypted backup off-site with rclone, e.g. `b2:my-bucket/hearth` |
+| `DISAPPEAR_SWEEP_MS` | `60000` | How often the safety sweep deletes disappearing messages whose time has passed (each one is also deleted at its own time by a precise timer) |
+| `DISAPPEAR_CHECKPOINT_MS` | `600000` | The shortest gap between resets of the database's write-ahead log after a sweep that deleted something (so deleted messages' bytes don't linger there) |
 | `HEARTH_BIND` | all interfaces | Docker only: the address port 3000 listens on. Set `127.0.0.1` behind Caddy |
 
 ---
@@ -528,7 +568,7 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 
 ## Not included (yet)
 
-App Store / Play Store listings, screen sharing in the Android app, push notifications for the Android app while it's swiped away, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
+App Store / Play Store listings, screen sharing in the Android app, a full-screen incoming-call screen on Android, separate encryption keys per private channel, drag-and-drop reordering of channels (use the Move up/down menu items), and encrypted reactions.
 
 ## Email (password resets)
 
@@ -696,6 +736,62 @@ Open **Events** at the top of a server's channel list → **Plan an event**. Any
 - **Add to my calendar** downloads an .ics file with the repeat rule and the time zone, so calendar apps show every time. The zone's clock changes are written as yearly rules where they fit, and listed date by date for the next ten years where they don't (Israel, Egypt, Morocco, Chile and a few others).
 - **Not end-to-end encrypted:** the server needs the times to send reminders, so it can read event titles, descriptions and places (the app says so).
 
+## Disappearing messages
+
+Set a timer on a DM, a group chat or a server channel, and new messages there disappear for everyone that long after
+they're sent: **off, 1 hour, 1 day, 1 week or 4 weeks**.
+
+- **Who can set it:** either person in a DM (not after one of you blocked the other), anyone in a group chat, and in
+  a server people with **Manage Channels** in that channel. It's in the conversation's ⋯ menu, and for server
+  channels also under Edit channel → Disappearing messages. Every change shows in the conversation ("Alice turned on
+  disappearing messages: 1 week"), and while it's on there's a timer in the header, a note above the message box and
+  a small timer on each disappearing message (hover it to see when it goes).
+- **Never retroactive:** each message keeps the timer it was sent with. Changing the timer or turning it off doesn't
+  change messages already sent, and editing a message doesn't move its time. A thread reply never outlives the
+  message that started the thread.
+- **What goes with a message:** its files (they stop loading at once), reactions, poll votes, pins and pin history,
+  mention counts and everyone's saved copies. Replies quoting it say "Original message is no longer available".
+  Posts by bots, webhooks and the news bot in a disappearing channel go too.
+- **On your devices:** the app hides a message at its time even before the server has deleted it, and lets go of
+  what it kept: the decrypted files, its notification (while the app is running, see below), inbox entries, reminders
+  and search results. The timer is also inside the encrypted message, so the app hides it on time even if the server
+  forgets to delete it; a dishonest server can still change a message's send time and keep it showing longer. Only
+  the timers listed above count inside a message, so a modified app can't make one vanish from your screen within
+  seconds, before you could report it.
+- **If the timer changes while you send:** turned on or made shorter, your message goes with the new timer. Turned off
+  or made longer, the app asks before sending it, since you wrote it expecting it to disappear.
+
+**What it doesn't do — read this before relying on it:**
+
+- **The host does the deleting.** Messages are deleted on the Hearth server, once, for everyone. Someone who runs
+  or breaks into the server can skip that, change the code, or keep copies of the database. End-to-end encrypted
+  messages stay unreadable to them, but anyone who later gets a member's keys could read such copies (there's no
+  forward secrecy for history, see [Things to know](#things-to-know)).
+- **Backups keep copies until they rotate out.** Every backup made before a message's time holds it: the daily
+  encrypted backups (the newest 7 days by default), their copies on your regions (14 by default), `hearth-auto-*.db`
+  copies, and — until you delete them — off-site rclone copies, `hearth-before-v*.db` upgrade copies and the
+  snapshots `scripts/hearth-update.sh` keeps. Restoring an older backup brings such messages back only until the
+  first sweep after start-up, which deletes everything whose time has passed.
+- **Anyone can screenshot.** People can copy, forward, download, export ("Export my data" keeps them in the zip) or
+  photograph what they see, and a modified app can keep everything. A report sends the reported messages' text to
+  this server's staff (and, when you also show it to a server's moderators, the reported person's messages to them),
+  who keep it with the report.
+- **The server controls message times.** The app's deadline is the earlier of the server's and the send time plus
+  the timer inside the message, but the send time comes from the server too: a dishonest server can make a message
+  look newer and keep it on screen longer.
+- **Notifications can stay.** The app closes a disappearing message's notification when the message goes, but only
+  while it's running. On Android, a notification shown while the app was open stays after the app is closed, and so
+  does one that arrived while it was closed (those never carry the message's words, only "New message" or who and
+  where), until you dismiss it or open that conversation; phones and computers that keep a notification history keep
+  it there too.
+- **Below the database:** deleted rows are overwritten in the database file and its write-ahead log is reset after
+  each sweep that deleted something (at most every 10 minutes), but SSDs, copy-on-write file systems and VPS
+  snapshots can keep old blocks.
+- **Metadata stays:** the server still sees who wrote when, each conversation's timer and who changed it, and when
+  each message is due to disappear. In a server, the audit log also keeps who pinned, unpinned or deleted someone's
+  message, whose it was, in which channel and when (never the message itself), for up to a year after the message is
+  gone, and people with View Audit Log can read it.
+
 ## Group chats
 
 **New group chat** is under the + next to Direct messages on Home, and on the Friends page. A friend's ⋯ menu can also start a group chat or add them to one.
@@ -760,6 +856,8 @@ server/db.js        SQLite schema, encrypted-key storage
 server/profile.js   Profile validation
 server/perms.js     Roles and permission rules
 server/selfroles.js Roles members pick themselves (and what keeps them from handing out power)
+server/imports.js   Import from Discord: preview and create a server from a pasted template
+server/discordmap.js Discord template → Hearth roles, channels and permissions (pure, no I/O)
 public/             The web app (plain JavaScript modules, no build)
 public/js/e2ee.js   Encryption primitives (WebCrypto + Argon2id)
 public/js/secure.js Key management: group keys, rotation, verification

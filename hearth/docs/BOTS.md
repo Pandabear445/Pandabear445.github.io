@@ -98,7 +98,9 @@ Base URL: `https://<your hearth>/api/bot/v1`. JSON in and out. Every error looks
 ### Messages
 
 - `GET /channels/:id/messages?before=<id>&limit=50` (`messages.read.metadata`) →
-  `{ messages: [{ messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo }] }`
+  `{ messages: [{ messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo, expiresAt }] }`
+  (`expiresAt`: when a message in a channel with disappearing messages goes, or `null`; messages whose time has passed
+  are never listed, and acting on one is 404)
 - `POST /channels/:id/messages` (`messages.send`) `{ content, replyTo? }` → `{ message: { …metadata, content } }`
 - `PATCH /messages/:id` (`messages.send`, own only) `{ content }`
 - `DELETE /messages/:id` (`messages.send`, own only)
@@ -130,7 +132,7 @@ Hearth POSTs each event to the bot's webhook address as JSON:
   "type": "message.created",
   "createdAt": 1791660986167,
   "botId": "…", "installationId": "…", "serverId": "…",
-  "data": { "messageId": "…", "channelId": "…", "authorId": "…", "authorIsBot": false, "createdAt": 1791660986160, "editedAt": null, "threadId": null, "replyTo": null }
+  "data": { "messageId": "…", "channelId": "…", "authorId": "…", "authorIsBot": false, "createdAt": 1791660986160, "editedAt": null, "threadId": null, "replyTo": null, "expiresAt": null }
 }
 ```
 
@@ -139,8 +141,8 @@ each attempt), `X-Hearth-Signature: v1=<hex>`, `Content-Type: application/json`.
 
 | Type | Needs | `data` |
 |---|---|---|
-| `message.created` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo` |
-| `message.deleted` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, threadId, deletedBy` (one per message, also for a moderator's bulk delete and a ban's message cleanup) |
+| `message.created` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo, expiresAt` (`expiresAt`: when it disappears, in a channel with disappearing messages; else `null`) |
+| `message.deleted` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, threadId, deletedBy` (one per message, also for a moderator's bulk delete and a ban's message cleanup; a disappearing message that reached its time comes with `deletedBy: null, expired: true`) |
 | `reaction.added` | `messages.read.metadata`, channel allowed | `messageId, channelId, userId, emoji` |
 | `member.joined` | `members.read` | `serverId, userId, joinedAt` |
 | `member.left` | `members.read` | `serverId, userId` |

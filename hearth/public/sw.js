@@ -61,10 +61,14 @@ self.addEventListener('push', (e) => {
     // If a Hearth window is already focused, the app shows its own notification.
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     if (wins.some((w) => w.focused)) return;
+    // A call push that arrives late (the device was offline) is a missed call, not a ring. (`at` is when the
+    // server sent it; something must still be shown, browsers require it.)
+    const tag = typeof data.tag === 'string' ? data.tag : '';
+    const missed = tag.startsWith('call:') && typeof data.at === 'number' && Date.now() - data.at > 120000;
     await self.registration.showNotification(data.title || 'Hearth', {
-      body: data.body || 'New activity',
-      tag: data.tag || undefined,
-      renotify: !!data.tag,
+      body: missed ? 'Missed call' : data.body || 'New activity',
+      tag: (missed ? 'missed-' + tag : tag) || undefined,
+      renotify: !!tag,
       icon: '/icons/icon-192.png',
       badge: '/icons/badge-96.png',
       data: { url: data.url || '/' },
