@@ -926,6 +926,26 @@ describe('step-up codes and session tokens (auth-6, auth-11)', () => {
     assert.match(third.json.token, /^[0-9a-f]{64}$/);
   });
 
+  test('auth-11: a new token ends the media token handed out with the old one; the app gets a working one when it reconnects', async () => {
+    // 400 = token accepted (the empty URL is then refused), 403 = token refused.
+    const gif = (t) => srv.call('GET', `/media/gif?t=${encodeURIComponent(t)}&u=`);
+    const u = await srv.register();
+    const before = (await rs(u, 'GET', '/bootstrap')).json.mediaToken; // what the app, or a copy of its token, holds
+    assert.equal((await gif(before)).status, 400);
+    const r = await rs(u, 'POST', '/me/sessions/revoke-others', { authKey: u.authKey });
+    assert.equal(r.status, 200, r.text);
+    assert.equal((await gif(before)).status, 403, 'a copy of the old sign-in token can\u2019t keep fetching through the picture proxies');
+    u.token = r.json.token;
+    const after = (await rs(u, 'GET', '/bootstrap')).json.mediaToken;
+    assert.notEqual(after, before);
+    assert.equal((await gif(after)).status, 400, 'the new one works');
+    // The same for a password change.
+    const pw = newPw(u);
+    const p = await rs(u, 'POST', '/me/password', pw);
+    assert.equal(p.status, 200, p.text);
+    assert.equal((await gif(after)).status, 403);
+  });
+
   test('auth-11: a copy of the token alone can’t get a new one and lock the original device out', async () => {
     const u = await srv.register();
     const copy = u.token; // the same token, used from somewhere else

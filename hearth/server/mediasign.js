@@ -4,7 +4,8 @@
 // webhook post's avatar (on a known avatar host only: see avatarHost below), someone's album art. The link names
 // that one address and a time it stops working, with an HMAC over both, so a link for one picture can't be turned
 // into a link for another, and nobody can make up a link for an address this server never chose to show. The app
-// adds its sign-in media token (see mediaToken in index.js), so a link also needs a live session to work.
+// adds its sign-in media token (see mediaToken in index.js), so a link also needs a live session, still on the sign-in
+// token it had then, to work.
 //
 // A link lasts about a day: long enough for a tab left open, short enough that a copied link soon stops working.
 // The time it stops is rounded to the next 6 hours, so the same picture gets the same link for a while and browsers

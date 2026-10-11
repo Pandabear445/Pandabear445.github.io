@@ -751,9 +751,12 @@ Automatic Away after a while without input, and an expiry for custom statuses. v
    `PATCH /me/status` all compare `presenceFor` before and after and send a presence entry only when it changed,
    so an Invisible or Do Not Disturb account opening and closing windows (or changing "Away after") tells nobody
    anything. In the app, a `user:update` about yourself that changes only `presence` and `autoAway` patches your
-   dots and the line under your name in place (`onlyMyPresence`), so a call in full screen, a button being pressed
-   and keyboard focus are left alone; other people's presence redraws only the rows of the friends and member
-   lists (their search boxes keep what's typed) and Home's online friends (`redrawPeople`).
+   dots and the line under your name in place (`onlyPresenceChanged` in `presence.js`), so a call in full screen,
+   a button being pressed and keyboard focus are left alone. It doesn't count what differs without anything
+   changing: the server-folder layout (the app's own, tidied in place by `folders.js`), a missing `keysReset`
+   against `null`, and the re-signed album-art link (`activity.music.artSrc`). Other people's presence redraws
+   only the rows of the friends and member lists (their search boxes keep what's typed) and Home's online friends
+   (`redrawPeople`).
 3. `PUT /me/custom-status` takes `expiresIn` in ms. The app works out "today" and "this week" in the person's time
    zone (`clearAfterMs`; the week starts where the browser's language says) and sends only the length, so the
    server needs no time zone and a wrong device clock doesn't matter. The `status.expire` job (every 15 s,
@@ -1025,9 +1028,14 @@ queued. It goes out only once the person confirms it from a session still signed
 **Edit** or **Reschedule** in the list re-encrypt it from their own copy (which ties it to the new session). The app
 never does that by itself, a key change doesn't turn it into an ordinary key hold, and `POST …/send` and a
 reschedule alone answer 409 `held`. At its time the person is told it's waiting, as for any held one. A session
-that simply expires doesn't count, and neither does a new sign-in token for the session itself (`rotateToken`: the
-device that changes the password, turns on two-factor or uses *Log out all other devices* with the password keeps
-its session id), so what that device scheduled stays as it was.
+that simply expires doesn't count. A new sign-in token for the session itself (`rotateToken`: the device that changes
+the password, turns on two-factor or uses *Log out all other devices* with the password keeps its session id) isn't a
+sign-out, but it's what shuts out a copy of the old token, and the server can't tell what the device scheduled from
+what a copy did. So what the session had pending is held too (`token_renewed`, `tokenRenewed`), and the person's app
+re-encrypts it by itself, as after a key change (`fixHeld`), from their own copy: what the device wrote goes out as
+planned, and what a copy of the token queued (its copy can't open without the identity key) stays held and can only
+be cancelled. The news that it's held can reach the app just before it has the new token; a re-encrypt turned away
+then (401) is tried again when it reconnects.
 
 **Key changes, decided honestly.** A channel message is locked with one epoch of the server key, and members who
 joined after a rotation never receive older keys; posting old ciphertext would make a message they can't open,
@@ -1085,7 +1093,7 @@ Anyone else's id (or a malformed one) answers 404 "Scheduled message not found."
 Socket events go only to `user:<you>`: `scheduled:update` (the item) and `scheduled:remove` (`{ id, messageId }`).
 Items carry `id`, `serverId`, `channelId`, `dmId`, `threadId`, `replyTo`, `ciphertext`, `epoch`, `ref`, `draft`,
 `files` (a count), `sendAt`, `status` (`pending`, `held`, `failed`), `reason` (for held: `key`, `peer_key`,
-`session_ended`), `note`, `createdAt` and `encryptedAt`. `ref` must be 16–64 of `A-Z a-z 0-9 _ -` and `draft` an
+`session_ended`, `token_renewed`), `note`, `createdAt` and `encryptedAt`. `ref` must be 16–64 of `A-Z a-z 0-9 _ -` and `draft` an
 `x1:` string of at most 66,000 characters (400 `draft` otherwise); the server can't open it.
 
 **Data model** (`scheduled_messages`, v19): owner, server, channel or DM (exactly one; no foreign key, so a deleted
@@ -1126,7 +1134,8 @@ deletes its scheduled messages and their files at once.
   out, signing one out) holds what it scheduled (`session_ended`): not posted at its time, the sender told, not
   sendable or reschedulable as it is, not turned into a key hold by a key change, sent once confirmed with new
   ciphertext, and what other sessions scheduled untouched; a new sign-in token for the same session (`auth-11`)
-  holds nothing, and its messages are listed, sent and cancelled from the new token; Settings → Storage and the admin report label a
+  holds what it had pending (`token_renewed`), a copy of the old token can't confirm one, and the app re-encrypts
+  its own from the new token (after a 401 too) but never one whose copy doesn't open; Settings → Storage and the admin report label a
   scheduled message's file; static checks that `public/js/scheduled.js` never builds HTML and never decrypts the
   ciphertext it's given (it re-encrypts only from the vault-sealed copy, bound to ref, conversation and thread).
 - Browser flow (`npm run test:e2e`, "send later"): a right-click on Send offers the times; the clock schedules

@@ -3,7 +3,9 @@
 // with your personal vault key and bound to its ref, conversation and thread). This module keeps your list (synced
 // across your devices by scheduled:update / scheduled:remove), draws the picker for when, the bar above the
 // composer and the list per conversation (from your own copies, opened here on your device), and re-encrypts a
-// message the server is holding because the conversation's key changed after you wrote it:
+// message the server is holding because the conversation's key changed after you wrote it, or because your sign-in
+// got a new token since (a password change, two-factor turned on, other devices signed out: a copy of the old token
+// could have scheduled it, and only one you wrote has a copy that opens here):
 //   - by itself, as soon as it can, when its time is still ahead or passed less than 10 minutes ago (it then goes
 //     out at once);
 //   - later than that, only when you say so (Send now or a new time): a message sent days late might not be one
@@ -161,15 +163,17 @@ export function createScheduled(deps) {
     apply(fresh);
     return fresh;
   }
-  // Held ones whose time is ahead (or just passed) because a key changed: re-encrypted without asking. One that
-  // can't be (no key yet, a safety number to check, a copy that doesn't open) waits for the next change of keys, or
-  // for you. Never one from a session that was signed out since: you confirm those yourself.
+  // Held ones whose time is ahead (or just passed) because a key changed or the sign-in got a new token: re-encrypted
+  // without asking. One that can't be (no key yet, a safety number to check, a copy that doesn't open) waits for the
+  // next change of keys, or for you. Never one from a session that was signed out since: you confirm those yourself.
+  // A try turned away as signed out (401) isn't held against it: the news that it's held can arrive just before this
+  // tab has the new token, and it's tried again when the app reconnects with it (load).
   async function fixHeld({ force = false } = {}) {
     for (const it of [...items.values()]) {
       if (it.status !== 'held' || it.reason === 'session_ended' || busy.has(it.id) || it.sendAt < Date.now() - LATE_OK) continue;
       if (!force && tried.get(it.id) === it.ciphertext) continue;
       busy.add(it.id);
-      try { await reseal(it, { now: true }); tried.delete(it.id); } catch { tried.set(it.id, it.ciphertext); } finally { busy.delete(it.id); }
+      try { await reseal(it, { now: true }); tried.delete(it.id); } catch (e) { if (!e || e.status !== 401) tried.set(it.id, it.ciphertext); } finally { busy.delete(it.id); }
     }
   }
 

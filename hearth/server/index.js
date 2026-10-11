@@ -2021,7 +2021,9 @@ function useStepUpTicket(req, raw, purpose) {
 // up, and they reconnect. Live connections still on the old token are closed now, with reason 'token_rotated'
 // (and by the minute sweep in setupSockets, should one slip through). The session's push subscriptions go: one
 // may have been made with a copy of the token. The app's own windows subscribe again as they reconnect (and
-// pushSubLive refuses one made with the old token that was still on its way in).
+// pushSubLive refuses one made with the old token that was still on its way in). For the same reason, what the
+// session has scheduled is held until the person's app re-encrypts it from their own copy, which it does by itself
+// (scheduled.js tokenRenewed), and the media token handed out with the old token stops working (mediaSig).
 // Every caller has checked the password first (and two-factor, when it's on): a copied token alone must never be
 // able to push the original device off the session it shares, and keep it.
 function rotateToken(req) {
@@ -2031,6 +2033,7 @@ function rotateToken(req) {
   db.prepare('UPDATE sessions SET token_hash = ? WHERE id = ?').run(hash, sid);
   // (Ones from before subscriptions recorded their session can't be told apart, so they go too, as in revokeSessions.)
   db.prepare('DELETE FROM push_subs WHERE user_id = ? AND (session_id = ? OR session_id IS NULL)').run(req.userId, sid);
+  if (SCHED) SCHED.tokenRenewed(req.userId, sid);
   if (io) io.in(`user:${req.userId}`).fetchSockets().then((socks) => socks.forEach((x) => {
     if (x.data.sid === sid && x.data.tokenHash !== hash) { x.emit('session:revoked', { reason: 'token_rotated' }); x.disconnect(true); }
   })).catch(() => {});
@@ -2269,7 +2272,7 @@ api.get('/bootstrap', auth, (req, res) => {
   // No password-locked private key here: a session alone must not be enough to take it away and guess the
   // password offline (POST /me/keys/wrapped hands it out with the password). The signing key's private half
   // is locked with the identity key, not the password, so it can't be guessed at and stays.
-  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid, req.session.id), me: selfUser(me), encSignPrivateKey: me.enc_sign_private_key, e2eeSince: Number(getSetting('e2eeSince')) || 0, servers, dms, relationships, users, voice, keyStates, blocked,
+  res.json({ iceServers: iceServersFor(uid), termsVersion: termsInfo().version || 0, tosAccepted: me.tos_version || 0, mediaToken: mediaToken(uid, req.session), me: selfUser(me), encSignPrivateKey: me.enc_sign_private_key, e2eeSince: Number(getSetting('e2eeSince')) || 0, servers, dms, relationships, users, voice, keyStates, blocked,
     // The server's clock: apps hide disappearing messages by it, whatever the device's own clock says.
     serverNow: Date.now() });
 });
@@ -4873,21 +4876,24 @@ async function fetchGifMedia(u, signal) {
   return null;
 }
 // The token belongs to one sign-in session: it stops working when that session ends (log out, revoked, expired)
-// or the account is suspended or deleted, not just after its 7 days. It says who is asking, not what for: the news
-// and music-art proxies also need a link signed for that one address (MEDIA_LINKS), so the token alone can't fetch
-// anything there.
-const mediaSig = (uid, sid, exp) => crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${sid}|${exp}`).digest('base64url').slice(0, 22);
-function mediaToken(uid, sid) {
+// or the account is suspended or deleted, not just after its 7 days. It's signed with the session's current token
+// (its hash), so a new sign-in token (rotateToken, auth-11) ends it too: a copy of the old sign-in token that
+// fetched one from /bootstrap before can't keep using it. The app gets a new one when it reconnects with the new
+// token. It says who is asking, not what for: the news and music-art proxies also need a link signed for that one
+// address (MEDIA_LINKS), so the token alone can't fetch anything there.
+const mediaSig = (uid, s, exp) => crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${s.id}|${s.token_hash}|${exp}`).digest('base64url').slice(0, 22);
+function mediaToken(uid, session) {
   const exp = Math.floor(Date.now() / 1000) + 7 * 86400;
-  return `${uid}.${sid}.${exp}.${mediaSig(uid, sid, exp)}`;
+  return `${uid}.${session.id}.${exp}.${mediaSig(uid, session, exp)}`;
 }
 function checkMediaToken(t) {
   const [uid, sid, exp, sig, extra] = String(t || '').split('.');
   if (!uid || !sid || !exp || !sig || extra !== undefined || +exp < Date.now() / 1000) return false;
-  const good = mediaSig(uid, sid, exp);
-  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
   const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sid);
-  const u = s && s.user_id === uid && sessionLive(s) && db.prepare('SELECT id, suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(uid);
+  if (!s || s.user_id !== uid || !sessionLive(s)) return false;
+  const good = mediaSig(uid, s, exp);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
+  const u = db.prepare('SELECT id, suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(uid);
   return !!u && !u.deleted_at && !stillSuspended(u);
 }
 app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {

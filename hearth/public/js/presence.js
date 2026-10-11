@@ -66,6 +66,26 @@ export function initAway({ socket, minutes, busy = () => false }) {
   return { check, used };
 }
 
+// A user:update about yourself (`u`, the server's whole copy) that changes nothing but whether you show as Away for
+// being inactive, compared with what the app has (`me`): then the app only redraws the dots and the line under
+// your name (app.js). Everything else in it must be the same, except what differs without anything changing:
+//   rail      the server-folder layout is the app's own: it tidies the order in place without saving (folders.js),
+//             and other devices' changes come as 'rail:update', so the copy in here says nothing new;
+//   keysReset missing and null both mean verified (your public copy, which comes with a server or group you join,
+//             leaves it out: secure.js mergeUser);
+//   activity  the album art's link (music.artSrc) is signed again every few hours; the song itself is compared.
+const PRESENCE_ONLY = new Set(['presence', 'autoAway']);
+const withoutArt = (a) => (a && a.music ? { ...a, music: { ...a.music, artSrc: undefined } } : a);
+const sameAs = (k, a, b) => {
+  if (k === 'keysReset') return (a || null) === (b || null);
+  if (k === 'activity') return JSON.stringify(withoutArt(a) || null) === JSON.stringify(withoutArt(b) || null);
+  return JSON.stringify(a) === JSON.stringify(b);
+};
+export function onlyPresenceChanged(me, u) {
+  if (!me || !u || u.id !== me.id) return false;
+  return Object.keys(u).every((k) => PRESENCE_ONLY.has(k) || k === 'rail' || sameAs(k, u[k], me[k]));
+}
+
 // ------------------------------------------------------------------ custom status: "Clear after"
 // The choices, in the order the dialog lists them. The app works out how long each lasts on this device, in the
 // person's own time zone, and sends only that length (expiresIn) to the server.

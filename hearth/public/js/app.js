@@ -12,7 +12,7 @@ import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
 import { prepareImage, makeQueue, whenVisible, previewThumb } from './media.js';
 import { isUploadUrl, safeDownloadHref } from './attachments.js';
-import { outsideMode, outsideHost, imageDecision } from './outside.js';
+import { outsideMode, outsideHost, imageDecision, openedLinks } from './outside.js';
 import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, mediaKind, typeLabel } from './files.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
@@ -43,7 +43,7 @@ import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNot
 import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer, stricter as stricterTimer } from './disappear.js';
 import { createScheduled } from './scheduled.js';
 import { trackViewport } from './viewport.js';
-import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel } from './presence.js';
+import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel, onlyPresenceChanged } from './presence.js';
 
 // ======================================================================= state
 const S = {
@@ -477,7 +477,7 @@ function startApp() {
   // loaded there's no setting yet, and while the status isn't Online it can't change anything: nothing is sent.
   // Being in a call counts as using Hearth (talking, or watching a shared screen without touching anything).
   // (A connection made again with a new sign-in token starts out "in use" on the server like any new one, and
-  // presence.js reports again on 'connect'; the session id, which presence and scheduled holds go by, stays.)
+  // presence.js reports again on 'connect', so the person shows as Away again once this app is idle.)
   away = initAway({
     socket,
     minutes: () => (S.me && S.me.status === 'online' && Number.isFinite(S.me.awayAfter) ? S.me.awayAfter : 0),
@@ -629,10 +629,9 @@ function startApp() {
   socket.on('user:update', (u) => {
     if (!S.me) return;
     // Only your own Away for being inactive (or back): just the dots and the line under your name. Nothing is
-    // rebuilt, so a call stays as it is (full screen too), and a button being pressed or focused stays put.
-    const presenceOnly = onlyMyPresence(u);
-    if (u && u.id === S.me.id) rememberSelf(u);
-    if (presenceOnly) { setUser(u); showMyPresence(); return; }
+    // rebuilt, so a call stays as it is (full screen too), and a button being pressed or focused stays put. (The
+    // server folders stay as this app has them: presence.js onlyPresenceChanged says why.)
+    if (onlyPresenceChanged(S.me, u)) { setUser({ ...u, rail: S.me.rail }); showMyPresence(); return; }
     const roleBefore = S.me.staffRole;
     const outsideBefore = outsideMode(S.me.privacy);
     const wasWaiting = sec.awaitingVerify(S.users[u.id]) || (u.id === S.me.id && sec.awaitingVerify(S.me));
@@ -959,7 +958,6 @@ async function loadBootstrap() {
   // How far this device's clock is from the server's (at most a day either way), for disappearing messages.
   if (Number.isFinite(b.serverNow)) S.clockOffset = Math.max(-86400000, Math.min(86400000, b.serverNow - Math.round((asked + Date.now()) / 2)));
   S.me = b.me;
-  rememberSelf(b.me);
   drafts = createDrafts(S.me.id);
   S.mediaToken = b.mediaToken;
   S.iceServers = b.iceServers;
@@ -1065,17 +1063,7 @@ function redrawPeople() {
     if (sec) sec.replaceWith(onlineFriendsSection()); else renderMain();
   }
 }
-// A user:update about you that changes nothing but whether you show as Away for being inactive.
-// Compared with the last copy of you the server sent, not with S.me: the app tidies parts of S.me itself (the
-// server bar's order gains servers you joined, see folders.js), and that alone mustn't count as a change.
-const PRESENCE_ONLY = new Set(['presence', 'autoAway']);
-let lastSelf = null; // key -> JSON of the last value the server sent for you
-function rememberSelf(u) { lastSelf = Object.fromEntries(Object.entries(u).map(([k, v]) => [k, JSON.stringify(v)])); }
-function onlyMyPresence(u) {
-  if (!u || u.id !== S.me.id) return false;
-  const was = (k) => (lastSelf && k in lastSelf ? lastSelf[k] : JSON.stringify(S.me[k]));
-  return Object.keys(u).every((k) => PRESENCE_ONLY.has(k) || JSON.stringify(u[k]) === was(k));
-}
+// Your own Away for being inactive (or back), in place: the dots and the line under your name.
 function showMyPresence() {
   const st = presenceOf(S.me, S.me.id);
   $$(`[data-user-av="${S.me.id}"][data-status="1"] .status-dot`).forEach((d) => {
@@ -3694,7 +3682,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
   } else {
     const chat = P.chat;
     // A message that's only an image link shows just the picture, once the picture is really shown.
-    const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length && embedDecision(text.trim()) === 'show';
+    const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length && embedDecision(text.trim(), m) === 'show';
     const embed = m.dec && m.dec.embed;
     if (text && !hideText && !(embed && text === embed.title)) {
       const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: senderMayPingEveryone(m) }) : escapeText(text);
@@ -3703,7 +3691,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     // A link preview built by the sender: it came inside the encrypted message, so nothing is fetched to show it.
     const links = chat.linkCards !== false && senderMayEmbed(m) ? linksOf(m) : [];
     if (links.length) body.append(h('div', { class: 'msg-links' }, links.map(linkCardEl)));
-    const embeds = chat.embeds ? extractImageUrls(text).filter((u) => !links.some((l) => l.url === u) && embedDecision(u) !== 'skip') : [];
+    const embeds = chat.embeds ? extractImageUrls(text).filter((u) => !links.some((l) => l.url === u) && embedDecision(u, m) !== 'skip') : [];
     if (embeds.length) body.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => embedEl(u, m))));
     if (m.dec && m.dec.p) body.append(pollEl(m));
     const files = filesOf(m);
@@ -3812,15 +3800,15 @@ const mediaUrl = (u) => (isGiphy(u) && S.config.gifProxy && S.mediaToken ? `/med
 // waits behind a placeholder until clicked, unless Settings → Privacy & safety says Always or Never. Files uploaded
 // here, GIFs through this server's GIF proxy and link preview pictures (inside the message) never contact the other
 // site. Any other address on this server stays a plain link (outside.js imagePlace says why).
-const openedOutside = new Set(); // links clicked open this session, so a redraw doesn't ask again
-const embedDecision = (u) => imageDecision(u, { origin: location.origin, viaProxy: mediaUrl(u) !== u, mode: outsideMode(S.me && S.me.privacy), opened: openedOutside.has(u) });
+const openedOutside = openedLinks(); // Load clicked in that message this session, so a redraw doesn't ask again
+const embedDecision = (u, m) => imageDecision(u, { origin: location.origin, viaProxy: mediaUrl(u) !== u, mode: outsideMode(S.me && S.me.privacy), opened: openedOutside.has(m && m.id, u) });
 function embedImg(u) {
   return h('div', { class: `embed-wrap${isGiphy(u) ? ' giphy' : ''}` },
     h('img', { class: 'embed-img', src: mediaUrl(u), alt: isGiphy(u) ? 'GIF' : 'Linked image', loading: 'lazy', referrerpolicy: 'no-referrer', onclick: (e) => openViewer(e.currentTarget) }),
     isGiphy(u) ? h('span', { class: 'giphy-tag' }, /klipy/i.test(u) ? 'KLIPY' : 'GIPHY') : null);
 }
 function embedEl(u, m) {
-  const decision = embedDecision(u);
+  const decision = embedDecision(u, m);
   if (decision === 'show') return embedImg(u);
   const host = outsideHost(u);
   const box = h('div', { class: `embed-ask${decision === 'hidden' ? ' never' : ''}`, title: u },
@@ -3829,7 +3817,7 @@ function embedEl(u, m) {
       h('span', { class: 'embed-ask-sub' }, decision === 'hidden' ? 'Not loaded: you chose Never load in Privacy & safety.' : `Loading it shows ${host} your IP address.`)));
   if (decision === 'ask') {
     box.append(h('button', { class: 'btn ghost sm', 'aria-label': `Load image from ${host}`, onclick: () => {
-      openedOutside.add(u);
+      openedOutside.add(m && m.id, u);
       // Redraw the whole message: one that's only this link then shows just the picture, and keyboard focus
       // (on the button, now gone) moves to the message instead of falling back to the page.
       if (m && box.closest('.msg[data-mid]')) return replaceMessageEl(m);

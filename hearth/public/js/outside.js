@@ -45,7 +45,7 @@ export function imagePlace(link, { origin, viaProxy = false }) {
 // What a message shows for an image link: 'show' (load it now), 'ask' (a placeholder with a Load button),
 // 'hidden' (a placeholder without one) or 'skip' (no picture: the link stays a plain link). `link` is the address
 // as written in the message, `viaProxy` whether the app loads it through this server's GIF proxy, `opened`
-// whether the viewer already clicked Load on this link in this session.
+// whether the viewer already clicked Load on this link in this message, this session (openedLinks).
 export function imageDecision(link, { origin, viaProxy = false, mode = 'ask', opened = false }) {
   const place = imagePlace(link, { origin, viaProxy });
   if (place === 'here') return 'show';
@@ -53,6 +53,18 @@ export function imageDecision(link, { origin, viaProxy = false, mode = 'ask', op
   if (mode === 'never') return 'hidden';
   if (mode === 'always' || opened) return 'show';
   return 'ask';
+}
+
+// The Load clicks of this session, by message and link, so a redraw of that message doesn't ask again. Not by link
+// alone: a later message with the same link asks again, or its sender (serving the picture uncached) would learn
+// when each one is read, without the reader being asked. A link with no message to go with it isn't remembered.
+export function openedLinks() {
+  const seen = new Set();
+  const key = (messageId, link) => `${messageId}\n${link}`;
+  return {
+    add(messageId, link) { if (messageId) seen.add(key(messageId, link)); },
+    has(messageId, link) { return !!messageId && seen.has(key(messageId, link)); },
+  };
 }
 
 // A watch-together item that loads straight from another site (a direct video file). YouTube, Vimeo and Twitch

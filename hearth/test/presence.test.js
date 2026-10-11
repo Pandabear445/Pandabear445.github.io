@@ -520,6 +520,47 @@ test('app: in the Android app, going to the background says nothing by itself, t
   }
 });
 
+test('app: going Away after joining a server is still "only presence" (the folders, keysReset and re-signed album art don\u2019t count)', async () => {
+  const P = await import(js('presence.js'));
+  // (secure.js brings api.js, which reads the stored token as it loads.)
+  if (!globalThis.localStorage) globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+  const SEC = await import(js('secure.js'));
+  const { a } = await pair();
+  // The app's copy of you, as it would be after joining someone else's server by invite: its server:add carries
+  // your public copy (which leaves keysReset out), and drawing the server bar puts the new server in your folder
+  // order without saving it (folders.js).
+  let mine = await me(a);
+  const c = await srv.register();
+  const hall = (await as(c, 'POST', '/servers', { name: 'Porch ' + hex(3) })).json;
+  const inv = (await as(c, 'POST', `/servers/${hall.id}/invites`, {})).json;
+  const s = await sock(a);
+  const added = next(s, 'server:add', (x) => x.server.id === hall.id);
+  assert.equal((await as(a, 'POST', `/invites/${inv.code}/join`)).status, 200);
+  const add = await added;
+  assert.ok(add && add.users[a.id], 'your own public copy comes with it');
+  mine = SEC.mergeUser(mine, add.users[a.id]);
+  assert.equal('keysReset' in mine, false);
+  mine.rail = { ...mine.rail, order: [...mine.rail.order, 's:' + hall.id] };
+  // Going Away: the update to your own apps differs from the app's copy only in presence (and autoAway).
+  const update = next(s, 'user:update', (u) => u.id === a.id && u.autoAway === true);
+  assert.deepEqual(await idle(s, true), { ok: true });
+  const u = await update;
+  assert.ok(u, 'told it shows as Away');
+  assert.equal(u.keysReset, null);
+  assert.deepEqual(u.rail.order, [], 'the server\u2019s copy of the folders has no order saved');
+  assert.equal(P.onlyPresenceChanged(mine, u), true, 'just the dots: nothing rebuilt');
+  // A song playing: its art link is signed again every few hours, which isn't a change; another song is.
+  const song = (artSrc, title = 'Song') => ({ music: { title, artist: 'Band', art: 'https://art.example/a.jpg', artSrc } });
+  assert.equal(P.onlyPresenceChanged({ ...mine, activity: song('/media/art/x?e=1&s=a') }, { ...u, activity: song('/media/art/x?e=2&s=b') }), true);
+  assert.equal(P.onlyPresenceChanged({ ...mine, activity: song('/media/art/x?e=1&s=a') }, { ...u, activity: song('/media/art/x?e=1&s=a', 'Other') }), false);
+  // Anything else that changed still redraws: a status, a reset mark appearing, an "Away after" time.
+  assert.equal(P.onlyPresenceChanged(mine, { ...u, profile: { ...u.profile, customStatus: { emoji: '', text: 'Lunch' } } }), false);
+  assert.equal(P.onlyPresenceChanged(mine, { ...u, keysReset: Date.now() }), false);
+  assert.equal(P.onlyPresenceChanged(mine, { ...u, awayAfter: 30 }), false);
+  assert.equal(P.onlyPresenceChanged(mine, { ...u, id: c.id }), false, 'about someone else');
+  assert.equal(P.onlyPresenceChanged(null, u), false);
+});
+
 test('study page: input in the Recall frame counts as using Hearth, and says nothing else', () => {
   const fs = require('node:fs');
   const recall = fs.readFileSync(path.join(__dirname, '..', 'public', 'recall', 'recall.js'), 'utf8');

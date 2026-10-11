@@ -108,9 +108,9 @@ The reset link still gets you back in, but your device has to make **new encrypt
     servers can only open that server, which it reads already. Your app says **Ask a member to verify you** and lists
     the people who can, with where their word counts.
   - **Verified everywhere:** once every server and group you were in before the reset (including any you've left
-    since) has had someone verify you, or an instance admin marks you verified in Admin → Users (with their password and two-factor code), the mark goes, and
-    with it the hold in servers you've joined since. Until then you can't start group chats, give out staff roles
-    or hand over ownership of the instance.
+    since) has had someone verify you, or an instance admin marks you verified in Admin → Users (with their password
+    and, if it's on, a fresh two-factor code), the mark goes, and with it the hold in servers you've joined since.
+    Until then you can't start group chats, give out staff roles or hand over ownership of the instance.
   - **Current key period:** once you're verified somewhere, members' apps hand you that server's current key again.
     You can read everything written under it, including messages from before your reset.
   - **Older key periods** (before the last key change): stay unreadable for you. Nobody can hand out an old key again.

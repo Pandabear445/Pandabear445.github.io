@@ -16,7 +16,11 @@
 // Sessions. Each one records the session that wrote it. When that session ends (logged out, signed out from another
 // device, a password change or reset, staff), what it scheduled is held ("session_ended") and goes out only once the
 // person confirms it from an app still signed in, so signing out a stolen session also stops what it queued. Expiry
-// alone doesn't count.
+// alone doesn't count. A new sign-in token for a session (rotateToken in index.js: a password change, two-factor
+// turned on, "Log out all other devices" with the password) isn't a sign-out, but it's what shuts out a copy of the
+// old token, so what the session had waiting is held too ("token_renewed"). The person's app re-encrypts those by
+// itself, as for a key change, from their own copies; one a copy of the token made has no copy that opens (no
+// identity key), so it stays held and can only be cancelled.
 //
 // Disappearing messages. The app encrypts it for the conversation's timer when it's scheduled (x inside, and ttl
 // beside it, checked like a message sent then: 409 disappear_changed if the timer just changed) and this keeps ttl.
@@ -93,6 +97,7 @@ const WHY = {
   suspended: 'Your account was suspended when it was due.',
   too_late: 'It was due more than a day ago, while your Hearth server was down, so it wasn’t sent that late.',
   session_ended: 'It was scheduled from a session that has been signed out since, so it waits for you to confirm it (Keep, Send now or Edit) or cancel it.',
+  token_renewed: 'Your sign-in got a new token after it was scheduled (a password change, two-factor turned on or other devices signed out). Your app re-encrypts it by itself once it confirms you wrote it; if it can’t, a copy of your old sign-in may have made it: cancel it.',
 };
 
 module.exports = function setupScheduled(ctx) {
@@ -185,13 +190,14 @@ module.exports = function setupScheduled(ctx) {
   }
 
   // ------------------------------------------------------------------ sending
-  // Keys, then whether it waits for its sender to confirm it. A session_ended hold stays until a session still signed
-  // in re-encrypts it (the person confirming it), whatever happens to the keys meanwhile: only the sender's own new
-  // keys (which fail it) come first.
+  // Keys, then whether it waits for its sender to confirm it. A session_ended or token_renewed hold stays until a
+  // session still signed in re-encrypts it (the person confirming it, or their app from their own copy), whatever
+  // happens to the keys meanwhile: only the sender's own new keys (which fail it) come first.
+  const WAITS_FOR_SENDER = new Set(['session_ended', 'token_renewed']);
   function waitsFor(r, u) {
     const keys = keyProblem(r, u);
     if (keys && keys.fail) return keys;
-    if (r.status === 'held' && r.reason === 'session_ended') return { hold: 'session_ended' };
+    if (r.status === 'held' && WAITS_FOR_SENDER.has(r.reason)) return { hold: r.reason };
     return keys;
   }
   // Everything a message sent now would be checked for, from the sender's side. Returns what to do:
@@ -505,6 +511,14 @@ module.exports = function setupScheduled(ctx) {
       if (!gone.size) return;
       const rows = db.prepare("SELECT * FROM scheduled_messages WHERE user_id = ? AND status != 'failed'").all(userId).filter((r) => gone.has(r.session_id));
       for (const r of rows) mark(r, 'held', 'session_ended');
+      if (rows.length) arm();
+    },
+    // A session got a new sign-in token (rotateToken in index.js): what it had waiting is held until the person's app
+    // re-encrypts it from their own copy, so what a copy of the old token queued doesn't go out. (Ones already held
+    // for a key change wait for the same thing; failed ones go nowhere anyway.)
+    tokenRenewed(userId, sessionId) {
+      const rows = db.prepare("SELECT * FROM scheduled_messages WHERE user_id = ? AND session_id = ? AND status = 'pending'").all(userId, sessionId);
+      for (const r of rows) mark(r, 'held', 'token_renewed');
       if (rows.length) arm();
     },
     // The account was deleted: nothing it scheduled goes out.

@@ -1749,6 +1749,14 @@ async function outsideImages(t) {
     await bob.page.waitForFunction((el) => el.complete && el.naturalWidth === 80, await img.elementHandle());
     check(hits.length === 1 && hits[0] === first, `After the click, the picture should load once (fetched ${hits.join(', ')}).`);
     check(!(await msg.locator('.embed-ask').count()), 'The placeholder should be gone once the picture shows.');
+    // The click was for that message: the same link in a later one asks again (or its sender, serving the picture
+    // uncached, would learn when each later message is read without Bob being asked).
+    await alice.send(`Sunset again ${first}`);
+    const again = bob.message('Sunset again');
+    await again.locator('.embed-ask button', { hasText: exact('Load image') }).waitFor();
+    check(!(await again.locator('img.embed-img').count()), 'The same link in a later message should ask again, not load by itself.');
+    check(hits.length === 1, `Nothing more should be fetched for the later message (fetched ${hits.join(', ')}).`);
+    check(await msg.locator('img.embed-img').count() === 1, 'The message it was loaded in should keep its picture.');
 
     // A message that's only the link, from the keyboard: the link text shows while it asks, then just the picture,
     // and keyboard focus moves to the message (the button it was on is gone).
@@ -2124,13 +2132,16 @@ async function awayAndStatus(t) {
   t.pw.dana = newPassword();
   const dana = await t.open('dana');
   await dana.register('dana', t.pw.dana);
-  await dana.join(link, SERVER);
   await dana.openSettings('Privacy & safety');
   const after = dana.$('select[aria-label="Show me as Away after"]');
   check((await after.inputValue()) === '10', 'Away after should start at 10 minutes.');
   await after.selectOption('5');
   await dana.toast('Saved.');
   await dana.closeSettings();
+  // Joined after that, so nothing has sent the app a whole new copy of Dana since: what joining leaves differs from
+  // the server's copy without anything changing (her public copy has no keysReset, and the server bar put the new
+  // server in her folder order on this device only). Going Away must still be just the dots.
+  await dana.join(link, SERVER);
 
   await alice.railButton(SERVER);
   await alice.openChannel('general');

@@ -421,7 +421,8 @@ per message. The "after" run removed 0. No change was made to this path.
 ### Limitations
 
 - Only the sizes above were measured, on one shared machine, in Chromium, over loopback. Real networks add latency
-  that the 37-module waterfall and the Google Fonts request would feel more.
+  that the 37-module waterfall would feel more. (The Google Fonts request measured here is gone: since 1.29.0 the
+  fonts are served by Hearth.)
 - Phones weren't measured on real devices; 4× CPU throttling is a stand-in.
 - The member list still redraws all rows when someone's presence changes. That's batched per frame, and the server
   flushes presence once a second; it costs ~45 ms of JS per redraw at 1,000 members. An incremental update would

@@ -320,10 +320,10 @@ test('disappearing messages: re-encrypting a scheduled message (a key change, an
   for (const x of [b, c, d]) await as(ann, 'DELETE', `/scheduled-messages/${x.id}`);
 });
 
-// The app's side (public/js/scheduled.js), run in Node with its imports replaced by small fakes: re-encrypting
-// passes the timer from the sender's own copy on to sealFor (which puts the stricter of it and the conversation's
-// timer inside the message), so a message re-encrypted by itself after a key change keeps it.
-test('the app re-encrypts a held message with the timer its own copy was written for', async () => {
+// The app's side (public/js/scheduled.js), run in Node with its imports replaced by small fakes (loaded once).
+let clientModule = null;
+async function clientScheduled() {
+  if (clientModule) return clientModule;
   const { register } = require('node:module');
   const fakes = {
     './util.js': `export const h = () => ({ append() {}, classList: { add() {} } }); export const clear = (x) => x; export const icon = () => null;
@@ -339,7 +339,13 @@ test('the app re-encrypts a held message with the timer its own copy was written
       if (ctx.parentURL && ctx.parentURL.endsWith('/public/js/scheduled.js') && urls[spec]) return { url: urls[spec], shortCircuit: true };
       return next(spec, ctx);
     }`));
-  const { createScheduled } = await import(require('node:url').pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'scheduled.js')).href);
+  clientModule = await import(require('node:url').pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'scheduled.js')).href);
+  return clientModule;
+}
+// Re-encrypting passes the timer from the sender's own copy on to sealFor (which puts the stricter of it and the
+// conversation's timer inside the message), so a message re-encrypted by itself after a key change keeps it.
+test('the app re-encrypts a held message with the timer its own copy was written for', async () => {
+  const { createScheduled } = await clientScheduled();
   const patches = []; const sealed = [];
   globalThis.__sched = {
     toasts: [],
@@ -377,6 +383,53 @@ test('the app re-encrypts a held message with the timer its own copy was written
   assert.equal(of(items.a.ref).payload.t, 'see you at 9');
   assert.equal(of(items.b.ref).keep.x, 0, 'one written without a timer has none to keep');
   assert.ok(patches.every(([, body]) => body.sendNow === true && body.epoch === 2));
+  assert.deepEqual(globalThis.__sched.toasts, []);
+});
+
+// A new sign-in token holds what the session had waiting (token_renewed). The app re-encrypts those by itself, like
+// after a key change, but only from copies that open with its own keys; and the live event can reach it before it
+// has the new token, so a try turned away then (401) is tried again once it's back with the new one.
+test('the app re-encrypts by itself what a new sign-in token held, only from its own copies, and again after reconnecting', async () => {
+  const { createScheduled } = await clientScheduled();
+  const patches = [];
+  let refuse = true; // still on the old token
+  const base = { serverId: 's1', channelId: 'c1', dmId: null, threadId: null, status: 'held', reason: 'token_renewed', sendAt: Date.now() + HOUR, ciphertext: 'old', files: 0, ttl: 0 };
+  const items = {
+    mine: { ...base, id: 'mine', ref: 'm'.repeat(16), draft: 'x1:mine' },
+    copy: { ...base, id: 'copy', ref: 'c'.repeat(16), draft: 'x1:made-with-a-copy-of-the-token' },
+  };
+  globalThis.__sched = {
+    toasts: [],
+    api: async (method, p, body) => {
+      if (method === 'GET' && p === '/scheduled-messages') return { items: Object.values(items) };
+      if (method !== 'PATCH') throw new Error(`unexpected ${method} ${p}`);
+      if (refuse) { const e = new Error('Not signed in.'); e.status = 401; e.code = 'signed_out'; throw e; }
+      patches.push([p, body]);
+      const id = p.split('/').pop();
+      return { ...items[id], status: 'pending', reason: null, ciphertext: body.ciphertext, draft: body.draft };
+    },
+  };
+  const sched = createScheduled({
+    me: () => ({ id: 'u1' }),
+    openDraft: async (it) => { if (it.id !== 'mine') throw new Error('doesn\u2019t open'); return { t: 'see you at 9', f: [] }; },
+    sealFor: async (key, payload, keep) => ({ ciphertext: 'new-' + keep.ref, epoch: 1, ttl: 0, draft: 'x1:again' }),
+    withKeyRetry: (serverId, fn) => fn(),
+    refreshTimer: async () => {},
+    placeOf: () => ({ label: '#general', dm: false }),
+    onChange: () => {},
+    openKey: () => {},
+  });
+  sched.onUpdate(items.mine);
+  sched.onUpdate(items.copy);
+  await sleep(100);
+  assert.equal(patches.length, 0, 'turned away while the old token was still in use');
+  refuse = false;
+  await sched.load(); // reconnected with the new token
+  await until(() => patches.length === 1, 'its own one re-encrypted');
+  assert.equal(patches[0][0], '/scheduled-messages/mine');
+  assert.equal(patches[0][1].ciphertext, 'new-' + items.mine.ref);
+  await sleep(100);
+  assert.equal(patches.length, 1, 'never the one whose copy doesn\u2019t open');
   assert.deepEqual(globalThis.__sched.toasts, []);
 });
 
@@ -890,35 +943,58 @@ test('a session that ends: what it scheduled waits for its owner to confirm it f
   assert.notEqual(rowOf(mine.id).reason, 'session_ended', 'still not held for that (only for the key change above)');
 });
 
-test('a new sign-in token for the same session (auth-11) isn’t a sign-out: what it scheduled still goes out, from the new token', async () => {
+test('a new sign-in token for the same session (auth-11) isn’t a sign-out, but what it had waiting is held until the app re-encrypts it from its own copy: a copy of the old token gets nothing out', async () => {
   const ann = await user('stok'); const ben = await user('stokb'); const ch = await room('tokens');
   freshEpoch();
-  const benS = await sock(ben);
+  const benS = await sock(ben); const annS = await sock(ann);
   const benNew = collect(benS, 'message:new');
+  const ups = collect(annS, 'scheduled:update');
   const a = await schedule(ann, ch.id, { sendAt: soon(HOUR) });
   const b = await schedule(ann, ch.id, { sendAt: soon(HOUR) });
+  // Someone with a copy of ann's token (no identity key, so its own copy of the message is one her app can't open).
+  const copy = { ...ann, ip: '203.0.113.77' };
+  const c = await schedule(copy, ch.id, { sendAt: soon(4000) });
   const sid = rowOf(a.id).session_id;
+  assert.equal(rowOf(c.id).session_id, sid, 'the same session: the server can\u2019t tell them apart');
   // "Log out all other devices" with the password, then a password change: each gives this session a new token.
   const rv = await as(ann, 'POST', '/me/sessions/revoke-others', { authKey: ann.authKey });
   assert.equal(rv.status, 200, rv.text);
   assert.ok(rv.json.token && rv.json.token !== ann.token, 'a new token');
   const old = ann.token;
   ann.token = rv.json.token;
+  for (const x of [a, b, c]) {
+    const row = rowOf(x.id);
+    assert.deepEqual([row.status, row.reason], ['held', 'token_renewed'], 'held: a copy of the old token could have written it');
+    assert.equal(row.session_id, sid, 'still this session\u2019s');
+  }
+  await until(() => ups.some((x) => x.id === a.id && x.status === 'held' && x.reason === 'token_renewed' && /new token/.test(x.note)), 'her apps hear about it');
+  assert.equal((await as(copy, 'PATCH', `/scheduled-messages/${c.id}`, { draft: draft(), ciphertext: cipher(), epoch: 1, sendNow: true })).status, 401, 'the copy can\u2019t confirm its own any more');
+  // Her app re-encrypts the ones it wrote (from its own copies), from the new token: pending again, still this session's.
+  const ct = cipher();
+  const fixed = await as(ann, 'PATCH', `/scheduled-messages/${a.id}`, { draft: draft(), ciphertext: ct, epoch: 1 });
+  assert.equal(fixed.status, 200, fixed.text);
+  assert.deepEqual([fixed.json.status, rowOf(a.id).session_id], ['pending', sid]);
+  // A password change on top: held again, the same way.
   const newAuthKey = hex(32);
   const pw = await as(ann, 'POST', '/me/password', { oldAuthKey: ann.authKey, newAuthKey, encPrivateKey: 'x'.repeat(80), salt: crypto.randomBytes(16).toString('base64') });
   assert.equal(pw.status, 200, pw.text);
   ann.authKey = newAuthKey;
   ann.token = pw.json.token;
   assert.equal((await srv.api('GET', '/scheduled-messages', { token: old, ip: ann.ip })).status, 401, 'the old token is out');
-  for (const x of [a, b]) {
-    const row = rowOf(x.id);
-    assert.equal(row.status, 'pending', 'not held: the session that wrote it is still signed in');
-    assert.equal(row.session_id, sid);
-  }
-  assert.equal((await list(ann)).filter((x) => x.id === a.id || x.id === b.id).length, 2, 'listed for the new token');
+  assert.equal(rowOf(a.id).reason, 'token_renewed');
+  assert.equal((await list(ann)).filter((x) => [a.id, b.id, c.id].includes(x.id)).length, 3, 'listed for the new token');
+  // Not sent as it is, at its time or on request.
+  assert.equal((await as(ann, 'POST', `/scheduled-messages/${a.id}/send`)).json.code, 'held');
+  await until(() => rowOf(c.id).told_at, 'the copy\u2019s came due: she\u2019s told it waits', 10000);
+  await sleep(300);
+  assert.ok(!benNew.some((m) => m.ciphertext === c.ciphertext), 'the copy\u2019s never went out');
+  assert.deepEqual([rowOf(c.id).status, rowOf(c.id).reason], ['held', 'token_renewed']);
+  // Re-encrypted from the new token, it goes.
+  const ct2 = cipher();
+  assert.equal((await as(ann, 'PATCH', `/scheduled-messages/${a.id}`, { draft: draft(), ciphertext: ct2, epoch: 1 })).status, 200);
   assert.equal((await as(ann, 'POST', `/scheduled-messages/${a.id}/send`)).status, 200, 'sent now from the new token');
-  await until(() => benNew.find((m) => m.ciphertext === a.ciphertext), 'posted');
-  assert.equal((await as(ann, 'DELETE', `/scheduled-messages/${b.id}`)).status, 200);
+  await until(() => benNew.find((m) => m.ciphertext === ct2), 'posted');
+  for (const x of [b, c]) assert.equal((await as(ann, 'DELETE', `/scheduled-messages/${x.id}`)).status, 200);
 });
 
 // ------------------------------------------------------------------ files, accounts, restarts

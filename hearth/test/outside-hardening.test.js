@@ -224,7 +224,7 @@ test('xss-8: every message body goes through click-to-load, voice channel chats 
   assert.equal(calls, 3, 'embedImg: its definition, the show branch and the Load button');
   // Image links are only pulled out of a message in fillMessage, and filtered by the reader's choice there.
   const fill = app.slice(app.indexOf('function fillMessage('), app.indexOf('function fillMessage(') + 6000);
-  assert.match(fill, /extractImageUrls\(text\)\.filter\(.*embedDecision\(u\) !== 'skip'\)/);
+  assert.match(fill, /extractImageUrls\(text\)\.filter\(.*embedDecision\(u, m\) !== 'skip'\)/);
   assert.match(fill, /embeds\.map\(\(u\) => embedEl\(u, m\)\)/);
   assert.equal([...app.matchAll(/extractImageUrls\(/g)].length, 2, 'fillMessage, and a count of image links (no picture)');
   // A voice channel's chat is the same conversation view as a text channel's, so its messages go through fillMessage.
@@ -233,6 +233,29 @@ test('xss-8: every message body goes through click-to-load, voice channel chats 
   // Scheduled messages (the Send later list) never build HTML from what people wrote, so no picture loads there.
   const sched = fs.readFileSync(path.join(PUBLIC, 'js', 'scheduled.js'), 'utf8');
   assert.doesNotMatch(sched, /innerHTML|'img'|extractImageUrls|embed-img/);
+});
+
+test('xss-8: a Load click counts for that message only: a later message with the same link asks again', () => {
+  // Remembered by link alone, one click would let every later message with that link load by itself, anywhere, so
+  // its sender (serving the picture uncached) would learn when each one is read without the reader being asked.
+  const origin = 'https://chat.example.test';
+  const link = 'https://pics.example.net/receipt.png';
+  const opened = O.openedLinks();
+  const decide = (mid) => O.imageDecision(link, { origin, mode: 'ask', opened: opened.has(mid, link) });
+  assert.equal(decide('m1'), 'ask');
+  opened.add('m1', link);
+  assert.equal(decide('m1'), 'show', 'a redraw of the message it was clicked in doesn\u2019t ask again');
+  assert.equal(decide('m2'), 'ask', 'another message with the same link asks again');
+  assert.equal(opened.has('m1', 'https://pics.example.net/other.png'), false, 'another link in the same message asks too');
+  opened.add(undefined, link); opened.add('', link);
+  assert.equal(opened.has(undefined, link) || opened.has('', link) || opened.has(null, link), false, 'nothing is remembered without a message');
+  // The app asks with the message it draws.
+  const app = fs.readFileSync(path.join(PUBLIC, 'js', 'app.js'), 'utf8');
+  assert.match(app, /const openedOutside = openedLinks\(\);/);
+  assert.match(app, /opened: openedOutside\.has\(m && m\.id, u\)/);
+  assert.match(app, /openedOutside\.add\(m && m\.id, u\);/);
+  assert.match(app, /embedDecision\(text\.trim\(\), m\) === 'show'/);
+  assert.doesNotMatch(app, /embedDecision\([^,()]+\)/, 'every call says which message');
 });
 
 test('xss-8: a watch-together video file from another site gets a notice; this server\'s files and the embedded players don\'t', () => {
