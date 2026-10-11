@@ -93,6 +93,19 @@ Suggested order:
 - **SECURITY.md §4:** calls now rejoin after short drops, and the server has an access log.
 - **The comment above `leaveVoice` in server/index.js** described the removed "study together" timer.
 
+## Design documents
+
+Build-ready designs for the larger picks, each grounded in the current code (with sources for outside facts):
+
+- [design/ANDROID-PUSH.md](design/ANDROID-PUSH.md): notifications when the Android app is closed. UnifiedPush
+  delivers the Web Push the server already sends; no schema change; effort L.
+- [design/DISAPPEARING-MESSAGES.md](design/DISAPPEARING-MESSAGES.md): timers per DM, group and channel; effort L.
+- [design/LINK-PREVIEWS.md](design/LINK-PREVIEWS.md): previews built by the sender inside the encrypted message;
+  effort M.
+- [design/DISCORD-IMPORT.md](design/DISCORD-IMPORT.md): import a Discord server's structure, then emoji, then
+  history. Whether Discord serves template links without a login couldn't be checked from the research
+  environment, so the design falls back to pasting the template JSON.
+
 ## Progress
 
 The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-REPORT.md) as they land.
