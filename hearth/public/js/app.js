@@ -40,6 +40,7 @@ import { openDiscordImport } from './discord-import.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
 import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer } from './disappear.js';
+import { createScheduled } from './scheduled.js';
 import { trackViewport } from './viewport.js';
 import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel } from './presence.js';
 
@@ -425,6 +426,7 @@ async function signOutHere() {
   localStorage.removeItem('hearth.userId');
   fileUrls.release(); // decrypted files in memory
   clearAllDrafts(); // unsent words stay with the account, not the next person on this browser
+  SCHED.reset();
   sec.reset();
   await E2EE.clearKeys();
   location.href = '/';
@@ -695,6 +697,8 @@ function startApp() {
   socket.on('read:update', (st) => onReadUpdate(st));
   socket.on('notify:update', (r) => applyNotifyPref(r));
   socket.on('notify:settings', (st) => { S.notifySettings = st; syncCallNotification(); });
+  socket.on('scheduled:update', (it) => { if (S.me) SCHED.onUpdate(it); });
+  socket.on('scheduled:remove', (p) => SCHED.onRemove(p));
   socket.on('saved:update', (p) => { if (p.saved) S.savedIds.add(p.messageId); else S.savedIds.delete(p.messageId); if (S.view.type === 'saved') later(renderMain); });
   socket.on('timeout:update', ({ serverId, until }) => {
     const sv = S.servers.find((x) => x.id === serverId);
@@ -939,6 +943,7 @@ async function loadBootstrap() {
   applyUserState(await extras);
   renderAll();
   loadPreviews();
+  SCHED.load(); // your scheduled messages (after the keys above: some may need re-encrypting)
   if (!S.remindersOn) { S.remindersOn = true; startReminders(); }
   purgeInbox();
   armClientExpiry();
@@ -2691,6 +2696,8 @@ function drawHeader(head) {
   const key = currentKey();
   const server = currentServer();
   const PIN_ITEM = { label: S.panel === 'pins' ? 'Hide pinned messages' : 'Pinned messages', icon: 'pin', action: () => togglePanel('pins') };
+  // Counted when the menu opens, so it's never out of date.
+  const SCHED_ITEM = () => { const n = key ? SCHED.forKey(key).length : 0; return { label: 'Scheduled messages', icon: 'clock', hint: n ? String(n) : null, action: () => SCHED.openList(key) }; };
   if (v.type === 'channel' && server && !isGroup(server)) {
     const c = server.channels.find((x) => x.id === v.channelId);
     if (!c) return;
@@ -2705,7 +2712,7 @@ function drawHeader(head) {
         isMuted(key) ? ibtn('bellOff', 'Muted. Click to change.', (e) => menu(e.currentTarget, notifyMenu(key), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }) : null,
         threadsButton(c.id),
         ibtn('people', S.panel === 'members' ? 'Hide members' : 'Show members', () => togglePanel('members'), { active: S.panel === 'members' }),
-        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
+        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, SCHED_ITEM(), ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'channel' && isGroup(server)) {
     const call = server.channels.find((c) => c.type === 'voice');
     const inCall = voice && call && voice.channelId === call.id;
@@ -2722,7 +2729,7 @@ function drawHeader(head) {
         ibtn('search', 'Search (Ctrl+K)', () => openSearch({ scope: key })),
         threadsButton(v.channelId),
         ibtn('people', 'Members', () => togglePanel('members'), { active: S.panel === 'members' }),
-        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...groupMenuItems(server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
+        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, SCHED_ITEM(), ...groupMenuItems(server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'dm') {
     const d = S.dms.find((x) => x.id === v.dmId);
     if (!d) return;
@@ -2746,7 +2753,7 @@ function drawHeader(head) {
         })(),
         ibtn('search', 'Search (Ctrl+K)', () => openSearch({ scope: key })),
         ibtn('user', S.panel === 'members' ? 'Hide profile' : 'Show profile', () => togglePanel('members'), { active: S.panel === 'members' }),
-        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...dmMenuItems(d), '-', blockItem(u)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
+        ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, SCHED_ITEM(), ...dmMenuItems(d), '-', blockItem(u)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'voice' && server) {
     const c = server.channels.find((x) => x.id === v.channelId);
     const ck = 'c:' + v.channelId;
@@ -2758,7 +2765,7 @@ function drawHeader(head) {
         chatOpen ? ibtn('search', 'Search this chat (Ctrl+K)', () => openSearch({ scope: ck })) : null,
         chatOpen && isMuted(ck) ? ibtn('bellOff', 'Muted. Click to change.', (e) => menu(e.currentTarget, notifyMenu(ck), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }) : null,
         hasChat(c) ? voiceChatButton(c) : null,
-        chatOpen ? ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' }) : null));
+        chatOpen ? ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, SCHED_ITEM(), ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' }) : null));
   } else if (v.type === 'friends') {
     const pending = Object.values(S.relationships).filter((r) => r.direction === 'incoming').length;
     const tab = (k, label, extra) => h('button', { class: `tab${v.tab === k ? ' active' : ''}${k === 'add' ? ' tab-add' : ''}`, role: 'tab', 'aria-selected': String(v.tab === k), onclick: () => goFriends(k) }, label, extra);
@@ -3284,6 +3291,7 @@ async function onKeysChanged(serverId, added) {
     if (server && isGroup(server)) { await previewGroup(server); if (!S.view.serverId) renderSidebar(); }
   }
   if (S.view.serverId === serverId && composers.main) { composers.main.renderExtras(); renderHeader(); }
+  if (added) SCHED.onKeys(); // scheduled messages waiting for this key can be re-encrypted now
 }
 function onKeyWarning(user) {
   toast(`${displayName(user)}'s security key changed. Compare safety numbers before trusting it.`, 'error');
@@ -3852,6 +3860,7 @@ function openLinkFromHash() {
   if (m) return jumpToMessageId(m[1]);
   if (hsh === '#updates') return setView({ type: 'updates' });
   if (hsh === '#study') return setView({ type: 'study' });
+  if (hsh === '#scheduled') return SCHED.openList(null); // a push about a scheduled message
   m = hsh.match(/^#c\/([a-z0-9]+)$/i);
   if (m) { const s = serverOfChannel(m[1]); if (s) openChannel(m[1], s.id); else toast('You don\u2019t have access to that channel.'); return; }
   m = hsh.match(/^#d\/([a-z0-9]{1,64})$/i);
@@ -4265,7 +4274,7 @@ async function onNewMessage(key, m) {
         const above = firstPending ? firstPending.previousElementSibling : sc.lastElementChild;
         put(messageEl(m, newDay || (above && above.classList.contains('sys-line')) ? null : prev, 'main'));
         ensureCurrentMessage(sc);
-        if (near || m.authorId === S.me.id) sc.scrollTop = sc.scrollHeight;
+        if (near || (m.authorId === S.me.id && !m.scheduled)) sc.scrollTop = sc.scrollHeight;
       }
     }
   }
@@ -4275,10 +4284,13 @@ async function onNewMessage(key, m) {
   if (t && t.has(m.authorId)) { clearTimeout(t.get(m.authorId)); t.delete(m.authorId); if (currentKey() === key) renderTyping(); }
   const knewUpTo = S.lastIds[key];
   if (!m.threadId && !(S.lastIds[key] && S.lastIds[key] >= m.id)) S.lastIds[key] = m.id;
-  // Your own message (from here or another device) means you've read the conversation up to it.
+  // Your own message (from here or another device) means you've read the conversation up to it. Not one the server
+  // posted for you at its time (Send later, m.scheduled): you may not have been here, so what's unread stays so.
   if (m.authorId === S.me.id) {
-    S.lastRead[key] = m.id;
-    if (S.unread.delete(key) | S.mentions.delete(key)) { closeNotifications(key); updateTitle(); later(renderRail); }
+    if (!m.scheduled) {
+      S.lastRead[key] = m.id;
+      if (S.unread.delete(key) | S.mentions.delete(key)) { closeNotifications(key); updateTitle(); later(renderRail); }
+    }
     if (!S.view.serverId || S.view.serverId === m.serverId) later(renderSidebar);
     return;
   }
@@ -4502,7 +4514,7 @@ async function onThreadMessage(m) {
     // the newest replies (where it is); anyone else's just counts.
     t.total = (t.total || 0) + 1;
     if (S.thread && S.thread.rootId === m.threadId) {
-      if (m.authorId === S.me.id && !t.jumping) loadNewestReplies();
+      if (m.authorId === S.me.id && !m.scheduled && !t.jumping) loadNewestReplies();
       else { const div = $('.thread-list .thread-divider span'); if (div) div.textContent = threadCountLabel(t); }
     }
   } else if (t && !t.list.find((x) => x.id === m.id)) {
@@ -4542,9 +4554,12 @@ function countThreadReply(m) {
   const st = (S.threadState[m.threadId] ||= { channelId: m.channelId, unread: 0, mentions: 0, lastReadId: null, lastId: null });
   if (!st.lastId || m.id > st.lastId) st.lastId = m.id;
   if (m.authorId === S.me.id) {
-    // Yours, from here or another device: read up to it (the server says so too, with the channel's badge).
-    const k = st.mentions; Object.assign(st, { unread: 0, mentions: 0, lastReadId: m.id });
-    if (k) setThreadPings(key, Math.max(0, (S.threadMentions.get(key) || 0) - k));
+    // Yours, from here or another device: read up to it (the server says so too, with the channel's badge). Not a
+    // scheduled one posted at its time: what's new in the thread stays new.
+    if (!m.scheduled) {
+      const k = st.mentions; Object.assign(st, { unread: 0, mentions: 0, lastReadId: m.id });
+      if (k) setThreadPings(key, Math.max(0, (S.threadMentions.get(key) || 0) - k));
+    }
   } else if (readingThread(m.threadId)) {
     markThreadRead(m.threadId);
   } else {
@@ -5058,6 +5073,35 @@ function onThreadCount(rootId, channelId, count, lastAt) {
 
 // ======================================================================= composer
 const composers = {};
+// Scheduled messages, "Send later" (scheduled.js): your list, the bar above the composer, and re-encrypting the ones
+// the server holds because a key changed after you wrote them.
+const SCHED = createScheduled({
+  me: () => S.me,
+  openDraft: (it) => openDraft(it.ref, it.dmId ? 'd:' + it.dmId : 'c:' + it.channelId, it.threadId, it.draft),
+  sealFor: (key, payload, keep) => sealFor(key, payload, keep),
+  withKeyRetry: (serverId, fn) => withKeyRetry(serverId, fn),
+  // The conversation's disappearing timer changed under a re-encrypt (409 disappear_changed): fetch it, then try again.
+  refreshTimer: (key) => refreshTimer(key),
+  placeOf: (it) => {
+    if (it.dmId) {
+      const d = S.dms.find((x) => x.id === it.dmId);
+      return { label: d ? displayName(getUser(d.userId)) : 'a conversation you can no longer open', dm: !!d };
+    }
+    const c = channelById(it.channelId);
+    const s = c && serverOfChannel(c.id);
+    if (!c || !s) return { label: 'a channel you can no longer open', dm: false };
+    return { label: isGroup(s) ? groupName(s) : `${chanLabel(c)} · ${s.name}`, dm: false };
+  },
+  onChange: (key) => {
+    if (currentKey() !== key) return;
+    if (composers.main) composers.main.renderExtras();
+  },
+  openKey: (key) => {
+    if (key.startsWith('d:')) { if (S.dms.some((d) => d.id === key.slice(2))) openDm(key.slice(2)); return; }
+    const s = serverOfChannel(key.slice(2));
+    if (s) openChannel(key.slice(2), s.id);
+  },
+});
 // Bots' slash commands (bots.js). Answers only you can see live in memory and show above the main composer.
 const SLASH = createSlash({
   getSocketId: () => (socket && socket.id) || null,
@@ -5085,9 +5129,12 @@ function createComposer({ id, key, threadId, placeholder }) {
   const typing = h('div', { class: 'typing', 'aria-live': 'polite', dataset: { key: k } });
   const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: () => { addFiles(fileIn.files); fileIn.value = ''; } });
   const sendBtn = h('button', { class: 'send-btn', 'data-tip': P.chat.enterToSend ? 'Send (Enter)' : 'Send (Ctrl+Enter)', 'aria-label': 'Send message', onclick: () => send() }, icon('send'));
+  // Send later (scheduled.js): the clock next to the send button, or a right-click (a long press) on it.
+  const laterBtn = h('button', { class: 'icon-btn send-later', 'aria-label': 'Send later', 'data-tip': 'Send later', 'data-pop-anchor': '', onclick: (e) => sendLater(e.currentTarget) }, icon('clock'));
+  sendBtn.addEventListener('contextmenu', (e) => { if (sendBtn.disabled || laterBtn.hidden) return; e.preventDefault(); sendLater(sendBtn); });
   const suggest = h('div', { class: 'suggest', role: 'listbox', hidden: true });
   const autosize = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 260) + 'px'; };
-  const update = () => { sendBtn.disabled = !ta.value.trim() && !state.pending.length; };
+  const update = () => { sendBtn.disabled = !ta.value.trim() && !state.pending.length; laterBtn.disabled = sendBtn.disabled; };
   const box = h('div', { class: 'composer' },
     h('button', { class: 'icon-btn attach', 'aria-label': 'Attach a file or create a poll', 'data-tip': 'Attach or poll', 'data-pop-anchor': '', onclick: (e) => menu(e.currentTarget, [
       { label: 'Upload a file', icon: 'file', action: () => fileIn.click() },
@@ -5098,7 +5145,7 @@ function createComposer({ id, key, threadId, placeholder }) {
       h('button', { class: 'icon-btn', 'aria-label': 'Emoji', 'data-tip': 'Emoji', 'data-pop-anchor': '', onclick: (e) => emojiPicker(e.currentTarget, (em) => insertAtCursor(ta, em), { keepOpen: true }) }, icon('smile')),
       voiceButton(() => box, (file, dur) => send('', { files: [{ file, voice: true, dur }] })),
       (S.config.features || {}).gifs === false ? null : h('button', { class: 'icon-btn', 'aria-label': 'GIFs', 'data-tip': 'GIFs', 'data-pop-anchor': '', onclick: (e) => gifPicker(e.currentTarget, (url) => send(url), { onEmoji: (em) => insertAtCursor(ta, em) }) }, icon('gif')),
-      sendBtn),
+      laterBtn, sendBtn),
     fileIn);
   const slowNote = h('div', { class: 'slow-note', hidden: true });
   const disNote = h('div', { class: 'dis-note', hidden: true });
@@ -5408,6 +5455,10 @@ function createComposer({ id, key, threadId, placeholder }) {
     const noSend = ch && !canIn(ch, threadId() ? PERMS.CREATE_THREADS : PERMS.SEND_MESSAGES);
     ta.disabled = !!blockedNote || !!noSend;
     box.querySelector('.attach').hidden = !!ch && !canIn(ch, PERMS.ATTACH_FILES);
+    laterBtn.hidden = !kk || !!blockedNote || !!noSend;
+    // This conversation's scheduled messages (on the main composer only: the list covers its threads too).
+    const schedBar = id === 'main' && kk ? SCHED.bar(kk) : null;
+    if (schedBar) extras.append(schedBar);
     if (blockedNote) extras.append(blockedNote);
     const to = ch && (serverOfChannel(ch.id) || {}).timeout;
     if (noSend && to && to.until > Date.now()) extras.append(h('div', { class: 'key-bar' }, icon('timer'), h('span', null, `You\u2019re timed out until ${fmtStamp(to.until)}${to.reason ? ` (${to.reason})` : ''}. You can still read.`)));
@@ -5424,14 +5475,17 @@ function createComposer({ id, key, threadId, placeholder }) {
   // "sending…", and messages go out one after another in the background (so they stay in order).
   let queue = Promise.resolve();
   // extra: { poll } for a poll, { files } for a voice message; the typed text stays in the box for those.
+  // { sendAt } schedules what's in the box for then (Send later) instead of sending it now.
   function send(overrideText, extra = {}) {
     const text = overrideText != null ? overrideText : ta.value;
     const files = extra.files || (overrideText != null ? [] : state.pending.slice());
     const poll = extra.poll || null;
+    const sendAt = extra.sendAt || null;
     if (!text.trim() && !files.length && !poll) return;
     // A bot's slash command goes to the bot (after the warning), not into the channel.
     const slashIn = overrideText == null && !poll && slashChannel();
     const cmd = slashIn && SLASH.match(slashIn, text.trim());
+    if (cmd && sendAt) { toast('Bot commands can\u2019t be scheduled. Send it now, or remove the / to schedule it as a message.', 'error'); return; }
     if (cmd) {
       SLASH.run(slashIn, cmd, text.trim(), serverOfChannel(slashIn)).then((sent) => {
         if (!sent || ta.value.trim() !== text.trim()) return;
@@ -5457,13 +5511,19 @@ function createComposer({ id, key, threadId, placeholder }) {
     if (old) replaceMessageEl(old);
     renderExtras(); autosize(); update();
     const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)), (x) => x.toString(16).padStart(2, '0')).join('');
-    if (id === 'main' && !tid) showPendingSend(kk, nonce, poll ? `\uD83D\uDCCA ${poll.q}` : files.some((f) => f.voice) ? '\uD83C\uDFA4 Voice message' : text, files.some((f) => f.voice) ? 0 : files.length, replyTo);
-    // The disappearing timer they wrote it under (the note above the box): a weaker one by the time it goes out asks first.
+    if (id === 'main' && !tid && !sendAt) showPendingSend(kk, nonce, poll ? `\uD83D\uDCCA ${poll.q}` : files.some((f) => f.voice) ? '\uD83C\uDFA4 Voice message' : text, files.some((f) => f.voice) ? 0 : files.length, replyTo);
+    // The disappearing timer they wrote it under (the note above the box): a weaker one by the time it goes out asks
+    // first. A scheduled message is encrypted now, for the timer in force now, like one sent now.
     const wrote = convSecs(kk);
-    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState, wrote }));
+    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState, wrote, sendAt }));
     return queue;
   }
-  async function deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState, wrote }) {
+  // Send later: when, from the quick picks or a date and time; then it goes like a send, scheduled.
+  function sendLater(anchor) {
+    if (sendBtn.disabled) return;
+    SCHED.pickTime(anchor, (sendAt) => send(null, { sendAt }));
+  }
+  async function deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState, wrote, sendAt }) {
     const bar = upStatus.querySelector('.bar');
     const totalBytes = files.reduce((a, p) => a + (p.file ? p.file.size : 0), 0);
     let retrying = null;
@@ -5481,8 +5541,9 @@ function createComposer({ id, key, threadId, placeholder }) {
     uploading = ctl;
     try {
       const f = await uploadEncryptedFiles(kk, files, setProgress, { signal: ctl && ctl.signal, onStatus });
-      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}), ...(links ? { l: links } : {}) }, replyTo, nonce, { wrote });
+      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}), ...(links ? { l: links } : {}) }, replyTo, nonce, { wrote, sendAt });
       files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
+      if (sendAt) { SCHED.added(msg); toast(`Scheduled for ${SCHED.whenPhrase(msg.sendAt)}.`); return; }
       playSound('sent');
       // Normally the live connection delivers it first; this covers a slow or dropped connection.
       if (msg && msg.id) { if (msg.threadId) onThreadMessage(msg); else onNewMessage(kk, msg); }
@@ -5610,13 +5671,15 @@ async function encryptFitting(payload, encrypt) {
 // changed the timer meanwhile, the server says so (409 disappear_changed): fetch the new one and send again, once.
 // wrote: the timer in force when they wrote it (pressed Send). Turned off or made longer since, the message isn't
 // sent unless they say so: they wrote it expecting it to disappear.
-async function sendTo(key, threadId, payload, replyTo, nonce, { wrote = convSecs(key) } = {}) {
+// sendAt (ms): schedule it for then instead (server/scheduled.js); the answer is the scheduled message. It's encrypted
+// now for the timer in force now, like a message sent now; the server gives it its deadline when it's posted.
+async function sendTo(key, threadId, payload, replyTo, nonce, { wrote = convSecs(key), sendAt = null } = {}) {
   const agreed = await stillSend(key, wrote);
-  try { return await sendOnce(key, threadId, payload, replyTo, nonce); } catch (e) {
+  try { return await sendOnce(key, threadId, payload, replyTo, nonce, sendAt); } catch (e) {
     if (!(e.status === 409 && e.code === 'disappear_changed')) throw e;
     await refreshTimer(key);
     await stillSend(key, agreed);
-    return sendOnce(key, threadId, payload, replyTo, nonce);
+    return sendOnce(key, threadId, payload, replyTo, nonce, sendAt);
   }
 }
 // Asks when the timer got weaker than the one a message was written under. Returns the timer they've now agreed to;
@@ -5637,24 +5700,53 @@ async function stillSend(key, wrote) {
   if (!yes) throw Object.assign(new Error('Not sent: disappearing messages changed here.'), { code: 'disappear_weaker' });
   return now;
 }
-async function sendOnce(key, threadId, payload0, replyTo, nonce) {
-  const files = (payload0.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
+// The encrypted message for a conversation, as it goes to the server: { ciphertext, epoch, mentions, everyone, ttl }
+// for a channel (with its current key), { ciphertext, ttl } for a DM. Sending, scheduling and re-encrypting a
+// scheduled message all use it, so a scheduled message is exactly what sending it now would have sent: the text,
+// files, poll and link preview card, and the conversation's disappearing timer as it is now (x inside, ttl beside).
+// keep: { ref, threadId } for a scheduled message: then `draft` comes too, your own copy of what was encrypted (the
+// version that fitted), which only your keys open (sealDraft). Never anything readable: all of this goes to the server.
+async function sealFor(key, payload0, keep = null) {
   const ttl = convSecs(key);
   const { x, ...rest } = payload0;
   const payload = ttl ? { ...rest, x: ttl } : rest;
+  let fitted = payload; // encryptFitting tries smaller versions in turn and keeps the first that fits: the last one tried
+  const out = { ttl };
   if (key.startsWith('c:')) {
     const channelId = key.slice(2);
     const server = serverOfChannel(channelId);
     if (!server) throw new Error('Channel not found.');
+    const { ciphertext, epoch } = await encryptFitting(payload, (p) => { fitted = p; return sec.encryptChannel(server.id, channelId, p); });
+    // @everyone / @here: the server checks the sender may use it, then counts and pushes it as a ping. Said either
+    // way, so new words for a scheduled message that drop it ping nobody.
+    const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || ''));
+    Object.assign(out, { ciphertext, epoch, mentions: mentionedIds(server, payload.t), everyone });
+  } else out.ciphertext = await encryptFitting(payload, (p) => { fitted = p; return sec.encryptDm(key.slice(2), p); });
+  if (keep) out.draft = await sealDraft(keep.ref, key, keep.threadId, fitted);
+  return out;
+}
+// A scheduled message's own copy for its sender (server/scheduled.js): sealed with your personal vault key, which only
+// your identity key derives, and bound to its ref, conversation and thread. Your app re-encrypts a scheduled message
+// only from this copy, so the server (or a stolen session) can't get it to re-sign something you didn't schedule there.
+const draftId = (ref, key, threadId) => `${ref}|${key}|${threadId || ''}`;
+const sealDraft = async (ref, key, threadId, payload) => E2EE.sealVault(await myVaultKey(), 'scheduled', draftId(ref, key, threadId), payload);
+const openDraft = async (ref, key, threadId, text) => E2EE.openVault(await myVaultKey(), 'scheduled', draftId(ref, key, threadId), text);
+async function sendOnce(key, threadId, payload, replyTo, nonce, sendAt = null) {
+  const files = (payload.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
+  const where = key.startsWith('c:') ? `/channels/${key.slice(2)}` : `/dms/${key.slice(2)}`;
+  // A scheduled one gets an id of this app's choosing for its own copy (sealFor's keep).
+  const ref = sendAt ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (x) => x.toString(16).padStart(2, '0')).join('') : null;
+  if (key.startsWith('c:')) {
+    const server = serverOfChannel(key.slice(2));
+    if (!server) throw new Error('Channel not found.');
     return withKeyRetry(server.id, async () => {
-      const { ciphertext, epoch } = await encryptFitting(payload, (p) => sec.encryptChannel(server.id, channelId, p));
-      // @everyone / @here: the server checks the sender may use it, then counts and pushes it as a ping.
-      const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || '')) ? true : undefined;
-      return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), everyone, nonce, ttl });
+      const sealed = await sealFor(key, payload, sendAt ? { ref, threadId } : null);
+      return sendAt ? api('POST', `${where}/scheduled-messages`, { ...sealed, ref, replyTo, threadId, files, sendAt })
+        : api('POST', `${where}/messages`, { ...sealed, replyTo, threadId, files, nonce });
     });
   }
-  const ciphertext = await encryptFitting(payload, (p) => sec.encryptDm(key.slice(2), p));
-  return api('POST', `/dms/${key.slice(2)}/messages`, { ciphertext, replyTo, files, nonce, ttl });
+  const sealed = await sealFor(key, payload, sendAt ? { ref, threadId: null } : null);
+  return sendAt ? api('POST', `${where}/scheduled-messages`, { ...sealed, ref, replyTo, files, sendAt }) : api('POST', `${where}/messages`, { ...sealed, replyTo, files, nonce });
 }
 // "Sending…" copies of your own messages, shown until the real one arrives.
 const pendingSends = new Map(); // nonce -> { key, text, files, replyTo, el }
@@ -6480,6 +6572,7 @@ async function openSafetyNumber(u) {
         { label: changed ? 'Not now' : 'Close' },
         { label: changed ? 'Numbers match \u2014 trust new key' : 'Numbers match', kind: 'primary', action: () => {
           sec.acceptKeys(user);
+          SCHED.onKeys(); // a scheduled DM waiting for their new key
           toast(`${displayName(user)} is verified on this device.`);
           renderHeader(); if (composers.main) composers.main.renderExtras();
           S.servers.filter((s) => s.memberIds.includes(user.id)).forEach((s) => sec.maintain(s.id));

@@ -899,3 +899,213 @@ teach people to ignore it. The server (`followsVoiceChat` in `server/index.js`, 
   see a voice channel can read its chat. Deny Send Messages (or use Make the chat read-only) on channels that
   should stay voice-only.
 - The chat's history isn't tied to calls: it stays after everyone leaves, like a text channel's.
+
+## Scheduled messages (Send later)
+
+The sender's app encrypts a message exactly as it would to send it now; the server holds that ciphertext until
+the chosen time and then posts it as if it were sent then. Server channels (voice channels' chats too), threads,
+group chats and DMs. Code:
+`server/scheduled.js` (rules, routes, the timer), `public/js/scheduled.js` (picker, list, re-encrypting), the
+composer in `public/js/app.js` (`sendLater`, `sealFor`, `sendTo`). Schema: the `scheduled_messages` table (v19).
+
+**How it works**
+
+1. **Send later** (the clock next to the send button, or a right-click / long press on it) offers *In 1 hour*,
+   *In 3 hours*, *This evening* (19:00, when that's over 90 minutes away), *Tomorrow morning* (9:00), *Monday
+   morning* and *Pick a date and time…* (a `datetime-local` field in the device's time zone, at most 30 days
+   ahead). The words in the box, its files and a ready link preview go, as for Send; polls, voice messages, GIFs
+   and bot commands can't be scheduled.
+2. The app builds the payload and encrypts it with `sealFor`, the same function sending uses: for a channel the
+   current server key epoch, the ECDSA signature, the `@mention` ids and `everyone` (always `true` or `false`); for
+   a DM the `d2:` format. Files are uploaded encrypted at once. With it goes the sender's **own copy** (`draft`):
+   the same payload (the version that fitted the size limit) sealed with their personal vault key
+   (`E2EE.sealVault(vaultKey, 'scheduled', '<ref>|<c:channel or d:dm>|<thread>')`, the key saved-message notes and
+   Recall use, which only the account's identity key derives), bound to `ref` (16 random bytes the app picks), the
+   conversation and the thread. It posts `{ ciphertext, epoch, ref, draft, sendAt, replyTo, threadId, files,
+   mentions, everyone }` to `POST /channels/:id/scheduled-messages` (or `{ ciphertext, ref, draft, sendAt, replyTo,
+   files }` to `POST /dms/:id/scheduled-messages`). Nothing in the format binds the message id or time (see
+   ARCHITECTURE.md §4), so the stored ciphertext is a valid message whenever it goes out.
+3. Scheduling is checked like sending: you can see and post in the channel (Send Messages, Attach Files for
+   files, Create Threads for a thread), aren't timed out, and the key epoch is current (409 `stale-key`
+   otherwise, which the app's usual retry handles); in a DM, no block either way and the other account exists.
+   The time must be a whole number of milliseconds in the future and at most 30 days ahead (`send_at`). Up to 25
+   pending or held per person (`too_many`; failed ones don't count). Scheduling counts against the message rate
+   limits (`limitMessages`) plus 30 a minute of its own.
+4. One timer, armed for the soonest due message (and at least once a minute; `scheduled.watch` restarts it if a
+   run ever failed before re-arming), takes due messages 50 at a time. Each is checked again exactly as a message
+   sent then would be (`prepare`): account suspended; channel, server or DM gone, not a member, or can't see the
+   channel (`no_access`); timed out; no permission to post, attach or reply in threads (`no_permission`); the
+   thread deleted (`thread_gone`); a block (`blocked`); the other account deleted (`deleted`); keys (below). A
+   refusal marks it **failed** with that reason, sends `scheduled:update` to the sender's open apps and a push to
+   devices without one ("A scheduled message wasn't sent", tag `sched:<id>`, opening `/#scheduled`). Slow mode
+   doesn't refuse it: the time moves to when slow mode allows. A message due more than a day ago that wasn't
+   re-encrypted since (the server was down or in maintenance for that long, or brought back from an old backup)
+   fails as `too_late` instead of being posted that late. Nothing is sent during maintenance.
+5. Otherwise it's posted by `postChannelMessage` / `postDmMessage` (with `{ scheduled: true }`), the code
+   `POST /channels/:id/messages` and `POST /dms/:id/messages` use: a new message id, `created_at` = the moment it
+   goes out, `message:new` / `dm:message`, pushes, `mention_marks`, bot `message.created` events, thread activity.
+   One difference: the author may well be away, so their read marker (and thread marker) isn't moved, and the copy
+   their own apps get carries `scheduled: true`, so they don't clear the conversation's unread count, pings or
+   notifications either; pings and messages that came meanwhile stay unread. Nobody else's copy (or the history)
+   says it was scheduled. In the same transaction the scheduled row is deleted and its files (blobs whose
+   `message_id` was the row's id) become the message's, so it can't be posted twice or lose its files. The sender's
+   apps get `scheduled:remove` with the new message id.
+
+**Disappearing messages and voice chats.** A scheduled message is encrypted like one sent now, so `sealFor` puts the
+conversation's timer as it is then inside it (`x`) and sends it beside it (`ttl`): scheduling (and every re-encrypt,
+`PATCH` with new ciphertext) is refused with 409 `disappear_changed` when the timer just changed, and the app fetches
+it and encrypts again, once (`refreshTimer`). The row keeps `ttl`. When it's posted, `postChannelMessage` /
+`postDmMessage` stamp its deadline from that moment (`created_at` is the send time), by the conversation's timer
+then, never later than `ttl` (`sendSecs` in `index.js`): turned on or shortened since, the conversation's timer
+wins; turned off or made longer, it still goes when its sender expected, so the server deletes it when readers' apps
+(which take the earlier of `expiresAt` and `createdAt + x`) hide it anyway. Its files get the same deadline when
+they're handed over. A reply or thread that has disappeared by its time counts as gone (`replyIn`, `threadRootIn`
+check `alive`). The list shows "Disappears after …" on each one encrypted for a timer. A voice channel's chat takes
+scheduled messages like a text channel (`hasChat`; a group's call has no chat, 400), but threads stay in text
+channels (400 "Threads are only in text channels.").
+
+**Only what the sender scheduled is ever re-encrypted.** Re-encrypting a message re-signs it with the sender's key
+under the current server key, so the app does it only from the sender's own copy (`draft`), never from the
+ciphertext the server hands back. Without that, the server, or anyone with a stolen session token (who has no
+identity key), could slip a forged message (or one of the sender's ordinary old messages, from a key epoch newer
+members never had) into the sender's list as "held" and have their open app re-sign it under their name, or re-lock
+old words for people who joined since. A copy only opens with the account's own keys and for its ref, conversation
+and thread, so it can't be made, moved or swapped by anyone else. The list shows what a scheduled message says from
+that copy too. One whose copy is missing or doesn't open shows as "This device can't confirm you wrote this one",
+is never re-encrypted, and offers only **Cancel**.
+
+**Sessions.** Each scheduled message records the session that last wrote it (`session_id`: the one that scheduled,
+edited or re-encrypted it). When that session ends through the server (`revokeSessions`: logged out, signed out in
+Settings → Signed-in devices or by *Log out all other devices*, a password change or reset, turning on two-factor, a
+suspension or staff), what it scheduled is **held** (`session_ended`), so signing out a stolen session stops what it
+queued. It goes out only once the person confirms it from a session still signed in: **Keep**, **Send now**,
+**Edit** or **Reschedule** in the list re-encrypt it from their own copy (which ties it to the new session). The app
+never does that by itself, a key change doesn't turn it into an ordinary key hold, and `POST …/send` and a
+reschedule alone answer 409 `held`. At its time the person is told it's waiting, as for any held one. A session
+that simply expires doesn't count.
+
+**Key changes, decided honestly.** A channel message is locked with one epoch of the server key, and members who
+joined after a rotation never receive older keys; posting old ciphertext would make a message they can't open,
+and one a removed member could. A DM is locked with both people's identity keys. So the server never posts
+ciphertext written with keys that changed since:
+
+- **The server's key changed or needs replacing** (someone left or was removed; `needs_rotation`): the message is
+  **held** (`key`). That happens as soon as the key state changes (`emitKeyState` → `recheckServer`, for senders
+  still in the server), when the list is fetched, and at the latest at its time. The sender's app re-encrypts it
+  with the current key (`PATCH` with new ciphertext, making the new key itself if needed, as sending would) and
+  it's **pending** again with the same time. The app does that **by itself** when its time is ahead or passed
+  under 10 minutes ago, as soon as it's open and has the key (at start-up, on `scheduled:update`, on new keys).
+  Later than that it waits for the person: **Send now** or **Reschedule** re-encrypt first, and saving an **Edit**
+  (or **Keep**) asks "Send it now, or pick a new time?". A message re-encrypted after its time goes out at once, so
+  the server insists on being told: new ciphertext for a held message whose time has passed needs `sendNow: true`
+  or a new `sendAt`, else 409 `overdue` (the automatic path sends `sendNow`, since it only runs within 10 minutes).
+- **The other person's identity key changed** (a password reset without the recovery key): held (`peer_key`),
+  found at listing and at send time. The app can only re-encrypt once the sender has checked the new safety
+  number, since it never encrypts to an unchecked key; marking it verified retries.
+- **The sender's own keys changed** (the identity key, or for channels the signing key): **failed**
+  (`keys_changed`). The old private key is gone, so the ciphertext can't be opened to re-encrypt, and its
+  signature would no longer check out.
+- `own_key` / `peer_key` are SHA-256 fingerprints of the public keys (`users.public_key`, `sign_public_key`) at
+  the time the ciphertext was written; `epoch` is the server key epoch the app said it used (as for sending, the
+  server can't check that against the ciphertext, and a wrong one only hurts the sender).
+- A held message whose time comes is checked again then: one that can't go anyway (removed, timed out…) fails,
+  else the sender is told once (`told_at`) that it's waiting. Held messages nobody re-encrypts go 30 days after
+  their time; failed ones a week after their time (`scheduled.prune`, hourly).
+
+**The app** (`public/js/scheduled.js`): the list comes from `GET /scheduled-messages` at start-up and reconnect and
+follows `scheduled:update` / `scheduled:remove` on every device. A bar above the main composer says what's
+scheduled in that conversation ("2 messages scheduled here, the next tomorrow at 9:00 AM", or in red when one
+wasn't sent or is waiting for you) with **View**; the conversation's ⋯ menu has **Scheduled messages** too (with a
+count, worked out when the menu opens), and the push opens the list of all of them. The list opens each message's
+own copy on the device and offers **Send now**, **Edit** (Enter saves: new ciphertext and a new copy, with the
+files, the poll and the link previews still in the text kept), **Reschedule** and **Cancel**, plus **Keep** for one
+from a signed-out session; failed ones show the reason, **Copy text** and **Dismiss**; unconfirmed ones only
+**Cancel**. Times read "Sends tomorrow at 9:00 AM", "Waiting · was due today at 11:48 AM", "Rescheduled for
+Monday at 9:00 AM". Words are put on the page as text nodes only. The 25 limit, the times and the reasons come from
+the server, which also sends its words for each reason (`note`). Settings → Storage lists a scheduled message's
+files as "Waiting with a scheduled message (due …)", and the admin storage report counts them on their own.
+
+**API**
+
+| Route | Auth | Notes |
+|---|---|---|
+| `GET /scheduled-messages` | session | your own, soonest first, with `max` and `maxDays`; key changes are checked first; 60/min |
+| `POST /channels/:id/scheduled-messages` | can post in the channel, not timed out | see above; 30/min, plus the message limits |
+| `POST /dms/:id/scheduled-messages` | your DM, no block, the other account exists | see above |
+| `PATCH /scheduled-messages/:id` `{ sendAt?, ciphertext?, draft?, epoch?, mentions?, everyone?, sendNow? }` | your own, the conversation still yours | new ciphertext needs its new `draft` (400 `draft`), replaces `mentions` and `everyone` (missing means none) and the session, and makes a held one pending; a held one whose time has passed needs `sendNow: true` or a `sendAt` with it (409 `overdue`); a held one can't just be rescheduled (409 `held`); a failed one can't be changed (409 `failed`); 60/min |
+| `POST /scheduled-messages/:id/send` | your own | sends now with the same checks; a refusal is answered (403, 404, 429 `slowmode`) and the message left as it was; 409 `held` marks it held |
+| `DELETE /scheduled-messages/:id` | your own | cancels or dismisses; its files are deleted; 120/min |
+
+Anyone else's id (or a malformed one) answers 404 "Scheduled message not found.", like one that doesn't exist.
+Socket events go only to `user:<you>`: `scheduled:update` (the item) and `scheduled:remove` (`{ id, messageId }`).
+Items carry `id`, `serverId`, `channelId`, `dmId`, `threadId`, `replyTo`, `ciphertext`, `epoch`, `ref`, `draft`,
+`files` (a count), `sendAt`, `status` (`pending`, `held`, `failed`), `reason` (for held: `key`, `peer_key`,
+`session_ended`), `note`, `createdAt` and `encryptedAt`. `ref` must be 16–64 of `A-Z a-z 0-9 _ -` and `draft` an
+`x1:` string of at most 66,000 characters (400 `draft` otherwise); the server can't open it.
+
+**Data model** (`scheduled_messages`, v19): owner, server, channel or DM (exactly one; no foreign key, so a deleted
+one is reported at send time), thread, reply, ciphertext, epoch, `ref` and `draft` (the sender's own copy),
+`session_id` (the session that last wrote it), `own_key`, `peer_key`, file URLs, mention ids, `everyone`,
+`send_at`, `status`, `reason`, `told_at`, `created_at`, `updated_at` (when the ciphertext was written). No
+plaintext column. A scheduled message's files are `blobs` rows whose `message_id` is its id: the
+orphan sweep (`uploads.orphan_sweep`) and *Clean up orphans now* count them as in use. Deleting the account
+deletes its scheduled messages and their files at once.
+
+**Tests**
+
+- `test/scheduled.test.js` (24 tests): a channel message goes out at its time as a normal one (live event,
+  `createdAt` at the time, a new id, no nonce, the ping recorded, nobody else told, `scheduled: true` on the
+  sender's own copy only); going out marks nothing read for the sender (a ping, a DM and a thread reply with a ping
+  that came meanwhile all stay unread); thread replies, replies, and a reply whose target was deleted; DMs and group
+  chats; disappearing messages (scheduling and re-encrypting refused for a timer that just changed, the timer kept,
+  the deadline counted from when it goes out and its file's with it, the conversation's timer winning when it got
+  shorter or was turned on meanwhile, the one it was written for when it got longer or was turned off, in a channel
+  and a DM); voice channels' chats taking scheduled messages, with threads there and a group's call refused;
+  list, edit, reschedule, send now and cancel, and that nobody else can do any of it or tell an id from a
+  missing one; new words replace who it pings (@everyone and @names edited out ping nobody; rescheduling keeps
+  them); the sender's own copy and its ref required and checked for shape, and replaced with the ciphertext;
+  validation of the time
+  (strings, booleans, past, 31 days, huge numbers, arrays), the ciphertext (the size limit as for sending),
+  mentions, files, replies, threads, a group's call, outsiders and stale epochs; the 25 limit (DMs included,
+  failed ones not counted) and the rate limit; refusals when scheduling (no permission, files without Attach
+  Files, timed out, blocked either way, deleted account); refusals at the time (timed out, kicked, channel
+  deleted, thread deleted, permission taken away; blocked, account deleted), each failed with its reason and the
+  sender told, nothing posted; send now refused while timed out, and slow mode moving the time; key rotation
+  (held at once when someone leaves, held at its time when the epoch changed unseen, not reschedulable or sendable
+  until re-encrypted, a stale epoch refused, sent once re-encrypted, an overdue one only with `sendNow` (409
+  `overdue` otherwise), failed when the sender was removed meanwhile); a DM partner's new key holds it, the sender's own new keys fail it (the signing key for
+  channels only); a message overdue by more than a day fails as `too_late` unless re-encrypted since; files (only
+  your own unused uploads, handed to the message, kept by *Clean up orphans now*, deleted on cancel); a deleted
+  account's messages never go out; a message due while the server was down goes out once after a restart, and the
+  start-up orphan sweep keeps a waiting message's file; a session that ends (*Log out all other devices*, logging
+  out, signing one out) holds what it scheduled (`session_ended`): not posted at its time, the sender told, not
+  sendable or reschedulable as it is, not turned into a key hold by a key change, sent once confirmed with new
+  ciphertext, and what other sessions scheduled untouched; Settings → Storage and the admin report label a
+  scheduled message's file; static checks that `public/js/scheduled.js` never builds HTML and never decrypts the
+  ciphertext it's given (it re-encrypts only from the vault-sealed copy, bound to ref, conversation and thread).
+- Browser flow (`npm run test:e2e`, "send later"): a right-click on Send offers the times; the clock schedules
+  "In 1 hour", the box empties and the bar appears, Bob sees nothing; the list decrypts it, Edit changes the
+  words, Reschedule with a date and time changes when, Send now posts it and Bob reads the edited words; in a DM,
+  one is scheduled, found from the ⋯ menu and cancelled. Then Bob schedules one and Alice leaves and comes back:
+  his open app re-encrypts it by itself with each new key (the stored copy ends on the current epoch), and once
+  sent Alice reads it with the key made after her return. Then two "held" messages are slipped into Bob's list in
+  the database (one of his own old messages from an earlier epoch, without a copy and with a made-up one): after a
+  reload his app sends no PATCH, leaves both exactly as they were, shows "can't confirm you wrote this one" with
+  Cancel only, and he cancels them. Last, one of Alice's is held as if its session had been signed out, three hours
+  overdue: after a reload her app leaves it alone, the bar says it's waiting for her, the card says "was due today
+  at …", saving an edit asks "Its time has passed" (and Cancel leaves it unsent), and **Keep** → **Send now** sends
+  it to Bob.
+
+**Known limitations**
+
+- The server learns, ahead of time, that a message is coming, where, when, its size, and when and from which
+  session it was written or edited. It holds a valid, signed message until the time, and is trusted to send it then
+  (not earlier, later or twice: the time and id aren't signed, as for any message) and to really delete one that's
+  cancelled. A dishonest server that kept a cancelled one (its ciphertext and the sender's copy) could bring it
+  back into the same conversation and thread, and after a key change the sender's app would re-encrypt it if it
+  were due within minutes. Holding a signed-out session's messages is the server's doing too: it protects against
+  a stolen session token, not against the server.
+- A message held because of a key change goes out late if the sender's app isn't opened before its time; over 10
+  minutes late, the app asks before sending it.
+- *Export my data* doesn't include scheduled messages that haven't gone out yet.
+- Server backups taken while a message waits keep its ciphertext until they rotate out.

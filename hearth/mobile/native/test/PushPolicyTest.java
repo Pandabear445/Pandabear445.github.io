@@ -64,7 +64,7 @@ public class PushPolicyTest {
 
     @Test
     public void notificationsOnlyOpenInAppAddresses() {
-        for (String ok : new String[] { "/", "/#m/abc123", "/#c/abc", "/#d/abc", "/#call/dm:abc", "/#call/abc", "/#updates", "/#study" }) {
+        for (String ok : new String[] { "/", "/#m/abc123", "/#c/abc", "/#d/abc", "/#call/dm:abc", "/#call/abc", "/#updates", "/#study", "/#scheduled" }) {
             assertEquals(ok, PushPolicy.safeOpenPath(ok));
         }
         for (String bad : new String[] { "https://evil.example/", "//evil.example", "/#reset=AAAAAAAAAAAAAAAAAAAAAAAA", "javascript:alert(1)",

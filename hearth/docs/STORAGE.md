@@ -142,13 +142,14 @@ All decryption happens in the app; the server only ever sends ciphertext.
 | A member leaves, is kicked or banned | Nothing: the files they posted stay with the conversation | Still counts against the uploader |
 | An account is deleted | Avatar, banner, background, profile song and page background are deleted; unfinished uploads are cancelled. Messages they sent stay (still encrypted) with their attachments | Profile files freed; attachments stay counted to the deleted account |
 | A file is uploaded but never posted | Removed after 24 h (hourly sweep) | Freed |
+| A file goes with a scheduled message (Send later) | Kept with it (its blob's `message_id` is the scheduled message's id) and handed to the message when it's posted; deleted when it's cancelled or dismissed, a week after it failed, 30 days after its time if it's still held, or with the account. Settings → Storage shows it as "Waiting with a scheduled message (due …)"; the admin report counts these files on their own ("Waiting with scheduled messages") | Counts against the uploader all along |
 | An upload is never finished | Removed after 24 h idle (sweep every 10 min) | Reservation freed |
 | An admin uses "Delete all their files" | Everything they uploaded, attachments included (messages remain and show "no longer available"), their library GIFs, unfinished uploads | Freed |
 | A message is forwarded | The copy points at the same blobs; if the original is deleted, the copy's files show "no longer available" | Counted once, to the uploader |
 | A disappearing message reaches its time | Its files are 404 at once (`blobs.expires_at`, checked on every `.bin` request) and deleted by the `messages.expire` job within a second or two (a minute at most) | Freed |
 
-Leftovers from before these rules existed (blobs whose message is gone) are swept once shortly after start and
-daily (`sweepOrphans`).
+Leftovers from before these rules existed (blobs whose message is gone, and not a waiting scheduled message's) are
+swept once shortly after start and daily (`sweepOrphans`).
 
 ## 7. Storage report and orphan cleanup (Admin → Security → Storage & limits)
 
@@ -159,7 +160,8 @@ unfinished uploads (who, how far, when they expire); free and total disk; and a 
 **What counts as referenced** (`references` in `server/storage.js`), built from the database, never from names
 or guesses:
 
-1. blobs whose message exists (channel or DM), and unattached blobs younger than max(grace, 24 h);
+1. blobs whose message exists (channel or DM) or whose scheduled message is still waiting (`scheduled_messages`),
+   and unattached blobs younger than max(grace, 24 h);
 2. every GIF library file;
 3. every `/uploads/<name>` written in any text column of any other table (avatars, banners, songs, server icons and
    themes, emoji, profile pages, settings, …), so a future feature that stores a picture is covered automatically;

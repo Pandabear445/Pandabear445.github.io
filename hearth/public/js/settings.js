@@ -1383,6 +1383,7 @@ function storageTab(app) {
     const w = f.where;
     if (!w) return KIND[f.kind] || 'File';
     if (w.type === 'unsent') return 'Uploaded, not sent (removed after a day)';
+    if (w.type === 'scheduled') return `Waiting with a scheduled message (due ${new Date(w.sendAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })})`;
     if (w.type === 'dm') return 'In a direct message';
     const s = (app.S.servers || []).find((x) => x.id === w.serverId);
     const c = s && (s.channels || []).find((x) => x.id === w.channelId);

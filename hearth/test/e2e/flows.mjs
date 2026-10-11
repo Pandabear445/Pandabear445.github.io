@@ -1,6 +1,7 @@
 // The end-to-end flows, in order: each one builds on what the earlier ones set up (accounts, the server, roles…).
 // Everything goes through the real UI; the only shortcuts are reading state the UI already shows.
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { exact, makePng, totp, newPassword } from './harness.mjs';
 
 export function check(ok, message) { if (!ok) throw new Error(message); }
@@ -2055,6 +2056,194 @@ async function voiceChat(t) {
   await bob.openChannel('general');
 }
 
+// ------------------------------------------------------------------ 25. send later (scheduled messages)
+async function sendLater(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const box = alice.$('#composer-input');
+  // A right-click on the send button offers the same choices as the clock next to it.
+  await box.fill('Scheduled: the pineapple party starts at noon');
+  await alice.$('.cw-main .send-btn').click({ button: 'right' });
+  await alice.menuItem('Tomorrow morning').waitFor();
+  await alice.page.keyboard.press('Escape');
+  // The clock: pick "In 1 hour". The box empties and a bar above it says what's waiting.
+  await alice.$('.cw-main button[aria-label="Send later"]').click();
+  await alice.menuItem('In 1 hour').click();
+  await alice.toast('Scheduled for');
+  check(!(await box.inputValue()), 'The box should be empty once the message is scheduled.');
+  const bar = alice.$('.cw-main .sched-bar');
+  await bar.filter({ hasText: '1 message scheduled here' }).waitFor();
+  check(!(await bob.message('pineapple party').count()), 'Bob should not see a scheduled message before its time.');
+
+  // The list decrypts it on Alice's device. Edit the words, pick another time, then send it now.
+  await bar.locator('button', { hasText: exact('View') }).click();
+  const dlg = await alice.dialog('Scheduled messages');
+  const item = dlg.locator('.sched-item');
+  await item.locator('.sched-text', { hasText: 'the pineapple party starts at noon' }).waitFor();
+  check((await item.locator('.sched-when').innerText()).startsWith('Sends '), 'The list should say when it goes out.');
+  await item.locator('button', { hasText: exact('Edit') }).click();
+  const ed = dlg.locator('textarea.sched-edit');
+  await ed.fill('Scheduled: the pineapple party starts at one');
+  await ed.press('Enter');
+  await item.locator('.sched-text', { hasText: 'starts at one' }).waitFor();
+  await item.locator('button', { hasText: exact('Reschedule') }).click();
+  await alice.menuItem('Pick a date and time…').click();
+  const pick = await alice.dialog('Reschedule');
+  const d = new Date(Date.now() + 2 * 86400000);
+  d.setHours(15, 30, 0, 0);
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  await pick.locator('input[type="datetime-local"]').fill(local);
+  await pick.locator('.modal-foot .btn.primary').click();
+  await alice.toast('Rescheduled for');
+  await item.locator('.sched-when', { hasText: /3:30/ }).waitFor();
+  check(!(await bob.message('pineapple party').count()), 'Editing and rescheduling should not send anything.');
+  await item.locator('button', { hasText: exact('Send now') }).click();
+  await bob.message('the pineapple party starts at one').waitFor(); // decrypted on bob's device
+  check(!(await bob.message('starts at noon').count()), 'Bob should only ever get the edited words.');
+  await dlg.locator('.sched-list .panel-empty').waitFor();
+  await dlg.locator('.modal-x').click();
+  await bar.waitFor({ state: 'detached' });
+
+  // In a DM: schedule, find it from the conversation's ⋯ menu, cancel it. Bob never gets it.
+  await alice.railButton('Direct messages');
+  await alice.dmRow('bob').click();
+  await alice.page.waitForSelector('#composer-input[placeholder="Message bob"]');
+  await box.fill('A DM for later that never goes out');
+  await alice.$('.cw-main button[aria-label="Send later"]').click();
+  await alice.menuItem('In 3 hours').click();
+  await alice.toast('Scheduled for');
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('Scheduled messages').click();
+  const dm = await alice.dialog('Scheduled messages');
+  await dm.locator('.sched-text', { hasText: 'never goes out' }).waitFor();
+  await dm.locator('.sched-item button', { hasText: exact('Cancel') }).click();
+  const sure = await alice.dialog('Cancel this scheduled message?');
+  await sure.locator('.modal-foot .btn.danger').click();
+  await dm.locator('.sched-list .panel-empty').waitFor();
+  await dm.locator('.modal-x').click();
+  await alice.$('.cw-main .sched-bar').waitFor({ state: 'detached' });
+
+  // The key changes while one waits: alice leaves and comes back. Bob's open app re-encrypts his scheduled message
+  // with each new key by itself (the server never posts it with the old one), and it still goes out readable.
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.$('#composer-input').fill('Scheduled before the key changed: kiwi');
+  await bob.$('.cw-main button[aria-label="Send later"]').click();
+  await bob.menuItem('In 3 hours').click();
+  await bob.toast('Scheduled for');
+  const held = () => t.server.rows("SELECT epoch, status FROM scheduled_messages WHERE status != 'failed' ORDER BY created_at DESC LIMIT 1")[0];
+  const first = held();
+  check(first && first.status === 'pending', 'The scheduled message should be waiting on the server.');
+  await alice.railButton(SERVER);
+  await alice.serverMenu('Leave server');
+  await alice.modal(`Leave ${SERVER}?`).locator('.modal-foot .btn.danger').click();
+  await alice.$(`#rail button[aria-label="${SERVER}"]`).waitFor({ state: 'detached' });
+  await alice.join(await bob.inviteLink(), SERVER);
+  const keyNow = () => t.server.rows('SELECT key_epoch, needs_rotation FROM servers WHERE name = ?', SERVER)[0];
+  for (const until = Date.now() + 30000; ; await new Promise((r) => setTimeout(r, 200))) {
+    const row = held(); const k = keyNow();
+    if (row && row.status === 'pending' && !k.needs_rotation && row.epoch === k.key_epoch && row.epoch > first.epoch) break;
+    check(Date.now() < until, `Bob's app should re-encrypt the held message with the new key (it has epoch ${row && row.epoch}, ${row && row.status}; the server is at ${k.key_epoch}).`);
+  }
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const kl = await bob.dialog('Scheduled messages');
+  await kl.locator('.sched-item .sched-text', { hasText: 'kiwi' }).waitFor();
+  await kl.locator('.sched-item button', { hasText: exact('Send now') }).click();
+  await kl.locator('.sched-list .panel-empty').waitFor();
+  await kl.locator('.modal-x').click();
+  // Decrypted on alice's device, with the key made after she came back (older messages from while she was away stay
+  // closed to her, as they should).
+  await alice.openChannel('general');
+  await alice.message('Scheduled before the key changed: kiwi').waitFor();
+
+  // The server (or someone with Bob's session token) slips "held" messages into Bob's list: one of his own old
+  // messages from an earlier key, and the same with a made-up copy. His app must never re-encrypt and re-sign them
+  // (that would hand the old words to people who joined since, under his name): it re-encrypts only from his own
+  // copy, which nobody without his keys can make. They show as unconfirmed, with Cancel only.
+  const bobId = await bob.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  const hall = t.server.rows('SELECT id, key_epoch FROM servers WHERE name = ?', SERVER)[0];
+  const general = t.server.rows("SELECT id FROM channels WHERE server_id = ? AND name = 'general'", hall.id)[0];
+  const old = t.server.rows('SELECT ciphertext, epoch FROM messages WHERE author_id = ? AND channel_id = ? AND thread_id IS NULL AND epoch < ? ORDER BY created_at DESC LIMIT 1', bobId, general.id, hall.key_epoch)[0];
+  check(old, 'Bob should have an older message in #general from before the key changed.');
+  const keys = t.server.rows('SELECT public_key, sign_public_key FROM users WHERE id = ?', bobId)[0];
+  const ownKey = crypto.createHash('sha256').update(['c', keys.public_key, keys.sign_public_key].join('|')).digest('base64').slice(0, 24);
+  const plant = (id, draft) => t.server.sql(`INSERT INTO scheduled_messages (id, user_id, server_id, channel_id, ciphertext, epoch, ref, draft, own_key, send_at, status, reason, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', 'key', ?, ?)`, id, bobId, hall.id, general.id, old.ciphertext, old.epoch, crypto.randomBytes(12).toString('hex'), draft, ownKey, Date.now() + 2 * 3600000, Date.now(), Date.now());
+  plant('plantedold' + crypto.randomBytes(4).toString('hex'), null);
+  plant('plantedfake' + crypto.randomBytes(4).toString('hex'), 'x1:' + crypto.randomBytes(120).toString('base64'));
+  const patches = [];
+  bob.page.on('request', (r) => { if (r.method() === 'PATCH' && r.url().includes('/api/scheduled-messages/')) patches.push(r.url()); });
+  await bob.page.reload();
+  await bob.waitApp();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.$('.cw-main .sched-bar', { hasText: '2 messages scheduled here' }).waitFor();
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const fake = await bob.dialog('Scheduled messages');
+  await fake.locator('.sched-item .sched-text', { hasText: 'can’t confirm you wrote this one' }).nth(1).waitFor();
+  for (const card of await fake.locator('.sched-item').all()) {
+    const labels = (await card.locator('.sched-actions button').allInnerTexts()).map((x) => x.trim());
+    check(labels.join() === 'Cancel', `An unconfirmed scheduled message should only offer Cancel (it offers ${labels.join(', ')}).`);
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+  const planted = t.server.rows("SELECT status, ciphertext, epoch FROM scheduled_messages WHERE id LIKE 'planted%'");
+  check(planted.length === 2 && planted.every((x) => x.status === 'held' && x.ciphertext === old.ciphertext && x.epoch === old.epoch),
+    'Bob’s app should leave scheduled messages it can’t confirm exactly as they were.');
+  check(!patches.length, `Bob’s app should never re-encrypt a scheduled message it can’t confirm (it sent ${patches.length} PATCH requests).`);
+  for (const left of [1, 0]) {
+    await fake.locator('.sched-item button', { hasText: exact('Cancel') }).first().click();
+    await (await bob.dialog('Cancel this scheduled message?')).locator('.modal-foot .btn.danger').click();
+    await fake.locator('.sched-item').nth(left).waitFor({ state: 'detached' });
+  }
+  await fake.locator('.sched-list .panel-empty').waitFor();
+  await fake.locator('.modal-x').click();
+
+  // One scheduled from a session that has been signed out since waits for its owner, and one whose time has passed
+  // isn't sent by saving an edit without asking. (The server holds it when the session ends; here that's done in
+  // the database, along with moving its time three hours back.)
+  await alice.$('#composer-input').fill('Scheduled from a laptop: tamarind');
+  await alice.$('.cw-main button[aria-label="Send later"]').click();
+  await alice.menuItem('In 3 hours').click();
+  await alice.toast('Scheduled for');
+  const aliceId = await alice.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  const tama = t.server.rows("SELECT id FROM scheduled_messages WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", aliceId)[0];
+  t.server.sql("UPDATE scheduled_messages SET status = 'held', reason = 'session_ended', send_at = ? WHERE id = ?", Date.now() - 3 * 3600000, tama.id);
+  const alicePatches = [];
+  alice.page.on('request', (r) => { if (r.method() === 'PATCH' && r.url().includes('/api/scheduled-messages/')) alicePatches.push(r.url()); });
+  await alice.page.reload();
+  await alice.waitApp();
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  const abar = alice.$('.cw-main .sched-bar', { hasText: '1 scheduled message is waiting for you' });
+  await abar.waitFor();
+  await abar.locator('button', { hasText: exact('View') }).click();
+  const ad = await alice.dialog('Scheduled messages');
+  const mcard = ad.locator('.sched-item');
+  await mcard.locator('.sched-text', { hasText: 'tamarind' }).waitFor();
+  const mwhen = await mcard.locator('.sched-when').innerText();
+  check(/^Waiting · was due (today|yesterday) at /.test(mwhen), `The card should say when it was due, mid-sentence (it says “${mwhen}”).`);
+  check(!alicePatches.length, 'Alice’s app should not confirm a message from a signed-out session by itself.');
+  await mcard.locator('button', { hasText: exact('Edit') }).click();
+  const med = ad.locator('textarea.sched-edit');
+  await med.fill('Scheduled from a laptop: tamarind and lime');
+  await med.press('Enter');
+  const late = await alice.dialog('Its time has passed');
+  await late.locator('.modal-foot .btn', { hasText: exact('Cancel') }).click();
+  await new Promise((r) => setTimeout(r, 500));
+  check(t.server.rows('SELECT status FROM scheduled_messages WHERE id = ?', tama.id)[0].status === 'held', 'Saving an edit of an overdue message should ask before sending it.');
+  check(!(await bob.message('from a laptop: tamarind').count()), 'Bob should not get it before Alice says so.');
+  await med.press('Escape');
+  await mcard.locator('button', { hasText: exact('Keep') }).click();
+  await (await alice.dialog('Its time has passed')).locator('.modal-foot .btn.primary', { hasText: exact('Send now') }).click();
+  await alice.toast('Sent.');
+  await bob.message('Scheduled from a laptop: tamarind').waitFor();
+  await ad.locator('.sched-list .panel-empty').waitFor();
+  await ad.locator('.modal-x').click();
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -2090,4 +2279,5 @@ export const FLOWS = [
   ['channel order: drag a channel into a category and a category above another, live for everyone; Move down by keyboard keeps focus (into a collapsed category too); a menu left open doesn’t undo another move', channelOrder],
   ['away and status: Away after inactivity and back on input; a custom status that clears itself, live', awayAndStatus],
   ['voice chat: open beside the call, both ways, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
+  ['send later: schedule from the send button, edit, reschedule and send now from the list; cancel one in a DM; re-encrypted by itself when the key changes, never from a copy it can’t confirm; a signed-out session’s message waits for Keep; overdue ones ask first', sendLater],
 ];

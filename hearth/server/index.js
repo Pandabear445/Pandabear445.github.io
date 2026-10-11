@@ -271,6 +271,12 @@ function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
 // when their app starts), so a big server's fan-out only does work for the people actually online.
 const connected = (userId) => io.sockets.adapter.rooms.has(`user:${userId}`);
 function emitKeyState(serverId) {
+  sendKeyState(serverId);
+  // Then scheduled messages locked with a key that's no longer current wait for their sender's app, which by now has
+  // heard the key changed (server/scheduled.js).
+  if (SCHED) SCHED.recheckServer(serverId);
+}
+function sendKeyState(serverId) {
   const info = serverKeyInfo(serverId);
   if (!info) return;
   const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
@@ -1046,7 +1052,9 @@ jobs.every('uploads.unlinked_cleanup', 3600 * 1000, () => {
 // Leftovers whose message is gone: from before the cleanup above existed (groups that emptied out, for example).
 // Once shortly after start, then daily.
 function sweepOrphans() {
-  const gone = (t) => `${t}.message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages WHERE id = ${t}.message_id) AND NOT EXISTS (SELECT 1 FROM dm_messages WHERE id = ${t}.message_id)`;
+  // A scheduled message's files belong to its row until it's sent (server/scheduled.js).
+  const gone = (t) => `${t}.message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages WHERE id = ${t}.message_id) AND NOT EXISTS (SELECT 1 FROM dm_messages WHERE id = ${t}.message_id)
+    AND NOT EXISTS (SELECT 1 FROM scheduled_messages WHERE id = ${t}.message_id)`;
   const blobs = db.prepare(`SELECT name FROM blobs WHERE ${gone('blobs')}`).all();
   blobs.forEach((b) => removeUpload('/uploads/' + b.name));
   if (blobs.length) db.prepare(`DELETE FROM blobs WHERE ${gone('blobs')}`).run();
@@ -1304,6 +1312,9 @@ function revokeSessions(userId, { id = null, except = null, reason = 'signed_out
   const ids = db.prepare(`SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL ${where}`).all(userId, ...args).map((r) => r.id);
   if (!ids.length) return 0;
   db.prepare(`UPDATE sessions SET revoked_at = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL ${where}`).run(t, reason, userId, ...args);
+  // What they scheduled waits for the person to confirm it from a session still signed in (server/scheduled.js):
+  // signing out a stolen session stops what it queued, too.
+  if (SCHED) SCHED.sessionsEnded(userId, ids);
   // Their push notifications stop too (a signed-out laptop shouldn't keep showing who messaged you). Ones
   // saved before subscriptions recorded their session can't be told apart, so they go as well; the app
   // turns push back on for the sessions still signed in the next time it starts.
@@ -1587,6 +1598,7 @@ let USE = null; // server/usability.js
 let DIS = null; // server/disappear.js: disappearing messages
 let SELF = null; // server/selfroles.js
 let PRES = null; // server/presence.js
+let SCHED = null; // server/scheduled.js
 function pushTo(userIds, payload, what = { kind: 'other' }) {
   if (!vapid) return;
   const ids = [...new Set(userIds)];
@@ -1968,6 +1980,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
   })();
   files.forEach((f) => removeUpload(f));
+  SCHED.forgetUser(row.id); // messages they scheduled never go out
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
   broadcastUser(row.id, audience);
   closeWindows(row.id, 'account_deleted');
@@ -3097,41 +3110,71 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   const ep = requireCurrentEpoch(c.server_id, epoch);
   // The disappearing timer the app encrypted for must be the one in force (it's inside the message too).
   DIS.checkTtl(req.body, c.disappear_secs);
-  const t = now();
-  let replyTo = (req.body || {}).replyTo || null;
-  if (replyTo && !alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND channel_id = ?').get(replyTo, c.id), t)) replyTo = null;
+  const replyTo = replyIn(c, (req.body || {}).replyTo);
   let threadId = (req.body || {}).threadId || null;
-  let root = null;
   if (threadId) {
-    root = db.prepare('SELECT id, thread_id, expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
-    if (!alive(root, t) || root.thread_id) fail(404, 'That thread no longer exists.');
-    threadId = root.id; // the stored id, whatever shape the request gave it in
+    threadId = threadRootIn(c, threadId);
+    if (!threadId) fail(404, 'That thread no longer exists.');
   }
+  const msg = postChannelMessage(c, req.userId, { ciphertext, epoch: ep, files, replyTo, threadId, mentions: (req.body || {}).mentions, everyone: (req.body || {}).everyone }, req.body);
+  res.json(msg);
+});
+// The message a new one replies to, if it's really in this channel and hasn't disappeared (else none, as a reply to
+// a deleted message).
+const replyIn = (c, replyTo, t = now()) => (replyTo && alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(replyTo), c.id), t) ? String(replyTo) : null);
+// The stored id of a thread's first message in this channel (whatever shape the request gave it in), or null: none
+// there, or one that has disappeared.
+function threadRootIn(c, threadId, t = now()) {
+  const root = db.prepare('SELECT id, thread_id, expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
+  return alive(root, t) && !root.thread_id ? root.id : null;
+}
+// The disappearing timer a new message goes by: its conversation's at the moment it's posted. A scheduled message
+// also carries ttl, the timer its sender's app encrypted it for (inside it as x too, so readers' apps hide it by then
+// whatever happens): it never outlives that either, so the server deletes it when the apps hide it.
+const sendSecs = (secs, ttl = null) => (ttl > 0 ? (secs > 0 ? Math.min(secs, ttl) : ttl) : secs || 0);
+// Posts a channel message that passed its checks: stores it, sends it to everyone who can see the channel, pushes
+// and counts its pings, marks it read for its author and tells bots. POST /channels/:id/messages and scheduled
+// messages (server/scheduled.js) both end here, so a scheduled one arrives exactly like one sent then: its deadline
+// (disappearing messages) counts from when it's posted, by the channel's timer then (see sendSecs).
+// body: the request, for the sender's nonce. within(id): more writes that must happen in the same transaction (a
+// scheduled message hands over its row and files). scheduled: posted at its time while its author may well be away,
+// so their read marker stays where it was (what others wrote meanwhile stays unread for them), and their own apps get
+// their copy marked scheduled: true so they don't take it as "read up to here" either.
+function postChannelMessage(c, authorId, { ciphertext, epoch, files, replyTo, threadId, mentions, everyone, ttl = null }, body, { within = null, scheduled = false } = {}) {
   const id = newId();
+  const t = now();
   // A thread reply never outlives the message that starts the thread.
-  const expiresAt = DISAPPEAR.stamp({ secs: c.disappear_secs, t, root });
+  const root = threadId ? db.prepare('SELECT id, expires_at FROM messages WHERE id = ?').get(threadId) : null;
+  const expiresAt = DISAPPEAR.stamp({ secs: sendSecs(c.disappear_secs, ttl), t, root });
   db.transaction(() => {
     db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, c.id, req.userId, '', ciphertext, ep, replyTo, t, threadId, expiresAt);
+      .run(id, c.id, authorId, '', ciphertext, epoch, replyTo, t, threadId, expiresAt);
     // A reply moves its thread to the top of the channel's Threads list (deleting one is handled in db.js).
     if (threadId) {
       db.prepare(`INSERT INTO thread_activity (root_id, channel_id, last_reply_id) VALUES (?, ?, ?)
         ON CONFLICT(root_id) DO UPDATE SET last_reply_id = excluded.last_reply_id WHERE excluded.last_reply_id > thread_activity.last_reply_id`).run(threadId, c.id, id);
     }
+    if (within) within(id);
+    // Files handed over in within (a scheduled message's) carry its deadline too, as attachBlobs gives them.
+    if (within && expiresAt != null) db.prepare('UPDATE blobs SET expires_at = ? WHERE message_id = ?').run(expiresAt, id);
   })();
-  attachBlobs(files, req.userId, id, expiresAt);
+  attachBlobs(files, authorId, id, expiresAt);
   DISAPPEAR.arm(expiresAt);
   const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
-  withNonce(msg, req.body);
-  toChannel(c).emit('message:new', msg);
-  notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions, (req.body || {}).everyone);
-  if (USE && !threadId) USE.markSent(req.userId, 'c:' + c.id, id);
-  else if (USE) USE.markThreadSent(req.userId, c, threadId, id);
+  withNonce(msg, body);
+  if (scheduled) {
+    const others = toChannel(c);
+    (others.except ? others.except(`user:${authorId}`) : others).emit('message:new', msg);
+    io.to(`user:${authorId}`).emit('message:new', { ...msg, scheduled: true });
+  } else toChannel(c).emit('message:new', msg);
+  notifyChannelMessage(c, id, authorId, replyTo, threadId, mentions, everyone);
+  if (USE && !scheduled && !threadId) USE.markSent(authorId, 'c:' + c.id, id);
+  else if (USE && !scheduled) USE.markThreadSent(authorId, c, threadId, id);
   // Bots get who, where and when: never the text, which is end-to-end encrypted.
-  BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId: req.userId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null, expiresAt }, { channel: c, actorId: req.userId });
+  BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null, expiresAt }, { channel: c, actorId: authorId });
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
-  res.json(msg);
-});
+  return msg;
+}
 
 api.patch('/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
@@ -3358,25 +3401,34 @@ api.post('/dms/:id/messages', auth, (req, res) => {
   const { ciphertext, files } = req.body || {};
   validCipher(ciphertext);
   DIS.checkTtl(req.body, d.disappear_secs);
-  const t = now();
-  let replyTo = (req.body || {}).replyTo || null;
-  if (replyTo && !alive(db.prepare('SELECT expires_at FROM dm_messages WHERE id = ? AND dm_id = ?').get(replyTo, d.id), t)) replyTo = null;
+  res.json(postDmMessage(d, req.userId, { ciphertext, files, replyTo: dmReplyIn(d, (req.body || {}).replyTo) }, req.body));
+});
+// The DM a new one replies to, if it's really in this DM and hasn't disappeared.
+const dmReplyIn = (d, replyTo, t = now()) => (replyTo && alive(db.prepare('SELECT expires_at FROM dm_messages WHERE id = ? AND dm_id = ?').get(String(replyTo), d.id), t) ? String(replyTo) : null);
+// Posts a DM that passed its checks (see postChannelMessage: scheduled DMs end here too, with the same options, and
+// get their deadline from the DM's timer when they're posted).
+function postDmMessage(d, authorId, { ciphertext, files, replyTo, ttl = null }, body, { within = null, scheduled = false } = {}) {
   const id = newId();
-  const expiresAt = DISAPPEAR.stamp({ secs: d.disappear_secs, t });
-  db.prepare('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, d.id, req.userId, ciphertext, replyTo, t, expiresAt);
-  attachBlobs(files, req.userId, id, expiresAt);
+  const t = now();
+  const expiresAt = DISAPPEAR.stamp({ secs: sendSecs(d.disappear_secs, ttl), t });
+  db.transaction(() => {
+    db.prepare('INSERT INTO dm_messages (id, dm_id, author_id, ciphertext, reply_to, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, d.id, authorId, ciphertext, replyTo, t, expiresAt);
+    if (within) within(id);
+    if (within && expiresAt != null) db.prepare('UPDATE blobs SET expires_at = ? WHERE message_id = ?').run(expiresAt, id);
+  })();
+  attachBlobs(files, authorId, id, expiresAt);
   DISAPPEAR.arm(expiresAt);
-  pushTo([d.user_a === req.userId ? d.user_b : d.user_a], { title: nameOf(req.userId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id, generic: 'New message' }, { kind: 'dm', dmId: d.id });
-  if (USE) USE.markSent(req.userId, 'd:' + d.id, id);
+  pushTo([d.user_a === authorId ? d.user_b : d.user_a], { title: nameOf(authorId), body: 'Sent you a message', tag: 'd:' + d.id, url: '/#m/' + id, generic: 'New message' }, { kind: 'dm', dmId: d.id });
+  if (USE && !scheduled) USE.markSent(authorId, 'd:' + d.id, id);
   db.prepare('UPDATE dm_channels SET last_message_at = ? WHERE id = ?').run(t, d.id);
   const msg = serializeDmMessage(db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id));
-  withNonce(msg, req.body);
+  withNonce(msg, body);
   for (const uid of [d.user_a, d.user_b]) {
     const dm = serializeDm({ ...d, last_message_at: t }, uid);
-    io.to(`user:${uid}`).emit('dm:message', { dm, message: msg, user: publicUser(getUserRow(dm.userId)) });
+    io.to(`user:${uid}`).emit('dm:message', { dm, message: scheduled && uid === authorId ? { ...msg, scheduled: true } : msg, user: publicUser(getUserRow(dm.userId)) });
   }
-  res.json(msg);
-});
+  return msg;
+}
 
 api.patch('/dm-messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
@@ -5745,6 +5797,13 @@ SA = require('./serveraudit')({ api, auth, db, fail, rateLimit, perms, PM, ALL: 
 // Start a server from a Discord server template the person pastes (server/imports.js, server/discordmap.js).
 require('./imports')({ api, auth, db, fail, rateLimit, limitNet, newId, now, features, isStaff, ALL: ALL_PERMS, CHANNEL_SCOPED, PM,
   serializeServer, keyState, getIo: () => io, auditLog, requirePerm });
+// Scheduled messages, "Send later" (server/scheduled.js): ciphertext held until its time, then posted as if sent then.
+SCHED = require('./scheduled')({ api, auth, db, fail, rateLimit, limitMessages, newId, now, perms, PM, requireChannel, requireDm, isMember, serverOf,
+  isBlocked, getUserRow, stillSuspended, validCipher, requireCurrentEpoch, attachBlobs, removeUpload, replyIn, threadRootIn, dmReplyIn,
+  postChannelMessage, postDmMessage, pushTo, maintenance, nameOf, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), ready: () => !!io,
+  // Voice channels' chats take scheduled messages like text channels; the disappearing timer a message was encrypted
+  // for is checked when it's scheduled, as when it's sent (server/disappear.js).
+  hasChat, checkTtl: (body, secs) => DIS.checkTtl(body, secs) });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();

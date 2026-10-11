@@ -116,6 +116,12 @@ export async function startServer() {
       const d = new Database(path.join(dir, 'hearth.db'));
       try { d.pragma('busy_timeout = 5000'); return d.prepare(q).run(...args); } finally { d.close(); }
     },
+    // Reads it the same way, for what no screen shows (which key a message the server holds is locked with, say).
+    rows(q, ...args) {
+      const Database = createRequire(path.join(ROOT, 'package.json'))('better-sqlite3');
+      const d = new Database(path.join(dir, 'hearth.db'), { readonly: true });
+      try { d.pragma('busy_timeout = 5000'); return d.prepare(q).all(...args); } finally { d.close(); }
+    },
     // The newest email to this address that matches, once it arrives.
     async mail(to, match, timeout = 15000) {
       for (const until = Date.now() + timeout; Date.now() < until; await sleep(100)) {

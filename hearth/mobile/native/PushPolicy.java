@@ -21,8 +21,9 @@ final class PushPolicy {
     /** How far the phone's clock may be ahead of the server's before a ring from "the future" is distrusted. */
     static final long CLOCK_SKEW_MS = 300_000;
 
-    // "/" or one of the app's own hash links. Ids are the server's newId(): lowercase letters and digits.
-    private static final Pattern OPEN = Pattern.compile("^/(#(?:m|c|d)/[a-z0-9]{1,64}|#call/(?:dm:)?[a-z0-9]{1,64}|#updates|#study)?$");
+    // "/" or one of the app's own hash links. Ids are the server's newId(): lowercase letters and digits. #scheduled is
+    // the person's scheduled messages (a push says one wasn't sent, or is waiting for them).
+    private static final Pattern OPEN = Pattern.compile("^/(#(?:m|c|d)/[a-z0-9]{1,64}|#call/(?:dm:)?[a-z0-9]{1,64}|#updates|#study|#scheduled)?$");
     private static final Pattern TAG = Pattern.compile("^[A-Za-z0-9:_-]{1,100}$");
     // An uncompressed P-256 public key (65 bytes starting 0x04) in base64url without padding: 87 characters,
     // and the 0x04 makes the first one "B".

@@ -3,8 +3,9 @@
 // the server exactly as a browser subscribes its own (POST /api/push/subscribe). The sign-in token never leaves
 // the page. No DOM here, so it's tested in Node (test/android-push.test.js).
 
-// Where a tapped notification may take you: the app's own links only (the same rule as PushPolicy.java).
-export const OPEN_RE = /^\/(#(?:m|c|d)\/[a-z0-9]{1,64}|#call\/(?:dm:)?[a-z0-9]{1,64}|#updates|#study)?$/;
+// Where a tapped notification may take you: the app's own links only (the same rule as PushPolicy.java). #scheduled
+// is your scheduled messages (a push says one wasn't sent, or is waiting for you).
+export const OPEN_RE = /^\/(#(?:m|c|d)\/[a-z0-9]{1,64}|#call\/(?:dm:)?[a-z0-9]{1,64}|#updates|#study|#scheduled)?$/;
 export const safeOpenHash = (path) => { const m = OPEN_RE.exec(String(path ?? '')); return m && m[1] ? m[1] : ''; };
 // An invite link the app was opened with: only the code travels (InviteLinks.java).
 export const safeInviteHash = (code) => (/^[A-Za-z0-9]{2,64}$/.test(String(code ?? '')) ? `#invite/${code}` : '');

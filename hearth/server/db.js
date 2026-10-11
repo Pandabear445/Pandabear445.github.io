@@ -1456,6 +1456,55 @@ if (!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'voiceChatLimits'")
   db.prepare("INSERT INTO instance_settings (key, value) VALUES ('voiceChatLimits', ?)").run(String(Date.now()));
 }
 
+// v19 (scheduled messages): "Send later" (server/scheduled.js). The sender's app encrypts the message exactly as it
+// would to send it now; this holds the ciphertext until send_at, then posts it as a new message. Only ciphertext,
+// never text. channel_id and dm_id have no foreign key on purpose: when the channel or DM is gone by send time, the
+// row stays so the sender can be told (it fails then). epoch is the server key a channel message is locked with;
+// own_key and peer_key are fingerprints of the public keys it was written with (the sender's, and in a DM the other
+// person's), so a key change before send time is noticed and the message held for re-encrypting instead of being
+// posted unreadable. draft is the sender's own copy of what they scheduled, sealed with their personal vault key
+// and bound to ref (an id their app picks), the conversation and the thread: their app re-encrypts only from that
+// copy, so nothing else the server holds can be passed off as something they scheduled. session_id is the session
+// that last wrote it: when that session ends (logout, revoked, password changed), the message is held until the
+// person confirms it from one still signed in. ttl is the disappearing-messages timer the app encrypted it for (in
+// seconds, 0 = none; NULL from an app that didn't say): when it's posted, its deadline counts from then, by the
+// conversation's timer at that moment, and never later than ttl (server/disappear.js, sendSecs in index.js).
+// status: pending, held (needs re-encrypting or confirming by the sender's app) or failed (kept a week so the
+// sender sees why); told_at is when the sender was told one that came due is held. Attachments are blobs whose
+// message_id is this row's id until it's sent.
+db.exec(`
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  server_id TEXT,
+  channel_id TEXT,
+  dm_id TEXT,
+  thread_id TEXT,
+  reply_to TEXT,
+  ciphertext TEXT NOT NULL,
+  epoch INTEGER,
+  ref TEXT,
+  draft TEXT,
+  session_id TEXT,
+  own_key TEXT NOT NULL,
+  peer_key TEXT,
+  ttl INTEGER,
+  files TEXT NOT NULL DEFAULT '[]',
+  mentions TEXT NOT NULL DEFAULT '[]',
+  everyone INTEGER NOT NULL DEFAULT 0,
+  send_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','held','failed')),
+  reason TEXT,
+  told_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK ((channel_id IS NULL) != (dm_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_messages(status, send_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_user ON scheduled_messages(user_id, send_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_server ON scheduled_messages(server_id, status) WHERE server_id IS NOT NULL;
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

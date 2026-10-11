@@ -1838,6 +1838,28 @@ img.cemoji.big { width: 40px; height: 40px; }
 .dis-note .ic { width: 13px; height: 13px; flex: none; }
 .dis-note[hidden] { display: none; }
 .dis-hint .ic { width: 13px; height: 13px; vertical-align: -2px; margin-right: 4px; }
+
+/* ------------------------------------------------------------------ scheduled messages (Send later) */
+.composer-tools .send-later[hidden] { display: none; }
+.composer-tools .send-later:disabled { opacity: .45; }
+.sched-bar { margin-bottom: 6px; }
+.sched-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; max-height: min(60vh, 560px); overflow-y: auto; }
+.sched-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 12px; background: var(--hover); border: 1px solid var(--line-2); }
+.sched-item.failed { border-color: rgb(239 84 102 / .35); }
+.sched-item.held { border-color: color-mix(in oklab, var(--idle) 45%, transparent); }
+.sched-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); flex-wrap: wrap; }
+.sched-head .ic { width: 15px; height: 15px; flex: none; }
+.sched-item.failed .sched-head { color: color-mix(in oklab, var(--danger) 75%, var(--text)); }
+.sched-when { font-weight: 600; }
+.sched-tag, .sched-files { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
+.sched-files .ic { width: 12px; height: 12px; }
+.sched-where { align-self: flex-start; font-size: 12.5px; }
+.sched-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9.5em; overflow-y: auto; line-height: 1.45; }
+.sched-text.muted { color: var(--muted); font-style: italic; }
+.sched-note { margin: 0; font-size: 12.5px; color: var(--text-2); }
+.sched-note.bad { color: color-mix(in oklab, var(--danger) 75%, var(--text)); }
+.sched-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.sched-edit { min-height: 64px; }
 .server-welcome { margin-top: 6px; padding: 10px 14px; border-radius: 12px; background: rgb(var(--accent-rgb) / .08); border: 1px solid rgb(var(--accent-rgb) / .25); color: var(--msg-text); max-width: 70ch; }
 .modal-xl { max-width: 1080px; }
 .server-settings .modal-body { padding: 0; }

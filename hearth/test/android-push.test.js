@@ -437,7 +437,7 @@ test('android-push-12: notification payloads are parsed strictly (javac)', { ski
 });
 
 test('android-push-13: a notification only ever opens an in-app address (javac, and the page agrees)', { skip: !hasJava() && 'no JDK (javac) here' }, async () => {
-  const ok = ['/', '/#m/abc123', '/#c/abc', '/#d/abc', '/#call/dm:abc', '/#call/abc', '/#updates', '/#study'];
+  const ok = ['/', '/#m/abc123', '/#c/abc', '/#d/abc', '/#call/dm:abc', '/#call/abc', '/#updates', '/#study', '/#scheduled'];
   const bad = ['https://evil.example/', '//evil.example', '/#reset=AAAAAAAAAAAAAAAAAAAAAAAA', 'javascript:alert(1)', '/#m/ABC', '/#m/abc?x', '/#call/dm:abc/x', '', '/#invite/abcd', '/x', ' /#m/abc'];
   const out = runJava([...ok, ...bad].map((u) => `    System.out.println(PushPolicy.safeOpenPath(${jstr(u)}));`).join('\n') + '\n    System.out.println(PushPolicy.safeOpenPath(null));');
   assert.deepEqual(out, [...ok, ...bad.map(() => '/'), '/']);

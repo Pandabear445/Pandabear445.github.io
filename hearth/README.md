@@ -257,7 +257,7 @@ The owner (normally the first account created on the server), the admins and mod
 - **Captcha on sign-up and login:** a private, self-hosted "I'm not a robot" check (proof of work, like ALTCHA). People's browsers solve a small puzzle — about a fifth of a second on a computer, usually finished before they've typed their password — which makes mass sign-ups and password guessing expensive for bots. Puzzles are signed, single-use and expire after 5 minutes. Networks (IPv6 per /64) that keep failing get harder puzzles. When sign-ups (more than 120 an hour) or sign-ins (more than 3,000 in 10 minutes) are unusually busy, the puzzle gets harder for everyone, up to a few seconds in a browser, instead of turning people away; the app solves the harder one by itself. With the robot check switched off, those limits refuse requests instead. "Forgot password" uses the login robot check. No Google/hCaptcha scripts and no tracking. Turn it on or off for login and sign-up in Admin → Registration & Terms. It's proof of work, so a determined attacker with fast hardware pays less than a browser does.
 - Strict browser security policy (only this server's own scripts can run, and the app's own requests can only go back to this server), clickjacking protection, HSTS on HTTPS, locked-down browser permissions. Pictures and videos can still load from other sites, so the policy alone doesn't stop data leaving (see [SECURITY.md](SECURITY.md) row 25).
 - Rate limits by network (IPv6 per /64), per account (from any number of IPs) and per session on sign-in, sign-up, password reset, two-factor codes, email codes, messages, uploads, joining servers and profile edits. Requests without a solved robot check don't count toward the per-account or instance-wide limits. The devices that have signed in to an account before (they keep a signed note) and the networks it has been used from (for IPv6, the whole /64) have their own limit, so a stranger can't lock someone out of their usual devices. Someone who keeps solving robot checks can still hold up a brand-new device on a new network for a while (10 tries per 15 minutes, 100 a day per account).
-- **Sessions:** every device is listed in Settings → Security → Signed-in devices (device, IP, last active) and can be signed out on its own, or all at once with "Log out all other devices". Sessions also end after 60 days unused or 365 days in total. Signing out, changing the password, a reset and turning on two-factor all cut off the other devices immediately, including open app windows and their push notifications. (The device you make the change on keeps its own sign-in.)
+- **Sessions:** every device is listed in Settings → Security → Signed-in devices (device, IP, last active) and can be signed out on its own, or all at once with "Log out all other devices". Sessions also end after 60 days unused or 365 days in total. Signing out, changing the password, a reset and turning on two-factor all cut off the other devices immediately, including open app windows and their push notifications, and messages they [scheduled](#send-later-scheduled-messages) wait until you confirm them. (The device you make the change on keeps its own sign-in.)
 - **Re-confirm before sensitive changes:** these need your password again, plus a two-factor code if it's on: changing your password, email, recovery key or username, turning off two-factor, deleting your account, and deleting or handing over a server you own. For admins also: team and ownership changes, deleting backups or keeping fewer of them, showing the backup key, changing where payments go, changing the call relay's secret or addresses, and creating or reinstalling a region. If you passed two-factor in the last 10 minutes (say, you just signed in with a code), the password alone is enough; turning two-factor off always needs a fresh code. 10 wrong passwords per 10 minutes.
 - **Blocked IP addresses** (Admin → Security) also cut off people already signed in from that address, and its "forgot password" and reset links. Staff are exempt, and logging out always works.
 - **Automated attacker:** the test suite (`npm test`, run by GitHub Actions on every push) tries every API route without signing in, with other people's ids, and with hostile input, and checks the rules in [SECURITY.md](SECURITY.md).
@@ -463,6 +463,7 @@ All chats are end-to-end encrypted: your browser encrypts each message and file 
 | Who's in which server, who messages whom and when, emoji reactions, server/channel names, avatars and profiles, file sizes, which GIFs people pick and load, and when and where (not what) you search | Yes |
 | Whether each of your open apps is in use or idle (for automatic **Away**), and how long a custom status should last | Yes. Away, like Online, goes to everyone signed in on this Hearth (people you've blocked too), so it shows when you stop and start using Hearth. See [Away and custom statuses](#away-and-custom-statuses) |
 | Links you ask a **link preview** for (and that it was you, and when) | Yes: the server fetches the page for you. The preview itself then travels inside the encrypted message. See [Link previews](#link-previews) |
+| **Scheduled messages** (Send later) | **No** for what they say: encrypted on your device like any message. Yes for where each is going, when it's due, when and from which session you wrote or changed it and how big it is, before it's sent. See [Send later](#send-later-scheduled-messages) |
 | Messages sent before the encryption upgrade | Yes, with `data/secret.key` (shown in the app as "Older message — not end-to-end encrypted, sender not verified"; plaintext messages dated after encryption was switched on are hidden) |
 
 ### How it works
@@ -692,6 +693,53 @@ Details: [docs/design/LINK-PREVIEWS.md](docs/design/LINK-PREVIEWS.md) and [docs/
 - **Limits:** 15 status changes a minute and 120 an hour per account (Online/Away/Do Not Disturb/Invisible, the Away
   time and custom statuses together). Each app's idle reports, 20 changes a minute per account. A custom status is up
   to 128 characters (one line) with one emoji, and can clear itself from 1 minute to a week from now.
+
+## Send later (scheduled messages)
+
+Write a message, then press the **clock** next to the send button (or right-click the send button) and pick a time:
+in 1 hour, in 3 hours, this evening, tomorrow morning, Monday morning, or **Pick a date and time…** (up to 30 days
+ahead). Works in server channels (voice channels' chats too), threads, group chats and DMs, with files and link
+previews. At that time it's posted as if you sent it then: everyone gets it live, with notifications and @mentions
+as usual.
+
+- **Still end-to-end encrypted.** Your app encrypts the message the moment you schedule it, exactly as it would to
+  send it now (same format, key and signature); your Hearth server keeps that ciphertext and posts it at the time.
+  It never gets the words. It does know where it's going, when, and how big it is, ahead of time. Your app also
+  keeps its own copy there, locked with a key only your account's keys make, which is what your list shows and the
+  only thing your app ever re-encrypts (see below).
+- **Disappearing messages:** in a conversation with a timer, it's encrypted for the timer in force when you schedule
+  it, and it disappears that long after it's **posted** (not after you scheduled it), or sooner if the conversation's
+  timer is shorter by then. The list shows "Disappears after …" on each one like that.
+- **It doesn't mark anything read for you.** When it goes out you may well be away, so @mentions and messages that
+  arrived in that conversation meanwhile stay unread (unlike a message you send yourself).
+- **Your list:** a bar above the message box says what's scheduled in that conversation (also in the ⋯ menu →
+  **Scheduled messages**). From there you can **Edit** the words, **Reschedule**, **Send now** or **Cancel**. Up to
+  25 scheduled messages at a time.
+- **If it can't go out at its time** (you were timed out, removed or banned, lost permission to post there, the
+  channel, thread or DM is gone, they blocked you or deleted their account), it isn't sent: it shows as **Not sent**
+  with the reason, and you're told (in the app, or by push if it's closed). Slow mode only delays it. One that came
+  due more than a day ago while the server was down isn't posted that late either.
+- **If the conversation's key changes first** (someone left the server, or the person you're writing to reset their
+  password without their recovery key), the stored message would be locked with the old key, which newer members
+  can't open (and a removed member could). So the server **holds** it instead, and your app re-encrypts it with the
+  new key the next time it's open, by itself if the time is still ahead (or passed less than 10 minutes ago); for a
+  DM, once you've checked their new safety number. Later than that it asks you first (**Send now** or a new time),
+  and saving an edit of one asks too. If **your own** keys changed (a password reset without your recovery key), the
+  old message can't be re-encrypted any more: it shows as not sent, so write it again.
+- **Signed out means stopped.** If the device or session that scheduled a message is signed out before it goes (you
+  log out there, sign it out in Settings → Signed-in devices or with **Log out all other devices**, or change or reset your
+  password), the message waits for you: open the list on a device that's still signed in and choose **Keep** (or
+  Send now, Edit, Reschedule, Cancel). So signing out a stolen session also stops what it queued.
+- **Only what you scheduled.** Your app re-encrypts a scheduled message only from its own copy, never from what the
+  server hands back. A message in your list that your app can't confirm you wrote (it wasn't scheduled by one of
+  your signed-in apps) says so and can only be cancelled: neither the server nor someone with a stolen session can
+  get your app to re-sign their words, or an old message of yours, under your name.
+- **Honest limits:** the server is trusted to keep the time and to really delete a message you cancel (it holds a
+  valid encrypted message, and your app's copy, until then: a dishonest server could bring back one you cancelled,
+  into the same conversation), and the message's time isn't signed. Holding a signed-out session's messages is done
+  by the server too. Server backups taken meanwhile keep a copy until they rotate out, as for any message.
+
+Details: [docs/FEATURES.md](docs/FEATURES.md#scheduled-messages-send-later).
 
 ## Search (Ctrl+K)
 

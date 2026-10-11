@@ -369,8 +369,9 @@ fails (404/410 → dropped, or 507 → failures; see §6.4). This trade-off is a
 - **Notifications stop with the session.** `pushSubLive` and `revokeSessions` already enforce this server-side. The
   app also unregisters natively on sign-out.
 - **Tap targets are in-app only.** A notification can open only `/`, `/#m/<id>`, `/#c/<id>`, `/#d/<id>`,
-  `/#call/<room>`, `/#updates` or `/#study`. These are validated in Java (`PushPolicy.safeOpenPath`) and again in
-  JS. A crafted payload can't make the app load another site, and the WebView's own navigation guard
+  `/#call/<room>`, `/#updates`, `/#study` or `/#scheduled` (your scheduled messages, added with Send later). These
+  are validated in Java (`PushPolicy.safeOpenPath`) and again in JS. A crafted payload can't make the app load
+  another site, and the WebView's own navigation guard
   (`HearthClient.shouldOverrideUrlLoading`) still applies.
 
 ### What is new or weaker (put these in SECURITY.md §4)
