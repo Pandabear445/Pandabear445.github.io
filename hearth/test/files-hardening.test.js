@@ -681,6 +681,11 @@ test('files-12: GIF media is fetched from an address rebuilt from the allowed ho
   const giphy = ['media.giphy.com', 'i.giphy.com', ...Array.from({ length: 10 }, (_, n) => `media${n}.giphy.com`)];
   assert.deepEqual([...MEDIA_HOSTS].sort(), [...giphy, 'static.klipy.com', 'static.klipy.co', 'media.klipy.com'].sort());
   for (const h of MEDIA_HOSTS) assert.equal(at(`https://${h}/media/abc/giphy.gif`), `https://${h}/media/abc/giphy.gif`, h);
+  // The app sends a GIF through the proxy only if it is on these same hosts; anything else loads directly.
+  const appJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  const isGiphy = new RegExp(/const isGiphy = \(u\) => \/(.*)\/i\.test\(u\);/.exec(appJs)[1], 'i');
+  for (const h of MEDIA_HOSTS) assert.ok(isGiphy.test(`https://${h}/x.gif`), `the app proxies ${h}`);
+  for (const h of ['media10.giphy.com', 'media01.giphy.com', 'mediax.giphy.com', 'giphy.com', 'tenor.com']) assert.ok(!isGiphy.test(`https://${h}/x.gif`), `the app doesn't proxy ${h}`);
   for (const s of ['https://media10.giphy.com/x.gif', 'https://media01.giphy.com/x.gif', 'https://mediax.giphy.com/x.gif', 'https://evil.media.giphy.com/x.gif',
     'https://media.giphy.com.evil.test/x.gif', 'https://giphy.com/x.gif', 'https://klipy.com/x.gif', 'https://static.klipy.com.evil.test/x.gif']) assert.equal(at(s), null, s);
   // Upper case is the same host. A trailing dot, plain http, another port or another scheme: refused.

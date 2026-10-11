@@ -3824,6 +3824,7 @@ const turnUrls = () => String(getSetting('turnUrls') || process.env.TURN_URL || 
 const turnSecret = () => getSetting('turnSecret') || process.env.TURN_SECRET || '';
 // The older static TURN_USERNAME/TURN_CREDENTIAL still work, but then every signed-in user (and every former
 // member) holds the same relay password, forever. Say so, so it gets replaced by the shared-secret mode.
+if (process.env.MAIL_OUTBOX_DIR) log.warn('mail', 'outbox_removed', { msg: 'MAIL_OUTBOX_DIR is no longer used: emails are only sent through SMTP (Admin \u2192 Owner \u2192 Email, or SMTP_HOST and MAIL_FROM).' });
 if (process.env.TURN_USERNAME && !turnSecret()) log.warn('turn', 'static_password', { msg: 'TURN_USERNAME/TURN_CREDENTIAL hand everyone the same relay password that never expires. Use TURN_SECRET instead (sudo bash scripts/setup-turn.sh sets it all up).' });
 // Relays: this server's own (if set up) plus every linked region that's up (server/regions.js). Each is its own
 // entry with a region name, so the app can measure which answer fastest and use those.

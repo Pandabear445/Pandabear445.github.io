@@ -618,7 +618,7 @@ implementer). Benchmark, 200,000 messages: one page in 4–12 ms (p50), a 1,000-
 - Exports larger than a test account.
 - Media end-to-end encryption, which is designed in `docs/VOICE.md` but not built.
 
-## 12. Code scanning cleanup (1.28.1)
+## 12. Code scanning cleanup (1.28.1 and 1.28.2)
 
 CodeQL (`security-extended`, the same queries as CI) was run locally on 1.28.0 with the CodeQL CLI. It reported
 493 results: 437 `js/missing-rate-limiting` and 56 others. Each was traced from source to sink.
@@ -649,25 +649,27 @@ CodeQL (`security-extended`, the same queries as CI) was run locally on 1.28.0 w
   - What was really missing was a limit for ordinary signed-in requests. That limit is now in `auth()`:
     `API_RATE_LIMIT`, 1200 a minute per account by default (SECURITY.md row 91).
   - Bots already had their own limit, and the routes that work without signing in limit themselves.
-- **Fixed in 1.28.2 (5).** These first looked like by-design matches, but each had a real fix:
+- **Closed in 1.28.2 (5).** These first looked like by-design matches. Three had a real fix; two were closed by renames:
   - `js/weak-cryptographic-algorithm`: TURN REST credentials stay HMAC-SHA1, because coturn requires it and
     HMAC-SHA1 is not a broken MAC. What changed is the relay login: it used to carry the user id, so every relay
     logged real user ids, including region relays that may run on other people's machines. It now carries
     `log.userHash(uid)`, the keyed pseudonym the access log already uses. The login is still per person, so
-    coturn's quota is unchanged, and an admin can still match relay logs to the access log (`voice-hardening.test.js`
-    › voice-6/9). The local variable is now called `login`, which is also what the comments call it.
+    coturn's quota is unchanged. An admin can match relay logs to the access log and find the account with
+    `node server/cli.js who <pseudonym>` (`voice-hardening.test.js` › voice-6/9). The local variable is now called
+    `login`, which is also what the comments call it. CodeQL also flags any variable named `username`.
   - `js/request-forgery`: the GIF media proxy used to check a requested address and then fetch it as given. Now
     every address it fetches, the first and each redirect, is rebuilt by `server/gifmedia.js` from this server's
     own strings: the scheme, a host from an exact list, and the request's path and query re-encoded segment by
-    segment. The host list replaces the `media\d*` pattern with media and media0–9; built-in hosts with a port are
-    refused, and the app's own GIPHY check matches the list (`files-hardening.test.js` › files-12).
+    segment. The host list replaces the `media\d*` pattern with media and media0–9, built-in hosts on a port other
+    than 443 are refused, and the app's own GIPHY check matches the list (`files-hardening.test.js` › files-12).
   - `js/http-to-file-access`: the test-only `MAIL_OUTBOX_DIR`, which wrote each email to a folder, is gone from
-    the server. The tests now receive mail over real SMTP in an in-memory sink (`test/smtp-sink.js`), so mail goes
-    through nodemailer as it does in production.
+    the server, which logs a warning at start-up if it is still set. The tests now receive mail over real SMTP in
+    an in-memory sink (`test/smtp-sink.js`), so mail goes through nodemailer as it does in production.
   - `js/user-controlled-bypass` (×2): CodeQL treats any call whose name contains "auth" as an authorization
     check. `showAuth()` only shows the sign-in screen, and `authorMayPingEveryone()` only decides how an @everyone
-    is shown on this device. They are now `showSignIn()` and `senderMayPingEveryone()`, names that say what they do.
-    The server makes every real access decision.
+    is shown on this device. Neither was ever an access check, so nothing about behaviour changed: they were
+    renamed `showSignIn()` and `senderMayPingEveryone()`, names that say what they do. The server makes every real
+    access decision.
 
 Each fix was checked by a fresh CodeQL database and analysis (CodeQL 2.27.2, the same queries as CI). The
 remaining result count is 0, apart from the turned-off rate-limiting rule. On GitHub, alerts close when the

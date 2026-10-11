@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
+const { spawnSync } = require('node:child_process');
 const { startServer, hex, sleep } = require('./helpers');
 
 const P = { VIEW: 1, SEND: 2, MENTION_EVERYONE: 16, CONNECT: 64, SPEAK: 128 };
@@ -366,6 +367,15 @@ test('voice-6/9: relay logins say when they run out, stay the same for hours, ne
   assert.ok(limited >= 1, '/ice is rate-limited');
   // It's the access log's pseudonym for the same person, so an admin can match relay logs to it.
   assert.ok(await until(() => new RegExp(`route=/api/ice status=429 .*uid=${who}\\b`).test(srv.log)), 'the access log names the person the same way');
+  // The server's admin can turn a pseudonym (or a whole login from a relay's log) back into the account.
+  const who_ = (arg) => spawnSync(process.execPath, ['server/cli.js', 'who', arg], { cwd: path.join(__dirname, '..'), env: { ...process.env, DATA_DIR: srv.dir }, encoding: 'utf8' });
+  for (const arg of [who, relay.username]) {
+    const r = who_(arg);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, new RegExp(`\\(id ${u.id}\\)`), arg);
+    assert.doesNotMatch(r.stdout, new RegExp(other.id));
+  }
+  assert.equal(who_('000000000000').status, 1, 'an unknown pseudonym finds nobody');
 });
 
 test('voice-6: the app sees when relay logins are about to run out, and never hands expiresAt to WebRTC', async () => {

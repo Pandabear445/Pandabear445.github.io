@@ -608,6 +608,8 @@ are never logged, and IP addresses are cut to their network (`LOG_FULL_IP=true` 
   alerts to the owner by email.
 - `node server/cli.js doctor`: read-only checks of your install, exit 0/1/2. Add `--relays` to test relays, or
   `--fix-permissions` to tighten key file permissions.
+- `node server/cli.js who <pseudonym>`: logs name people by a pseudonym, not their user id (the access log's `uid`, and
+  the part after the colon in a relay login). This finds the account behind one.
 
 See `docs/OPERATIONS.md`.
 
