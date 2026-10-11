@@ -606,7 +606,9 @@ function startApp() {
     if (!S.me) return;
     // Only your own Away for being inactive (or back): just the dots and the line under your name. Nothing is
     // rebuilt, so a call stays as it is (full screen too), and a button being pressed or focused stays put.
-    if (onlyMyPresence(u)) { setUser(u); showMyPresence(); return; }
+    const presenceOnly = onlyMyPresence(u);
+    if (u && u.id === S.me.id) rememberSelf(u);
+    if (presenceOnly) { setUser(u); showMyPresence(); return; }
     const roleBefore = S.me.staffRole;
     setUser(u); sec.trust(u); refreshUserBits(u.id);
     // Given or lost a staff role: show or hide the admin dashboard right away.
@@ -920,6 +922,7 @@ async function loadBootstrap() {
   // How far this device's clock is from the server's (at most a day either way), for disappearing messages.
   if (Number.isFinite(b.serverNow)) S.clockOffset = Math.max(-86400000, Math.min(86400000, b.serverNow - Math.round((asked + Date.now()) / 2)));
   S.me = b.me;
+  rememberSelf(b.me);
   drafts = createDrafts(S.me.id);
   S.mediaToken = b.mediaToken;
   S.iceServers = b.iceServers;
@@ -1026,10 +1029,15 @@ function redrawPeople() {
   }
 }
 // A user:update about you that changes nothing but whether you show as Away for being inactive.
+// Compared with the last copy of you the server sent, not with S.me: the app tidies parts of S.me itself (the
+// server bar's order gains servers you joined, see folders.js), and that alone mustn't count as a change.
 const PRESENCE_ONLY = new Set(['presence', 'autoAway']);
+let lastSelf = null; // key -> JSON of the last value the server sent for you
+function rememberSelf(u) { lastSelf = Object.fromEntries(Object.entries(u).map(([k, v]) => [k, JSON.stringify(v)])); }
 function onlyMyPresence(u) {
   if (!u || u.id !== S.me.id) return false;
-  return Object.keys(u).every((k) => PRESENCE_ONLY.has(k) || JSON.stringify(u[k]) === JSON.stringify(S.me[k]));
+  const was = (k) => (lastSelf && k in lastSelf ? lastSelf[k] : JSON.stringify(S.me[k]));
+  return Object.keys(u).every((k) => PRESENCE_ONLY.has(k) || JSON.stringify(u[k]) === was(k));
 }
 function showMyPresence() {
   const st = presenceOf(S.me, S.me.id);
