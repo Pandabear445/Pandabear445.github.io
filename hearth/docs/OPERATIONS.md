@@ -1,8 +1,9 @@
 # Running Hearth: logs, health, alerts and the doctor
 
 This page is for the person who runs a Hearth server. It covers what Hearth writes to its log, the health
-endpoints and what each one means, how to wire them into a reverse proxy or Docker, the `doctor` command, the
-alerts the owner gets, and how the updater checks an update. The last section lists what Hearth still doesn't do.
+endpoints and what each one means, how to wire them into a reverse proxy or Docker, metrics for Prometheus, the
+`doctor` command, the alerts the owner gets and where else they can go, and how the updater checks an update. The
+last section lists what Hearth still doesn't do.
 
 Paths are relative to `hearth/`.
 
@@ -187,7 +188,8 @@ be. `200` means "send people here", `503` means "don't".
   memory, uptime, version, Node version, schema version, open connections.
 - **Security**: failed sign-ins, robot checks and blocked connections in the last 10 minutes, and unexpected
   server errors in the same window.
-- **Alerts**: the settings and the last 30 alerts.
+- **Alerts**: the settings, the alert channels (masked) with their last delivery, and the last 30 alerts.
+- **Alert channels**: degraded when a switched-on channel's last 3 deliveries failed (`channel_failing`).
 
 The overall status is the worst of the parts.
 
@@ -228,6 +230,66 @@ chat.example.com {
 
 nginx (open source) has no active checks; point an uptime monitor (Uptime Kuma, Gatus, healthchecks.io's HTTP
 check, a cron job with curl) at `https://your.domain/api/health/ready` and alert on anything but `200`.
+
+### Metrics for Prometheus (`/metrics`)
+
+`GET /metrics` answers in Prometheus's text format (`text/plain; version=0.0.4`). It's **off** unless
+`METRICS_TOKEN` is set in the environment, at least 16 characters (`openssl rand -hex 32`); shorter keeps it off
+and says so in the log. Off, it's a plain `404`.
+
+- **Auth:** `Authorization: Bearer <METRICS_TOKEN>`, compared in constant time. Anything else is `401` with
+  `WWW-Authenticate: Bearer`. The token is never accepted in the address. 20 wrong tokens from one network
+  (an IPv4 address or an IPv6 /64) in 10 minutes and that network gets `429` for the rest of the window, the right
+  token included, so guessing doesn't pay. 600 scrapes a minute per network. So scrape from an address that
+  visitors don't share: if people reach Hearth's published port directly, Docker can show them all as its gateway
+  (`172.x.0.1`), and someone sending wrong tokens could then lock out a scraper on that same address. Scraping
+  `http://hearth:3000/metrics` from a container on the same Docker network, or through the proxy with
+  `TRUST_PROXY` set, keeps the scraper's address its own.
+- **What's in it:** only numbers about the instance. Labels are a status class, a background job's fixed name, a
+  message kind, and the version; never a person, a name, an id, an IP or a server.
+
+| Metric | Type | What |
+|---|---|---|
+| `hearth_info{version,schema,node}` | gauge | always 1 |
+| `hearth_ready` | gauge | 1 when `/api/health/ready` would say ready |
+| `hearth_process_uptime_seconds` | gauge | since the process started |
+| `hearth_event_loop_lag_p99_seconds`, `hearth_event_loop_lag_max_seconds` | gauge | over the last sampled minute (the first sample is 15 s after start) |
+| `hearth_process_resident_memory_bytes`, `hearth_process_heap_used_bytes`, `hearth_process_heap_total_bytes` | gauge | memory |
+| `hearth_http_requests_total{class="1xx".."5xx"}` | counter | HTTP answers by status class (Socket.IO traffic isn't counted) |
+| `hearth_unexpected_errors_total` | counter | error-level log lines (the same ones the "repeated errors" alert counts) |
+| `hearth_sockets` | gauge | open live connections |
+| `hearth_job_last_run_timestamp_seconds{job}`, `hearth_job_last_success_timestamp_seconds{job}` | gauge | Unix time; absent until the job has run (or succeeded) |
+| `hearth_job_runs_total{job}`, `hearth_job_failures_total{job}` | counter | since the process started |
+| `hearth_job_consecutive_failures{job}` | gauge | failures in a row (3 is "broken" in Admin → Health) |
+| `hearth_backups` | gauge | encrypted backups kept |
+| `hearth_backup_last_timestamp_seconds`, `hearth_backup_age_seconds` | gauge | the newest encrypted backup; absent when there's none |
+| `hearth_disk_free_bytes`, `hearth_disk_total_bytes` | gauge | where the data lives |
+| `hearth_registered_users` | gauge | accounts (bots and webhooks not counted); counted at most once a minute |
+| `hearth_messages{kind="channel"\|"direct"}` | gauge | messages stored; counted at most once a minute |
+
+Counters start again at 0 when Hearth restarts (Prometheus's `rate()` and `increase()` handle that).
+
+A scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: hearth
+    scheme: https
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/hearth-token   # the same value as METRICS_TOKEN
+    static_configs:
+      - targets: ['chat.example.com']
+```
+
+Behind Caddy with `HTTPS=false`, Hearth refuses plain-HTTP requests that come straight from the internet, so
+Prometheus either goes through the proxy (as above) or scrapes `http://hearth:3000/metrics` from the same Docker
+network or machine. To keep `/metrics` off the public site, add `respond /metrics 404` before `reverse_proxy` in
+the Caddyfile and scrape Hearth directly.
+
+Some alerting rules to start from: `hearth_ready == 0` for 5m; `hearth_backup_age_seconds > 26*3600`;
+`hearth_job_consecutive_failures >= 3`; `rate(hearth_http_requests_total{class="5xx"}[5m]) > 0.1`;
+`hearth_disk_free_bytes / hearth_disk_total_bytes < 0.1`; `hearth_event_loop_lag_p99_seconds > 0.2`.
 
 ## 4. The doctor
 
@@ -295,12 +357,15 @@ Where they go:
   Email) and the owner's account has a confirmed address.
 - **The admin dashboard, live**: the `admin:alert` event to the `admins` room. Staff who have the app open see a
   toast; Admin → Health lists the last 30.
+- **Alert channels** an admin added in Admin → Health → *Where alerts go*: ntfy, a signed webhook, Discord or
+  Slack (below).
 
 No storms:
 
 - The same alert is sent **at most once per cooldown** (default 60 minutes; Admin → Health, or
   `ALERT_COOLDOWN_MIN`). What was held back in between is counted and mentioned in the next one.
-- **At most 12 alerts an hour** in all.
+- **At most 12 alerts an hour** in all. The one saying alert channels are failing has its own slot instead (at most
+  once an hour), so it never holds back a real alert.
 - The state is saved, so a restart (or a crash loop) doesn't send everything again.
 - When a condition clears (a job works again, disk is freed, a region comes back), its alert is armed again.
 
@@ -309,8 +374,68 @@ descriptions.
 
 Switching: Admin → Health → Alerts (on/off, email on/off, cooldown) or `ALERTS=off` in the environment as the
 default. Turning alerts or alert emails **off** needs the password (and two-factor) again, like reducing backups,
-because it's what someone covering their tracks would do; it's recorded in the audit log. "Send a test alert"
-checks that they reach you.
+because it's what someone covering their tracks would do; so does a cooldown longer than an hour (at a week, each
+kind of alert would reach the owner once a week). Both are recorded in the audit log. "Send a test alert"
+checks that they reach you (the email and every channel that's on).
+
+### Alert channels
+
+Admin → Health → **Where alerts go** adds places besides the owner's email (up to 10):
+
+| Kind | What you give it | What it sends |
+|---|---|---|
+| **ntfy** | the server (`https://ntfy.sh`, or your own), a topic, and optionally an access token (`tk_…`) | a JSON publish to the server: the topic, `title` ("<instance name>: <alert>"), `message`, `priority` 5 for urgent alerts and 4 for the others, a tag; `Authorization: Bearer <token>` when there's a token |
+| **Webhook** | an address | `POST` with JSON `{ v: 1, id, type: "alert" \| "alert.test", createdAt, server, alert: { key, severity, title, detail, held, at } }`, signed (below) |
+| **Discord** | a Discord webhook URL (or anything that takes Discord's format) | `{ content, allowed_mentions: { parse: [] } }`, so nothing in an alert can ping anyone |
+| **Slack** | an incoming-webhook URL from Slack, Mattermost, Rocket.Chat… | `{ text }`, with `&`, `<` and `>` escaped as Slack asks |
+
+The words are the email's: the alert's title and details, how many were held back, and "Open Admin → Health". No
+names, addresses or message content, as with the email.
+
+**Webhook signature**, the same scheme as bot webhooks (`docs/BOTS.md`): headers `X-Hearth-Event`,
+`X-Hearth-Delivery` (the body's `id`), `X-Hearth-Timestamp` (Unix seconds) and
+`X-Hearth-Signature: v1=<hex>`, where `<hex>` is HMAC-SHA256 of `"<timestamp>.<raw body>"` with the channel's
+signing secret. The secret is shown once, when the channel is added; to get a new one, remove the channel and add it
+again. Check the signature against the raw bytes, compare in constant time, and refuse old timestamps.
+
+**Secrets:** addresses, topics (on a public ntfy, whoever knows the topic can read it) and tokens are sealed at rest
+with the server's key (`data/secret.key`, like the SMTP password) in the `alertChannels` setting, and only a masked
+form ever goes to the browser or the audit log: the server and the last four characters (`https://discord.com/••••x9Qz`,
+`topic ••••ab12`). A long first part of a host name is masked too, since some services put the secret there
+(`https://••••7e64.m.pipedream.net/••••`), and so is the path of an ntfy server. Restoring a backup without its `secret.key` leaves channels unreadable: remove and add them again.
+
+**Who can do what:** instance admins add channels, rename them, turn them on and use **Test**. Turning one **off**,
+changing where it points (address, topic or token) or **removing** it needs the password again, and a fresh
+two-factor code each time when that's on, for the same reason as turning alerts off: someone covering their tracks
+would quietly redirect alerts. So does making the cooldown longer than an hour. A new address is checked before the
+code is asked for, so a typo doesn't use one up. Everything is in the audit log. Limits: 30 changes and 20 tests an hour per admin.
+
+Moving an ntfy channel to a **different server** needs its topic typed again (and its access token, if the new
+server needs one): the saved ones are never sent to another server, since whoever runs it would learn them. The
+ntfy topic's own address pasted as the server (`https://ntfy.sh/my-topic`, with the topic `my-topic`) is taken
+apart into the server and the topic; end the address with `/` when the path is your ntfy's own
+(`https://example.com/alerts/` with the topic `alerts`).
+
+**The network:** deliveries go through the same guard as feeds and push (`server/netguard.js`): `https` only, every
+address the name has must be public (no private, loopback, link-local, CGNAT or cloud-metadata addresses, however
+they're written), the connection goes to the address that was checked (no DNS rebinding), redirects aren't
+followed, one delivery may take `ALERT_CHANNEL_TIMEOUT_MS` (8 s) in all, and at most 16 KB of the answer is read.
+A service on your own network (a self-hosted ntfy on the LAN or a Docker network) must be named in
+`ALERT_PRIVATE_HOSTS`: exact names or addresses, on the default port unless the entry has one (`ntfy.lan:8080`,
+`[fd00::5]:8443`). Only those hosts may use plain `http`. Addresses are checked when a channel is saved and again
+on every delivery.
+
+**Status:** each channel shows its last delivery (when, the answer, the error) and how many real alerts failed in a
+row. Any 2xx answer counts as delivered. A switched-on channel whose last 3 alerts failed makes Admin → Health
+*degraded* and raises an alert ("Alerts can't reach the … channel", or "… N alert channels" naming them), which goes
+out through the email and the other channels. That's one alert for all failing channels, at most once an hour and
+outside the 12-an-hour cap, so broken channels (or an admin adding a pile of them) can't hold back real alerts.
+**Test** sends a test to that one channel, on or off, and shows what came back; a failed Test is shown but doesn't
+count toward "failing", and one that gets through resets it.
+
+**ntfy tips:** on ntfy.sh, pick a long random topic. On your own ntfy with `auth-default-access: deny-all`, make a
+token for a user with write access to the topic (`ntfy token add <user>`, `ntfy access <user> <topic> write-only`).
+`401`/`403` from ntfy means the token or its access is wrong.
 
 ## 6. Updates: checksums and signatures
 
@@ -418,14 +543,15 @@ the phone). Each host and answer is logged at most once an hour, and never the a
 
 ## 8. What's still missing
 
-- **Metrics export.** There's no Prometheus/OpenMetrics endpoint. Admin → Health and `/api/admin/health` are
-  point-in-time; there's no history beyond the logs.
+- **Metrics history.** `/metrics` (section 3) is point-in-time like Admin → Health; keeping history is up to
+  Prometheus (or whatever scrapes it). There's no OpenMetrics format, no per-route timings and no histograms.
 - **Multiple instances.** Job health, alert counters, rate limits and the security log live in one process (job
   health and alert state are also saved in that instance's database). Running several Hearth processes against
   one database isn't supported anyway.
 - **External monitoring.** Hearth can't tell you it's down: if the process or the machine is gone, nothing sends
   an alert. Point an external uptime monitor at `/api/health/ready` for that.
-- **Other alert channels.** Email and the dashboard only: no webhooks, Slack, ntfy or SMS yet.
+- **More alert channels.** Email, the dashboard, ntfy, signed webhooks, Discord and Slack; no SMS, Matrix or
+  Telegram (a webhook to a bridge works). A failed delivery isn't retried: the next alert, or Test, tries again.
 - **Log shipping and retention** are up to Docker's log driver or journald (the compose file rotates at
   3 × 10 MB).
 - **The security log** is still kept in memory (500 events) for Admin → Security; the server log now has a copy

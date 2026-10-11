@@ -617,6 +617,9 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `BACKUP_RCLONE_REMOTE` | — | Copy every encrypted backup off-site with rclone, e.g. `b2:my-bucket/hearth` |
 | `DISAPPEAR_SWEEP_MS` | `60000` | How often the safety sweep deletes disappearing messages whose time has passed (each one is also deleted at its own time by a precise timer) |
 | `DISAPPEAR_CHECKPOINT_MS` | `600000` | The shortest gap between resets of the database's write-ahead log after a sweep that deleted something (so deleted messages' bytes don't linger there) |
+| `ALERT_PRIVATE_HOSTS` | — | Alert channels (ntfy, webhooks) on your own network that may have private addresses, and may use plain `http`: exact names or addresses, on the default port unless given (`ntfy.lan:8080`). Nothing else private is reachable |
+| `ALERT_CHANNEL_TIMEOUT_MS` | `8000` | How long one delivery to an alert channel may take |
+| `METRICS_TOKEN` | — (off) | Turns on `GET /metrics` (Prometheus text) for scrapers that send `Authorization: Bearer <token>`. At least 16 characters (`openssl rand -hex 32`); shorter keeps it off |
 | `HEARTH_BIND` | all interfaces | Docker only: the address port 3000 listens on. Set `127.0.0.1` behind Caddy |
 
 ---
@@ -862,6 +865,16 @@ are never logged, and IP addresses are cut to their network (`LOG_FULL_IP=true` 
 - `GET /api/health/ready`: ready for people (database, data folder, schema, maintenance, disk). `200` or `503`.
 - Admin → **Health**: background jobs, the news bot, relays, backups and restore tests, disk, responsiveness, and
   alerts to the owner by email.
+- **Where alerts go** (Admin → Health): besides the email, alerts can go to ntfy (ntfy.sh or your own, with an access
+  token), a webhook signed like the bots' (HMAC-SHA256), or a Discord or Slack webhook. Each has a Test button and
+  shows its last delivery. Addresses and tokens are kept encrypted and only ever shown masked. Any admin can add one;
+  turning one off, changing where it points or removing it needs the password again (that's how someone would hide
+  alerts), and so does a cooldown longer than an hour. Channels that keep failing raise one alert between them, so
+  they never hold back real ones. They must be public `https` addresses unless `ALERT_PRIVATE_HOSTS` names the host
+  (a self-hosted ntfy on your network).
+- `GET /metrics`: numbers for Prometheus (uptime, event-loop lag, memory, requests by status class, sockets, jobs,
+  backup age, disk, account and message totals), nothing about anyone. Off unless `METRICS_TOKEN` is set; scrapers
+  send `Authorization: Bearer <token>`.
 - `node server/cli.js doctor`: read-only checks of your install, exit 0/1/2. Add `--relays` to test relays, or
   `--fix-permissions` to tighten key file permissions.
 - `node server/cli.js who <pseudonym>`: logs name people by a pseudonym, not their user id (the access log's `uid`, and

@@ -704,11 +704,16 @@ function startApp() {
     playSound('mention');
     if (S.view.type === 'admin' && S.view.tab === 'reports') renderMain();
   });
+  // Only the Health page's own content is redrawn (a new admin view would jump back to the top and drop focus, for
+  // whoever pressed the button and for every other admin looking at Health).
+  const refreshHealth = () => { if (S.view.type === 'admin' && S.adminEl && S.adminEl._refreshHealth) S.adminEl._refreshHealth(); };
   // Problems the server found (failed backup, a relay down, low disk...): staff see them as they happen.
   socket.on('admin:alert', ({ title, severity }) => {
     toast(`${severity === 'critical' ? 'Urgent: ' : ''}${title}. Open Admin \u2192 Health.`, severity === 'critical' ? 'error' : undefined);
-    if (S.view.type === 'admin' && S.view.tab === 'health') renderMain();
+    refreshHealth();
   });
+  // Another admin added, changed, tested or removed an alert channel: the Health tab shows it at once.
+  socket.on('admin:alert-channels', refreshHealth);
   socket.on('profile:comment', ({ from }) => toast(`${displayName(getUser(from))} commented on your profile.`));
   socket.on('config:update', (c) => {
     Object.assign(S.config, c);

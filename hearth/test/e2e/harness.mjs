@@ -96,6 +96,8 @@ export async function startServer() {
     NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --require ${site.preload}`.trim(), NODE_EXTRA_CA_CERTS: site.ca, LINK_PREVIEW_ALLOW_PRIVATE: site.host,
     // Webhook avatars are shown only from known avatar hosts and ones the admin lists (files-10): this stand-in site.
     WEBHOOK_AVATAR_HOSTS: site.host,
+    // The same stand-in site takes alert-channel webhooks (it's on 127.0.0.1, so it has to be named, port and all).
+    ALERT_PRIVATE_HOSTS: `${site.host}:${site.port}`,
   };
   let log = '';
   const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });

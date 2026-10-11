@@ -3008,6 +3008,66 @@ async function joinHistory(t) {
   await bob.noModals();
 }
 
+// ------------------------------------------------------------------ 31. where alerts go
+// Bob (the owner) adds a webhook alert channel pointing at the stand-in site (named in ALERT_PRIVATE_HOSTS by the
+// harness), gets its signing secret once, and Test makes the site get a POST. The row shows the delivery and only a
+// masked address. Turning it off and removing it ask for his password; turning it back on doesn't. Pressing Test or
+// Turn off down the page leaves it scrolled where it was, with focus on that button (the live update that follows
+// redraws only Health's own content).
+async function alertChannels(t) {
+  const { bob } = t.people;
+  const site = t.server.site;
+  await bob.railButton('Admin');
+  await bob.$('.admin-tabs .admin-tab', { hasText: 'Health' }).click();
+  await bob.$('.admin-body button', { hasText: 'Add a channel' }).click();
+  const add = await bob.dialog('Add an alert channel');
+  await add.locator('.chips .chip', { hasText: exact('Webhook') }).click();
+  const hookPath = `/alert-hook/${crypto.randomBytes(8).toString('hex')}`;
+  await add.locator('input[type=url]').fill(`${site.base}${hookPath}`);
+  await add.locator('input[placeholder="e.g. My phone"]').fill('Pager');
+  await add.locator('.modal-foot .btn.primary').click();
+  const shown = await bob.dialog('Webhook signing secret');
+  const secret = (await shown.locator('.secret-box code').innerText()).trim();
+  check(/^[A-Za-z0-9_-]{43}$/.test(secret), `The signing secret should be shown once (got “${secret}”).`);
+  await shown.locator('input[type=checkbox]').check();
+  await shown.locator('button', { hasText: exact('Done') }).click();
+  await bob.noModals();
+  const row = () => bob.$('.admin-body .chan-row', { hasText: 'Pager' });
+  await row().waitFor();
+  const text = await row().innerText();
+  check(!text.includes(hookPath.slice(-8)) && text.includes('news.preview-site.net'), `The address should only be shown masked (got “${text}”).`);
+  const page = bob.$('.admin-body');
+  await row().locator('button', { hasText: exact('Test') }).scrollIntoViewIfNeeded();
+  const scrolled = await page.evaluate((el) => el.scrollTop);
+  const stayed = async (label, what) => {
+    await bob.page.waitForTimeout(800); // the server's admin:alert-channels event redraws Health once more
+    const now = await page.evaluate((el) => el.scrollTop);
+    check(Math.abs(now - scrolled) < 120, `${what} should leave Health scrolled where it was (${scrolled}, now ${now}).`);
+    const focus = await bob.page.evaluate(() => { const a = document.activeElement; const r = a && a.closest('.chan-row'); return r ? `${r.querySelector('strong').textContent}: ${a.textContent}` : a && a.tagName; });
+    check(focus === `Pager: ${label}`, `${what} should leave focus on Pager’s “${label}” (it’s on ${focus}).`);
+  };
+  const before = site.hits.length;
+  await row().locator('button', { hasText: exact('Test') }).click();
+  await bob.toast('Delivered to Pager.');
+  check(site.hits.slice(before).includes(hookPath), 'The stand-in site should have received the test alert.');
+  await row().locator('.badge-tag', { hasText: 'Delivered' }).waitFor();
+  await stayed('Test', 'Test');
+
+  await row().locator('button', { hasText: exact('Turn off') }).click();
+  await bob.confirmPassword('Confirm turning off an alert channel', t.pw.bob);
+  await bob.toast('Pager is off.');
+  await row().locator('button', { hasText: exact('Turn on') }).waitFor();
+  await stayed('Turn on', 'Turning it off');
+  await row().locator('button', { hasText: exact('Turn on') }).click();
+  await bob.toast('Pager is on.');
+  await row().locator('button', { hasText: exact('Remove') }).click();
+  await bob.modal('Remove Pager?').locator('.modal-foot .btn.danger').click();
+  await bob.confirmPassword('Confirm removing an alert channel', t.pw.bob);
+  await bob.toast('Pager removed.');
+  await row().waitFor({ state: 'detached' });
+  check(!(await bob.$('.admin-body').innerText()).includes(secret), 'The secret is never shown again.');
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -3050,4 +3110,5 @@ export const FLOWS = [
   ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
   ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off', wordFilter],
   ['join history: new members can’t read back (setting, audit log); someone joining again sees one line instead of locked rows, in a channel and a voice chat; later messages both ways', joinHistory],
+  ['alert channels: add a signed webhook, its secret shown once, Test reaches it, masked address; off and remove need the password; the page stays put', alertChannels],
 ];

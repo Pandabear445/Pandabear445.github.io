@@ -96,8 +96,8 @@ By severity: 8 high (6 fixed, 2 partly fixed), 47 medium (36 fixed, 11 partly fi
 fixed, 15 partly fixed, 12 documented, 1 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
 vulnerabilities, 38 bugs, 19 overclaims, 14 limitations, 13 hardening, 3 performance. Since 1.28.0 (in 1.29.0):
 `auth-6`, `auth-11`, `xss-8` and `data-4` are fixed, and `xss-7`, `crypto-2` and `crypto-7` partly fixed (they were
-documented, deferred or partly fixed); `files-6`, `files-10`, `crypto-8` and `crypto-13` stay partly fixed, with more of each
-done (§5).
+documented, deferred or partly fixed); `files-6`, `files-10`, `crypto-8` and `crypto-13` stay partly fixed, with
+more of each done (§5).
 
 All fixes are **implemented**. Every fixed or partly fixed finding with a proving test below is **tested locally**
 (§6: 357 of 358 tests passed, 1 skipped) and **tested in CI** in the `tests` job at `dec63ee`, except the parts
@@ -722,3 +722,55 @@ Built from `docs/design/ANDROID-PUSH.md` (NEXT.md picks 1 and 12). No schema cha
   (the calls the server rings); a link to a server voice channel just opens the server. The lock-screen claim was
   wrong: Android shows the full notification there unless the phone hides sensitive content, so the call
   notification's title now follows the previews setting ("In a call" by default), like pushes already did.
+
+## 14. Alert channels and metrics for operators
+
+Closes two items from `docs/OPERATIONS.md` §8 ("Other alert channels", "Metrics export"). No schema change: the
+channels live in one sealed-per-field setting (`alertChannels`).
+
+- **Alert channels** (`server/alertchannels.js`; routes in `health.js`; Admin → Health → *Where alerts go*): ntfy
+  (JSON publish, optional Bearer token), a generic webhook signed with bots.js `sign` (HMAC-SHA256 over
+  `"<timestamp>.<body>"`), and Discord- and Slack-style webhooks (`allowed_mentions` empty; Slack markup escaped).
+  `alerts.raise` hands each sent alert to every switched-on channel without waiting; the words are the email's.
+- **Threats considered.** *A hidden redirect of alerts:* turning a channel off, changing its address, topic or token,
+  and removing it need step-up, the password and a fresh two-factor code when it's on (`auth-6`; adding, renaming,
+  turning on don't; a new address is checked before the code is asked for), and everything is audit-logged. *SSRF:* every
+  delivery goes through netguard (https, all addresses public, pinned, no redirects, deadline, 16 KB cap); private
+  hosts only by name in `ALERT_PRIVATE_HOSTS` (`name` or `name:port`, like `PUSH_PRIVATE_HOSTS`), and only those may
+  use http, so a token never crosses the internet in the clear. *Secret disclosure:* addresses, topics, tokens and
+  the signing secret are sealed with `sealSecret`; the API, the dashboard and the audit log get a masked form only;
+  the signing secret is returned once; a long first label of a host name (some services put the secret there) and
+  an ntfy server's path are masked too. *A stored credential following a new address:* an ntfy channel moved to
+  another origin doesn't keep its topic or token (the topic must be given again; the token is dropped unless given),
+  so an admin who only ever saw them masked can't redirect them to their own server and press Test. *Crowding out
+  real alerts:* all failing channels share one alert (`alert_channels`) that sits outside the 12-an-hour cap and goes
+  at most hourly, and failed Test presses aren't counted toward "failing", so adding broken channels (no password
+  needed) can't hold back a real alert. *A near-off cooldown:* lengthening the cooldown past an hour needs step-up
+  like turning alerts off. *Alert loops:* the failing-channels alert isn't raised about its own delivery.
+  *Enumeration:* channel ids are random 64-bit values; admins only.
+- **Metrics** (`server/metrics.js`): `GET /metrics`, Prometheus text 0.0.4, off unless `METRICS_TOKEN` (16+
+  characters). Bearer only, compared as SHA-256 digests with `timingSafeEqual`; 20 wrong tokens per network in 10
+  minutes and that network is refused before any comparison. Labels: status class, job name, message kind, version.
+  Kept as is after review: someone sharing the scraper's network (Docker's gateway address, when visitors reach the
+  published port directly) can lock it out for 10 minutes; letting the right token through regardless would tell a
+  guesser which guess was right. `docs/OPERATIONS.md` says to scrape from an address of its own.
+- **Found and fixed on the way:** `PUT /api/admin/alerts` asked for the password only when `enabled` or `email` was
+  exactly `false`, but stored any falsy value as off, so `{"enabled": null}` (or `0`, `""`) turned alerts off
+  without step-up. Any falsy value now counts as turning off, there and for channels. The same route let any admin
+  set the cooldown to a week without the password; longer than an hour now needs it.
+- **Fixed after review:** per-channel failure alerts that could fill the hourly cap; Test failures counted toward
+  "failing"; an ntfy token and topic carried to a new server; a base path named like the topic cut off; unmasked
+  secret host names; and every channel action (and every live alert) rebuilding the whole admin view, which threw
+  the Health page back to the top and dropped focus for every admin watching it.
+- **Checked here:** `test/alert-channels-metrics.test.js` (21: permissions for members, moderators and signed-out
+  callers; step-up on off/retarget/remove, the null/0/"" bypass and a longer cooldown; masking in answers, health,
+  the audit log and at rest, including secret host names; an ntfy topic address pasted as the server, and a base
+  path named like the topic kept; moving an ntfy channel never takes its topic or token along; nine broken channels
+  and failed Tests can't cap a real alert, and their one alert names them; 17 refused
+  addresses including disguised and DNS-hidden ones; DNS rebinding at delivery; ntfy by LAN name with a token, signed
+  webhook, Discord and Slack delivered to local servers; error, 401, timeout, redirect and endless answers; the
+  self-alert; rate limits; metrics off, short token, auth, guess limit and content), `observability.test.js`, and an
+  e2e flow (31) that adds a webhook channel, sees its secret once, tests it (the page stays scrolled where it was,
+  focus on the button) and removes it with the password.
+  **Not checked here:** a real ntfy.sh, Discord or Slack (their formats are from their documentation), and a real
+  Prometheus scrape.

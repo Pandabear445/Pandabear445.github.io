@@ -2888,6 +2888,13 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .hook-row .bot-tag { margin-left: 6px; }
 .hook-pings { margin-top: 4px; font-size: 13px; }
 @media (max-width: 600px) { .adm-row.hook-row { grid-template-columns: 1fr; } }
+/* where alerts go (Admin → Health) */
+.adm-row.chan-row { grid-template-columns: minmax(140px, 1fr) minmax(0, 1.5fr) minmax(0, 1.5fr) auto; }
+.chan-row .badge-tag { margin-left: 4px; }
+.chan-row.off > :not(.chan-actions) { opacity: .65; }
+.chan-where { overflow-wrap: anywhere; }
+.chan-actions { flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 900px) { .adm-row.chan-row { grid-template-columns: 1fr; } .chan-actions { justify-content: flex-start; } }
 .bots-panel { flex: none; gap: 12px; }
 .bot-scopes { min-width: 0; max-width: 100%; }
 /* Pick your roles (public/js/selfroles.js) */

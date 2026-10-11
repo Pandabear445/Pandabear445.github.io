@@ -743,6 +743,8 @@ try {
 app.disable('x-powered-by');
 // Request ids (X-Request-Id, echoed or made up) and the access log: route templates, never full URLs.
 app.use(log.requestLogger());
+// Every answer counted by status class (and unexpected errors), for /metrics (server/metrics.js; off by default).
+app.use(require('./metrics').countRequests());
 const PRIVATE_IP = /^(::1|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|f[cd][0-9a-f]{2}:|fe80:|::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.))/i;
 const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/, '').slice(0, 64);
 // Behind a proxy (HTTPS=false) on another address (an older docker-compose.yml, nginx in its own container)
@@ -6687,14 +6689,17 @@ function indexLibraryUploads() {
 }
 
 // ---------------------------------------------------------------- health and alerts (server/health.js, server/alerts.js)
-// Alerts go to the owner's confirmed email and to the dashboard live ('admins' room). Unexpected errors, jobs that
-// keep failing and sign-in abuse (secEvent) feed them; backups raise their own.
-ALERTS = require('./alerts')({ getSetting, setSetting, emitAdmins: (ev, data) => io && io.to('admins').emit(ev, data), ownerRow: () => getUserRow(ownerId()), notify: (...a) => ACCT.notify(...a) });
+// Alerts go to the owner's confirmed email, to the dashboard live ('admins' room) and to the alert channels admins
+// add (server/alertchannels.js, set up by health.js). Unexpected errors, jobs that keep failing and sign-in abuse
+// (secEvent) feed them; backups raise their own. health.js also adds GET /metrics (server/metrics.js).
+const emitAdmins = (ev, data) => io && io.to('admins').emit(ev, data);
+ALERTS = require('./alerts')({ getSetting, setSetting, emitAdmins, ownerRow: () => getUserRow(ownerId()), notify: (...a) => ACCT.notify(...a) });
 log.onError((line) => ALERTS.countError(line));
 jobs.setOnFailure((r) => ALERTS.jobFailed(r));
 jobs.setOnRecover((r) => ALERTS.jobRecovered(r.name));
 require('./health').setupHealth({ api, auth, adminOnly, wrap, fail, rateLimit, limitNet, db, DATA_DIR, SCHEMA_VERSION, VERSION, maintenance, stepUp, auditLog, alerts: ALERTS,
-  sockets: () => (io ? io.engine.clientsCount : 0), listEncBackups, listBackups, autoBackup, NEWS_BOT_ID, isAlive: REG.isAlive });
+  sockets: () => (io ? io.engine.clientsCount : 0), listEncBackups, listBackups, autoBackup, NEWS_BOT_ID, isAlive: REG.isAlive,
+  app, getSetting, setSetting, sealSecret, openSecret, brandName: () => brand().name, emitAdmins, countHit, hitsSoFar, netOf });
 
 // ---------------------------------------------------------------- errors + SPA fallback
 api.use((req, res) => res.status(404).json({ error: 'Not found.' }));
