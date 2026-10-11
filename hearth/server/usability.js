@@ -13,8 +13,9 @@
 //   PUT    /me/saved/:id            save (or change the note of) a message you can see
 //   DELETE /me/saved/:id            unsave (works for messages that are gone too)
 //   GET    /me/unread               per conversation: last read, last message, unread and mention counts
-//   POST   /me/read                 { conv, messageId, unread?, threads? } — move your read marker (synced to your
-//                                   devices); conv t:<root id> is a thread; threads: true also marks a channel's threads
+//   POST   /me/read                 { conv, messageId, unread?, threads?, pings? } — move your read marker (synced to
+//                                   your devices); conv t:<root id> is a thread; threads: true also marks a channel's
+//                                   threads; pings: true reads a voice chat you don't follow without following it
 //   POST   /servers/:id/read        mark every channel you can see in a server as read, threads included
 //   GET    /channels/:id/threads    the channel's threads, latest reply first, with your unread counts (?before=&limit=)
 //   GET    /me/notify               your preferences and Do Not Disturb settings
@@ -143,6 +144,9 @@ module.exports = function setupUsability(ctx) {
     unreadD: countSql('SELECT 1 FROM dm_messages WHERE dm_id = ? AND id > ? AND author_id != ?'),
     marks: countSql("SELECT 1 FROM mention_marks WHERE conv = ? AND (user_id = ? OR (user_id = '*' AND ? = 1)) AND message_id > ?"),
     marker: 'SELECT last_read_id FROM read_states WHERE user_id = ? AND conv = ?',
+    // A voice chat's first ping for you after a point, and the message just before it (followVoiceChat).
+    firstMark: "SELECT MIN(message_id) AS id FROM mention_marks WHERE conv = ? AND (user_id = ? OR (user_id = '*' AND ? = 1)) AND message_id > ?",
+    lastBefore: 'SELECT MAX(id) AS id FROM messages WHERE channel_id = ? AND thread_id IS NULL AND id < ?',
     // Threads (idx_messages_thread, idx_mention_marks_thread): the newest reply, unread replies and pings in one.
     // A reply whose time has passed (a disappearing message the sweep hasn't reached) counts for none of them.
     lastT: `SELECT id FROM messages WHERE thread_id = ? AND ${LIVE} ORDER BY id DESC LIMIT 1`,
@@ -192,6 +196,40 @@ module.exports = function setupUsability(ctx) {
     st.mentions = kind === 'd' || group ? st.unread : db.prepare(Q.marks).get(conv, uid, suppressAll ? 0 : 1, lastReadId).n;
     return st;
   }
+  // v19 (voice chat): a voice channel's chat counts as unread only for people who follow it: who opened it, wrote
+  // there or picked "All messages" for it, which leaves a read marker (and, in the app, who are in its call). Until
+  // then only its pings count (unread stays 0, opened false), from the baseline or from where "Mark as read" left
+  // them (cp:<channel>, "pings read up to", which doesn't make you follow it). It has no threads.
+  //   marker: your read marker there, or null; pingsRead: your cp: marker there, or null
+  function voiceChatState(uid, conv, marker, { baseline, suppressAll = false, pingsRead = null }) {
+    if (marker) return { ...convState(uid, conv, marker, { suppressAll }), opened: true };
+    const floor = pingsRead && pingsRead > baseline ? pingsRead : baseline;
+    const last = db.prepare(Q.lastC).get(conv.slice(2));
+    const mentions = last && last.id > floor ? db.prepare(Q.marks).get(conv, uid, suppressAll ? 0 : 1, floor).n : 0;
+    return { lastReadId: null, lastId: last ? last.id : null, unread: 0, mentions, opened: false };
+  }
+  const isVoiceChat = (c, s = serverOf(c)) => c.type === 'voice' && !!s && s.kind !== 'group';
+  // Following a voice chat by picking "All messages" for it, as opening it would: a read marker at its newest message
+  // ('0' while it has none), so what's said there from now on counts as unread on all your devices. Pings you haven't
+  // read stay: the marker then goes just before the first of them. Nothing changes for a chat you already follow.
+  function followVoiceChat(uid, c) {
+    const conv = 'c:' + c.id;
+    if (!isVoiceChat(c) || markerOf(uid, conv)) return;
+    const baseline = baselineOf(uid);
+    const pingsRead = markerOf(uid, 'cp:' + c.id);
+    const floor = pingsRead && pingsRead > baseline ? pingsRead : baseline;
+    const suppressAll = suppressedAll(uid, c);
+    const ping = db.prepare(Q.firstMark).get(conv, uid, suppressAll ? 0 : 1, floor).id;
+    let at;
+    if (ping) { const before = db.prepare(Q.lastBefore).get(c.id, ping).id; at = before && before > floor ? before : floor; }
+    else at = (db.prepare(Q.lastC).get(c.id) || {}).id || '0';
+    setRead(uid, conv, at);
+    emitTo(uid, 'read:update', { conv, ...convState(uid, conv, at, { suppressAll }), opened: true });
+  }
+  // The channels of a server that have a chat: text channels, and voice channels outside group chats (a group's call
+  // has none: the group's conversation is its chat).
+  const chatChannels = (s) => db.prepare(s.kind === 'group' ? "SELECT * FROM channels WHERE server_id = ? AND type = 'text'"
+    : "SELECT * FROM channels WHERE server_id = ? AND type IN ('text', 'voice')").all(s.id);
   function unreadFor(uid) {
     const baseline = baselineOf(uid);
     // Not the thread markers (t:): there's one for every thread ever opened, and threads are counted per channel here.
@@ -200,13 +238,13 @@ module.exports = function setupUsability(ctx) {
     for (const s of db.prepare('SELECT s.* FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ?').all(uid)) {
       const group = s.kind === 'group';
       const sp = prefRow(uid, 's:' + s.id);
-      for (const c of db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text'").all(s.id)) {
+      for (const c of chatChannels(s)) {
         if (!(perms.channel(s, c, uid) & PM.VIEW_CHANNEL)) continue;
         const conv = 'c:' + c.id;
         const cp = prefRow(uid, conv);
-        out[conv] = convState(uid, conv, states.get(conv) || baseline, {
-          group, suppressAll: !!((cp && cp.suppress_everyone) || (sp && sp.suppress_everyone)),
-          floor: threadFloor(uid, c.id, baseline, states.get('ct:' + c.id) || null),
+        const suppressAll = !!((cp && cp.suppress_everyone) || (sp && sp.suppress_everyone));
+        out[conv] = c.type === 'voice' ? voiceChatState(uid, conv, states.get(conv) || null, { baseline, suppressAll, pingsRead: states.get('cp:' + c.id) || null }) : convState(uid, conv, states.get(conv) || baseline, {
+          group, suppressAll, floor: threadFloor(uid, c.id, baseline, states.get('ct:' + c.id) || null),
         });
       }
     }
@@ -241,23 +279,35 @@ module.exports = function setupUsability(ctx) {
     const a = convAccess(req.userId, b.conv);
     const back = b.unread === true;
     const id = String(b.messageId || '');
-    if (id === '0') { if (!back) fail(400, 'Pick a message.'); } else {
+    // A voice channel's chat opened while it has no messages yet: the marker '0' (before every message) is how it
+    // counts as opened from then on, on all your devices. It only ever moves forward from there.
+    const voiceChat = a.kind === 'c' && a.channel.type === 'voice' && a.server.kind !== 'group';
+    if (id === '0') { if (!back && !voiceChat) fail(400, 'Pick a message.'); } else {
       idParam(id);
       const there = a.kind === 'c'
         ? db.prepare('SELECT 1 FROM messages WHERE id = ? AND channel_id = ?').get(id, a.channel.id)
         : db.prepare('SELECT 1 FROM dm_messages WHERE id = ? AND dm_id = ?').get(id, a.dm.id);
       if (!there) fail(404, 'That message doesn’t exist.');
     }
+    // "Mark as read" from a menu on a voice chat you don't follow (pings: true): its pings are read, and it stays
+    // unfollowed (a cp: marker, not a read marker). Marking it read isn't opening it.
+    if (voiceChat && b.pings === true && !back && !markerOf(req.userId, a.conv)) {
+      if (id === '0') fail(400, 'Pick a message.');
+      const pingsRead = setRead(req.userId, 'cp:' + a.channel.id, id);
+      const out = { conv: a.conv, ...voiceChatState(req.userId, a.conv, null, { baseline: baselineOf(req.userId), suppressAll: suppressedAll(req.userId, a.channel), pingsRead }) };
+      emitTo(req.userId, 'read:update', out);
+      return res.json(out);
+    }
     const lastReadId = setRead(req.userId, a.conv, id, back);
     // Reading a channel leaves its threads alone: each has its own marker. "Mark as read" (threads: true) is the
     // exception, so the badge it clears doesn't come straight back from a ping in a thread. Only then is the answer's
     // threadMentions worked out: a plain read can't change it (the app keeps what it has), and the app sends one
     // every time you scroll to the bottom of a busy channel.
-    const threadsRead = a.kind === 'c' && b.threads === true && !back ? readAllThreads(req.userId, a.channel.id) : null;
+    const threadsRead = a.kind === 'c' && a.channel.type === 'text' && b.threads === true && !back ? readAllThreads(req.userId, a.channel.id) : null;
     const st = convState(req.userId, a.conv, lastReadId, a.kind === 'c'
       ? { group: a.server.kind === 'group', suppressAll: suppressedAll(req.userId, a.channel), floor: threadsRead ? threadFloor(req.userId, a.channel.id) : null }
       : {});
-    const out = { conv: a.conv, ...st, ...(threadsRead ? { threadsRead } : {}) };
+    const out = { conv: a.conv, ...st, ...(threadsRead ? { threadsRead } : {}), ...(voiceChat ? { opened: true } : {}) };
     emitTo(req.userId, 'read:update', out);
     res.json(out);
   });
@@ -317,14 +367,26 @@ module.exports = function setupUsability(ctx) {
     rateLimit('read:' + req.userId, 240, 60000);
     const s = requireServer(req.params.id, req.userId);
     const changed = [];
+    const baseline = baselineOf(req.userId);
     db.transaction(() => {
-      for (const c of db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text'").all(s.id)) {
+      for (const c of chatChannels(s)) {
         if (!(perms.channel(s, c, req.userId) & PM.VIEW_CHANNEL)) continue;
         const last = db.prepare(Q.lastC).get(c.id);
         if (!last) continue;
+        const conv = 'c:' + c.id;
+        if (c.type === 'voice') {
+          if (markerOf(req.userId, conv)) { changed.push({ conv, lastReadId: setRead(req.userId, conv, last.id), lastId: last.id, unread: 0, mentions: 0, opened: true }); continue; }
+          // A voice chat you don't follow stays that way (marking it read isn't opening it): only its pings are read
+          // (its cp: marker), and one without a ping for you is left alone.
+          const pingsRead = markerOf(req.userId, 'cp:' + c.id);
+          if (!voiceChatState(req.userId, conv, null, { baseline, suppressAll: suppressedAll(req.userId, c), pingsRead }).mentions) continue;
+          setRead(req.userId, 'cp:' + c.id, last.id);
+          changed.push({ conv, lastReadId: null, lastId: last.id, unread: 0, mentions: 0, opened: false });
+          continue;
+        }
         // Marking a whole server read takes its threads with it too.
         const threadsRead = readAllThreads(req.userId, c.id);
-        changed.push({ conv: 'c:' + c.id, lastReadId: setRead(req.userId, 'c:' + c.id, last.id), lastId: last.id, unread: 0, mentions: 0, threadMentions: 0, ...(threadsRead ? { threadsRead } : {}) });
+        changed.push({ conv, lastReadId: setRead(req.userId, conv, last.id), lastId: last.id, unread: 0, mentions: 0, threadMentions: 0, ...(threadsRead ? { threadsRead } : {}) });
       }
     })();
     changed.forEach((st) => emitTo(req.userId, 'read:update', st));
@@ -456,7 +518,8 @@ module.exports = function setupUsability(ctx) {
     rateLimit('notify:' + req.userId, 120, 60000);
     const m = TARGET.exec(String(req.params.target || ''));
     if (!m) fail(400, 'Unknown conversation.');
-    if (m[1] === 's') requireServer(m[2], req.userId); else if (m[1] === 'c') requireChannel(m[2], req.userId); else requireDm(m[2], req.userId);
+    const ch = m[1] === 'c' ? requireChannel(m[2], req.userId) : null;
+    if (m[1] === 's') requireServer(m[2], req.userId); else if (m[1] === 'd') requireDm(m[2], req.userId);
     const b = req.body || {};
     const cur = prefRow(req.userId, req.params.target) || { level: 'default', mute_until: null, suppress_everyone: 0 };
     let level = b.level === undefined ? cur.level : b.level === 'muted' ? 'none' : b.level;
@@ -474,6 +537,8 @@ module.exports = function setupUsability(ctx) {
         .run(req.userId, req.params.target, level, until, sup ? 1 : 0, now());
     }
     const out = { target: req.params.target, level, muteUntil: until, suppressEveryone: sup };
+    // v19 (voice chat): "All messages" for a voice channel's chat follows it, like opening it.
+    if (ch && level === 'all') followVoiceChat(req.userId, ch);
     emitTo(req.userId, 'notify:update', out);
     res.json(out);
   });
@@ -554,6 +619,7 @@ module.exports = function setupUsability(ctx) {
     // Thread markers for threads that were deleted, and "every thread read up to" markers for deleted channels.
     db.prepare("DELETE FROM read_states WHERE conv LIKE 't:%' AND NOT EXISTS (SELECT 1 FROM messages WHERE id = substr(read_states.conv, 3))").run();
     db.prepare("DELETE FROM read_states WHERE conv LIKE 'ct:%' AND NOT EXISTS (SELECT 1 FROM channels WHERE id = substr(read_states.conv, 4))").run();
+    db.prepare("DELETE FROM read_states WHERE conv LIKE 'cp:%' AND NOT EXISTS (SELECT 1 FROM channels WHERE id = substr(read_states.conv, 4))").run();
   }
   // Safe jobs (errors logged and shown in Admin → Health, never a crash).
   jobs.every('usability.end_timeouts', 60000, endExpired, { firstDelay: 5000 });
@@ -633,8 +699,9 @@ module.exports = function setupUsability(ctx) {
     const servers = db.prepare('SELECT s.*, m.joined_at FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ? ORDER BY m.joined_at').all(uid).map((s) => ({
       id: s.id, name: s.name, kind: s.kind || 'server', joinedAt: s.joined_at, owner: s.owner_id === uid,
       roles: db.prepare('SELECT r.name FROM member_roles mr JOIN roles r ON r.id = mr.role_id WHERE mr.server_id = ? AND mr.user_id = ?').all(s.id, uid).map((r) => r.name),
-      channels: db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text' ORDER BY position, created_at").all(s.id)
-        .filter((c) => perms.channel(s, c, uid) & PM.VIEW_CHANNEL).map((c) => ({ id: c.id, name: c.name, topic: c.topic || '' })),
+      // Voice channels' chats (v19) are conversations too, and export like text channels.
+      channels: chatChannels(s).sort((a, b) => a.position - b.position || a.created_at - b.created_at)
+        .filter((c) => perms.channel(s, c, uid) & PM.VIEW_CHANNEL).map((c) => ({ id: c.id, name: c.name, type: c.type, topic: c.topic || '' })),
       members: s.kind === 'group' ? db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(s.id).map((r) => person(r.user_id)) : undefined,
     }));
     const dms = db.prepare('SELECT * FROM dm_channels WHERE user_a = ? OR user_b = ?').all(uid, uid).map((d) => ({ id: d.id, with: person(d.user_a === uid ? d.user_b : d.user_a), createdAt: d.created_at }));

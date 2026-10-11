@@ -166,7 +166,8 @@ a channel that gives @everyone Manage messages, Move members, Manage channel, Ma
 - Text channel names are cleaned exactly as Hearth cleans them: lower case, spaces become dashes, and anything
   but letters a–z, digits, `-` and `_` goes. So `📢・announcements` becomes `announcements`. A name with nothing
   left (`公告`) becomes `channel-<its position>`. Voice channel names are kept as they are, up to 48 characters.
-- Topics are cut to 300 characters. Slowmode (0–6 hours) comes over for text channels.
+- Topics are cut to 300 characters. Slowmode (0–6 hours) comes over for text channels, and for voice channels too,
+  where it applies to their chat (Hearth's voice channels have a text chat, like Discord's).
 - Skipped and listed in the report: a category's own permissions (each channel keeps its own, which is what
   Discord shows anyway), permissions for single members (a template has no members), overrides for roles that
   aren't coming, age-restricted (NSFW) flags, voice user limits and forum tags.

@@ -292,8 +292,8 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
 | `GET /me/saved`, `GET /me/saved/ids` | session | your own only; 120/min |
 | `PUT /me/saved/:id` `{ note? }`, `DELETE /me/saved/:id` | session | message must be visible; note must be `x1:`; 60/min |
 | `GET /me/unread` | session | 60/min |
-| `POST /me/read` `{ conv, messageId, unread?, threads? }` | session | conversation access checked; message must be in it; `t:<root>` for a thread (a reply in it, forward only); `threads: true` marks a channel's threads too; 240/min |
-| `POST /servers/:id/read` | member | channels you can see, their threads too |
+| `POST /me/read` `{ conv, messageId, unread?, threads?, pings? }` | session | conversation access checked; message must be in it; `t:<root>` for a thread (a reply in it, forward only); `threads: true` marks a channel's threads too; `messageId: '0'` marks an empty voice chat opened; `pings: true` reads the pings of a voice chat you don't follow without following it; 240/min |
+| `POST /servers/:id/read` | member | channels you can see, their threads too; voice chats you follow, and the pings of ones you don't |
 | `GET /channels/:id/threads` `?before=&limit=` | can view channel | text channels; latest reply first; 25 (max 50) a page; 60/min |
 | `GET /me/notify` | session | your own only |
 | `PUT /me/notify/:target` `{ level, muteUntil, suppressEveryone }` | member of that place | 120/min; up to 2000 rows |
@@ -303,7 +303,7 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
 | `POST/DELETE /servers/:id/members/:uid/timeout` | Kick Members + role order | audit-logged; 30/min |
 | `POST /servers/:id/voice/:uid/disconnect`, `/move` | Move Members (per channel) + role order | audit-logged; 60/min |
 | `POST/DELETE /servers/:id/voice/:uid/mute` | Mute Members (server-wide) + role order | audit-logged; 60/min |
-| `POST /channels/:id/messages/bulk-delete` | Manage Messages in the channel | 100 messages, 14 days; audit-logged; 10/min |
+| `POST /channels/:id/messages/bulk-delete` | Manage Messages in the channel (text or voice) | 100 messages, 14 days; audit-logged; 10/min |
 | `POST /servers/:id/bans` `{ userId, reason, deleteHours }` | Ban Members + role order | cleanup audit-logged; 30/min |
 | `GET /me/reports` | session | your own only |
 | `POST /me/export` | **step-up** | audit-logged; 5/hour |
@@ -318,7 +318,7 @@ The Threads panel follows the channel's existing `message:new` and `thread:updat
 | Table | Holds | Readable text? |
 |---|---|---|
 | `saved_messages` | user, message id, optional `x1:` note, time | no |
-| `read_states` | user, conversation key (`c:`, `d:`, `t:<thread root>`, `ct:<channel>` for "its threads read up to"), last-read message id | no |
+| `read_states` | user, conversation key (`c:`, `d:`, `t:<thread root>`, `ct:<channel>` for "its threads read up to", `cp:<voice channel>` for "its pings read up to" in a voice chat you don't follow), last-read message id | no |
 | `mention_marks` | message id, conversation (`ct:<channel>` for a thread reply), user id or `*`, thread root (v19) | no (ids the sender's app already sent for push) |
 | `thread_activity` (v19) | thread root, channel, newest reply id | no |
 | `notify_prefs` | user, target, level, mute-until, ignore-@everyone | no |
@@ -544,7 +544,7 @@ What this pass built, and where it differs from that design:
   0, 3600, 86400, 604800 or 2419200 (and 5 under `NODE_ENV=test`), anything else 400 `bad_timer`. DMs: either person,
   403 after a block either way, 403 `deleted` when the other account is deleted, 404 for outsiders. Group chats: any
   member. Server channels: Manage Channels in that channel (`requireManageableChannel`), a channel you can't see is
-  404, voice channels 400 `bad_channel`. Limits: 10 changes a minute per person, and 10 an hour per person in each
+  404, a group's call 400 `bad_channel` (a server's voice channel has one for its chat). Limits: 10 changes a minute per person, and 10 an hour per person in each
   conversation (not one budget for the whole conversation, which one person could use up to lock the timer for
   everyone else). The same value again changes nothing (no log line, no event). `GET` on the same paths gives `{ seconds, log }` (the last 20
   changes). Live: `disappear:update { conv, channelId | dmId, id, seconds, prev, by, at }` to whoever can see the
@@ -774,3 +774,128 @@ A refused idle report changes nothing, and the app tries again on its next check
 - Open apps drop a status up to 15 seconds after its time (when the sweep runs); anything the server sends from the
   moment it's due already leaves it out.
 - "Keep" in the dialog works out the remaining time on the device, so a device clock that's off shifts it by that much.
+
+## Voice channel chats
+
+Every voice channel in a server has a text chat beside its call (like Discord's text in voice). It is that channel's
+ordinary messages: no new table, no new route and no schema change. `POST /channels/:id/messages` now takes a
+server's voice channels (`hasChat` in `server/index.js`); the app opens the chat in the call view's side panel.
+
+**What it shares with text channels**
+
+- **Encryption:** the same server key and epoch (`requireCurrentEpoch`), the same ciphertext-only storage and the
+  same `secure.js` path (the channel id is bound into every message, as for text channels). The server never sees
+  the text.
+- **Permissions:** View Channel to read it, Send Messages to write; Attach Files, Add Reactions, Mention @everyone,
+  Show link previews and Manage Messages as in text channels, all per channel. **Connect isn't needed**: someone who
+  may see a voice channel but not join its call can still chat, and can read what's said there. Timeouts take it
+  away like any other channel's. Slow mode applies (the Overview tab shows it for voice channels now). The
+  permission editor lists these for voice channels (Send Messages says who can read the chat), and the channel's
+  menu has **Make the chat read-only** (Send Messages denied for @everyone).
+- **The rest:** replies, edits, reactions, pins (Manage Messages, with pin history), polls, voice messages, files,
+  link previews, typing, saved messages, reminders, message links, reports, the message rate limits, `GET
+  /messages/:id/locate`, and deleting the channel (its messages go with it).
+- **Disappearing messages:** the voice channel's timer is its chat's, set and shown as in a text channel
+  (`PUT /channels/:id/disappearing` takes a server's voice channel, `serializeChannel` carries `disappear` for it,
+  Manage Channels there sets it, the ⋯ menu, Edit channel, the header's timer button and the note above the box
+  offer it). Messages are stamped, checked against the `ttl` the app encrypted for and never served after their
+  time, exactly as in text channels. A group's call has no chat and no timer (400 `bad_channel`).
+- **Moderation:** bulk delete (`POST /channels/:id/messages/bulk-delete` used to refuse voice channels), Delete
+  recent messages and select-to-delete in the app, a ban's message cleanup (it already went through every channel),
+  and the server audit log.
+- **Search:** `scope=s:<server>` and `scope=all` now look in voice channels too (`server/search.js`); `in:` finds a
+  voice channel by name when no text channel has that name. **Export my data** lists voice channels with
+  `type: 'voice'` and exports their messages.
+
+**What it doesn't have**
+
+- **Threads:** `threadId` is refused (400), `GET /channels/:id/threads` already was, and the app offers no thread
+  buttons there. A voice chat stays one conversation next to the call.
+- **Bots, webhooks and slash commands:** bots still post only in text channels (`bad_channel`), webhooks can't be
+  made there, and the composer doesn't offer commands. Bots with the message metadata scope still see that messages
+  were sent there, as for any channel they may read.
+- **Group calls:** a group's `call` channel has no chat (400 "A group call has no chat of its own"); the group's
+  own conversation, shown with the call above it, is its chat.
+
+**Unread, mentions and notifications (the decision)**
+
+A voice chat counts as unread only for people who **follow** it: who opened it or wrote there once, on any device,
+who picked *All messages* for it, or who are in its call right now. Pings always count. The reasoning: most members
+never look at most voice channels' chats, and a server where every call's side chatter lit up the channel list would
+teach people to ignore it. The server (`followsVoiceChat` in `server/index.js`, for pushes) and the app
+(`followsVoiceChat` in `app.js`, for dots and sounds) use this one rule.
+
+- "Following" is a read marker (`read_states`, `c:<voice channel>`). Opening the chat reads it up to the newest
+  message; an empty chat is marked opened with the marker `'0'` (`POST /me/read { conv, messageId: '0' }`, allowed
+  for voice chats only and forward only, so it never moves an existing marker back). Sending there leaves one too.
+- **Picking *All messages*** for a voice chat (`PUT /me/notify/c:<id> { level: 'all' }`) leaves one as well: at the
+  newest message, or just before the first ping you haven't read so it still counts, or `'0'` in an empty chat.
+  Every device hears it (`read:update`), so its dot and sound start at once. Picking another level later doesn't
+  take it away (like a chat you opened). Text channels and a group's call get no marker from it.
+- **Mark as read** (the voice channel's menu, when it pinged you) and **Mark server as read** on a chat you don't
+  follow read only its pings, with a `cp:<channel>` marker ("pings read up to"): they don't make you follow it.
+  The app sends `POST /me/read { pings: true }` for that; on a chat you follow, or one on screen, it's an ordinary
+  read.
+- `GET /me/unread` gives voice chats `opened: true | false`. Not followed: `lastReadId: null`, `unread: 0`, and
+  `mentions` counted from the person's baseline or their `cp:` marker, whichever is later. Followed: counted from
+  the marker like a text channel.
+- In the app, a new message in a voice chat you don't follow adds no unread dot and makes no sound; while you're
+  in its call it does (the server doesn't keep that part: after a reload in a call, only what arrives next counts).
+  Opening the chat then puts "New messages" just after the last message the app knew of before it turned unread,
+  not above everything ever said there.
+- **Mentions** (@you, a reply to you, a role you have, an allowed @everyone/@here) count, show in the inbox and push
+  whether or not you follow the chat.
+- **"All messages"** pushes for a voice chat reach only followers: people in its call, people with a marker there,
+  and people who picked *All messages* on that voice channel itself. A server set to *All messages* doesn't push
+  every line said next to every call.
+- The channel's menu has **Chat notifications** (the same levels, mute and @everyone settings as a text channel).
+- Moderators don't follow every voice chat because of Manage Messages: members report what they see, and the
+  upgrade below keeps the limits a server already had.
+
+**In the app**
+
+- The call view's header has a **chat button** (Show chat / Hide chat). While the chat is hidden it carries your
+  ping count, or a dot for new messages that count for you. Open or closed is remembered on this device.
+- Right-click a voice channel → **Open chat** opens the call view with the chat, without joining the call.
+  Notifications, message links, search results, pins and saved messages open voice chats the same way. Pinned
+  messages (More → Pinned messages) show in the chat's place; their **Jump** (and Pin history's) goes back to the
+  chat at that message.
+- The chat button's label says what it does (Show chat / Hide chat), so it has no pressed state as well.
+- The chat is the same conversation view as a text channel (`chatView`) in the side panel (`#members`, mode
+  `chat`, the thread panel's width). It isn't rebuilt when the panel redraws for other reasons (people joining,
+  server updates), so typing and scroll position survive. Pinned messages open in its place.
+- Placeholders and labels name it "🔊 Lounge" instead of "#lounge".
+
+**Tests**
+
+- `test/voice-chat.test.js` (9 tests): sending, reading, editing, reacting, replying and typing in a voice chat,
+  ciphertext only; Connect not needed; refusals (hidden channel, no Send Messages, no Attach Files, timeout, group
+  call, threads, bad and stale payloads, slow mode, webhooks, bots); a disappearing timer on a voice chat (set by
+  Manage Channels only, `ttl` checked, stamped, an expired message never served, none for a group's call); the
+  message rate limits; unread (`opened`,
+  pings, the `'0'` marker, sending opens it, Mark server read and `pings: true` read pings without following);
+  *All messages* follows a chat (the marker before an unread ping, at the newest, `'0'`; not for text channels or
+  group calls); push (server-wide *All messages* only for followers, pings always, channel-level *All messages*);
+  pins, search, bulk delete, a ban's cleanup, Export my data and deleting the channel; the upgrade (Connect denied,
+  a muted role, a read-only server with slow mode, an open server untouched, the audit log, once only).
+- Browser flow (`npm run test:e2e`, "voice chat"): open the chat from the voice channel's menu without joining,
+  both ways decrypted, no thread button, a never-opened chat shows only a ping, the header button hides and shows
+  it, once opened a new message makes it unread; Jump from Pinned messages; *All messages* on a never-opened chat
+  gives a dot and the sound; in a call whose chat was never opened, "New messages" sits above what was said since
+  joining.
+
+**Known limitations**
+
+- Being "in the call" only counts on the device in the call, live: the server doesn't remember it for unread counts.
+- Voice channels that existed before this get a chat too. On the first start of this version (once: the
+  `voiceChatLimits` mark in `instance_settings`, set in the same transaction as the rest of the upgrade) the limits
+  a server had on posting are carried over to them (`server/db.js`): an override denying Connect on a voice channel
+  also denies Send Messages there; a role, member or @everyone denied Send Messages in every text channel it isn't
+  hidden from is denied it on the voice channels too; and when every text channel has slow mode, the voice
+  channels get the shortest. Only denies are added (an explicit allow is left alone), and each change is a
+  `channel_overrides` or `channel_update` entry in the server's audit log, by Hearth, marked `voiceChat`. So a
+  staff-only call room keeps a closed chat (staff included) until an admin allows Send Messages for the people who
+  may use it. Limits set only server-wide (a role without Connect at all) aren't carried over, and everyone who can
+  see a voice channel can read its chat. Deny Send Messages (or use Make the chat read-only) on channels that
+  should stay voice-only.
+- The chat's history isn't tied to calls: it stays after everyone leaves, like a text channel's.

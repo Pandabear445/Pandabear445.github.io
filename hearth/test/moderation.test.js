@@ -348,7 +348,11 @@ test('bulk delete refuses people without Manage Messages, outsiders, bad input a
   const bd = (u, body, ch = text.id) => as(u, 'POST', `/channels/${ch}/messages/bulk-delete`, body);
   assert.equal((await bd(member, { ids: [mine] })).status, 403, 'not even your own, without the permission');
   assert.equal((await bd(outsider, { ids: [target] })).status, 404);
-  assert.equal((await bd(mod, { count: 1 }, voice.id)).status, 400, 'a voice channel has no messages');
+  // A server's voice channel has a chat (v19), so bulk delete works there too (a group's call has none: see
+  // voice-chat.test.js); this one is empty.
+  const inVoice = await bd(mod, { count: 1 }, voice.id);
+  assert.equal(inVoice.status, 200, inVoice.text);
+  assert.equal(inVoice.json.deleted, 0);
   for (const body of [{}, { count: 0 }, { count: 101 }, { count: 2.5 }, { ids: [] }, { ids: 'x' }, { ids: [1, 2] }, { ids: ['a b'] },
     { ids: Array.from({ length: 101 }, (_, i) => 'm' + i) }, { ids: ['x'.repeat(65)] }]) {
     assert.equal((await bd(owner, body)).status, 400, JSON.stringify(body).slice(0, 60));

@@ -59,6 +59,14 @@ gives way.
 - A call can be pinned to one region (`POST /api/calls/region`; Manage Channels in a server, anyone in a DM or
   group). A pinned call uses that region's relay only (`iceTransportPolicy: 'relay'`).
 
+### Text chat beside the call
+
+A server's voice channels have a text chat (v19): the channel's own messages, end-to-end encrypted with the server's
+key like a text channel's, shown in the call view's side panel. It has nothing to do with the media path: no
+signaling, no relay, and you don't have to be in the call to read or write it (View Channel and Send Messages, not
+Connect). Being in the call only changes what counts as unread: a voice chat counts for people who opened it, wrote
+there or picked "All messages" for it, and for people in its call. A group's call has no separate chat. Details, decisions and limits: [FEATURES.md](FEATURES.md#voice-channel-chats).
+
 ## 2. The call state machine
 
 `Voice.state` is the one source of truth; the call bar (`#voice-panel [data-call-state]`) and the call stage head

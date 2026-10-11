@@ -69,6 +69,7 @@ const S = {
   mentions: new Map(),
   lastRead: {},         // conversation key -> last message id read (kept on the server, synced across devices)
   lastIds: {},          // conversation key -> newest message id we know of
+  chatFloor: {},        // voice chat key -> the newest message known before it last turned unread (one you never opened)
   notifyPrefs: {},      // 's:'|'c:'|'d:' key -> { level, muteUntil, suppressEveryone } (on the server)
   notifySettings: { dnd: { on: false }, previews: 'hidden' },
   savedIds: new Set(),  // saved messages (ids only; on the server)
@@ -132,6 +133,9 @@ const P = {
   get chat() { return { enterToSend: true, embeds: true, markdown: true, jumbo: true, linkPreviews: 'ask', linkCards: true, ...LS.get('hearth.chat', {}) }; },
   get showMembers() { return localStorage.getItem('hearth.members') !== 'off'; },
   set showMembers(v) { localStorage.setItem('hearth.members', v ? 'on' : 'off'); },
+  // The chat beside a voice channel's call: shown or hidden as you last left it (closed until you first open it).
+  get voiceChat() { return localStorage.getItem('hearth.voiceChat') === 'on'; },
+  set voiceChat(v) { localStorage.setItem('hearth.voiceChat', v ? 'on' : 'off'); },
 };
 
 // expose for settings.js
@@ -507,7 +511,7 @@ function startApp() {
     onChange: () => {
       if (!voice.channelId) S.regionWarned.clear();
       shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers();
-      if (S.view.type === 'channel' || S.view.type === 'dm') renderHeader();
+      if (S.view.type === 'channel' || S.view.type === 'dm' || S.view.type === 'voice') renderHeader();
       reportCall({ inCall: !!voice.channelId, muted: voice.muted, deafened: voice.deafened });
       syncCallNotification();
     },
@@ -1080,12 +1084,13 @@ function convSecs(key) {
 const timerChoices = () => (((S.config || {}).disappearing || {}).choices || TIMERS.map(([v]) => v));
 // Who may change it: either person in a DM (not someone they blocked, not a deleted account), anyone in a group chat,
 // and in a server channel people who can edit it (Manage Channels there). The server checks all of this again.
+// A server's voice channel has one for its chat, like a text channel (a group's call has no chat of its own).
 function mayChangeTimer(key) {
   if (!key) return false;
   if (key.startsWith('d:')) { const d = S.dms.find((x) => x.id === key.slice(2)); return !!d && !S.blocked.has(d.userId) && !getUser(d.userId).deleted; }
   const c = channelById(key.slice(2));
   const srv = c && serverOfChannel(c.id);
-  return !!c && c.type === 'text' && (isGroup(srv) || canEditChannel(srv, c));
+  return !!c && hasChat(c) && (isGroup(srv) || canEditChannel(srv, c));
 }
 // The section in a conversation's menu: the choices with the one in force ticked; people who can't change it just
 // see what it is.
@@ -1094,13 +1099,13 @@ function disappearItems(key) {
   if (!mayChangeTimer(key)) return secs ? ['-', { header: `Disappearing messages: ${disLabel(secs)}` }] : [];
   return ['-', { header: 'Disappearing messages' }, ...timerChoices().map((v) => ({ label: disLabel(v), checked: secs === v, action: () => setDisappearing(key, v) }))];
 }
-// "your chat with Bob", "Weekend plans", "#general": where a conversation is, in a sentence.
+// "your chat with Bob", "Weekend plans", "#general", "🔊 Lounge": where a conversation is, in a sentence.
 function convTitle(key) {
   if (key.startsWith('d:')) { const d = S.dms.find((x) => x.id === key.slice(2)); return d ? `your chat with ${displayName(getUser(d.userId))}` : 'this chat'; }
   const s = serverOfChannel(key.slice(2));
   if (isGroup(s)) return groupName(s);
   const c = channelById(key.slice(2));
-  return c ? `#${c.name}` : 'this channel';
+  return c ? chanLabel(c) : 'this channel';
 }
 const timerUrl = (key) => `${key.startsWith('d:') ? '/dms/' : '/channels/'}${encodeURIComponent(key.slice(2))}/disappearing`;
 // Returns whether the timer is now secs: false when they cancelled, or when it failed (shown as a toast, or thrown
@@ -1312,7 +1317,8 @@ function refreshUnreadSoon() {
 }
 
 // ======================================================================= navigation
-const currentKey = () => (S.view.type === 'channel' ? 'c:' + S.view.channelId : S.view.type === 'dm' ? 'd:' + S.view.dmId : null);
+// The conversation on screen: a channel, a DM, or a voice channel's chat while it's open beside the call.
+const currentKey = () => (S.view.type === 'channel' || (S.view.type === 'voice' && S.view.chat) ? 'c:' + S.view.channelId : S.view.type === 'dm' ? 'd:' + S.view.dmId : null);
 const currentServer = () => S.servers.find((s) => s.id === S.view.serverId);
 const isOwner = (server) => !!server && server.ownerId === S.me.id;
 // ---- permissions (the server sends our own, already resolved, per server and per channel)
@@ -1368,6 +1374,21 @@ const realServers = () => S.servers.filter((s) => s.kind !== 'group');
 const groups = () => S.servers.filter((s) => s.kind === 'group');
 const serverOfChannel = (channelId) => S.servers.find((s) => s.channels.some((c) => c.id === channelId));
 const channelById = (id) => { for (const s of S.servers) { const c = s.channels.find((x) => x.id === id); if (c) return c; } return null; };
+
+// ---- voice channel chats
+// A server's voice channels have a text chat beside the call (a group's call doesn't: the group's own conversation
+// is its chat). It's the channel's ordinary messages, so it uses the server's keys like any text channel. It opens
+// in the call view's side panel. Its new messages count as unread only for people who follow it: who opened it once
+// or wrote there (that leaves a read marker, synced to all their devices), picked "All messages" for it (the server
+// then leaves one too), or are in its call right now. The server uses the same rule for pushes. Pings always count.
+const hasChat = (c) => !!c && (c.type === 'text' || (c.type === 'voice' && !isGroup(serverOfChannel(c.id))));
+const isVoiceChat = (key) => { const c = key && key.startsWith('c:') ? channelById(key.slice(2)) : null; return !!c && c.type === 'voice' && hasChat(c); };
+const followsVoiceChat = (c) => !!S.lastRead['c:' + c.id] || (!!voice && voice.channelId === c.id) || (S.notifyPrefs['c:' + c.id] || {}).level === 'all';
+// Whether new messages in this channel count as unread for me.
+const chatCounts = (c) => !c || c.type !== 'voice' || followsVoiceChat(c);
+const countsUnread = (key) => !key.startsWith('c:') || chatCounts(channelById(key.slice(2)));
+// How a channel is named in sentences: #general, or 🔊 Lounge for a voice channel's chat.
+const chanLabel = (c) => (c && c.type === 'voice' ? `\uD83D\uDD0A ${c.name}` : `#${c ? c.name : 'channel'}`);
 
 // ---- screen sharing: keep DMs private
 // While you share your screen, direct messages and group chats are covered (and their previews and pop-up
@@ -1476,11 +1497,15 @@ function setView(v) {
   if (S.panel === 'pins' || (S.panel === 'threads' && (!S.threadsPanel || S.threadsPanel.channelId !== v.channelId))) S.panel = null;
   if (S.panel === null && P.showMembers && wideEnoughForPanel() && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
   document.body.classList.remove('nav-open');
+  // Going somewhere draws the side panel afresh (a voice chat panel otherwise stays as it is through redraws).
+  const panelEl = $('#members');
+  if (panelEl) delete panelEl.dataset.key;
   if (v.type === 'channel') { const lc = new Map(Object.entries(P.lastChannel)); lc.set(v.serverId, v.channelId); P.lastChannel = Object.fromEntries(lc); }
   // Where "New messages" goes: the read marker as it was when you opened the conversation.
   const ck = currentKey();
   S.unreadMarker = ck && S.unread.has(ck) ? ck : null;
-  S.markerId = S.unreadMarker ? S.lastRead[ck] || '0' : null;
+  // (A voice chat you never opened, that turned unread while you were in its call: from the last message before that.)
+  S.markerId = S.unreadMarker ? S.lastRead[ck] || S.chatFloor[ck] || '0' : null;
   S.markerCount = S.unreadMarker ? S.unreadCounts && S.unreadCounts[ck] || 0 : 0;
   renderAll();
   markRead(currentKey());
@@ -1502,8 +1527,25 @@ function openServer(serverId) {
   const c = s.channels.find((x) => x.id === last && x.type === 'text') || orderedChannels(s).find((x) => x.type === 'text');
   if (c) openChannel(c.id, s.id); else setView({ type: 'empty-server', serverId });
 }
-function openChannel(channelId, serverId) { setView({ type: 'channel', channelId, serverId }); }
-function openVoiceRoom(channelId, serverId) { setView({ type: 'voice', channelId, serverId }); }
+// Where a channel's messages are read: its own view, or for a voice channel the call view with the chat open beside it
+// (from a notification, a message link, a search result...).
+function channelView(channelId, serverId, extra = {}) {
+  const c = channelById(channelId);
+  return c && c.type === 'voice' && hasChat(c) ? { type: 'voice', channelId, serverId, chat: true, ...extra } : { type: 'channel', channelId, serverId, ...extra };
+}
+function openChannel(channelId, serverId) { setView(channelView(channelId, serverId)); }
+function openVoiceRoom(channelId, serverId, { chat = P.voiceChat } = {}) { setView({ type: 'voice', channelId, serverId, chat: !!chat && hasChat(channelById(channelId)) }); }
+// The chat button in the call view's header (and the chat panel's close button): remembered for the next call.
+function toggleVoiceChat(on = !S.view.chat) {
+  if (S.view.type !== 'voice') return;
+  P.voiceChat = on;
+  // From the keyboard (the header's button or the panel's close button): focus stays on the chat button, not lost
+  // with the redraw.
+  const keep = !!(document.activeElement && document.activeElement.closest('#main-head, #members'));
+  setView({ ...S.view, chat: on && hasChat(channelById(S.view.channelId)), jumpTo: undefined });
+  const b = keep && $('#main-head .voice-chat-btn');
+  if (b) b.focus({ preventScroll: true });
+}
 function openGroup(serverId) {
   const s = S.servers.find((x) => x.id === serverId);
   const c = s && textChannel(s);
@@ -1618,6 +1660,7 @@ function onReadUpdate(st) {
   if (!st.unread) closeNotifications(st.conv);
   updateTitle(); later(renderRail); later(renderSidebar);
   if (S.view.type === 'home') later(renderMain);
+  if (S.view.type === 'voice') later(renderHeader); // the chat button's badge
 }
 // Preferences and saved messages used to be kept only in this browser. The first time this device sees the
 // server's (empty) copy, it hands its own over (ids and levels only: the saved text it kept is deleted).
@@ -1652,7 +1695,7 @@ function serverUnread(s) {
   for (const c of s.channels) {
     const k = 'c:' + c.id;
     mentions += mentionsOf(k);
-    if (S.unread.has(k) && notifyLevel(k) === 'all') unread = true;
+    if (S.unread.has(k) && notifyLevel(k) === 'all' && chatCounts(c)) unread = true;
   }
   if (notifyLevel('s:' + s.id) === 'muted') unread = false;
   return { unread, mentions };
@@ -1670,6 +1713,9 @@ function syncRead(key, messageId, unread = false, threads = false) {
 function markRead(key) {
   if (!key || document.hidden) return;
   const st = S.msgs[key];
+  // A voice channel's chat opened before anyone wrote in it: the marker '0' (before every message) says you opened
+  // it, so what's written there next counts as unread for you, on all your devices.
+  if (st && st.loaded && !st.list.length && !S.lastRead[key] && isVoiceChat(key)) { S.lastRead[key] = '0'; syncRead(key, '0'); }
   const lastId = st && st.list.length && !st.hasNewer ? st.list[st.list.length - 1].id : null;
   const badges = S.unread.has(key) || S.mentions.has(key);
   // Called on every scroll near the bottom: only do the work when something actually changes.
@@ -1691,7 +1737,10 @@ function markConvRead(key, { threads: withThreads = true } = {}) {
   const st = S.msgs[key];
   const lastId = (st && st.list.length && !st.hasNewer && st.list[st.list.length - 1].id) || S.lastIds[key];
   const threads = withThreads && key.startsWith('c:');
-  if (lastId) { S.lastRead[key] = lastId; syncRead(key, lastId, false, threads); }
+  // A voice chat you never opened, from a menu: its pings are read, and it stays that way (marking it read isn't
+  // opening it). One on screen is open, so that's an ordinary read.
+  if (lastId && isVoiceChat(key) && !S.lastRead[key] && currentKey() !== key) { S.chatFloor[key] = lastId; api('POST', '/me/read', { conv: key, messageId: lastId, pings: true }).catch(() => {}); }
+  else if (lastId) { S.lastRead[key] = lastId; syncRead(key, lastId, false, threads); }
   S.unread.delete(key); S.mentions.delete(key);
   if (threads) { S.threadMentions.delete(key); clearThreads(key.slice(2)); }
   if (S.unreadCounts) S.unreadCounts[key] = 0;
@@ -1839,6 +1888,8 @@ function renderAll() {
 // What the right panel should show for the current view (or null).
 function panelMode() {
   if (S.panel === 'thread' && S.thread) return 'thread';
+  // The call view's side panel is the voice channel's chat (or the chat's pinned messages), while it's open.
+  if (S.view.type === 'voice') return S.view.chat ? (S.panel === 'pins' ? 'pins' : 'chat') : null;
   if (!['channel', 'dm'].includes(S.view.type)) return null;
   return S.panel;
 }
@@ -1855,7 +1906,7 @@ function resizeHandle(which) {
   const cfg = () => {
     const d = document.documentElement.dataset;
     if (which === 'sidebar') return { key: 'sideW', v: '--side-w', min: 200, max: 420, def: 256, dir: d.sidebarSide === 'right' ? -1 : 1, box: $('#sidebar') };
-    const thread = panelMode() === 'thread';
+    const thread = panelMode() === 'thread' || panelMode() === 'chat'; // conversations in the panel share one width
     return { key: thread ? 'threadW' : 'panelW', v: thread ? '--thread-w' : '--members-w', min: thread ? 300 : 220, max: thread ? 680 : 520, def: thread ? 400 : 272, dir: d.panelSide === 'left' ? 1 : -1, box: $('#members') };
   };
   const save = (key, w) => { const a = loadAppearance(); a.layout[key] = Math.round(w); saveAppearance(a); };
@@ -2158,7 +2209,7 @@ function renderServerSidebar(server, head, body) {
   cats.forEach((cat, ci) => {
     const chans = channelsIn(server, cat);
     const isCollapsed = collapsed.includes(cat);
-    const catUnread = isCollapsed && chans.some((c) => S.unread.has('c:' + c.id) && !isMuted('c:' + c.id));
+    const catUnread = isCollapsed && chans.some((c) => S.unread.has('c:' + c.id) && !isMuted('c:' + c.id) && chatCounts(c));
     const head = h('div', { class: 'cat-head' },
       h('button', {
         class: `cat-toggle${catUnread ? ' unread' : ''}`, 'aria-expanded': String(!isCollapsed),
@@ -2196,7 +2247,8 @@ function channelRow(c, server) {
   const k = 'c:' + c.id;
   const active = S.view.channelId === c.id;
   const muted = isMuted(k);
-  const unread = c.type === 'text' && S.unread.has(k) && notifyLevel(k) === 'all';
+  // A voice channel's chat shows as unread only to people who follow it (see hasChat above); its pings always show.
+  const unread = hasChat(c) && chatCounts(c) && S.unread.has(k) && notifyLevel(k) === 'all';
   const mentions = mentionsOf(k);
   const connected = voice && voice.channelId === c.id;
   return h('div', {
@@ -2219,23 +2271,30 @@ function channelMenuItems(c, server) {
   const roles = canEditChannelPerms(server, c);
   const pk = S.notifyPrefs[k];
   const lvl = pk && pk.level !== 'default' ? (pk.level === 'none' ? 'muted' : pk.level) : 'default';
+  const chat = hasChat(c);
+  // A voice chat you don't follow has nothing to mark read unless it pinged you (that reads the pings and leaves it
+  // unfollowed: see markConvRead).
+  const markable = c.type === 'text' || (chat && (mentionsOf(k) > 0 || (S.unread.has(k) && chatCounts(c))));
   return [
-    c.type === 'text' ? { label: 'Mark as read', icon: 'check', action: () => markConvRead(k) } : null,
+    chat && c.type === 'voice' ? { label: S.view.type === 'voice' && S.view.channelId === c.id && S.view.chat ? 'Hide chat' : 'Open chat', icon: 'message', action: () => (S.view.type === 'voice' && S.view.channelId === c.id ? toggleVoiceChat() : openVoiceRoom(c.id, server.id, { chat: true })) } : null,
+    markable ? { label: 'Mark as read', icon: 'check', action: () => markConvRead(k) } : null,
     ...(c.type === 'voice' && callRegions().length ? [...regionMenuItems(c.id), '-'] : []),
-    c.type === 'text' ? { header: 'Notifications' } : null,
-    ...(c.type === 'text' ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
-    c.type === 'text' ? { label: 'Ignore @everyone and @here', checked: !!(pk && pk.suppressEveryone), action: () => setNotify(k, undefined, { suppressEveryone: !(pk && pk.suppressEveryone) }) } : null,
-    ...(c.type === 'text' ? notifyItems(k) : []),
-    ...(c.type === 'text' ? disappearItems(k) : []),
+    chat ? { header: c.type === 'voice' ? 'Chat notifications' : 'Notifications' } : null,
+    ...(chat ? [['default', 'Use server default'], ['all', 'All messages'], ['mentions', 'Only @mentions'], ['muted', 'Nothing']].map(([v, l]) => ({ label: l, checked: lvl === v, action: () => setNotify(k, v) })) : []),
+    chat ? { label: 'Ignore @everyone and @here', checked: !!(pk && pk.suppressEveryone), action: () => setNotify(k, undefined, { suppressEveryone: !(pk && pk.suppressEveryone) }) } : null,
+    ...(chat ? notifyItems(k) : []),
+    // A voice channel's chat disappears like a text channel's (the timer is the channel's).
+    ...(chat ? disappearItems(k) : []),
     '-',
     { label: 'Copy channel link', icon: 'link', action: () => { copyText(`${location.origin}/#c/${c.id}`); toast('Link copied.'); } },
     edit ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
     roles ? { label: 'Permissions', icon: 'shield', action: () => openEditChannel(c, 'perms') } : null,
     canManageHooks(server, c) ? { label: 'Webhooks', icon: 'link', action: () => openEditChannel(c, 'hooks') } : null,
     roles && c.type === 'text' ? { label: 'Make read-only (announcements)', icon: 'megaphone', action: () => quickOverride(server, c, 'readonly') } : null,
+    roles && c.type === 'voice' && hasChat(c) ? { label: 'Make the chat read-only', icon: 'message', action: () => quickOverride(server, c, 'readonly') } : null,
     roles ? { label: 'Make private', icon: 'lock', action: () => quickOverride(server, c, 'private') } : null,
     ...channelMoveItems(server, c),
-    c.type === 'text' && canIn(c, PERMS.MANAGE_MESSAGES) ? { label: 'Delete recent messages\u2026', icon: 'trash', danger: true, action: () => openPurgeRecent(c) } : null,
+    hasChat(c) && canIn(c, PERMS.MANAGE_MESSAGES) ? { label: 'Delete recent messages\u2026', icon: 'trash', danger: true, action: () => openPurgeRecent(c) } : null,
     edit ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
   ];
 }
@@ -2254,7 +2313,7 @@ async function quickOverride(server, c, kind) {
   const overrides = [...(c.overrides || []).filter((o) => !isEveryone(o) && !isMe(o)), everyone, ...(me ? [me] : [])];
   try {
     await api('PUT', `/channels/${c.id}/overrides`, { overrides });
-    toast(kind === 'readonly' ? `#${c.name} is now read-only. Give roles "Send messages" in its permissions to let them post.` : `#${c.name} is now private. Add roles or people who should see it.`);
+    toast(kind === 'readonly' ? `${chanLabel(c)}${c.type === 'voice' ? '\u2019s chat' : ''} is now read-only. Give roles "Send messages" in its permissions to let them post.` : `${chanLabel(c)} is now private. Add roles or people who should see it.`);
     if (kind === 'private') openEditChannel(c, 'perms', { overrides });
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2276,7 +2335,7 @@ function categoryMenuItems(server, cat, i, cats) {
 const canMoveChannel = (server, c) => canEditChannel(server, c);
 const canMoveCategory = (server, cat) => isAdmin(server) && channelsIn(server, cat).every((c) => canIn(c, PERMS.MANAGE_CHANNELS));
 const channelLayout = (server) => orderedCategories(server).map((cat) => ({ cat, list: channelsIn(server, cat) }));
-const chanLabel = (c) => (c.type === 'voice' ? c.name : `#${c.name}`);
+// (Toasts name the channel with chanLabel, above: "#news moved up.", "🔊 Lounge moved down.")
 // Built on the server bar's drag code (folders.js): a channel lands between channels, or on a category's name (first
 // in it); a category lands before or after another one.
 const channelDrag = dragDrop({
@@ -2594,6 +2653,20 @@ function threadsButton(channelId) {
   else if (fresh) b.append(h('span', { class: 'unread-dot', 'aria-hidden': 'true' }));
   return b;
 }
+// Show or hide the chat beside a call. While it's hidden, its badge counts your pings there, and a dot means new
+// messages (when they count for you: you opened it before, or you're in the call).
+function voiceChatButton(c) {
+  const k = 'c:' + c.id;
+  const open = !!S.view.chat;
+  const pings = open ? 0 : mentionsOf(k);
+  const fresh = !open && !pings && S.unread.has(k) && chatCounts(c) && !isMuted(k);
+  const label = `${open ? 'Hide chat' : 'Show chat'}${pings ? ` \u00b7 ${pings} mention${pings === 1 ? '' : 's'}` : fresh ? ' \u00b7 new messages' : ''}`;
+  // The label says what pressing it does (Show or Hide), so no aria-pressed as well: "Hide chat, pressed" contradicts itself.
+  const b = ibtn('message', label, () => toggleVoiceChat(), { active: open, cls: 'with-badge voice-chat-btn', attrs: { 'aria-pressed': null } });
+  if (pings) b.append(h('span', { class: 'badge', 'aria-hidden': 'true' }, pings > 99 ? '99+' : pings));
+  else if (fresh) b.append(h('span', { class: 'unread-dot', 'aria-hidden': 'true' }));
+  return b;
+}
 function togglePanel(mode) {
   S.panel = S.panel === mode ? null : mode;
   if (mode === 'members') P.showMembers = S.panel === 'members';
@@ -2676,8 +2749,16 @@ function drawHeader(head) {
         ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...dmMenuItems(d), '-', blockItem(u)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'voice' && server) {
     const c = server.channels.find((x) => x.id === v.channelId);
+    const ck = 'c:' + v.channelId;
+    const chatOpen = !!v.chat && hasChat(c);
     head.append(h('div', { class: 'head-title' }, icon('speaker', 'ic head-ic'), h('h1', null, c ? c.name : 'Voice')),
-      headTools(h('span', { class: 'head-note' }, icon('lock', 'ic'), c && c.region && callRegions().some((r) => r.id === c.region) ? `Audio goes through ${regionName(c.region)}, encrypted end to end` : 'Audio goes directly between members, encrypted')));
+      headTools(h('span', { class: 'head-note call-note' }, icon('lock', 'ic'), c && c.region && callRegions().some((r) => r.id === c.region) ? `Audio goes through ${regionName(c.region)}, encrypted end to end` : 'Audio goes directly between members, encrypted'),
+        chatOpen ? encBadge(() => openServerSecurity(server)) : null,
+        chatOpen ? timerButton(ck) : null,
+        chatOpen ? ibtn('search', 'Search this chat (Ctrl+K)', () => openSearch({ scope: ck })) : null,
+        chatOpen && isMuted(ck) ? ibtn('bellOff', 'Muted. Click to change.', (e) => menu(e.currentTarget, notifyMenu(ck), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }) : null,
+        hasChat(c) ? voiceChatButton(c) : null,
+        chatOpen ? ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' }) : null));
   } else if (v.type === 'friends') {
     const pending = Object.values(S.relationships).filter((r) => r.direction === 'incoming').length;
     const tab = (k, label, extra) => h('button', { class: `tab${v.tab === k ? ' active' : ''}${k === 'add' ? ' tab-add' : ''}`, role: 'tab', 'aria-selected': String(v.tab === k), onclick: () => goFriends(k) }, label, extra);
@@ -3322,6 +3403,12 @@ function welcomeBlock() {
       timerWelcome(currentKey()));
   }
   const c = server.channels.find((x) => x.id === S.view.channelId);
+  if (c.type === 'voice') {
+    return h('div', { class: 'welcome' }, h('div', { class: 'welcome-ic' }, icon('message')), h('h2', null, `${c.name} chat`),
+      h('p', null, 'Text chat for this voice channel: links, notes and anything said while you talk. Anyone who can see the channel can read it, in the call or not.'),
+      h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only members of this server can read it.'),
+      timerWelcome('c:' + c.id));
+  }
   const th = server.theme || {};
   return h('div', { class: 'welcome' }, h('div', { class: 'welcome-ic' }, icon(channelIcon(c))), h('h2', null, `Welcome to #${c.name}`),
     h('p', null, c.topic || 'This is the start of the channel.'),
@@ -3451,7 +3538,7 @@ async function deleteSelected() {
 }
 function openPurgeRecent(c) {
   const count = h('input', { class: 'input', type: 'number', min: '1', max: String(BULK_MAX), step: '1', value: '20', inputmode: 'numeric' });
-  modal({ title: `Delete recent messages in #${c.name}?`, size: 'sm',
+  modal({ title: `Delete recent messages in ${chanLabel(c)}?`, size: 'sm',
     body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `The newest messages in this channel from the last ${BULK_DAYS} days go for everyone, with their files and thread replies. Messages by people at or above your highest role are kept. This can\u2019t be undone.`),
       field(`How many (up to ${BULK_MAX})`, count)),
     actions: [{ label: 'Cancel' }, { label: 'Delete', kind: 'danger', action: async () => {
@@ -3636,10 +3723,12 @@ function messageTools(m, ctx) {
     h('button', { class: 'tool quick', 'data-tip': 'React with 👍', 'aria-label': 'React with thumbs up', onclick: () => react(m, '👍') }, '👍'),
     h('button', { class: 'tool', 'data-tip': 'Add reaction', 'aria-label': 'Add reaction', 'data-pop-anchor': '', onclick: (e) => emojiPicker(e.currentTarget, (em) => react(m, em)) }, icon('smile')),
     ok ? h('button', { class: 'tool', 'data-tip': 'Reply', 'aria-label': 'Reply', onclick: () => startReply(m, ctx) }, icon('reply')) : null,
-    ok && !m.dmId && !m.threadId && ctx === 'main' ? h('button', { class: 'tool', 'data-tip': m.threadCount ? 'Open thread' : 'Reply in thread', 'aria-label': 'Reply in thread', onclick: () => openThread(m) }, icon('thread')) : null,
+    ok && threadable(m) && ctx === 'main' ? h('button', { class: 'tool', 'data-tip': m.threadCount ? 'Open thread' : 'Reply in thread', 'aria-label': 'Reply in thread', onclick: () => openThread(m) }, icon('thread')) : null,
     h('button', { class: 'tool', 'data-tip': 'More', 'aria-label': 'More actions', 'data-pop-anchor': '', onclick: (e) => menu(e.currentTarget, messageMenuItems(m, ctx), { align: 'end' }) }, icon('more')),
   );
 }
+// Threads start from a text channel's messages (a voice channel's chat is one conversation next to the call).
+const threadable = (m) => !m.dmId && !m.threadId && (channelById(m.channelId) || {}).type !== 'voice';
 function canModerate(m) {
   if (m.dmId) return false;
   return canIn(channelById(m.channelId), PERMS.MANAGE_MESSAGES);
@@ -3671,7 +3760,7 @@ function messageMenuItems(m, ctx) {
   return [
     { label: 'Add reaction', icon: 'smile', action: () => { const el = $(`[data-mid="${m.id}"] .msg-tools .tool:nth-child(2)`); emojiPicker(el || $('#main'), (em) => react(m, em)); } },
     ok ? { label: 'Reply', icon: 'reply', action: () => startReply(m, ctx) } : null,
-    ok && !m.dmId && !m.threadId && ctx === 'main' ? { label: m.threadCount ? 'Open thread' : 'Reply in thread', icon: 'thread', action: () => openThread(m) } : null,
+    ok && threadable(m) && ctx === 'main' ? { label: m.threadCount ? 'Open thread' : 'Reply in thread', icon: 'thread', action: () => openThread(m) } : null,
     ok ? { label: 'Forward', icon: 'forward', action: () => openForward(m) } : null,
     '-',
     canPin ? { label: m.pinnedAt ? 'Unpin message' : 'Pin message', icon: 'pin', action: () => togglePin(m) } : null,
@@ -3711,9 +3800,10 @@ function flash(el) {
   setTimeout(() => el.classList.remove('flash'), 2000);
 }
 async function jumpToMessage(key, id) {
-  if (currentKey() !== key) {
+  // A voice channel's chat whose pinned messages are showing in its place: back to the chat, at the message.
+  if (currentKey() !== key || (S.view.type === 'voice' && !$('#messages'))) {
     if (key.startsWith('d:')) setView({ type: 'dm', dmId: key.slice(2), jumpTo: id });
-    else { const s = serverOfChannel(key.slice(2)); if (s) setView({ type: 'channel', channelId: key.slice(2), serverId: s.id, jumpTo: id }); }
+    else { const s = serverOfChannel(key.slice(2)); if (s) setView(channelView(key.slice(2), s.id, { jumpTo: id })); }
     return;
   }
   const el = $(`#messages [data-mid="${id}"]`);
@@ -3855,7 +3945,7 @@ function whereLabel(m) {
   const s = S.servers.find((x) => x.id === m.serverId);
   if (isGroup(s)) return groupName(s);
   const c = channelById(m.channelId);
-  return s && c ? `#${c.name} \u00b7 ${s.name}` : 'Channel';
+  return s && c ? `${chanLabel(c)} \u00b7 ${s.name}` : 'Channel';
 }
 async function toggleSaved(m) {
   const was = S.savedIds.has(m.id);
@@ -4183,6 +4273,7 @@ async function onNewMessage(key, m) {
   if (disappears(m)) armClientExpiry();
   const t = S.typing[key];
   if (t && t.has(m.authorId)) { clearTimeout(t.get(m.authorId)); t.delete(m.authorId); if (currentKey() === key) renderTyping(); }
+  const knewUpTo = S.lastIds[key];
   if (!m.threadId && !(S.lastIds[key] && S.lastIds[key] >= m.id)) S.lastIds[key] = m.id;
   // Your own message (from here or another device) means you've read the conversation up to it.
   if (m.authorId === S.me.id) {
@@ -4198,14 +4289,21 @@ async function onNewMessage(key, m) {
   // @everyone you've chosen to ignore here isn't a ping.
   const mentioned = !!kind && !(kind === 'everyone' && everyoneMuted(key));
   const repliedToMe = m.reply && m.reply.authorId === S.me.id;
+  // A voice channel's chat you don't follow (never opened, not in its call): only pings count, quietly otherwise.
+  const counts = countsUnread(key);
   if (!viewing) {
-    S.unread.add(key);
-    if (S.unreadCounts) S.unreadCounts[key] = (S.unreadCounts[key] || 0) + 1;
+    if (counts) {
+      // A voice chat you follow only by being in its call has no read marker: "New messages" goes after what was there
+      // before it turned unread.
+      if (!S.unread.has(key) && !S.lastRead[key] && isVoiceChat(key)) S.chatFloor[key] = knewUpTo || '0';
+      S.unread.add(key);
+      if (S.unreadCounts) S.unreadCounts[key] = (S.unreadCounts[key] || 0) + 1;
+    }
     if ((isDm || mentioned || repliedToMe) && level !== 'muted' && !S.blocked.has(m.authorId)) {
       S.mentions.set(key, (S.mentions.get(key) || 0) + 1);
       // Several tabs open: only the first to claim this message makes a sound and shows it.
       if (!quiet()) claimOnce(m.id).then((mineToShow) => { if (!mineToShow) return; playSound((mentioned && kind) || (isDm ? (key.startsWith('d:') ? 'dm' : 'groupDm') : 'reply')); notify(getUser(m.authorId), previewText(m).replace(/^You: /, ''), key, m.id); if (!document.hasFocus()) flashTaskbar(); });
-    } else if (level === 'all' && !S.blocked.has(m.authorId) && !quiet()) claimOnce(m.id).then((ok) => { if (ok) playSound('message'); });
+    } else if (counts && level === 'all' && !S.blocked.has(m.authorId) && !quiet()) claimOnce(m.id).then((ok) => { if (ok) playSound('message'); });
   } else {
     // Reading along at the bottom: the marker follows (and your other devices clear their badge).
     later(() => { const sc = currentKey() === key && $('#messages'); if (sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight < 160) markRead(key); });
@@ -4223,6 +4321,8 @@ async function onNewMessage(key, m) {
   later(renderRail);
   if ((isDm && !S.view.serverId) || (!isDm && S.view.serverId === m.serverId) || (isDm && isGroup(currentServer()))) later(renderSidebar);
   if (S.view.type === 'home') later(renderMain);
+  // The call view of this voice channel with its chat hidden: the chat button shows what's new.
+  if (S.view.type === 'voice' && 'c:' + S.view.channelId === key) later(renderHeader);
 }
 function notify(author, body, key, msgId = null) {
   if (!('Notification' in window) || Notification.permission !== 'granted' || (!document.hidden && document.hasFocus())) return;
@@ -4474,8 +4574,15 @@ function renderPanel() {
   // The Threads list keeps the card that had focus through a rebuild (server updates, people joining…).
   const was = el.querySelector(':scope > .threads-list');
   const refocus = was && was.contains(document.activeElement) ? document.activeElement.closest('[data-root]') : null;
-  clear(el);
   const mode = panelMode();
+  // A voice channel's chat stays as it is through the panel's redraws (people joining, server updates): drawing it
+  // again would lose your place in it and the focus of what you're typing. Going somewhere else draws it afresh.
+  if (mode === 'chat' && el.dataset.mode === 'chat' && el.dataset.key === currentKey() && el.querySelector(':scope > .chat')) {
+    if (composers.main) composers.main.renderExtras();
+    return;
+  }
+  clear(el);
+  delete el.dataset.key;
   document.body.classList.toggle('panel-open', !!mode);
   el.hidden = !mode;
   if (!mode || !S.me) return;
@@ -4483,14 +4590,22 @@ function renderPanel() {
   queueMicrotask(() => { if (!el.querySelector(':scope > .resize-handle')) el.append(resizeHandle('panel')); });
   if ((mode === 'thread' || mode === 'pins' || mode === 'threads') && hiddenWhileSharing(privateKey())) return el.append(h('p', { class: 'sidebar-empty' }, 'Hidden while you share your screen.'));
   if (mode === 'thread') return threadPanel(el);
+  if (mode === 'chat') return voiceChatPanel(el);
   if (mode === 'pins') return pinsPanel(el);
   if (mode === 'threads') return threadsPanel(el, refocus && refocus.dataset.root);
   if (S.view.type === 'dm') return dmProfilePanel(el);
   return membersPanel(el);
 }
-function panelHead(title, sub, extra) {
+function panelHead(title, sub, extra, close = null) {
   return h('div', { class: 'panel-head' }, h('div', { class: 'panel-title' }, h('h2', null, title), sub ? h('span', null, sub) : null),
-    extra, ibtn('close', 'Close panel', () => (S.panel === 'thread' ? closeThread(true) : togglePanel(S.panel))));
+    extra, close || ibtn('close', 'Close panel', () => (S.panel === 'thread' ? closeThread(true) : togglePanel(S.panel))));
+}
+// The chat beside a voice channel's call: the same conversation view as a text channel (messages, the composer, the
+// "New messages" line, picking messages to delete), in the side panel. Pinned messages open in its place.
+function voiceChatPanel(el) {
+  const c = channelById(S.view.channelId);
+  el.dataset.key = currentKey();
+  el.append(panelHead('Chat', c ? chanLabel(c) : '', null, ibtn('close', 'Hide chat', () => toggleVoiceChat(false))), chatView());
 }
 
 function membersPanel(el) {
@@ -5002,7 +5117,8 @@ function createComposer({ id, key, threadId, placeholder }) {
   const cmdBar = h('div', { class: 'cmd-bar', hidden: true });
   const ephBox = h('div', { class: 'eph-list' });
   const el = h('div', { class: `composer-wrap cw-${id}` }, suggest, ephBox, cmdBar, extras, box, disNote, slowNote, typing);
-  const slashChannel = () => { const kk = key(); if (id !== 'main' || !kk || !kk.startsWith('c:')) return null; const s = serverOfChannel(kk.slice(2)); return s && !isGroup(s) ? kk.slice(2) : null; };
+  // Bots' commands work in text channels (not a group's chat, nor a voice channel's).
+  const slashChannel = () => { const kk = key(); if (id !== 'main' || !kk || !kk.startsWith('c:')) return null; const s = serverOfChannel(kk.slice(2)); return s && !isGroup(s) && (channelById(kk.slice(2)) || {}).type === 'text' ? kk.slice(2) : null; };
   const renderCmdBar = () => {
     const ch = slashChannel();
     const cmd = ch && SLASH.match(ch, ta.value);
@@ -5295,7 +5411,7 @@ function createComposer({ id, key, threadId, placeholder }) {
     if (blockedNote) extras.append(blockedNote);
     const to = ch && (serverOfChannel(ch.id) || {}).timeout;
     if (noSend && to && to.until > Date.now()) extras.append(h('div', { class: 'key-bar' }, icon('timer'), h('span', null, `You\u2019re timed out until ${fmtStamp(to.until)}${to.reason ? ` (${to.reason})` : ''}. You can still read.`)));
-    else if (noSend) extras.append(h('div', { class: 'key-bar' }, icon('lock'), h('span', null, threadId() ? 'You can read this thread but not reply.' : `You can read #${ch.name} but you don\u2019t have permission to send messages here.`)));
+    else if (noSend) extras.append(h('div', { class: 'key-bar' }, icon('lock'), h('span', null, threadId() ? 'You can read this thread but not reply.' : `You can read ${chanLabel(ch)} but you don\u2019t have permission to send messages here.`)));
     ta.placeholder = noSend ? 'Read only' : placeholder || placeholderFor(kk);
     slowNote.hidden = !(ch && ch.slowmode > 0 && !canIn(ch, PERMS.MANAGE_MESSAGES));
     if (!slowNote.hidden && !slowUntil) slowNote.textContent = `Slowmode is on: one message every ${fmtDuration(ch.slowmode)}`;
@@ -5400,7 +5516,7 @@ function placeholderFor(k) {
   const s = serverOfChannel(k.slice(2));
   if (isGroup(s)) return `Message ${groupName(s)}`;
   const c = channelById(k.slice(2));
-  return c ? `Message #${c.name}` : 'Message';
+  return c ? `Message ${chanLabel(c)}` : 'Message';
 }
 function insertAtCursor(ta, text) {
   const s = ta.selectionStart; const e = ta.selectionEnd;
@@ -5421,7 +5537,7 @@ function keyNotice() {
     }
     return null;
   }
-  if (S.view.type !== 'channel') return null;
+  if (S.view.type !== 'channel' && !(S.view.type === 'voice' && S.view.chat)) return null;
   const st = sec.stateOf(S.view.serverId);
   if (!st || sec.currentKey(S.view.serverId) || st.needsRotation || !st.keyEpoch) return null;
   return h('div', { class: 'key-bar' }, h('span', { class: 'spinner' }),
@@ -5898,7 +6014,7 @@ function openSearch({ scope = null } = {}) {
     if (key.startsWith('d:')) return `In DM with ${displayName(getUser((S.dms.find((d) => d.id === key.slice(2)) || {}).userId))}`;
     const s = serverOfScope(key);
     if (key.startsWith('s:')) return `In ${s ? s.name : 'this server'}`;
-    return isGroup(s) ? `In ${groupName(s)}` : `In #${(channelById(key.slice(2)) || {}).name || 'channel'}`;
+    return isGroup(s) ? `In ${groupName(s)}` : `In ${chanLabel(channelById(key.slice(2)))}`;
   }
   const handles = (list) => list.slice(0, 4).map((u) => '@' + u.username).join(', ') + (list.length > 4 ? '…' : '');
   function findPerson(f) {
@@ -5922,7 +6038,10 @@ function openSearch({ scope = null } = {}) {
       return d ? { key: 'd:' + d.id } : { error: `You don’t have a DM with @${p.user.username}.` };
     }
     const n = f.name.toLowerCase();
-    const hits = realServers().flatMap((s) => s.channels.filter((c) => c.type === 'text' && c.name.toLowerCase() === n).map((c) => ({ c, s })));
+    // Text channels first; a voice channel's chat when no text channel has that name.
+    const named = (type) => realServers().flatMap((s) => s.channels.filter((c) => c.type === type && c.name.toLowerCase() === n).map((c) => ({ c, s })));
+    const text = named('text');
+    const hits = text.length ? text : named('voice');
     if (!hits.length) return { error: `No channel called #${f.name} that you can see.` };
     // Several servers have one: take the one being searched or looked at.
     const here = (serverOfScope(scopeKey) || {}).id || S.view.serverId;
@@ -7056,8 +7175,10 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   dis.value = String(ch0.disappear || 0);
   const tabs = h('div', { class: 'seg' });
   const body = h('div', { class: 'stack' });
+  // A voice channel's chat follows the chat permissions too (deny Send Messages to keep it voice only); it has no threads.
+  const VOICE_CHAT = hasChat(ch0) ? ['SEND_MESSAGES', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES'] : [];
   const scoped = PERM_GROUPS.flatMap(([, l]) => l).filter(([k]) => (c.type === 'voice'
-    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MOVE_MEMBERS', 'MANAGE_CHANNELS', 'MANAGE_ROLES']
+    ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MOVE_MEMBERS', 'MANAGE_CHANNELS', 'MANAGE_ROLES', ...VOICE_CHAT]
     : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES']).includes(k));
   const label = (o) => {
     if (o.type === 'member') return displayName(getUser(o.id));
@@ -7072,8 +7193,9 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
     const save = body.closest('.modal') && body.closest('.modal').querySelector('.modal-foot .btn.primary');
     if (save) save.hidden = tab === 'hooks';
     if (tab === 'overview') {
-      body.append(field('Channel name', name), ...(c.type === 'text' ? [field('Topic', topic), field('Slowmode', slow, 'How long people wait between messages. Anyone with Manage Messages skips it.'),
-        field('Disappearing messages', dis, 'New messages disappear this long after they\u2019re sent. Messages already here aren\u2019t affected.')] : []), field('Category', cat.el));
+      body.append(field('Channel name', name), ...(c.type === 'text' ? [field('Topic', topic)] : []),
+        ...(hasChat(ch0) ? [field('Slowmode', slow, `How long people wait between messages${c.type === 'voice' ? ' in its chat' : ''}. Anyone with Manage Messages skips it.`),
+          field('Disappearing messages', dis, `New messages${c.type === 'voice' ? ' in its chat' : ''} disappear this long after they\u2019re sent. Messages already here aren\u2019t affected.`)] : []), field('Category', cat.el));
       return;
     }
     // Webhooks save as you go (webhooks.js). Enter in its fields stays there: the dialog would otherwise take it as
@@ -7106,7 +7228,9 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
           ...scoped.map(([k, l, hint0]) => {
             const bit = PERMS[k]; const st = state(sel, bit);
             // Pings are checked by each reader's app against the server-wide permission (see mayMentionRole).
-            const hint = k === 'MENTION_EVERYONE' ? 'Needs the permission server-wide too: allowing it only here doesn\u2019t make pings work. Denying it here hides the suggestions.' : hint0;
+            // A voice channel's chat is read by everyone who can see the channel, Connect or not.
+            const hint = k === 'MENTION_EVERYONE' ? 'Needs the permission server-wide too: allowing it only here doesn\u2019t make pings work. Denying it here hides the suggestions.'
+              : k === 'SEND_MESSAGES' && c.type === 'voice' ? 'Write in its chat. Everyone who can see this channel can read the chat, whether or not they may join the call.' : hint0;
             return h('div', { class: 'ov-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, l), hint ? h('span', { class: 'field-hint' }, hint) : null),
               h('div', { class: 'tri', role: 'radiogroup', 'aria-label': l },
                 h('button', { class: `tri-btn deny${st === 'deny' ? ' on' : ''}`, 'aria-label': 'Deny', 'data-tip': 'Deny', onclick: () => setState(sel, bit, 'deny') }, icon('close')),
@@ -7126,7 +7250,7 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
         if (mayPerms) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
         // The timer has its own route, so every change is logged and shown in the channel. Last, so the rest is saved
         // either way; refused, the dialog shows why and stays open, and cancelling the question keeps it open too.
-        if (mayEdit && c.type === 'text' && +dis.value !== (fresh().disappear || 0) && !(await setDisappearing('c:' + c.id, +dis.value, { quiet: true, raise: true }))) return false;
+        if (mayEdit && hasChat(ch0) && +dis.value !== (fresh().disappear || 0) && !(await setDisappearing('c:' + c.id, +dis.value, { quiet: true, raise: true }))) return false;
         toast('Channel saved.');
       } } : null,
     ].filter(Boolean),

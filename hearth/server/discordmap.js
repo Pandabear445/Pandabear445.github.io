@@ -581,9 +581,11 @@ function planFromTemplate(guild, opts = {}) {
       // Private: @everyone can't see it (the lock in the preview).
       const eo = overrides.find((o) => o.target === 'everyone');
       const evView = eo ? (everyone.permissions & ~eo.deny) | eo.allow : everyone.permissions;
+      // Slowmode comes over for voice channels too: in Discord it's their text chat's, and Hearth's voice channels
+      // have a chat with slowmode (v19, voice chat).
       channels.push({
         key: c.key, name, sourceName: c.name, type: kind, group: g, category: catName.get(g), topic: c.topic,
-        slowmode: kind === 'text' ? c.slowmode : 0, position, overrides, notes, private: !(evView & P.VIEW_CHANNEL) && !everyone.dangerous,
+        slowmode: c.slowmode, position, overrides, notes, private: !(evView & P.VIEW_CHANNEL) && !everyone.dangerous,
       });
     }
   }

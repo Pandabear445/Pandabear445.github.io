@@ -11,7 +11,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Home screen** with recent and pinned conversations, online friends, your servers and recent activity.
 - **Search everything with Ctrl+K**: people, channels, servers, messages, files and links, with filters like `from:`, `in:`, `before:` and `has:`. Because messages are end-to-end encrypted, message search runs on your device; the server never sees the words (see [Search](#search-ctrlk)).
 - **Notification center** for mentions, replies and friend requests, plus unread and mention indicators that respect muted channels and servers.
-- **Voice and video:** voice channels, group DM calls and 1-to-1 **DM calls that ring** (accept, accept with video, decline). **Webcam** and **screen sharing with sound** everywhere, with a spotlight view, fullscreen, picture-in-picture and per-person volume. Calls go directly between participants when they can, encrypted (DTLS-SRTP). When a network blocks that, they go through a TURN relay (this server, if `setup-turn.sh` installed it here, or a linked region), which only ever sees encrypted packets. Mute, deafen, speaking indicators and an optional input-sensitivity gate.
+- **Voice and video:** voice channels (each with a text chat beside the call), group DM calls and 1-to-1 **DM calls that ring** (accept, accept with video, decline). **Webcam** and **screen sharing with sound** everywhere, with a spotlight view, fullscreen, picture-in-picture and per-person volume. Calls go directly between participants when they can, encrypted (DTLS-SRTP). When a network blocks that, they go through a TURN relay (this server, if `setup-turn.sh` installed it here, or a linked region), which only ever sees encrypted packets. Mute, deafen, speaking indicators and an optional input-sensitivity gate.
 - **End-to-end encryption for everything:** server channels, DMs, group DMs and every attachment are encrypted in your browser before they're sent. The server stores only scrambled data, so the person hosting it can't read your chats from it, as long as the app code the server sends you is honest. It does see who talks to whom and when (see [what's protected](#security-and-privacy--whats-protected) and [SECURITY.md](SECURITY.md)).
 - **Admin dashboard** for server administrators: live stats, who's online (with IP addresses and devices), reports with evidence, user lookup with IP history, suspend / unsuspend, sign out everywhere, registration control (open, invite code, closed), a Terms of Service editor, and an audit log of every admin action.
 - **Reporting:** anyone can report a message or a person. Because messages are end-to-end encrypted, the reporter's app shares the messages they choose (shown to them first); the server verifies who sent them and when.
@@ -397,6 +397,41 @@ participants) and Hearth rejoins by itself. Others see you as "reconnecting" for
 After a server restart, everyone rejoins automatically. The call bar always shows the real state, and **Call
 diagnostics** (the ⓘ button in a call) shows round trip, loss, jitter, path type and relay for your own connections.
 Developers: `npm run test:voice` runs a two-browser call test. See `docs/VOICE.md`.
+
+## Text chat in voice channels
+
+Every voice channel in a server has a text chat beside its call, for links, notes and whatever you'd rather type.
+Open it with the **chat button** in the call's header, or right-click the voice channel → **Open chat** (you don't
+have to join the call to read or write). It's the same conversation view as a text channel: replies, reactions, pins,
+edits, files, polls, voice messages, link previews, @mentions, search (Ctrl+K) and Export my data, end-to-end
+encrypted with the server's key like every channel.
+
+- **Who can use it:** anyone who can see the voice channel and has **Send Messages** there. Connect isn't needed, so
+  people who can only see a call can still chat. To keep a voice channel voice-only, deny Send Messages in its
+  permissions, or use **Make the chat read-only** in its menu. Slow mode, Attach Files, Add Reactions, Mention
+  @everyone and Manage Messages work there as in text channels.
+- **Unread:** a voice chat counts as unread only for people who follow it: who have opened it once or written there
+  (on any of their devices), who picked *All messages* for it, or who are in its call. Until then only pings show:
+  an @mention of you, a reply to you, a role you have, or an allowed @everyone. Notifications follow the same rule:
+  a server set to *All messages* doesn't notify you about voice chats you don't follow. Set *All messages* on the
+  voice channel itself (right-click → Chat notifications) to follow it and hear about every message there from then
+  on. **Mark as read** on a chat you don't follow (or Mark server as read) only clears its pings: it doesn't make
+  you follow it.
+- **Not there:** threads, bots, webhooks and slash commands stay in text channels. A group chat's call has no separate
+  chat: the group's own conversation is it.
+- **Moderation:** pins, Delete recent messages, picking messages to delete, a ban's message cleanup and the server's
+  audit log all cover voice chats.
+- **Upgrading:** voice channels that already exist get a chat too, with the limits your server already had on
+  posting carried over, once, on the first start: whoever is denied **Connect** on a voice channel is denied Send
+  Messages there too, a role or member denied Send Messages in every text channel they can see (a "Muted" role,
+  @everyone on a read-only server) is denied it in the voice channels as well, and when every text channel has slow
+  mode the voice channels get the shortest one. Each change is in the server's audit log, by Hearth. Nothing else
+  changes, so on most servers everyone who can see a voice channel can chat there: deny Send Messages (or use
+  **Make the chat read-only**) on channels that should stay voice-only, and remember that everyone who can see a
+  voice channel can read its chat, whether or not they may join the call. A staff-only call room keeps a closed
+  chat until an admin allows Send Messages for the people who may use it.
+
+Details: [docs/FEATURES.md](docs/FEATURES.md#voice-channel-chats).
 
 ## Voice not working?
 

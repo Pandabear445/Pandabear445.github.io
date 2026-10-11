@@ -108,11 +108,13 @@ module.exports = function setupDisappear(ctx) {
     return out;
   }
   // Who may change a channel's timer: any member of a group chat (like renaming it), Manage Channels in that
-  // channel in a server. Only text channels have messages.
+  // channel in a server. Only channels with messages have one: text channels, and a server's voice channels, whose
+  // chat (v19, voice chat) disappears like a text channel's. A group's call has no chat of its own.
   function channelFor(req, change) {
     const c = requireChannel(req.params.id, req.userId);
-    if (c.type !== 'text') fail(400, 'Only text channels have disappearing messages.', 'bad_channel');
-    if (change && (serverOf(c) || {}).kind !== 'group') requireManageableChannel(c.id, req.userId);
+    const srv = serverOf(c) || {};
+    if (c.type !== 'text' && !(c.type === 'voice' && srv.kind !== 'group')) fail(400, 'Only text channels and voice channels’ chats have disappearing messages.', 'bad_channel');
+    if (change && srv.kind !== 'group') requireManageableChannel(c.id, req.userId);
     return c;
   }
   // A DM's timer: either person, but not after a block (either way), nor once the other account is deleted.

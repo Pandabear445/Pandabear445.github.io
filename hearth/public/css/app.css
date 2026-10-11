@@ -329,7 +329,7 @@ body:not(.panel-open) #app { grid-template-columns: var(--cols-np, var(--rail-w)
 #main { background: rgb(var(--s2) / var(--glass)); display: flex; flex-direction: column; position: relative; }
 html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter: blur(18px) saturate(1.2); -webkit-backdrop-filter: blur(18px) saturate(1.2); }
 #members { width: var(--members-w); display: flex; flex-direction: column; animation: panel-in .18s var(--ease); }
-#members[data-mode='thread'] { width: var(--thread-w); }
+#members[data-mode='thread'], #members[data-mode='chat'] { width: var(--thread-w); }
 #members[hidden] { display: none; }
 @keyframes panel-in { from { opacity: 0; transform: translateX(8px); } }
 .app-loader { display: none; }
@@ -1634,7 +1634,7 @@ html.has-bg .set-nav, html.has-bg .set-main { backdrop-filter: blur(18px) satura
   body.nav-open .nav-scrim { display: block; position: fixed; inset: 0; z-index: 25; background: var(--scrim); }
   .nav-toggle { display: inline-flex !important; margin-left: -6px; }
   #members { position: fixed; inset: 0; width: 100% !important; border-radius: 0; z-index: 35; }
-  .head-topic { display: none; }
+  .head-topic, .call-note { display: none; }
   #main-head { gap: 4px; padding: 0 6px 0 10px; }
   .head-tools .icon-btn { width: 32px; }
   .head-badge { display: none; }

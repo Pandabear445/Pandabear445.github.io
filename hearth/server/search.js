@@ -65,11 +65,13 @@ module.exports = function setupSearch(ctx) {
     .all(src.id, ...(from ? [from] : []), hi[0], hi[1], lo[0], lo[1], n).map((r) => [r.t, r.id]);
 
   // The conversations a request may read. Single channels and DMs are checked up front (404 like the history
-  // endpoints); channels found through s: or all are checked one by one, only as far as they're needed.
+  // endpoints); channels found through s: or all are checked one by one, only as far as they're needed. Voice
+  // channels count too (v19): their chats are channel messages like any other (a voice channel without one has no
+  // messages, so it drops out at the first lookup).
   function sources(scope, uid, from) {
     if (scope === 'all') {
       const chans = db.prepare(`SELECT c.* FROM channels c JOIN members m ON m.server_id = c.server_id
-        WHERE m.user_id = ? AND c.type = 'text'`).all(uid).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
+        WHERE m.user_id = ? AND c.type IN ('text', 'voice')`).all(uid).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
       const dms = db.prepare('SELECT id, user_a, user_b FROM dm_channels WHERE user_a = ? OR user_b = ?').all(uid, uid)
         .filter((d) => !from || from === d.user_a || from === d.user_b).map((d) => ({ kind: 'd', id: d.id }));
       return [...chans, ...dms];
@@ -78,7 +80,7 @@ module.exports = function setupSearch(ctx) {
     if (kind === 'c') { const c = requireChannel(id, uid); return [{ kind: 'c', id: c.id, channel: c }]; }
     if (kind === 'd') { const d = requireDm(id, uid); return !from || from === d.user_a || from === d.user_b ? [{ kind: 'd', id: d.id }] : []; }
     const s = requireServer(id, uid);
-    return db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text'").all(s.id).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
+    return db.prepare("SELECT * FROM channels WHERE server_id = ? AND type IN ('text', 'voice')").all(s.id).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
   }
 
   api.get('/search/messages', auth, (req, res) => {

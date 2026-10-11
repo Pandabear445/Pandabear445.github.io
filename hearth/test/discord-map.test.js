@@ -188,6 +188,15 @@ test('planFromTemplate(sample): categories in Discord order, channels without on
   assert.equal(ch(p, '21').topic, 'Talk about anything');
 });
 
+test('planFromTemplate: a voice channel keeps its slowmode, since its chat has one in Hearth too (voice chat)', () => {
+  const g = clone(SAMPLE);
+  g.serialized_source_guild.channels.find((c) => c.id === 31).rate_limit_per_user = 15;
+  const p = plan(g);
+  assert.equal(ch(p, '31').type, 'voice');
+  assert.equal(ch(p, '31').slowmode, 15);
+  assert.equal(ch(p, '32').slowmode, 0);
+});
+
 test('planFromTemplate(sample): text names are cleaned like Hearth\'s own; one with nothing left becomes channel-<position>', () => {
   const p = plan();
   assert.equal(ch(p, '40').sourceName, '👋・welcome');

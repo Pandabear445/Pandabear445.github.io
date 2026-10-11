@@ -283,7 +283,7 @@ function emitKeyState(serverId) {
   for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list));
 }
 
-const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, disappear: c.type === 'text' ? c.disappear_secs || 0 : undefined, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
+const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, disappear: c.type === 'text' || c.type === 'voice' ? c.disappear_secs || 0 : undefined, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
 const THEME_DEFAULT = { accent: '', banner: '', bannerCrop: null, background: { kind: 'none' }, welcome: '', roleColors: true, iconShape: 'rounded' };
 const themeOf = (s) => { try { return { ...THEME_DEFAULT, ...JSON.parse(s.theme || '{}') }; } catch { return { ...THEME_DEFAULT }; } };
 const NEWS_BOT_ID = require('./newsbot').BOT_ID;
@@ -3027,14 +3027,33 @@ function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, ever
     pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: srv.name ? `in ${srv.name}` : 'in your group', ...base }, what('mention'));
     return pushTo(members.filter((u) => !named.has(u)), { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', ...base }, what('group'));
   }
-  const where = `#${c.name} \u00b7 ${srv.name}`;
+  const where = `${c.type === 'voice' ? '\uD83D\uDD0A ' : '#'}${c.name} \u00b7 ${srv.name}`;
   pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, ...base }, what('mention'));
   pushTo(replied, { title: `${nameOf(senderId)} replied to you`, body: where, ...base }, what('reply'));
   const told = new Set([...mentioned, ...replied]);
   if (pingAll) pushTo(members.filter((u) => !told.has(u) && reaches(u)), { title: `${nameOf(senderId)} mentioned everyone`, body: where, ...base }, what('everyone'));
-  // People who picked "All messages" for this channel or server hear about the rest too.
-  if (USE && !threadId && !pingAll) pushTo(USE.wantsAll(srv, c).filter((u) => u !== senderId && !told.has(u) && reaches(u)), { title: nameOf(senderId), body: where, ...base }, what('message'));
+  // People who picked "All messages" for this channel or server hear about the rest too. A voice channel's chat only
+  // reaches those of them who follow it (see followsVoiceChat): a server set to "All messages" doesn't buzz for
+  // every line said next to a call nobody asked to hear about.
+  if (USE && !threadId && !pingAll) {
+    pushTo(USE.wantsAll(srv, c).filter((u) => u !== senderId && !told.has(u) && reaches(u) && (c.type !== 'voice' || followsVoiceChat(c, u))),
+      { title: nameOf(senderId), body: where, ...base }, what('message'));
+  }
 }
+// v19 (voice chat): who follows a voice channel's chat. People in its call, people who opened it (opening it,
+// sending there or picking "All messages" for it leaves a read marker; "Mark as read" on one you don't follow
+// doesn't) and people who picked "All messages" for that voice channel itself. The app uses the same rule
+// (followsVoiceChat in app.js). For everyone else its messages don't count as unread or push; pings (@you, replies,
+// an allowed @everyone) still do.
+function followsVoiceChat(c, u) {
+  const call = voiceChannels.get(c.id);
+  if (call && call.has(u)) return true;
+  if (db.prepare('SELECT 1 FROM read_states WHERE user_id = ? AND conv = ?').get(u, 'c:' + c.id)) return true;
+  return !!db.prepare("SELECT 1 FROM notify_prefs WHERE user_id = ? AND target = ? AND level = 'all'").get(u, 'c:' + c.id);
+}
+// Which channels have a chat: every text channel, and (v19, voice chat) the voice channels of a server. A group's
+// call has none: the group's own conversation is its chat.
+const hasChat = (c, srv = serverOf(c)) => c.type === 'text' || (c.type === 'voice' && !!srv && srv.kind !== 'group');
 
 const validCipher = (c) => {
   if (typeof c !== 'string' || c.length < 20 || c.length > 64000) fail(400, 'Bad encrypted payload. Reload the page.');
@@ -3053,14 +3072,17 @@ function withNonce(msg, body) {
   if (typeof n === 'string' && /^[a-z0-9]{8,40}$/i.test(n)) msg.nonce = n;
   return msg;
 }
-// Channel messages are end-to-end encrypted by the sender. The server stores ciphertext only.
+// Channel messages are end-to-end encrypted by the sender. The server stores ciphertext only. Voice channels' chats
+// (v19) go the same way: same keys and epochs, same permissions (View Channel and Send Messages; Connect isn't needed
+// to chat), but no threads: a voice channel's chat stays one conversation next to the call.
 api.post('/channels/:id/messages', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
-  if (c.type !== 'text') fail(400, 'You can only send messages in text channels.');
+  const srvRow = serverOf(c);
+  if (!hasChat(c, srvRow)) fail(400, c.type === 'voice' ? 'A group call has no chat of its own: write in the group.' : 'You can only send messages in text and voice channels.');
+  if ((req.body || {}).threadId && c.type !== 'text') fail(400, 'Threads are only in text channels.');
   limitMessages(req);
   const { ciphertext, epoch, files } = req.body || {};
   validCipher(ciphertext);
-  const srvRow = serverOf(c);
   const cp = perms.channel(srvRow, c, req.userId);
   if (!(cp & PM.SEND_MESSAGES)) fail(403, 'You don\u2019t have permission to send messages here.');
   if (Array.isArray(files) && files.length && !(cp & PM.ATTACH_FILES)) fail(403, 'You don\u2019t have permission to attach files here.');
@@ -3157,7 +3179,7 @@ api.post('/channels/:id/messages/bulk-delete', auth, (req, res) => {
   const s = serverOf(c);
   if (!canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission here.');
   if (perms.timedOut(s.id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
-  if (c.type !== 'text') fail(400, 'Only text channels have messages to delete.');
+  if (!hasChat(c, s)) fail(400, 'Only text channels and voice channel chats have messages to delete.');
   const b = req.body || {};
   const t = now();
   const since = t - BULK_DAYS * 86400000;

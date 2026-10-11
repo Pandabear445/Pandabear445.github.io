@@ -1385,6 +1385,77 @@ CREATE TABLE IF NOT EXISTS import_map (
 CREATE INDEX IF NOT EXISTS idx_import_map_target ON import_map(kind, target_id);
 `);
 
+// v19 (voice chat): a server's voice channels have a text chat now (POST /channels/:id/messages takes them). Nobody
+// could be denied Send Messages on a voice channel before (the permission editor didn't offer it there), so without
+// this the limits a server had on posting wouldn't reach the chats of the voice channels it already had. Once, for
+// the voice channels there at the upgrade (marked done in instance_settings, in this same transaction):
+//   - whoever may not join its call (an override there denying Connect) may not post in its chat either;
+//   - whoever is denied Send Messages in every text channel they aren't hidden from (a "Muted" role, @everyone on a
+//     read-only server) is denied it in the server's voice chats too;
+//   - when every text channel has slow mode, the voice chats get the shortest of them.
+// Only ever more limits (an explicit allow is left alone), and each change goes in the server's audit log, by Hearth,
+// so its admins can see why and open a chat up in its Permissions. Voice channels made after this start open.
+if (!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'voiceChatLimits'").get()) {
+  const { PERMS: PB } = require('./perms');
+  const ovOf = db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?');
+  const putDeny = db.prepare(`INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, 0, ?)
+    ON CONFLICT(channel_id, target_type, target_id) DO UPDATE SET deny = excluded.deny`);
+  const audit = db.prepare(`INSERT INTO server_audit (server_id, seq, actor_id, action, target_id, channel_id, detail, created_at)
+    SELECT ?, COALESCE(MAX(seq), 0) + 1, NULL, ?, ?, ?, ?, ? FROM server_audit WHERE server_id = ?`);
+  const roleName = db.prepare('SELECT name FROM roles WHERE id = ?');
+  const everyoneRole = db.prepare('SELECT permissions FROM roles WHERE id = ?');
+  const same = (a, b) => a.type === b.type && a.id === b.id;
+  for (const s of db.prepare("SELECT id FROM servers WHERE kind != 'group'").all()) {
+    const chans = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id);
+    const voice = chans.filter((c) => c.type === 'voice');
+    if (!voice.length) continue;
+    const text = chans.filter((c) => c.type === 'text').map((c) => ({ c, ov: ovOf.all(c.id) }));
+    const everyone = { type: 'role', id: s.id };
+    // Hidden from a target: its own override denies View, or @everyone's does and its own doesn't allow it back.
+    const hidden = (t, x) => {
+      const own = x.ov.find((o) => same(o, t)); const all = x.ov.find((o) => same(o, everyone));
+      return !!(own && own.deny & PB.VIEW_CHANNEL) || (!same(t, everyone) && !!(all && all.deny & PB.VIEW_CHANNEL) && !(own && own.allow & PB.VIEW_CHANNEL));
+    };
+    const cantPost = [];
+    for (const x of text) {
+      for (const o of x.ov) {
+        if (!(o.deny & PB.SEND_MESSAGES) || cantPost.some((t) => same(t, o))) continue;
+        const seen = text.filter((y) => !hidden(o, y));
+        if (seen.length && seen.every((y) => y.ov.some((p) => same(p, o) && p.deny & PB.SEND_MESSAGES && !(p.allow & PB.SEND_MESSAGES)))) cantPost.push({ type: o.type, id: o.id });
+      }
+    }
+    const slow = text.length && text.every((x) => x.c.slowmode > 0) ? Math.min(...text.map((x) => x.c.slowmode)) : 0;
+    const roleOk = everyoneRole.get(s.id);
+    for (const v of voice) {
+      const ov = ovOf.all(v.id);
+      const deny = new Map(); // `${type}:${id}` -> { target, was }
+      const add = (t) => {
+        const o = ov.find((x) => same(x, t)) || { type: t.type, id: t.id, allow: 0, deny: 0 };
+        if ((o.allow | o.deny) & PB.SEND_MESSAGES) return; // already decided for this channel
+        deny.set(`${t.type}:${t.id}`, o);
+      };
+      for (const o of ov) if (o.deny & PB.CONNECT) add(o);
+      for (const t of cantPost) add(t);
+      const changes = [];
+      for (const o of deny.values()) {
+        putDeny.run(v.id, o.type, o.id, o.deny | PB.SEND_MESSAGES);
+        const name = o.type === 'role' ? (o.id === s.id ? '@everyone' : (roleName.get(o.id) || {}).name || '') : '';
+        changes.push({ type: o.type, id: o.id, name, allow: o.allow, deny: o.deny | PB.SEND_MESSAGES, was: { allow: o.allow, deny: o.deny } });
+      }
+      // The same "private" mark the audit log gives channels some members can't see (perms.restricted).
+      const priv = (roleOk && !(roleOk.permissions & PB.VIEW_CHANNEL)) || ov.some((o) => o.deny & PB.VIEW_CHANNEL);
+      const channel = { id: v.id, name: v.name, ...(priv ? { private: true } : {}) };
+      const t = Date.now();
+      if (changes.length) audit.run(s.id, 'channel_overrides', v.id, v.id, JSON.stringify({ channel, changes: changes.slice(0, 25), voiceChat: true }), t, s.id);
+      if (slow && !v.slowmode) {
+        db.prepare('UPDATE channels SET slowmode = ? WHERE id = ?').run(slow, v.id);
+        audit.run(s.id, 'channel_update', v.id, v.id, JSON.stringify({ channel, changes: { slowmode: { from: 0, to: slow } }, voiceChat: true }), t, s.id);
+      }
+    }
+  }
+  db.prepare("INSERT INTO instance_settings (key, value) VALUES ('voiceChatLimits', ?)").run(String(Date.now()));
+}
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

@@ -142,7 +142,7 @@ test('timer: in a DM either person can set it; outsiders get 404; a block either
   useTimer('d:' + dm.id, 0);
 });
 
-test('timer: any group member can set it; in a server channel only Manage Channels there (a per-channel deny counts); voice channels are refused', async () => {
+test('timer: any group member can set it; in a server channel only Manage Channels there (a per-channel deny counts); a voice channel\'s chat has one, a group\'s call doesn\'t', async () => {
   assert.equal((await setTimer(bob, 'c:' + groupChat.id, WEEK)).status, 200, 'any group member');
   assert.equal((await setTimer(carol, 'c:' + groupChat.id, DAY)).status, 404, 'not in the group');
   useTimer('c:' + groupChat.id, 0);
@@ -158,15 +158,26 @@ test('timer: any group member can set it; in a server channel only Manage Channe
   await as(boss, 'PUT', `/channels/${hidden.id}/overrides`, { overrides: [{ type: 'role', id: space.id, allow: 0, deny: P.VIEW }] });
   assert.equal((await setTimer(carol, 'c:' + hidden.id, DAY)).status, 404);
   assert.equal((await as(carol, 'GET', `/channels/${hidden.id}/disappearing`)).status, 404);
+  // A server's voice channel has a chat (voice chat), which disappears like a text channel's; a group's call has no
+  // chat of its own, so it has no timer either.
   const v = await setTimer(boss, 'c:' + voiceCh.id, DAY);
-  assert.equal(v.status, 400);
-  assert.equal(v.json.code, 'bad_channel');
+  assert.equal(v.status, 200, v.text);
+  const groupCall = group.channels.find((c) => c.type === 'voice');
+  const gv = await setTimer(alice, 'c:' + groupCall.id, DAY);
+  assert.equal(gv.status, 400);
+  assert.equal(gv.json.code, 'bad_channel');
   assert.equal((await setTimer(outsider, 'c:' + general.id, DAY)).status, 404);
   // Channels carry it to everyone who can see them.
-  const ch = (await as(bob, 'GET', '/bootstrap')).json.servers.find((s) => s.id === space.id).channels.find((c) => c.id === general.id);
-  assert.equal(ch.disappear, DAY);
-  assert.equal(voiceCh.disappear, undefined);
+  const chans = (await as(bob, 'GET', '/bootstrap')).json.servers.find((s) => s.id === space.id).channels;
+  assert.equal(chans.find((c) => c.id === general.id).disappear, DAY);
+  assert.equal(chans.find((c) => c.id === voiceCh.id).disappear, DAY);
+  assert.equal(voiceCh.disappear, 0);
+  // A message in the voice channel's chat gets its deadline like one in a text channel.
+  const before = Date.now();
+  const vm = await sendC(bob, voiceCh.id, { ttl: DAY });
+  assert.ok(vm.expiresAt >= before + DAY * 1000 && vm.expiresAt <= Date.now() + DAY * 1000, 'stamped from the voice channel’s timer');
   useTimer('c:' + general.id, 0);
+  useTimer('c:' + voiceCh.id, 0);
 });
 
 test('timer: each change is logged (who, from, to, when) and shown with the history page it falls in; the same value again logs nothing; at most 50 kept', async () => {

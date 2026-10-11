@@ -1945,6 +1945,116 @@ async function awayAndStatus(t) {
   await alice.$('#user-panel .me-sub', { hasText: 'Out for lunch' }).waitFor({ state: 'detached', timeout: 10000 });
 }
 
+// ------------------------------------------------------------------ 24. text chat in a voice channel
+// The chat opens beside the call view (from the voice channel's menu, or the header's chat button), messages go both
+// ways end-to-end encrypted, and threads aren't offered there. A chat bob never opened doesn't light up for him (a
+// ping still does); once he has opened it, new messages count as unread like any channel's. Pinned messages open in
+// the chat's place and Jump goes back to it. "All messages" on a chat alice never opened makes it count (dot and
+// sound); in a call whose chat she never opened, "New messages" goes above what was said since she joined.
+async function voiceChat(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  // Alice opens the Lounge's chat from its menu: the call view with the chat beside it, without joining the call.
+  await alice.channelRow('Lounge').click({ button: 'right' });
+  await alice.menuItem('Open chat').click();
+  await alice.$('#members[data-mode="chat"] #composer-input[placeholder="Message \u{1F50A} Lounge"]').waitFor();
+  await alice.$('.voice-room .cs-controls button', { hasText: 'Join call' }).waitFor();
+  await alice.send('Anyone up for a round in the Lounge?');
+  // Bob never opened it: a plain message doesn't light it up for him, a ping does.
+  await alice.send('@bob come join us');
+  const lounge = bob.channelRow('Lounge');
+  await lounge.locator('.badge', { hasText: exact('1') }).waitFor();
+  check(!(await lounge.evaluate((el) => el.classList.contains('unread'))), 'A voice chat Bob never opened should show only his ping, not as unread.');
+  // He opens it from the menu too: both messages, decrypted, and the ping is read.
+  await lounge.click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.message('Anyone up for a round in the Lounge?').waitFor();
+  check(!(await bob.$('#messages .msg-text.undecryptable').count()), 'Bob should be able to decrypt the voice chat.');
+  await lounge.locator('.badge').waitFor({ state: 'detached' });
+  await bob.send('On my way');
+  await alice.message('On my way').waitFor();
+  // No threads in a voice channel's chat.
+  const onAlice = alice.message('On my way').first();
+  await onAlice.hover();
+  await onAlice.locator('button[aria-label="Add reaction"]').waitFor();
+  check(!(await onAlice.locator('button[aria-label="Reply in thread"]').count()), 'A voice chat message should not offer a thread.');
+  // The header's chat button hides and shows it.
+  await alice.$('#main-head button[aria-label="Hide chat"]').click();
+  await alice.page.waitForSelector('#members', { state: 'hidden' });
+  await alice.$('#main-head button[aria-label^="Show chat"]').click();
+  await alice.message('On my way').waitFor();
+  // Now that Bob has opened it, a new message counts as unread for him while he's elsewhere.
+  await bob.openChannel('general');
+  await alice.send('Bring snacks');
+  await bob.$('#sidebar-body .ch-row.unread').filter({ has: bob.$('.ch-name', { hasText: exact('Lounge') }) }).waitFor();
+
+  // Pinned messages show in the chat's place; Jump goes back to the chat, at the message (bob owns the server since
+  // the step-up flow, so he pins).
+  await bob.channelRow('Lounge').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.send('pin me please zebra');
+  await bob.messageAction('pin me please zebra', 'Pin message');
+  await bob.toast('Message pinned.');
+  await bob.$('#main-head button[aria-label="More"]').click();
+  await bob.menuItem('Pinned messages').click();
+  await bob.$('#members[data-mode="pins"] .pin-card', { hasText: 'pin me please zebra' }).locator('button', { hasText: 'Jump' }).click();
+  await bob.$('#members[data-mode="chat"] #messages .msg.flash', { hasText: 'pin me please zebra' }).waitFor();
+  check(!(await bob.$('#toasts .toast', { hasText: 'That message was deleted' }).count()), 'Jump from the pins of a voice chat should find the message.');
+
+  // Two new voice channels whose chats alice has never opened. (Her chat button is set to hide the chat from now on.)
+  await alice.$('#main-head button[aria-label="Hide chat"]').click();
+  await alice.page.waitForSelector('#members', { state: 'hidden' });
+  for (const name of ['Den', 'Nook']) {
+    await bob.serverMenu('Create channel');
+    const cc = await bob.dialog('Create channel');
+    await cc.locator('.radio-card', { hasText: 'Voice' }).click();
+    await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill(name);
+    await cc.locator('.modal-foot .btn.primary').click();
+    await bob.noModals();
+    await alice.channelRow(name).waitFor();
+  }
+  // Alice picks "All messages" for the Den's chat: from then on it counts for her (an unread dot and the sound).
+  await alice.channelRow('Den').click({ button: 'right' });
+  const saved = alice.page.waitForResponse((r) => r.url().includes('/api/me/notify/') && r.request().method() === 'PUT');
+  await alice.menuItem('All messages').click();
+  await saved;
+  await bob.channelRow('Den').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.$('#members[data-mode="chat"] #composer-input[placeholder="Message \u{1F50A} Den"]').waitFor();
+  await bob.send('den news');
+  const denId = await bob.message('den news').first().getAttribute('data-mid');
+  await alice.$('#sidebar-body .ch-row.unread').filter({ has: alice.$('.ch-name', { hasText: exact('Den') }) }).waitFor();
+  await alice.page.waitForFunction((id) => (localStorage.getItem('hearth.notified') || '').includes(id), denId);
+
+  // Alice joins the Nook's call (its chat hidden, never opened): what's said meanwhile counts, and opening the chat
+  // puts "New messages" right above it, not above everything said before she came.
+  await bob.channelRow('Nook').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.$('#members[data-mode="chat"] #composer-input[placeholder="Message \u{1F50A} Nook"]').waitFor();
+  await bob.send('before the call 1');
+  await bob.send('before the call 2');
+  await alice.channelRow('Nook').locator('.ch-main').click();
+  await alice.$('#sidebar-body .vc-user', { hasText: 'Alice Wonder' }).waitFor();
+  await alice.$('#main-head button[aria-label="Show chat"]').waitFor();
+  check(!(await alice.$('#main-head button[aria-label="Show chat"][aria-pressed]').count()), 'The chat button names what it does; it has no pressed state too.');
+  await bob.send('during the call');
+  await alice.$('#main-head button[aria-label="Show chat \u00b7 new messages"]').click();
+  await alice.message('during the call').waitFor();
+  await alice.$('#unread-bar', { hasText: '1 new message since' }).waitFor();
+  check(await alice.page.evaluate(() => { const d = document.querySelector('#new-div'); return !!(d && d.nextElementSibling && d.nextElementSibling.textContent.includes('during the call')); }),
+    '"New messages" should sit right above the message said during the call.');
+
+  // Back to a text channel for whatever runs next (the chat stays closed next time).
+  await alice.$('#main-head button[aria-label="Hide chat"]').click();
+  await alice.page.waitForSelector('#members', { state: 'hidden' });
+  await alice.$('#voice-panel button[aria-label="Leave call"]').click();
+  await alice.$('#sidebar-body .vc-user', { hasText: 'Alice Wonder' }).waitFor({ state: 'detached' });
+  await alice.openChannel('general');
+  await bob.openChannel('general');
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -1979,4 +2089,5 @@ export const FLOWS = [
   ['discord import: paste a template, see what is skipped, leave some out, create', discordImport],
   ['channel order: drag a channel into a category and a category above another, live for everyone; Move down by keyboard keeps focus (into a collapsed category too); a menu left open doesn’t undo another move', channelOrder],
   ['away and status: Away after inactivity and back on input; a custom status that clears itself, live', awayAndStatus],
+  ['voice chat: open beside the call, both ways, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
 ];

@@ -84,6 +84,9 @@ const theChannel = (d, deleting) => {
 };
 const quoted = (t) => `“${t}”`;
 
+// Hearth's own entries from the upgrade that gave voice channels a chat (v19, see server/db.js).
+const VOICE_CHAT_NOTE = 'Voice channels have a text chat now: this keeps the limits the server had on who may post.';
+
 // One entry as a sentence: [parts of the sentence, an optional second line].
 export function sentence(e, users) {
   const d = e.detail || {};
@@ -141,7 +144,7 @@ export function sentence(e, users) {
       if (c.topic) bits.push('changed the topic');
       if (c.category) bits.push(`moved it to ${quoted(c.category.to)}`);
       if (c.slowmode) bits.push(c.slowmode.to ? `set slowmode to ${c.slowmode.to < 60 ? plural(c.slowmode.to, 'second', 'seconds') : duration(Math.round(c.slowmode.to / 60))}` : 'turned slowmode off');
-      return [[who, ` changed ${ch}`], bits.length ? `${bits.join('; ')}.`.replace(/^./, (x) => x.toUpperCase()) : null];
+      return [[who, ` changed ${ch}`], [bits.length ? `${bits.join('; ')}.`.replace(/^./, (x) => x.toUpperCase()) : null, d.voiceChat ? VOICE_CHAT_NOTE : null].filter(Boolean).join(' ') || null];
     }
     case 'channel_delete': return [[who, ` deleted ${theChannel(d, true)}`]];
     // One channel dragged (or moved from its menu) is named; a bigger reorder says how many moved.
@@ -159,7 +162,7 @@ export function sentence(e, users) {
         if (reset) parts.push(`reset ${list(permNames(reset))}`);
         return `${target}: ${parts.join('; ') || 'changed'}`;
       });
-      return [[who, ` changed permissions in ${ch}`], lines.length ? lines.join(' · ') : null];
+      return [[who, ` changed permissions in ${ch}`], [lines.length ? lines.join(' · ') : null, d.voiceChat ? VOICE_CHAT_NOTE : null].filter(Boolean).join('. ') || null];
     }
     case 'invite_create': return [[who, ` created an invite (${e.targetId})`], [d.maxUses ? `Works ${plural(d.maxUses, 'time', 'times')}` : 'No use limit', d.hours ? `expires after ${duration(d.hours * 60)}` : 'never expires'].join(', ') + '.'
       + (d.last ? ' More invites they made this hour aren’t listed.' : '')];
