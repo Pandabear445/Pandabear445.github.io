@@ -397,8 +397,9 @@ test('storage-9: blobs and media answer Range requests (206/416) with safe heade
   assert.ok([200, 416].includes(r.status), `a malformed range: ${r.status}`);
   await r.arrayBuffer();
 
-  // Public media (a profile song): inline type, cached for good, Range works.
-  const song = Buffer.concat([Buffer.from('ID3'), crypto.randomBytes(20000)]);
+  // Public media (a profile song): inline type, cached for good, Range works. Songs lose their tags when uploaded, so
+  // this one can't look like it has any: no ID3 version is 0xFF, and its last bytes aren't a tag at the end either.
+  const song = Buffer.concat([Buffer.from('ID3'), Buffer.from([0xff]), crypto.randomBytes(20000), Buffer.alloc(128)]);
   const boundary = '----hearth' + hex(8);
   const raw = Buffer.concat([Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="s.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`), song, Buffer.from(`\r\n--${boundary}--\r\n`)]);
   const up = await srv.api('POST', '/me/song', { token: a.token, ip: a.ip, raw, headers: { 'content-type': `multipart/form-data; boundary=${boundary}` } });

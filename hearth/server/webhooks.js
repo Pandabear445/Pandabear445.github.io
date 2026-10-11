@@ -13,8 +13,10 @@
 //    deleting are audit-logged (by webhook id, never the secret).
 //  - What comes in is text from outside, so it's stored like a bot post: sealed with the server's at-rest key, not
 //    end-to-end encrypted, and the app labels it that way. It's shown through the app's own escaping Markdown.
-//  - Nothing is fetched when a post arrives. An avatar_url is kept as a link and only ever shown through the image
-//    proxy the news bot already uses (/media/news: netguard, no private addresses, images only).
+//  - Nothing is fetched when a post arrives. An avatar_url is kept as a link and only ever shown through the avatar
+//    proxy (/media/avatar: netguard, images only), and only when it's on a known avatar host (Discord, GitHub,
+//    Gravatar, or one the admin listed in WEBHOOK_AVATAR_HOSTS); see avatarHost in mediasign.js. Anything else
+//    shows the webhook's own picture, so a webhook can't make this server fetch any picture on the internet.
 //  - It pings nobody unless the webhook was allowed to (off by default; only someone who may mention @everyone in
 //    that channel can turn it on, or get a new address for one that may): @everyone, @here, role and @name
 //    mentions are defused before the post is stored. Pushes for "All messages" happen either way.

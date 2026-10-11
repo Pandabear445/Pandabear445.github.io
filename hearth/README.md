@@ -148,7 +148,7 @@ The first time, it asks for your server address and offers password-free login (
 
 Upgrades keep your accounts, passwords, encryption keys and messages, but they're not only additions: some convert existing data (for example how sign-in sessions or the audit log are stored). That's why Hearth copies the database first.
 
-1. **Back up** the `data/` folder and `.env` (copy them somewhere safe). Hearth also makes its own copy automatically: before applying a database upgrade it saves `data/backups/hearth-before-vN-<date>.db` (a consistent copy, made once per upgrade).
+1. **Back up** the `data/` folder and `.env` (copy them somewhere safe). Hearth also makes its own copy automatically: before applying a database upgrade it saves `data/backups/hearth-before-vN-<date>.db` (a consistent copy, made once per upgrade; the newest 3 are kept, see `PRE_UPGRADE_KEEP`).
 2. Replace the program files with the new version, **keeping `data/` and `.env`**.
 3. Install dependencies and restart:
    - Without Docker: `npm ci --omit=dev`, then `sudo systemctl restart hearth` (or however you start it).
@@ -537,11 +537,12 @@ Hearth makes two kinds of backup by itself every day (Admin → Owner → Backup
 - **Full guide**, including what each kind of account recovery can and can't bring back: [docs/RECOVERY.md](docs/RECOVERY.md). `node scripts/recovery-drill.js` and `bash scripts/upgrade-drill.sh` prove it end to end.
 - **Lost the owner's account?** `node server/cli.js set-owner <username>` makes another account the owner. It works while Hearth is running, refuses deleted, bot and suspended accounts, drops the new owner's other staff role, and is written to the audit log (`ownership_set_cli`).
 
-**Disappearing messages** are in every backup made before their time, until that backup is pruned (or, for
-off-site and `hearth-before-v*.db` copies, deleted by hand). Restoring an older backup deletes the ones whose time has
-passed at the first start, before anyone can connect.
+**Disappearing messages** are in every backup made before their time, until that backup is pruned (an upgrade
+copy, `hearth-before-v*.db`, once it's no longer among the newest `PRE_UPGRADE_KEEP`; off-site copies when
+deleted by hand). Restoring an older backup deletes the ones whose time has passed at the first start, before anyone
+can connect.
 
-**Database copies** (`data/backups/*.db`) are for undoing an update on this machine. They're as sensitive as the database itself, so they never leave the server and can't be downloaded. Copies made before upgrades (`hearth-before-v*.db`) are never deleted automatically; remove old ones by hand once you're happy with an upgrade.
+**Database copies** (`data/backups/*.db`) are for undoing an update on this machine. They're as sensitive as the database itself, so they never leave the server and can't be downloaded. Copies made before upgrades (`hearth-before-v*.db`) are pruned after each upgrade that goes through: the newest `PRE_UPGRADE_KEEP` (3 by default) stay, the one that upgrade made always stays, and only files with exactly that name pattern are ever removed (rename a copy to keep it for good; `PRE_UPGRADE_KEEP=0` keeps them all). Like the database itself they aren't encrypted, so remove ones you don't need.
 
 Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are regenerated if missing.
 
@@ -573,6 +574,7 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `PUSH_NTFY_URL` | — | Your own ntfy (`https://…` only): the Android app's settings tell people to use it |
 | `ANDROID_CERT_SHA256` | — | SHA-256 fingerprint(s) of the key the Android app is signed with: lets an app built for this server open `https://…/invite/…` links (served as `/.well-known/assetlinks.json`) |
 | `ANDROID_PACKAGE` | `app.hearth.mobile` | The Android app's package name, for the same file |
+| `WEBHOOK_AVATAR_HOSTS` | — | Comma-separated hosts (or `host:port`; `*.example.com` for every name under it) whose pictures webhook posts may use as their avatar, on top of Discord's, GitHub's and Gravatar's. These may be on your own network |
 | `OUTBOUND_BLOCK` | — | Comma-separated addresses or ranges (CIDR) that feeds, pictures, link previews and push may never reach, on any port. For example this server's public IP when it's behind NAT, or your router's |
 | `LINK_PREVIEWS` | `true` | `false` starts with link previews switched off (the owner can switch them in Admin → Owner → Features) |
 | `LINK_PREVIEW_ACCEPT_LANGUAGE` | `en` | The language sites are asked for when this server fetches a page for a preview (the same for everyone, so it doesn't single anyone out) |
@@ -582,6 +584,7 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `DOWNLOADS_DIR` | `data/downloads` | Installers offered on `/download` |
 | `DESKTOP_DOWNLOAD_URL` | — | Link `/download` to your GitHub releases page instead |
 | `AT_REST_KEY` | — | 64-hex-char key instead of `data/secret.key` (for pre-upgrade messages) |
+| `PRE_UPGRADE_KEEP` | `3` | How many `data/backups/hearth-before-v*.db` copies (made before each database upgrade) to keep; older ones are removed after an upgrade goes through, never the one it just made. `0` keeps every copy |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `MAIL_FROM` | — | Email for password resets (or set it in Admin → Owner → Email) |
 | `PUBLIC_URL` | — | This server's public address, used in reset links |
 | `SESSION_IDLE_DAYS` / `SESSION_MAX_DAYS` | `60` / `365` | A device is signed out after this many days unused / after this many days in total |
@@ -647,7 +650,7 @@ they paid for.
 
 ## News bot
 
-In a server's **Server Settings → News bot** (needs Manage Server), follow a topic (Google News), a YouTube channel, a subreddit, a Steam game's news, a GitHub project's releases, or any RSS/Atom feed, and pick the channel to post in. Press **Preview** to see what it would find. When you follow something, the bot posts the newest item right away so you can see it working; after that it posts only new things — never a backlog of old news — at most 3 at a time, checking every 10 minutes. The bot shows as online in the member list of servers it posts in. Add keywords to post only matching items (for example `patch, update`). Bot posts show a **BOT** tag and a card with the picture, which loads through your server so readers' IPs aren't shared.
+In a server's **Server Settings → News bot** (needs Manage Server), follow a topic (Google News), a YouTube channel, a subreddit, a Steam game's news, a GitHub project's releases, or any RSS/Atom feed, and pick the channel to post in. Press **Preview** to see what it would find. When you follow something, the bot posts the newest item right away so you can see it working; after that it posts only new things — never a backlog of old news — at most 3 at a time, checking every 10 minutes. The bot shows as online in the member list of servers it posts in. Add keywords to post only matching items (for example `patch, update`). Bot posts show a **BOT** tag and a card with the picture, which loads through your server so readers' IPs aren't shared. The server signs a link for each picture when it sends the post to someone's app, and the picture proxy fetches nothing else. Previews show no pictures. The pictures are whatever the feed names, so anyone who follows a feed they wrote themselves still chooses which public pictures your server fetches, a few at a time.
 
 Bot posts come from public feeds, so they aren't end-to-end encrypted (the server writes them). The bot can't sign in and can't read your encrypted messages. The server needs outgoing internet access to the sites you follow.
 
@@ -811,8 +814,10 @@ Embeds are turned into text with a coloured dot (🔴 down, 🟢 up…).
   theirs and starts it again. Managers can only change webhooks whose address was made by someone below their
   highest role (or by themselves).
 - Limits like Discord's (5 posts per 2 seconds per webhook, 30 a minute per channel). Nothing is fetched when a post
-  arrives; a post's avatar is loaded through this server's image proxy (public https images only) when people view
-  the post.
+  arrives. A post's own avatar (`avatar_url`) is shown only if it's on Discord's, GitHub's or Gravatar's picture
+  hosts, or a host you list in `WEBHOOK_AVATAR_HOSTS`; it loads through this server's avatar proxy (images only,
+  by a link the server signs for that avatar) when people view the post. Any other avatar shows the webhook's own
+  picture, so a webhook can't make your server fetch pictures from anywhere.
 
 Details, every field that's understood and the error codes: `docs/BOTS.md` ("Incoming webhooks").
 
@@ -887,9 +892,9 @@ they're sent: **off, 1 hour, 1 day, 1 week or 4 weeks**.
   forward secrecy for history, see [Things to know](#things-to-know)).
 - **Backups keep copies until they rotate out.** Every backup made before a message's time holds it: the daily
   encrypted backups (the newest 7 days by default), their copies on your regions (14 by default), `hearth-auto-*.db`
-  copies, and — until you delete them — off-site rclone copies, `hearth-before-v*.db` upgrade copies and the
-  snapshots `scripts/hearth-update.sh` keeps. Restoring an older backup brings such messages back only until the
-  first sweep after start-up, which deletes everything whose time has passed.
+  copies, the newest `hearth-before-v*.db` upgrade copies (3 by default), and — until you delete them — off-site
+  rclone copies and the snapshots `scripts/hearth-update.sh` keeps. Restoring an older backup brings such messages
+  back only until the first sweep after start-up, which deletes everything whose time has passed.
 - **Anyone can screenshot.** People can copy, forward, download, export ("Export my data" keeps them in the zip) or
   photograph what they see, and a modified app can keep everything. A report sends the reported messages' text to
   this server's staff (and, when you also show it to a server's moderators, the reported person's messages to them),
@@ -994,7 +999,10 @@ server/money.js     Ko-fi / Stripe webhooks, supporter time and perks
 server/search.js    Message search: metadata filters only, returns ciphertext
 server/netguard.js  Outbound request guard (public addresses only, pinned lookups, caps)
 server/proxytrust.js Which proxies may set the visitor's address (TRUST_PROXY)
-server/imagemeta.js Strips hidden metadata from public pictures
+server/imagemeta.js Strips hidden metadata from public pictures (and runs audiometa.js on profile songs, in a worker of their own)
+server/audiometa.js Strips tags (ID3, APE, WAV INFO, M4A iTunes and purchase boxes) from profile songs
+server/mediasign.js Signed links for the news, webhook-avatar and album-art picture proxies
+server/upgradecopies.js Prunes old pre-upgrade database copies (PRE_UPGRADE_KEEP)
 public/sw.js        Service worker: offline app shell, updates, push notifications
 scripts/            hearth-update.sh — safe server-side updater with automatic rollback;
                     make-update-zip.sh — release zip + .sha256

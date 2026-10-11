@@ -14,7 +14,7 @@ Tests: `test/storage.test.js`, plus `test/files-hardening.test.js` for the older
 |---|---|---|
 | Attachments (E2EE) | that a blob exists, its size, who uploaded it, when, and which message (so which channel/DM) it is attached to | its contents, name, type, dimensions, its key |
 | Uploads in progress | declared size, bytes received so far, timestamps, the SHA-256 of the ciphertext | anything about the plaintext |
-| Public media (avatars, banners, icons, emoji, profile songs, GIF library) | everything: these are stored as uploaded (pictures have their metadata stripped first) | |
+| Public media (avatars, banners, icons, emoji, profile songs, GIF library) | everything: these are stored as uploaded (pictures have their metadata stripped first, and profile songs their tags, except OGG's) | |
 
 Every attachment is encrypted in the app with its own random AES-256-GCM key before upload (`E2EE.encryptFile`:
 `blob = iv(12) ‖ ciphertext ‖ tag(16)`). The key, name and type travel inside the encrypted message (`f[]`).

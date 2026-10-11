@@ -16,7 +16,7 @@ const KIND_HELP = {
 const ago = (t) => { const s = (Date.now() - t) / 1000; return s < 3600 ? `${Math.max(1, Math.round(s / 60))} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : fmtStamp(t); };
 
 export function createUpdates(ctx) {
-  // ctx: { S, mediaNewsUrl(u), onUnread(n) }
+  // ctx: { S, mediaSrc(signed /media/news link from the server), onUnread(n) }
   let state = { trackers: [], items: [], unread: 0, filter: null, loaded: false };
   const setUnread = (n) => { state.unread = n; if (ctx.S.me) ctx.S.me.updatesUnread = n; ctx.onUnread(n); };
 
@@ -82,7 +82,7 @@ export function createUpdates(ctx) {
   function card(i, redraw) {
     const t = state.trackers.find((x) => x.id === i.feedId);
     return h('article', { class: `update-card${i.read ? '' : ' unread'}` },
-      i.image ? h('img', { class: 'update-img', src: ctx.mediaNewsUrl(i.image), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.currentTarget.remove() }) : null,
+      ctx.mediaSrc(i.imageSrc) ? h('img', { class: 'update-img', src: ctx.mediaSrc(i.imageSrc), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.currentTarget.remove() }) : null,
       h('div', { class: 'update-text' },
         h('div', { class: 'update-meta' }, t ? h('span', { class: 'update-tracker' }, t.title) : null, i.source && (!t || i.source !== t.title) ? h('span', null, i.source) : null, h('span', null, ago(i.date || i.foundAt))),
         h('a', { class: 'update-title', href: i.url, target: '_blank', rel: 'noopener noreferrer' }, i.title),
@@ -134,7 +134,7 @@ export function createUpdates(ctx) {
       try {
         const r = await api('POST', '/me/trackers/preview', { kind: kindSel.value, query: q.value });
         clear(prev).append(h('p', { class: 'field-hint' }, `Found “${r.title || q.value}”. Its latest posts (these count as already seen):`),
-          ...r.items.map((i) => h('div', { class: 'feed-prev' }, i.image ? h('img', { src: ctx.mediaNewsUrl(i.image), alt: '', loading: 'lazy' }) : h('span', { class: 'feed-prev-ph' }, icon('rss')),
+          ...r.items.map((i) => h('div', { class: 'feed-prev' }, ctx.mediaSrc(i.imageSrc) ? h('img', { src: ctx.mediaSrc(i.imageSrc), alt: '', loading: 'lazy' }) : h('span', { class: 'feed-prev-ph' }, icon('rss')),
             h('span', null, h('strong', null, i.title), h('span', { class: 'field-hint' }, i.date ? ` · ${new Date(i.date).toLocaleDateString()}` : '')))));
       } catch (e) { clear(prev).append(h('p', { class: 'form-error' }, e.message)); }
     };

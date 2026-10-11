@@ -354,6 +354,20 @@ above it say why), or when the server pins a key but its installed updater can't
 was put back, or it's gone; `--allow-unsigned` goes ahead anyway, with a warning); 90–92 still mean the upload or
 the zip itself was wrong. In all four cases nothing ran.
 
+### Database copies made before upgrades
+
+Before a database upgrade, Hearth saves `data/backups/hearth-before-v<version>-<date>.db` (see
+[RECOVERY.md](RECOVERY.md), "Upgrades and rolling back"). Once the upgrade has gone through, older copies beyond the
+newest `PRE_UPGRADE_KEEP` (in `.env`, default `3`) are deleted, and the log says which (`db upgrade_backup_pruned`).
+
+- The copy that upgrade made, or found already made, always stays. While an upgrade keeps failing, nothing is pruned.
+- Only plain files named exactly the way Hearth names them are removed. A renamed copy, a link, a folder, the daily
+  `hearth-auto-*.db` copies and the encrypted backups are never touched by this.
+- `PRE_UPGRADE_KEEP=0` keeps every copy (the behaviour before 1.29.0). A value that isn't a whole number logs
+  `db upgrade_backup_keep` and uses 3.
+- The copies aren't encrypted: each holds what the database holds. Keep the data folder private, and use the
+  encrypted backups for anything that leaves the machine.
+
 ## 7. Self-hosted ntfy for Android notifications
 
 The Android app gets notifications while it's closed through a UnifiedPush push app, usually ntfy, which by default

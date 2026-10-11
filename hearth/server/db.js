@@ -39,6 +39,7 @@ if (fromVersion > SCHEMA_VERSION) {
 }
 db.pragma('journal_mode = WAL');
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
+let upgradeCopy = null; // the copy this upgrade made or reused (never pruned below)
 if (hasData && fromVersion < SCHEMA_VERSION) {
   const dir = path.join(DATA_DIR, 'backups');
   fs.mkdirSync(dir, { recursive: true });
@@ -55,8 +56,10 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
   const changedAt = Math.max(st.mtimeMs, st.ctimeMs);
   for (const f of fs.readdirSync(dir)) if (f.startsWith('hearth-before-') && f.endsWith('.partial')) fs.rmSync(path.join(dir, f), { force: true });
   const fresh = settled && fs.readdirSync(dir).find((f) => f.startsWith(prefix) && f.endsWith('.db') && fs.statSync(path.join(dir, f)).mtimeMs > changedAt);
-  if (fresh) log.info('db', 'upgrade_backup', { msg: `The database was already backed up before this upgrade: ${path.join(dir, fresh)}` });
-  else {
+  if (fresh) {
+    upgradeCopy = fresh;
+    log.info('db', 'upgrade_backup', { msg: `The database was already backed up before this upgrade: ${path.join(dir, fresh)}` });
+  } else {
     // VACUUM INTO makes a consistent copy through SQLite (even if something else has the file open). It's written
     // under a temporary name first, so a copy that was cut short is never taken for a complete one.
     const file = path.join(dir, `${prefix}${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
@@ -64,6 +67,7 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
       db.prepare('VACUUM INTO ?').run(`${file}.partial`);
       fs.renameSync(`${file}.partial`, file);
     } catch (e) { fs.rmSync(`${file}.partial`, { force: true }); throw e; }
+    upgradeCopy = path.basename(file);
     log.info('db', 'upgrade_backup', { msg: `Backed up the database before upgrading: ${file}`, outcome: 'ok' });
   }
 }
@@ -1529,6 +1533,20 @@ if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;
 if (anchorAfterCommit) writeAnchor(...anchorAfterCommit);
+
+// v19 (data-4 / crypto-8): the upgrade went through, so older pre-upgrade copies beyond the newest PRE_UPGRADE_KEEP
+// (3 by default, 0 = keep all) are removed; see server/upgradecopies.js. Only after the commit: while an upgrade can
+// still fail, every copy stays. The copy made (or reused) for this upgrade is never removed.
+if (upgradeCopy) {
+  const UC = require('./upgradecopies');
+  let keep = UC.keepSetting();
+  if (keep === null) {
+    keep = UC.DEFAULT_KEEP;
+    log.warn('db', 'upgrade_backup_keep', { msg: `PRE_UPGRADE_KEEP must be a whole number (0 keeps every copy); using ${keep}.` });
+  }
+  const removed = UC.pruneUpgradeCopies(path.join(DATA_DIR, 'backups'), { keep, protect: upgradeCopy });
+  if (removed.length) log.info('db', 'upgrade_backup_pruned', { msg: `Removed ${removed.length} older pre-upgrade database ${removed.length === 1 ? 'copy' : 'copies'} (keeping the newest ${keep}): ${removed.join(', ')}` });
+}
 
 // v17 (admin): where the audit log's keyed part starts, checked on every start. Only once the upgrade above has
 // committed: the anchor file is outside the database, so written during the upgrade it would outlive a rollback (a

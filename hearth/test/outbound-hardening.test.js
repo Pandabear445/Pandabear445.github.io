@@ -372,10 +372,10 @@ test('trackers and feeds: disguised and DNS-hidden private addresses are refused
     assert.equal(r.status, 400, `${q} → ${r.status} ${r.text}`);
     assert.match(r.json.error, /blocked on this server/, q);
   }
-  // The news picture proxy too.
+  // The news picture proxy too, even for an address the server signed (as if a feed had listed it).
   const t = (await as(strict, u, 'GET', '/bootstrap')).json.mediaToken;
   for (const q of [`http://[::ffff:7f00:1]:${feedPort}/a.png`, `http://rebind.test:${feedPort}/a.png`]) {
-    const r = await strict.call('GET', `/media/news?u=${encodeURIComponent(q)}&t=${encodeURIComponent(t)}`);
+    const r = await strict.call('GET', `${strict.mediaLink('news', q)}&t=${encodeURIComponent(t)}`);
     assert.equal(r.status, 404, q);
   }
   assert.equal(feedHits, 0, 'the private site never got a request');
@@ -403,14 +403,15 @@ test('picture proxy: allowed hosts still work through the guard; private answers
   try {
     const u = await strict.register();
     const t = (await as(strict, u, 'GET', '/bootstrap')).json.mediaToken;
-    const r = await strict.call('GET', `/media/art?u=${encodeURIComponent(`https://img.steamstatic.com:${pushPort}/x.png`)}&t=${encodeURIComponent(t)}`);
+    const r = await strict.call('GET', `${strict.mediaLink('art', `https://img.steamstatic.com:${pushPort}/x.png`)}&t=${encodeURIComponent(t)}`);
     assert.equal(r.status, 404);
     assert.equal(conns.length, 0, 'no connection was made');
   } finally { pushSrv.off('connection', watch); }
 
   const u = await loose.register();
   const t = encodeURIComponent((await as(loose, u, 'GET', '/bootstrap')).json.mediaToken);
-  const art = (p) => fetch(`${loose.base}/media/art?u=${encodeURIComponent(`http://127.0.0.1:${artPort}${p}`)}&t=${t}`);
+  // Links the server signed (as it does for album art it sends to apps), so this checks what happens after that.
+  const art = (p) => fetch(`${loose.base}${loose.mediaLink('art', `http://127.0.0.1:${artPort}${p}`)}&t=${t}`);
   const ok = await art('/cover.png');
   assert.equal(ok.status, 200);
   assert.equal(ok.headers.get('content-type'), 'image/png');

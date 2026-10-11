@@ -612,3 +612,88 @@ test('a database from a newer Hearth is refused at start-up, untouched; backups 
     assert.equal((await s.api('GET', '/config')).status, 200);
   } finally { await s.stop(); fs.rmSync(tmp, { recursive: true, force: true }); }
 });
+
+// ------------------------------------------------------------------ data-4 / crypto-8: pruning pre-upgrade copies
+test('data-4: which pre-upgrade copies are pruned: the newest N by the time in their name, never the one just made, only exact names', () => {
+  const { copiesToPrune, keepSetting, COPY_NAME } = require('../server/upgradecopies');
+  const copy = (v, day) => `hearth-before-v${v}-2026-01-${String(day).padStart(2, '0')}T10-00-00-000Z.db`;
+  const copiesOnDisk = [copy(17, 1), copy(18, 2), copy(19, 3), copy(19, 4), copy(18, 5)];
+  const notCopies = ['hearth-before-v19-notes.db', `${copy(19, 6)}.partial`, `${copy(19, 7)}.bak`, `old-${copy(19, 8)}`, 'Hearth-before-v19-2026-01-09T10-00-00-000Z.db',
+    'hearth-before-v19-2026-01-10T10-00-00Z.db', 'hearth-auto-2026-01-11T10-00-00-000Z.db', 'hearth.db', 'hearth-before-v19-2026-01-12T10-00-00-000Z.db.db', 'hearth-before-v-2026-01-13T10-00-00-000Z.db'];
+  for (const f of copiesOnDisk) assert.ok(COPY_NAME.test(f), f);
+  for (const f of notCopies) assert.ok(!COPY_NAME.test(f), f);
+  const names = [...notCopies, ...copiesOnDisk];
+  // Newest first by the time in the name (not the version): the 5th and 4th stay.
+  assert.deepEqual(copiesToPrune(names, 2).sort(), [copy(17, 1), copy(18, 2), copy(19, 3)].sort());
+  // The copy just made always stays and counts as one of those kept, even if a clock made it look older.
+  assert.deepEqual(copiesToPrune(names, 2, copy(17, 1)).sort(), [copy(18, 2), copy(19, 3), copy(19, 4)].sort());
+  assert.deepEqual(copiesToPrune(names, 1, copy(18, 5)).sort(), [copy(17, 1), copy(18, 2), copy(19, 3), copy(19, 4)].sort());
+  assert.deepEqual(copiesToPrune(names, 0, copy(18, 5)), [], '0 keeps them all');
+  assert.deepEqual(copiesToPrune(names, 9), [], 'fewer than N: nothing goes');
+  // Same time: the higher version counts as newer.
+  const tie = ['hearth-before-v18-2026-01-01T10-00-00-000Z.db', 'hearth-before-v19-2026-01-01T10-00-00-000Z.db'];
+  assert.deepEqual(copiesToPrune(tie, 1), [tie[0]]);
+  // PRE_UPGRADE_KEEP: 3 when not set, 0 = all, anything but a whole number is reported (null).
+  assert.equal(keepSetting(undefined), 3);
+  assert.equal(keepSetting(''), 3);
+  assert.equal(keepSetting(' 5 '), 5);
+  assert.equal(keepSetting('0'), 0);
+  for (const bad of ['-1', '2.5', 'all', '1e3']) assert.equal(keepSetting(bad), null, bad);
+});
+
+test('data-4: after an upgrade, older pre-upgrade copies beyond PRE_UPGRADE_KEEP are removed; the new copy and other files stay', async () => {
+  const s = await startServer({ PRE_UPGRADE_KEEP: '2' });
+  try {
+    const v = version(s);
+    const u = await s.register();
+    const dir = path.join(s.dir, 'backups');
+    fs.mkdirSync(dir, { recursive: true });
+    // Copies from earlier upgrades (one dated in the future, as a wrong clock would leave it), and things that only
+    // look like copies: a renamed one, a folder and a link with a copy's name, notes, the daily copies.
+    const old = ['hearth-before-v16-2025-01-01T00-00-00-000Z.db', 'hearth-before-v17-2025-06-01T00-00-00-000Z.db', 'hearth-before-v18-2099-01-01T00-00-00-000Z.db'];
+    for (const f of old) fs.writeFileSync(path.join(dir, f), `old copy ${f}`);
+    const others = ['hearth-before-v15-2024-01-01T00-00-00-000Z.db.keep', 'my-hearth-before-v15-2024-01-01T00-00-00-000Z.db', 'hearth-auto-2024-01-01T00-00-00-000Z.db', 'notes.txt'];
+    for (const f of others) fs.writeFileSync(path.join(dir, f), 'keep me');
+    fs.mkdirSync(path.join(dir, 'hearth-before-v14-2023-01-01T00-00-00-000Z.db'));
+    fs.writeFileSync(path.join(s.dir, 'precious.txt'), 'outside');
+    fs.symlinkSync(path.join(s.dir, 'precious.txt'), path.join(dir, 'hearth-before-v13-2022-01-01T00-00-00-000Z.db'));
+
+    // An upgrade: a new copy is made, then (once it has gone through) only it and the newest other copy stay.
+    s.sql('PRAGMA user_version = 11');
+    await s.restart();
+    assert.equal(version(s), v);
+    const made = copies(s, v);
+    assert.equal(made.length, 1, 'the copy for this upgrade');
+    assert.ok(fs.existsSync(path.join(dir, 'hearth-before-v18-2099-01-01T00-00-00-000Z.db')), 'the newest other copy stays');
+    for (const f of old.slice(0, 2)) assert.ok(!fs.existsSync(path.join(dir, f)), `${f} was pruned`);
+    for (const f of others) assert.equal(fs.readFileSync(path.join(dir, f), 'utf8'), 'keep me', `${f} untouched`);
+    assert.ok(fs.statSync(path.join(dir, 'hearth-before-v14-2023-01-01T00-00-00-000Z.db')).isDirectory(), 'a folder with a copy’s name is left alone');
+    assert.ok(fs.lstatSync(path.join(dir, 'hearth-before-v13-2022-01-01T00-00-00-000Z.db')).isSymbolicLink(), 'so is a link');
+    assert.equal(fs.readFileSync(path.join(s.dir, 'precious.txt'), 'utf8'), 'outside');
+    assert.match(s.log, /Removed 2 older pre-upgrade database copies \(keeping the newest 2\)/);
+    // The copy is the real database from before the upgrade.
+    const D = require('better-sqlite3');
+    const c = new D(path.join(dir, made[0]), { readonly: true });
+    try { assert.equal(c.pragma('user_version', { simple: true }), 11); assert.equal(c.prepare('SELECT COUNT(*) n FROM users WHERE id = ?').get(u.id).n, 1); } finally { c.close(); }
+
+    // A start without an upgrade removes nothing.
+    await s.restart();
+    assert.equal(copies(s, v).length, 1);
+    assert.ok(fs.existsSync(path.join(dir, 'hearth-before-v18-2099-01-01T00-00-00-000Z.db')));
+
+    // PRE_UPGRADE_KEEP=0 keeps everything, as before this version.
+    s.sql('PRAGMA user_version = 12');
+    await s.restart({ PRE_UPGRADE_KEEP: '0' });
+    assert.equal(copies(s, v).length, 2);
+    assert.ok(fs.existsSync(path.join(dir, 'hearth-before-v18-2099-01-01T00-00-00-000Z.db')));
+
+    // A value that isn't a whole number: the default (3), and the log says so.
+    s.sql('PRAGMA user_version = 13');
+    await s.restart({ PRE_UPGRADE_KEEP: 'all' });
+    assert.match(s.log, /PRE_UPGRADE_KEEP must be a whole number/);
+    const kept = fs.readdirSync(dir).filter((f) => /^hearth-before-v\d+-\d{4}-.*Z\.db$/.test(f) && fs.lstatSync(path.join(dir, f)).isFile());
+    assert.equal(kept.length, 3);
+    assert.equal(copies(s, v).length, 2, 'the two newest copies of this version and the future-dated one stay; the oldest of this version went');
+    assert.equal((await s.api('GET', '/me/sessions', { token: u.token, ip: u.ip })).status, 200, 'and the server runs normally');
+  } finally { await s.stop(); }
+});

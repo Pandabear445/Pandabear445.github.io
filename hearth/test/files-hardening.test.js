@@ -8,11 +8,13 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const path = require('node:path');
 const zlib = require('node:zlib');
 const { pathToFileURL } = require('node:url');
 const { startServer, sleep } = require('./helpers');
 const { stripImageMetadata, stripFile, ImageRejected, tiffOrientation, crc32 } = require('../server/imagemeta');
+const { stripAudioMetadata, stripAudioFile, AudioRejected } = require('../server/audiometa');
 
 // ------------------------------------------------------------------ picture fixtures
 // A 12x8 JPEG made by Chromium (it carries an ICC colour profile in APP2, which must survive).
@@ -101,6 +103,141 @@ function webpWithMeta() {
   const riff = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), body]); riff.writeUInt32LE(riff.length - 8, 4);
   return riff;
 }
+// ------------------------------------------------------------------ GIF fixtures (files-6)
+// Sub-blocks: pieces of up to 255 bytes, each after its length, and a zero length at the end.
+const gifSub = (data) => {
+  const out = [];
+  for (let i = 0; i < data.length; i += 255) { const part = data.subarray(i, i + 255); out.push(Buffer.from([part.length]), part); }
+  out.push(Buffer.from([0]));
+  return Buffer.concat(out);
+};
+// LZW image data the simple way: a clear code before every two pixels, so the code size never grows (valid GIF data).
+function gifLzw(px, minCode = 2) {
+  const clear = 1 << minCode; const size = minCode + 1;
+  const codes = [];
+  for (let i = 0; i < px.length; i += 2) codes.push(clear, ...px.slice(i, i + 2));
+  codes.push(clear + 1);
+  const out = []; let acc = 0; let bits = 0;
+  for (const c of codes) { acc |= c << bits; bits += size; while (bits >= 8) { out.push(acc & 255); acc >>= 8; bits -= 8; } }
+  if (bits) out.push(acc & 255);
+  return Buffer.concat([Buffer.from([minCode]), gifSub(Buffer.from(out))]);
+}
+// A standard GIF LZW decoder (for checking that a cleaned GIF still decodes to the same pixels).
+function gifUnlzw(data, minCode) {
+  const clear = 1 << minCode; const eoi = clear + 1;
+  let size; let dict; let prev;
+  const reset = () => { dict = Array.from({ length: clear + 2 }, (_, k) => (k < clear ? [k] : [])); size = minCode + 1; prev = null; };
+  reset();
+  const out = []; let acc = 0; let bits = 0; let pos = 0;
+  for (;;) {
+    while (bits < size) { if (pos >= data.length) return out; acc |= data[pos++] << bits; bits += 8; }
+    const code = acc & ((1 << size) - 1); acc >>>= size; bits -= size;
+    if (code === clear) { reset(); continue; }
+    if (code === eoi) return out;
+    let entry;
+    if (code < dict.length) entry = dict[code];
+    else if (code === dict.length && prev) entry = [...prev, prev[0]];
+    else throw new Error(`bad LZW code ${code}`);
+    out.push(...entry);
+    if (prev) { dict.push([...prev, entry[0]]); if (dict.length === 1 << size && size < 12) size++; }
+    prev = entry;
+  }
+}
+// Decodes a whole GIF: every frame's pixels and raw bytes, the graphic control block before it, the application
+// blocks' names, the extension labels in order, and where the trailer ends. Throws if any block doesn't parse.
+function gifDecode(buf) {
+  assert.match(buf.toString('latin1', 0, 6), /^GIF8[79]a$/);
+  const table = (p) => (p & 0x80 ? 3 * (1 << ((p & 7) + 1)) : 0);
+  const subs = (k) => { const parts = []; for (;;) { const len = buf[k++]; if (len === undefined) throw new Error('cut off'); if (!len) return { data: Buffer.concat(parts), end: k }; parts.push(buf.subarray(k, k + len)); k += len; } };
+  let i = 13 + table(buf[10]);
+  const frames = []; const apps = []; const labels = []; let gce = null;
+  for (;;) {
+    const b = buf[i];
+    if (b === 0x3b) return { frames, apps, labels, end: i + 1 };
+    if (b === 0x21) {
+      const { data, end } = subs(i + 2);
+      labels.push(buf[i + 1]);
+      if (buf[i + 1] === 0xf9) gce = buf.subarray(i, end);
+      if (buf[i + 1] === 0xff) apps.push(data.toString('latin1', 0, 11));
+      i = end;
+    } else if (b === 0x2c) {
+      const w = buf.readUInt16LE(i + 5); const h = buf.readUInt16LE(i + 7);
+      const k = i + 10 + table(buf[i + 9]);
+      const { data, end } = subs(k + 1);
+      const pixels = gifUnlzw(data, buf[k]);
+      assert.equal(pixels.length, w * h, 'every pixel decoded');
+      frames.push({ gce, pixels, raw: buf.subarray(i, end) });
+      gce = null; i = end;
+    } else throw new Error(`not a GIF block: ${b} at ${i}`);
+  }
+}
+const GIF_W = 4; const GIF_H = 3;
+const gifFrame = (px) => Buffer.concat([Buffer.from([0x2c, 0, 0, 0, 0, GIF_W, 0, GIF_H, 0, 0]), gifLzw(px)]);
+const gifGce = (delay, transparent) => Buffer.from([0x21, 0xf9, 4, transparent ? 5 : 4, delay, 0, transparent ? 3 : 0, 0]);
+const gifApp = (name, data) => Buffer.concat([Buffer.from([0x21, 0xff, 11]), Buffer.from(name, 'latin1'), gifSub(data)]);
+const GIF_PX = [[0, 1, 2, 3, 3, 2, 1, 0, 1, 1, 2, 2], [3, 3, 3, 0, 0, 1, 2, 3, 0, 1, 2, 3]];
+// Two frames that loop forever, and what editors and some tools hide in a GIF: comments, a plain-text block, an
+// XMP block, another program's block and bytes after the end.
+function gifWithMeta() {
+  return Buffer.concat([
+    Buffer.from('GIF89a', 'latin1'), Buffer.from([GIF_W, 0, GIF_H, 0, 0x81, 0, 0]), Buffer.from([0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]),
+    gifApp('NETSCAPE2.0', Buffer.from([1, 0, 0])),
+    Buffer.concat([Buffer.from([0x21, 0xfe]), gifSub(Buffer.from('SECRET-GIF-COMMENT taken at 48.8584N 2.2945E', 'latin1'))]),
+    gifGce(10, true), gifFrame(GIF_PX[0]),
+    gifApp('XMP DataXMP', Buffer.from('<x:xmpmeta>SECRET-GIF-XMP</x:xmpmeta>', 'latin1')),
+    Buffer.concat([Buffer.from([0x21, 0x01, 12]), Buffer.alloc(12), gifSub(Buffer.from('SECRET-PLAIN-TEXT', 'latin1'))]),
+    gifApp('MGKIPTC0000', Buffer.from('SECRET-IPTC', 'latin1')),
+    gifGce(20, false), gifFrame(GIF_PX[1]),
+    Buffer.concat([Buffer.from([0x21, 0xfe]), gifSub(Buffer.from('SECRET-'.repeat(60), 'latin1'))]), // over 255 bytes: two sub-blocks
+    Buffer.from([0x3b]), Buffer.from('SECRET-TRAILER', 'latin1'),
+  ]);
+}
+
+// ------------------------------------------------------------------ profile song fixtures (files-6)
+// MPEG-1 Layer III frames (128 kbit/s, 44.1 kHz: 417 bytes each) with made-up audio data.
+function mp3Frames(n = 6) {
+  return Buffer.concat(Array.from({ length: n }, (_, k) => { const f = Buffer.alloc(417); f.writeUInt32BE(0xfffb9064, 0); for (let i = 4; i < 417; i++) f[i] = (i * 31 + k * 7) & 255; return f; }));
+}
+const syncsafe = (n) => Buffer.from([(n >> 21) & 127, (n >> 14) & 127, (n >> 7) & 127, n & 127]);
+const id3Frame = (id, body) => { const h = Buffer.alloc(10); h.write(id, 0, 'latin1'); h.writeUInt32BE(body.length, 4); return Buffer.concat([h, body]); };
+// An ID3v2 tag: title, a comment with an email address, a cover picture and padding (v2.4 can end in a footer).
+function id3v2(version = 3, footer = false) {
+  const body = Buffer.concat([id3Frame('TIT2', Buffer.from('\0SECRET-TITLE', 'latin1')), id3Frame('COMM', Buffer.from('\0eng\0SECRET-COMMENT ripped by someone@example.test', 'latin1')),
+    id3Frame('APIC', Buffer.concat([Buffer.from('\0image/jpeg\0\x03SECRET-PHOTO\0', 'latin1'), JPEG])), Buffer.alloc(64)]);
+  const head = Buffer.concat([Buffer.from('ID3', 'latin1'), Buffer.from([version, 0, footer ? 0x10 : 0]), syncsafe(body.length)]);
+  return Buffer.concat([head, body, footer ? Buffer.concat([Buffer.from('3DI', 'latin1'), head.subarray(3)]) : Buffer.alloc(0)]);
+}
+const id3v1 = () => { const b = Buffer.alloc(128); b.write('TAG', 0, 'latin1'); b.write('SECRET-V1-TITLE', 3, 'latin1'); b.write('SECRET-V1-ARTIST', 33, 'latin1'); return b; };
+function apeTag() {
+  const item = Buffer.concat([Buffer.alloc(8), Buffer.from('Comment\0SECRET-APE', 'latin1')]);
+  item.writeUInt32LE('SECRET-APE'.length, 0);
+  const edge = (header) => { const b = Buffer.alloc(32); b.write('APETAGEX', 0, 'latin1'); b.writeUInt32LE(2000, 8); b.writeUInt32LE(item.length + 32, 12); b.writeUInt32LE(1, 16); b.writeUInt32LE((0x80000000 | (header ? 0x20000000 : 0)) >>> 0, 20); return b; };
+  return Buffer.concat([edge(true), item, edge(false)]);
+}
+const lyrics3 = () => { const body = Buffer.from('LYRICSBEGININD0000210LYR00013SECRET-LYRICS', 'latin1'); return Buffer.concat([body, Buffer.from(`${String(body.length).padStart(6, '0')}LYRICS200`, 'latin1')]); };
+const riffChunk = (id, data) => { const h = Buffer.alloc(8); h.write(id, 0, 'latin1'); h.writeUInt32LE(data.length, 4); return Buffer.concat([h, data, Buffer.alloc(data.length & 1)]); };
+const wavFile = (chunks) => { const body = Buffer.concat(chunks); const h = Buffer.alloc(12); h.write('RIFF', 0, 'latin1'); h.writeUInt32LE(body.length + 4, 4); h.write('WAVE', 8, 'latin1'); return Buffer.concat([h, body]); };
+const WAV_FMT = riffChunk('fmt ', Buffer.from([1, 0, 1, 0, 0x40, 0x1f, 0, 0, 0x80, 0x3e, 0, 0, 2, 0, 16, 0])); // PCM, mono, 8 kHz, 16-bit
+const WAV_DATA = riffChunk('data', Buffer.from(Array.from({ length: 1000 }, (_, i) => (i * 13) & 255)));
+const mp4Box = (type, ...parts) => { const body = Buffer.concat(parts); const h = Buffer.alloc(8); h.writeUInt32BE(body.length + 8, 0); h.write(type, 4, 'latin1'); return Buffer.concat([h, body]); };
+// An M4A as iTunes writes one: tags (title, the buyer's account), a track name, and an XMP box.
+function m4aWithMeta() {
+  return Buffer.concat([mp4Box('ftyp', Buffer.from('M4A \0\0\0\0M4A isom', 'latin1')),
+    mp4Box('moov', mp4Box('mvhd', Buffer.alloc(100, 1)),
+      mp4Box('trak', mp4Box('tkhd', Buffer.alloc(84, 2)), mp4Box('mdia', Buffer.alloc(40, 3)), mp4Box('udta', mp4Box('name', Buffer.from('SECRET-TRACK-NAME', 'latin1')))),
+      mp4Box('udta', mp4Box('meta', Buffer.alloc(4), mp4Box('hdlr', Buffer.alloc(25)), mp4Box('ilst',
+        mp4Box('\xa9nam', mp4Box('data', Buffer.from('\0\0\0\x01\0\0\0\0SECRET-TITLE', 'latin1'))),
+        mp4Box('apID', mp4Box('data', Buffer.from('\0\0\0\x01\0\0\0\0buyer@example.test', 'latin1'))))))),
+    mp4Box('uuid', Buffer.from('be7acfcb97a942e89c71999491e3afac', 'hex'), Buffer.from('<x:xmpmeta>SECRET-XMP</x:xmpmeta>', 'latin1')),
+    mp4Box('mdat', Buffer.from('audio!'.repeat(200), 'latin1'))]);
+}
+// The boxes from `from` to `to`: [{ type, start, end }].
+function mp4Boxes(buf, from = 0, to = buf.length) {
+  const out = [];
+  for (let i = from; i < to;) { const size = buf.readUInt32BE(i); out.push({ type: buf.toString('latin1', i + 4, i + 8), start: i, end: i + size }); i += size; }
+  return out;
+}
+
 // Files no camera makes: millions of empty blocks, which used to keep the server busy for seconds and use hundreds
 // of MB of memory while it looked for metadata.
 const MIB = 1024 * 1024;
@@ -142,9 +279,10 @@ const fileOf = (srv, url) => path.join(srv.dir, 'uploads', path.basename(url));
 
 // ------------------------------------------------------------------ a fake GIF provider / picture host
 // KLIPY's API shape, GIF media, a huge answer without a size, and redirects (some to a host that isn't allowed).
+// Also a news feed whose item has a picture, pictures under /pics/ and an iTunes-like search (album art).
 // Every request it gets is noted in st.seen: the path asked for and any login sent.
 function startFake() {
-  const st = { search: 0, posts: 0, media: 0, sent: {}, closedEarly: {}, otherHost: 0, seen: [] };
+  const st = { search: 0, posts: 0, media: 0, sent: {}, closedEarly: {}, otherHost: 0, seen: [], pics: 0 };
   const other = http.createServer((req, res) => { st.otherHost++; res.writeHead(200, { 'content-type': 'image/gif' }); res.end(fakeGif()); });
   const srv = http.createServer((req, res) => {
     st.seen.push({ url: req.url, auth: req.headers.authorization });
@@ -159,6 +297,12 @@ function startFake() {
     }
     if (u.pathname === '/v2/posts') { st.posts++; res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ results: [item(u.searchParams.get('ids'), 'emoji')] })); }
     if (u.pathname.startsWith('/media/')) { st.media++; res.writeHead(200, { 'content-type': 'image/gif' }); return res.end(fakeGif()); }
+    if (u.pathname === '/feed.xml') {
+      res.writeHead(200, { 'content-type': 'application/rss+xml' });
+      return res.end(`<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel><title>Pics</title><item><title>Picture news</title><link>https://example.test/a</link><guid>a</guid><pubDate>${new Date().toUTCString()}</pubDate><media:thumbnail url="${base}/pics/news-a.png"/></item></channel></rss>`);
+    }
+    if (u.pathname.startsWith('/pics/')) { st.pics++; res.writeHead(200, { 'content-type': 'image/png' }); return res.end(PNG); }
+    if (u.pathname === '/search') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ results: [{ artworkUrl100: `${base}/pics/art-100x100bb.png` }] })); }
     if (u.pathname === '/redirect-out') { res.writeHead(302, { location: `http://localhost:${other.address().port}/x.gif` }); return res.end(); }
     if (u.pathname === '/redirect-in') { res.writeHead(302, { location: `${base}/media/ok.gif` }); return res.end(); }
     // The allowed host as a login in front of another host, and a scheme-relative jump to another host.
@@ -192,7 +336,7 @@ function startFake() {
 let srv; let fake; let owner;
 before(async () => {
   fake = await startFake();
-  srv = await startServer({ KLIPY_API_BASE: fake.base, GIF_PROXY_EXTRA_HOSTS: `127.0.0.1:${fake.port}`, ART_PROXY_EXTRA_HOSTS: `127.0.0.1:${fake.port}`, ORPHAN_SWEEP_DELAY_MS: '1500' });
+  srv = await startServer({ KLIPY_API_BASE: fake.base, GIF_PROXY_EXTRA_HOSTS: `127.0.0.1:${fake.port}`, ART_PROXY_EXTRA_HOSTS: `127.0.0.1:${fake.port}`, WEBHOOK_AVATAR_HOSTS: `127.0.0.1:${fake.port}`, ORPHAN_SWEEP_DELAY_MS: '1500' });
   owner = srv.owner;
   const r = await srv.api('PATCH', '/admin/settings', { token: owner.token, ip: owner.ip, body: { klipyKey: 'test-key', gifProvider: 'klipy' } });
   assert.equal(r.status, 200, r.text);
@@ -473,6 +617,108 @@ test('files-6: profile and server pictures are stored without their GPS position
   // A plain picture is stored byte for byte.
   const p = await post(srv, u, '/me/media/background', { filename: 'p.png', type: 'image/png', bytes: PNG, fields: [['crop', '{}']] });
   assert.ok(fs.readFileSync(fileOf(srv, p.json.background)).equals(PNG));
+});
+
+// ------------------------------------------------------------------ files-6: GIF comments and profile songs' tags
+test('files-6: GIF comments, plain text and editors’ blocks are removed; frames, looping and timing stay byte for byte and still decode', () => {
+  const src = gifWithMeta();
+  const out = stripImageMetadata(src);
+  assert.ok(out);
+  assert.equal(has(out, 'SECRET'), false, 'no comment, plain text, XMP, other program’s block or trailer');
+  const before = gifDecode(src); const after = gifDecode(out);
+  assert.equal(after.end, out.length, 'nothing after the end');
+  assert.deepEqual(after.apps, ['NETSCAPE2.0'], 'the looping block stays');
+  assert.deepEqual(after.labels, [0xff, 0xf9, 0xf9], 'looping, then one graphic control block per frame');
+  assert.equal(after.frames.length, 2);
+  for (const k of [0, 1]) {
+    assert.ok(after.frames[k].raw.equals(before.frames[k].raw), `frame ${k}: byte for byte`);
+    assert.ok(after.frames[k].gce.equals(before.frames[k].gce), `frame ${k}: same delay and transparency`);
+    assert.deepEqual(after.frames[k].pixels, GIF_PX[k], `frame ${k}: decodes to the same pixels`);
+  }
+  assert.ok(out.subarray(0, 25).equals(src.subarray(0, 25)), 'header and colour table unchanged');
+  // Nothing hidden (a colour profile and looping are kept): left alone. Not really a GIF: left alone.
+  const head = src.subarray(0, 25);
+  const plain = Buffer.concat([head, gifApp('NETSCAPE2.0', Buffer.from([1, 0, 0])), gifApp('ICCRGBG1012', Buffer.from('a colour profile')), gifGce(10, true), gifFrame(GIF_PX[0]), Buffer.from([0x3b])]);
+  assert.equal(stripImageMetadata(plain), null);
+  assert.equal(stripImageMetadata(fakeGif()), null);
+  // Cut off part way through a frame: what comes before it is cleaned, the rest is kept as it is.
+  const at = src.indexOf(gifFrame(GIF_PX[1])) + 9;
+  const cut = stripImageMetadata(src.subarray(0, at));
+  assert.ok(cut && !has(cut, 'SECRET'));
+  assert.ok(cut.subarray(cut.length - 9).equals(src.subarray(at - 9, at)));
+});
+
+test('files-6: a GIF avatar is stored without its comments, still animated, and quota counts the cleaned size', async () => {
+  const u = await srv.register('gifface');
+  const r = await post(srv, u, '/me/media/avatar', { filename: 'me.gif', type: 'image/gif', bytes: gifWithMeta(), fields: [['crop', '{}']] });
+  assert.equal(r.status, 200, r.text);
+  const served = Buffer.from(await (await fetch(srv.base + r.json.avatar)).arrayBuffer());
+  assert.equal(has(served, 'SECRET'), false);
+  assert.ok(served.equals(stripImageMetadata(gifWithMeta())));
+  assert.deepEqual(gifDecode(served).frames.map((f) => f.pixels), GIF_PX);
+  assert.equal(srv.sql('SELECT size FROM user_files WHERE name = ?', path.basename(r.json.avatar))[0].size, served.length);
+});
+
+test('files-6: profile songs lose their tags (ID3v2, APE, Lyrics3, ID3v1; WAV INFO; M4A iTunes boxes) and keep the audio byte for byte', () => {
+  const frames = mp3Frames();
+  // MP3: tags at both ends; the MPEG frames between them come out exactly.
+  const mp3 = Buffer.concat([id3v2(3), frames, apeTag(), lyrics3(), id3v1()]);
+  assert.ok(stripAudioMetadata(mp3).equals(frames));
+  assert.ok(stripAudioMetadata(Buffer.concat([id3v2(4, true), id3v2(3), frames, id3v2(4, true)])).equals(frames), 'two tags in front, a v2.4 tag with a footer at the end');
+  assert.ok(stripAudioMetadata(Buffer.concat([frames, id3v1()])).equals(frames));
+  assert.equal(stripAudioMetadata(frames), null, 'nothing to remove: left alone');
+  // A tag whose size runs past the end of the file takes the rest with it (it is never kept because of a bad size).
+  const bad = id3v2(3); bad.set(syncsafe(1e6), 6);
+  assert.equal(has(stripAudioMetadata(Buffer.concat([bad, frames])), 'SECRET'), false);
+  // WAV: the INFO list and broadcast chunk go (an odd-sized one with its pad byte); format and samples stay.
+  const wav = wavFile([WAV_FMT, riffChunk('LIST', Buffer.concat([Buffer.from('INFO'), riffChunk('IART', Buffer.from('SECRET-ARTIST\0'))])), WAV_DATA, riffChunk('bext', Buffer.from('SECRET-BEXT', 'latin1'))]);
+  assert.ok(stripAudioMetadata(wav).equals(wavFile([WAV_FMT, WAV_DATA])));
+  assert.equal(stripAudioMetadata(wavFile([WAV_FMT, WAV_DATA])), null);
+  // M4A: the tag boxes become "free" boxes of zeros of the same size, so nothing else moves.
+  const m4a = m4aWithMeta();
+  const out = stripAudioMetadata(m4a);
+  assert.equal(out.length, m4a.length);
+  for (const x of ['SECRET', 'buyer@example.test', 'xmpmeta']) assert.equal(has(out, x), false, x);
+  const top = mp4Boxes(out); const was = mp4Boxes(m4a);
+  assert.deepEqual(top.map((b) => b.type), ['ftyp', 'moov', 'free', 'mdat']);
+  const moov = mp4Boxes(out, top[1].start + 8, top[1].end);
+  assert.deepEqual(moov.map((b) => b.type), ['mvhd', 'trak', 'free']);
+  assert.deepEqual(mp4Boxes(out, moov[1].start + 8, moov[1].end).map((b) => b.type), ['tkhd', 'mdia', 'free']);
+  for (const b of [top[2], moov[2]]) assert.ok(out.subarray(b.start + 8, b.end).every((x) => x === 0), 'blanked');
+  // Everything but the blanked boxes is byte for byte the same.
+  const blanks = [moov[1], moov[2], top[2]].map((x, k) => (k ? x : mp4Boxes(out, x.start + 8, x.end)[2])); // in file order
+  const kept = (buf) => { const parts = []; let i = 0; for (const b of blanks) { parts.push(buf.subarray(i, b.start + 4)); i = b.end; } parts.push(buf.subarray(i)); return Buffer.concat(parts); };
+  assert.ok(kept(out).equals(kept(m4a)));
+  assert.ok(out.subarray(was[3].start).equals(m4a.subarray(was[3].start)), 'the audio data');
+  // OGG (comments live inside its pages) and anything unrecognisable are left as they are.
+  assert.equal(stripAudioMetadata(Buffer.concat([Buffer.from('OggS\0\x02', 'latin1'), Buffer.alloc(200, 7), Buffer.from('ARTIST=someone')])), null);
+  assert.equal(stripAudioMetadata(Buffer.from('not a song at all')), null);
+});
+
+test('files-6: an uploaded profile song is stored without its tags; the audio and the quota match the cleaned file', async () => {
+  const u = await srv.register('singer');
+  const frames = mp3Frames(12);
+  const up = async (filename, type, bytes) => {
+    const r = await post(srv, u, '/me/song', { filename, type, bytes, fields: [['title', 'My song']] });
+    assert.equal(r.status, 200, r.text);
+    const stored = fs.readFileSync(fileOf(srv, r.json.song));
+    assert.equal(srv.sql('SELECT size FROM user_files WHERE name = ?', path.basename(r.json.song))[0].size, stored.length);
+    return { url: r.json.song, stored };
+  };
+  const mp3 = await up('song.mp3', 'audio/mpeg', Buffer.concat([id3v2(3), frames, apeTag(), id3v1()]));
+  assert.ok(mp3.stored.equals(frames), 'only the MPEG frames are left');
+  const served = Buffer.from(await (await fetch(srv.base + mp3.url)).arrayBuffer());
+  assert.ok(served.equals(frames));
+  const m4a = await up('song.m4a', 'audio/mp4', m4aWithMeta());
+  assert.ok(m4a.stored.equals(stripAudioMetadata(m4aWithMeta())));
+  assert.equal(has(m4a.stored, 'buyer@example.test'), false);
+  const wav = await up('song.wav', 'audio/wav', wavFile([WAV_FMT, riffChunk('LIST', Buffer.from('INFOSECRET')), WAV_DATA]));
+  assert.ok(wav.stored.equals(wavFile([WAV_FMT, WAV_DATA])));
+  // A song with nothing to remove, and an OGG, are stored byte for byte.
+  assert.ok((await up('plain.mp3', 'audio/mpeg', frames)).stored.equals(frames));
+  const ogg = Buffer.concat([Buffer.from('OggS\0\x02', 'latin1'), Buffer.alloc(300, 9)]);
+  assert.ok((await up('song.ogg', 'audio/ogg', ogg)).stored.equals(ogg));
+  assert.equal(fs.readdirSync(path.join(srv.dir, 'uploads')).filter((f) => f.endsWith('.tmp')).length, 0);
 });
 
 // ------------------------------------------------------------------ review-1/2: the stripper itself can't be used against the server
@@ -773,12 +1019,311 @@ test('files-12: the GIF proxy sends only the rebuilt request: no login, odd path
 test('ssrf-3: the picture proxy stops reading a huge answer at its 6 MB limit instead of buffering it', async () => {
   const u = await srv.register('artviewer');
   const t = encodeURIComponent(await mediaTokenOf(u));
-  const r = await srv.call('GET', `/media/art?u=${encodeURIComponent(`${fake.base}/huge-art.jpg`)}&t=${t}`, { timeout: 30000 });
+  const r = await srv.call('GET', `${srv.mediaLink('art', `${fake.base}/huge-art.jpg`)}&t=${t}`, { timeout: 30000 });
   assert.equal(r.status, 404);
   await sleep(300);
   assert.ok(fake.st.sent['/huge-art.jpg'] < 40 * 1024 * 1024, `read ${fake.st.sent['/huge-art.jpg']} of 100 MB`);
   assert.equal(fake.st.closedEarly['/huge-art.jpg'], true);
   assert.equal((await srv.api('GET', '/config')).status, 200);
+});
+
+// ------------------------------------------------------------------ files-10: signed picture-proxy links
+test('files-10: the server signs each news and album-art picture it hands out; a link for one picture can’t fetch another, and made-up or expired links are refused', async () => {
+  // Its own server: one that may read feeds from this machine and asks the fake for album art.
+  const news = await startServer({ FEED_ALLOW_PRIVATE: '1', ART_PROXY_EXTRA_HOSTS: `127.0.0.1:${fake.port}`, ITUNES_API_BASE: fake.base });
+  try {
+    const u = await news.register('reader');
+    const t = encodeURIComponent((await as(news, u, 'GET', '/bootstrap')).json.mediaToken);
+    const status = async (src, tok = t) => (await news.call('GET', tok ? `${src}&t=${tok}` : src)).status;
+    const picture = async (src) => { const r = await fetch(`${news.base}${src}&t=${t}`); return { status: r.status, type: r.headers.get('content-type'), body: Buffer.from(await r.arrayBuffer()) }; };
+    const signedLink = /^\/media\/(news|art)\/[0-9a-f]{12}\?u=[^&]+&e=\d+&s=[\w-]{32}$/;
+
+    // review-5: a preview (a feed tried before it's followed) names the item's picture but gives no link to load it
+    // (the app shows a placeholder): signed, it let anyone's own feed point the proxy at any picture, straight away.
+    const prev = await as(news, u, 'POST', '/me/trackers/preview', { kind: 'rss', query: `${fake.base}/feed.xml` });
+    assert.equal(prev.status, 200, prev.text);
+    assert.equal(prev.json.items[0].image, `${fake.base}/pics/news-a.png`);
+    assert.equal(prev.json.items[0].imageSrc, undefined, 'a tracker preview signs nothing');
+    const s = (await as(news, u, 'POST', '/servers', { name: 'Newsroom' })).json;
+    const ch = s.channels.find((c) => c.type === 'text');
+    const fprev = await as(news, u, 'POST', `/servers/${s.id}/feeds/preview`, { kind: 'rss', query: `${fake.base}/feed.xml` });
+    assert.equal(fprev.status, 200, fprev.text);
+    assert.equal(fprev.json.items[0].imageSrc, undefined, 'nor does a server feed preview');
+
+    // A news bot post: the message carries a fresh signed link for its picture (older posts get one too, each time
+    // they're loaded), which works.
+    const add = await as(news, u, 'POST', `/servers/${s.id}/feeds`, { kind: 'rss', query: `${fake.base}/feed.xml`, channelId: ch.id, postLatest: true });
+    assert.equal(add.status, 200, add.text);
+    const post = (await as(news, u, 'GET', `/channels/${ch.id}/messages`)).json.messages.find((m) => m.embed);
+    assert.ok(post, 'the bot posted the newest item');
+    const item = post.embed;
+    assert.equal(item.image, `${fake.base}/pics/news-a.png`);
+    assert.match(item.imageSrc, signedLink);
+    const ok = await picture(item.imageSrc);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.type, 'image/png');
+    assert.ok(ok.body.equals(PNG));
+
+    // Refused before anything is fetched: the same signature with another address, the address with another end
+    // time, a news link used for album art, a link without a signed-in session, and any address with only the
+    // sign-in token (all the proxy needed before).
+    const hits = fake.st.pics;
+    const swap = (src, to) => src.replace(`u=${encodeURIComponent(item.image)}`, `u=${encodeURIComponent(to)}`);
+    assert.equal(await status(swap(item.imageSrc, `${fake.base}/pics/news-b.png`)), 403, 'a link for picture A can’t fetch picture B');
+    assert.equal(await status(swap(item.imageSrc, `https://example.test/secret.png`)), 403);
+    const e = /&e=(\d+)/.exec(item.imageSrc)[1];
+    assert.equal(await status(item.imageSrc.replace(`&e=${e}`, `&e=${Number(e) + 6 * 3600}`)), 403, 'a later end time breaks the signature');
+    assert.equal(await status(item.imageSrc.replace('/media/news/', '/media/art/')), 403, 'a news link isn’t an album-art link');
+    assert.equal(await status(item.imageSrc, ''), 403, 'it still needs a signed-in session');
+    for (const target of [`${fake.base}/pics/anything.png`, 'https://example.test/x.png']) {
+      assert.equal(await status(`/media/news?u=${encodeURIComponent(target)}`), 403, `/media/news is no longer an open proxy (${target})`);
+      assert.equal(await status(`/media/art?u=${encodeURIComponent(target)}`), 403, `nor /media/art (${target})`);
+    }
+    assert.equal(fake.st.pics, hits, 'nothing was fetched for any of them');
+
+    // Expired: the same address signed by this server's key more than a day and a half ago is refused; signed now, it works.
+    assert.equal(await status(news.mediaLink('news', item.image, { now: Date.now() - 31 * 3600000 })), 403, 'expired');
+    assert.equal(await status(news.mediaLink('news', item.image, { now: Date.now() - 3600000 })), 200, 'an hour old is fine');
+    assert.equal(await status(news.mediaLink('art', `${fake.base}/pics/art-300x300bb.png`, { now: Date.now() - 31 * 3600000 })), 403, 'expired album art');
+
+    // The post's signature can't be moved to another address either.
+    assert.equal(await status(swap(post.embed.imageSrc, `${fake.base}/pics/other.png`)), 403);
+
+    // Album art: someone's activity carries a signed link for their art; only that picture comes through it.
+    const sock = await news.socket(u.token);
+    try {
+      const act = await as(news, u, 'PUT', '/me/activity', { music: { title: 'Song', artist: 'Band' } });
+      assert.equal(act.status, 200, act.text);
+      const music = act.json.activity.music;
+      assert.equal(music.art, `${fake.base}/pics/art-300x300bb.png`);
+      assert.match(music.artSrc, signedLink);
+      const art = await picture(music.artSrc);
+      assert.equal(art.status, 200);
+      assert.ok(art.body.equals(PNG));
+      const before = fake.st.pics;
+      assert.equal(await status(music.artSrc.replace(`u=${encodeURIComponent(music.art)}`, `u=${encodeURIComponent(`${fake.base}/pics/private.png`)}`)), 403);
+      assert.equal(await status(music.artSrc.replace('/media/art/', '/media/news/')), 403, 'an album-art link isn’t a news link');
+      assert.equal(fake.st.pics, before);
+    } finally { sock.close(); }
+  } finally { await news.stop(); }
+});
+
+test('files-10: album art comes only from the music and game services’ own picture hosts, not shared hosting', async () => {
+  const u = await srv.register('artcheck');
+  const t = encodeURIComponent(await mediaTokenOf(u));
+  // Even an address the server signed is fetched only from an allowed host. These were allowed before (broad
+  // suffixes for anyone's content) and are now refused without a request; each answers 404 like any refused picture.
+  for (const target of ['https://evil.global.ssl.fastly.net/x.png', 'https://lh3.googleusercontent.com/x.png', 'https://yt3.ggpht.com/x.png']) {
+    const r = await srv.call('GET', `${srv.mediaLink('art', target)}&t=${t}`);
+    assert.equal(r.status, 404, target);
+  }
+  // The services' own hosts are still on the list (checked without fetching anything: they're on the internet).
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server', 'activity.js'), 'utf8');
+  const hosts = new RegExp(/const ART_HOSTS = \/(.*)\/i;/.exec(src)[1], 'i');
+  for (const h of ['shared.akamai.steamstatic.com', 'cdn.akamai.steamstatic.com', 'upload.wikimedia.org', 'media.rawg.io', 'lastfm.freetls.fastly.net', 'is1-ssl.mzstatic.com',
+    'i.scdn.co', 'image-cdn-ak.spotifycdn.com', 'i.ytimg.com', 'i1.sndcdn.com', 'e-cdns-images.dzcdn.net', 'resources.tidal.com', 'f4.bcbits.com']) assert.ok(hosts.test(h), h);
+  for (const h of ['fastly.net', 'evil.global.ssl.fastly.net', 'lh3.googleusercontent.com', 'yt3.ggpht.com', 'steamstatic.com.evil.test', 'evilmzstatic.com']) assert.ok(!hosts.test(h), h);
+});
+
+test('review-5 (files-10): webhook avatars are signed only on known avatar hosts, and that proxy fetches from those hosts alone', async () => {
+  const u = await srv.register('hookmaker');
+  const t = encodeURIComponent(await mediaTokenOf(u));
+  const s = (await as(srv, u, 'POST', '/servers', { name: 'My hooks' })).json;
+  const ch = s.channels.find((c) => c.type === 'text');
+  const made = await as(srv, u, 'POST', `/channels/${ch.id}/webhooks`, { name: 'Alerts' });
+  assert.equal(made.status, 200, made.text);
+  // A stand-in for "any host on the internet": it counts the connections it gets.
+  let conns = 0;
+  const any = net.createServer((c) => { conns++; c.destroy(); });
+  await new Promise((r) => any.listen(0, '127.0.0.1', r));
+  const avatarOf = async (avatar) => {
+    for (;;) {
+      const r = await srv.call('POST', made.json.path, { body: { content: `post ${avatar}`, avatar_url: avatar }, ip: '198.18.7.7' });
+      if (r.status === 429 && r.json && r.json.retry_after <= 3) { await sleep(r.json.retry_after * 1000 + 50); continue; }
+      assert.equal(r.status, 204, r.text);
+      break;
+    }
+    const m = (await as(srv, u, 'GET', `/channels/${ch.id}/messages`)).json.messages.find((x) => x.content === `post ${avatar}`);
+    return m.webhook;
+  };
+  const avatarLink = /^\/media\/avatar\/[0-9a-f]{12}\?u=[^&]+&e=\d+&s=[\w-]{32}$/;
+  try {
+    // The review's case: an avatar anywhere else is kept as the post's link, but not signed, so the app shows the
+    // webhook's own picture and the server never fetches it (before, any https address got a signed proxy link).
+    for (const target of [`https://127.0.0.1:${any.address().port}/any/path.png?q=chosen`, 'https://example.test/x.png', 'https://evilgravatar.com/x.png', 'https://cdn.discordapp.com:8443/x.png']) {
+      const w = await avatarOf(target);
+      assert.equal(w.avatar, target);
+      assert.equal(w.avatarSrc, undefined, target);
+    }
+    // Discord's and Gravatar's avatar hosts, and a host the admin listed (WEBHOOK_AVATAR_HOSTS), get a signed link
+    // to the avatar proxy (not the news one).
+    const discord = await avatarOf('https://cdn.discordapp.com/avatars/1/abc.png');
+    assert.match(discord.avatarSrc, avatarLink);
+    assert.match((await avatarOf('https://secure.gravatar.com/avatar/00?s=64')).avatarSrc, avatarLink);
+    assert.match((await avatarOf(`https://127.0.0.1:${fake.port}/pics/hook.png`)).avatarSrc, avatarLink);
+    const get = async (src) => (await srv.call('GET', `${src}&t=${t}`)).status;
+    assert.equal(await get(discord.avatarSrc.replace('/media/avatar/', '/media/news/')), 403, 'an avatar link isn’t a news link');
+    assert.equal(await get(srv.mediaLink('news', `${fake.base}/pics/hook.png`).replace('/media/news/', '/media/avatar/')), 403, 'nor the other way round');
+    assert.equal(await get(discord.avatarSrc.replace(/u=[^&]+/, `u=${encodeURIComponent(`https://127.0.0.1:${any.address().port}/x.png`)}`)), 403, 'its signature can’t be moved');
+
+    // The proxy fetches a listed host's picture (here over http, as an admin's own host may be)...
+    const ok = await fetch(`${srv.base}${srv.mediaLink('avatar', `${fake.base}/pics/hook.png`)}&t=${t}`);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get('content-type'), 'image/png');
+    assert.ok(Buffer.from(await ok.arrayBuffer()).equals(PNG));
+    // ...but nothing else, even with a link this server's key signed: another host or port, and a listed host's
+    // redirect to another host (Gravatar sends a "default picture" address on like that).
+    const other = fake.st.otherHost;
+    for (const target of [`https://127.0.0.1:${any.address().port}/x.png`, `http://localhost:${fake.port}/pics/x.png`, `${fake.base}/redirect-out`]) {
+      assert.equal(await get(srv.mediaLink('avatar', target)), 404, target);
+    }
+    await sleep(200);
+    assert.equal(fake.st.otherHost, other, 'the redirect was not followed');
+    assert.equal(conns, 0, 'the stand-in host never got a connection');
+  } finally { any.close(); }
+});
+
+// ------------------------------------------------------------------ review-5: the song cleaner can't be used against the server
+// The review's file: under the 10 MB song limit, many moov boxes of tracks full of 8-byte boxes (each list under the
+// old per-list cap), so about 1.3 million boxes in all: about 3 seconds of worker time per upload before.
+function manyBoxM4a(bytes) {
+  const inner = mp4Box('free');
+  const trak = mp4Box('trak', ...Array(16).fill(inner));
+  const parts = [mp4Box('ftyp', Buffer.from('M4A \0\0\0\0', 'latin1'))];
+  let size = parts[0].length;
+  while (size < bytes - 200 * 1024) {
+    const moov = mp4Box('moov', ...Array(5000).fill(trak), mp4Box('udta', Buffer.from('SECRET')));
+    parts.push(moov); size += moov.length;
+  }
+  return Buffer.concat(parts);
+}
+function manyChunkWav(bytes) {
+  const n = Math.floor(bytes / 8) - 4;
+  const body = Buffer.alloc(n * 8);
+  for (let k = 0; k < n; k++) body.write('junk', k * 8, 'latin1');
+  return wavFile([body, riffChunk('LIST', Buffer.from('INFOSECRET'))]);
+}
+
+test('review-5 (files-6): a song made of a flood of tiny boxes or chunks is refused in well under a second; real ones are still cleaned', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'hearth-song-'));
+  try {
+    for (const [kind, buf] of [['M4A', manyBoxM4a(10 * MIB)], ['WAV', manyChunkWav(10 * MIB)]]) {
+      assert.throws(() => stripAudioMetadata(buf), AudioRejected, kind);
+      // The way uploads are cleaned: read from the file in small pieces.
+      const f = path.join(dir, `song-${kind}`);
+      fs.writeFileSync(f, buf);
+      const t = Date.now();
+      assert.throws(() => stripAudioFile(f, `${f}.tmp`), AudioRejected, kind);
+      const ms = Date.now() - t;
+      assert.ok(ms < 1000, `${kind}: ${ms} ms`);
+      assert.ok(!fs.existsSync(`${f}.tmp`));
+      assert.ok(fs.readFileSync(f).equals(buf), 'the file is left as it was (the upload is then refused)');
+    }
+    // A real song with a lot of boxes (a few hundred: many tracks, say) is cleaned as before.
+    const traks = Array.from({ length: 300 }, () => mp4Box('trak', mp4Box('tkhd', Buffer.alloc(84, 2)), mp4Box('udta', Buffer.from('SECRET-T', 'latin1'))));
+    const busy = Buffer.concat([mp4Box('ftyp', Buffer.from('M4A \0\0\0\0', 'latin1')), mp4Box('moov', mp4Box('mvhd', Buffer.alloc(100, 1)), ...traks), mp4Box('mdat', Buffer.alloc(500, 7))]);
+    const out = stripAudioMetadata(busy);
+    assert.ok(out && out.length === busy.length && !has(out, 'SECRET'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('review-5 (files-6): the buyer’s name in a track’s audio description, file-level tags and tags after a WAV’s data go too', () => {
+  // iTunes Store purchases name the buyer in moov/trak/mdia/minf/stbl/stsd/mp4a/pinf as well as in the iTunes tags.
+  const pinf = mp4Box('pinf', mp4Box('frma', Buffer.from('mp4a')), mp4Box('schi', mp4Box('name', Buffer.from('SECRET-PURCHASER-NAME', 'latin1'))));
+  const esds = mp4Box('esds', Buffer.alloc(30, 5));
+  const purchased = (entryHead) => Buffer.concat([mp4Box('ftyp', Buffer.from('M4A \0\0\0\0M4A isom', 'latin1')),
+    mp4Box('moov', mp4Box('mvhd', Buffer.alloc(100, 1)),
+      mp4Box('trak', mp4Box('tkhd', Buffer.alloc(84, 2)), mp4Box('mdia', mp4Box('mdhd', Buffer.alloc(24, 3)),
+        mp4Box('minf', mp4Box('stbl', mp4Box('stsd', Buffer.from([0, 0, 0, 0, 0, 0, 0, 1]), mp4Box('mp4a', entryHead, esds, pinf)), mp4Box('stts', Buffer.alloc(8, 4)))))),
+      mp4Box('udta', mp4Box('meta', Buffer.alloc(4), mp4Box('ilst', mp4Box('apID', mp4Box('data', Buffer.from('\0\0\0\x01\0\0\0\0SECRET-buyer@example.test', 'latin1'))))))),
+    mp4Box('mdat', Buffer.alloc(500, 7))]);
+  const v1 = Buffer.alloc(28 + 16, 9); v1.writeUInt16BE(1, 8); // QuickTime's version 1 sound description: 16 more bytes
+  for (const head of [Buffer.alloc(28, 9).fill(0, 8, 10), v1]) {
+    const m4a = purchased(head);
+    const out = stripAudioMetadata(m4a);
+    assert.equal(out.length, m4a.length, 'nothing moves');
+    for (const x of ['SECRET-PURCHASER-NAME', 'SECRET-buyer']) assert.equal(has(out, x), false, x);
+    // Exactly the original with the pinf and udta boxes turned into "free" boxes of zeros: the audio description
+    // (its own fields and the esds box) and everything else stay byte for byte.
+    const want = Buffer.from(m4a);
+    for (const type of ['pinf', 'udta']) {
+      const at = m4a.indexOf(Buffer.from(type, 'latin1'));
+      want.write('free', at, 'latin1');
+      want.fill(0, at + 4, at - 4 + m4a.readUInt32BE(at - 4));
+    }
+    assert.ok(out.equals(want));
+  }
+  // A udta box for the whole file (at the top level) goes too.
+  const top = Buffer.concat([mp4Box('ftyp', Buffer.from('M4A \0\0\0\0', 'latin1')), mp4Box('moov', mp4Box('mvhd', Buffer.alloc(100, 1))), mp4Box('udta', mp4Box('\xa9ART', Buffer.from('SECRET-TOP', 'latin1'))), mp4Box('mdat', Buffer.alloc(100, 1))]);
+  const topOut = stripAudioMetadata(top);
+  assert.ok(topOut && topOut.length === top.length && !has(topOut, 'SECRET'));
+  assert.deepEqual(mp4Boxes(topOut).map((b) => b.type), ['ftyp', 'moov', 'free', 'mdat']);
+  // A WAV with tags some taggers add after the RIFF data, as they would to an MP3: they go, the WAV stays exactly.
+  const wav = wavFile([WAV_FMT, WAV_DATA]);
+  for (const after of [id3v1(), id3v2(3), Buffer.concat([id3v2(3), apeTag(), id3v1()])]) {
+    assert.ok(stripAudioMetadata(Buffer.concat([wav, after])).equals(wav), String(after.subarray(0, 3)));
+  }
+  // With a chunk to drop as well, and bytes after the RIFF data that aren't a tag (kept: they may be audio).
+  const extra = Buffer.from('more audio', 'latin1');
+  const both = Buffer.concat([wavFile([WAV_FMT, riffChunk('LIST', Buffer.from('INFOSECRET')), WAV_DATA]), extra, id3v1()]);
+  assert.ok(stripAudioMetadata(both).equals(Buffer.concat([wav, extra])));
+  assert.equal(stripAudioMetadata(Buffer.concat([wav, extra])), null);
+});
+
+test('review-5: songs are cleaned in a worker of their own, so a song that takes long never holds up a picture', { skip: process.platform === 'win32' && 'needs a named pipe' }, async () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'hearth-lanes-'));
+  try {
+    // Opening a named pipe waits until something writes to it: a song the worker is stuck on for as long as this
+    // test wants (as a huge or slow one would be).
+    const fifo = path.join(dir, 'slow.mp3');
+    require('node:child_process').execFileSync('mkfifo', [fifo]);
+    // Opening it for reading and writing at once never waits, and lets the worker's open go through.
+    const release = () => fs.closeSync(fs.openSync(fifo, fs.constants.O_RDWR));
+    let songDone = false;
+    const song = stripFile(fifo, { audio: true }).finally(() => { songDone = true; });
+    try {
+      await sleep(200);
+      const pic = path.join(dir, 'me.jpg');
+      fs.writeFileSync(pic, jpegWithMeta(6));
+      const size = await Promise.race([stripFile(pic), sleep(5000).then(() => 'stuck')]);
+      assert.notEqual(size, 'stuck', 'the picture waited for the song');
+      assert.equal(size, fs.statSync(pic).size);
+      assert.equal(has(fs.readFileSync(pic), 'SECRET'), false);
+      assert.equal(songDone, false, 'the song was still being read');
+    } finally { release(); }
+    // Let through, the song is empty: nothing to remove.
+    assert.equal(await song, null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('review-5: a file whose check takes too long gets its own error and message, not "save it again as a normal file"', async () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'hearth-slow-'));
+  const mod = require.resolve('../server/imagemeta');
+  const saved = require.cache[mod];
+  delete require.cache[mod];
+  process.env.IMAGE_STRIP_LIMIT_MS = '1';
+  let impatient;
+  try { impatient = require('../server/imagemeta'); } finally { delete process.env.IMAGE_STRIP_LIMIT_MS; require.cache[mod] = saved; }
+  try {
+    const f = path.join(dir, 'song.mp3');
+    fs.writeFileSync(f, Buffer.concat([id3v2(3), mp3Frames()]));
+    await assert.rejects(impatient.stripFile(f, { audio: true }), (e) => e instanceof impatient.StripTimedOut && e instanceof impatient.ImageRejected);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  // On a server where every check runs out of time: the upload says so (503, too_slow), and nothing is kept.
+  const slow = await startServer({ IMAGE_STRIP_LIMIT_MS: '1' });
+  try {
+    const u = await slow.register('impatient');
+    const r = await post(slow, u, '/me/song', { filename: 'song.mp3', type: 'audio/mpeg', bytes: Buffer.concat([id3v2(3), mp3Frames()]), fields: [['title', 'Mine']] });
+    assert.equal(r.status, 503, r.text);
+    assert.equal(r.json.code, 'too_slow');
+    assert.match(r.json.error, /took too long/);
+    assert.doesNotMatch(r.json.error, /normal MP3/);
+    const p = await post(slow, u, '/me/media/avatar', { filename: 'me.jpg', type: 'image/jpeg', bytes: jpegWithMeta(6), fields: [['crop', '{}']] });
+    assert.equal(p.status, 503, p.text);
+    assert.equal(p.json.code, 'too_slow');
+    await sleep(150);
+    assert.equal(slow.sql('SELECT COUNT(*) n FROM user_files WHERE user_id = ?', u.id)[0].n, 0, 'no storage used');
+  } finally { await slow.stop(); }
 });
 
 // ------------------------------------------------------------------ ssrf-4: emoji from GIPHY/KLIPY
@@ -922,6 +1467,10 @@ test('files-5/xss-3 + files-6 in Chromium: attacker attachment URLs are never lo
     assert.equal(av.status, 200, av.text);
     const dims = await page.evaluate(async (u) => { const i = new Image(); i.src = u; await i.decode(); return [i.naturalWidth, i.naturalHeight]; }, av.json.avatar);
     assert.deepEqual(dims, [8, 12]);
+    // A GIF banner with comments, plain text and XMP: stored without them, and the browser still decodes it.
+    const gif = await post(srv, alice, '/me/media/banner', { filename: 'b.gif', type: 'image/gif', bytes: gifWithMeta(), fields: [['crop', '{}']] });
+    assert.equal(gif.status, 200, gif.text);
+    assert.deepEqual(await page.evaluate(async (u) => { const i = new Image(); i.src = u; await i.decode(); return [i.naturalWidth, i.naturalHeight]; }, gif.json.banner), [GIF_W, GIF_H]);
 
     const server = (await as(srv, alice, 'POST', '/servers', { name: 'Work' })).json;
     const channel = server.channels.find((c) => c.type === 'text');

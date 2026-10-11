@@ -2009,7 +2009,7 @@ function resizeHandle(which) {
 // ---- server rail: rounded tiles, favorites first
 const serverIconEl = (s) => (s.icon ? h('img', { src: s.icon, alt: '' }) : h('span', { class: 'rail-initials', style: s.theme && s.theme.accent ? { color: s.theme.accent } : null }, s.name.split(/\s+/).map((w) => w[0]).join('').slice(0, 3)));
 const updates = createUpdates({
-  S, mediaNewsUrl: (u) => mediaNewsUrl(u),
+  S, mediaSrc: (src) => mediaSrc(src),
   onUnread: () => { if (!S.view.serverId) renderSidebar(); renderRail(); },
 });
 // Study tools: Recall in a sandboxed frame, with its decks end-to-end encrypted and synced (recall-host.js).
@@ -3389,7 +3389,7 @@ const faceKey = (m) => (m.webhook ? `${m.webhook.name || ''}\n${m.webhook.avatar
 function hookFace(author, m) {
   const w = m.dec && m.dec.bot && m.dec.webhook;
   if (!w || (!w.name && !w.avatar)) return author;
-  return { id: `hook:${author.id}`, username: author.username, bot: true, profile: { displayName: w.name || displayName(author) }, avatar: w.avatar ? mediaNewsUrl(w.avatar) : author.avatar || null };
+  return { id: `hook:${author.id}`, username: author.username, bot: true, profile: { displayName: w.name || displayName(author) }, avatar: (w.avatarSrc && mediaSrc(w.avatarSrc)) || author.avatar || null };
 }
 function renderMessages(stick) {
   const sc = $('#messages');
@@ -7016,7 +7016,7 @@ async function newsBotTab(s, body) {
     try {
       const r = await api('POST', `/servers/${s.id}/feeds/preview`, { kind, query: query.value });
       clear(preview).append(h('p', { class: 'muted-p' }, h('b', null, r.title || 'Feed'), ` \u2014 the newest items right now (these count as already seen; only newer ones get posted):`),
-        ...r.items.map((i) => h('div', { class: 'feed-prev' }, i.image ? h('img', { src: mediaNewsUrl(i.image), alt: '', loading: 'lazy' }) : h('span', { class: 'feed-prev-ph' }, icon('megaphone')),
+        ...r.items.map((i) => h('div', { class: 'feed-prev' }, mediaSrc(i.imageSrc) ? h('img', { src: mediaSrc(i.imageSrc), alt: '', loading: 'lazy' }) : h('span', { class: 'feed-prev-ph' }, icon('megaphone')),
           h('div', { class: 'act-text' }, h('a', { class: 'act-title', href: i.link, target: '_blank', rel: 'noopener noreferrer' }, i.title), h('span', { class: 'act-sub' }, i.date ? new Date(i.date).toLocaleString() : '')))));
       if (!r.items.length) preview.append(h('p', { class: 'field-hint' }, 'Nothing in it right now, which is fine: new items will still get posted.'));
     } catch (e) { clear(preview).append(h('p', { class: 'form-error' }, e.message)); }
@@ -7052,8 +7052,11 @@ async function newsBotTab(s, body) {
       } }, 'Follow')),
     preview);
 }
-const newsKey = (u) => { let x = 5381; for (let i = 0; i < u.length; i++) x = ((x * 33) ^ u.charCodeAt(i)) >>> 0; return x.toString(36); };
-const mediaNewsUrl = (u) => (u ? `/media/news/${newsKey(u)}?u=${encodeURIComponent(u)}&t=${encodeURIComponent(S.mediaToken || '')}` : '');
+// News pictures and webhook avatars load through this server's picture proxies, with a link the server signed for
+// that one picture (imageSrc, avatarSrc; files-10). The app only adds its sign-in media token: it never makes up a
+// proxy link for an address of its own, and anything but a /media/news/ or /media/avatar/ link from the server is
+// ignored.
+const mediaSrc = (src) => (typeof src === 'string' && /^\/media\/(news|avatar)\/[\w-]+\?/.test(src) ? `${src}&t=${encodeURIComponent(S.mediaToken || '')}` : '');
 function newsCard(e) {
   let host = '';
   try { host = new URL(e.url).hostname.replace(/^www\./, ''); } catch { /* bad link */ }
@@ -7063,7 +7066,7 @@ function newsCard(e) {
       h('span', { class: 'news-title' }, e.title),
       e.summary ? h('span', { class: 'news-summary' }, e.summary.length > 220 ? `${e.summary.slice(0, 220)}\u2026` : e.summary) : null,
       h('span', { class: 'news-meta' }, [host, e.date ? fmtStamp(e.date) : ''].filter(Boolean).join(' \u00b7 '))),
-    e.image ? h('img', { class: 'news-img', src: mediaNewsUrl(e.image), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (ev) => ev.currentTarget.remove() }) : null);
+    mediaSrc(e.imageSrc) ? h('img', { class: 'news-img', src: mediaSrc(e.imageSrc), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (ev) => ev.currentTarget.remove() }) : null);
 }
 // A link preview from inside a message (secure.js already checked it: an https link that's in the text, capped
 // fields, a small WebP/JPEG thumbnail). Text goes in as text nodes only, never as HTML. The picture is a data:

@@ -94,6 +94,8 @@ export async function startServer() {
     ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test',
     SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), SMTP_USER: '', SMTP_PASS: '', MAIL_FROM: 'hearth@chat.example.test', PUBLIC_URL: base,
     NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --require ${site.preload}`.trim(), NODE_EXTRA_CA_CERTS: site.ca, LINK_PREVIEW_ALLOW_PRIVATE: site.host,
+    // Webhook avatars are shown only from known avatar hosts and ones the admin lists (files-10): this stand-in site.
+    WEBHOOK_AVATAR_HOSTS: site.host,
   };
   let log = '';
   const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });

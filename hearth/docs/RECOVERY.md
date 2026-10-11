@@ -185,7 +185,8 @@ Messages and attachments inside a backup are still end-to-end encrypted. The bac
 person's password or recovery key still opens their own data. **A backup can't give anyone back a lost password.**
 
 **Disappearing messages** are in every backup made before their time, with their files, until that backup is pruned
-(or, for off-site and `hearth-before-v*.db` copies, deleted by hand). After a restore, the first start deletes every
+(for a `hearth-before-v*.db` copy, once a later upgrade leaves it out of the newest `PRE_UPGRADE_KEEP`; off-site
+copies only when deleted by hand). After a restore, the first start deletes every
 message whose time has passed before anyone can connect, so a restored server never shows them again; ones whose time
 hasn't come yet disappear on schedule.
 
@@ -270,6 +271,13 @@ error, never a partial restore.
 
 - Before an upgrade that changes the database (a new database version), Hearth copies the database to
   `data/backups/hearth-before-v<new version>-<date>.db`.
+- Once an upgrade has gone through, older copies are pruned: the newest `PRE_UPGRADE_KEEP` stay (3 by default;
+  `0` keeps them all). The copy that upgrade made always stays, and nothing is pruned while an upgrade keeps
+  failing. Only files named exactly `hearth-before-v<N>-<date>.db` (as Hearth names them) are removed, so to keep
+  one for good, rename it (for example `keep-hearth-before-v18-….db`) or copy it elsewhere.
+- These copies are plain database files, not encrypted, as sensitive as `data/hearth.db` itself: they never leave
+  the server and can't be downloaded. Don't copy them elsewhere as they are; the encrypted backups are the ones
+  meant to leave the machine.
 - The upgrade then runs as **one transaction**. It either finishes or changes nothing.
   - If it's killed half-way (crash, out of memory, power cut), the database is exactly as it was. The next start
     simply runs the upgrade again.

@@ -28,7 +28,11 @@ jobs.setStore((r) => db.prepare(`INSERT INTO job_health (name, every_ms, last_ru
 const { sanitizeProfile, parseProfile } = require('./profile');
 const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
-const { stripFile, ImageRejected } = require('./imagemeta');
+const { stripFile, ImageRejected, StripTimedOut } = require('./imagemeta');
+// files-10: signed links for the news, webhook-avatar and music-art picture proxies (server/mediasign.js). The server
+// signs each picture's address when it hands it to an app, so the proxies only fetch what this server chose to show.
+const MEDIA_LINKS = require('./mediasign').mediaLinks(atRestKey);
+const { avatarHost } = require('./mediasign');
 const { readLimited, cancel: cancelBody } = require('./fetchlimit');
 const recur = require('./recurrence');
 // Disappearing messages (server/disappear.js): alive(row) is false once a message's time has passed, even before the
@@ -477,7 +481,7 @@ function serializeMessage(row, channel, reactions) {
     channelId: row.channel_id,
     serverId: channel.server_id,
     authorId: row.author_id,
-    ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [], ...(data.embed ? { embed: data.embed } : {}), ...(data.bot ? { bot: true } : {}), ...(data.bot && data.webhook ? { webhook: data.webhook } : {}) }),
+    ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [], ...(data.embed ? { embed: newsEmbedOut(data.embed) } : {}), ...(data.bot ? { bot: true } : {}), ...(data.bot && data.webhook ? { webhook: webhookOut(data.webhook) } : {}) }),
     replyTo: row.reply_to,
     reply,
     threadId: row.thread_id || null,
@@ -488,6 +492,22 @@ function serializeMessage(row, channel, reactions) {
     expiresAt: row.expires_at || null,
     reactions: reactions ? reactions[row.id] || [] : reactionsFor([row.id])[row.id] || [],
   };
+}
+// files-10: a news post's picture and a webhook post's avatar come with a signed proxy link (imageSrc, avatarSrc),
+// made fresh each time a message is sent to an app, so older posts get working links too. The app loads only those.
+// A webhook post names its own avatar and anyone can make a webhook (in a server of their own), so an avatar is
+// signed only on a known avatar host (mediasign.js: avatarHost), and only for /media/avatar, which fetches from
+// those hosts alone. Any other avatar isn't shown: the webhook's own picture is.
+function newsEmbedOut(e) {
+  if (!e || typeof e !== 'object' || !e.image) return e;
+  return { ...e, imageSrc: MEDIA_LINKS.sign('news', e.image) };
+}
+function webhookOut(w) {
+  if (!w || typeof w !== 'object' || !w.avatar) return w;
+  let u = null;
+  try { u = new URL(w.avatar); } catch { /* not an address */ }
+  const src = u && avatarHost(u) ? MEDIA_LINKS.sign('avatar', w.avatar) : null;
+  return src ? { ...w, avatarSrc: src } : w;
 }
 // A thread's reply count and latest reply, leaving out replies whose time has passed (not yet swept).
 function threadInfo(row) {
@@ -795,8 +815,22 @@ async function stripUploadedImage(file, stored) {
     const size = await stripFile(stored);
     if (size != null) file.size = size;
   } catch (e) {
+    if (e instanceof StripTimedOut) throw new HttpError(503, 'Checking that picture for hidden data (like a GPS position) took too long, so it wasn\u2019t saved. Try again in a moment, or try a smaller picture.', 'too_slow');
     if (e instanceof ImageRejected) throw new HttpError(400, 'That picture couldn\u2019t be checked for hidden data (like a GPS position), so it wasn\u2019t saved. Save it again as a normal JPG or PNG and try once more.', 'bad_image');
     throw new HttpError(503, 'Pictures can\u2019t be saved right now. Try again in a moment.');
+  }
+}
+// files-6: profile songs lose their tags (ID3, APE, WAV INFO, M4A iTunes boxes and cover art) the same way, in a
+// worker of their own (so songs never hold up pictures); see server/audiometa.js. Formats it can't take apart safely
+// (OGG) are stored as they are.
+async function stripUploadedSong(file, stored) {
+  try {
+    const size = await stripFile(stored, { audio: true });
+    if (size != null) file.size = size;
+  } catch (e) {
+    if (e instanceof StripTimedOut) throw new HttpError(503, 'Checking that song for hidden data (like tags with names or pictures) took too long, so it wasn\u2019t saved. Try again in a moment, or try a smaller file.', 'too_slow');
+    if (e instanceof ImageRejected) throw new HttpError(400, 'That song couldn\u2019t be checked for hidden data (like tags with names or pictures), so it wasn\u2019t saved. Save it again as a normal MP3 and try once more.', 'bad_audio');
+    throw new HttpError(503, 'Songs can\u2019t be saved right now. Try again in a moment.');
   }
 }
 // Text fields that come with an upload (a name, a crop, a title…). Without these limits multer keeps any number
@@ -854,8 +888,8 @@ function limited(kind, base, field) {
       const file = req.file;
       if (!file) { release(); return next(); }
       const stored = file.path ? uploadPath(file.filename) : null;
-      // Still counted as in progress while the picture is cleaned, so the disk can't fill up meanwhile.
-      const cleaned = PUBLIC_KINDS.has(kind) && stored ? stripUploadedImage(file, stored) : Promise.resolve();
+      // Still counted as in progress while the picture (or song) is cleaned, so the disk can't fill up meanwhile.
+      const cleaned = !stored ? Promise.resolve() : PUBLIC_KINDS.has(kind) ? stripUploadedImage(file, stored) : kind === 'song' ? stripUploadedSong(file, stored) : Promise.resolve();
       cleaned.then(() => {
         release();
         try {
@@ -4626,6 +4660,10 @@ api.put('/admin/gif-library', auth, (req, res) => {
 // GIF privacy proxy: viewers load GIPHY media through this server, so GIPHY never sees their IP.
 // Links carry a short-lived signed token (images can't send login headers), and only GIPHY's media
 // hosts are allowed (server/gifmedia.js), so this can't be used as an open proxy.
+// files-10: unlike the news and music-art proxies, GIF links aren't signed per address. A GIF in a message is inside
+// the end-to-end encrypted text, which this server can't read, so it can't sign it; the app builds the link itself.
+// What keeps this proxy closed is the exact list of GIF media host names, which every address (and every redirect)
+// is rebuilt from.
 const { gifMediaUrl } = require('./gifmedia');
 const EXTRA_MEDIA_HOSTS = (process.env.GIF_PROXY_EXTRA_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean);
 const gifHostOk = (u) => gifMediaUrl(u, EXTRA_MEDIA_HOSTS) !== null;
@@ -4647,7 +4685,9 @@ async function fetchGifMedia(u, signal) {
   return null;
 }
 // The token belongs to one sign-in session: it stops working when that session ends (log out, revoked, expired)
-// or the account is suspended or deleted, not just after its 7 days.
+// or the account is suspended or deleted, not just after its 7 days. It says who is asking, not what for: the news
+// and music-art proxies also need a link signed for that one address (MEDIA_LINKS), so the token alone can't fetch
+// anything there.
 const mediaSig = (uid, sid, exp) => crypto.createHmac('sha256', atRestKey).update(`media|${uid}|${sid}|${exp}`).digest('base64url').slice(0, 22);
 function mediaToken(uid, sid) {
   const exp = Math.floor(Date.now() / 1000) + 7 * 86400;
@@ -4693,7 +4733,7 @@ app.get(['/media/gif', '/media/gif/:key'], wrap(async (req, res) => {
 
 // The news bot (server/newsbot.js): follows feeds and posts new items into channels.
 const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer,
-  canManageServer: (s, uid) => can(s, uid, PM.MANAGE_SERVER), serializeMessage, toChannel, checkMediaToken, emitServerFeeds: (serverId) => emitServer(serverId),
+  canManageServer: (s, uid) => can(s, uid, PM.MANAGE_SERVER), serializeMessage, toChannel, checkMediaToken, mediaLinks: MEDIA_LINKS, emitServerFeeds: (serverId) => emitServer(serverId),
   searchSteam: (q) => ACT.searchGames(q),
   // Personal trackers found something: tell the person's open apps, and push a notification if they want one.
   notifyUser: (uid, p) => {
@@ -4702,7 +4742,7 @@ const NEWS = require('./newsbot')({ api, app, auth, db, fail, wrap, rateLimit, s
   } });
 // Study tools (server/study.js): encrypted sync for Recall's decks, pictures and profile.
 require('./study')({ api, auth, db, fail, rateLimit, pushTo: (...a) => pushTo(...a), emitToUser: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data) });
-ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, sealSecret, openSecret, auditLog,
+ACT = require('./activity')({ api, app, auth, db, emit: (...a) => io && io.emit(...a), fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, mediaLinks: MEDIA_LINKS, sealSecret, openSecret, auditLog,
   requireInstanceAdmin, checkWords, broadcastUser: (id) => broadcastUser(id), DATA_DIR, version: require('../package.json').version });
 
 // Admin: GIF settings (key, rating, privacy proxy) without editing .env.

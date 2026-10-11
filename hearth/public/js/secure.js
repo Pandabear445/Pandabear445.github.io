@@ -437,12 +437,14 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     return { t: m.content || '', f: cleanFiles(m.attachments), legacy: true, verified: false, embed: m.embed || null, bot, webhook: bot ? hookOf(m.webhook) : null };
   }
   // A channel webhook's post: the name and picture the program asked for (the picture is an https address the app
-  // only loads through this server's image proxy), and whether it may ping.
+  // only loads through this server's avatar proxy, by the link the server signed for it: avatarSrc, sent only for
+  // pictures on known avatar hosts), and whether it may ping.
   function hookOf(w) {
     if (!w || typeof w !== 'object') return null;
     return {
       id: String(w.id || ''), name: typeof w.name === 'string' && w.name ? w.name.slice(0, 64) : null,
       avatar: typeof w.avatar === 'string' && /^https:\/\//.test(w.avatar) ? w.avatar : null, pings: w.pings === true,
+      avatarSrc: typeof w.avatarSrc === 'string' && /^\/media\/avatar\//.test(w.avatarSrc) ? w.avatarSrc : null,
     };
   }
   // A bot post from an account this device hasn't loaded (a channel webhook's, or a bot removed since): load it first,

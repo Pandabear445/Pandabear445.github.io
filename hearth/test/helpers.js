@@ -139,6 +139,13 @@ async function startServer(extraEnv = {}) {
     async login(user, extra = {}, { ip = user.ip } = {}) {
       return srv.api('POST', '/auth/login', { body: { username: user.username, authKey: user.authKey, ...extra }, ip });
     },
+    // A picture-proxy link (/media/news or /media/art) signed with this server's own key, the way the server signs
+    // the ones it hands to apps (server/mediasign.js). For tests about what the proxies do with an address the server
+    // did sign; opts.now makes one as if signed at that time. The app adds &t=<media token> to it.
+    mediaLink(kind, url, opts) {
+      const key = env.AT_REST_KEY ? Buffer.from(env.AT_REST_KEY, 'hex') : Buffer.from(fs.readFileSync(path.join(dir, 'secret.key'), 'utf8').trim(), 'hex');
+      return require('../server/mediasign').mediaLinks(key).sign(kind, url, opts);
+    },
     // Direct database access, as someone who copied the file would have.
     db() {
       const Database = require('better-sqlite3');

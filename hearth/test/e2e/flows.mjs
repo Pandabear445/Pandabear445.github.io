@@ -157,6 +157,36 @@ async function webhooks(t) {
   const ping = bob.message('the deploy finished');
   await ping.waitFor();
   check(!(await ping.evaluate((el) => el.classList.contains('mentioned'))), 'A webhook’s @everyone should not ping (it wasn’t allowed to).');
+  // A post's own picture (Grafana sends avatar_url) loads through this server's avatar proxy, by the link the server
+  // signed for that picture (files-10): only for a known avatar host or one the admin listed (here the stand-in
+  // site, in WEBHOOK_AVATAR_HOSTS). The app only adds its media token, and the proxy fetches the picture.
+  const pic = `${t.server.site.base}/cover.png`;
+  check((await post({ content: 'Grafana alert firing', username: 'Grafana', avatar_url: pic })).status === 204, 'The post with a picture should be accepted.');
+  const graf = bob.message('Grafana alert firing').first();
+  await graf.locator('.msg-av img').waitFor();
+  const src = await graf.locator('.msg-av img').getAttribute('src');
+  check(/^\/media\/avatar\/[0-9a-f]{12}\?u=[^&]+&e=\d+&s=[\w-]{32}&t=[^&]+$/.test(src || ''), `The avatar should load through a signed proxy link (got ${src}).`);
+  check(decodeURIComponent(/[?&]u=([^&]+)/.exec(src)[1]) === pic, 'The signed link should name the picture the post asked for.');
+  const status = await bob.page.evaluate(async (s) => (await fetch(s)).status, src);
+  check(status === 200, `The avatar proxy should load the picture (got ${status}).`);
+  check(await graf.locator('.msg-av img').evaluate((img) => img.complete && img.naturalWidth > 0), 'The avatar picture should show.');
+  const forged = await bob.page.evaluate(async (s) => (await fetch(s.replace(/([?&]u=)[^&]+/, `$1${encodeURIComponent('https://example.com/x.png')}`))).status, src);
+  check(forged === 403, `The same signature for another address should be refused (got ${forged}).`);
+  // An avatar on any other host isn't signed: the post shows the webhook's own picture, which the server never fetches.
+  const elsewhere = `https://pictures.example.test/${'x'.repeat(8)}.png`;
+  check((await post({ content: 'Avatar from elsewhere', username: 'Elsewhere', avatar_url: elsewhere })).status === 204, 'The post with another host\u2019s picture should be accepted.');
+  await bob.message('Avatar from elsewhere').first().waitFor();
+  const loaded = await bob.page.evaluate(() => [...document.images].map((i) => i.getAttribute('src') || '').filter((x) => x.includes('pictures.example.test')));
+  check(!loaded.length, `A picture on another host should not be loaded (got ${loaded.join(', ')}).`);
+  // Alice (the owner) deletes that post, so later flows don't keep loading its picture.
+  const own = alice.message('Grafana alert firing').first();
+  await own.hover();
+  await own.locator('button[aria-label="More actions"]').click();
+  await alice.menuItem('Delete message').click();
+  await alice.modal('Delete message?').locator('.modal-foot .btn.danger').click();
+  await bob.message('Grafana alert firing').first().waitFor({ state: 'detached' });
+  // The stand-in site is shared with the link-preview flow, which counts every request it gets: forget these.
+  t.server.site.hits.splice(0);
 }
 
 // ------------------------------------------------------------------ 4. direct messages and blocking
