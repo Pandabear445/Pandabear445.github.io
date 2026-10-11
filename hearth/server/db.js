@@ -1296,6 +1296,13 @@ CREATE TABLE IF NOT EXISTS voice_mutes (
 );
 `);
 
+// v19 (away and status expiry): away_after is how many minutes without input before someone whose status is
+// Online shows as Away (5, 10, 15 or 30; 0 = never). status_expires_at is when their custom status clears by itself
+// (NULL = when they clear it); the sweep in server/presence.js finds the due ones through the partial index.
+addColumn('users', 'away_after', 'INTEGER NOT NULL DEFAULT 10');
+addColumn('users', 'status_expires_at', 'INTEGER');
+db.exec('CREATE INDEX IF NOT EXISTS idx_users_status_expires ON users(status_expires_at) WHERE status_expires_at IS NOT NULL;');
+
 // v18 (voice reliability): a version number for each call's region. Every change bumps it, so when two people
 // switch the region at the same moment the last write wins and every app settles on the newest one, whatever
 // order the announcements arrive in.

@@ -41,6 +41,7 @@ import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './a
 import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
 import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer } from './disappear.js';
 import { trackViewport } from './viewport.js';
+import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel } from './presence.js';
 
 // ======================================================================= state
 const S = {
@@ -80,6 +81,7 @@ const nowServer = () => Date.now() + (S.clockOffset || 0);
 let socket;
 let hadController = false; // was a service worker already in charge when the page loaded?
 let voice;
+let away = null; // automatic Away (presence.js)
 const sec = createSecure({ S, onKeysChanged, onKeyWarning });
 const fetchingUsers = new Set();
 
@@ -139,6 +141,7 @@ export const app = {
   P,
   get voice() { return voice; },
   onMe(u) { setUser(u); renderUserPanel(); },
+  checkAway: () => away && away.check(), // after "Away after" changes
   logout,
   rerender: () => { lsCache.clear(); renderAll(); }, // settings.js writes some preferences straight to localStorage
   openProfile: (id) => openProfileModal(id),
@@ -449,6 +452,14 @@ function startApp() {
   $('#app').hidden = false;
   $('#app').classList.add('loading');
   socket = io({ auth: { token: getToken() }, transports: ['websocket', 'polling'] });
+  // Tells the server when this app goes unused (and comes back), for automatic Away. Until the account has
+  // loaded there's no setting yet, and while the status isn't Online it can't change anything: nothing is sent.
+  // Being in a call counts as using Hearth (talking, or watching a shared screen without touching anything).
+  away = initAway({
+    socket,
+    minutes: () => (S.me && S.me.status === 'online' && Number.isFinite(S.me.awayAfter) ? S.me.awayAfter : 0),
+    busy: () => !!(voice && voice.channelId),
+  });
   // Keybinds (push-to-talk, mute, deafen) and the desktop app's extras. Global keys in the desktop app.
   if (!S.keybindsOn) {
     S.keybindsOn = true;
@@ -572,8 +583,7 @@ function startApp() {
       });
     }
     if (!changed) return;
-    if (S.panel === 'members' || S.view.type === 'dm') later(renderPanel);
-    if (['friends', 'home'].includes(S.view.type) && S.view.tab !== 'add') later(renderMain);
+    later(redrawPeople);
   });
   // Someone started or stopped a game or a song.
   socket.on('user:activity', (list) => {
@@ -583,11 +593,14 @@ function startApp() {
       S.users[id] = { ...S.users[id], activity: activity || null };
       if (id === S.me.id) { S.me.activity = activity || null; renderUserPanel(); }
     }
-    if (S.panel === 'members' || S.view.type === 'dm') later(renderPanel);
-    if (['friends', 'home', 'people'].includes(S.view.type) && S.view.tab !== 'add') later(renderMain);
+    later(redrawPeople);
+    if (S.view.type === 'people' && S.view.tab !== 'add') later(renderMain);
   });
   socket.on('user:update', (u) => {
     if (!S.me) return;
+    // Only your own Away for being inactive (or back): just the dots and the line under your name. Nothing is
+    // rebuilt, so a call stays as it is (full screen too), and a button being pressed or focused stays put.
+    if (onlyMyPresence(u)) { setUser(u); showMyPresence(); return; }
     const roleBefore = S.me.staffRole;
     setUser(u); sec.trust(u); refreshUserBits(u.id);
     // Given or lost a staff role: show or hide the admin dashboard right away.
@@ -985,6 +998,39 @@ function refreshUserBits(id) {
   if (S.panel === 'members' || S.view.type === 'dm') renderPanel();
   if (['friends', 'home'].includes(S.view.type) && S.view.tab !== 'add') renderMain();
   if (S.view.type === 'voice') renderMain();
+}
+// Someone came online, went Away, went offline or started a game: the lists that show it. The friends list and the
+// member list redraw only their rows, so what's typed in their search boxes (and focus there) stays; on Home only
+// the online friends. Automatic Away makes these frequent, so nothing else is rebuilt (or fetched again).
+function redrawPeople() {
+  if (S.panel === 'members' || S.view.type === 'dm') {
+    const list = S.view.type !== 'dm' && $('#members .member-list');
+    if (list && list._redraw) list._redraw(); else renderPanel();
+  }
+  if (S.view.tab === 'add') return;
+  if (S.view.type === 'friends') {
+    const list = $('#main .friend-list');
+    if (list && list._redraw) list._redraw(); else renderMain();
+  } else if (S.view.type === 'home') {
+    const sec = $('#main .home-online');
+    if (sec) sec.replaceWith(onlineFriendsSection()); else renderMain();
+  }
+}
+// A user:update about you that changes nothing but whether you show as Away for being inactive.
+const PRESENCE_ONLY = new Set(['presence', 'autoAway']);
+function onlyMyPresence(u) {
+  if (!u || u.id !== S.me.id) return false;
+  return Object.keys(u).every((k) => PRESENCE_ONLY.has(k) || JSON.stringify(u[k]) === JSON.stringify(S.me[k]));
+}
+function showMyPresence() {
+  const st = presenceOf(S.me, S.me.id);
+  $$(`[data-user-av="${S.me.id}"][data-status="1"] .status-dot`).forEach((d) => {
+    d.className = d.className.replace(/\bst-\S+/, `st-${st}`);
+    d.title = STATUS_LABEL[st] || '';
+    d.setAttribute('aria-label', STATUS_LABEL[st] || '');
+  });
+  const sub = $('#user-panel .me-sub');
+  if (sub) sub.textContent = mySubLine(); else renderUserPanel();
 }
 
 // ======================================================================= conversation previews (decrypted locally)
@@ -1843,7 +1889,8 @@ const updates = createUpdates({
   onUnread: () => { if (!S.view.serverId) renderSidebar(); renderRail(); },
 });
 // Study tools: Recall in a sandboxed frame, with its decks end-to-end encrypted and synced (recall-host.js).
-const study = createRecall({ S, onEnabled: () => { if (!S.view.serverId) renderSidebar(); } });
+// Input in its frame doesn't reach this page, so the frame says when it's in use (for automatic Away).
+const study = createRecall({ S, onEnabled: () => { if (!S.view.serverId) renderSidebar(); }, onActive: () => { if (away) away.used(); } });
 const folders = createFolders({
   S, servers: () => realServers(), favorites: () => new Set(P.favorites.filter((f) => f.startsWith('s:')).map((f) => f.slice(2))),
   rerender: () => renderRail(), serverUnread: (s) => serverUnread(s), setNotify: (k, v) => setNotify(k, v), railSide: () => railSide(),
@@ -2382,14 +2429,18 @@ function renderSidebarVoiceUsers() {
 }
 
 // ======================================================================= user + call panels
+// The line under your name: what you're playing or listening to, your custom status, or your status.
+function mySubLine() {
+  const p = S.me.profile || {};
+  const act = S.me.activity || {};
+  return act.game ? `Playing ${act.game.name}` : act.music ? `\u266B ${act.music.title}` : p.customStatus && (p.customStatus.text || p.customStatus.emoji)
+    ? `${p.customStatus.emoji || ''} ${p.customStatus.text || ''}`.trim()
+    : S.me.status === 'online' && S.me.autoAway ? 'Away (inactive)' : STATUS_LABEL[S.me.status] || 'Online';
+}
 function renderUserPanel() {
   const el = clear($('#user-panel'));
   if (!S.me) return;
-  const p = S.me.profile || {};
-  const act = S.me.activity || {};
-  const sub = act.game ? `Playing ${act.game.name}` : act.music ? `\u266B ${act.music.title}` : p.customStatus && (p.customStatus.text || p.customStatus.emoji)
-    ? `${p.customStatus.emoji || ''} ${p.customStatus.text || ''}`.trim()
-    : STATUS_LABEL[S.me.status] || 'Online';
+  const sub = mySubLine();
   const av = avatarEl(S.me, 34, { status: true, meId: S.me.id });
   av.dataset.speak = S.me.id;
   const inCall = voice && voice.channelId;
@@ -2452,13 +2503,13 @@ async function joinVoice(c, server, { stay = false } = {}) {
 
 function statusMenu(anchor) {
   const opts = ['online', 'idle', 'dnd', 'invisible'];
-  const desc = { idle: 'Shown as away', dnd: 'Silences notifications', invisible: 'Appear offline, keep full access' };
+  const desc = { online: S.me.autoAway ? 'Shown as away while you\u2019re inactive' : '', idle: 'Shown as away', dnd: 'Silences notifications', invisible: 'Appear offline, keep full access' };
   const el = h('div', { class: 'menu status-menu' },
     opts.map((s) => h('button', {
       class: `menu-item${S.me.status === s ? ' current' : ''}`,
       onclick: async () => {
         closePopover();
-        try { await api('PATCH', '/me/status', { status: s }); S.me.status = s; S.users[S.me.id].status = s; renderUserPanel(); } catch (e) { toast(e.message, 'error'); }
+        try { await api('PATCH', '/me/status', { status: s }); setUser({ id: S.me.id, status: s, autoAway: false }); renderUserPanel(); } catch (e) { toast(e.message, 'error'); }
       },
     }, h('span', { class: `status-dot inline st-${s}`, 'aria-hidden': 'true' }), h('span', { class: 'menu-col' }, s === 'idle' ? 'Away' : STATUS_LABEL[s], desc[s] ? h('span', { class: 'menu-desc' }, desc[s]) : null))),
     h('div', { class: 'menu-sep' }),
@@ -2477,17 +2528,30 @@ function openCustomStatus() {
   const emoji = h('input', { class: 'input emoji-input', maxlength: '16', value: cs.emoji || '', placeholder: '😊', 'aria-label': 'Status emoji' });
   const text = h('input', { class: 'input', maxlength: '128', value: cs.text || '', placeholder: "What's happening?", 'aria-label': 'Status text' });
   const pickBtn = ibtn('smile', 'Pick emoji', (e) => emojiPicker(e.currentTarget, (em) => { emoji.value = em; }), { attrs: { type: 'button', 'data-pop-anchor': '' } });
+  // When it clears itself. A status that already has a time keeps it unless another choice is made.
+  const current = (cs.text || cs.emoji) && S.me.customStatusExpiresAt;
+  const until = h('select', { class: 'input', 'aria-label': 'Clear after' },
+    current ? h('option', { value: 'keep' }, `Keep (${clearsLabel(current).replace(/^C/, 'c').replace(/\.$/, '')})`) : null,
+    CLEAR_AFTER.map(([v, label]) => h('option', { value: v }, label)));
+  until.value = current ? 'keep' : 'never';
+  const when = h('span', { class: 'field-hint', 'aria-live': 'polite' });
+  const expiresIn = () => (until.value === 'keep' ? Math.max(60000, current - Date.now()) : clearAfterMs(until.value));
+  const drawWhen = () => { const ms = expiresIn(); when.textContent = clearsLabel(ms ? Date.now() + ms : null); };
+  until.onchange = drawWhen;
+  drawWhen();
   modal({
     title: 'Set a custom status', size: 'sm',
-    body: h('div', { class: 'stack' }, h('div', { class: 'row gap' }, pickBtn, emoji, text)),
+    body: h('div', { class: 'stack' }, h('div', { class: 'row gap' }, pickBtn, emoji, text),
+      h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'Clear after'), until, when)),
     actions: [
       { label: 'Clear', action: () => saveCustomStatus('', '') },
-      { label: 'Save', kind: 'primary', action: () => saveCustomStatus(emoji.value.trim(), text.value.trim()) },
+      { label: 'Save', kind: 'primary', action: () => saveCustomStatus(emoji.value.trim(), text.value.trim(), expiresIn()) },
     ],
   });
 }
-async function saveCustomStatus(emoji, text) {
-  const u = await api('PATCH', '/me/profile', { customStatus: { emoji, text } });
+// expiresIn: how long it lasts, in ms (worked out here, in this device's time zone), or null until it's cleared.
+async function saveCustomStatus(emoji, text, expiresIn = null) {
+  const u = await api('PUT', '/me/custom-status', { emoji, text, expiresIn: emoji || text ? expiresIn : null });
   setUser(u);
   renderUserPanel();
 }
@@ -2722,11 +2786,7 @@ function homeView() {
     convs.length ? h('div', { class: 'conv-cards' }, convs.filter((c) => !favs.includes(c.fav)).slice(0, 6).map(convCard))
       : h('p', { class: 'muted-p' }, 'No conversations yet.')));
 
-  const online = Object.values(S.relationships).filter((r) => r.status === 'accepted').map((r) => getUser(r.userId)).filter((u) => (u.presence || 'offline') !== 'offline');
-  wrap.append(section(`Online friends \u2014 ${online.length}`, h('button', { class: 'link-btn', onclick: () => goFriends('all') }, 'All friends'),
-    online.length ? h('div', { class: 'friend-chips' }, online.map((u) => h('button', { class: 'friend-chip', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'bottom') },
-      avatarEl(u, 30, { status: true, meId: S.me.id }), h('span', null, displayName(u)))))
-      : h('p', { class: 'muted-p' }, 'Nobody\u2019s online right now.')));
+  wrap.append(onlineFriendsSection());
 
   const servers = realServers();
   wrap.append(section('Your servers', h('button', { class: 'link-btn', onclick: openAddServer }, 'Create or join'),
@@ -2748,6 +2808,15 @@ function homeView() {
   }
   return wrap;
 }
+// Home: friends who are online (redrawn by itself when someone comes or goes, see redrawPeople).
+function onlineFriendsSection() {
+  const online = Object.values(S.relationships).filter((r) => r.status === 'accepted').map((r) => getUser(r.userId)).filter((u) => (u.presence || 'offline') !== 'offline');
+  return h('section', { class: 'home-sec home-online' },
+    h('div', { class: 'home-sec-head' }, h('h3', null, `Online friends \u2014 ${online.length}`), h('button', { class: 'link-btn', onclick: () => goFriends('all') }, 'All friends')),
+    online.length ? h('div', { class: 'friend-chips' }, online.map((u) => h('button', { class: 'friend-chip', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'bottom') },
+      avatarEl(u, 30, { status: true, meId: S.me.id }), h('span', null, displayName(u)))))
+      : h('p', { class: 'muted-p' }, 'Nobody\u2019s online right now.'));
+}
 function convCard(c) {
   const unread = c.unreadKey && S.unread.has(c.unreadKey) && !isMuted(c.unreadKey);
   return h('button', { class: `conv-card${unread ? ' unread' : ''}`, onclick: c.open, oncontextmenu: (e) => contextMenu(e, c.menu) },
@@ -2758,7 +2827,6 @@ function convCard(c) {
 function friendsView() {
   const v = S.view;
   const wrap = h('div', { class: 'friends' });
-  const rels = Object.values(S.relationships);
   if (v.tab === 'add') {
     const input = h('input', { class: 'input', placeholder: 'Enter a username', maxlength: '24', autocomplete: 'off', 'aria-label': 'Username' });
     const msg = h('p', { class: 'add-msg', role: 'status' });
@@ -2782,6 +2850,7 @@ function friendsView() {
   const listEl = h('div', { class: 'friend-list' });
   const draw = () => {
     clear(listEl);
+    const rels = Object.values(S.relationships);
     let list;
     if (v.tab === 'pending') list = rels.filter((r) => r.status === 'pending');
     else {
@@ -2829,6 +2898,7 @@ function friendsView() {
     }
   };
   search.addEventListener('input', draw);
+  listEl._redraw = draw; // people coming and going redraw the rows only (redrawPeople)
   draw();
   wrap.append(h('div', { class: 'friends-top' }, h('div', { class: 'friends-search' }, icon('search'), search),
     h('button', { class: 'btn', onclick: () => openNewConversation(null, { group: true }) }, icon('people'), 'New group chat')), listEl);
@@ -4476,6 +4546,7 @@ function membersPanel(el) {
     if (!users.length && !bots.length) list.append(h('p', { class: 'sidebar-empty' }, 'No one matches.'));
   };
   search.addEventListener('input', draw);
+  list._redraw = () => (currentServer() === server ? draw() : renderPanel()); // people coming and going: the rows only (redrawPeople)
   draw();
   el.append(panelHead(group ? 'People' : 'Members', `${server.memberIds.length}`,
     group ? ibtn('userPlus', 'Add people', () => openNewConversation(server), { cls: 'sm' }) : can(server, PERMS.CREATE_INVITE) ? ibtn('userPlus', 'Invite people', () => openInvite(server), { cls: 'sm' }) : null),

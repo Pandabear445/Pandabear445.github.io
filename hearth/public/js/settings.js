@@ -13,6 +13,7 @@ import { reasonText } from './android-push.js';
 import { desktopSettingsSection } from './desktop-settings.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
 import { getKeybinds, saveKeybinds, comboLabel, recordCombo, DEFAULT_KEYBINDS } from './keybinds.js';
+import { clearsLabel } from './presence.js';
 import {
   THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, UI_FONTS, CORNERS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
   gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage, exportAppearance, importAppearance,
@@ -197,7 +198,12 @@ function profileTab(app, setDirty) {
 
   const save = async () => {
     try {
-      const u = await api('PATCH', '/me/profile', draft);
+      // The custom status goes only when it was edited here, so one that cleared itself since this page opened
+      // isn't put back (and one that's unchanged keeps the time it clears).
+      // (Not called `body`: that's this tab, which is swapped for a fresh one below.)
+      const payload = { ...draft };
+      if (JSON.stringify(draft.customStatus) === JSON.stringify(JSON.parse(original).customStatus)) delete payload.customStatus;
+      const u = await api('PATCH', '/me/profile', payload);
       app.onMe(u);
       setDirty(false);
       toast('Profile saved.');
@@ -357,7 +363,10 @@ function profileTab(app, setDirty) {
       field('Display name', displayName, 'Shown instead of your username.'),
       field('Pronouns', pronouns),
       h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'About me', bioCount), bio),
-      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Custom status'), h('div', { class: 'row gap' }, csEmoji, csText))),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Custom status'), h('div', { class: 'row gap' }, csEmoji, csText),
+        h('span', { class: 'field-hint' }, S.me.customStatusExpiresAt
+          ? `${clearsLabel(S.me.customStatusExpiresAt)} A new status set here stays until you clear it; to have one clear itself, use Set a custom status in your status menu.`
+          : 'Stays until you clear it. To have it clear itself, use Set a custom status in your status menu.'))),
     section('Pictures', mediaHost),
     fold('Name style', 'Color, gradient, font and effects',
       h('div', { class: 'grid-2' },
@@ -1487,6 +1496,7 @@ function privacyTab(app) {
   drawBlocked();
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Privacy & safety'),
+    awaySection(app),
     section('Direct messages',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Who can start a DM with you'),
         chips([['everyone', 'Anyone who shares a server'], ['friends', 'Friends only']], p.dms, (v) => save('dms', v)))),
@@ -1499,6 +1509,27 @@ function privacyTab(app) {
     exportSection(app),
   );
 }
+// Automatic Away (server/presence.js): how long without using Hearth before people see you as Away. Kept on the
+// account, so every device uses the same time.
+const AWAY_AFTER = [[5, '5 minutes'], [10, '10 minutes'], [15, '15 minutes'], [30, '30 minutes'], [0, 'Never']];
+function awaySection(app) {
+  const desktop = window.hearthDesktop && typeof window.hearthDesktop.idleSeconds === 'function';
+  const sel = h('select', { class: 'input sm', 'aria-label': 'Show me as Away after', onchange: async () => {
+    try {
+      const r = await api('PATCH', '/me/status', { awayAfter: Number(sel.value) });
+      app.onMe({ id: app.S.me.id, awayAfter: r.awayAfter });
+      app.checkAway();
+      toast('Saved.');
+    } catch (e) { sel.value = String(app.S.me.awayAfter); toast(e.message, 'error'); }
+  } }, AWAY_AFTER.map(([v, label]) => h('option', { value: String(v) }, label)));
+  sel.value = String(Number.isFinite(app.S.me.awayAfter) ? app.S.me.awayAfter : 10);
+  return section('Online status',
+    h('div', { class: 'toggle-row' },
+      h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Show me as Away after'),
+        h('span', { class: 'field-hint' }, `When you haven\u2019t used Hearth for this long, people see you as Away, and Online again as soon as you\u2019re back. ${desktop ? 'In the desktop app, using anything on your computer counts.' : 'In a browser, using this tab counts; the desktop app counts anything you do on your computer.'} Being in a call counts too. With Hearth open on several devices, you\u2019re Away once none of them is in use. Only while your status is Online: Do Not Disturb and Invisible never change. Like Online, everyone signed in on this Hearth sees it, so they can tell when you stop and start using it.`)),
+      sel));
+}
+
 // Export my data: your account, profile, servers and every message you can decrypt, as JSON plus attachments in a
 // zip. The server sends ciphertext; it's decrypted and packed on this device. Starting needs your password.
 function exportSection(app) {

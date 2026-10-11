@@ -97,7 +97,11 @@ Each item is checked by `npm run test:a11y` unless marked otherwise.
 ### Not colour alone
 - Presence dots differ by shape as well as colour: a solid dot (online), a moon (idle), a bar (do not disturb) and
   a ring (offline or invisible). They carry the status as text (`role="img"`, `aria-label`), which is kept in sync
-  when presence changes.
+  when presence changes. Automatic Away uses the same moon and label; your own panel says "Away (inactive)" in words,
+  and changes in place, so keyboard focus on its buttons stays put when you go Away or come back (and other people
+  going Away leaves the friends and member search boxes, and focus in them, as they were).
+  The custom status dialog's "Clear after" choice has a label, and the line saying when it clears is a polite live
+  region.
 - Form errors are text, tied to their field. Key-change warnings use a shield icon plus a label.
 
 ### Labels

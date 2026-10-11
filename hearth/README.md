@@ -20,7 +20,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Privacy and safety:** blocking (the DM freezes both ways: no new messages, edits, reactions, pins, poll votes or typing; people can still delete their own), who can DM you ("friends only" also stops non-friends adding you to group chats), who can send friend requests, and a list of signed-in devices you can sign out remotely.
 - **MySpace-style profile pages:** everyone gets a full page (open anyone's profile): headline (it can scroll like a marquee), mood, glitter name, profile song (optional autoplay), "Who I'd like to meet", an interests table, custom details (Location, Zodiac…), a Friend Space with your top 8 and a friend count, a **comment wall** (anyone / friends only / nobody), a retro profile-view counter and a **cursor trail**. Style it with six starter themes or by hand: layout, background (gradient, color, 8 patterns, or your own tiling image), box colors, opacity, 9 border styles, corners, shadows, fonts and text size. **Custom CSS** works too, safely: it only affects your own page, and anything that would load from another site is stripped. It can't cover the rest of the app or the close button, or hide text, and visitors leave comments in Hearth's own dialog.
 - **Make your own effects:** pick any characters or emoji (up to 6), how they move (fall, rise, float, drift, twinkle, spin, zoom, bounce), how many, speed, size, color and glow; it plays on your card and across your whole page. Names can use up to 4 colors with flowing, pulse, wave, neon, glitch, outline and retro-shadow effects; avatar rings can spin with 3 colors at the speed you choose.
-- **Profiles, all free:** GIF or image avatar, banner and full-card background; display name, pronouns, bio, links and custom status; name colors, gradients, 12 fonts and glow/shimmer/rainbow effects; avatar shapes and animated rings; card colors, presets, glass style and animated effects.
+- **Profiles, all free:** GIF or image avatar, banner and full-card background; display name, pronouns, bio, links and a custom status that can clear itself; name colors, gradients, 12 fonts and glow/shimmer/rainbow effects; avatar shapes and animated rings; card colors, presets, glass style and animated effects.
 - **Your layout:** rearrange the server bar, channels, conversation and side panel in any order (or pick a preset), put the server bar across the top, drag panel edges to resize, and choose floating, attached or spacious panels.
 - **Pictures you can position:** move and zoom your avatar, banner and profile background after uploading — animated GIFs keep animating.
 - **Installable apps:** install from the browser on Windows, Mac, Linux, Android and iPhone, with push notifications when the app is closed; plus a desktop app (Windows/Mac/Linux) built automatically by GitHub Actions and a `/download` page for your users.
@@ -426,6 +426,7 @@ All chats are end-to-end encrypted: your browser encrypts each message and file 
 | Direct messages and files | **No** — end-to-end encrypted |
 | Voice | **No** — encrypted between browsers (DTLS-SRTP), handshakes signed; a relay, when one is needed, only forwards encrypted packets |
 | Who's in which server, who messages whom and when, emoji reactions, server/channel names, avatars and profiles, file sizes, which GIFs people pick and load, and when and where (not what) you search | Yes |
+| Whether each of your open apps is in use or idle (for automatic **Away**), and how long a custom status should last | Yes. Away, like Online, goes to everyone signed in on this Hearth (people you've blocked too), so it shows when you stop and start using Hearth. See [Away and custom statuses](#away-and-custom-statuses) |
 | Links you ask a **link preview** for (and that it was you, and when) | Yes: the server fetches the page for you. The preview itself then travels inside the encrypted message. See [Link previews](#link-previews) |
 | Messages sent before the encryption upgrade | Yes, with `data/secret.key` (shown in the app as "Older message — not end-to-end encrypted, sender not verified"; plaintext messages dated after encryption was switched on are hidden) |
 
@@ -627,6 +628,35 @@ What to know:
 - Limits: 20 previews a minute per person, 2 at once, 60 a minute from one network, 100 fetches an hour per person; a page is read up to 512 KB and its picture up to 2 MB, all within 10 seconds. Older apps that don't know about previews just show the link.
 
 Details: [docs/design/LINK-PREVIEWS.md](docs/design/LINK-PREVIEWS.md) and [docs/FEATURES.md](docs/FEATURES.md#link-previews).
+
+## Away and custom statuses
+
+- **Away by itself:** when you haven't used Hearth for a while, people see you as **Away** (the moon), and as
+  **Online** again the moment you're back. Pick how long in **Settings → Privacy & safety → Show me as Away after**:
+  5, 10 (the default), 15 or 30 minutes, or **Never**. It follows your account, so all your devices use the same time.
+- **What counts as using it:** in a browser, a key, click, scroll or touch in the Hearth tab (the Study page
+  included), or coming back to it. In the desktop app, anything you do on your computer, so playing a game with
+  Hearth in the background doesn't make you Away. Being in a call always counts, so you aren't Away while you watch a shared
+  screen without touching anything. With Hearth open on several devices (or tabs), you're Away only once none of
+  them is in use.
+- **Your choice wins:** it only ever changes **Online**. Do Not Disturb, Invisible and Away picked by hand stay as
+  they are, and while you use one of them your apps don't report anything. Your own status dot shows when you're
+  Away by yourself, and the status menu says why.
+- **A custom status that clears itself:** in the status menu → **Set a custom status**, pick **Clear after**:
+  30 minutes, 1 hour, 4 hours, Today, This week or Don't clear. "Today" and "This week" follow your own time zone
+  (the week starts on the day your browser's language says). The server clears it when it's due and everyone sees
+  it go right away; until then, only you see when it clears. A status set in Settings → Profile stays until you
+  clear it, and saving your profile keeps the time of one you set from the menu.
+- **What the server sees, and who else does:** only whether each of your open apps is in use or idle (never what you
+  typed or clicked), and how long a status should last. Your apps say so as it happens, so the switch to Away and
+  back shows *when* you stopped and started using Hearth (in the desktop app, your computer): to within about a
+  quarter of a minute plus your Away time when you stop, and to the second when you're back. Like Online, Away isn't
+  end-to-end encrypted, and presence (Online, Away, Do Not Disturb, Offline) is sent to everyone signed in on this
+  Hearth, including people who share no server with you and people you've blocked. Set **Never** (or Invisible)
+  if you'd rather not show it.
+- **Limits:** 15 status changes a minute and 120 an hour per account (Online/Away/Do Not Disturb/Invisible, the Away
+  time and custom statuses together). Each app's idle reports, 20 changes a minute per account. A custom status is up
+  to 128 characters (one line) with one emoji, and can clear itself from 1 minute to a week from now.
 
 ## Search (Ctrl+K)
 
@@ -859,6 +889,8 @@ server/perms.js     Roles and permission rules
 server/selfroles.js Roles members pick themselves (and what keeps them from handing out power)
 server/imports.js   Import from Discord: preview and create a server from a pasted template
 server/discordmap.js Discord template → Hearth roles, channels and permissions (pure, no I/O)
+server/presence.js  Automatic Away, status changes, custom statuses that clear themselves
+public/js/presence.js Tells the server when this app goes idle; "Clear after" times
 public/             The web app (plain JavaScript modules, no build)
 public/js/e2ee.js   Encryption primitives (WebCrypto + Argon2id)
 public/js/secure.js Key management: group keys, rotation, verification

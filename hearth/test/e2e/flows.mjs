@@ -1858,6 +1858,93 @@ async function channelOrder(t) {
   check(await focusedOn() === 'drag-me', `The focus should be on #drag-me after the move (it is on ${await focusedOn()}).`);
 }
 
+// ------------------------------------------------------------------ 23. away after inactivity, a custom status that clears itself
+// Dana (new, in the server) sets "Away after" to 5 minutes. With her page's clock moved six minutes on and no input,
+// Alice sees her go Away by herself, and Online again the moment she moves the mouse; Dana's own panel changes in
+// place (its buttons aren't rebuilt under her pointer). Dana saves a custom status in Settings → Profile and clears
+// it again in the same tab. Alice sets a status that clears after 30 minutes: Bob sees it, and when it's due the
+// server clears it for both of them without a reload.
+async function awayAndStatus(t) {
+  const { alice, bob } = t.people;
+  await bob.railButton(SERVER);
+  const link = await bob.inviteLink();
+  t.pw.dana = newPassword();
+  const dana = await t.open('dana');
+  await dana.register('dana', t.pw.dana);
+  await dana.join(link, SERVER);
+  await dana.openSettings('Privacy & safety');
+  const after = dana.$('select[aria-label="Show me as Away after"]');
+  check((await after.inputValue()) === '10', 'Away after should start at 10 minutes.');
+  await after.selectOption('5');
+  await dana.toast('Saved.');
+  await dana.closeSettings();
+
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await alice.showMembers();
+  const danaRow = alice.member('dana');
+  await danaRow.locator('.status-dot.st-online').waitFor();
+  const gearKept = () => dana.page.evaluate(() => !!(window.e2eGear && window.e2eGear.isConnected));
+  await dana.page.evaluate(() => { window.e2eGear = document.querySelector('#user-panel button[aria-label="Settings"]'); });
+  // Six minutes without input (only the page's clock moves; its timers keep running).
+  await dana.page.clock.setFixedTime(Date.now() + 6 * 60000);
+  await danaRow.locator('.status-dot.st-idle').waitFor({ timeout: 40000 });
+  await dana.$('#user-panel .me-sub', { hasText: 'Away (inactive)' }).waitFor();
+  await dana.$('#user-panel .status-dot.st-idle').waitFor();
+  check(await gearKept(), 'Going Away by herself should change Dana\u2019s panel in place, not rebuild its buttons.');
+  // Back: moving the mouse is enough, without waiting for the next check.
+  await dana.page.mouse.move(300, 300);
+  await dana.page.mouse.move(340, 320);
+  await danaRow.locator('.status-dot.st-online').waitFor({ timeout: 10000 });
+  await dana.$('#user-panel .me-sub', { hasText: 'Online' }).waitFor();
+  check(await gearKept(), 'Coming back should not rebuild Dana\u2019s panel either.');
+
+  // Settings → Profile: a custom status saved there, then cleared again in the same tab (which reloads after each
+  // save, so the second save sees the status changed).
+  await dana.openSettings('Profile');
+  const csText = dana.$('.settings-modal input[aria-label="Status text"]');
+  await csText.fill('Lunch');
+  await dana.$('.settings-modal .save-bar button', { hasText: 'Save changes' }).click();
+  await dana.toast('Profile saved.');
+  // (Settings covers the user panel, so these only need it to be in the page.)
+  await dana.$('#user-panel .me-sub', { hasText: 'Lunch' }).waitFor({ state: 'attached' });
+  check((await csText.inputValue()) === 'Lunch', 'The reloaded Profile tab should show the saved status.');
+  await csText.fill('');
+  await dana.$('.settings-modal .save-bar button', { hasText: 'Save changes' }).click();
+  await dana.$('#user-panel .me-sub', { hasText: 'Online' }).waitFor({ state: 'attached' });
+  check(!(await dana.$('#toasts .toast-error').count()), `Saving the profile should show no error (got ${JSON.stringify(await dana.$('#toasts .toast-error').allTextContents())}).`);
+  await dana.closeSettings();
+  await dana.close();
+
+  // A status that clears itself after 30 minutes.
+  await alice.$('#user-panel .me-btn').click();
+  await alice.$('.popover .menu-item', { hasText: 'Set a custom status' }).click();
+  let m = await alice.dialog('Set a custom status');
+  await m.locator('input[aria-label="Status text"]').fill('Out for lunch');
+  check((await m.locator('select[aria-label="Clear after"]').inputValue()) === 'never', 'A new status should stay until cleared unless told otherwise.');
+  await m.locator('select[aria-label="Clear after"]').selectOption('30m');
+  await m.locator('.field-hint', { hasText: /^Clears (at|tomorrow at) / }).waitFor();
+  await m.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await alice.noModals();
+  await alice.$('#user-panel .me-sub', { hasText: 'Out for lunch' }).waitFor();
+  await bob.openChannel('general');
+  await bob.showMembers();
+  const status = bob.member('Alice Wonder').locator('.member-status', { hasText: 'Out for lunch' });
+  await status.waitFor();
+  // Opening it again keeps the time it clears unless she picks another.
+  await alice.$('#user-panel .me-btn').click();
+  await alice.$('.popover .menu-item', { hasText: 'Set a custom status' }).click();
+  m = await alice.dialog('Set a custom status');
+  check((await m.locator('select[aria-label="Clear after"]').inputValue()) === 'keep', 'Reopening should offer to keep the time it clears.');
+  await m.locator('.modal-x').click();
+  await alice.noModals();
+  // Due (as if the half hour had passed): cleared by the server, live, for both.
+  const aliceId = await alice.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  t.server.sql('UPDATE users SET status_expires_at = ? WHERE id = ?', Date.now() - 1000, aliceId);
+  await status.waitFor({ state: 'detached', timeout: 30000 });
+  await alice.$('#user-panel .me-sub', { hasText: 'Out for lunch' }).waitFor({ state: 'detached', timeout: 10000 });
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -1891,4 +1978,5 @@ export const FLOWS = [
   ['link previews: ask, turn down, preview, send; the reader sees the card and never contacts the site; keyboard; editing a link in Always mode', linkPreviews],
   ['discord import: paste a template, see what is skipped, leave some out, create', discordImport],
   ['channel order: drag a channel into a category and a category above another, live for everyone; Move down by keyboard keeps focus (into a collapsed category too); a menu left open doesn’t undo another move', channelOrder],
+  ['away and status: Away after inactivity and back on input; a custom status that clears itself, live', awayAndStatus],
 ];

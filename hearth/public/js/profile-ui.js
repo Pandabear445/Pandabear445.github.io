@@ -27,7 +27,8 @@ export function displayName(u) {
 
 export function presenceOf(u, meId) {
   if (!u) return 'offline';
-  if (u.id === meId && u.status) return u.status === 'invisible' ? 'invisible' : u.status;
+  // Your own dot shows the status you picked, or Away while the server shows you as away for being inactive.
+  if (u.id === meId && u.status) return u.status === 'online' && u.autoAway ? 'idle' : u.status;
   return u.presence || 'offline';
 }
 

@@ -133,6 +133,27 @@ const userVoice = new Map(); // userId -> channelId
 const voiceEvicted = new Map(); // userId -> { room, to, until }
 
 const isOnline = (userId) => onlineSockets.has(userId) && onlineSockets.get(userId).size > 0;
+// Automatic Away (server/presence.js): every one of this person's open connections says it has gone unused.
+// leaving: a connection that's closing (Socket.IO has already let go of it, but it still counts here).
+function allIdle(userId, leaving = null) {
+  const set = onlineSockets.get(userId);
+  if (!io || !set || !set.size) return false;
+  for (const id of set) {
+    const s = leaving && leaving.id === id ? leaving : io.sockets.sockets.get(id);
+    if (!s || !s.data.idle) return false;
+  }
+  return true;
+}
+// What everyone else sees: offline unless connected (and not invisible), and Away instead of Online while every
+// app of theirs is idle and they haven't turned that off. Do Not Disturb and Away picked by hand stay as they are.
+// leaving: as allIdle (a connection that's closing still counts).
+function presenceFor(row, leaving = null) {
+  if (row.is_bot) return 'online'; // bots run inside this server: they're up whenever it is
+  if (!isOnline(row.id) || row.status === 'invisible') return 'offline';
+  return row.status === 'online' && row.away_after > 0 && allIdle(row.id, leaving) ? 'idle' : row.status;
+}
+// A custom status past its time is never sent out, even in the moments before the sweep clears it.
+const statusExpired = (row) => !!row.status_expires_at && row.status_expires_at <= Date.now();
 // Games/music people are playing (server/activity.js fills these in once everything it needs exists).
 let ACT = { activityFor: () => null, recentFor: () => undefined };
 let ACCT = null; // server/accounts.js: email, recovery key, two-factor
@@ -179,9 +200,8 @@ function withPastKeys(users) {
 function publicUser(row) {
   if (!row) return null;
   const profile = parseProfile(row);
-  let presence = 'offline';
-  if (isOnline(row.id) && row.status !== 'invisible') presence = row.status;
-  if (row.is_bot) presence = 'online'; // bots run inside this server: they're up whenever it is
+  if (statusExpired(row)) profile.customStatus = { emoji: '', text: '' };
+  const presence = presenceFor(row);
   return {
     id: row.id,
     username: row.username,
@@ -204,6 +224,9 @@ function publicUser(row) {
 function selfUser(row) {
   const u = publicUser(row);
   u.status = row.status;
+  u.awayAfter = row.away_after; // minutes without input before Online shows as Away (0: never)
+  u.autoAway = row.status === 'online' && u.presence === 'idle'; // shown as Away right now because every app is idle
+  u.customStatusExpiresAt = (!statusExpired(row) && row.status_expires_at) || null;
   u.kdf = row.kdf;
   u.kdfSalt = row.kdf_salt;
   u.privacy = privacyOf(row);
@@ -1563,6 +1586,7 @@ function pushFailed(endpoint) {
 let USE = null; // server/usability.js
 let DIS = null; // server/disappear.js: disappearing messages
 let SELF = null; // server/selfroles.js
+let PRES = null; // server/presence.js
 function pushTo(userIds, payload, what = { kind: 'other' }) {
   if (!vapid) return;
   const ids = [...new Set(userIds)];
@@ -1939,7 +1963,7 @@ api.delete('/me', auth, wrap(async (req, res) => {
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
     for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
-    db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0 WHERE id = ?").run(row.id);
+    db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0, status_expires_at = NULL WHERE id = ?").run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
   })();
@@ -2059,11 +2083,16 @@ function flushPresence() {
   presenceQueue.clear();
   if (list.length) io.emit('user:presence', list);
 }
-function broadcastPresence(userId) {
+// before: what everyone saw until now, when the caller knows. If that hasn't changed (a setting changed, say),
+// only the person's own apps are told, so nobody learns that an Invisible account is doing anything.
+function broadcastPresence(userId, before) {
   const row = getUserRow(userId);
   if (!row) return;
-  presenceQueue.set(userId, isOnline(row.id) && row.status !== 'invisible' ? row.status : 'offline');
-  if (!presenceTimer) presenceTimer = setTimeout(jobs.job('presence.flush', flushPresence), 1000);
+  const presence = presenceFor(row);
+  if (before === undefined || presence !== before) {
+    presenceQueue.set(userId, presence);
+    if (!presenceTimer) presenceTimer = setTimeout(jobs.job('presence.flush', flushPresence), 1000);
+  }
   io.to(`user:${userId}`).emit('user:update', selfUser(row));
 }
 // Who sees a person in their app: everyone in a server with them, friends and friend requests, and DM partners.
@@ -2109,7 +2138,12 @@ api.patch('/me/profile', auth, (req, res) => {
   requireUnlocked(req.userId);
   limitProfileWrites(req);
   const row = getUserRow(req.userId);
+  const before = parseProfile(row).customStatus;
   const profile = sanitizeProfile(req.body || {}, parseProfile(row));
+  // A different custom status counts as a status change (server/presence.js) and lasts until it's cleared; the
+  // same one again (the profile editor sends everything) keeps the time it clears itself.
+  const statusChanged = profile.customStatus.emoji !== before.emoji || profile.customStatus.text !== before.text;
+  if (statusChanged) PRES.limitStatus(req);
   checkWords(profile.displayName, profile.pronouns, profile.bio, profile.aboutMe, profile.headline, profile.mood.text, profile.customStatus.text, profile.interests, profile.songTitle, profile.links.map((l) => l.label));
   if (!profile.displayName) profile.displayName = row.username;
   // Top friends must actually be friends.
@@ -2117,18 +2151,14 @@ api.patch('/me/profile', auth, (req, res) => {
   const json = JSON.stringify(profile);
   if (json !== row.profile) { // saving the same thing again changes nothing, so nobody needs telling
     db.prepare('UPDATE users SET profile = ? WHERE id = ?').run(json, req.userId);
+    if (statusChanged) db.prepare('UPDATE users SET status_expires_at = NULL WHERE id = ?').run(req.userId);
     broadcastUser(req.userId);
   }
   res.json(selfUser(getUserRow(req.userId)));
 });
 
-api.patch('/me/status', auth, (req, res) => {
-  const status = (req.body || {}).status;
-  if (!['online', 'idle', 'dnd', 'invisible'].includes(status)) fail(400, 'Unknown status.');
-  db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, req.userId);
-  broadcastPresence(req.userId);
-  res.json({ ok: true });
-});
+// PATCH /me/status (Online, Away, Do not disturb, Invisible, and the automatic Away time) and PUT /me/custom-status
+// are in server/presence.js.
 
 const MEDIA_KINDS = { avatar: 'avatar', banner: 'banner', background: 'background', pagebg: 'page_bg' };
 function setMediaCrop(userId, kind, c) {
@@ -5682,6 +5712,9 @@ DIS = require('./disappear')({ api, auth, db, fail, rateLimit, newId, now, requi
   // (io is declared further down: during the start-up sweep it doesn't exist yet, and there's nobody to tell.)
   toChannel: (c) => toChannel(c), getIo: () => { try { return io || null; } catch { return null; } }, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), removeUpload, unseal, threadInfo, groupLast,
   bots: () => BOTS });
+// Away after inactivity and custom statuses that clear themselves (server/presence.js).
+PRES = require('./presence')({ api, auth, db, fail, rateLimit, limitNet, now, getUserRow, parseProfile, sanitizeProfile, checkWords, requireUnlocked,
+  broadcastUser, broadcastPresence, presenceFor, selfUser });
 // Roles members can pick themselves (server/selfroles.js).
 SELF = require('./selfroles')({ api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL: ALL_PERMS, CHANNEL_SCOPED, MEMB,
   emitServer: (sid) => io && emitServer(sid), recheckVoice, serverAudit });
@@ -6227,10 +6260,14 @@ function setupSockets(server) {
     if (isStaff(uid)) socket.join('admins');
     db.prepare('SELECT server_id FROM members WHERE user_id = ?').all(uid).forEach((r) => socket.join(`server:${r.server_id}`));
 
-    const wasOnline = isOnline(uid);
+    // Everyone is told only when what they see changes: coming online, or back from Away (a new window starts out
+    // in use). Someone Invisible or on Do Not Disturb looks the same however many windows they open, so nothing
+    // goes out, and nobody can tell when they pick up another device.
+    const meRow = getUserRow(uid);
+    const shownBefore = meRow && presenceFor(meRow);
     if (!onlineSockets.has(uid)) onlineSockets.set(uid, new Set());
     onlineSockets.get(uid).add(socket.id);
-    if (!wasOnline) broadcastPresence(uid);
+    if (meRow && presenceFor(meRow) !== shownBefore) broadcastPresence(uid);
 
     const guard = (fn) => (...args) => {
       const cb = typeof args[args.length - 1] === 'function' ? args.pop() : () => {};
@@ -6240,6 +6277,9 @@ function setupSockets(server) {
         cb({ error: e.message || 'Error' });
       }
     };
+
+    // Whether this app has gone unused for the person's "Away after" time (server/presence.js).
+    socket.on('presence:idle', guard((p = {}) => PRES.setIdle(socket, p)));
 
     // An open Audit log tab (Server settings) hears about new entries, while its reader may still read them.
     socket.on('audit:watch', guard((p = {}) => SA.watch(socket, p)));
@@ -6491,9 +6531,14 @@ function setupSockets(server) {
         s.grace.unref?.();
         emitVoiceState(ch);
       }
+      // As on connect, only a change is sent: going offline, or Away because the window still in use closed and
+      // every one left is idle. (Socket.IO has already let go of this socket; presenceFor still counts it.)
       const set = onlineSockets.get(uid);
+      const meRow = getUserRow(uid);
+      const shownBefore = meRow && presenceFor(meRow, socket);
       if (set) { set.delete(socket.id); if (!set.size) onlineSockets.delete(uid); }
-      if (!isOnline(uid)) { userBudget.delete(uid); typingAt.delete(uid); broadcastPresence(uid); }
+      if (!isOnline(uid)) { userBudget.delete(uid); typingAt.delete(uid); }
+      if (meRow && presenceFor(meRow) !== shownBefore) broadcastPresence(uid);
     });
   });
 }

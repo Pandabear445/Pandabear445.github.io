@@ -788,6 +788,9 @@ ipcMain.handle('desktop-settings:get', (e) => (fromOurPage(e) ? desktopSettings(
 ipcMain.handle('desktop-settings:set', (e, key, value) => (fromOurPage(e) ? setDesktopSetting(String(key), value) : { ok: false, error: 'Not allowed.' }));
 ipcMain.handle('check-updates', (e) => (fromOurPage(e) ? checkForUpdates() : { state: 'error', message: 'Not allowed.' }));
 ipcMain.on('restart', (e) => { if (fromOurPage(e)) restartApp(); });
+// Automatic Away: seconds since the last input anywhere on the computer, so someone playing a game with Hearth in
+// the background isn't shown as away. The page asks every 15 seconds; it gets the number and nothing else.
+ipcMain.handle('idle-time', (e) => (fromOurPage(e) ? powerMonitor.getSystemIdleTime() : null));
 // Game / music detection (detect.js), only while the person shares it.
 const detect = require('./detect');
 ipcMain.on('detect', (e, o) => {

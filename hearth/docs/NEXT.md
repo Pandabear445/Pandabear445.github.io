@@ -63,7 +63,8 @@ Suggested order:
   - 2FA, recovery key, safety numbers;
   - hiding DMs while screen sharing.
 - Group chats of up to 25 people.
-- A manual "Away" status.
+- "Away": picked by hand, or automatic after 5–30 minutes without input on every device; custom statuses that
+  clear themselves.
 
 ## Not recommended, and why
 

@@ -685,3 +685,92 @@ the server bar's (`public/js/folders.js` `dragDrop`), shared with the channel li
 - Dragging needs a mouse or pen (HTML drag and drop); on touch screens, use Move up / Move down.
 - Other channels can be moved around one the person can't manage (that's how lists work), so it can still end up
   above or below different neighbours; what can't happen is moving it itself or swapping two such channels.
+
+## Away and custom statuses that clear themselves
+
+Automatic Away after a while without input, and an expiry for custom statuses. v19 adds `users.away_after`
+(minutes, 0 = never, default 10) and `users.status_expires_at` with the partial index `idx_users_status_expires`.
+
+**How it works**
+
+1. Each open app (one socket) says whether it has gone unused for the account's "Away after" time:
+   `presence:idle { idle }` (`public/js/presence.js` `initAway`, checked every 15 seconds, and "in use" again on
+   the first key, click, scroll, touch or pointer move, or when the page comes back into view). The desktop app
+   uses the computer's idle time instead (`hearthDesktop.idleSeconds()` → `powerMonitor.getSystemIdleTime()`,
+   answered only to the main window showing the server), so a game in front of Hearth doesn't count as away.
+   The Android app counts like a browser: input in Hearth itself. Going to the background reports nothing by
+   itself, so Away still comes only after the person's time (a backgrounded web view may check only once a
+   minute); the app's own messages to the page (`hearth-push`, `hearth-hangup`, `hearth-open`, `hearth-invite`, a
+   notification click) are never input; opening Hearth again, from the launcher or a notification, is use the
+   moment the page is visible. A call that carries on with the screen off (the app's call notification,
+   `androidApp.callState`) counts as use like any call.
+   Being in a call counts as use (`busy()`), and so does input in the Study page: the Recall frame is a sandbox of
+   its own whose input never reaches the page, so it posts `{ t: 'active' }` (at most every 30 seconds, nothing
+   else) and `recall-host.js` calls the tracker's `used()`. While the status isn't Online the app reports nothing.
+2. The server combines them (`presenceFor` in `server/index.js`): someone whose status is Online shows as `idle`
+   only while every socket of theirs has said idle; a new socket starts in use, and one that never reports (an
+   older app) counts as in use. Do Not Disturb, Away picked by hand and Invisible never change, and "never"
+   (`awayAfter: 0`) ignores the reports. Changes go out through the existing `broadcastPresence` (a presence
+   entry to every socket, batched each second) and `user:update` to the person's own apps, which carries
+   `autoAway` so their own dot and status menu can say why. Connecting, disconnecting, idle reports and
+   `PATCH /me/status` all compare `presenceFor` before and after and send a presence entry only when it changed,
+   so an Invisible or Do Not Disturb account opening and closing windows (or changing "Away after") tells nobody
+   anything. In the app, a `user:update` about yourself that changes only `presence` and `autoAway` patches your
+   dots and the line under your name in place (`onlyMyPresence`), so a call in full screen, a button being pressed
+   and keyboard focus are left alone; other people's presence redraws only the rows of the friends and member
+   lists (their search boxes keep what's typed) and Home's online friends (`redrawPeople`).
+3. `PUT /me/custom-status` takes `expiresIn` in ms. The app works out "today" and "this week" in the person's time
+   zone (`clearAfterMs`; the week starts where the browser's language says) and sends only the length, so the
+   server needs no time zone and a wrong device clock doesn't matter. The `status.expire` job (every 15 s,
+   `STATUS_SWEEP_MS`) clears due statuses and sends `user:update`; until it runs, `publicUser` already leaves an
+   expired status out. Only the person's own apps get `customStatusExpiresAt`.
+4. `PATCH /me/profile` (the profile editor sends the whole profile) keeps the expiry when the status is unchanged
+   and drops it when the status changes; the editor sends the status only when it was edited there, so one that
+   cleared itself since the page opened isn't put back.
+
+**API**
+
+| Route / event | Auth | Notes |
+|---|---|---|
+| `PATCH /me/status` `{ status?, awayAfter? }` | session | `online`, `idle`, `dnd`, `invisible`; `awayAfter` one of 0, 5, 10, 15, 30; answers `{ ok, status, awayAfter }` |
+| `PUT /me/custom-status` `{ emoji, text, expiresIn? }` | session | one line (control characters become spaces), text ≤ 128, emoji ≤ 16 UTF-16 units; `expiresIn` an integer from 60,000 to 8 days, or null; word filter; a locked profile can clear but not set; answers the person's own user |
+| socket `presence:idle { idle }` | socket | only `idle: true` counts as idle; repeats change nothing |
+
+Limits: status changes (both routes, and a changed status through `PATCH /me/profile`) 15 a minute and 120 an hour
+per account, 120 a minute per network; idle changes 20 a minute per account (an app sends at most two per period).
+A refused idle report changes nothing, and the app tries again on its next check.
+
+**Tests**
+
+- `test/presence.test.js` (14 tests): defaults and the "Away after" choices; Away only once every socket is idle,
+  back on one, Away when the socket in use closes, Online when a new one opens, Offline when all close; never over
+  Do Not Disturb, Invisible or a hand-picked Away, and "never" ignores reports; an Invisible or Do Not Disturb
+  account's windows opening and closing (and its "Away after" changing) send nobody a presence entry, an Invisible
+  one's first and last window included; the idle and status limits (custom
+  statuses included, also through the profile editor); custom status validation, the expiry, the editor keeping or
+  dropping it, the sweep clearing it live for others and the person's own apps; the word filter and a locked profile;
+  an expired status never sent before the sweep, and cleared after a restart; the app's `clearAfterMs`,
+  `clearsLabel` and `weekStart`; `initAway` with page input, visibility, "never", a refused report, reconnects, the
+  desktop idle time, an older desktop app, a call counting as use and `used()`; the Android app going to the
+  background saying nothing by itself, its own events never counting as input, and coming back or a call counting; the Study frame's throttled
+  "active" message reaching the tracker; the desktop bridge only answering the main window.
+- Browser flow (`npm run test:e2e`, "away and status"): a new member sets "Away after" to 5 minutes; with her page's
+  clock moved on, another member sees her dot turn to Away and her own panel says "Away (inactive)" without its
+  buttons being rebuilt, and a mouse move brings her back; a status set to clear after 30 minutes shows for others,
+  reopening the dialog offers to keep its time, and when it's due both apps drop it without a reload; Settings →
+  Profile saves a status, then clears it in the same tab.
+
+**Known limitations**
+
+- Away isn't end-to-end encrypted, like Online, and presence goes to every account signed in on the instance
+  (`io.emit`), people who share no server with you and people you've blocked included. Because apps report as it
+  happens, everyone learns roughly when you stop using Hearth (within about 15 seconds plus your Away time) and the
+  second you're back; in the desktop app, that's any input on your computer. "Never", Invisible or Do Not Disturb
+  turns that off. (Proposed for SECURITY.md's honest limits.)
+- In a browser, only input in a Hearth tab counts: someone working in another tab or app shows as Away after their
+  time. The desktop app counts the whole computer.
+- A tab in the background may check only once a minute (browsers slow timers there), so Away can come a minute late.
+- An older app that never reports keeps the person Online while it's open.
+- Open apps drop a status up to 15 seconds after its time (when the sweep runs); anything the server sends from the
+  moment it's due already leaves it out.
+- "Keep" in the dialog works out the remaining time on the device, so a device clock that's off shifts it by that much.
