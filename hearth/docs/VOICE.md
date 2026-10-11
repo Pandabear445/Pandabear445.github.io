@@ -49,7 +49,7 @@ gives way.
 
 - STUN defaults to Google's servers (`STUN_URLS`). `iceServersFor` adds the main relay (`turnUrls` setting or
   `TURN_URL`) and every region with a heartbeat in the last 3 minutes (`REG.liveRelays`).
-- With a TURN secret, credentials follow the coturn REST scheme (`<expiry>:<uid>`, HMAC-SHA1), 12–18 hours, the
+- With a TURN secret, credentials follow the coturn REST scheme (`<expiry>:<pseudonym>`, HMAC-SHA1), 12–18 hours, the
   same login on every relay. They arrive in `/api/bootstrap` and `/api/ice`; the app refreshes them before a call
   when they're within an hour of expiring.
 - `relays.js` measures each relay (time to get a relay candidate) and caches it for 6 hours. Automatic mode uses
@@ -217,7 +217,8 @@ This section is about calls. The general threat model is in `SECURITY.md`.
 
 **Media encryption ends at the peers.** Each `RTCPeerConnection` runs DTLS-SRTP between the two browsers. A TURN
 relay forwards packets it can't decrypt: it sees ciphertext, packet sizes and timing (so roughly when someone
-talks), both ends' IP addresses, and the TURN username, which contains the user id. Hearth has no media server, so
+talks), both ends' IP addresses, and the TURN username: an expiry and a keyed pseudonym of the person (the one the
+access log records), never their user id. Hearth has no media server, so
 there is no point where media is decrypted.
 
 **Offers and answers are signed; ICE candidates are not.** An SDP is signed (ECDSA P-256) over
@@ -255,7 +256,7 @@ connection's keys come from its own DTLS handshake and die with it.
 
 **What a compromised relay can do.** Everything any relay can (above): see metadata, drop or delay packets, end
 calls through it. It can't decrypt or inject media (SRTP is authenticated). A compromised **region** VPS also holds
-the instance-wide TURN secret: it can mint relay logins for any user id on every relay (abuse relay bandwidth;
+the instance-wide TURN secret: it can mint relay logins under any name on every relay (abuse relay bandwidth;
 TURN usernames are not proof of identity), and it stores encrypted backups. It has no signaling access.
 
 **Diagnostics** show only the viewer's own connections and never addresses or device ids.

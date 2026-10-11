@@ -10,11 +10,11 @@ before(async () => { srv = await startServer(); });
 after(async () => { await srv.stop(); });
 
 const forgot = (login, ip = newIp()) => srv.api('POST', '/auth/forgot', { body: { login }, ip });
-const lastMailTo = (email) => srv.mails().filter((m) => m.to === email).pop();
+const lastMailTo = async (email) => (await srv.mails()).filter((m) => m.to === email).pop();
 async function resetLink(u, email) {
-  const n = srv.mails().length;
+  const n = (await srv.mails()).length;
   await forgot(u.username);
-  const m = srv.mails().slice(n).find((x) => x.to === email);
+  const m = (await srv.mails()).slice(n).find((x) => x.to === email);
   assert.ok(m, 'reset email sent');
   return resetTokenFrom(m);
 }
@@ -31,21 +31,21 @@ const withRecovery = async (u) => {
 test('"forgot password" answers the same for unknown, unconfirmed and real accounts', async () => {
   const a = await srv.register(); await confirmEmail(srv, a, `${a.username}@example.test`);
   const b = await srv.register(); // no email
-  const n = srv.mails().length;
+  const n = (await srv.mails()).length;
   const answers = await Promise.all([forgot(a.username), forgot(b.username), forgot('nobody_' + hex(3)), forgot('nobody@example.test'), forgot(`${a.username}@example.test`)]);
   for (const r of answers) assert.deepEqual([r.status, r.json], [200, { ok: true }]);
-  const sent = srv.mails().slice(n);
+  const sent = (await srv.mails()).slice(n);
   assert.equal(sent.length, 2, 'only the confirmed address gets mail (twice: by name and by email)');
   assert.ok(sent.every((m) => m.to === `${a.username}@example.test`));
 });
 
 test('an inbox can’t be flooded, and the limit doesn’t reveal the account exists', async () => {
   const a = await srv.register(); await confirmEmail(srv, a, `${a.username}@example.test`);
-  const n = srv.mails().length;
+  const n = (await srv.mails()).length;
   const rs = [];
   for (let i = 0; i < 6; i++) rs.push(await forgot(a.username));
   assert.ok(rs.every((r) => r.status === 200), 'never a different answer for a real account');
-  assert.equal(srv.mails().slice(n).length, 3, 'at most 3 reset emails an hour');
+  assert.equal((await srv.mails()).slice(n).length, 3, 'at most 3 reset emails an hour');
 });
 
 test('"forgot password" is limited per network', async () => {
@@ -96,7 +96,7 @@ test('a reset signs out every device (live connections too) and emails a notice'
   assert.equal(r.status, 200);
   assert.equal((await srv.api('GET', '/bootstrap', { token: u.token, ip: u.ip })).status, 401);
   await new Promise((res) => (sock.disconnected ? res() : sock.once('disconnect', res)));
-  assert.match(lastMailTo(email).subject, /password was changed/);
+  assert.match((await lastMailTo(email)).subject, /password was changed/);
   assert.equal((await srv.api('GET', '/bootstrap', { token: r.json.token, ip: u.ip })).status, 200);
 });
 
@@ -168,7 +168,7 @@ test('recovery key and email changes need the password', async () => {
 test('email confirmation codes: 5 wrong tries kill the code', async () => {
   const u = await srv.register();
   await srv.api('POST', '/me/email', { token: u.token, ip: u.ip, body: { authKey: u.authKey, email: `${u.username}@example.test` } });
-  const code = /is (\d{6})/.exec(lastMailTo(`${u.username}@example.test`).subject)[1];
+  const code = /is (\d{6})/.exec((await lastMailTo(`${u.username}@example.test`)).subject)[1];
   const wrong = String((+code + 1) % 1000000).padStart(6, '0');
   for (let i = 0; i < 5; i++) assert.equal((await srv.api('POST', '/me/email/verify', { token: u.token, ip: u.ip, body: { code: wrong } })).status, 400);
   assert.equal((await srv.api('POST', '/me/email/verify', { token: u.token, ip: u.ip, body: { code } })).status, 429, 'even the right code is dead now');
@@ -177,7 +177,7 @@ test('email confirmation codes: 5 wrong tries kill the code', async () => {
 test('changing the email warns the old address', async () => {
   const u = await srv.register(); const old = `${u.username}@example.test`; await confirmEmail(srv, u, old);
   await confirmEmail(srv, u, `${u.username}.new@example.test`);
-  assert.match(lastMailTo(old).subject, /email was changed/);
+  assert.match((await lastMailTo(old)).subject, /email was changed/);
 });
 
 // ------------------------------------------------------------------ two-factor
@@ -282,7 +282,7 @@ test('2FA failures after the right password email a warning', async () => {
   const u = await srv.register(); const email = `${u.username}@example.test`; await confirmEmail(srv, u, email);
   await enable2fa(srv, u);
   for (let i = 0; i < 3; i++) await srv.login(u, { totp: String(200000 + i) });
-  assert.match(lastMailTo(email).subject, /someone has your password/);
+  assert.match((await lastMailTo(email)).subject, /someone has your password/);
 });
 
 test('admins can remove 2FA only for people below them; others can’t at all', async () => {

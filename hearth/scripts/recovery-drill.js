@@ -38,7 +38,7 @@ function client(base) {
 // Starts Hearth on an existing data folder (a restored one) without touching its accounts.
 async function startOn(dir) {
   const port = await new Promise((resolve) => { const s = require('node:net').createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
-  const env = { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test', MAIL_OUTBOX_DIR: path.join(dir, 'outbox'), PUBLIC_URL: 'https://chat.example.test' };
+  const env = { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test', PUBLIC_URL: 'https://chat.example.test' };
   const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   child.stdout.on('data', (d) => { log += d; }); child.stderr.on('data', (d) => { log += d; });
@@ -160,10 +160,10 @@ function createDrill() {
   const texts = (msgs) => msgs.filter((m) => m.dec && m.dec.t).map((m) => m.dec.t).sort();
   const sorted = (a) => [...a].sort();
   async function resetLink(p) {
-    const n = srv.mails().length;
+    const n = (await srv.mails()).length;
     const r = await api('POST', '/auth/forgot', { ip: H.newIp(), body: { login: p.username } });
     assert.equal(r.status, 200);
-    const m = srv.mails().slice(n).find((x) => x.to === p.email && /reset your password/.test(x.subject));
+    const m = (await srv.mails()).slice(n).find((x) => x.to === p.email && /reset your password/.test(x.subject));
     assert.ok(m, 'the reset email arrived');
     return H.resetTokenFrom(m);
   }

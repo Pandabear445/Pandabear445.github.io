@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.28.2', items: [
+    'Privacy: call relays (including other regions\u2019 relays) no longer see who you are, only an anonymous name that stays the same for you. The GIF proxy only ever downloads from GIPHY\u2019s and KLIPY\u2019s own media servers.',
+  ] },
   { version: '1.28.1', items: [
     'Security fixes from an automated code scan: a generous per-account limit on requests, so one account can\u2019t flood the server; stricter checks on file names, profile CSS and links you open; and the server\u2019s own keys are created safely even if two copies start at once.',
   ] },

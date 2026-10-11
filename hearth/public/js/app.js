@@ -175,13 +175,13 @@ async function init() {
   });
   // A password-reset link: show the sign-in screen with the reset window on top.
   const pendingReset = sessionStorage.getItem('hearth.resetToken');
-  if (pendingReset) { sessionStorage.removeItem('hearth.resetToken'); showAuth(); openReset(pendingReset); return; }
+  if (pendingReset) { sessionStorage.removeItem('hearth.resetToken'); showSignIn(); openReset(pendingReset); return; }
   const uid = localStorage.getItem('hearth.userId');
   if (getToken() && uid) {
     const key = await E2EE.loadKey(uid).catch(() => null);
     if (key) { S.privateKey = key; return startApp(); }
   }
-  showAuth();
+  showSignIn();
 }
 
 // ======================================================================= auth screen
@@ -206,7 +206,7 @@ function saveDeviceNote(username, note) {
 // harder robot check: solve a new one and try once more.
 const harderOnce = (attempt) => attempt().catch((ex) => (ex.code === 'captcha_harder' ? attempt() : Promise.reject(ex)));
 
-function showAuth() {
+function showSignIn() {
   $('#app').hidden = true;
   $('#auth').hidden = false;
   const loginForm = $('#login-form');
@@ -2538,7 +2538,7 @@ function mentionKind(m) {
   const server = S.servers.find((x) => x.id === m.serverId);
   const mine = server ? (server.memberRoles || {})[S.me.id] || [] : [];
   for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id) && mayMentionRole(server, id, m.authorId)) return 'roleMention';
-  if (/(^|\s)@(everyone|channel|here)\b/i.test(t) && authorMayPingEveryone(m)) return 'everyone';
+  if (/(^|\s)@(everyone|channel|here)\b/i.test(t) && senderMayPingEveryone(m)) return 'everyone';
   return null;
 }
 const mentionsMe = (m) => !!mentionKind(m);
@@ -2739,7 +2739,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length;
     const embed = m.dec && m.dec.embed;
     if (text && !hideText && !(embed && text === embed.title)) {
-      const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: authorMayPingEveryone(m) }) : escapeText(text);
+      const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: senderMayPingEveryone(m) }) : escapeText(text);
       body.append(h('div', { class: `msg-text${chat.jumbo && isJumbo(text) ? ' jumbo' : ''}`, html: html + (m.editedAt ? '<span class="edited" title="Edited">(edited)</span>' : '') }));
     }
     const embeds = chat.embeds ? extractImageUrls(text) : [];
@@ -2832,7 +2832,8 @@ function messageListKeys(list) {
   });
 }
 // GIPHY media goes through our server (if the admin left the privacy proxy on), so GIPHY never sees viewers' IPs.
-const isGiphy = (u) => /^https:\/\/(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)\//i.test(u);
+// The GIF hosts the server's media proxy accepts (server/gifmedia.js): anything else loads directly.
+const isGiphy = (u) => /^https:\/\/(media\d?\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)\//i.test(u);
 // Each GIF gets its own path (/media/gif/<short hash>), not just its own "?u=…". Older app caches ignored
 // everything after "?" and showed the same GIF everywhere; a distinct path can't be mixed up.
 const urlKey = (u) => { let x = 5381; for (let i = 0; i < u.length; i++) x = ((x * 33) ^ u.charCodeAt(i)) >>> 0; return x.toString(36); };
@@ -2854,7 +2855,8 @@ function canModerate(m) {
   if (m.dmId) return false;
   return canIn(channelById(m.channelId), PERMS.MANAGE_MESSAGES);
 }
-function authorMayPingEveryone(m) {
+// Whether this message's @everyone is highlighted and pings on this device. Push notifications are the server's own check.
+function senderMayPingEveryone(m) {
   if (m.dmId) return false;
   const server = S.servers.find((x) => x.id === m.serverId);
   return !!server && has(basePerms(server, m.authorId), PERMS.MENTION_EVERYONE);

@@ -326,13 +326,24 @@ test('voice-15: in host-only mode only the host skips; "video ended" counts once
 });
 
 // ------------------------------------------------------------------ voice-6 / voice-9: relay logins
-test('voice-6/9: relay logins say when they run out, stay the same for hours, and /ice is rate-limited', async () => {
+test('voice-6/9: relay logins say when they run out, stay the same for hours, never name the user id, and /ice is rate-limited', async () => {
   const u = await srv.register();
   const t0 = Date.now();
   const relay = (await as(u, 'GET', '/ice')).json.find((e) => e.username);
   assert.ok(relay, 'a relay login');
-  const [exp, uid] = relay.username.split(':');
-  assert.equal(uid, u.id);
+  const parts = relay.username.split(':');
+  assert.equal(parts.length, 2, 'coturn reads the expiry before the one colon');
+  const [exp, who] = parts;
+  assert.match(exp, /^\d+$/);
+  // Relays (regions may be someone else's machine) log logins: they get a pseudonym, never the user id.
+  assert.match(who, /^[0-9a-f]{12}$/, 'a 12-hex pseudonym');
+  assert.notEqual(who, u.id);
+  assert.ok(!relay.username.includes(u.id), 'the user id appears nowhere in the login');
+  // Keyed, so a relay can't get it back by hashing user ids (which any member can see).
+  for (const alg of ['sha256', 'sha1', 'md5']) {
+    const plain = crypto.createHash(alg).update(u.id).digest('hex');
+    assert.ok(!plain.startsWith(who) && !plain.endsWith(who), `not a plain ${alg} of the user id`);
+  }
   assert.equal(relay.expiresAt, +exp * 1000, 'expiresAt matches the login');
   const ahead = relay.expiresAt - Date.now();
   assert.ok(ahead > 12 * 3600e3 - 60e3 && ahead <= 18 * 3600e3, `runs out in ${Math.round(ahead / 3600e3)} h`);
@@ -340,11 +351,21 @@ test('voice-6/9: relay logins say when they run out, stay the same for hours, an
   const again = (await as(u, 'GET', '/ice')).json.find((e) => e.username);
   const step = (t) => Math.floor(t / 1000 / 21600);
   assert.ok(again.username === relay.username || step(Date.now()) !== step(t0), 'the same login for hours (the relay’s per-login quota is then per person)');
+  assert.equal(again.username.split(':')[1], who, 'the same pseudonym every time for the same person');
+  assert.equal(again.credential, crypto.createHmac('sha1', TURN_SECRET).update(again.username).digest('base64'));
   const boot = (await as(u, 'GET', '/bootstrap')).json.iceServers.find((e) => e.username);
   assert.equal(boot.expiresAt, again.expiresAt, 'the app gets the expiry with its first relay list too');
+  assert.equal(boot.username.split(':')[1], who, '/bootstrap names the person the same way');
+  const other = await srv.register();
+  const theirs = (await as(other, 'GET', '/ice')).json.find((e) => e.username);
+  assert.notEqual(theirs.username.split(':')[1], who, 'two people get different pseudonyms');
+  assert.ok(!theirs.username.includes(other.id));
+  assert.equal(theirs.credential, crypto.createHmac('sha1', TURN_SECRET).update(theirs.username).digest('base64'));
   let limited = 0;
   for (let i = 0; i < 60; i++) if ((await as(u, 'GET', '/ice')).status === 429) limited++;
   assert.ok(limited >= 1, '/ice is rate-limited');
+  // It's the access log's pseudonym for the same person, so an admin can match relay logs to it.
+  assert.ok(await until(() => new RegExp(`route=/api/ice status=429 .*uid=${who}\\b`).test(srv.log)), 'the access log names the person the same way');
 });
 
 test('voice-6: the app sees when relay logins are about to run out, and never hands expiresAt to WebRTC', async () => {

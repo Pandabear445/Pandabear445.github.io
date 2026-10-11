@@ -649,14 +649,26 @@ CodeQL (`security-extended`, the same queries as CI) was run locally on 1.28.0 w
   - What was really missing was a limit for ordinary signed-in requests. That limit is now in `auth()`:
     `API_RATE_LIMIT`, 1200 a minute per account by default (SECURITY.md row 91).
   - Bots already had their own limit, and the routes that work without signing in limit themselves.
-- **By design (5), to dismiss on GitHub with these reasons:**
-  - `js/weak-cryptographic-algorithm`: TURN REST credentials are HMAC-SHA1 because coturn requires it.
-    HMAC-SHA1 is not a broken MAC.
-  - `js/request-forgery`: the GIF media proxy. The host is checked against an allow-list, and checked again on
-    every redirect.
-  - `js/http-to-file-access`: `MAIL_OUTBOX_DIR`, the test-only mail sink.
-  - `js/user-controlled-bypass` (×2): heuristic matches. The "sensitive action" is storing a reset token the user
-    pasted, or rendering a message.
+- **Fixed in 1.28.2 (5).** These first looked like by-design matches, but each had a real fix:
+  - `js/weak-cryptographic-algorithm`: TURN REST credentials stay HMAC-SHA1, because coturn requires it and
+    HMAC-SHA1 is not a broken MAC. What changed is the relay login: it used to carry the user id, so every relay
+    logged real user ids, including region relays that may run on other people's machines. It now carries
+    `log.userHash(uid)`, the keyed pseudonym the access log already uses. The login is still per person, so
+    coturn's quota is unchanged, and an admin can still match relay logs to the access log (`voice-hardening.test.js`
+    › voice-6/9). The local variable is now called `login`, which is also what the comments call it.
+  - `js/request-forgery`: the GIF media proxy used to check a requested address and then fetch it as given. Now
+    every address it fetches, the first and each redirect, is rebuilt by `server/gifmedia.js` from this server's
+    own strings: the scheme, a host from an exact list, and the request's path and query re-encoded segment by
+    segment. The host list replaces the `media\d*` pattern with media and media0–9; built-in hosts with a port are
+    refused, and the app's own GIPHY check matches the list (`files-hardening.test.js` › files-12).
+  - `js/http-to-file-access`: the test-only `MAIL_OUTBOX_DIR`, which wrote each email to a folder, is gone from
+    the server. The tests now receive mail over real SMTP in an in-memory sink (`test/smtp-sink.js`), so mail goes
+    through nodemailer as it does in production.
+  - `js/user-controlled-bypass` (×2): CodeQL treats any call whose name contains "auth" as an authorization
+    check. `showAuth()` only shows the sign-in screen, and `authorMayPingEveryone()` only decides how an @everyone
+    is shown on this device. They are now `showSignIn()` and `senderMayPingEveryone()`, names that say what they do.
+    The server makes every real access decision.
 
-Verified locally by a fresh CodeQL database and analysis of the working tree: nothing left beyond the 5 above and
-the turned-off rule. On GitHub, alerts close when the CodeQL job runs on the default branch with these changes.
+Each fix was checked by a fresh CodeQL database and analysis (CodeQL 2.27.2, the same queries as CI). The
+remaining result count is 0, apart from the turned-off rate-limiting rule. On GitHub, alerts close when the
+CodeQL job runs on the default branch with these changes.

@@ -16,6 +16,7 @@ import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const { startSmtpSink } = createRequire(import.meta.url)('../smtp-sink.js');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ Playwright and the browser
@@ -54,11 +55,12 @@ export async function startServer() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-e2e-data-'));
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
-  const outbox = path.join(dir, 'outbox');
-  // Emails go to a folder instead of out (read with mails()); PUBLIC_URL is what reset links point at.
+  // Emails go out over SMTP, as on a real server, to a mail sink in this process (read with mails()); no SMTP
+  // login, as the sink offers none. PUBLIC_URL is what reset links point at.
+  const sink = await startSmtpSink();
   const env = {
     ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test',
-    MAIL_OUTBOX_DIR: outbox, PUBLIC_URL: base,
+    SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), SMTP_USER: '', SMTP_PASS: '', MAIL_FROM: 'hearth@chat.example.test', PUBLIC_URL: base,
   };
   let log = '';
   const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -66,16 +68,14 @@ export async function startServer() {
   child.stderr.on('data', (d) => { log += d; });
   for (let i = 0; ; i++) {
     try { const r = await fetch(base + '/api/config'); if (r.ok) break; } catch { /* not up yet */ }
-    if (i > 300 || child.exitCode !== null) throw new Error(`Hearth didn't start:\n${log}`);
+    if (i > 300 || child.exitCode !== null) { await sink.close(); throw new Error(`Hearth didn't start:\n${log}`); }
     await sleep(100);
   }
   return {
     base, dir, port, get log() { return log; },
-    // Every email the server has sent so far, oldest first: { to, subject, text }.
-    mails() {
-      if (!fs.existsSync(outbox)) return [];
-      return fs.readdirSync(outbox).sort().map((f) => JSON.parse(fs.readFileSync(path.join(outbox, f), 'utf8')));
-    },
+    // Every email the server has sent so far, oldest first: { to, subject, text }. Waits until mail has stopped
+    // arriving first, since some are sent after the HTTP answer.
+    async mails() { await sink.idle(); return sink.messages.map((m) => ({ ...m })); },
     // Changes the database directly, as the server's operator could: for states a browser can't reach quickly (a
     // two-factor check from more than 10 minutes ago, say). The server reads them on its next request.
     sql(q, ...args) {
@@ -86,8 +86,8 @@ export async function startServer() {
     // The newest email to this address that matches, once it arrives.
     async mail(to, match, timeout = 15000) {
       for (const until = Date.now() + timeout; Date.now() < until; await sleep(100)) {
-        const hit = this.mails().reverse().find((m) => m.to === to && match.test(m.subject + '\n' + m.text));
-        if (hit) return hit;
+        const hit = [...sink.messages].reverse().find((m) => m.to === to && match.test(m.subject + '\n' + m.text));
+        if (hit) return { ...hit };
       }
       throw new Error(`No email to ${to} matching ${match} arrived.`);
     },
@@ -97,6 +97,7 @@ export async function startServer() {
         for (let i = 0; i < 60 && child.exitCode === null; i++) await sleep(50);
         if (child.exitCode === null) child.kill('SIGKILL');
       }
+      await sink.close();
       if (!keep) fs.rmSync(dir, { recursive: true, force: true });
     },
   };

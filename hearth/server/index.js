@@ -3700,22 +3700,24 @@ api.put('/admin/gif-library', auth, (req, res) => {
 
 // GIF privacy proxy: viewers load GIPHY media through this server, so GIPHY never sees their IP.
 // Links carry a short-lived signed token (images can't send login headers), and only GIPHY's media
-// hosts are allowed, so this can't be used as an open proxy.
-const MEDIA_HOSTS = /^(media\d*\.giphy\.com|i\.giphy\.com|static\.klipy\.com|static\.klipy\.co|media\.klipy\.com)$/i;
+// hosts are allowed (server/gifmedia.js), so this can't be used as an open proxy.
+const { gifMediaUrl } = require('./gifmedia');
 const EXTRA_MEDIA_HOSTS = (process.env.GIF_PROXY_EXTRA_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean);
-const gifHostOk = (u) => (u.protocol === 'https:' && MEDIA_HOSTS.test(u.hostname)) || EXTRA_MEDIA_HOSTS.includes(u.host);
+const gifHostOk = (u) => gifMediaUrl(u, EXTRA_MEDIA_HOSTS) !== null;
 const GIF_MEDIA_MAX = 20 * 1024 * 1024;
-// Fetches GIF media, following up to 3 redirects itself and checking each one, so a redirect can't send this
-// server anywhere but the GIF providers' media hosts. null if it leads elsewhere.
+// Fetches GIF media, following up to 3 redirects itself. Every address it fetches, the first and each redirect, is
+// rebuilt by gifMediaUrl from the allowed hosts, so a redirect can't send this server anywhere but the GIF
+// providers' media hosts. null if it leads elsewhere.
 async function fetchGifMedia(u, signal) {
   let target = u;
   for (let hop = 0; hop < 4; hop++) {
-    if (!gifHostOk(target)) return null;
-    const r = await fetch(target, { signal, redirect: 'manual', headers: { 'User-Agent': 'Hearth' } });
+    const href = gifMediaUrl(target, EXTRA_MEDIA_HOSTS);
+    if (!href) return null;
+    const r = await fetch(href, { signal, redirect: 'manual', headers: { 'User-Agent': 'Hearth' } });
     const loc = r.status >= 300 && r.status < 400 ? r.headers.get('location') : null;
     if (!loc) return r;
     await cancelBody(r.body);
-    try { target = new URL(loc, target); } catch { return null; }
+    try { target = new URL(loc, href); } catch { return null; }
   }
   return null;
 }
@@ -3835,10 +3837,15 @@ function iceServersFor(uid) {
     // Relay logins run out 12 to 18 hours from now, at a 6-hour boundary, so a person has at most three logins
     // alive at once. (The relay's per-login limits then work per person, not per request.) expiresAt tells the
     // app when to fetch new ones (GET /api/ice): an app left open for days keeps working calls.
+    // Relays log every login, and a region may run on someone else's machine, so the login names the person by
+    // the same keyed pseudonym the access log uses, never by their user id: steady per person, so the per-login
+    // limits still work, and an admin can match relay logs to access logs, but the login alone doesn't tell a relay
+    // who it is. (It never changes, though, so a relay can link one person's logins over time.)
+    // The password is coturn's shared-secret scheme (HMAC-SHA1 of the login), which every relay checks.
     const exp = (Math.floor(Date.now() / 1000 / TURN_STEP) + 3) * TURN_STEP;
-    const username = `${exp}:${uid}`;
-    const credential = crypto.createHmac('sha1', turnSecret()).update(username).digest('base64');
-    for (const r of relays) list.push({ urls: r.urls, username, credential, region: r.region, regionId: r.id, expiresAt: exp * 1000 });
+    const login = `${exp}:${log.userHash(uid)}`;
+    const credential = crypto.createHmac('sha1', turnSecret()).update(login).digest('base64');
+    for (const r of relays) list.push({ urls: r.urls, username: login, credential, region: r.region, regionId: r.id, expiresAt: exp * 1000 });
   } else if (urls.length && process.env.TURN_USERNAME) {
     list.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL || '' });
   }

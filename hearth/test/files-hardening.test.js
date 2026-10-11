@@ -141,11 +141,13 @@ const as = (srv, u, m, p, body) => srv.api(m, p, { token: u.token, ip: u.ip, bod
 const fileOf = (srv, url) => path.join(srv.dir, 'uploads', path.basename(url));
 
 // ------------------------------------------------------------------ a fake GIF provider / picture host
-// KLIPY's API shape, GIF media, a huge answer without a size, and redirects (one to a host that isn't allowed).
+// KLIPY's API shape, GIF media, a huge answer without a size, and redirects (some to a host that isn't allowed).
+// Every request it gets is noted in st.seen: the path asked for and any login sent.
 function startFake() {
-  const st = { search: 0, posts: 0, media: 0, sent: {}, closedEarly: {}, otherHost: 0 };
+  const st = { search: 0, posts: 0, media: 0, sent: {}, closedEarly: {}, otherHost: 0, seen: [] };
   const other = http.createServer((req, res) => { st.otherHost++; res.writeHead(200, { 'content-type': 'image/gif' }); res.end(fakeGif()); });
   const srv = http.createServer((req, res) => {
+    st.seen.push({ url: req.url, auth: req.headers.authorization });
     const u = new URL(req.url, 'http://x');
     const base = `http://127.0.0.1:${srv.address().port}`;
     const item = (id, title) => ({ id, content_description: title, media_formats: { gif: { url: `${base}/media/${id}.gif`, dims: [40, 30], size: 2000 }, tinygif: { url: `${base}/media/${id}-tiny.gif`, dims: [40, 30], size: 2000 } } });
@@ -159,6 +161,9 @@ function startFake() {
     if (u.pathname.startsWith('/media/')) { st.media++; res.writeHead(200, { 'content-type': 'image/gif' }); return res.end(fakeGif()); }
     if (u.pathname === '/redirect-out') { res.writeHead(302, { location: `http://localhost:${other.address().port}/x.gif` }); return res.end(); }
     if (u.pathname === '/redirect-in') { res.writeHead(302, { location: `${base}/media/ok.gif` }); return res.end(); }
+    // The allowed host as a login in front of another host, and a scheme-relative jump to another host.
+    if (u.pathname === '/redirect-login') { res.writeHead(302, { location: `http://127.0.0.1:${srv.address().port}@localhost:${other.address().port}/x.gif` }); return res.end(); }
+    if (u.pathname === '/redirect-slashes') { res.writeHead(302, { location: `//localhost:${other.address().port}/x.gif` }); return res.end(); }
     if (u.pathname.startsWith('/huge')) {
       // 100 MB of "image" with no Content-Length, written as fast as the reader takes it.
       const key = u.pathname;
@@ -179,7 +184,7 @@ function startFake() {
     res.writeHead(404); res.end();
   });
   return new Promise((resolve) => other.listen(0, '127.0.0.1', () => srv.listen(0, '127.0.0.1', () => resolve({
-    st, port: srv.address().port, base: `http://127.0.0.1:${srv.address().port}`,
+    st, port: srv.address().port, otherPort: other.address().port, base: `http://127.0.0.1:${srv.address().port}`,
     close: () => { srv.closeAllConnections(); other.closeAllConnections(); srv.close(); other.close(); },
   }))));
 }
@@ -666,6 +671,98 @@ test('files-10: the GIF proxy re-checks every redirect and stops huge answers th
   assert.ok(got <= 21 * 1024 * 1024, `client got ${got} bytes`);
   await sleep(300);
   assert.ok(fake.st.sent['/huge.gif'] < 60 * 1024 * 1024, `upstream stopped early (${fake.st.sent['/huge.gif']})`);
+});
+
+// ------------------------------------------------------------------ files-12: the address the GIF proxy fetches
+test('files-12: GIF media is fetched from an address rebuilt from the allowed hosts, never the one asked for', () => {
+  const { gifMediaUrl, MEDIA_HOSTS } = require('../server/gifmedia');
+  const at = (s, extra) => gifMediaUrl(new URL(s), extra);
+  // GIPHY's and KLIPY's media hosts, by exact name.
+  const giphy = ['media.giphy.com', 'i.giphy.com', ...Array.from({ length: 10 }, (_, n) => `media${n}.giphy.com`)];
+  assert.deepEqual([...MEDIA_HOSTS].sort(), [...giphy, 'static.klipy.com', 'static.klipy.co', 'media.klipy.com'].sort());
+  for (const h of MEDIA_HOSTS) assert.equal(at(`https://${h}/media/abc/giphy.gif`), `https://${h}/media/abc/giphy.gif`, h);
+  for (const s of ['https://media10.giphy.com/x.gif', 'https://media01.giphy.com/x.gif', 'https://mediax.giphy.com/x.gif', 'https://evil.media.giphy.com/x.gif',
+    'https://media.giphy.com.evil.test/x.gif', 'https://giphy.com/x.gif', 'https://klipy.com/x.gif', 'https://static.klipy.com.evil.test/x.gif']) assert.equal(at(s), null, s);
+  // Upper case is the same host. A trailing dot, plain http, another port or another scheme: refused.
+  assert.equal(at('HTTPS://MEDIA2.GIPHY.COM/Media/X.GIF'), 'https://media2.giphy.com/Media/X.GIF');
+  for (const s of ['https://media.giphy.com./x.gif', 'http://media.giphy.com/x.gif', 'http://i.giphy.com:443/x.gif', 'https://media.giphy.com:8443/x.gif',
+    'https://media.giphy.com:80/x.gif', 'ftp://media.giphy.com/x.gif', 'wss://media.giphy.com/x.gif']) assert.equal(at(s), null, s);
+  assert.equal(at('https://media.giphy.com:443/x.gif'), 'https://media.giphy.com/x.gif', 'the default port is no port');
+  // A login in the address is dropped; one that hides another host is judged by that host.
+  assert.equal(at('https://user:pw@i.giphy.com/a.gif'), 'https://i.giphy.com/a.gif');
+  for (const s of ['https://media.giphy.com@evil.test/x.gif', 'https://media.giphy.com:443@evil.test/x.gif', 'https://evil.test\\@media.giphy.com/x.gif',
+    'https://evil.test#@media.giphy.com/x.gif', 'https://evil.test?@media.giphy.com/']) assert.equal(at(s), null, s);
+  // Odd paths stay paths on the same host: a leading "//" or "\\", escaped slashes, dots and question marks.
+  assert.equal(at('https://media.giphy.com//evil.test/x.gif'), 'https://media.giphy.com//evil.test/x.gif');
+  assert.equal(new URL(at('https://media.giphy.com//evil.test/x.gif')).host, 'media.giphy.com');
+  assert.equal(at('https://media.giphy.com\\\\evil.test/x.gif'), 'https://media.giphy.com//evil.test/x.gif');
+  assert.equal(at('https://media.giphy.com/a%2F..%2F..%2Fb%5Cc%3Fd%23e.gif'), 'https://media.giphy.com/a%2F..%2F..%2Fb%5Cc%3Fd%23e.gif', 'escaped separators stay escaped');
+  assert.equal(at('https://media.giphy.com/a/%2e%2E/../b.gif'), 'https://media.giphy.com/b.gif');
+  assert.equal(at('https://media.giphy.com/caf%c3%a9%20%41.gif'), 'https://media.giphy.com/caf%C3%A9%20A.gif', 'escapes are written one way');
+  assert.equal(at("https://media.giphy.com/v1.a=b,c;d:e@f$g&h+i!j~k*l'm(n)o/x.gif"), "https://media.giphy.com/v1.a=b,c;d:e@f$g&h+i!j~k*l'm(n)o/x.gif", 'characters a path may hold are kept');
+  assert.equal(at('https://media.giphy.com/a%zz.gif'), null, 'a broken escape');
+  // The query is kept as it was; a fragment is never sent.
+  assert.equal(at('https://media4.giphy.com/media/v1.Y2lk/3o7/giphy.gif?cid=abc&rid=giphy.gif&ct=g#x'), 'https://media4.giphy.com/media/v1.Y2lk/3o7/giphy.gif?cid=abc&rid=giphy.gif&ct=g');
+  assert.equal(at('https://media.giphy.com/x.gif?u=//evil.test/@x'), 'https://media.giphy.com/x.gif?u=//evil.test/@x');
+  // The operator's extra hosts: exactly the host[:port] given, over http or https only, without a login.
+  const extra = ['127.0.0.1:9', 'gifs.lan'];
+  assert.equal(at('http://127.0.0.1:9/m/x.gif?a=1', extra), 'http://127.0.0.1:9/m/x.gif?a=1');
+  assert.equal(at('https://gifs.lan/x.gif', extra), 'https://gifs.lan/x.gif');
+  assert.equal(at('http://u:p@127.0.0.1:9/x.gif', extra), 'http://127.0.0.1:9/x.gif');
+  for (const s of ['http://127.0.0.1:10/x.gif', 'http://127.0.0.1/x.gif', 'ws://127.0.0.1:9/x', 'ftp://127.0.0.1:9/x', 'http://gifs.lan:8080/x.gif', 'http://127.0.0.1:9@evil.test/x.gif'])
+    assert.equal(at(s, extra), null, s);
+  assert.equal(at('http://127.0.0.1:9/x.gif'), null, 'not without the setting');
+  assert.equal(gifMediaUrl('https://media.giphy.com/x.gif'), null, 'only a parsed URL is judged');
+  // However the address is written, what comes out is on an allowed host, without a login or fragment, or nothing.
+  const origins = new Set([...MEDIA_HOSTS.map((h) => `https://${h}`), 'http://127.0.0.1:9', 'https://127.0.0.1:9', 'http://gifs.lan', 'https://gifs.lan']);
+  let passed = 0;
+  for (const scheme of ['https://', 'http://', 'HTTPS://', 'https:/', 'https:\\\\', 'ws://']) {
+    for (const auth of ['media.giphy.com', 'MEDIA.giphy.com', 'media.giphy.com.', 'media.giphy.com:443', 'media.giphy.com:8443', 'u:p@media.giphy.com', 'media.giphy.com@evil.test',
+      'evil.test\\@media.giphy.com', 'media.giphy.com%2F@evil.test', 'media%2egiphy.com', '127.0.0.1:9', '127.0.0.1:9@evil.test', 'gifs.lan', '[::1]', '0x7f000001']) {
+      for (const p of ['/x.gif', '//evil.test/x', '/\\evil.test', '/%2F%2Fevil.test', '/..%2F..%2F', '/@evil.test', '/x?y#z', '?//evil.test', '#//evil.test', '']) {
+        let u;
+        try { u = new URL(scheme + auth + p); } catch { continue; }
+        const href = gifMediaUrl(u, extra);
+        if (href === null) continue;
+        const x = new URL(href);
+        assert.ok(origins.has(x.origin), `${scheme + auth + p} -> ${href}`);
+        assert.equal(x.username + x.password + x.hash, '', href);
+        passed++;
+      }
+    }
+  }
+  assert.ok(passed > 50, `${passed} addresses were allowed`);
+});
+
+test('files-12: the GIF proxy sends only the rebuilt request: no login, odd paths stay on the allowed host, sneaky redirects are refused', async () => {
+  const u = await srv.register('gifpaths');
+  const t = encodeURIComponent(await mediaTokenOf(u));
+  const q = (target) => `/media/gif?u=${encodeURIComponent(target)}&t=${t}`;
+  const hostPort = `127.0.0.1:${fake.port}`;
+  const last = () => fake.st.seen[fake.st.seen.length - 1];
+  // A login in the address is not passed on.
+  let r = await srv.call('GET', q(`http://someone:secret@${hostPort}/media/login.gif`));
+  assert.equal(r.status, 200);
+  assert.deepEqual(last(), { url: '/media/login.gif', auth: undefined });
+  // Escaped slashes stay escaped: the provider is asked for one odd name under /media/, not for /redirect-out.
+  r = await srv.call('GET', q(`http://${hostPort}/media/a%2F..%2F..%2Fredirect-out`));
+  assert.equal(r.status, 200);
+  assert.equal(last().url, '/media/a%2F..%2F..%2Fredirect-out');
+  // A path that starts with "//" is still asked of the allowed host, never of the host written after it.
+  r = await srv.call('GET', q(`http://${hostPort}//localhost:${fake.otherPort}/x.gif`));
+  assert.equal(r.status, 502, 'the fake has nothing at that path');
+  assert.equal(last().url, `//localhost:${fake.otherPort}/x.gif`);
+  // Refused before anything is sent: another scheme, another port, the allowed host as a login, http, a port or a
+  // trailing dot on a built-in host.
+  const before = fake.st.seen.length;
+  for (const bad of [`ws://${hostPort}/media/x.gif`, `http://127.0.0.1:${fake.otherPort}/x.gif`, `http://${hostPort}@localhost:${fake.otherPort}/x.gif`,
+    'http://media.giphy.com/x.gif', 'https://media.giphy.com:8443/x.gif', 'https://media.giphy.com./x.gif', 'https://media.giphy.com/a%zz.gif']) {
+    assert.equal((await srv.call('GET', q(bad))).status, 400, bad);
+  }
+  assert.equal(fake.st.seen.length, before);
+  // Redirects to another host written as a login or as "//host": not followed.
+  for (const p of ['/redirect-login', '/redirect-slashes']) assert.equal((await srv.call('GET', q(`http://${hostPort}${p}`))).status, 502, p);
+  assert.equal(fake.st.otherHost, 0);
 });
 
 test('ssrf-3: the picture proxy stops reading a huge answer at its 6 MB limit instead of buffering it', async () => {
