@@ -467,6 +467,14 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .ch-gear { opacity: 0; margin-right: 4px; }
 .ch-row:hover .ch-gear, .ch-row.active .ch-gear, .ch-gear:focus-visible { opacity: 1; }
 .ch-row.unread:hover::before, .ch-row:has(.badge)::before { display: none; }
+/* A category and its channels (dragged as one). Drop markers: a line where a channel or category will land, or the
+   category's name lit up when a channel goes into it. Rows already use ::before and ::after, so the line is a shadow. */
+.cat-group { display: flex; flex-direction: column; gap: 1px; flex: none; border-radius: 8px; }
+.ch-row.dragging, .cat-group.dragging { opacity: .4; }
+.ch-row.drop-before, .cat-group.drop-before { box-shadow: 0 -2px 0 var(--accent); }
+.ch-row.drop-after, .cat-group.drop-after { box-shadow: 0 2px 0 var(--accent); }
+.cat-head.drop-into { background: rgb(var(--accent-rgb) / .14); border-radius: 8px; }
+.cat-head.drop-into .cat-toggle { color: var(--text); }
 .vc-users { display: flex; flex-direction: column; padding-left: 28px; flex: none; }
 .vc-user { display: flex; align-items: center; gap: 8px; padding: 3px 8px; border-radius: 8px; font-size: 13.5px; color: var(--text-2); text-align: left; min-width: 0; }
 .vc-user:hover { background: var(--hover); }

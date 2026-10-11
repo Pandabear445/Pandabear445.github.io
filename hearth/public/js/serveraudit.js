@@ -144,7 +144,8 @@ export function sentence(e, users) {
       return [[who, ` changed ${ch}`], bits.length ? `${bits.join('; ')}.`.replace(/^./, (x) => x.toUpperCase()) : null];
     }
     case 'channel_delete': return [[who, ` deleted ${theChannel(d, true)}`]];
-    case 'channel_reorder': return [[who, ` reordered the channels (${plural(d.count || 0, 'channel', 'channels')} moved)`]];
+    // One channel dragged (or moved from its menu) is named; a bigger reorder says how many moved.
+    case 'channel_reorder': return [[who, d.channel ? ` moved ${ch} in the channel list` : ` reordered the channels (${plural(d.count || 0, 'channel', 'channels')} moved)`]];
     case 'category_reorder': return [[who, ' reordered the categories']];
     case 'category_rename': return [[who, ` renamed the category ${quoted(d.from || '')} to ${quoted(d.to || '')}`]];
     case 'channel_overrides': {

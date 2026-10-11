@@ -611,3 +611,77 @@ notification shown while the app was open, or posted from a push while it was cl
 README says; while the app runs, `closeNotificationFor` also cancels the app's own notification with that tag through
 `alsoCloseNotifications`), a sender timestamp inside the
 encrypted message (the server still controls `createdAt`), a group-owner lock, a personal default timer, and signed timer changes.
+
+## Channel and category order
+
+Dragging channels and categories in a server's sidebar, for people with Manage Channels (v19, no schema change:
+`channels.position`, `channels.category` and `servers.category_order` already held the order). The drag code is
+the server bar's (`public/js/folders.js` `dragDrop`), shared with the channel list in `app.js`.
+
+**How it works**
+
+1. Each category and its channels are one `.cat-group` in the sidebar. A channel is dragged by its name and lands
+   before or after another channel, or on a category's name (first in that category); a category is dragged by
+   its name and lands before or after another category. The app shows the new order at once and puts it back if
+   the server refuses.
+2. **Move up** / **Move down** in a channel's or category's menu do the same from the keyboard. At the top or
+   bottom of a category, a channel's item moves it into the category above (last) or below (first). Where it goes
+   is worked out again when the item is chosen, from the list as it is then, so a menu left open while someone
+   else reorders never sends the old order back. A move into a collapsed category opens it, so the channel stays
+   drawn and keeps the focus (`openCategory`, `refocus` in `app.js`).
+3. Channels: `POST /api/servers/:id/channel-order { ids, categories?, from? }`. `ids` is every channel the person can
+   see, top to bottom; `categories` maps the ones changing category to their new one (it must be a category they
+   can see); `from` is the layout the app showed (`[[category, [channel ids]], …]`). Categories:
+   `PATCH /api/servers/:id { categoryOrder, categoryOrderFrom? }`. If `from` / `categoryOrderFrom` isn't the
+   current layout as the person sees it, the move is refused with the same 400 as a list that isn't theirs ("The
+   channel list changed in the meantime"), so one person's full list can't silently undo another's move. Both need
+   Manage Channels (in group chats too, so only the owner), and share a limit of 30 a minute per person with
+   renaming a category. `PATCH` with `categoryOrder` and other fields needs Manage Channels as well as Manage
+   Server, and is checked before anything is saved.
+4. `server/channelorder.js` decides what a full list may change. Channels the person can't see stay in their
+   category, right after the channel they followed before (the nearest one before them that the person sees and
+   that's still there), or first; categories they see no channel of keep their slot in `category_order`. A list
+   that isn't exactly the channels they see (a hidden channel's id, a made-up one, one left out) gets the same
+   400, and so does moving into a category they can't see or that doesn't exist. Channels where Manage Channels is
+   denied to them (a channel override) can't change category and keep their order among themselves; categories
+   holding such a channel keep theirs. Everything else goes where it was put.
+5. Open apps get `server:update` (only when something changed). Each member's `categoryOrder` now lists only
+   categories they have a channel in, so a category of private channels doesn't give its name away, and each
+   channel's `position` is its place among the channels that member sees (0, 1, 2…), so gaps don't tell how many
+   private channels there are or where they sit.
+6. Renaming a category (`POST /api/servers/:id/categories/rename { from, to }`, its menu → Rename category) relabels
+   every channel in it, so it goes by the same rules (`planRename`): Manage Channels in every channel of it the
+   person sees (the menu item isn't offered otherwise), and a category they see no channel of gets the same 400 as
+   a made-up name. Renaming onto another category's name merges the two, which moves the channels, so that also
+   needs seeing every channel in it (a hidden one keeps its category); the merged category takes the other one's
+   place. A plain rename takes hidden channels along, since they stay in the same (renamed) category.
+7. The server's audit log gets a `channel_update` (`changes.category { from, to }`) for each channel that changed
+   category, and one `channel_reorder { count }` for the channels that changed place inside their category
+   (counted as everything outside the longest run that kept its order, so dragging one channel is one move),
+   naming the channel (`channel`, target and channel id) when only one moved. `category_reorder` has no detail.
+
+**Tests**
+
+- `test/channel-order.test.js` (10 tests): reorder and move into another category with live updates and audit
+  entries; nothing changed means no update and no entry; emptying a category, and older channels without a
+  category; refusals (members, outsiders, Manage Server alone, group members); channels and categories with
+  Manage Channels denied; hidden channels and categories keep their place and are refused like made-up ids, and
+  their names never reach the moderator; a list built on an older layout (`from`, `categoryOrderFrom`) is refused
+  and the other move stands; positions without gaps; renaming a category (denied channels, hidden categories and
+  channels, merges, the shared limit); validation and the rate limit; the rules on their own.
+- Browser flow (`npm run test:e2e`, "channel order"): bob drags a channel onto the Voice category's name and the
+  Voice category above Text, alice sees both live and has nothing to drag or move; then Move down by keyboard,
+  within Voice and on into Text while Text is collapsed (it opens), with the focus staying on the channel; then a
+  menu left open while another of bob's devices reorders Text moves the channel from the new order, keeping that
+  other move.
+
+**Known limitations**
+
+- Categories are labels on channels, not channels with permissions of their own, so "Manage Channels in a
+  category" means in every channel of it the person can see, and it only covers moving or renaming the category
+  itself: categories holding a channel the person can't manage keep their order among themselves, but a single
+  such category can end up anywhere when the others move around it, and channels the person manages can go into
+  it (as Edit channel's category field already allows).
+- Dragging needs a mouse or pen (HTML drag and drop); on touch screens, use Move up / Move down.
+- Other channels can be moved around one the person can't manage (that's how lists work), so it can still end up
+  above or below different neighbours; what can't happen is moving it itself or swapping two such channels.

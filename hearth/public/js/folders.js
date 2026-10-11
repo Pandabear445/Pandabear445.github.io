@@ -15,6 +15,63 @@ import { modal, field, contextMenu, menu, confirmDialog } from './ui.js';
 const COLORS = ['#5865f2', '#3ba55d', '#f2a541', '#ed4245', '#eb459e', '#00b0f4', '#9b59b6', '#95a5a6'];
 const newId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
+// ------------------------------------------------------------------ drag and drop (also the channel list's)
+// Dragging with drop markers: the server bar here, and the channels and categories in a server's sidebar (app.js).
+//   axis():              'y' for a column, 'x' for a row: which way "before" and "after" lie
+//   zones(drag, target): where the item being dragged may land on this target: any of 'before', 'after' and 'into'
+//                        (none: it isn't a drop target for it). The middle third is 'into' where that's allowed.
+//   onDrop(drag, target, zone)
+// attach(el, target, { source = true }): el is an item; it gets .dragging while it's dragged and .drop-before /
+// .drop-after / .drop-into while something is over it. A drag that starts on something draggable="true" inside it
+// drags `target` (unless source is false: a part of a bigger item, like a category's name in its group). Items can
+// sit inside other items (a channel in its category): the innermost one that takes the drag marks itself and gets
+// the drop. Each list has its own instance, so something dragged in one is never dropped in another.
+export function dragDrop({ axis = () => 'y', zones = () => ['before', 'after', 'into'], onDrop }) {
+  let dragging = null;
+  const claimed = new WeakSet(); // drag starts an inner item took (its outer items leave them alone)
+  const MARKS = ['drop-before', 'drop-after', 'drop-into'];
+  const clearMarks = () => document.querySelectorAll('.drop-before, .drop-after, .drop-into').forEach((x) => x.classList.remove(...MARKS));
+  function zoneAt(el, ev, allowed) {
+    const b = el.getBoundingClientRect();
+    const t = axis() === 'x' ? (ev.clientX - b.left) / b.width : (ev.clientY - b.top) / b.height;
+    let z = t < 0.28 ? 'before' : t > 0.72 ? 'after' : 'into';
+    if (z === 'into' && !allowed.includes('into')) z = t < 0.5 ? 'before' : 'after';
+    return allowed.includes(z) ? z : allowed.includes('into') ? 'into' : allowed[0];
+  }
+  function attach(el, target, { source = true } = {}) {
+    el.addEventListener('dragstart', (ev) => {
+      // Pictures and links can be dragged too; only something marked draggable starts a move.
+      const handle = ev.target && ev.target.closest ? ev.target.closest('[draggable="true"]') : null;
+      if (!source || claimed.has(ev) || !handle || !el.contains(handle)) return;
+      claimed.add(ev);
+      dragging = target;
+      ev.dataTransfer.effectAllowed = 'move';
+      try { ev.dataTransfer.setData('text/plain', `${target.kind}:${target.id}`); } catch { /* old browsers */ }
+      el.classList.add('dragging');
+    });
+    el.addEventListener('dragend', () => { dragging = null; el.classList.remove('dragging'); clearMarks(); });
+    el.addEventListener('dragover', (ev) => {
+      if (!dragging || ev.defaultPrevented || (dragging.kind === target.kind && dragging.id === target.id)) return;
+      const allowed = zones(dragging, target);
+      if (!allowed.length) return;
+      ev.preventDefault();
+      const z = zoneAt(el, ev, allowed);
+      clearMarks();
+      el.classList.add('drop-' + z);
+    });
+    el.addEventListener('dragleave', () => el.classList.remove(...MARKS));
+    el.addEventListener('drop', (ev) => {
+      const z = ['into', 'before', 'after'].find((x) => el.classList.contains('drop-' + x));
+      if (!dragging || !z) return;
+      ev.preventDefault();
+      const d = dragging; dragging = null;
+      clearMarks();
+      onDrop(d, target, z);
+    });
+  }
+  return { attach };
+}
+
 export function createFolders(ctx) {
   // ctx: { S, servers() → real servers (no group chats), favorites() → Set of favorite server ids, rerender(),
   //        openServer(id), serverUnread(s), serverMenuItems(s), setNotify(key, level), isMutedServer(s),
@@ -126,40 +183,13 @@ export function createFolders(ctx) {
   }
 
   // ------------------------------------------------------------------ drag and drop
-  let dragging = null; // { kind, id }
   const vertical = () => document.documentElement.dataset.rail !== 'top';
-  function zone(el, ev) {
-    const b = el.getBoundingClientRect();
-    const t = vertical() ? (ev.clientY - b.top) / b.height : (ev.clientX - b.left) / b.width;
-    return t < 0.28 ? 'before' : t > 0.72 ? 'after' : 'into';
-  }
-  function clearMarks() { document.querySelectorAll('.drop-before, .drop-after, .drop-into').forEach((x) => x.classList.remove('drop-before', 'drop-after', 'drop-into')); }
-  function dnd(el, target) {
-    el.addEventListener('dragstart', (ev) => {
-      dragging = { kind: target.kind, id: target.id };
-      ev.dataTransfer.effectAllowed = 'move';
-      try { ev.dataTransfer.setData('text/plain', `${target.kind}:${target.id}`); } catch { /* old browsers */ }
-      el.classList.add('dragging');
-    });
-    el.addEventListener('dragend', () => { dragging = null; el.classList.remove('dragging'); clearMarks(); });
-    el.addEventListener('dragover', (ev) => {
-      if (!dragging || (dragging.kind === target.kind && dragging.id === target.id)) return;
-      ev.preventDefault();
-      let z = zone(el, ev);
-      if (z === 'into' && dragging.kind === 'folder') z = ev.clientY < el.getBoundingClientRect().top + el.offsetHeight / 2 ? 'before' : 'after';
-      clearMarks();
-      el.classList.add('drop-' + z);
-    });
-    el.addEventListener('dragleave', () => el.classList.remove('drop-before', 'drop-after', 'drop-into'));
-    el.addEventListener('drop', (ev) => {
-      ev.preventDefault();
-      const d = dragging; dragging = null;
-      const z = el.classList.contains('drop-into') ? 'into' : el.classList.contains('drop-before') ? 'before' : 'after';
-      clearMarks();
-      if (!d) return;
-      move(d, target, z);
-    });
-  }
+  // A folder can't go into anything, so on a folder or server it lands before or after.
+  const dnd = dragDrop({
+    axis: () => (vertical() ? 'y' : 'x'),
+    zones: (d) => (d.kind === 'folder' ? ['before', 'after'] : ['before', 'after', 'into']),
+    onDrop: (d, target, z) => move(d, target, z),
+  }).attach;
   // Moves a dragged server or folder relative to a target.
   function move(d, target, z) {
     const r = rail();

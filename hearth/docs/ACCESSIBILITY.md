@@ -77,6 +77,16 @@ Each item is checked by `npm run test:a11y` unless marked otherwise.
   - before this change, Tab walked through every message's five toolbar buttons on the way to the message box.
   - The code is `roveMessage`, `setCurrentMessage`, `ensureCurrentMessage` and `messageListKeys` in `app.js`.
 - Header redraws keep focus on the same button. "Show members" becomes "Hide members" without dropping focus.
+- Sidebar redraws keep focus too: if a channel (its name or its gear) or a category name had it, the new one gets
+  it (`sidebarFocus` in `app.js`). That covers opening or closing a category and live updates from other people.
+- **Arranging channels without dragging.** Dragging channels and categories is mouse-only, so every move has a menu
+  item: a channel's menu (right-click, Shift+F10, or **More** in the channel header) and a category's menu have
+  **Move up** and **Move down**. At the top or bottom of its category, a channel's item moves it into the next
+  category and says so ("Move down · to Voice", read as part of the item's name). After a move the focus stays on
+  the channel, and a toast ("#news moved up.", in the polite live region) says what happened. Moving into a
+  collapsed category opens it, so the channel is still there to focus (and to move again). If a live update
+  redrew the sidebar while the menu was open, the focus goes to the moved channel rather than the page. Items that
+  would be refused (Manage Channels denied in that channel, or in one of a category's channels) aren't offered.
 - On phones, Esc closes the navigation drawer and returns focus to its button.
 
 ### Announcements

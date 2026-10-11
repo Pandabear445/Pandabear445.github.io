@@ -35,6 +35,7 @@ const recur = require('./recurrence');
 // sweep deletes it; LIVE is the same test in SQL (one placeholder: the time now).
 const DISAPPEAR = require('./disappear');
 const { alive, LIVE } = DISAPPEAR;
+const ORDER = require('./channelorder');
 const perms = makePerms(db);
 
 // ---------------------------------------------------------------- config
@@ -277,8 +278,7 @@ function serverCommon(s) {
   const roleDefs = roleRows.map((r) => ({ id: r.id, name: r.name, color: r.color, icon: r.icon, position: r.position, permissions: r.permissions, hoist: !!r.hoist, mentionable: !!r.mentionable, everyone: r.id === s.id,
     selfAssign: !!r.self_assign, ...(pickIssues[r.id] ? { selfAssignIssue: pickIssues[r.id] } : {}) }));
   const emojis = db.prepare('SELECT id, name, url, animated FROM emojis WHERE server_id = ? ORDER BY name').all(s.id).map((e) => ({ ...e, animated: !!e.animated }));
-  let categoryOrder = [];
-  try { categoryOrder = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
+  const categoryOrder = ORDER.parseOrder(s.category_order);
   const out = {
     channels, memberIds, memberRoles, roleDefs, emojis, categoryOrder,
     // Bots working for this server (shown in the member list like on Discord): the news bot while it follows
@@ -320,13 +320,17 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
   const channels = common.channels
     .map((c) => ({ c, p: ev ? ev.channel(c, uid) : perms.channel(s, c, uid) }))
     .filter(({ p }) => p & PM.VIEW_CHANNEL)
-    .map(({ c, p }) => ({
-      ...serializeChannel(c), perms: p,
+    // position: the channel's place among the ones this member sees (they're in order), so gaps left by private
+    // channels don't tell how many there are or where they sit. The apps only compare positions.
+    .map(({ c, p }, i) => ({
+      ...serializeChannel(c), position: i, perms: p,
       overrides: manage ? db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?').all(c.id) : undefined,
     }));
+  // Only the categories this member has a channel in: a category of private channels doesn't give its name away.
+  const cats = new Set(channels.map(ORDER.catOf));
   const out = {
     id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: common.memberIds,
-    roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder,
+    roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder.filter((k) => cats.has(k)),
     bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
   };
   if (myBase & PM.MANAGE_ROLES) out.soldRoles = common.soldRoles;
@@ -2262,8 +2266,21 @@ api.patch('/servers/:id', auth, (req, res) => {
   const srv = requireServer(req.params.id, req.userId);
   // Anyone in a group DM can rename it; servers need Manage Server (or Manage Channels for category order).
   const body = req.body || {};
-  const onlyOrder = Object.keys(body).every((k) => k === 'categoryOrder');
-  if (srv.kind !== 'group' && !can(srv, req.userId, onlyOrder ? PM.MANAGE_CHANNELS : PM.MANAGE_SERVER)) fail(403, 'You need the Manage Server permission.');
+  const onlyOrder = Object.keys(body).every((k) => k === 'categoryOrder' || k === 'categoryOrderFrom');
+  if (srv.kind !== 'group' && !can(srv, req.userId, onlyOrder ? PM.MANAGE_CHANNELS : PM.MANAGE_SERVER)) fail(403, onlyOrder ? 'You need the Manage Channels permission.' : 'You need the Manage Server permission.');
+  // The category order is about channels: it needs Manage Channels however it comes (with other changes, or in a
+  // group chat), and is worked out before anything is written, since it can be refused (server/channelorder.js).
+  let categoryPlan = null;
+  if (body.categoryOrder !== undefined) {
+    if (!can(srv, req.userId, PM.MANAGE_CHANNELS)) fail(403, 'You need the Manage Channels permission.');
+    if (!Array.isArray(body.categoryOrder) || body.categoryOrder.length > 500) fail(400, 'Send the categories in order.');
+    // categoryOrderFrom: the order the app showed; a list built on an older one is refused rather than undoing a move.
+    const was = body.categoryOrderFrom;
+    if (was !== undefined && (!Array.isArray(was) || was.length > 500 || !was.every((k) => typeof k === 'string' && k.length <= 64))) fail(400, 'Send the categories in order.');
+    rateLimit('chanorder:' + req.userId, 30, 60 * 1000);
+    const { channels, seen, managed } = channelAccess(srv, req.userId);
+    categoryPlan = ORDER.planCategories({ channels, stored: ORDER.parseOrder(srv.category_order), requested: body.categoryOrder.map(cleanCategory), seen, managed, from: was, fail });
+  }
   const changes = []; // for the server's audit log: what changed (not the new text)
   if (body.description !== undefined) {
     const description = String(body.description || '').slice(0, 300);
@@ -2282,10 +2299,10 @@ api.patch('/servers/:id', auth, (req, res) => {
     if (oldImage && oldImage !== (next.background && next.background.image)) removeUpload(oldImage);
   }
   let reordered = false;
-  if (Array.isArray(body.categoryOrder)) {
-    const order = [...new Set(body.categoryOrder.map((c) => String(c).trim().slice(0, 32)).filter(Boolean))].slice(0, 50);
-    reordered = JSON.stringify(order) !== (srv.category_order || '[]');
-    db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify(order), srv.id);
+  if (categoryPlan) {
+    reordered = categoryPlan.moved.length > 0;
+    const order = JSON.stringify(categoryPlan.order);
+    if (order !== (srv.category_order || '[]')) db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(order, srv.id);
   }
   let renamed = null;
   if (body.name !== undefined) {
@@ -2761,27 +2778,84 @@ api.post('/servers/:id/keys/self', auth, (req, res) => {
 // ---------------------------------------------------------------- channels
 const cleanCategory = (c) => String(c || '').trim().slice(0, 32);
 
-// Reorder channels (ids in display order) — admins only.
+// A server's channels by position, and which of them this person can see and manage (one permission read for all).
+function channelAccess(s, userId) {
+  const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id);
+  const ev = perms.forServer(s, [userId]);
+  const seen = new Set(); const managed = new Set();
+  for (const c of channels) {
+    const p = ev.channel(c, userId);
+    if (p & PM.VIEW_CHANNEL) seen.add(c.id);
+    if ((p & PM.MANAGE_CHANNELS) === PM.MANAGE_CHANNELS) managed.add(c.id);
+  }
+  return { channels, seen, managed };
+}
+
+// Reorder channels, and move them into other categories (drag and drop, or Move up / Move down in the channel menu).
+//   { ids: every channel you can see, top to bottom; categories?: { channelId: category } for the ones changing category;
+//     from?: [[category, [channel ids]], …], the layout your app showed, so a list built on an old one is refused }
+// Needs Manage Channels; what you can't see or can't manage keeps its place (server/channelorder.js has the rules).
+// Open apps get the new order at once; the server's audit log gets a channel_update for each change of category and
+// one channel_reorder for the rest (naming the channel when only one moved).
 api.post('/servers/:id/channel-order', auth, (req, res) => {
   const s = requireAdmin(req.params.id, req.userId);
-  const ids = Array.isArray((req.body || {}).ids) ? req.body.ids.map(String) : [];
-  const upd = db.prepare('UPDATE channels SET position = ? WHERE id = ? AND server_id = ? AND position != ?');
-  let moved = 0;
-  db.transaction(() => ids.forEach((id, i) => { moved += upd.run(i, id, s.id, i).changes; }))();
-  if (moved) serverAudit(s, req.userId, 'channel_reorder', null, { count: moved });
-  emitServer(s.id);
-  res.json({ ok: true });
+  rateLimit('chanorder:' + req.userId, 30, 60 * 1000);
+  const body = req.body || {};
+  const ids = body.ids;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 1000 || !ids.every((x) => typeof x === 'string' && x.length <= 64)) fail(400, 'Send the channels in order.');
+  if (new Set(ids).size !== ids.length) fail(400, 'Each channel can only be in the list once.');
+  const moves = new Map();
+  if (body.categories !== undefined) {
+    const m = body.categories;
+    if (!m || typeof m !== 'object' || Array.isArray(m) || Object.keys(m).length > ids.length) fail(400, 'Send each moved channel with its new category.');
+    for (const [id, name] of Object.entries(m)) {
+      const k = typeof name === 'string' ? cleanCategory(name) : '';
+      if (!k) fail(400, 'Give the category a name.');
+      moves.set(id, k);
+    }
+  }
+  const from = body.from;
+  if (from !== undefined && (!Array.isArray(from) || from.length > ids.length
+    || !from.every((g) => Array.isArray(g) && g.length === 2 && typeof g[0] === 'string' && g[0].length <= 64 && Array.isArray(g[1]) && g[1].every((x) => typeof x === 'string' && x.length <= 64))
+    || from.reduce((n, g) => n + g[1].length, 0) > ids.length)) fail(400, 'Send the channels in order.');
+  const { channels, seen, managed } = channelAccess(s, req.userId);
+  const plan = ORDER.planChannels({ channels, stored: ORDER.parseOrder(s.category_order), ids, moves, seen, managed, from, fail });
+  if (plan.updates.length) {
+    const pos = db.prepare('UPDATE channels SET position = ? WHERE id = ?');
+    const both = db.prepare('UPDATE channels SET position = ?, category = ? WHERE id = ?');
+    db.transaction(() => { for (const u of plan.updates) { if (u.category !== undefined) both.run(u.position, u.category, u.c.id); else pos.run(u.position, u.c.id); } })();
+  }
+  // Like Edit channel's category field: the entry says where it went (readers who can't see the channel get neither).
+  for (const m of plan.recategorized) serverAudit(s, req.userId, 'channel_update', m.c.id, { channel: chanRef(s, m.c), changes: { category: { from: m.from, to: m.to } } }, m.c.id);
+  if (plan.reordered.length) {
+    const one = plan.reordered.length === 1 ? plan.reordered[0] : null;
+    serverAudit(s, req.userId, 'channel_reorder', one && one.id, { count: plan.reordered.length, channel: one ? chanRef(s, one) : undefined }, one && one.id);
+  }
+  if (plan.updates.length) emitServer(s.id);
+  res.json({ ok: true, moved: plan.recategorized.length + plan.reordered.length });
 });
+// Rename a category { from, to } (its menu → Rename category). Naming it like another category merges the two.
+// Needs what moving its channels would (server/channelorder.js planRename): Manage Channels in each channel of it you
+// see, and for a merge, seeing every one of them. A category you see no channel of is answered like a made-up name.
 api.post('/servers/:id/categories/rename', auth, (req, res) => {
   const s = requireAdmin(req.params.id, req.userId);
-  const from = cleanCategory((req.body || {}).from);
-  const to = cleanCategory((req.body || {}).to);
+  const body = req.body || {};
+  const from = typeof body.from === 'string' ? cleanCategory(body.from) : '';
+  const to = typeof body.to === 'string' ? cleanCategory(body.to) : '';
   if (!from || !to) fail(400, 'Give the category a name.');
-  db.prepare('UPDATE channels SET category = ? WHERE server_id = ? AND category = ?').run(to, s.id, from);
-  let order = [];
-  try { order = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
-  db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify([...new Set(order.map((c) => (c === from ? to : c)))]), s.id);
-  if (from !== to) serverAudit(s, req.userId, 'category_rename', null, { from, to });
+  // Each rename goes out to every member's app, like a reorder, so they share a limit.
+  rateLimit('chanorder:' + req.userId, 30, 60 * 1000);
+  const { channels, seen, managed } = channelAccess(s, req.userId);
+  const { relabel, merge } = ORDER.planRename({ channels, seen, managed, from, to, fail });
+  if (from === to) return res.json({ ok: true });
+  const set = db.prepare('UPDATE channels SET category = ? WHERE id = ?');
+  db.transaction(() => { for (const c of relabel) set.run(to, c.id); })();
+  // The renamed category keeps its place; merged into another one, it takes that one's place (which may be a
+  // category this person can't see: theirs mustn't move it).
+  const order = ORDER.parseOrder(s.category_order).filter((k) => typeof k === 'string');
+  const next = merge ? order.filter((k) => k !== from) : order.map((k) => (k === from ? to : k));
+  db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify([...new Set(next)]), s.id);
+  serverAudit(s, req.userId, 'category_rename', null, { from, to });
   emitServer(s.id);
   res.json({ ok: true });
 });

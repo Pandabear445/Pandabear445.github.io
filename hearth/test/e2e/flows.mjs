@@ -1731,12 +1731,16 @@ async function discordImport(t) {
   // (a second press would make a second server).
   const create = p.locator('.modal-foot .btn.primary', { hasText: 'Create server' });
   const muted = p.locator('.di-row', { hasText: 'Muted' }).locator('input[type=checkbox]');
-  await bob.page.route('**/api/imports/discord', async (route) => { await new Promise((r) => setTimeout(r, 3000)); await route.continue(); });
+  const held = []; // each request held back, until it has gone on
+  await bob.page.route('**/api/imports/discord', (route) => { const go = new Promise((r) => setTimeout(r, 3000)).then(() => route.continue()); held.push(go); return go; });
   await muted.check();
   await muted.uncheck();
   await create.click();
   await new Promise((r) => setTimeout(r, 1200));
   check(await create.isDisabled(), 'Create should stay off while the server is being made.');
+  // Let the held requests through before taking the hold away: unrouting one still waiting would fail it (and, with
+  // more flows after this one, bring the run down).
+  await Promise.all(held);
   await bob.page.unroute('**/api/imports/discord');
   await bob.page.locator('#sidebar-head .server-head-name', { hasText: exact('Pinecone Import') }).waitFor();
   const done = await bob.dialog('Imported Pinecone Import');
@@ -1748,6 +1752,110 @@ async function discordImport(t) {
   check(!(await bob.channelRow('trail-photos').count()), 'A channel left out should not be created.');
   await bob.openChannel('general');
   await bob.send('First message after the import: pinecone');
+}
+
+// ------------------------------------------------------------------ 22. channel order: drag and drop, and the keyboard
+// Bob (who owns the server now) drags a new channel onto the Voice category's name and then the Voice category above
+// Text; alice, who doesn't manage channels, sees each change at once and has nothing to drag. Then Move down from the
+// channel menu, by keyboard: inside Voice, then on into the next category (collapsed: it opens), with the focus
+// staying on the channel. Last, a menu left open while another of bob's devices reorders doesn't undo that.
+async function channelOrder(t) {
+  const { alice, bob } = t.people;
+  await bob.railButton(SERVER);
+  await alice.railButton(SERVER);
+  await bob.serverMenu('Create channel');
+  const cc = await bob.dialog('Create channel');
+  await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('drag-me');
+  await cc.locator('.modal-foot .btn.primary').click();
+  await bob.page.waitForSelector('#composer-input[placeholder="Message #drag-me"]');
+  await alice.channelRow('drag-me').waitFor();
+  const group = (p, cat) => p.$(`#sidebar-body .cat-group[data-cat="${cat}"]`);
+  const namesIn = (p, cat) => group(p, cat).locator('.ch-row .ch-name').allInnerTexts();
+  const categories = (p) => p.page.locator('#sidebar-body .cat-group').evaluateAll((els) => els.map((e) => e.dataset.cat));
+  check(!(await alice.$('#sidebar-body [draggable="true"]').count()), 'Alice can’t manage channels, so nothing in her channel list should be draggable.');
+  await alice.channelRow('drag-me').locator('.ch-main').click({ button: 'right' });
+  await alice.menuItem('Copy channel link').waitFor();
+  check(!(await alice.menuItem('Move up').count()) && !(await alice.menuItem('Move down').count()), 'Alice’s channel menu should not offer to move channels.');
+  await alice.page.keyboard.press('Escape');
+
+  // Onto the Voice category's name: first in Voice, for alice too.
+  await bob.channelRow('drag-me').locator('.ch-main').dragTo(group(bob, 'Voice').locator('.cat-head'));
+  await group(alice, 'Voice').locator('.ch-row').filter({ has: alice.page.locator('.ch-name', { hasText: exact('drag-me') }) }).waitFor();
+  check((await namesIn(alice, 'Voice'))[0] === 'drag-me', `#drag-me should be first in Voice (alice sees ${(await namesIn(alice, 'Voice')).join(', ')}).`);
+  check(!(await namesIn(alice, 'Text')).includes('drag-me'), '#drag-me should have left Text.');
+
+  // The Voice category above Text, dragged by its name onto the top of Text.
+  await group(bob, 'Voice').locator('.cat-toggle').dragTo(group(bob, 'Text'), { targetPosition: { x: 30, y: 3 } });
+  await alice.page.waitForFunction(() => {
+    const cats = [...document.querySelectorAll('#sidebar-body .cat-group')].map((e) => e.dataset.cat);
+    return cats.indexOf('Voice') >= 0 && cats.indexOf('Voice') < cats.indexOf('Text');
+  });
+  const order = await categories(bob);
+  check(order.indexOf('Voice') === order.indexOf('Text') - 1, `Voice should sit right above Text for bob (${order.join(', ')}).`);
+
+  // The keyboard: Move down from the channel's menu, chosen with Enter. The focus stays on the channel as it moves.
+  const voiceNames = await namesIn(bob, 'Voice');
+  const main = bob.channelRow('drag-me').locator('.ch-main');
+  await main.focus();
+  await main.click({ button: 'right' });
+  await bob.menuItem('Move down').press('Enter');
+  await bob.toast('#drag-me moved down.');
+  await alice.page.waitForFunction((n) => {
+    const rows = [...document.querySelectorAll('#sidebar-body .cat-group[data-cat="Voice"] .ch-row .ch-name')].map((e) => e.textContent);
+    return rows.indexOf('drag-me') === 1 && rows.length === n;
+  }, voiceNames.length);
+  const focusedOn = () => bob.page.evaluate(() => { const r = document.activeElement && document.activeElement.closest('.ch-row'); return r ? r.querySelector('.ch-name').textContent : null; });
+  check(await focusedOn() === 'drag-me', `The focus should stay on #drag-me after moving it (it is on ${await focusedOn()}).`);
+  // At the bottom of Voice, Move down goes on into the category below (Text), first in it.
+  for (let i = 2; i < voiceNames.length; i++) {
+    await main.click({ button: 'right' });
+    await bob.menuItem('Move down').press('Enter');
+    await bob.toast('#drag-me moved down.');
+  }
+  // With Text collapsed and another channel open, so nothing else keeps #drag-me drawn there: Text opens.
+  await bob.openChannel('general');
+  await group(bob, 'Text').locator('.cat-toggle').click();
+  await group(bob, 'Text').locator('.cat-toggle[aria-expanded="false"]').waitFor();
+  await main.focus();
+  await main.click({ button: 'right' });
+  const last = bob.menuItem('Move down');
+  check((await last.innerText()).includes('to Text'), `At the bottom of Voice, Move down should say where it goes (it says “${(await last.innerText()).trim()}”).`);
+  await last.press('Enter');
+  await bob.toast('#drag-me moved to Text.');
+  check(await group(bob, 'Text').locator('.cat-toggle').getAttribute('aria-expanded') === 'true', 'Moving a channel into a collapsed category from its menu should open the category.');
+  check((await namesIn(bob, 'Text'))[0] === 'drag-me', `#drag-me should be first in Text for bob (${(await namesIn(bob, 'Text')).join(', ')}).`);
+  check(await focusedOn() === 'drag-me', `The focus should stay on #drag-me after moving it into a collapsed category (it is on ${await focusedOn()}).`);
+  await alice.page.waitForFunction(() => document.querySelector('#sidebar-body .cat-group[data-cat="Text"] .ch-row .ch-name')?.textContent === 'drag-me');
+
+  // The menu stays open while another of bob's devices moves the last channel of Text to the top. Move down then
+  // goes from the list as it is now (below the next channel), and that other move stands.
+  await main.click({ button: 'right' });
+  const down = bob.menuItem('Move down');
+  await down.waitFor();
+  const lastInText = await bob.page.evaluate(async (name) => {
+    const token = localStorage.getItem('hearth.token');
+    const call = async (method, path, body) => (await fetch('/api' + path, { method, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) })).json();
+    const s = (await call('GET', '/bootstrap')).servers.find((x) => x.name === name);
+    const catOf = (c) => c.category || (c.type === 'voice' ? 'Voice' : 'Text');
+    const chans = [...s.channels].sort((a, b) => a.position - b.position);
+    const seen = [...new Set(chans.map(catOf))];
+    const cats = [...s.categoryOrder.filter((k) => seen.includes(k)), ...seen.filter((k) => !s.categoryOrder.includes(k))];
+    const groups = cats.map((k) => chans.filter((c) => catOf(c) === k));
+    const text = groups[cats.indexOf('Text')];
+    const moved = text.pop();
+    text.unshift(moved);
+    await call('POST', `/servers/${s.id}/channel-order`, { ids: groups.flat().map((c) => c.id) });
+    return moved.name;
+  }, SERVER);
+  await bob.page.waitForFunction((n) => document.querySelector('#sidebar-body .cat-group[data-cat="Text"] .ch-row .ch-name')?.textContent === n, lastInText);
+  const was = await namesIn(bob, 'Text');
+  check(was[1] === 'drag-me' && was.length >= 3, `Text should read ${lastInText}, drag-me, … for bob (${was.join(', ')}).`);
+  await down.press('Enter');
+  await bob.toast('#drag-me moved down.');
+  await bob.page.waitForFunction((n) => [...document.querySelectorAll('#sidebar-body .cat-group[data-cat="Text"] .ch-row .ch-name')].map((e) => e.textContent).indexOf('drag-me') === n, 2);
+  const now = await namesIn(bob, 'Text');
+  check(now[0] === lastInText && now[1] === was[2], `The other device's move should stand, with #drag-me below ${was[2]} (Text reads ${now.join(', ')}).`);
+  check(await focusedOn() === 'drag-me', `The focus should be on #drag-me after the move (it is on ${await focusedOn()}).`);
 }
 
 export const FLOWS = [
@@ -1782,4 +1890,5 @@ export const FLOWS = [
   ['threads: new replies and pings on the message and the Threads button, the Threads panel, read when opened', threads],
   ['link previews: ask, turn down, preview, send; the reader sees the card and never contacts the site; keyboard; editing a link in Always mode', linkPreviews],
   ['discord import: paste a template, see what is skipped, leave some out, create', discordImport],
+  ['channel order: drag a channel into a category and a category above another, live for everyone; Move down by keyboard keeps focus (into a collapsed category too); a menu left open doesn’t undo another move', channelOrder],
 ];

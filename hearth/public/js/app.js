@@ -28,7 +28,7 @@ import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, instal
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn, markInvalid, clearInvalid, trapTab } from './ui.js';
 import { openSettings, applyAppearance, confirmedCall, displayNameDialog } from './settings.js';
-import { createFolders } from './folders.js';
+import { createFolders, dragDrop } from './folders.js';
 import { createUpdates } from './updates.js';
 import { createRecall } from './recall-host.js';
 import { openMemberships, membershipsTab } from './memberships.js';
@@ -1899,13 +1899,32 @@ function renderRail() {
 }
 
 // ---- sidebar
+// Redraws replace the sidebar's buttons. When one of a server's channels or categories had keyboard focus (after Move
+// up in its menu, opening a category, or a live update from someone else), this finds it again among the new ones.
+function sidebarFocus() {
+  const el = document.activeElement;
+  const body = $('#sidebar-body');
+  if (!el || !body || !body.contains(el) || !window.CSS || !CSS.escape) return null;
+  const row = el.closest('[data-cid]');
+  if (row) return `[data-cid="${CSS.escape(row.dataset.cid)}"] ${el.classList.contains('ch-gear') ? '.ch-gear' : '.ch-main'}`;
+  const group = el.closest('.cat-group');
+  if (group && el.classList.contains('cat-toggle')) return `.cat-group[data-cat="${CSS.escape(group.dataset.cat)}"] .cat-toggle`;
+  return null;
+}
 function renderSidebar() {
+  const focused = sidebarFocus();
   const head = clear($('#sidebar-head'));
   head.classList.remove('has-banner');
   const body = clear($('#sidebar-body'));
   if (!S.me) return;
   const server = currentServer();
-  if (server && !isGroup(server)) return renderServerSidebar(server, head, body);
+  if (server && !isGroup(server)) {
+    renderServerSidebar(server, head, body);
+    // Back on the same channel or category, now drawn anew.
+    const el = focused && body.querySelector(focused);
+    if (el) el.focus({ preventScroll: true });
+    return;
+  }
   // Home / messages sidebar
   head.append(h('button', { class: 'find-btn', onclick: () => openSearch(), 'aria-label': 'Search (Ctrl+K)' }, icon('search'), h('span', null, 'Search or jump to\u2026'), h('kbd', null, 'Ctrl K')));
   const pending = Object.values(S.relationships).filter((r) => r.direction === 'incoming').length;
@@ -2051,20 +2070,17 @@ function notifyItems(key) {
 }
 
 // ---- server sidebar with categories
+// A channel's category (older channels without one go under Text or Voice, as on the server).
+const catOf = (c) => c.category || (c.type === 'voice' ? 'Voice' : 'Text');
 function orderedCategories(server) {
   const seen = [];
   const byPos = [...server.channels].sort((a, b) => a.position - b.position);
-  byPos.forEach((c) => { const cat = c.category || (c.type === 'voice' ? 'Voice' : 'Text'); if (!seen.includes(cat)) seen.push(cat); });
+  byPos.forEach((c) => { const cat = catOf(c); if (!seen.includes(cat)) seen.push(cat); });
   const order = (server.categoryOrder || []).filter((c) => seen.includes(c));
   return [...order, ...seen.filter((c) => !order.includes(c))];
 }
-function orderedChannels(server) {
-  const out = [];
-  for (const cat of orderedCategories(server)) {
-    out.push(...server.channels.filter((c) => (c.category || (c.type === 'voice' ? 'Voice' : 'Text')) === cat).sort((a, b) => a.position - b.position));
-  }
-  return out;
-}
+const channelsIn = (server, cat) => server.channels.filter((c) => catOf(c) === cat).sort((a, b) => a.position - b.position);
+const orderedChannels = (server) => orderedCategories(server).flatMap((cat) => channelsIn(server, cat));
 function channelIcon(c) {
   if (c.type === 'voice') return 'speaker';
   if (/announce|news|updates/i.test(c.name)) return 'megaphone';
@@ -2093,12 +2109,13 @@ function renderServerSidebar(server, head, body) {
   const collapsed = P.collapsed[server.id] || [];
   const cats = orderedCategories(server);
   cats.forEach((cat, ci) => {
-    const chans = server.channels.filter((c) => (c.category || (c.type === 'voice' ? 'Voice' : 'Text')) === cat).sort((a, b) => a.position - b.position);
+    const chans = channelsIn(server, cat);
     const isCollapsed = collapsed.includes(cat);
     const catUnread = isCollapsed && chans.some((c) => S.unread.has('c:' + c.id) && !isMuted('c:' + c.id));
-    body.append(h('div', { class: 'cat-head' },
+    const head = h('div', { class: 'cat-head' },
       h('button', {
         class: `cat-toggle${catUnread ? ' unread' : ''}`, 'aria-expanded': String(!isCollapsed),
+        draggable: canMoveCategory(server, cat) ? 'true' : null,
         onclick: () => {
           const all = P.collapsed; const list = all[server.id] || [];
           all[server.id] = isCollapsed ? list.filter((x) => x !== cat) : [...list, cat];
@@ -2106,14 +2123,23 @@ function renderServerSidebar(server, head, body) {
         },
         oncontextmenu: admin ? (e) => contextMenu(e, categoryMenuItems(server, cat, ci, cats)) : null,
       }, icon('chevron', `ic cat-chev${isCollapsed ? ' closed' : ''}`), h('span', null, cat)),
-      admin ? ibtn('plus', `Create channel in ${cat}`, () => openCreateChannel(server, chans[0] ? chans[0].type : 'text', cat), { cls: 'sm' }) : null));
+      admin ? ibtn('plus', `Create channel in ${cat}`, () => openCreateChannel(server, chans[0] ? chans[0].type : 'text', cat), { cls: 'sm' }) : null);
+    // Each category with its channels, so a category is dragged (and dropped on) as a whole.
+    const group = h('div', { class: 'cat-group', dataset: { cat } }, head);
+    body.append(group);
+    if (admin) {
+      channelDrag.attach(group, { kind: 'category', id: cat });
+      channelDrag.attach(head, { kind: 'catHead', id: cat }, { source: false });
+    }
     for (const c of chans) {
       const active = S.view.channelId === c.id;
       const k = 'c:' + c.id;
       // Collapsed categories still show the channel you're in, plus ones with mentions.
       if (isCollapsed && !active && !mentionsOf(k) && !(voice && voice.channelId === c.id)) continue;
-      body.append(channelRow(c, server));
-      if (c.type === 'voice') body.append(h('div', { class: 'vc-users', 'data-vc-users': c.id }));
+      const row = channelRow(c, server);
+      if (admin) channelDrag.attach(row, { kind: 'channel', id: c.id, category: cat });
+      group.append(row);
+      if (c.type === 'voice') group.append(h('div', { class: 'vc-users', 'data-vc-users': c.id }));
     }
   });
   if (!server.channels.length) body.append(h('p', { class: 'sidebar-empty' }, admin ? 'No channels yet. Use the server menu to create one.' : 'No channels yet.'));
@@ -2132,7 +2158,7 @@ function channelRow(c, server) {
     oncontextmenu: (e) => contextMenu(e, channelMenuItems(c, server)),
   },
   h('button', {
-    class: 'ch-main', 'data-nav': '', 'aria-current': active ? 'page' : null,
+    class: 'ch-main', 'data-nav': '', 'aria-current': active ? 'page' : null, draggable: canMoveChannel(server, c) ? 'true' : null,
     'aria-label': `${c.type === 'voice' ? 'Voice channel' : 'Channel'} ${c.name}${mentions ? `, ${mentions} mentions` : unread ? ', unread' : ''}${muted ? ', muted' : ''}`,
     onclick: () => (c.type === 'voice' ? (connected ? openVoiceRoom(c.id, server.id) : joinVoice(c, server)) : openChannel(c.id, server.id)),
   }, icon(mentions ? 'at' : channelIcon(c), 'ic ch-ic'), h('span', { class: 'ch-name' }, c.name),
@@ -2142,7 +2168,6 @@ function channelRow(c, server) {
 }
 function channelMenuItems(c, server) {
   const k = 'c:' + c.id;
-  const admin = isAdmin(server);
   const edit = canEditChannel(server, c);
   const roles = canEditChannelPerms(server, c);
   const pk = S.notifyPrefs[k];
@@ -2162,8 +2187,7 @@ function channelMenuItems(c, server) {
     canManageHooks(server, c) ? { label: 'Webhooks', icon: 'link', action: () => openEditChannel(c, 'hooks') } : null,
     roles && c.type === 'text' ? { label: 'Make read-only (announcements)', icon: 'megaphone', action: () => quickOverride(server, c, 'readonly') } : null,
     roles ? { label: 'Make private', icon: 'lock', action: () => quickOverride(server, c, 'private') } : null,
-    admin ? { label: 'Move up', icon: 'arrowUp', action: () => moveChannel(server, c, -1) } : null,
-    admin ? { label: 'Move down', icon: 'arrowDown', action: () => moveChannel(server, c, 1) } : null,
+    ...channelMoveItems(server, c),
     c.type === 'text' && canIn(c, PERMS.MANAGE_MESSAGES) ? { label: 'Delete recent messages\u2026', icon: 'trash', danger: true, action: () => openPurgeRecent(c) } : null,
     edit ? { label: 'Delete channel', icon: 'trash', danger: true, action: () => deleteChannel(c) } : null,
   ];
@@ -2189,27 +2213,145 @@ async function quickOverride(server, c, kind) {
 }
 
 function categoryMenuItems(server, cat, i, cats) {
+  // Renaming relabels every channel in it, so it takes what moving the category does (the server checks the same).
+  const movable = canMoveCategory(server, cat);
   return [
     { label: 'Create channel here', icon: 'plus', action: () => openCreateChannel(server, 'text', cat) },
-    { label: 'Rename category', icon: 'edit', action: () => renameCategory(server, cat) },
-    i > 0 ? { label: 'Move up', icon: 'arrowUp', action: () => moveCategory(server, cats, i, -1) } : null,
-    i < cats.length - 1 ? { label: 'Move down', icon: 'arrowDown', action: () => moveCategory(server, cats, i, 1) } : null,
+    movable ? { label: 'Rename category', icon: 'edit', action: () => renameCategory(server, cat) } : null,
+    movable && i > 0 ? { label: 'Move up', icon: 'arrowUp', action: () => moveCategoryBy(server.id, cat, -1) } : null,
+    movable && i < cats.length - 1 ? { label: 'Move down', icon: 'arrowDown', action: () => moveCategoryBy(server.id, cat, 1) } : null,
   ];
 }
-async function moveCategory(server, cats, i, dir) {
-  const order = [...cats];
-  [order[i], order[i + dir]] = [order[i + dir], order[i]];
-  try { await api('PATCH', `/servers/${server.id}`, { categoryOrder: order }); } catch (e) { toast(e.message, 'error'); }
+
+// ---- arranging channels and categories (Manage Channels): drag and drop, or Move up / Move down in their menus
+// The server gets the whole list as you see it (server/channelorder.js). What you can't see or can't manage keeps
+// its place there, so a channel where Manage Channels is denied to you isn't draggable, nor is a category holding one.
+const canMoveChannel = (server, c) => canEditChannel(server, c);
+const canMoveCategory = (server, cat) => isAdmin(server) && channelsIn(server, cat).every((c) => canIn(c, PERMS.MANAGE_CHANNELS));
+const channelLayout = (server) => orderedCategories(server).map((cat) => ({ cat, list: channelsIn(server, cat) }));
+const chanLabel = (c) => (c.type === 'voice' ? c.name : `#${c.name}`);
+// Built on the server bar's drag code (folders.js): a channel lands between channels, or on a category's name (first
+// in it); a category lands before or after another one.
+const channelDrag = dragDrop({
+  zones: (d, t) => {
+    if (d.kind === 'channel') return t.kind === 'channel' ? ['before', 'after'] : t.kind === 'catHead' ? ['into'] : [];
+    return d.kind === 'category' && t.kind === 'category' ? ['before', 'after'] : [];
+  },
+  onDrop: (d, t, z) => {
+    const server = currentServer();
+    if (!server) return;
+    if (d.kind === 'category') {
+      const i = orderedCategories(server).filter((k) => k !== d.id).indexOf(t.id);
+      if (i >= 0) placeCategory(server, d.id, z === 'before' ? i : i + 1);
+      return;
+    }
+    const c = server.channels.find((x) => x.id === d.id);
+    if (!c) return;
+    if (t.kind === 'catHead') { placeChannel(server, c, t.id, 0); return; }
+    const i = channelsIn(server, t.category).filter((x) => x.id !== c.id).findIndex((x) => x.id === t.id);
+    if (i >= 0) placeChannel(server, c, t.category, z === 'before' ? i : i + 1);
+  },
+});
+// Puts channel c at `index` in category `cat` and saves it. The list changes straight away; everyone's apps follow
+// with the server's update, and if the server refuses, it goes back as it was. The server also gets the layout this
+// started from, and refuses the move if someone changed it meanwhile (rather than this quietly undoing theirs).
+// `said`: what to announce once saved, for a move from a menu (the menu items say what happened, for screen readers;
+// a drag shows it). Such a move opens the category the channel lands in if it was collapsed, so the channel stays in
+// sight and keeps the focus.
+async function placeChannel(server, c, cat, index, said) {
+  const from = channelLayout(server).map((g) => [g.cat, g.list.map((x) => x.id)]);
+  const layout = channelLayout(server).map((g) => ({ cat: g.cat, list: g.list.filter((x) => x.id !== c.id) }));
+  const dest = layout.find((g) => g.cat === cat);
+  if (!dest) return;
+  dest.list.splice(Math.max(0, Math.min(index, dest.list.length)), 0, c);
+  const ids = layout.flatMap((g) => g.list.map((x) => x.id));
+  const was = catOf(c);
+  if (was === cat && ids.join() === orderedChannels(server).map((x) => x.id).join()) return;
+  const before = server.channels.map((x) => [x, x.position, x.category]);
+  let pos = 0;
+  for (const g of layout) for (const x of g.list) x.position = pos++;
+  if (was !== cat) c.category = cat;
+  if (said) openCategory(server, cat);
+  renderSidebar();
+  if (said) refocus((el) => el.matches('.ch-main') && el.closest('[data-cid]').dataset.cid === c.id);
+  try {
+    await api('POST', `/servers/${server.id}/channel-order`, { ids, categories: was !== cat ? { [c.id]: cat } : undefined, from });
+    if (said) toast(said);
+  } catch (e) {
+    for (const [x, p, k] of before) { x.position = p; x.category = k; }
+    renderSidebar();
+    toast(e.message, 'error');
+  }
 }
-async function moveChannel(server, c, dir) {
-  const cat = c.category;
-  const list = server.channels.filter((x) => x.category === cat).sort((a, b) => a.position - b.position);
-  const i = list.findIndex((x) => x.id === c.id);
-  const j = i + dir;
-  if (j < 0 || j >= list.length) return;
-  [list[i], list[j]] = [list[j], list[i]];
-  const others = orderedChannels(server).filter((x) => x.category !== cat);
-  try { await api('POST', `/servers/${server.id}/channel-order`, { ids: [...list, ...others].map((x) => x.id) }); } catch (e) { toast(e.message, 'error'); }
+// The same for a category: moves it to `index` in the list of categories.
+async function placeCategory(server, cat, index, said) {
+  const now = orderedCategories(server);
+  const cats = now.filter((k) => k !== cat);
+  cats.splice(Math.max(0, Math.min(index, cats.length)), 0, cat);
+  if (JSON.stringify(cats) === JSON.stringify(now)) return;
+  const old = server.categoryOrder;
+  server.categoryOrder = cats;
+  renderSidebar();
+  if (said) refocus((el) => el.matches('.cat-toggle') && el.closest('.cat-group').dataset.cat === cat);
+  try {
+    await api('PATCH', `/servers/${server.id}`, { categoryOrder: cats, categoryOrderFrom: now });
+    if (said) toast(said);
+  } catch (e) {
+    server.categoryOrder = old;
+    renderSidebar();
+    toast(e.message, 'error');
+  }
+}
+// Opens a category collapsed in this server's sidebar.
+function openCategory(server, cat) {
+  const all = P.collapsed; const list = all[server.id] || [];
+  if (!list.includes(cat)) return;
+  all[server.id] = list.filter((x) => x !== cat);
+  P.collapsed = all;
+}
+// After a move from a menu, the sidebar's redraw keeps the focus where it was (sidebarFocus). If the menu outlived
+// its channel or category (a live update redrew the sidebar while it was open), the focus fell to the page: put it
+// back on the item that moved.
+function refocus(match) {
+  const el = document.activeElement;
+  if (el && el !== document.body) return;
+  const t = $$('#sidebar-body .ch-main, #sidebar-body .cat-toggle').find(match);
+  if (t) t.focus({ preventScroll: true });
+}
+// Where Move up (dir -1) or Move down (1) takes channel c in the layout as it is: the next place in its category, or
+// at the top or bottom of it, on into the category above (to its end) or below (to its start). Null: nowhere.
+function channelStep(server, c, dir) {
+  const layout = channelLayout(server);
+  const g = layout.findIndex((x) => x.cat === catOf(c));
+  if (g < 0) return null;
+  const { cat, list } = layout[g];
+  const i = list.findIndex((x) => x.id === c.id) + dir;
+  if (i >= 0 && i < list.length) return { cat, index: i, said: `${chanLabel(c)} moved ${dir < 0 ? 'up' : 'down'}.` };
+  const other = layout[g + dir];
+  return other ? { cat: other.cat, index: dir < 0 ? other.list.length : 0, into: true, said: `${chanLabel(c)} moved to ${other.cat}.` } : null;
+}
+// Move up / Move down in a channel's menu: the keyboard's way to do what dragging does. The menu shows where each one
+// goes ("Move down · to Voice"); choosing it works that out again from the channel list as it is then, in case
+// someone else moved channels while the menu was open (so it never sends back the order the menu was opened on).
+function channelMoveItems(server, c) {
+  if (!canMoveChannel(server, c)) return [];
+  return [-1, 1].map((dir) => {
+    const step = channelStep(server, c, dir);
+    return step && { label: dir < 0 ? 'Move up' : 'Move down', hint: step.into ? `to ${step.cat}` : undefined, icon: dir < 0 ? 'arrowUp' : 'arrowDown', action: () => moveChannelBy(server.id, c.id, dir) };
+  });
+}
+function moveChannelBy(serverId, channelId, dir) {
+  const server = S.servers.find((x) => x.id === serverId);
+  const c = server && server.channels.find((x) => x.id === channelId);
+  if (!c || !canMoveChannel(server, c)) return;
+  const step = channelStep(server, c, dir);
+  if (step) placeChannel(server, c, step.cat, step.index, step.said);
+}
+function moveCategoryBy(serverId, cat, dir) {
+  const server = S.servers.find((x) => x.id === serverId);
+  if (!server || !canMoveCategory(server, cat)) return;
+  const i = orderedCategories(server).indexOf(cat);
+  if (i >= 0) placeCategory(server, cat, i + dir, `${cat} moved ${dir < 0 ? 'up' : 'down'}.`);
 }
 function renameCategory(server, cat) {
   const input = h('input', { class: 'input', value: cat, maxlength: '32' });
