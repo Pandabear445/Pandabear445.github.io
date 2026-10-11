@@ -822,6 +822,16 @@ mark { background: rgb(var(--accent-rgb) / .35); color: inherit; border-radius: 
 /* attachments */
 .msg-embeds, .msg-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
 .embed-img { max-width: min(420px, 100%); max-height: 320px; border-radius: 12px; cursor: zoom-in; object-fit: contain; background: var(--hover); }
+/* an image link to another site, waiting for a click (or not loaded at all: Never load) */
+.embed-ask {
+  display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 12px; border-radius: 12px;
+  background: rgb(var(--s3) / .55); border: 1px dashed var(--line-2); width: min(420px, 100%); min-width: 0;
+}
+.embed-ask > .ic { flex: none; color: var(--text-2); }
+.embed-ask-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.embed-ask-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.embed-ask-sub { color: var(--muted); font-size: 12.5px; }
+.embed-ask .btn { flex: none; }
 .att-media { position: relative; border-radius: 12px; overflow: hidden; max-width: min(440px, 100%); background: var(--hover); border: 1px solid var(--line); }
 .att-media.locked { min-width: 220px; min-height: 150px; }
 .att-media.locked::after { content: ''; position: absolute; inset: 0; background: linear-gradient(110deg, transparent 30%, rgb(var(--text-rgb) / .06) 50%, transparent 70%) 0 0 / 200% 100%; animation: shimmer 1.4s linear infinite; }
@@ -2382,6 +2392,8 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .wt { display: flex; flex-direction: column; gap: 8px; }
 .wt-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; max-height: min(62vh, calc(100vh - 380px)); min-height: 200px; background: #000; border-radius: 12px; overflow: hidden; }
 .wt-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+/* a video file from another site: one line saying so, and a button, before it loads */
+.wt-outside { position: absolute; inset: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; align-content: center; gap: 10px 14px; padding: 16px; color: #ede9f5; text-align: center; font-size: 14px; }
 .wt-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .wt-title { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .wt-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

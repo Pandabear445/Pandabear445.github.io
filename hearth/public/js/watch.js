@@ -3,6 +3,7 @@
 // each player follows it, and reports what its viewer does (play, pause, seek) back to the server.
 // YouTube and Vimeo are controlled through their embed's message API, so no outside script is loaded.
 import { h, clear, icon, toast } from './util.js';
+import { outsideVideoHost } from './outside.js';
 
 const DRIFT = 1.6; // seconds out of step before we correct
 const clock = (s) => { s = Math.max(0, Math.floor(s || 0)); const hh = Math.floor(s / 3600); const mm = Math.floor((s % 3600) / 60); const ss = String(s % 60).padStart(2, '0'); return hh ? `${hh}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`; };
@@ -94,7 +95,19 @@ function twitchAdapter(item) {
   return { el: frame, live: true, play() {}, pause() {}, seek() {}, rate() {}, time: () => 0, playing: () => true, duration: () => 0, destroy() {} };
 }
 function videoAdapter(item, onEvent) {
-  const v = h('video', { class: 'wt-frame', src: item.src, controls: true, playsinline: true, preload: 'auto' });
+  const v = h('video', { class: 'wt-frame', controls: true, playsinline: true, preload: 'auto' });
+  // A video file on another site loads from that site, which sees each viewer's IP address. Say so first, and
+  // load it only when this viewer agrees (xss-8). Files on this server load straight away.
+  const host = outsideVideoHost(item, location.origin);
+  let loaded = !host;
+  let el = v;
+  if (loaded) v.src = item.src;
+  else {
+    el = h('div', { class: 'wt-frame' }, v, h('div', { class: 'wt-outside', role: 'note' },
+      h('span', null, 'This video comes from ', h('strong', null, host), ', which will see your IP address.'),
+      // Keyboard focus goes to the player (its controls), not back to the page, once the notice is gone.
+      h('button', { class: 'btn primary sm', onclick: (e) => { loaded = true; e.currentTarget.parentElement.remove(); v.src = item.src; v.focus({ preventScroll: true }); } }, icon('play'), 'Load video')));
+  }
   v.addEventListener('loadedmetadata', () => onEvent('ready'));
   v.addEventListener('play', () => onEvent('play', v.currentTime));
   v.addEventListener('pause', () => { if (!v.ended) onEvent('pause', v.currentTime); });
@@ -103,7 +116,7 @@ function videoAdapter(item, onEvent) {
   v.addEventListener('ended', () => onEvent('ended', v.currentTime));
   v.addEventListener('error', () => onEvent('error'));
   return {
-    el: v, live: false,
+    el, live: false, waiting: () => !loaded,
     play: () => v.play().catch(() => onEvent('blocked')), pause: () => v.pause(), seek: (s) => { v.currentTime = s; }, rate: (r) => { v.playbackRate = r; },
     time: () => v.currentTime, playing: () => !v.paused, duration: () => (Number.isFinite(v.duration) ? v.duration : 0), destroy: () => { v.pause(); v.removeAttribute('src'); v.load(); },
   };
@@ -211,7 +224,9 @@ function createPlayer(room, initialCtx) {
   // Move our player to where the shared state says it should be.
   function follow(force = false) {
     const st = self.state;
-    if (!adapter || !st || adapter.live) return;
+    // (A video from another site that this viewer hasn't agreed to load yet has nothing to move; once it loads,
+    // its 'ready' brings it in step.)
+    if (!adapter || !st || adapter.live || (adapter.waiting && adapter.waiting())) return;
     const want = expectedPosition(st, self.offset);
     const off = Math.abs(adapter.time() - want);
     if (force || off > DRIFT) { quiet(); ownSeek = want; adapter.seek(want); }

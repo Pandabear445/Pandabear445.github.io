@@ -29,9 +29,10 @@ machine that checks them:
 3. **When something changed:** `test/visual/output/` gets the new screenshot and a `.diff.png`, with changed pixels
    in magenta. If the change is intended, accept it with `npm run test:visual -- --update`.
 
-Google Fonts requests are blocked during the run, so results don't depend on the network. Times, avatar colours
-(made from random ids) and the time-of-day greeting are blanked by a test-only stylesheet. Masking alone wasn't
-enough, because dialog backdrops blur what's behind them, smearing those colours past any mask.
+The app's fonts are served by Hearth itself (`public/fonts`), so results don't depend on the network. Baselines
+made before 1.29.0 (when the fonts came from Google Fonts and were blocked during the run) need `--update` once.
+Times, avatar colours (made from random ids) and the time-of-day greeting are blanked by a test-only stylesheet.
+Masking alone wasn't enough, because dialog backdrops blur what's behind them, smearing those colours past any mask.
 
 ## What the client guarantees
 

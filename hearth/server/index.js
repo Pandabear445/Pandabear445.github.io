@@ -585,7 +585,11 @@ function toChannel(c, except) {
   return rooms.length ? (except ? except.to(rooms) : io.to(rooms)) : { emit() {} };
 }
 const isBlocked = (a, b) => !!db.prepare('SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)').get(a, b, b, a);
-const privacyOf = (row) => { try { return { dms: 'everyone', friendRequests: 'everyone', ...JSON.parse(row.privacy || '{}') }; } catch { return { dms: 'everyone', friendRequests: 'everyone' }; } };
+// outsideImages: what your apps do with an image link to another site in a message (xss-8). Loading it shows that
+// site your IP address, so by default they ask first ('ask' | 'always' | 'never'). Only your own apps read it.
+const PRIVACY_DEFAULTS = { dms: 'everyone', friendRequests: 'everyone', outsideImages: 'ask' };
+const OUTSIDE_IMAGES = ['ask', 'always', 'never'];
+const privacyOf = (row) => { try { return { ...PRIVACY_DEFAULTS, ...JSON.parse(row.privacy || '{}') }; } catch { return { ...PRIVACY_DEFAULTS }; } };
 function requireChannel(channelId, userId) {
   const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
   if (!c || !isMember(c.server_id, userId)) fail(404, 'Channel not found.');
@@ -648,16 +652,23 @@ const jsonBody = (req) => !/^\/api\/webhooks\//i.test(req.originalUrl) && String
 app.use(express.json({ limit: '2mb', type: jsonBody, verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
 // Strict browser security policy for the app's own pages:
 //   scripts       only files from this server (+ WebAssembly for password hashing) — no inline or injected code
-//   connections   fetch/XHR/WebSocket only back to this server (its API and live connection). This isn't a complete
-//                 barrier: injected markup could still leak data through https: image/media URLs, the allowed video
-//                 frames or navigation, so it limits what an XSS bug can do rather than making leaks impossible.
+//   connections   fetch/XHR/WebSocket go only back to this server (its API and live connection)
+//   fonts         only from this server (public/fonts), so no font host learns who opens Hearth
+//   styles        this server's files, plus inline styles: style attributes (the UI sets colours and sizes that way)
+//                 and <style> elements (a profile page's custom CSS is one, with url() taken out). CSS can't run
+//                 code, though an outside url() in injected CSS would load like any https: image (below)
+//   images/media  this server, data: and blob: (decrypted files), and still any https: source: image links in
+//                 messages load from their own site after a click (by default; Settings → Privacy & safety),
+//                 and a watch-together video file from another site after a notice. So this is not a complete
+//                 barrier: injected markup could still send data out in an https: image or media address, the
+//                 allowed video frames or a navigation. It limits what an XSS bug can do; it doesn't make leaks
+//                 impossible.
+//   frames        Recall (this server) and the YouTube, Vimeo and Twitch players only
 //   framing       nobody can put Hearth inside their page (clickjacking); no plugins; forms only post here
-//   styles        inline style attributes are allowed (the UI sets colours and sizes that way); CSS can't run code
-//   images/media  any https: source, for link previews and profile songs people choose (and blob: for decrypted files)
 const CSP_BASE = [
-  "default-src 'self'", "script-src 'self' 'wasm-unsafe-eval'", "script-src-attr 'none'", "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-  "font-src 'self' data: https://fonts.gstatic.com", "img-src 'self' data: blob: https:", "media-src 'self' blob: data: https:",
-  "worker-src 'self' blob:", "frame-src 'self' blob: https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://player.twitch.tv", "object-src 'none'", "base-uri 'none'",
+  "default-src 'self'", "script-src 'self' 'wasm-unsafe-eval'", "script-src-attr 'none'", "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:", "img-src 'self' data: blob: https:", "media-src 'self' blob: data: https:",
+  "worker-src 'self' blob:", "frame-src 'self' https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://player.twitch.tv", "object-src 'none'", "base-uri 'none'",
   "form-action 'self'", "frame-ancestors 'none'", "manifest-src 'self'",
 ].join('; ');
 // 'self' covers the live connection (wss://) in current browsers; the host is named too for older Safari.
@@ -1133,8 +1144,10 @@ const SW_TEMPLATE = fs.readFileSync(path.join(PUBLIC_DIR, 'sw.js'), 'utf8');
 function walk(dir, base = '') {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => (d.isDirectory() ? walk(path.join(dir, d.name), base + d.name + '/') : [base + d.name]));
 }
+// The interface's own fonts are kept for offline use too; a profile font loads the first time a profile uses it.
+const CORE_FONTS = /^fonts\/(fonts\.css|(figtree|bricolage-grotesque)-[\w-]+\.woff2)$/;
 const APP_ASSETS = ['/', '/manifest.webmanifest', '/vendor/argon2.js', '/socket.io/socket.io.js',
-  ...walk(PUBLIC_DIR).filter((f) => /^(js|css|icons)\//.test(f) || f === 'favicon.svg').map((f) => '/' + f)];
+  ...walk(PUBLIC_DIR).filter((f) => /^(js|css|icons)\//.test(f) || f === 'favicon.svg' || CORE_FONTS.test(f)).map((f) => '/' + f)];
 const BUILD = crypto.createHash('sha256').update(walk(PUBLIC_DIR).sort().map((f) => f + fs.readFileSync(path.join(PUBLIC_DIR, f)).length + fs.statSync(path.join(PUBLIC_DIR, f)).mtimeMs).join('|')).digest('hex').slice(0, 12);
 app.get('/sw.js', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
@@ -1226,7 +1239,10 @@ app.use((req, res, next) => {
   res.setHeader('Content-Length', e[enc].length);
   res.end(req.method === 'HEAD' ? undefined : e[enc]);
 });
-app.use(express.static(PUBLIC_DIR, { index: 'index.html' }));
+// Font files (public/fonts) hardly ever change, so browsers keep them for a week instead of asking again on
+// every page load, as they did with the font host the app used before.
+const keepFonts = (res, file) => { if (file.endsWith('.woff2')) res.setHeader('Cache-Control', 'public, max-age=604800'); };
+app.use(express.static(PUBLIC_DIR, { index: 'index.html', setHeaders: keepFonts }));
 // Argon2id (WebAssembly) for password hardening in the browser, served from the npm package.
 const ARGON2_JS = require.resolve('hash-wasm/dist/argon2.umd.min.js');
 app.get('/vendor/argon2.js', (req, res) => {
@@ -4138,12 +4154,16 @@ api.put('/me/rail', auth, (req, res) => {
   res.json(rail);
 });
 api.patch('/me/privacy', auth, (req, res) => {
+  rateLimit('privacy:' + req.userId, 60, 60000);
   const row = getUserRow(req.userId);
   const p = privacyOf(row);
   const b = req.body || {};
   if (['everyone', 'friends'].includes(b.dms)) p.dms = b.dms;
   if (['everyone', 'mutual', 'nobody'].includes(b.friendRequests)) p.friendRequests = b.friendRequests;
+  if (OUTSIDE_IMAGES.includes(b.outsideImages)) p.outsideImages = b.outsideImages;
   db.prepare('UPDATE users SET privacy = ? WHERE id = ?').run(JSON.stringify(p), req.userId);
+  // Your other devices follow right away (an image link they show switches to asking, or stops asking).
+  io.to(`user:${req.userId}`).emit('user:update', selfUser(getUserRow(req.userId)));
   res.json(p);
 });
 // Settings → Sessions: every device signed in (and recently signed out), with where and when it was last used.

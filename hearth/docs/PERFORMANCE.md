@@ -412,7 +412,8 @@ per message. The "after" run removed 0. No change was made to this path.
   from the same host. With fonts blocked entirely, sign-in was ready ~150–300 ms sooner on this network. But removing
   only the decorative one would save just the difference between the two requests, and the UI font has to block to
   avoid a flash of fallback text. Not changed. This is the biggest load-time lever left; self-hosting the fonts would
-  remove the third-party round trip.
+  remove the third-party round trip. (Done since, in 1.29.0, for privacy: the fonts are in `public/fonts`, served by
+  Hearth, and the interface fonts are kept in the offline copy. Not re-measured.)
 - **Lazy-loading `settings.js` (121 KB) and `admin.js` (91 KB).** Not attempted. The CPU profile of a signed-in load
   at 4× showed only ~60 ms of JS in total. Most of the time is native work (module loading, style, layout), so
   splitting these two wouldn't be measurable at this scale.

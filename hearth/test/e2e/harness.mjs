@@ -167,7 +167,8 @@ export class Person {
 
   static async open(browser, base, name) {
     const context = await browser.newContext({ viewport: { width: 1400, height: 900 }, acceptDownloads: true, permissions: ['microphone', 'camera'] });
-    // Nothing leaves this machine: fonts and other outside requests are refused (fast and the same every run).
+    // Nothing leaves this machine: outside requests are refused (fast and the same every run). A flow that needs an
+    // outside site answers for it with its own page.route, which takes precedence over this one.
     await context.route((url) => !url.href.startsWith(base), (route) => route.abort());
     // Every call connection the app makes, so the voice flow can check it really connected.
     await context.addInitScript(() => {

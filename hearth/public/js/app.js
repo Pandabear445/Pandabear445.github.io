@@ -12,6 +12,7 @@ import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
 import { prepareImage, makeQueue, whenVisible, previewThumb } from './media.js';
 import { isUploadUrl, safeDownloadHref } from './attachments.js';
+import { outsideMode, outsideHost, imageDecision } from './outside.js';
 import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, mediaKind, typeLabel } from './files.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
@@ -155,6 +156,7 @@ export const app = {
   checkAway: () => away && away.check(), // after "Away after" changes
   logout,
   rerender: () => { lsCache.clear(); renderAll(); }, // settings.js writes some preferences straight to localStorage
+  redrawImageLinks: () => redrawImageLinks(),
   openProfile: (id) => openProfileModal(id),
   install: () => installApp(),
   get canInstall() { return !!installPrompt; },
@@ -630,7 +632,10 @@ function startApp() {
     if (u && u.id === S.me.id) rememberSelf(u);
     if (presenceOnly) { setUser(u); showMyPresence(); return; }
     const roleBefore = S.me.staffRole;
+    const outsideBefore = outsideMode(S.me.privacy);
     setUser(u); sec.trust(u); refreshUserBits(u.id);
+    // Outside images changed on another device: the image links on screen follow the new choice.
+    if (u.id === S.me.id && outsideMode(S.me.privacy) !== outsideBefore) later(redrawImageLinks);
     // Given or lost a staff role: show or hide the admin dashboard right away.
     if (u.id === S.me.id && 'staffRole' in u && (u.staffRole || null) !== (roleBefore || null)) {
       if (S.view.type === 'admin' && !u.staffRole) setView({ type: 'home' }); else app.rerender();
@@ -3670,7 +3675,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       : 'Waiting for the encryption key from another member\u2026'));
   } else {
     const chat = P.chat;
-    const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length;
+    // A message that's only an image link shows just the picture, once the picture is really shown.
+    const hideText = chat.embeds && isOnlyImageUrl(text) && !filesOf(m).length && embedDecision(text.trim()) === 'show';
     const embed = m.dec && m.dec.embed;
     if (text && !hideText && !(embed && text === embed.title)) {
       const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: senderMayPingEveryone(m) }) : escapeText(text);
@@ -3679,10 +3685,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     // A link preview built by the sender: it came inside the encrypted message, so nothing is fetched to show it.
     const links = chat.linkCards !== false && senderMayEmbed(m) ? linksOf(m) : [];
     if (links.length) body.append(h('div', { class: 'msg-links' }, links.map(linkCardEl)));
-    const embeds = chat.embeds ? extractImageUrls(text).filter((u) => !links.some((l) => l.url === u)) : [];
-    if (embeds.length) body.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => h('div', { class: `embed-wrap${isGiphy(u) ? ' giphy' : ''}` },
-      h('img', { class: 'embed-img', src: mediaUrl(u), alt: isGiphy(u) ? 'GIF' : 'Linked image', loading: 'lazy', referrerpolicy: 'no-referrer', onclick: (e) => openViewer(e.currentTarget) }),
-      isGiphy(u) ? h('span', { class: 'giphy-tag' }, /klipy/i.test(u) ? 'KLIPY' : 'GIPHY') : null))));
+    const embeds = chat.embeds ? extractImageUrls(text).filter((u) => !links.some((l) => l.url === u) && embedDecision(u) !== 'skip') : [];
+    if (embeds.length) body.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => embedEl(u, m))));
     if (m.dec && m.dec.p) body.append(pollEl(m));
     const files = filesOf(m);
     if (files.length) body.append(h('div', { class: 'msg-files' }, files.map((f) => attachmentEl(f, m))));
@@ -3786,6 +3790,89 @@ const isGiphy = (u) => /^https:\/\/(media\d?\.giphy\.com|i\.giphy\.com|static\.k
 // everything after "?" and showed the same GIF everywhere; a distinct path can't be mixed up.
 const urlKey = (u) => { let x = 5381; for (let i = 0; i < u.length; i++) x = ((x * 33) ^ u.charCodeAt(i)) >>> 0; return x.toString(36); };
 const mediaUrl = (u) => (isGiphy(u) && S.config.gifProxy && S.mediaToken ? `/media/gif/${urlKey(u)}?u=${encodeURIComponent(u)}&t=${encodeURIComponent(S.mediaToken)}` : u);
+// Image links in messages (xss-8). One on another site would show that site every reader's IP address, so it
+// waits behind a placeholder until clicked, unless Settings → Privacy & safety says Always or Never. Files uploaded
+// here, GIFs through this server's GIF proxy and link preview pictures (inside the message) never contact the other
+// site. Any other address on this server stays a plain link (outside.js imagePlace says why).
+const openedOutside = new Set(); // links clicked open this session, so a redraw doesn't ask again
+const embedDecision = (u) => imageDecision(u, { origin: location.origin, viaProxy: mediaUrl(u) !== u, mode: outsideMode(S.me && S.me.privacy), opened: openedOutside.has(u) });
+function embedImg(u) {
+  return h('div', { class: `embed-wrap${isGiphy(u) ? ' giphy' : ''}` },
+    h('img', { class: 'embed-img', src: mediaUrl(u), alt: isGiphy(u) ? 'GIF' : 'Linked image', loading: 'lazy', referrerpolicy: 'no-referrer', onclick: (e) => openViewer(e.currentTarget) }),
+    isGiphy(u) ? h('span', { class: 'giphy-tag' }, /klipy/i.test(u) ? 'KLIPY' : 'GIPHY') : null);
+}
+function embedEl(u, m) {
+  const decision = embedDecision(u);
+  if (decision === 'show') return embedImg(u);
+  const host = outsideHost(u);
+  const box = h('div', { class: `embed-ask${decision === 'hidden' ? ' never' : ''}`, title: u },
+    icon('image'),
+    h('span', { class: 'embed-ask-text' }, h('span', { class: 'embed-ask-title' }, 'Image from ', h('strong', null, host)),
+      h('span', { class: 'embed-ask-sub' }, decision === 'hidden' ? 'Not loaded: you chose Never load in Privacy & safety.' : `Loading it shows ${host} your IP address.`)));
+  if (decision === 'ask') {
+    box.append(h('button', { class: 'btn ghost sm', 'aria-label': `Load image from ${host}`, onclick: () => {
+      openedOutside.add(u);
+      // Redraw the whole message: one that's only this link then shows just the picture, and keyboard focus
+      // (on the button, now gone) moves to the message instead of falling back to the page.
+      if (m && box.closest('.msg[data-mid]')) return replaceMessageEl(m);
+      const shown = embedImg(u);
+      box.replaceWith(shown);
+      shown.tabIndex = -1;
+      shown.focus({ preventScroll: true });
+    } }, 'Load image'));
+  }
+  return box;
+}
+// Outside images changed (here, or on another device): redraw just the messages showing an image link, in place,
+// keeping what you're reading where it is. The message being edited is left alone (a redraw would throw away what
+// you've typed); it follows the new choice when you save or cancel. So is a blocked person's message you chose to
+// show (a redraw would hide it again).
+function redrawImageLinks() {
+  const lists = { main: (S.msgs[currentKey()] || { list: [] }).list, thread: threadList() };
+  const loading = []; // [message element, its pictures still on their way]
+  const run = () => {
+    const done = new Set();
+    for (const el of $$('.msg[data-mid]')) {
+      const id = el.dataset.mid;
+      if (done.has(id) || id === S.editing || !el.querySelector('.msg-embeds')) continue;
+      const m = (lists[el.dataset.ctx || 'main'] || []).find((x) => x.id === id);
+      if (!m || S.blocked.has(m.authorId)) continue;
+      done.add(id);
+      const was = new Map($$(`.msg[data-mid="${id}"]`).map((x) => [x.dataset.ctx, x.offsetHeight]));
+      replaceMessageEl(m);
+      // A picture switched on has no size until it's in: until then the message keeps its height, so the list
+      // doesn't shrink under what you're reading and grow back.
+      for (const x of $$(`.msg[data-mid="${id}"]`)) {
+        const imgs = $$('img.embed-img', x).filter((i) => !i.complete);
+        if (!imgs.length) continue;
+        x.style.minHeight = `${was.get(x.dataset.ctx) || 0}px`;
+        loading.push([x, imgs]);
+      }
+    }
+  };
+  const sc = $('#messages');
+  if (!sc) return run();
+  const atEnd = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80; // reading the newest: stay there
+  keepAnchor(sc, run);
+  if (atEnd) sc.scrollTop = sc.scrollHeight;
+  // As each picture comes in, its message may grow; the first message in view goes back to its spot (the list
+  // doesn't do that by itself), or the newest stays in view, unless you've scrolled since.
+  const scTop = () => sc.getBoundingClientRect().top;
+  const anchor = $$(':scope > .msg[data-mid]', sc).find((el) => el.getBoundingClientRect().bottom > scTop());
+  const offset = anchor ? anchor.getBoundingClientRect().top - scTop() : 0;
+  let at = sc.scrollTop;
+  for (const [x, imgs] of loading) {
+    let left = imgs.length;
+    const settle = () => {
+      if (--left === 0) x.style.minHeight = '';
+      if (sc.scrollTop !== at) return;
+      if (atEnd) sc.scrollTop = sc.scrollHeight;
+      else if (anchor && anchor.isConnected) sc.scrollTop += anchor.getBoundingClientRect().top - scTop() - offset;
+      at = sc.scrollTop;
+    };
+    for (const i of imgs) { i.addEventListener('load', settle, { once: true }); i.addEventListener('error', settle, { once: true }); }
+  }
+}
 const escapeText = (t) => t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])).replace(/\n/g, '<br>');
 
 // Hover toolbar: just the essentials. Everything else lives in the ⋯ menu / right-click.
@@ -8116,7 +8203,7 @@ function openWatchStart(room, queue = false) {
       recent.length ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Watched recently'),
         h('div', { class: 'wt-recent' }, recent.map((link) => h('button', { class: 'chip', type: 'button', title: link, onclick: () => { url.value = link; check(); submit().catch((x) => toast(x.message, 'error')); } }, link.replace(/^https?:\/\/(www\.)?/, '').slice(0, 40))))) : null,
       queue ? null : h('label', { class: 'row gap' }, hostOnly, 'Only I can play, pause and skip'),
-      h('p', { class: 'field-hint' }, 'The video loads straight from YouTube/Vimeo/Twitch, so they can see each viewer’s IP address, like when you watch there.')),
+      h('p', { class: 'field-hint' }, 'The video loads straight from YouTube/Vimeo/Twitch, so they can see each viewer’s IP address, like when you watch there. A video file on another site does too, so each viewer is told before it loads.')),
     actions: [{ label: 'Cancel' }, { label: queue ? 'Add to queue' : 'Start watching', kind: 'primary', action: () => new Promise((resolve, reject) => {
       socket.emit('watch:start', { url: url.value, queue, hostOnly: hostOnly.checked }, (r) => { if (r && r.error) return reject(new Error(r.error)); rememberWatch(url.value.trim()); resolve(); });
     }) }],

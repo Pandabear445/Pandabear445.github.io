@@ -235,8 +235,8 @@ where the docs now state the behaviour.
 | xss-2 | medium | vulnerability | Invisible status leaks through lastSeen on profile pages and People, including to users the owner has blocked | Fixed | `client-hardening.test.js` |
 | xss-5 | medium | vulnerability | Profile writes have no rate limit, and each one pushes the full public profile to every connected socket on the instance | Fixed | `client-hardening.test.js` |
 | xss-6 | low | bug | A shared 'look' file can inject CSS into the app background via an unchecked bg.angle (persistent outside-URL beacon) | Fixed | `client-hardening.test.js` |
-| xss-7 | low | overclaim | The CSP comment and SECURITY.md row 25 say data can't leave, but img-src/media-src https:, third-party frames and navigation allow it | Documented | — (SECURITY.md row 25; README) |
-| xss-8 | low | limitation | Users' IPs reach third parties: Google Fonts on every load, auto-loaded image links, direct watch-together videos | Documented | — (SECURITY.md §4; README) |
+| xss-7 | low | overclaim | The CSP comment and SECURITY.md row 25 say data can't leave, but img-src/media-src https:, third-party frames and navigation allow it | Partly fixed | `outside-hardening.test.js`, `platform.test.js` |
+| xss-8 | low | limitation | Users' IPs reach third parties: Google Fonts on every load, auto-loaded image links, direct watch-together videos | Fixed | `outside-hardening.test.js`, e2e (outside images, watch together) |
 | xss-9 | info | hardening | Watch-together iframes have no sandbox attribute, and YouTube commands are posted with targetOrigin '*' | Fixed | `client-hardening.test.js` |
 
 ### Infrastructure, desktop and CI (infra, 12 findings)
@@ -320,6 +320,7 @@ where the docs now state the behaviour.
 | voice-4 | No per-session socket cap and no per-network handshake limit. | Tabs share one session; a NAT full of users reconnecting after a restart would be locked out. The per-user cap of 30 sockets and shared event budget cover it. |
 | voice-9 | Anyone who can sign up gets relay logins; no default total bandwidth cap; existing installs need `setup-turn.sh` again. | Product decision; the right total depends on each VPS plan. |
 | admin-11 | Done since: zips are signed (Ed25519, `scripts/update-key.js`) and each server pins one key in `/etc/hearth-update.pub`. What stays: the first key is trusted on first use, a server that never ran `hearth-update` has no trusted updater to check the tools' upload, and a server with neither OpenSSL 3.0+ nor Node stays on checksums. | The owner makes the key (none is committed); see docs/SIGNING.md, "Signing server updates". |
+| xss-7 | Done since: the CSP comment says what the policy really does, and the policy no longer names Google Fonts or allows blob: frames (both unused). What stays: `img-src` and `media-src` still allow any https: site (an image link someone clicks open, a watch-together video file), so injected markup could still send data out in a picture address; the YouTube, Vimeo and Twitch frames and navigation stay too. | Narrowing them needs every outside picture and video to go through a proxy on the server, which would then fetch (and see) every link people open: a product decision. Image links now wait for a click by default (`xss-8`), so the everyday leak is gone. |
 | infra-1 | Updates come from whatever server the app is connected to; `data/downloads` is writable by Hearth; the SignPath certificate thumbprint isn't pinned. | Signed updates make the feed's origin irrelevant for builds with a key; the rest are deploy changes or need external information. Apps released before signing install the hop to the first signed build the old way. |
 | infra-2 | No always-visible native "sharing your screen" indicator; an old-style capture request gets the whole screen for about 3 s after a pick. | UX work; Electron can't tell the two request kinds apart, so the window is shortened, not closed. |
 | infra-3 | Using a non-root deploy user is up to the operator. | The workflow can't enforce VPS and GitHub settings; the docs recommend it. |
@@ -482,8 +483,8 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 6. Rotate the server key after a reset without a recovery key, or keep a reset account out of key sharing until a
    member verifies it (`crypto-2`).
 7. Per-region relay secrets and a rotate action (`voice-10`); a total bandwidth cap per region.
-8. Self-host the app's fonts and offer click-to-load for outside images (`xss-8`), then tighten `img-src` and
-   `media-src` (`xss-7`).
+8. Done: the app's fonts are served by Hearth itself and outside images wait for a click (`xss-8`). Still open:
+   tighten `img-src` and `media-src` (`xss-7`), which needs a picture and video proxy on the server.
 9. Close the open review minors in §9 item 9.
 10. Run the Electron end-to-end test and the browser suites (`test:e2e`, `test:voice`, `test:a11y`) in CI (install
     Playwright and Electron there), and run a real `hearth-update` and `setup-turn.sh` on a test VPS.

@@ -11,6 +11,7 @@ import { runExport, EXPORT_LIMITS, quietNow } from './usability.js';
 import { androidApp } from './android.js';
 import { reasonText } from './android-push.js';
 import { desktopSettingsSection } from './desktop-settings.js';
+import { OUTSIDE_MODES, OUTSIDE_LABELS, outsideMode } from './outside.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
 import { getKeybinds, saveKeybinds, comboLabel, recordCombo, DEFAULT_KEYBINDS } from './keybinds.js';
 import { clearsLabel } from './presence.js';
@@ -1419,7 +1420,7 @@ function chatTab(app) {
       h('div', { class: 'kv' }, h('span', null, 'Mention someone'), h('kbd', null, '@ then a name'))),
     section('Display',
       toggle('Optimize photos before sending', c.compressImages !== false, (v) => set('compressImages', v), 'Big photos are resized to 2560 px and made much smaller (also removing hidden location data). Turn off to always send the original file.'),
-      toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'Pasted image URLs are loaded from the other site, which can see your IP address.'),
+      toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'By default a picture from another site waits for a click, since that site sees your IP address (Privacy & safety \u2192 Outside images).'),
       toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers|| and > quotes.'),
       toggle('Large emoji when a message is only emoji', c.jumbo, (v) => set('jumbo', v))),
     linkPreviewSection(app, c, set),
@@ -1573,8 +1574,14 @@ function sessionsTab(app) {
 function privacyTab(app) {
   const p = { dms: 'everyone', friendRequests: 'everyone', ...(app.S.me.privacy || {}) };
   const save = async (k, v) => {
-    try { const out = await api('PATCH', '/me/privacy', { [k]: v }); app.S.me.privacy = out; toast('Saved.'); } catch (e) { toast(e.message, 'error'); }
+    try {
+      const out = await api('PATCH', '/me/privacy', { [k]: v });
+      app.S.me.privacy = out; toast('Saved.');
+      if (k === 'outsideImages') app.redrawImageLinks(); // image links already on screen follow the new choice
+    } catch (e) { toast(e.message, 'error'); }
   };
+  const outside = chips(OUTSIDE_MODES.map((m) => [m, m === 'ask' ? `${OUTSIDE_LABELS[m]} (default)` : OUTSIDE_LABELS[m]]), outsideMode(p), (v) => save('outsideImages', v));
+  outside.setAttribute('aria-label', 'Outside images');
   const blockedHost = h('div', { class: 'stack' });
   const drawBlocked = () => {
     clear(blockedHost);
@@ -1596,6 +1603,9 @@ function privacyTab(app) {
     section('Friend requests',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Who can send you friend requests'),
         chips([['everyone', 'Everyone'], ['mutual', 'People in my servers'], ['nobody', 'Nobody']], p.friendRequests, (v) => save('friendRequests', v)))),
+    section('Outside images',
+      h('p', { class: 'set-sub' }, 'A picture linked from another site loads from that site, which then sees your IP address. Files people send, link preview pictures and GIFs this server passes through for you always show. This choice follows you to all your devices.'),
+      outside),
     section('Blocked people',
       h('p', { class: 'set-sub' }, 'Blocked people can\u2019t DM you or send friend requests. Their messages in shared servers are hidden behind a click. They aren\u2019t notified.'),
       blockedHost),

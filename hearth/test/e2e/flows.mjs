@@ -608,6 +608,29 @@ async function watchTogether(t) {
   await alice.$('.wt-actions button', { hasText: 'Stop' }).first().click();
   for (const p of [alice, bob]) await p.$('.wt-title').first().waitFor({ state: 'detached' });
 
+  // A video file on another site: each viewer is told that site will see their IP address, and it loads only
+  // when they choose to (the harness refuses outside requests, so here it then fails to play, which is fine).
+  const outsideHost = 'videos.outside-site.test';
+  const asked = [];
+  const onRequest = (r) => { if (r.url().includes(outsideHost)) asked.push(r.url()); };
+  bob.page.on('request', onRequest);
+  try {
+    await alice.$('.voice-room .cs-controls button[aria-label="Watch together"]').click();
+    const m2 = await alice.dialog('Watch together');
+    await m2.locator('input.input').fill(`https://${outsideHost}/trailer.webm`);
+    await m2.locator('.modal-foot .btn.primary').click();
+    for (const p of [alice, bob]) await p.$('.wt-outside', { hasText: `This video comes from ${outsideHost}, which will see your IP address.` }).first().waitFor();
+    check(!asked.length, `Nothing should be fetched from ${outsideHost} before Bob agrees (fetched ${asked.join(', ')}).`);
+    const req = bob.page.waitForRequest((r) => r.url().includes(outsideHost));
+    await bob.$('.wt-outside button', { hasText: 'Load video' }).first().click();
+    await req;
+    await bob.$('.wt-outside').first().waitFor({ state: 'detached' });
+    check(await bob.page.evaluate(() => !!document.activeElement && document.activeElement.matches('video.wt-frame')), 'After Load video, keyboard focus should be on the player, not lost to the page.');
+    check(await alice.$('.wt-outside').first().isVisible(), 'Alice\'s choice is her own: her notice stays until she clicks.');
+  } finally { bob.page.off('request', onRequest); }
+  await alice.$('.wt-actions button', { hasText: 'Stop' }).first().click();
+  for (const p of [alice, bob]) await p.$('.wt-title').first().waitFor({ state: 'detached' });
+
   // Leaving: bob first (alice sees him go), then alice from the call bar.
   await bob.$('.voice-room .cs-controls button[aria-label="Leave call"]').click();
   await alice.$('.voice-room .cs-tile', { hasText: 'bob' }).waitFor({ state: 'detached' });
@@ -1659,6 +1682,130 @@ async function linkPreviews(t) {
   check(!bobAsked.length, `Bob's app should never contact the site or ask about the link (it asked for ${bobAsked.join(', ')}).`);
 }
 
+// ------------------------------------------------------------------ outside images and the app's own fonts (xss-8)
+// An image link to another site would show that site every reader's IP address, so it waits behind a placeholder
+// until clicked (Settings → Privacy & safety → Outside images: Ask first, Always load, Never load). The other site
+// here is answered by Bob's browser itself, counting what it's asked for.
+async function outsideImages(t) {
+  const { alice, bob } = t.people;
+  const host = 'pics.outside-site.test';
+  const png = makePng(80, 60);
+  const hits = [];
+  await bob.page.route(`https://${host}/**`, (route) => { hits.push(route.request().url()); route.fulfill({ status: 200, contentType: 'image/png', body: png }); });
+  const choose = async (label) => {
+    await bob.openSettings('Privacy & safety');
+    await bob.page.locator('.chips[aria-label="Outside images"] .chip', { hasText: label }).click();
+    await bob.toast('Saved.');
+    await bob.closeSettings();
+  };
+  try {
+    await alice.railButton(SERVER);
+    await alice.openChannel('general');
+    await bob.railButton(SERVER);
+    await bob.openChannel('general');
+
+    // Ask first (the default): the host and a Load button, and nothing fetched until the click.
+    const first = `https://${host}/sunset.png`;
+    await alice.send(`Sunset from the trip ${first}`);
+    const msg = bob.message('Sunset from the trip');
+    const ask = msg.locator('.embed-ask');
+    await ask.waitFor();
+    check((await ask.innerText()).includes(host), 'The placeholder should name the site the picture would load from.');
+    check(!(await msg.locator('img.embed-img').count()), 'The picture should not be in the page before the click.');
+    check(!hits.length, `Nothing should be fetched from ${host} before the click (fetched ${hits.join(', ')}).`);
+    await ask.locator('button', { hasText: exact('Load image') }).click();
+    const img = msg.locator('img.embed-img');
+    await img.waitFor();
+    await bob.page.waitForFunction((el) => el.complete && el.naturalWidth === 80, await img.elementHandle());
+    check(hits.length === 1 && hits[0] === first, `After the click, the picture should load once (fetched ${hits.join(', ')}).`);
+    check(!(await msg.locator('.embed-ask').count()), 'The placeholder should be gone once the picture shows.');
+
+    // A message that's only the link, from the keyboard: the link text shows while it asks, then just the picture,
+    // and keyboard focus moves to the message (the button it was on is gone).
+    const only = `https://${host}/lighthouse.png`;
+    await alice.send(only);
+    const onlyMsg = bob.message(only).first();
+    await onlyMsg.locator('.embed-ask button').waitFor();
+    const onlyId = await onlyMsg.getAttribute('data-mid');
+    const onlyEl = bob.page.locator(`#messages .msg[data-mid="${onlyId}"]`);
+    await onlyEl.locator('.embed-ask button').focus();
+    await bob.page.keyboard.press('Enter');
+    await onlyEl.locator('img.embed-img').waitFor();
+    check(!(await onlyEl.locator('.msg-text').count()), 'Once its picture shows, a message that is only an image link should show just the picture.');
+    check(await bob.page.evaluate((id) => document.activeElement && document.activeElement.matches(`#messages .msg[data-mid="${id}"]`), onlyId),
+      'After Load image, keyboard focus should be on the message, not lost to the page.');
+
+    // Never load: no button, never fetched.
+    await choose('Never load');
+    const second = `https://${host}/harbour.png`;
+    await alice.send(`The harbour at dusk ${second}`);
+    const never = bob.message('The harbour at dusk').locator('.embed-ask.never');
+    await never.waitFor();
+    check(!(await never.locator('button').count()), 'Never load should offer no Load button.');
+    check(!(await bob.message('Sunset from the trip').locator('img.embed-img').count()), 'Never load should also hide a picture loaded earlier.');
+    check(!hits.includes(second), 'Never load should not fetch anything.');
+
+    // Changed on another device (here, the API with Bob's own sign-in): the pictures on screen follow at once,
+    // without throwing away an edit Bob is typing here.
+    await bob.send('A note I am still fixing');
+    await bob.messageAction('A note I am still fixing', 'Edit message');
+    const edit = bob.page.locator('#messages textarea.edit-input');
+    await edit.waitFor();
+    await edit.fill('A note I am still fixing, half-written');
+    const elsewhere = (mode) => bob.page.evaluate((v) => fetch('/api/me/privacy', { method: 'PATCH', headers: { Authorization: `Bearer ${localStorage.getItem('hearth.token')}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ outsideImages: v }) }).then((r) => r.status), mode);
+    check(await elsewhere('ask') === 200, 'Changing Outside images from another device should work.');
+    await bob.message('The harbour at dusk').locator('.embed-ask:not(.never) button').waitFor();
+    check(await edit.inputValue() === 'A note I am still fixing, half-written', 'An edit being typed should survive Outside images changing on another device.');
+    check(await edit.evaluate((el) => el === document.activeElement), 'The edit box should keep keyboard focus.');
+    check(!hits.includes(second), 'Ask first again: still nothing fetched.');
+    await edit.press('Escape');
+    await edit.waitFor({ state: 'detached' });
+
+    // Always load: pictures load straight away, as before.
+    await choose('Always load');
+    await bob.message('The harbour at dusk').locator('img.embed-img').waitFor();
+    await bob.page.waitForFunction(() => [...document.querySelectorAll('#messages img.embed-img')].some((i) => i.complete && i.naturalWidth === 80 && i.src.includes('harbour')));
+    check(hits.includes(second), 'Always load should fetch the picture.');
+
+    // Even then, a link to this server's own picture proxy (with the sender's token and the sender's choice of
+    // site) stays a plain link: showing it would have Hearth fetch that site for every reader.
+    const proxied = [];
+    const onProxy = (r) => { if (r.url().includes('/media/news')) proxied.push(r.url()); };
+    bob.page.on('request', onProxy);
+    try {
+      const sneaky = `${t.server.base}/media/news/x.png?u=${encodeURIComponent(`https://${host}/read-receipt.png`)}&t=alices-token`;
+      await alice.send(`Proxy trick ${sneaky}`);
+      const trick = bob.message('Proxy trick');
+      await trick.waitFor();
+      await bob.page.waitForTimeout(500);
+      check(!(await trick.locator('.msg-embeds, .embed-ask, img.embed-img').count()), 'A link to this server\'s picture proxy should not be shown as a picture.');
+      check(await trick.locator('.msg-text a').count() === 1, 'It should stay a plain link.');
+      check(!proxied.length && !hits.some((u) => u.includes('read-receipt')), `Nothing should be fetched for it (fetched ${[...proxied, ...hits.filter((u) => u.includes('read-receipt'))].join(', ')}).`);
+    } finally { bob.page.off('request', onProxy); }
+  } finally {
+    await bob.page.unroute(`https://${host}/**`);
+  }
+  // Back to the default for whatever runs next.
+  await choose('Ask first');
+
+  // The app's fonts come from Hearth itself: every face loads from this server (the harness refuses everything
+  // else), and the page asked no other site for a font.
+  const fonts = await bob.page.evaluate(async () => {
+    await document.fonts.ready;
+    const families = ['Figtree', 'Bricolage Grotesque', 'Pacifico', 'Orbitron', 'Press Start 2P', 'Caveat', 'Righteous', 'Bungee', 'Space Mono', 'Playfair Display', 'Creepster', 'Comfortaa', 'Monoton'];
+    const missing = [];
+    for (const f of families) {
+      try { const got = await document.fonts.load(`16px "${f}"`, 'Hearth'); if (!got.length || got.some((x) => x.status !== 'loaded')) missing.push(f); } catch { missing.push(f); }
+    }
+    const fontFiles = performance.getEntriesByType('resource').map((e) => e.name).filter((n) => /\.woff2(\?|$)|fonts\.(googleapis|gstatic)/.test(n));
+    return { missing, body: getComputedStyle(document.body).fontFamily, fontFiles };
+  });
+  check(!fonts.missing.length, `These fonts didn't load from Hearth: ${fonts.missing.join(', ')}`);
+  check(/^"?Figtree"?,/.test(fonts.body), `The interface font should be Figtree (it is ${fonts.body}).`);
+  const elsewhere = fonts.fontFiles.filter((u) => !u.startsWith(`${t.server.base}/fonts/`));
+  check(fonts.fontFiles.length && !elsewhere.length, `Fonts should only come from ${t.server.base}/fonts/ (also asked: ${elsewhere.join(', ') || 'none'}).`);
+}
+
 // ------------------------------------------------------------------ disappearing messages (a DM, 5 seconds: NODE_ENV=test)
 async function disappearing(t) {
   const { alice, bob } = t.people;
@@ -2051,6 +2198,19 @@ async function voiceChat(t) {
   await lounge.locator('.badge').waitFor({ state: 'detached' });
   await bob.send('On my way');
   await alice.message('On my way').waitFor();
+  // A picture link to another site waits for a click here too (Ask first, the default), as in any channel (xss-8).
+  const picHost = 'pics.outside-site.test';
+  const picHits = [];
+  await bob.page.route(`https://${picHost}/**`, (route) => { picHits.push(route.request().url()); route.fulfill({ status: 200, contentType: 'image/png', body: makePng(40, 30) }); });
+  try {
+    await alice.send(`Lounge snapshot https://${picHost}/lounge.png`);
+    const snap = bob.message('Lounge snapshot');
+    await snap.locator('.embed-ask').waitFor();
+    check(!(await snap.locator('img.embed-img').count()) && !picHits.length, `A picture link in a voice chat should wait for a click (fetched ${picHits.join(', ')}).`);
+    await snap.locator('.embed-ask button', { hasText: exact('Load image') }).click();
+    await bob.message('Lounge snapshot').locator('img.embed-img').waitFor();
+    check(picHits.length === 1, `After the click, the picture should load once (fetched ${picHits.join(', ')}).`);
+  } finally { await bob.page.unroute(`https://${picHost}/**`); }
   // No threads in a voice channel's chat.
   const onAlice = alice.message('On my way').first();
   await onAlice.hover();
@@ -2407,7 +2567,7 @@ export const FLOWS = [
   ['events: a weekly event, RSVP, stop it repeating', events],
   ['voice: two people connected in a call', voiceCall],
   ['moderator toolkit: server mute in and out of a call, bulk delete', moderatorTools],
-  ['watch together: start, pause for everyone, stop; leave the call', watchTogether],
+  ['watch together: start, pause for everyone, stop; a video file from another site says so before it loads; leave the call', watchTogether],
   ['audit log and reports: moderation as sentences, filters, live entries; a report reaches the server’s moderators', auditAndReports],
   ['dm call: ring, accept, hang up, decline', dmCall],
   ['group chat: create, talk both ways, call rings', groupChat],
@@ -2422,10 +2582,11 @@ export const FLOWS = [
   ['smoke: every settings, admin and server settings page loads', smoke],
   ['threads: new replies and pings on the message and the Threads button, the Threads panel, read when opened', threads],
   ['link previews: ask, turn down, preview, send; the reader sees the card and never contacts the site; keyboard; editing a link in Always mode', linkPreviews],
+  ['outside images: a picture link waits for a click and loads after it; Never and Always load; fonts come from Hearth', outsideImages],
   ['discord import: paste a template, see what is skipped, leave some out, create', discordImport],
   ['channel order: drag a channel into a category and a category above another, live for everyone; Move down by keyboard keeps focus (into a collapsed category too); a menu left open doesn’t undo another move', channelOrder],
   ['away and status: Away after inactivity and back on input; a custom status that clears itself, live', awayAndStatus],
-  ['voice chat: open beside the call, both ways, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
+  ['voice chat: open beside the call, both ways, a picture link from another site waits for a click, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
   ['send later: schedule from the send button, edit, reschedule and send now from the list; cancel one in a DM; re-encrypted by itself when the key changes, never from a copy it can’t confirm; a signed-out session’s message waits for Keep; overdue ones ask first', sendLater],
   ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
 ];
