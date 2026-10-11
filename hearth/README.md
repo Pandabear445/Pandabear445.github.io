@@ -7,7 +7,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Make your server yours:** banner (positionable, GIFs animate), description, accent color, a server-wide background (presets, custom gradients or an image), welcome message, icon shape, role-colored names, and up to 200 custom emoji — animated GIF, WebP and APNG included, uploaded in bulk or grabbed straight from GIPHY — that members can use in any server or DM.
 - **Conversations** with replies, threads, reactions, pins, edits, forwarding, saved messages, @mentions (including @everyone and @channel), Markdown, spoilers, code blocks, GIFs, emoji search, and image/video/file attachments with a full-screen image viewer.
 - **GIFs, stickers and emoji in one picker, laid out like Discord's:** GIFs / Stickers / Emoji tabs, big Favorites, Trending and category tiles, a back arrow out of any category or search, results in two steady columns that keep loading as you scroll, and a star on every GIF. Through KLIPY or GIPHY, with a privacy proxy so they never see your members' IP addresses.
-- **Direct messages and group DMs** (up to 10 people, with group voice calls).
+- **Direct messages and group DMs** (up to 25 people, with group voice calls).
 - **Home screen** with recent and pinned conversations, online friends, your servers and recent activity.
 - **Search everything with Ctrl+K**: people, channels, servers, messages, files and links, with filters like `from:`, `in:`, `before:` and `has:`. Because messages are end-to-end encrypted, message search runs on your device; the server never sees the words (see [Search](#search-ctrlk)).
 - **Notification center** for mentions, replies and friend requests, plus unread and mention indicators that respect muted channels and servers.
@@ -413,7 +413,7 @@ Your browser remembers everyone's keys the first time it sees them. If the serve
 
 ### Things to know
 
-- **Saved messages, the notification center and per-device preferences** (layout, favorites, collapsed categories, notification levels) live in your browser, not on the server.
+- **What syncs and what stays on this device:** saved messages, notification settings (per server, channel and DM, mute timers, quiet hours), read positions and server folders follow your account to every device. Layout, favorites and collapsed categories are kept per device, in that browser or app.
 - **Forgot your password?** Add an email (Settings → My Account → Email) and the sign-in screen's **Forgot your password?** link emails you a reset link (good for 30 minutes, one use; it stops working if the password or the email address changes first). Your password is what unlocks your keys, so what you keep depends on the **recovery key**:
   - **With your recovery key** (Settings → My Account → Recovery key, shown once — write it down): you keep everything, including all old messages.
   - **Without it:** you get your account, name, friends and servers back, but with new keys. You can't read your old encrypted messages any more (the people you talked to still can), and friends see "Security key changed" on you. Devices that knew your old key share server keys with you again once their owner verifies you (click the shield next to your name). A device that never saw your old key (someone's new phone, a new member) shares the current server key without asking, so you can read what's said from that key on.

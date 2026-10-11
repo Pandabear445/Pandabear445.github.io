@@ -197,8 +197,8 @@ Found a problem? Please tell the server owner privately (not in a public channel
 - **Other sites see people's IP addresses** for: Google Fonts on every load, image links in messages (embeds are
   on by default), direct video files in watch together, the YouTube, Vimeo and Twitch players, and the default
   STUN servers (Google). GIFs, news pictures and game and music art go through the server.
-- **Calls end on any connection blip.** A dropped live connection or a server restart ends every call, with no
-  rejoin, and changing the microphone mid-call doesn't switch the live one.
+- **Calls survive short blips, not long outages.** After a dropped connection or a server restart the app rejoins
+  the call by itself within the grace window (18 s by default, `VOICE_GRACE_MS`; row 89); past that, the call ends.
 - **The relay:** relay logins can't be revoked early, anyone who can sign up can get one, and the relay secret is
   shared by every region and stored in plain text. The hand-written `deploy/turnserver.conf` has no bandwidth cap
   (`setup-turn.sh` adds one; installs from before need it run again).
@@ -216,9 +216,10 @@ Found a problem? Please tell the server owner privately (not in a public channel
 - **Session location** ("Reno, NV") isn't shown, only the IP address: showing a place needs a GeoIP database or
   sending everyone's IPs to a third-party service.
 - **Rate limits and the security log are kept in memory**, so a restart resets them, and a multi-server setup
-  would need a shared store. There is no access log: failed sign-ins, robot-check failures and blocked addresses
-  are kept only in that in-memory log (the last 500 events). Staff actions and account security events go to the
-  audit log.
+  would need a shared store. The in-memory security log keeps the last 500 failed sign-ins, robot-check failures
+  and blocked addresses. Every request is also written to the structured server log (access log: route, status,
+  a keyed user pseudonym, a truncated address; docs/OPERATIONS.md), and staff actions and account security events
+  go to the audit log.
 
 - **Bot messages and slash-command text aren't end-to-end encrypted.** What you type after a bot's command goes to
   that bot's operator (the app warns first), and the bot's posts are readable by the server.

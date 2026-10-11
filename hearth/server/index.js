@@ -5288,8 +5288,8 @@ const dropWatch = (room) => { const e = watchEmits.get(room); if (e) clearTimeou
 // Where the video is right now, according to the shared state.
 const watchPos = (w) => w.position + (w.playing ? ((Date.now() - w.updatedAt) / 1000) * w.rate : 0);
 
-// Study together: a shared focus timer in a voice channel or call. Everyone in the room sees the same countdown
-// (worked out from when it started), so only the settings and start time live here; it ends when the room empties.
+// Takes someone out of the voice room they're in (and ends the room's watch-together when it empties).
+// notifyUser: also tell their app (voice:kicked), e.g. when they lost access to the channel.
 function leaveVoice(userId, notifyUser = false) {
   const channelId = userVoice.get(userId);
   if (!channelId) return;
