@@ -173,6 +173,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
               if (await confirmDialog({ title: 'Delete this message for everyone?', text: 'It disappears from the conversation for all members.', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/messages/${e.id}`).then(() => toast('Message deleted.'), (x) => toast(x.message, 'error')); }
             } }, 'Delete message') : null))) : null,
         r.resolution ? h('p', { class: 'stat-sub' }, `Note: ${r.resolution}${r.handledBy ? ` \u2014 ${r.handledBy.displayName}` : ''}`) : null,
+        // Also sent to the server's own moderators (their status is theirs; closing it here doesn't change it).
+        r.serverInbox ? h('p', { class: 'stat-sub' }, `The server\u2019s moderators have it too: ${r.serverInbox.status}${r.serverInbox.handledBy && r.serverInbox.status !== 'open' ? ` by ${r.serverInbox.handledBy.displayName}` : ''}${r.serverInbox.note ? ` \u2014 \u201c${r.serverInbox.note}\u201d` : ''}`) : null,
         h('div', { class: 'report-actions' },
           r.status === 'open' ? h('button', { class: 'btn ghost sm', onclick: () => act(r, { status: 'reviewing' }, 'Marked as reviewing.') }, 'I\u2019m on it') : null,
           r.target && !r.target.suspended ? h('button', { class: 'btn danger sm', onclick: () => suspendDialog(r.target, () => act(r, { status: 'resolved', resolution: 'Account suspended' }, 'Suspended and resolved.')) }, 'Suspend account') : null,

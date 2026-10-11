@@ -23,6 +23,8 @@ const PERMS = {
   // Voice moderation: server-mute people for everyone, and disconnect them or move them to another voice channel.
   MUTE_MEMBERS: 1 << 17,
   MOVE_MEMBERS: 1 << 18,
+  // v20 (server audit): read the server's audit log (server/serveraudit.js). Owners and Administrators always can.
+  VIEW_AUDIT_LOG: 1 << 19,
   ADMINISTRATOR: 1 << 30,
 };
 const ALL = Object.values(PERMS).reduce((a, b) => a | b, 0);

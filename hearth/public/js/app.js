@@ -34,6 +34,7 @@ import { openMemberships, membershipsTab } from './memberships.js';
 import { openRolePicker, pickableRoles, selfAssignProblem, SELF_BLOCKED } from './selfroles.js';
 import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
 import { webhooksPanel, onWebhooksUpdate } from './webhooks.js';
+import { initServerAudit, auditTab, reportsTab } from './serveraudit.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, quietNow } from './usability.js';
 import { trackViewport } from './viewport.js';
@@ -52,10 +53,13 @@ const S = {
   blocked: new Set(),
   voice: {},
   view: { type: 'home' },
-  panel: null,          // right panel: 'members' | 'pins' | 'thread' | null
-  thread: null,         // { rootId, channelId, serverId }
+  panel: null,          // right panel: 'members' | 'pins' | 'threads' | 'thread' | null
+  thread: null,         // { rootId, channelId, serverId, from: 'threads' when opened from the Threads panel }
   msgs: {},             // 'c:<channelId>' | 'd:<dmId>' -> { list, hasMore, hasNewer, loaded }
   threads: {},          // rootId -> { root, list, loaded }
+  threadState: {},      // rootId -> { channelId, unread, mentions, lastReadId, lastId }: your read state per thread (on the server)
+  threadMentions: new Map(), // 'c:<channelId>' -> pings in its threads not read yet (they count in the channel's badge)
+  threadsPanel: null,   // the Threads panel's list: { channelId, items, hasMore, next, loading, error }
   previews: {},         // conversation key -> decrypted preview text
   unread: new Set(),
   mentions: new Map(),
@@ -587,6 +591,11 @@ function startApp() {
     // In a 1-to-1 call nobody else is coming, so hang up.
     if (room.startsWith('dm:') && voice.channelId === room && (S.voice[room] || []).length <= 1) { voice.leave(); playSound('selfLeave'); }
   });
+  // Server settings → Audit log and Reports follow along live; a new report for a server you moderate says so.
+  initServerAudit(socket, { instanceName: () => S.config.name, onFreshReport: ({ serverId, category }) => {
+    const sv = S.servers.find((x) => x.id === serverId);
+    if (sv) toast(`New report in ${sv.name}: ${CATEGORY_LABEL[category] || category}. Open Server settings \u2192 Reports.`);
+  } });
   socket.on('admin:report', ({ category }) => {
     S.adminReports = (S.adminReports || 0) + 1;
     renderRail();
@@ -678,8 +687,10 @@ function startApp() {
     // back: load it fresh then.
     if (was) {
       const gone = new Set(was.channels.map((c) => c.id));
-      gone.forEach((id) => { delete S.msgs['c:' + id]; });
+      gone.forEach((id) => { delete S.msgs['c:' + id]; S.threadMentions.delete('c:' + id); });
       Object.entries(S.threads).forEach(([id, t]) => { if (t.root && gone.has(t.root.channelId)) delete S.threads[id]; });
+      Object.entries(S.threadState).forEach(([id, t]) => { if (gone.has(t.channelId)) delete S.threadState[id]; });
+      updateTitle();
     }
     if (S.view.serverId === serverId) { toast(was && was.kind === 'group' ? 'You left the group.' : 'You are no longer in that server.'); goHome(); }
     else { renderRail(); if (!S.view.serverId) renderSidebar(); }
@@ -722,6 +733,7 @@ function startApp() {
     const s = S.servers.find((x) => x.id === serverId);
     if (s) s.channels = s.channels.filter((c) => c.id !== id);
     delete S.msgs['c:' + id];
+    if (S.threadMentions.delete('c:' + id)) updateTitle();
     if (S.view.channelId === id) openServer(serverId);
     else if (S.view.serverId === serverId) renderSidebar();
   });
@@ -735,6 +747,7 @@ function startApp() {
     const store = S.msgs['c:' + channelId];
     const m = store && store.list.find((x) => x.id === rootId);
     if (m) { m.threadCount = threadCount || 0; m.threadLastAt = threadLastAt; if (currentKey() === 'c:' + channelId) replaceMessageEl(m); }
+    onThreadCount(rootId, channelId, threadCount || 0, threadLastAt);
   });
   socket.on('bot:interaction', (x) => SLASH.onInteraction(x));
   socket.on('webhooks:update', (x) => onWebhooksUpdate(x));
@@ -860,6 +873,8 @@ async function loadBootstrap() {
   S.voice = b.voice;
   S.msgs = {};
   S.threads = {};
+  S.threadState = {};
+  S.threadsPanel = null;
   await sec.ensureSigningKey(b.encSignPrivateKey);
   Object.values(S.users).forEach((u) => sec.trust(u));
   for (const st of Object.values(b.keyStates || {})) await sec.applyState(st);
@@ -975,7 +990,10 @@ const isFullAdmin = (server) => isOwner(server) || can(server, PERMS.ADMINISTRAT
 // You can only give a role whose permissions you have yourself (the server also checks its channel overrides,
 // which the app can't see for every channel, and explains when that's the reason).
 const mayGiveRole = (server, r) => !(r.permissions & ALL_PERMS & ~myPerms(server));
-const canManageServer = (server) => !!server && !isGroup(server) && (can(server, PERMS.MANAGE_SERVER) || can(server, PERMS.MANAGE_ROLES) || can(server, PERMS.MANAGE_EMOJIS) || can(server, PERMS.BAN_MEMBERS) || can(server, PERMS.KICK_MEMBERS));
+const canManageServer = (server) => !!server && !isGroup(server) && (can(server, PERMS.MANAGE_SERVER) || can(server, PERMS.MANAGE_ROLES) || can(server, PERMS.MANAGE_EMOJIS) || can(server, PERMS.BAN_MEMBERS) || can(server, PERMS.KICK_MEMBERS)
+  || can(server, PERMS.VIEW_AUDIT_LOG) || can(server, PERMS.MANAGE_MESSAGES));
+// Reports about this server reach people with these (server/serveraudit.js): Server settings → Reports.
+const canSeeReports = (server) => !!server && !isGroup(server) && (can(server, PERMS.MANAGE_MESSAGES) || can(server, PERMS.KICK_MEMBERS) || can(server, PERMS.BAN_MEMBERS));
 // Name color + badge for a member, from their roles in this server.
 function roleStyle(server, userId) {
   if (!server || isGroup(server)) return { color: '', badge: null };
@@ -1113,7 +1131,7 @@ function setView(v) {
   S.view = v;
   S.editing = null;
   if (S.panel === 'thread' && (!S.thread || S.thread.channelId !== v.channelId)) { S.panel = null; S.thread = null; }
-  if (S.panel === 'pins') S.panel = null;
+  if (S.panel === 'pins' || (S.panel === 'threads' && (!S.threadsPanel || S.threadsPanel.channelId !== v.channelId))) S.panel = null;
   if (S.panel === null && P.showMembers && wideEnoughForPanel() && (v.type === 'channel' || v.type === 'dm')) S.panel = 'members';
   document.body.classList.remove('nav-open');
   if (v.type === 'channel') { const lc = new Map(Object.entries(P.lastChannel)); lc.set(v.serverId, v.channelId); P.lastChannel = Object.fromEntries(lc); }
@@ -1195,16 +1213,60 @@ const quiet = () => S.me.status === 'dnd' || quietNow(S.notifySettings);
 function applyUserState([unread, notify, savedIds]) {
   if (notify) { S.notifyPrefs = notify.prefs || {}; S.notifySettings = notify.settings || S.notifySettings; migrateLocalNotify(); syncTimeZone(); }
   if (savedIds) { S.savedIds = new Set(savedIds); migrateLocalSaved(); }
-  if (unread) { S.unreadCounts = {}; for (const [conv, st] of Object.entries(unread.states || {})) applyReadState(conv, st); }
+  if (unread) { S.unreadCounts = {}; S.threadMentions = new Map(); for (const [conv, st] of Object.entries(unread.states || {})) applyReadState(conv, st); }
   updateTitle();
 }
 function applyReadState(conv, st) {
   if (!st) return;
+  if (conv.startsWith('t:')) return applyThreadState(st);
   if (st.lastReadId) S.lastRead[conv] = st.lastReadId;
   if (st.lastId) S.lastIds[conv] = st.lastId;
   (S.unreadCounts ||= {})[conv] = st.unread || 0;
   if (st.unread > 0) S.unread.add(conv); else S.unread.delete(conv);
   if (st.mentions > 0 && notifyLevel(conv) !== 'muted') S.mentions.set(conv, st.mentions); else S.mentions.delete(conv);
+  if (st.threadMentions !== undefined) setThreadPings(conv, st.threadMentions);
+  // "Mark as read" on the channel (here or on another device) took its threads with it.
+  if (st.threadsRead) clearThreads(conv.slice(2));
+}
+
+// ---- threads: your read state per thread, and the pings in a channel's threads
+// Reading a channel leaves its threads alone (each has its own marker, moved by opening the thread). Pings in a
+// thread count in its channel's badge until then; "Mark as read" on the channel or server clears those too.
+function setThreadPings(key, n) { if (n > 0) S.threadMentions.set(key, n); else S.threadMentions.delete(key); }
+const threadPings = (key) => (notifyLevel(key) === 'muted' ? 0 : S.threadMentions.get(key) || 0);
+// What a channel's badge counts: its own mentions plus the pings in its threads.
+const mentionsOf = (key) => (S.mentions.get(key) || 0) + (key.startsWith('c:') ? threadPings(key) : 0);
+// One thread's state from the server (a page of messages, the Threads panel, or a read on another device).
+function applyThreadState(st, { quiet = false } = {}) {
+  if (!st || !st.rootId) return;
+  S.threadState[st.rootId] = { channelId: st.channelId, unread: st.unread || 0, mentions: st.mentions || 0, lastReadId: st.lastReadId || null, lastId: st.lastId || null };
+  if (st.threadMentions !== undefined && st.channelId) setThreadPings('c:' + st.channelId, st.threadMentions);
+  if (!quiet) refreshThreadBits(st.rootId, st.channelId);
+}
+// The thread states that come with a page of channel messages ({ rootId: state }); the page is drawn next.
+function applyThreadStates(map) {
+  const list = Object.values(map || {});
+  list.forEach((st) => applyThreadState(st, { quiet: true }));
+  if (list.length) later(renderHeader);
+}
+function clearThreads(channelId) {
+  let any = false;
+  for (const [id, t] of Object.entries(S.threadState)) if (t.channelId === channelId && (t.unread || t.mentions)) { t.unread = 0; t.mentions = 0; any = true; refreshThreadBits(id, channelId, false); }
+  if (S.threadsPanel && S.threadsPanel.channelId === channelId) S.threadsPanel.items.forEach((x) => { x.unread = 0; x.mentions = 0; });
+  if (any || S.threadsPanel) { redrawThreads(); if (S.view.channelId === channelId) later(renderHeader); }
+}
+// Redraws what shows a thread's state: the line under the message that starts it, the Threads panel and button, and
+// the badges.
+function refreshThreadBits(rootId, channelId, badges = true) {
+  const store = S.msgs['c:' + channelId];
+  const m = store && store.list.find((x) => x.id === rootId);
+  if (m && currentKey() === 'c:' + channelId) replaceMessageEl(m);
+  const tp = S.threadsPanel;
+  const item = tp && tp.channelId === channelId && tp.items.find((x) => x.rootId === rootId);
+  if (item) { const st = S.threadState[rootId]; item.unread = st.unread; item.mentions = st.mentions; redrawThreads(); }
+  if (!badges) return;
+  if (S.view.channelId === channelId) later(renderHeader);
+  updateTitle(); later(renderRail); later(renderSidebar);
 }
 // Read on another device (or another tab): same badges here, and its notifications go away.
 function onReadUpdate(st) {
@@ -1246,7 +1308,7 @@ function serverUnread(s) {
   let mentions = 0;
   for (const c of s.channels) {
     const k = 'c:' + c.id;
-    mentions += S.mentions.get(k) || 0;
+    mentions += mentionsOf(k);
     if (S.unread.has(k) && notifyLevel(k) === 'all') unread = true;
   }
   if (notifyLevel('s:' + s.id) === 'muted') unread = false;
@@ -1255,10 +1317,12 @@ function serverUnread(s) {
 // The read marker is saved on the server (a moment after it moves, so scrolling through a busy channel is one
 // request), which tells your other devices.
 const readSync = new Map(); // key -> timer
-function syncRead(key, messageId, unread = false) {
+// threads: "Mark as read" on a channel, which takes its threads with it (sent straight away, so a later scroll
+// can't replace it with a plain read).
+function syncRead(key, messageId, unread = false, threads = false) {
   clearTimeout(readSync.get(key));
-  const go = () => { readSync.delete(key); api('POST', '/me/read', { conv: key, messageId, ...(unread ? { unread: true } : {}) }).catch(() => {}); };
-  if (unread) go(); else readSync.set(key, setTimeout(go, 600));
+  const go = () => { readSync.delete(key); api('POST', '/me/read', { conv: key, messageId, ...(unread ? { unread: true } : {}), ...(threads ? { threads: true } : {}) }).catch(() => {}); };
+  if (unread || threads) go(); else readSync.set(key, setTimeout(go, 600));
 }
 function markRead(key) {
   if (!key || document.hidden) return;
@@ -1278,19 +1342,22 @@ function markRead(key) {
   later(renderRail);
   later(renderSidebar);
 }
-// "Mark as read" from a menu: up to the newest message we know of, loaded or not.
-function markConvRead(key) {
+// "Mark as read" from a menu: up to the newest message we know of, loaded or not. A channel's menus take its threads
+// with it; the bar over the messages (threads: false) speaks of the channel's own messages, so it marks only those.
+function markConvRead(key, { threads: withThreads = true } = {}) {
   const st = S.msgs[key];
   const lastId = (st && st.list.length && !st.hasNewer && st.list[st.list.length - 1].id) || S.lastIds[key];
-  if (lastId) { S.lastRead[key] = lastId; syncRead(key, lastId); }
+  const threads = withThreads && key.startsWith('c:');
+  if (lastId) { S.lastRead[key] = lastId; syncRead(key, lastId, false, threads); }
   S.unread.delete(key); S.mentions.delete(key);
+  if (threads) { S.threadMentions.delete(key); clearThreads(key.slice(2)); }
   if (S.unreadCounts) S.unreadCounts[key] = 0;
   if (S.unreadMarker === key) { S.unreadMarker = null; if (currentKey() === key) renderMessages(false); }
   closeNotifications(key);
   renderSidebar(); renderRail(); updateTitle();
 }
 async function markServerRead(server) {
-  server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); });
+  server.channels.forEach((c) => { S.unread.delete('c:' + c.id); S.mentions.delete('c:' + c.id); S.threadMentions.delete('c:' + c.id); clearThreads(c.id); });
   renderAll(); updateTitle();
   try { (await api('POST', `/servers/${server.id}/read`)).states.forEach((st) => applyReadState(st.conv, st)); } catch (e) { toast(e.message, 'error'); }
 }
@@ -1309,6 +1376,7 @@ function markUnread(key, msgId) {
 function updateTitle() {
   let n = 0;
   S.mentions.forEach((c) => { n += c; });
+  S.threadMentions.forEach((c, k) => { n += threadPings(k); });
   const inbox = P.inbox.filter((x) => !x.read).length;
   document.title = (n ? `(${n}) ` : '') + (S.config.name || 'Hearth');
   if (window.hearthDesktop) window.hearthDesktop.setBadge(n);
@@ -1610,7 +1678,7 @@ function groupAvatar(g, size) {
 }
 function convRow(c) {
   const unread = c.unreadKey && S.unread.has(c.unreadKey) && !isMuted(c.unreadKey);
-  const mentions = c.unreadKey ? S.mentions.get(c.unreadKey) || 0 : 0;
+  const mentions = c.unreadKey ? mentionsOf(c.unreadKey) : 0;
   return h('button', {
     class: `dm-row${c.active ? ' active' : ''}${unread || mentions ? ' unread' : ''}${c.unreadKey && isMuted(c.unreadKey) ? ' muted' : ''}`,
     'data-nav': '', onclick: c.open, oncontextmenu: (e) => contextMenu(e, c.menu),
@@ -1735,7 +1803,7 @@ function renderServerSidebar(server, head, body) {
       const active = S.view.channelId === c.id;
       const k = 'c:' + c.id;
       // Collapsed categories still show the channel you're in, plus ones with mentions.
-      if (isCollapsed && !active && !S.mentions.get(k) && !(voice && voice.channelId === c.id)) continue;
+      if (isCollapsed && !active && !mentionsOf(k) && !(voice && voice.channelId === c.id)) continue;
       body.append(channelRow(c, server));
       if (c.type === 'voice') body.append(h('div', { class: 'vc-users', 'data-vc-users': c.id }));
     }
@@ -1748,7 +1816,7 @@ function channelRow(c, server) {
   const active = S.view.channelId === c.id;
   const muted = isMuted(k);
   const unread = c.type === 'text' && S.unread.has(k) && notifyLevel(k) === 'all';
-  const mentions = S.mentions.get(k) || 0;
+  const mentions = mentionsOf(k);
   const connected = voice && voice.channelId === c.id;
   return h('div', {
     class: `ch-row${active ? ' active' : ''}${unread ? ' unread' : ''}${muted ? ' muted' : ''}${connected ? ' connected' : ''}`,
@@ -1999,6 +2067,18 @@ function renderMain() {
 }
 const navToggle = () => ibtn('menu', 'Open navigation', () => document.body.classList.toggle('nav-open'), { cls: 'nav-toggle' });
 function headTools(...items) { return h('div', { class: 'head-tools', role: 'toolbar', 'aria-label': 'Conversation tools' }, items.filter(Boolean)); }
+// The channel's Threads panel. Its badge counts pings in the channel's threads; a dot means new replies in a thread
+// this app has seen (the panel itself has the full list).
+function threadsButton(channelId) {
+  const open = S.panel === 'threads' || (S.panel === 'thread' && S.thread && S.thread.from === 'threads');
+  const pings = threadPings('c:' + channelId);
+  const fresh = !pings && Object.entries(S.threadState).some(([id, t]) => t.channelId === channelId && t.unread > 0 && !S.blocked.has(threadAuthor(id, channelId)));
+  const label = `${S.panel === 'threads' ? 'Hide threads' : 'Threads'}${pings ? ` · ${pings} mention${pings === 1 ? '' : 's'}` : fresh ? ' · new replies' : ''}`;
+  const b = ibtn('thread', label, () => { if (S.panel !== 'threads') S.threadsPanel = null; togglePanel('threads'); }, { active: open, cls: 'with-badge' });
+  if (pings) b.append(h('span', { class: 'badge', 'aria-hidden': 'true' }, pings > 99 ? '99+' : pings));
+  else if (fresh) b.append(h('span', { class: 'unread-dot', 'aria-hidden': 'true' }));
+  return b;
+}
 function togglePanel(mode) {
   S.panel = S.panel === mode ? null : mode;
   if (mode === 'members') P.showMembers = S.panel === 'members';
@@ -2034,6 +2114,7 @@ function drawHeader(head) {
         ibtn('search', 'Search this channel (Ctrl+K)', () => openSearch({ scope: key })),
         // Notification options live in the ⋯ menu; the bell only shows up as a reminder when it's muted.
         isMuted(key) ? ibtn('bellOff', 'Muted. Click to change.', (e) => menu(e.currentTarget, notifyMenu(key), { align: 'end' }), { attrs: { 'data-pop-anchor': '' } }) : null,
+        threadsButton(c.id),
         ibtn('people', S.panel === 'members' ? 'Hide members' : 'Show members', () => togglePanel('members'), { active: S.panel === 'members' }),
         ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...channelMenuItems(c, server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'channel' && isGroup(server)) {
@@ -2049,6 +2130,7 @@ function drawHeader(head) {
         call ? h('button', { class: `btn sm ${inCall ? 'danger' : callers ? 'primary' : 'ghost'}`, onclick: () => (inCall ? voice.leave() : joinRoom(call.id)) },
           icon(inCall ? 'phoneOff' : 'phone'), inCall ? 'Leave call' : callers ? `Join call (${callers})` : 'Call') : null,
         ibtn('search', 'Search (Ctrl+K)', () => openSearch({ scope: key })),
+        threadsButton(v.channelId),
         ibtn('people', 'Members', () => togglePanel('members'), { active: S.panel === 'members' }),
         ibtn('more', 'More', (e) => menu(e.currentTarget, [PIN_ITEM, ...groupMenuItems(server)], { align: 'end' }), { attrs: { 'data-pop-anchor': '' }, active: S.panel === 'pins' })));
   } else if (v.type === 'dm') {
@@ -2420,6 +2502,7 @@ async function loadMessages(key, mode = 'latest') {
   if (!store.loaded) renderMessages(true);
   try {
     const res = await api('GET', msgUrl(key) + q);
+    applyThreadStates(res.threads);
     const known = new Set(store.list.map((m) => m.id));
     const fresh = res.messages.filter((m) => !known.has(m.id));
     store.list = [...store.list, ...fresh].sort((a, b) => (a.id < b.id ? -1 : 1));
@@ -2672,7 +2755,7 @@ function renderUnreadBar() {
   const first = store && store.list.find((m) => m.id > S.markerId && m.authorId !== S.me.id);
   bar.append(h('button', { class: 'unread-jump', onclick: () => jumpToFirstUnread() }, icon('arrowUp'),
     h('span', null, `${n >= 100 ? '99+' : n} new message${n === 1 ? '' : 's'}${first ? ` since ${fmtTime(first.createdAt)}` : ''}`), h('strong', null, 'Jump to first unread')),
-  h('button', { class: 'unread-mark', onclick: () => markConvRead(key) }, 'Mark as read', icon('check')));
+  h('button', { class: 'unread-mark', onclick: () => markConvRead(key, { threads: false }) }, 'Mark as read', icon('check')));
 }
 async function jumpToFirstUnread() {
   const key = currentKey();
@@ -2836,6 +2919,18 @@ function openPurgeRecent(c) {
       toast(bulkDone(await api('POST', `/channels/${encodeURIComponent(c.id)}/messages/bulk-delete`, { count: n })));
     } }] });
 }
+// Bot and webhook posts are labelled wherever they show (the channel, the Threads panel), so one can't pass for a
+// member: the BOT tag next to the name, and a flag saying the text isn't end-to-end encrypted.
+const isBotPost = (author, m) => !!(author.bot || m.bot || (m.dec && m.dec.bot));
+function postFlag(m, author) {
+  const d = m.dec;
+  if (!d) return null;
+  if (d.bot && m.authorId === NEWS_BOT_ID) return { label: 'News bot \u00b7 public feed, not end-to-end encrypted', tip: 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' };
+  if (d.bot && d.webhook) return { label: 'Webhook \u00b7 not end-to-end encrypted', tip: `Posted by a program outside Hearth through this channel’s webhook “${displayName(author)}”, so it isn’t end-to-end encrypted. Everything people write still is.` };
+  if (d.bot) return { label: 'Bot \u00b7 not end-to-end encrypted', tip: 'Posted by a bot this server added. Bot messages aren\u2019t end-to-end encrypted. Everything people write still is.' };
+  if (d.legacy) return { label: 'Older message \u2014 not end-to-end encrypted, sender not verified', tip: 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only, and nothing proves who wrote it: the server could have.' };
+  return null;
+}
 function messageElRevealed(m, prev, ctx) {
   const el = h('div', { class: 'msg', dataset: { mid: m.id, ctx }, tabindex: '-1' });
   return fillMessage(el, m, prev, ctx, { author: getUser(m.authorId), mine: false, isGrouped: false, text: textOf(m) });
@@ -2860,7 +2955,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const rs = roleStyle(server, author.id);
     body.append(h('div', { class: 'msg-head' },
       h('button', { class: 'msg-name', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, nameEl(hookFace(author, m), { roleColor: rs.color })),
-      (author.bot || m.bot || (m.dec && m.dec.bot)) ? h('span', { class: 'bot-tag' }, 'BOT') : null,
+      isBotPost(author, m) ? h('span', { class: 'bot-tag' }, 'BOT') : null,
       rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
       rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
       h('time', { class: 'msg-time', datetime: new Date(m.createdAt).toISOString(), title: new Date(m.createdAt).toLocaleString() }, fmtStamp(m.createdAt)),
@@ -2891,10 +2986,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     const wc = watchChips(text);
     if (wc) body.append(wc);
     if (embed) body.append(newsCard(embed));
-    if (m.dec && m.dec.bot && m.authorId === NEWS_BOT_ID) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
-    else if (m.dec && m.dec.bot && m.dec.webhook) body.append(h('div', { class: 'msg-flag', 'data-tip': `Posted by a program outside Hearth through this channel’s webhook “${displayName(author)}”, so it isn’t end-to-end encrypted. Everything people write still is.` }, 'Webhook \u00b7 not end-to-end encrypted'));
-    else if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by a bot this server added. Bot messages aren\u2019t end-to-end encrypted. Everything people write still is.' }, 'Bot \u00b7 not end-to-end encrypted'));
-    else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only, and nothing proves who wrote it: the server could have.' }, 'Older message \u2014 not end-to-end encrypted, sender not verified'));
+    const flag = postFlag(m, author);
+    if (flag) body.append(h('div', { class: 'msg-flag', 'data-tip': flag.tip }, flag.label));
     // Opened or signed with a key that isn't the person's current, trusted one (secure.js keysOf).
     else if (m.dec && m.dec.keyNote === 'listed') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'Written with a key the server says this person had before they reset their password. This device never saw that key as theirs and it can\u2019t be checked with safety numbers, so the server could have written this.' }, '\u26a0 Older key \u2014 not verified'));
     else if (m.dec && m.dec.keyNote === 'new') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'This person\u2019s security key changed and you haven\u2019t verified the new one yet. Compare safety numbers from their profile.' }, '\u26a0 New key \u2014 not verified yet'));
@@ -2911,9 +3004,18 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     }), h('button', { class: 'reaction add-r', 'data-pop-anchor': '', 'aria-label': 'Add reaction', 'data-tip': 'Add reaction', onclick: (e) => emojiPicker(e.currentTarget, (em) => react(m, em)) }, icon('smile'))));
   }
   if (m.threadCount && ctx === 'main') {
-    body.append(h('button', { class: 'thread-chip', onclick: () => openThread(m) }, icon('thread'),
-      h('strong', null, `${m.threadCount} ${m.threadCount === 1 ? 'reply' : 'replies'}`),
-      m.threadLastAt ? h('span', null, `Last reply ${relTime(m.threadLastAt)}`) : null, icon('chevronRight')));
+    // "3 replies · 2 new": the new ones are other people's replies since you last read the thread (@ when one pings you).
+    const ts = S.threadState[m.id];
+    const fresh = ts ? ts.unread : 0;
+    const pinged = fresh > 0 && ts.mentions > 0;
+    const count = `${m.threadCount} ${m.threadCount === 1 ? 'reply' : 'replies'}`;
+    body.append(h('button', {
+      class: `thread-chip${fresh ? ' unread' : ''}`, onclick: () => openThread(m),
+      'aria-label': `${count}${fresh ? `, ${fresh >= 100 ? '99+' : fresh} new${pinged ? ', mentions you' : ''}` : ''}${m.threadLastAt ? `, last reply ${relTime(m.threadLastAt)}` : ''}. Open thread`,
+    }, icon('thread'),
+    h('strong', null, count),
+    fresh ? h('span', { class: `thread-new${pinged ? ' ping' : ''}` }, `${pinged ? '@ ' : ''}${fresh >= 100 ? '99+' : fresh} new`) : null,
+    m.threadLastAt ? h('span', null, `Last reply ${relTime(m.threadLastAt)}`) : null, icon('chevronRight')));
   }
   el.append(gutter, body, messageTools(m, ctx));
   roveMessage(el, false);
@@ -3536,17 +3638,36 @@ async function onUpdateMessage(key, m) {
 function onDeleteChannelMessages(channelId, list) {
   const top = [];
   const threads = new Set();
+  const pinged = (S.threadMentions.get('c:' + channelId) || 0) > 0;
+  const roots = new Set(list.filter((x) => !x.threadId).map((x) => x.id)); // whole threads going (forgetThreads)
   for (const { id, threadId } of list) {
     const t = threadId && S.threads[threadId];
-    if (threadId) { if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); threads.add(threadId); } } else top.push(id);
+    if (threadId) {
+      if (t) { t.list = t.list.filter((x) => x.id !== id); t.total = Math.max(0, (t.total || 0) - 1); threads.add(threadId); }
+      // A reply that may have counted here (in its thread's "N new", or as a ping in the channel's badge).
+      const st = S.threadState[threadId];
+      if (!roots.has(threadId) && (pinged || (st && (st.unread || st.mentions) && (!st.lastReadId || id > st.lastReadId)))) recheckThread(threadId);
+    } else top.push(id);
   }
   if (S.thread && threads.has(S.thread.rootId)) renderPanel();
   if (top.length) onDeleteMessage('c:' + channelId, top);
 }
+// Replies were deleted that a thread's counts may include: ask the server for its state again (with the channel's
+// thread pings), once per thread, a moment later and at slightly different times on different people's apps. A
+// big purge rechecks a few threads: any of them sets the channel's badge right.
+const threadRecheck = new Map(); // rootId -> timer
+function recheckThread(rootId) {
+  if (threadRecheck.has(rootId) || threadRecheck.size >= 5) return;
+  threadRecheck.set(rootId, setTimeout(() => {
+    threadRecheck.delete(rootId);
+    api('GET', `/messages/${encodeURIComponent(rootId)}/thread?limit=1`).then((r) => applyThreadState(r.state)).catch(() => {});
+  }, 300 + Math.floor(Math.random() * 700)));
+}
 function onDeleteMessage(key, id) {
+  const gone = new Set(Array.isArray(id) ? id : [id]);
+  if (key.startsWith('c:')) forgetThreads(key, gone);
   const store = S.msgs[key];
   if (!store) return;
-  const gone = new Set(Array.isArray(id) ? id : [id]);
   store.list = store.list.filter((x) => !gone.has(x.id));
   store.list.forEach((x) => { if (x.reply && gone.has(x.reply.id)) x.reply = null; });
   if (S.select && S.select.key === key) { for (const x of gone) S.select.ids.delete(x); renderSelectBar(); }
@@ -3584,9 +3705,10 @@ function findThreadMessage(id) {
   }
   return null;
 }
-async function openThread(root, focusId) {
+// from: 'threads' when picked in the Threads panel (closing the thread goes back to it).
+async function openThread(root, focusId, { from = null } = {}) {
   if (root.threadId) return;
-  S.thread = { rootId: root.id, channelId: root.channelId, serverId: root.serverId, focusId };
+  S.thread = { rootId: root.id, channelId: root.channelId, serverId: root.serverId, focusId, from };
   S.panel = 'thread';
   document.body.classList.add('panel-open');
   renderPanel(); renderHeader();
@@ -3597,15 +3719,52 @@ async function openThread(root, focusId) {
     const t = { root: res.root, list: res.messages, loaded: true, hasMore: !!res.hasMore, hasNewer: !!res.hasNewer, total: Math.max(res.messages.length, res.root.threadCount || 0) };
     await Promise.all([t.root, ...t.list].map(decryptMessage));
     S.threads[root.id] = t;
-    if (S.thread && S.thread.rootId === root.id) renderPanel();
+    // Where you'd read up to before this: the "New" line, which stays put while the thread is open.
+    if (S.thread && S.thread.rootId === root.id && res.state && res.state.unread > 0) S.thread.markerId = res.state.lastReadId;
+    if (res.state) applyThreadState(res.state);
+    if (S.thread && S.thread.rootId === root.id) { renderPanel(); markThreadRead(root.id); }
   } catch (e) { toast(e.message, 'error'); closeThread(); }
 }
-function closeThread() {
+// all: the panel's close button (otherwise a thread opened from the Threads panel goes back to it).
+function closeThread(all = false) {
+  const back = !all && S.thread && S.thread.from === 'threads' && S.view.channelId === S.thread.channelId;
+  const rootId = S.thread && S.thread.rootId;
+  const panel = $('#members');
+  const hadFocus = !!panel && panel.contains(document.activeElement);
   S.thread = null;
-  S.panel = P.showMembers && wideEnoughForPanel() && ['channel', 'dm'].includes(S.view.type) ? 'members' : null;
+  S.panel = back ? 'threads' : P.showMembers && wideEnoughForPanel() && ['channel', 'dm'].includes(S.view.type) ? 'members' : null;
   document.body.classList.toggle('panel-open', !!panelMode());
   delete composers.thread;
   renderPanel(); renderHeader();
+  // Back in the list: the keyboard carries on from the thread you were in (or the panel's heading).
+  if (back && hadFocus) focusThreadCard(rootId, { fallback: true });
+}
+// You're reading this thread: the side panel shows it, the window is showing, and its newest replies are loaded.
+// Only then do replies count as read (the thread can stay chosen while the panel shows something else).
+function readingThread(rootId) {
+  const t = S.threads[rootId];
+  return panelMode() === 'thread' && !!S.thread && S.thread.rootId === rootId && !document.hidden && !!t && t.loaded && !t.hasNewer;
+}
+// Reading a thread moves its marker to its newest reply, a moment later (one request for a burst of replies). The
+// server tells your other devices, and its answer sets the channel's badge right.
+const threadReadSync = new Map(); // rootId -> timer
+function markThreadRead(rootId) {
+  if (!readingThread(rootId)) return;
+  const t = S.threads[rootId];
+  const last = t.list.length ? t.list[t.list.length - 1].id : null;
+  const st = S.threadState[rootId];
+  if (!last || (st && !st.unread && !st.mentions && st.lastReadId && st.lastReadId >= last)) return;
+  if (st) {
+    const k = 'c:' + st.channelId;
+    if (st.mentions) setThreadPings(k, Math.max(0, (S.threadMentions.get(k) || 0) - st.mentions));
+    Object.assign(st, { unread: 0, mentions: 0, lastReadId: last });
+    refreshThreadBits(rootId, st.channelId);
+  }
+  clearTimeout(threadReadSync.get(rootId));
+  threadReadSync.set(rootId, setTimeout(() => {
+    threadReadSync.delete(rootId);
+    api('POST', '/me/read', { conv: 't:' + rootId, messageId: last }).then((r) => applyThreadState(r)).catch(() => {});
+  }, 400));
 }
 async function onThreadMessage(m) {
   await decryptMessage(m);
@@ -3631,10 +3790,41 @@ async function onThreadMessage(m) {
       }
     }
   }
+  countThreadReply(m);
   if (m.authorId !== S.me.id && (mentionsMe(m) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId)) {
     addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${displayName(getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140) });
     if (!quiet() && notifyLevel('c:' + m.channelId) !== 'muted') claimOnce(m.id).then((ok) => { if (ok) playSound(mentionKind(m) || 'reply'); });
   }
+}
+// Messages that started threads were deleted (their replies went with them): drop those threads here too.
+function forgetThreads(key, gone) {
+  let pings = 0; let had = false;
+  for (const x of gone) { const st = S.threadState[x]; if (st) { pings += st.mentions; had = true; delete S.threadState[x]; } }
+  if (pings) { setThreadPings(key, Math.max(0, (S.threadMentions.get(key) || 0) - pings)); updateTitle(); later(renderRail); later(renderSidebar); }
+  if (had && currentKey() === key) later(renderHeader);
+  const tp = S.threadsPanel;
+  if (tp && 'c:' + tp.channelId === key && tp.items.some((x) => gone.has(x.rootId))) { tp.items = tp.items.filter((x) => !gone.has(x.rootId)); redrawThreads(); }
+}
+// A reply arrived: what's new in its thread for you. Reading along (the thread open, the window showing) keeps it
+// read; otherwise it counts, and a ping in it counts in the channel's badge too (as the server counts them).
+function countThreadReply(m) {
+  const key = 'c:' + m.channelId;
+  const st = (S.threadState[m.threadId] ||= { channelId: m.channelId, unread: 0, mentions: 0, lastReadId: null, lastId: null });
+  if (!st.lastId || m.id > st.lastId) st.lastId = m.id;
+  if (m.authorId === S.me.id) {
+    // Yours, from here or another device: read up to it (the server says so too, with the channel's badge).
+    const k = st.mentions; Object.assign(st, { unread: 0, mentions: 0, lastReadId: m.id });
+    if (k) setThreadPings(key, Math.max(0, (S.threadMentions.get(key) || 0) - k));
+  } else if (readingThread(m.threadId)) {
+    markThreadRead(m.threadId);
+  } else {
+    st.unread += 1;
+    const kind = mentionKind(m);
+    const pinged = ((kind && !(kind === 'everyone' && everyoneMuted(key))) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId);
+    if (pinged) { st.mentions += 1; S.threadMentions.set(key, (S.threadMentions.get(key) || 0) + 1); }
+  }
+  refreshThreadBits(m.threadId, m.channelId);
+  threadsPanelReply(m);
 }
 async function onThreadUpdate(m) {
   const t = S.threads[m.threadId];
@@ -3651,6 +3841,9 @@ async function onThreadUpdate(m) {
 function renderPanel() {
   const el = $('#members');
   if (!el) return;
+  // The Threads list keeps the card that had focus through a rebuild (server updates, people joining…).
+  const was = el.querySelector(':scope > .threads-list');
+  const refocus = was && was.contains(document.activeElement) ? document.activeElement.closest('[data-root]') : null;
   clear(el);
   const mode = panelMode();
   document.body.classList.toggle('panel-open', !!mode);
@@ -3658,15 +3851,16 @@ function renderPanel() {
   if (!mode || !S.me) return;
   el.dataset.mode = mode;
   queueMicrotask(() => { if (!el.querySelector(':scope > .resize-handle')) el.append(resizeHandle('panel')); });
-  if ((mode === 'thread' || mode === 'pins') && hiddenWhileSharing(privateKey())) return el.append(h('p', { class: 'sidebar-empty' }, 'Hidden while you share your screen.'));
+  if ((mode === 'thread' || mode === 'pins' || mode === 'threads') && hiddenWhileSharing(privateKey())) return el.append(h('p', { class: 'sidebar-empty' }, 'Hidden while you share your screen.'));
   if (mode === 'thread') return threadPanel(el);
   if (mode === 'pins') return pinsPanel(el);
+  if (mode === 'threads') return threadsPanel(el, refocus && refocus.dataset.root);
   if (S.view.type === 'dm') return dmProfilePanel(el);
   return membersPanel(el);
 }
 function panelHead(title, sub, extra) {
   return h('div', { class: 'panel-head' }, h('div', { class: 'panel-title' }, h('h2', null, title), sub ? h('span', null, sub) : null),
-    extra, ibtn('close', 'Close panel', () => (S.panel === 'thread' ? closeThread() : togglePanel(S.panel))));
+    extra, ibtn('close', 'Close panel', () => (S.panel === 'thread' ? closeThread(true) : togglePanel(S.panel))));
 }
 
 function membersPanel(el) {
@@ -3778,7 +3972,7 @@ function openTimeout(server, u) {
       { label: 'Time out', kind: 'danger', action: () => api('POST', `/servers/${server.id}/members/${u.id}/timeout`, { minutes: Number(len.value), reason: reason.value }).then((r) => toast(`${displayName(u)} is timed out until ${fmtStamp(r.until)}.`)) }] });
 }
 function openBan(server, u) {
-  const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional — only moderators see it' });
+  const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional — moderators see it (in Bans and the audit log)' });
   // Cleanup after a raid or a spammer: their messages in this server's channels from that window go too.
   const wipe = h('select', { class: 'input', 'aria-label': 'Delete their messages from the last' },
     [[0, 'Don\u2019t delete any'], [1, 'Last hour'], [24, 'Last 24 hours'], [168, 'Last 7 days']].map(([v, l]) => h('option', { value: String(v) }, l)));
@@ -3869,7 +4063,8 @@ async function pinHistory(el, channelId) {
 function threadPanel(el) {
   const t = S.threads[S.thread.rootId];
   const c = channelById(S.thread.channelId);
-  el.append(panelHead('Thread', c ? `#${c.name}` : ''));
+  const back = S.thread.from === 'threads' ? ibtn('chevronLeft', 'Back to threads', () => closeThread()) : null;
+  el.append(panelHead('Thread', c ? `#${c.name}` : '', back));
   if (!t) { el.append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' }))); return; }
   const list = h('div', { class: 'thread-list', role: 'log', 'aria-label': 'Thread messages' });
   list.addEventListener('click', onMessageAreaClick);
@@ -3878,7 +4073,16 @@ function threadPanel(el) {
   list.append(h('div', { class: 'thread-divider' }, h('span', null, threadCountLabel(t))));
   if (t.hasMore) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadOlderReplies(e.currentTarget) }, 'Show earlier replies'));
   let prev = null;
-  t.list.forEach((m) => { list.append(messageEl(m, prev, 'thread')); prev = m; });
+  // "New replies" above the first reply you hadn't read when you opened the thread.
+  const marker = S.thread.markerId;
+  let newShown = false;
+  t.list.forEach((m) => {
+    if (!newShown && marker && m.id > marker && m.authorId !== S.me.id) {
+      list.append(h('div', { class: 'new-div', role: 'separator', 'aria-label': 'New replies' }, h('span', null, 'New replies')));
+      newShown = true; prev = null;
+    }
+    list.append(messageEl(m, prev, 'thread')); prev = m;
+  });
   if (t.hasNewer) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadNewerReplies(e.currentTarget) }, 'Show newer replies'));
   ensureCurrentMessage(list);
   const comp = createComposer({ id: 'thread', key: () => 'c:' + S.thread.channelId, threadId: () => S.thread.rootId, placeholder: 'Reply in thread\u2026' });
@@ -3925,7 +4129,7 @@ async function loadNewerReplies(btn) {
     const have = new Set(t.list.map((m) => m.id));
     t.list = [...t.list, ...res.messages.filter((m) => !have.has(m.id))];
     t.hasNewer = !!res.hasNewer;
-    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = last; renderPanel(); }
+    if (S.thread && S.thread.rootId === rootId) { S.thread.keepId = last; renderPanel(); markThreadRead(rootId); }
   } catch (e) { toast(e.message, 'error'); btn.disabled = false; }
 }
 // Straight to the newest replies (after you reply while an older part of the thread is showing).
@@ -3938,8 +4142,159 @@ async function loadNewestReplies() {
     const res = await api('GET', `/messages/${rootId}/thread?limit=100`);
     await Promise.all(res.messages.map(decryptMessage));
     Object.assign(t, { list: res.messages, hasMore: !!res.hasMore, hasNewer: false, total: Math.max(res.messages.length, res.root.threadCount || 0) });
-    if (S.thread && S.thread.rootId === rootId) renderPanel();
+    if (S.thread && S.thread.rootId === rootId) { renderPanel(); markThreadRead(rootId); }
   } catch (e) { toast(e.message, 'error'); } finally { t.jumping = false; }
+}
+
+// ======================================================================= the Threads panel
+// A channel's threads, the one with the latest reply first (GET /channels/:id/threads), with what's new for you in
+// each. The first messages come encrypted and are decrypted here. Live: replies move their thread to the top.
+// refocus: the card that had focus before the panel was rebuilt.
+function threadsPanel(el, refocus = null) {
+  const channelId = S.view.channelId;
+  const c = channelById(channelId);
+  el.append(panelHead('Threads', c ? `#${c.name}` : ''));
+  const list = h('ul', { class: 'threads-list', 'aria-label': `Threads in ${c ? '#' + c.name : 'this channel'}` });
+  // Where the list is scrolled to, so a rebuild or coming back from a thread doesn't jump to the top.
+  list.addEventListener('scroll', () => { const tp = S.threadsPanel; if (tp && tp.channelId === channelId) tp.scrollTop = list.scrollTop; }, { passive: true });
+  el.append(list);
+  if (!S.threadsPanel || S.threadsPanel.channelId !== channelId) loadThreads(channelId);
+  drawThreads(list, S.threadsPanel);
+  if (S.threadsPanel && S.threadsPanel.scrollTop) list.scrollTop = S.threadsPanel.scrollTop;
+  if (refocus) focusThreadCard(refocus);
+}
+// Focus a thread's card in the Threads list (fallback: the panel's heading when the card isn't there).
+function focusThreadCard(rootId, { fallback = false } = {}) {
+  const panel = $('#members');
+  if (!panel || panelMode() !== 'threads') return;
+  const card = rootId && panel.querySelector(`.threads-list [data-root="${CSS.escape(rootId)}"]`);
+  const target = card && (card.matches('button') ? card : card.querySelector('button'));
+  if (target) { target.focus({ preventScroll: !!S.threadsPanel && !!S.threadsPanel.scrollTop }); return; }
+  if (!fallback) return;
+  const head = panel.querySelector('.panel-head h2');
+  if (head) { head.tabIndex = -1; head.focus(); }
+}
+async function loadThreads(channelId, more = false) {
+  let tp = S.threadsPanel;
+  if (!more || !tp || tp.channelId !== channelId) tp = S.threadsPanel = { channelId, items: [], hasMore: false, next: null, loading: false, error: null };
+  if (tp.loading) return;
+  tp.loading = true;
+  if (more) redrawThreads();
+  try {
+    const res = await api('GET', `/channels/${encodeURIComponent(channelId)}/threads${more && tp.next ? `?before=${encodeURIComponent(tp.next)}` : ''}`);
+    await Promise.all(res.threads.map((t) => decryptMessage(t.root)));
+    if (S.threadsPanel !== tp) return;
+    const have = new Set(tp.items.map((t) => t.rootId));
+    tp.items.push(...res.threads.filter((t) => !have.has(t.rootId)));
+    tp.hasMore = !!res.hasMore; tp.next = res.next; tp.error = null;
+    for (const t of res.threads) applyThreadState({ rootId: t.rootId, channelId, unread: t.unread, mentions: t.mentions, lastReadId: t.lastReadId, lastId: t.lastReplyId }, { quiet: true });
+    // The first page carries the channel's thread pings: its badge is right once the panel opens.
+    if (res.threadMentions !== undefined) { setThreadPings('c:' + channelId, res.threadMentions); updateTitle(); later(renderRail); later(renderSidebar); }
+    // The same threads' lines under their messages, if they're on screen.
+    const store = currentKey() === 'c:' + channelId && S.msgs['c:' + channelId];
+    if (store) for (const t of res.threads) { const m = store.list.find((x) => x.id === t.rootId); if (m) replaceMessageEl(m); }
+  } catch (e) { tp.error = e.message; } finally { tp.loading = false; }
+  if (S.threadsPanel === tp) { redrawThreads(); if (S.view.channelId === channelId) renderHeader(); }
+}
+// A reply arrived while the list is showing a new thread (or one further down): fetch the top again, once.
+let threadsReload = 0;
+function reloadThreadsSoon(channelId) {
+  clearTimeout(threadsReload);
+  threadsReload = setTimeout(() => {
+    const old = S.threadsPanel;
+    if (!old || old.channelId !== channelId) return;
+    S.threadsPanel = null;
+    loadThreads(channelId);
+    // Same list, newer contents: where it's scrolled to and the threads you chose to see stay.
+    if (S.threadsPanel) Object.assign(S.threadsPanel, { scrollTop: old.scrollTop, revealed: old.revealed });
+  }, 300);
+}
+function drawThreads(list, tp) {
+  if (!tp || (tp.loading && !tp.items.length)) return list.append(h('li', { class: 'panel-loading' }, h('span', { class: 'spinner', 'aria-label': 'Loading threads' })));
+  if (tp.error && !tp.items.length) return list.append(h('li', { class: 'sidebar-empty' }, tp.error));
+  if (!tp.items.length) return list.append(h('li', { class: 'panel-empty' }, icon('thread'), h('p', null, 'No threads here yet. Hover over a message and pick “Reply in thread” to start one.')));
+  for (const t of tp.items) list.append(h('li', null, threadCard(t)));
+  if (tp.hasMore) list.append(h('li', null, h('button', { class: 'btn ghost sm', type: 'button', disabled: tp.loading, onclick: () => loadThreads(tp.channelId, true) }, tp.loading ? 'Loading…' : 'Show older threads')));
+}
+// Redraws the list where it is (keeps the scroll position and the card that had focus).
+function redrawThreads() {
+  const list = panelMode() === 'threads' && $('#members .threads-list');
+  if (!list || !S.threadsPanel || S.threadsPanel.channelId !== S.view.channelId) return;
+  const top = list.scrollTop;
+  const focused = document.activeElement && list.contains(document.activeElement) && document.activeElement.closest('[data-root]');
+  clear(list);
+  drawThreads(list, S.threadsPanel);
+  list.scrollTop = top;
+  if (focused) focusThreadCard(focused.dataset.root);
+}
+const newLabel = (n) => `${n >= 100 ? '99+' : n} new`;
+// Who started a thread, if this app has its first message (in the channel's loaded messages, the thread itself or
+// the Threads list).
+function threadAuthor(rootId, channelId) {
+  const store = S.msgs['c:' + channelId];
+  const m = (store && store.list.find((x) => x.id === rootId)) || (S.threads[rootId] && S.threads[rootId].root)
+    || (S.threadsPanel && S.threadsPanel.items.find((x) => x.rootId === rootId) || {}).root;
+  return m ? m.authorId : null;
+}
+function threadCard(t) {
+  const tp = S.threadsPanel;
+  // Someone you blocked started it: folded away like their messages in the channel, until you ask to see it.
+  if (S.blocked.has(t.root.authorId) && !(tp && tp.revealed && tp.revealed.has(t.rootId))) {
+    return h('div', { class: 'thread-card blocked', dataset: { root: t.rootId } }, h('span', { class: 'blocked-note' }, icon('ban'), 'Thread started by someone you blocked. ',
+      h('button', { class: 'link-btn', type: 'button', onclick: () => { const cur = S.threadsPanel; if (!cur) return; (cur.revealed ||= new Set()).add(t.rootId); redrawThreads(); focusThreadCard(t.rootId); } }, 'Show')));
+  }
+  const st = S.threadState[t.rootId] || t;
+  const fresh = st.unread || 0;
+  const pinged = fresh > 0 && st.mentions > 0;
+  // The name, picture and labels the message has in the channel (a webhook's own name, BOT, not end-to-end encrypted).
+  const author = getUser(t.root.authorId);
+  const face = hookFace(author, t.root);
+  const bot = isBotPost(author, t.root);
+  const flag = readable(t.root) ? postFlag(t.root, author) : null;
+  const text = readable(t.root) ? textOf(t.root) : '';
+  const preview = h('span', { class: 'thread-card-text', html: text
+    ? md(text, { inline: true, mentionName: S.me.username, everyone: senderMayPingEveryone(t.root) })
+    : readable(t.root) && filesOf(t.root).length ? '<em>Attachment</em>' : '<em>Encrypted message</em>' });
+  // The card is one button: links and spoilers in the preview are plain text (open the thread to use them).
+  preview.querySelectorAll('a').forEach((a) => a.replaceWith(h('span', { class: 'link-text' }, a.textContent)));
+  preview.querySelectorAll('[tabindex], [role]').forEach((x) => { x.removeAttribute('tabindex'); x.removeAttribute('role'); x.removeAttribute('aria-label'); });
+  const count = `${t.replyCount} ${t.replyCount === 1 ? 'reply' : 'replies'}`;
+  const when = t.lastReplyAt ? `Last reply ${relTime(t.lastReplyAt)}` : '';
+  const people = (t.participants || []).filter((id) => !S.blocked.has(id));
+  return h('button', {
+    class: `thread-card${fresh ? ' unread' : ''}`, type: 'button', dataset: { root: t.rootId },
+    'aria-label': `Thread by ${displayName(face)}${bot ? ` (${flag ? flag.label.toLowerCase().replace(' \u00b7 ', ', ') : 'bot'})` : ''}: ${count}${fresh ? `, ${newLabel(fresh)}${pinged ? ', mentions you' : ''}` : ''}${when ? `, ${when.toLowerCase()}` : ''}. Open thread`,
+    onclick: () => openThread(t.root, null, { from: 'threads' }),
+  },
+  h('span', { class: 'thread-card-head' }, avatarEl(face, 20), nameEl(face), bot ? h('span', { class: 'bot-tag' }, 'BOT') : null,
+    fresh ? h('span', { class: `thread-new${pinged ? ' ping' : ''}` }, `${pinged ? '@ ' : ''}${newLabel(fresh)}`) : null),
+  preview,
+  flag ? h('span', { class: 'msg-flag thread-card-flag' }, flag.label) : null,
+  h('span', { class: 'thread-card-foot' },
+    people.length ? h('span', { class: 'thread-card-people', 'aria-hidden': 'true' }, people.map((id) => avatarEl(getUser(id), 18))) : null,
+    h('strong', null, count), when ? h('span', null, when) : null));
+}
+// A reply came in: its thread goes to the top, with the newest people and your counts (the reply count comes with
+// thread:update, which can arrive before this does).
+function threadsPanelReply(m) {
+  const tp = S.threadsPanel;
+  if (!tp || tp.channelId !== m.channelId || tp.loading) return;
+  const i = tp.items.findIndex((x) => x.rootId === m.threadId);
+  if (i < 0) return reloadThreadsSoon(m.channelId);
+  const [it] = tp.items.splice(i, 1);
+  Object.assign(it, { lastReplyId: m.id, lastReplyAt: m.createdAt, participants: [m.authorId, ...(it.participants || []).filter((x) => x !== m.authorId)].slice(0, 5) });
+  tp.items.unshift(it);
+  redrawThreads();
+}
+// thread:update: a thread's reply count changed (a reply was added or deleted). No replies left: not a thread.
+function onThreadCount(rootId, channelId, count, lastAt) {
+  if (!count) forgetThreads('c:' + channelId, new Set([rootId]));
+  const tp = S.threadsPanel;
+  const it = tp && tp.channelId === channelId && tp.items.find((x) => x.rootId === rootId);
+  if (!it) return;
+  if (!count) tp.items = tp.items.filter((x) => x !== it);
+  else Object.assign(it, { replyCount: count, lastReplyAt: lastAt || it.lastReplyAt });
+  redrawThreads();
 }
 
 // ======================================================================= composer
@@ -5229,7 +5584,7 @@ function serverMenuItems(server) {
     can(server, PERMS.CREATE_INVITE) ? { label: 'Invite people', icon: 'userPlus', action: () => openInvite(server) } : null,
     canManageServer(server) ? { label: 'Server settings', icon: 'gear', action: () => openServerSettings(server) } : null,
     canManageServer(server) && can(server, PERMS.MANAGE_ROLES) ? { label: 'Roles', icon: 'shield', action: () => openServerSettings(server, 'roles') } : null,
-    { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; P.showMembers = true; renderAll(); } },
+    { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; S.thread = null; delete composers.thread; P.showMembers = true; renderAll(); } },
     pickableRoles(server, S.me.id).length ? { label: 'Pick your roles', icon: 'at', action: () => pickRoles(server) } : null,
     server.memberships && !isOwner(server) ? { label: 'Memberships', icon: 'star', action: () => openMemberships(server) } : null,
     { label: fav ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => toggleFavorite('s:' + server.id) },
@@ -5338,7 +5693,8 @@ function openInvite(server) {
   const uses = h('select', { class: 'input' }, [['0', 'No limit'], ['1', '1 use'], ['5', '5 uses'], ['10', '10 uses'], ['25', '25 uses']].map(([v, l]) => h('option', { value: v }, l)));
   const make = async () => {
     try {
-      const { code } = await api('POST', `/servers/${server.id}/invites`, { expiresHours: expires.value, maxUses: uses.value });
+      // reuse: the same kind of link made in the last few minutes comes back, so reopening this doesn't make another.
+      const { code } = await api('POST', `/servers/${server.id}/invites`, { expiresHours: expires.value, maxUses: uses.value, reuse: true });
       out.value = `${location.origin}/invite/${code}`;
     } catch (e) { out.value = e.message; }
   };
@@ -5458,6 +5814,8 @@ function openServerSettings(server, startTab = 'overview') {
     ['news', 'News bot', 'megaphone', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bots', 'Bots', 'bot', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['bans', 'Bans', 'ban', (s) => can(s, PERMS.BAN_MEMBERS)],
+    ['reports', 'Reports', 'shield', (s) => canSeeReports(s)],
+    ['audit', 'Audit log', 'file', (s) => !isGroup(s) && can(s, PERMS.VIEW_AUDIT_LOG)],
     ['invites', 'Invites', 'link', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
@@ -5479,7 +5837,9 @@ function openServerSettings(server, startTab = 'overview') {
     if (!allowed.some(([k]) => k === tab)) tab = allowed[0][0];
     clear(nav).append(...allowed.map(([k, l, ic]) => h('button', { class: `ss-tab${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, icon(ic), l)));
     clear(body);
-    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bots: (sv) => botsTab(sv, body, { confirm: (fn, opts) => confirmedCall(app, fn, opts) }), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger })[tab](s);
+    ({ overview, appearance, roles, members, emoji, news: (sv) => newsBotTab(sv, body), bots: (sv) => botsTab(sv, body, { confirm: (fn, opts) => confirmedCall(app, fn, opts) }), memberships: (sv) => membershipsTab(sv, body, { roles: sv.roleDefs }), bans, invites, danger,
+      audit: (sv) => auditTab(sv, body, { memberIds: sv.memberIds, userOf: (id) => S.users[id] || null }),
+      reports: (sv) => reportsTab(sv, body, { jumpTo: (id) => { mdl.close(); jumpToMessageId(id); } }) })[tab](s);
   };
 
   function overview(s) {
@@ -6012,7 +6372,7 @@ function renameGroup(g) {
     actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: () => api('PATCH', `/servers/${g.id}`, { name: input.value }) }] });
 }
 
-document.addEventListener('visibilitychange', () => { if (!document.hidden) markRead(currentKey()); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { markRead(currentKey()); if (S.thread) markThreadRead(S.thread.rootId); } });
 
 // ======================================================================= installable app (PWA), updates, push
 let installPrompt = null;
@@ -6124,8 +6484,30 @@ async function askToAcceptTerms() {
 function openReport({ message, user, ctx = 'main' }) {
   const target = user || getUser(message.authorId);
   let category = '';
+  // The server it happened in (a message in one of its channels, or a member reported while you're in a server you
+  // share): its moderators can see the report too, without your name, unless you untick it. Not for group chats, and
+  // child-safety reports stay with this instance's admins (the server decides that again). Of the messages shared,
+  // they get only the reported person's: yours would give you away (server/serveraudit.js).
+  const instance = S.config.name || 'Hearth';
+  const viewed = !message && S.view.serverId && S.servers.find((x) => x.id === S.view.serverId);
+  const inServer = message ? (message.channelId && serverOfChannel(message.channelId)) : (viewed && viewed.memberIds.includes(target.id) ? viewed : null);
+  const shareable = inServer && !isGroup(inServer) ? inServer : null;
+  let shareWanted = true; // the person's own choice, kept while a category that can't be shared is picked
+  const toServer = h('input', { type: 'checkbox', checked: true, onchange: (e) => { shareWanted = e.target.checked; } });
+  const shareHint = h('span', { class: 'field-hint' });
+  const shareRow = shareable ? h('label', { class: 'tos-check' }, toServer, h('span', null, `Also show it to the moderators of ${shareable.name}`, h('br'), shareHint)) : null;
+  const drawShare = () => {
+    if (!shareRow) return;
+    const staffOnly = category === 'child_safety';
+    toServer.disabled = staffOnly;
+    toServer.checked = !staffOnly && shareWanted;
+    shareHint.textContent = staffOnly ? `Child-safety reports go to the admins of ${instance} only.`
+      : message ? `They won\u2019t see who sent it. They get what\u2019s wrong, your details and ${displayName(target)}\u2019s messages below; the other messages (yours too) go to the admins only.`
+        : 'They won\u2019t see who sent it. They get what\u2019s wrong and your details.';
+  };
+  drawShare();
   const cats = h('div', { class: 'report-cats', role: 'radiogroup' }, Object.entries(CATEGORY_LABEL).map(([k, l]) => h('label', { class: 'radio-card sm' },
-    h('input', { type: 'radio', name: 'rcat', value: k, onchange: () => { category = k; } }), h('span', null, l))));
+    h('input', { type: 'radio', name: 'rcat', value: k, onchange: () => { category = k; drawShare(); } }), h('span', null, l))));
   const details = h('textarea', { class: 'input', rows: '3', maxlength: '2000', placeholder: 'Anything that helps the admins understand (optional)' });
   let evidence = [];
   let includeContext = true;
@@ -6144,9 +6526,10 @@ function openReport({ message, user, ctx = 'main' }) {
   modal({
     title: message ? 'Report message' : `Report ${displayName(target)}`, size: 'md',
     body: h('div', { class: 'stack' },
-      h('p', { class: 'muted-p' }, 'Reports go to this server\u2019s administrators. The person you report isn\u2019t told who reported them.'),
+      h('p', { class: 'muted-p' }, `Reports go to the admins of ${instance}. The person you report isn\u2019t told who reported them.`),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'What\u2019s wrong?'), cats),
       field('Details', details),
+      shareRow,
       message ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'These messages will be shared with the admins'),
         h('label', { class: 'tos-check' }, h('input', { type: 'checkbox', checked: true, onchange: (e) => { includeContext = e.target.checked; drawPreview(); } }), h('span', null, 'Include up to 4 earlier messages for context')),
         preview,
@@ -6158,8 +6541,9 @@ function openReport({ message, user, ctx = 'main' }) {
         if (!category) throw new Error('Pick what\u2019s wrong.');
         await api('POST', '/reports', {
           category, details: details.value, targetId: target.id,
-          context: message ? { kind: 'message', messageId: message.id } : { kind: 'user' },
+          context: message ? { kind: 'message', messageId: message.id } : { kind: 'user', ...(shareable ? { serverId: shareable.id } : {}) },
           evidence: evidence.map(({ id, text, files }) => ({ id, text, files })),
+          toServer: !!shareable && toServer.checked,
         });
         toast('Thanks \u2014 the admins have your report.');
         if (!S.blocked.has(target.id)) setTimeout(() => toggleBlock(target.id, true), 200); // offers to block them too

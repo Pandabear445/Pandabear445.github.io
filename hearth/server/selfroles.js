@@ -36,7 +36,7 @@ const jobs = require('./jobs');
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 module.exports = function setupSelfRoles(ctx) {
-  const { api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL, CHANNEL_SCOPED, emitServer, recheckVoice, MEMB } = ctx;
+  const { api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL, CHANNEL_SCOPED, emitServer, recheckVoice, MEMB, serverAudit } = ctx;
   // Moderator powers, plus pinging everyone. MEMB.POWERFUL (what can't be sold) is folded in so the two lists
   // can't drift apart.
   const BLOCKED = MEMB.POWERFUL | PM.ADMINISTRATOR | PM.MANAGE_SERVER | PM.MANAGE_ROLES | PM.MANAGE_CHANNELS
@@ -135,6 +135,22 @@ module.exports = function setupSelfRoles(ctx) {
     }), b.wait).unref();
   }
 
+  // Picks and drops go in the server's audit log, marked as picked by the member themselves. A member toggling a
+  // role over and over could otherwise fill the log (and push older entries out of it), so each member gets at most
+  // LOG_MAX entries an hour per server; past that their changes aren't logged until the hour is up.
+  const LOG_MAX = 20;
+  const logged = new Map(); // `${serverId}|${userId}` -> { n, reset }
+  function logPick(s, uid, r, picked) {
+    const t = Date.now();
+    if (logged.size > 10000) for (const [k, v] of logged) if (v.reset < t) logged.delete(k);
+    const k = `${s.id}|${uid}`;
+    let e = logged.get(k);
+    if (!e || e.reset < t) { e = { n: 0, reset: t + 3600000 }; logged.set(k, e); }
+    if (++e.n > LOG_MAX) return;
+    const role = [{ id: r.id, name: r.name }];
+    serverAudit(s, uid, 'member_roles', uid, { added: picked ? role : [], removed: picked ? [] : role, self: true, last: e.n === LOG_MAX || undefined });
+  }
+
   // Members only (banned people aren't members any more), roles of this server only, and not while timed out.
   function target(req) {
     const s = requireServer(req.params.id, req.userId);
@@ -177,7 +193,7 @@ module.exports = function setupSelfRoles(ctx) {
         }
       }
     })();
-    if (added) broadcast(s);
+    if (added) { broadcast(s); logPick(s, req.userId, r, true); }
     res.json({ ok: true, roleId: r.id, has: true });
   });
 
@@ -186,7 +202,7 @@ module.exports = function setupSelfRoles(ctx) {
     limit(req);
     const { s, r } = target(req);
     const gone = db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(s.id, req.userId, r.id).changes;
-    if (gone) broadcast(s);
+    if (gone) { broadcast(s); logPick(s, req.userId, r, false); }
     res.json({ ok: true, roleId: r.id, has: false });
   });
 

@@ -9,7 +9,7 @@ import { PERMS, ALL } from './perms.js';
 const P = PERMS;
 // Moderator powers (the same list as server/memberships.js POWERFUL), and what self-assignable roles also can't have.
 const POWERFUL = P.ADMINISTRATOR | P.MANAGE_SERVER | P.MANAGE_ROLES | P.MANAGE_CHANNELS | P.MANAGE_MESSAGES
-  | P.MANAGE_EMOJIS | P.KICK_MEMBERS | P.BAN_MEMBERS;
+  | P.MANAGE_EMOJIS | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MUTE_MEMBERS | P.MOVE_MEMBERS | P.VIEW_AUDIT_LOG;
 export const SELF_BLOCKED = POWERFUL | P.MENTION_EVERYONE;
 const BLOCKED = SELF_BLOCKED;
 // The powers that only reach people below you (kick, ban, timeouts, role changes), as on the server: a marked

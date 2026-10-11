@@ -15,13 +15,13 @@ const jobs = require('./jobs');
 
 module.exports = function setupMemberships(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
-    isMember, emitServer, emitTo, seal, unseal, newId, brief, PM, mailPublicUrl, auditLog, stepUp, sealSecret, openSecret } = ctx;
+    isMember, emitServer, emitTo, seal, unseal, newId, brief, PM, mailPublicUrl, auditLog, serverAudit, stepUp, sealSecret, openSecret } = ctx;
   const now = () => Date.now();
   const API = () => (process.env.STRIPE_API_BASE || 'https://api.stripe.com').replace(/\/+$/, '');
   const MAX_TIERS = 5;
-  // A role you can buy can't come with moderator powers.
+  // A role you can buy can't come with moderator powers. Reading the audit log counts: it shows who moderated whom.
   const POWERFUL = PM.ADMINISTRATOR | PM.MANAGE_SERVER | PM.MANAGE_ROLES | PM.MANAGE_CHANNELS | PM.MANAGE_MESSAGES
-    | PM.MANAGE_EMOJIS | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MUTE_MEMBERS | PM.MOVE_MEMBERS;
+    | PM.MANAGE_EMOJIS | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MUTE_MEMBERS | PM.MOVE_MEMBERS | PM.VIEW_AUDIT_LOG;
   const LIVE = ['active', 'past_due']; // past_due: Stripe is still retrying the card, so they keep access meanwhile
 
   // ------------------------------------------------------------------ settings (Admin → Money)
@@ -110,16 +110,20 @@ module.exports = function setupMemberships(ctx) {
     const want = new Set(db.prepare(`SELECT t.role_id FROM memberships m JOIN membership_tiers t ON t.id = m.tier_id
       WHERE m.server_id = ? AND m.user_id = ? AND m.status IN ('active', 'past_due') AND t.role_id IS NOT NULL`).all(sid, uid).map((r) => r.role_id));
     const has = new Set(db.prepare('SELECT role_id FROM member_roles WHERE server_id = ? AND user_id = ?').all(sid, uid).map((r) => r.role_id));
-    let changed = false;
+    const added = []; const removed = [];
     for (const rid of tierRoles) {
       const role = roleRow(sid, rid);
       if (!role) continue;
       // Moderator powers can't be bought: a tier role that got them later (an edit, an override) isn't handed out.
       if (want.has(rid) && !has.has(rid) && powerful(role)) { log.warn('memberships', 'role_withheld', { msg: `Not giving the membership role "${role.name}": it has moderator powers.` }); continue; }
-      if (want.has(rid) && !has.has(rid)) { db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(sid, uid, rid); changed = true; }
-      if (!want.has(rid) && has.has(rid)) { db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(sid, uid, rid); changed = true; }
+      if (want.has(rid) && !has.has(rid)) { db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(sid, uid, rid); added.push({ id: rid, name: role.name }); }
+      if (!want.has(rid) && has.has(rid)) { db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(sid, uid, rid); removed.push({ id: rid, name: role.name }); }
     }
-    if (changed) emitServer(sid);
+    if (added.length || removed.length) {
+      // In the server's audit log as done by Hearth itself, because of a membership starting or ending.
+      if (serverAudit) serverAudit(sid, null, 'member_roles', uid, { added, removed, membership: true });
+      emitServer(sid);
+    }
   }
 
   const STATUS = { active: 'active', trialing: 'active', past_due: 'past_due', incomplete: 'pending', unpaid: 'ended', canceled: 'ended', incomplete_expired: 'ended', paused: 'ended' };

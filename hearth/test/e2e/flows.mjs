@@ -136,6 +136,7 @@ async function webhooks(t) {
   const shown = await alice.dialog('Webhook “Uptime Kuma” made');
   const url = await shown.locator('input[aria-label="Webhook address"]').inputValue();
   check(url.startsWith(`${t.server.base}/api/webhooks/`), `The webhook address should be on this server (got ${url}).`);
+  t.state.hookUrl = url; // the threads flow posts through it again
   await shown.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
   await settings.locator('.hook-row', { hasText: 'Uptime Kuma' }).waitFor();
   alice.page.off('request', watch);
@@ -612,6 +613,92 @@ async function watchTogether(t) {
   await alice.$('#voice-panel button[aria-label="Leave call"]').click();
   await alice.page.waitForSelector('#voice-panel', { state: 'hidden' });
   await bob.page.waitForSelector('#voice-panel', { state: 'hidden' });
+}
+
+// ------------------------------------------------------------------ the server's own audit log and report inbox
+async function auditAndReports(t) {
+  const { alice, bob } = t.people;
+  await alice.openChannel('general');
+  await bob.openChannel('general');
+  // Alice (the owner) reads what happened in her server, as sentences: the moderator toolkit's bulk delete and
+  // server mute, and bob picking a role himself.
+  await alice.serverMenu('Server settings');
+  const ss = alice.page.locator('.modal.server-settings');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  const row = (text) => ss.locator('.audit-row', { hasText: text });
+  await row('deleted 2 messages at once in #general').waitFor();
+  await row(/server-muted bob/).first().waitFor();
+  await row('bob picked the role “game-night”').first().waitFor();
+  // Filtered to voice, the message entries go.
+  await ss.locator('select[aria-label="Show"]').selectOption({ label: 'Voice' });
+  await row('deleted 2 messages').waitFor({ state: 'detached' });
+  await row(/server-muted bob/).first().waitFor();
+  await ss.locator('select[aria-label="Show"]').selectOption({ label: 'Everything' });
+  await row('deleted 2 messages at once in #general').waitFor();
+  // Filtered to one person (typed, as for someone who's no longer a member): only what they did or had done to them.
+  const person = ss.locator('input[aria-label="Done by or to"]');
+  await person.fill('bob');
+  await person.press('Enter');
+  await row('deleted 2 messages').waitFor({ state: 'detached' });
+  await row(/server-muted bob/).first().waitFor();
+  await person.fill('');
+  await row('deleted 2 messages at once in #general').waitFor();
+  // While it's open, a new entry appears by itself: bob picks the role again (and drops it, as it was).
+  const picks = () => alice.page.evaluate(() => [...document.querySelectorAll('.modal.server-settings .audit-row')].filter((r) => r.textContent.includes('bob picked the role')).length);
+  const before = await picks();
+  await bob.serverMenu('Pick your roles');
+  const picker = await bob.dialog('Pick your roles');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:checked').waitFor();
+  await alice.page.waitForFunction((n) => [...document.querySelectorAll('.modal.server-settings .audit-row')].filter((r) => r.textContent.includes('bob picked the role')).length > n, before, { timeout: 15000 });
+  check(await picks() === before + 1, 'The new entry should appear once.');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:not(:checked)').waitFor();
+  await picker.locator('.modal-x').click();
+  await bob.noModals();
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+
+  // A reported message reaches the server's moderators too (here the owner), without saying who reported it.
+  await bob.send('Rude remark about kumquats');
+  await alice.message('Rude remark about kumquats').waitFor();
+  await alice.messageAction('Rude remark about kumquats', 'Report message');
+  const rep = await alice.dialog('Report message');
+  await rep.locator('.radio-card', { hasText: 'Harassment or bullying' }).click();
+  const share = rep.locator('.tos-check', { hasText: `Also show it to the moderators of ${SERVER}` }).locator('input');
+  check(await share.isChecked(), 'Sharing with the server’s moderators should be on by default.');
+  await rep.locator('.modal-foot .btn.danger', { hasText: 'Send report' }).click();
+  await alice.toast(`New report in ${SERVER}`);
+  // The app offers to block bob afterwards: not now.
+  const block = await alice.dialog('Block bob?');
+  await block.locator('.modal-foot button', { hasText: 'Cancel' }).click();
+  await alice.noModals();
+  await alice.serverMenu('Server settings');
+  await ss.locator('.ss-tab', { hasText: exact('Reports') }).click();
+  const card = ss.locator('.report-card', { hasText: 'Harassment or bullying' });
+  await card.locator('.ev.reported', { hasText: 'Rude remark about kumquats' }).waitFor();
+  await card.locator('button', { hasText: 'Mark handled' }).click();
+  const note = await alice.dialog('Mark as handled');
+  await note.locator('input').fill('Talked to bob');
+  await note.locator('.modal-foot .btn.primary').click();
+  await alice.toast('Marked as handled.');
+  await ss.locator('.panel-empty', { hasText: 'No open reports.' }).waitFor();
+  // Who handled it stays on the report (not in the audit log, where the person reported might read it).
+  await ss.locator('.seg-btn', { hasText: exact('Handled') }).click();
+  await ss.locator('.report-card .stat-sub', { hasText: /Note: Talked to bob — Handled by / }).waitFor();
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+  // Alice also runs this Hearth: staff still have the report open, see what the server's moderators did, and close
+  // their own copy.
+  await alice.railButton('Admin');
+  await alice.$('.admin-tabs .admin-tab', { hasText: 'Reports' }).click();
+  const staffCard = alice.$('.admin-body .report-card', { hasText: 'Rude remark about kumquats' });
+  await staffCard.locator('.stat-sub', { hasText: 'The server’s moderators have it too: handled' }).waitFor();
+  await staffCard.locator('button', { hasText: exact('Resolve') }).click();
+  await (await alice.dialog('Resolve report')).locator('.modal-foot .btn.primary').click();
+  await alice.toast('Resolved.');
+  await alice.$('.admin-body .panel-empty', { hasText: 'No open reports' }).waitFor();
+  await alice.railButton(SERVER);
 }
 
 // ------------------------------------------------------------------ a 1-to-1 call from a DM: ring, accept, hang up, decline
@@ -1138,6 +1225,125 @@ async function smoke(t) {
   check(!failed.length, `Pages that failed to load:\n  ${failed.join('\n  ')}`);
 }
 
+// ------------------------------------------------------------------ 19. threads: what's new in them, the Threads panel
+// A ping in a thread shows on the message that starts it, on the Threads button and in the channel's badge, survives
+// a reload, and goes once the thread is opened. The panel lists the thread (decrypted) and follows new replies live.
+async function threads(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await alice.send('Thread starter: who brings snacks?');
+  const onBob = bob.message('Thread starter: who brings snacks?').first();
+  await onBob.hover();
+  await onBob.locator('button[aria-label="Reply in thread"]').click();
+  await bob.send('@alice_w I bring the chips', '.cw-thread textarea.composer-input');
+
+  const chip = alice.message('Thread starter: who brings snacks?').locator('.thread-chip');
+  const threadsBtn = alice.$('#main-head button.with-badge');
+  await chip.locator('.thread-new.ping', { hasText: '1 new' }).waitFor();
+  await threadsBtn.locator('.badge', { hasText: '1' }).waitFor();
+  await alice.channelRow('general').locator('.badge', { hasText: '1' }).waitFor();
+  // It's kept on the server: still there after a reload.
+  await alice.page.reload();
+  await alice.waitApp();
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await chip.locator('.thread-new', { hasText: '1 new' }).waitFor();
+
+  // The Threads panel lists it, decrypted, with what's new.
+  await threadsBtn.click();
+  const card = alice.$('#members .thread-card', { hasText: 'who brings snacks?' });
+  await card.locator('.thread-new', { hasText: '1 new' }).waitFor();
+  await card.click();
+  await alice.message('I bring the chips', '.thread-list').waitFor();
+  await alice.$('.thread-list .new-div', { hasText: 'New replies' }).waitFor();
+  // Opening it read it: the badges go.
+  await threadsBtn.locator('.badge').waitFor({ state: 'detached' });
+  await chip.locator('.thread-new').waitFor({ state: 'detached' });
+  check(!(await alice.channelRow('general').locator('.badge').count()), 'Reading the thread should clear the channel’s badge.');
+
+  // Back to the list from the keyboard: it lands on that thread's card. The list follows new replies live.
+  await alice.$('#members button[aria-label="Back to threads"]').focus();
+  await alice.page.keyboard.press('Enter');
+  await card.waitFor();
+  check(await card.evaluate((el) => el === document.activeElement), 'Back to threads should put the keyboard on that thread’s card.');
+  check(!(await card.locator('.thread-new').count()), 'A thread just read should have nothing new.');
+  await bob.send('And a bowl of dip', '.cw-thread textarea.composer-input');
+  await card.locator('.thread-new', { hasText: '1 new' }).waitFor();
+  await chip.locator('.thread-new', { hasText: '1 new' }).waitFor();
+  // "Mark as read" on the channel takes its threads with it.
+  await alice.channelRow('general').locator('.ch-main').click({ button: 'right' });
+  await alice.menuItem('Mark as read').click();
+  await card.locator('.thread-new').waitFor({ state: 'detached' });
+  await chip.locator('.thread-new').waitFor({ state: 'detached' });
+
+  // A thread left chosen while the member list covers it (the server menu's Members) doesn't read new replies.
+  await card.click();
+  await alice.message('And a bowl of dip', '.thread-list').waitFor();
+  await alice.serverMenu('Members');
+  await alice.$('#members .member-list').waitFor();
+  await bob.send('Napkins too', '.cw-thread textarea.composer-input');
+  await chip.locator('.thread-new', { hasText: '1 new' }).waitFor();
+
+  // A ping that's deleted leaves nothing behind: not on the channel, the message or the page title.
+  const title = await alice.page.title();
+  await bob.send('@alice_w ping, wrong person', '.cw-thread textarea.composer-input');
+  await chip.locator('.thread-new.ping', { hasText: '2 new' }).waitFor();
+  await alice.channelRow('general').locator('.badge', { hasText: '1' }).waitFor();
+  const wrong = bob.message('wrong person', '.thread-list').first();
+  await wrong.hover();
+  await wrong.locator('button[aria-label="More actions"]').click();
+  await bob.menuItem('Delete message').click();
+  await bob.modal('Delete message?').locator('.modal-foot .btn.danger').click();
+  await alice.channelRow('general').locator('.badge').waitFor({ state: 'detached' });
+  await chip.locator('.thread-new:not(.ping)', { hasText: '1 new' }).waitFor();
+  await alice.page.waitForFunction((t) => document.title === t, title);
+  await bob.$('#members button[aria-label="Close panel"]').click();
+
+  // A webhook's post that starts a thread keeps its BOT tag and "not end-to-end encrypted" flag in the Threads
+  // panel, even under a member's name, and links in a card's preview are plain text.
+  const hook = await fetch(t.state.hookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'bob', content: 'HOOKROOT the server moved, sign in again at https://evil.example' }) });
+  check(hook.status === 204, `Posting to the webhook should answer 204 (got ${hook.status}).`);
+  const hookMsg = bob.message('HOOKROOT').first();
+  await hookMsg.hover();
+  await hookMsg.locator('button[aria-label="Reply in thread"]').click();
+  await bob.send('Is this really you?', '.cw-thread textarea.composer-input');
+  await threadsBtn.click();
+  const hookCard = alice.$('#members .thread-card', { hasText: 'HOOKROOT' });
+  await hookCard.locator('.bot-tag', { hasText: 'BOT' }).waitFor();
+  await hookCard.locator('.msg-flag', { hasText: 'Webhook · not end-to-end encrypted' }).waitFor();
+  check(!(await hookCard.locator('a').count()), 'A link in a card’s preview should be plain text.');
+  check(/webhook/.test(await hookCard.getAttribute('aria-label')), 'A webhook’s card should say so to screen readers.');
+  await bob.$('#members button[aria-label="Close panel"]').click();
+
+  // A thread started by someone you blocked is folded away in the panel, as their messages are in the channel.
+  await bob.send('Bob secret root words');
+  const bobRoot = bob.message('Bob secret root words').first();
+  await bobRoot.hover();
+  await bobRoot.locator('button[aria-label="Reply in thread"]').click();
+  await bob.send('My own first reply', '.cw-thread textarea.composer-input');
+  await alice.$('#members .thread-card', { hasText: 'Bob secret root words' }).waitFor();
+  await alice.message('Bob secret root words').locator('.msg-name').click();
+  await alice.page.locator('.pop-profile button[aria-label="More"]').click();
+  await alice.menuItem('Block').click();
+  await alice.modal('Block bob?').locator('.modal-foot .btn.danger').click();
+  await alice.toast('bob is blocked.');
+  const folded = alice.$('#members .thread-card.blocked', { hasText: 'Thread started by someone you blocked' });
+  await folded.waitFor();
+  check(!(await alice.$('#members .threads-list', { hasText: 'Bob secret root words' }).count()), 'A blocked person’s thread should be folded away in the Threads panel.');
+  await folded.locator('button', { hasText: 'Show' }).click();
+  await alice.$('#members .thread-card', { hasText: 'Bob secret root words' }).waitFor();
+  // Unblocked again for whatever comes next.
+  await alice.showMembers();
+  await alice.member('bob').click();
+  await alice.page.locator('.pop-profile button[aria-label="More"]').click();
+  await alice.menuItem('Unblock').click();
+  await alice.toast('bob is unblocked.');
+  await bob.$('#members button[aria-label="Close panel"]').click();
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -1154,6 +1360,7 @@ export const FLOWS = [
   ['voice: two people connected in a call', voiceCall],
   ['moderator toolkit: server mute in and out of a call, bulk delete', moderatorTools],
   ['watch together: start, pause for everyone, stop; leave the call', watchTogether],
+  ['audit log and reports: moderation as sentences, filters, live entries; a report reaches the server’s moderators', auditAndReports],
   ['dm call: ring, accept, hang up, decline', dmCall],
   ['group chat: create, talk both ways, call rings', groupChat],
   ['step-up: delete and hand over a server, staff, relay, region, backups, owner', stepUp],
@@ -1164,4 +1371,5 @@ export const FLOWS = [
   ['instance: new owner removes staff, announces, maintenance on and off', broadcastAndMaintenance],
   ['moderation: staff sign-out and suspension say why; unsuspend', moderation],
   ['smoke: every settings, admin and server settings page loads', smoke],
+  ['threads: new replies and pings on the message and the Threads button, the Threads panel, read when opened', threads],
 ];

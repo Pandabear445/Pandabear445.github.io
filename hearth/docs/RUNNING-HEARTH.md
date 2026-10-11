@@ -143,13 +143,16 @@ their `docker-compose.yml`, so `hearth-update` adds `TRUST_PROXY=<your proxy net
 and says so.
 
 **Shipping a server update.** `bash scripts/make-update-zip.sh [folder]` makes `hearth-update-<version>.zip` and
-`hearth-update-<version>.zip.sha256` from the last commit (default folder: `hearth/dist`, which git ignores). Hand
-out both, and put the SHA-256 in the release notes too. The update tools and `hearth-update` refuse a zip that
-doesn't match the `.sha256` next to it, print the SHA-256 they install, and check the upload again on the server
-in a private temporary folder. Without a `.sha256` they only print the SHA-256, so compare it yourself. A checksum
-isn't a signature: someone who can replace both files can replace both, which is why the published copy matters.
-Exit codes 90–92 from the tools mean the updater never ran (damaged upload, no updater in the zip, no private
-folder).
+`hearth-update-<version>.zip.sha256` from the last commit (default folder: `hearth/dist`, which git ignores), and
+`hearth-update-<version>.zip.sig` when you have a server update signing key (`node scripts/update-key.js keygen`
+once, then commit `update-signing.pub`; see [SIGNING.md](SIGNING.md#signing-server-updates)). Hand out all three,
+and put the SHA-256 in the release notes too. The update tools and `hearth-update` refuse a zip that doesn't match
+the `.sha256` next to it, print the SHA-256 they install, and check the upload again on the server in a private
+temporary folder. Without a `.sha256` they only print the SHA-256, so compare it yourself. A checksum isn't a
+signature: someone who can replace both files can replace both. Once a server has pinned your key
+(`/etc/hearth-update.pub`), it also refuses any zip that isn't signed with it, before anything in it runs.
+Exit codes 90–93 from the tools mean nothing from the zip ran (damaged upload, no updater in the zip, no private
+folder, refused by the updater already on the server).
 
 **Shipping the desktop apps.** Set the `UPDATE_SIGNING_KEY` secret so installed apps only take updates you signed
 (see [SIGNING.md](SIGNING.md#signing-desktop-updates)). To have GitHub copy the installers to your server, add

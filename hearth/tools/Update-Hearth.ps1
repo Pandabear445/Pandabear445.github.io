@@ -2,7 +2,8 @@
 # Double-click Update-Hearth.bat, or drag an update .zip onto it.
 # It uploads the update to your server and runs the safe updater there (backups + automatic rollback).
 # Remote commands below never contain double quotes: Windows PowerShell 5.1 strips them when it starts ssh.
-param([string]$Zip, [switch]$Rollback, [switch]$Setup, [switch]$Status)
+# -AllowUnsigned installs an update the server would refuse for its signature (only one you checked yourself).
+param([string]$Zip, [switch]$Rollback, [switch]$Setup, [switch]$Status, [switch]$AllowUnsigned)
 
 # 'Continue' on purpose: Windows PowerShell 5.1 turns harmless SSH messages into fatal errors under 'Stop'.
 # Every step checks its own result instead.
@@ -141,6 +142,20 @@ if (Test-Path -LiteralPath $sumFile) {
   Say "SHA-256 of this update: $sum (no .sha256 file next to it to compare with)." Gray
 }
 
+# Its signature (update.zip.sig, published with each signed release) goes along with it: the server checks it
+# against the key it pinned. Only a well-formed one, since it becomes part of the command run there.
+$sig = ''
+$sigFile = "$Zip.sig"
+if (Test-Path -LiteralPath $sigFile) {
+  $sig = (@(Get-Content -LiteralPath $sigFile) | Where-Object { $_.Trim() } | Select-Object -First 1)
+  $sig = if ($sig) { ([string]$sig).Trim() } else { '' }
+  if ($sig -cnotmatch '^[A-Za-z0-9+/]{86}==$') { Fail "$([IO.Path]::GetFileName($sigFile)) isn't a signature file. Nothing was uploaded." }
+  Say '[OK] Signed: the server checks the signature before installing.' Green
+} else {
+  Say "Not signed (no .sig file next to it): a server that checks signatures will refuse it." Yellow
+}
+if ($AllowUnsigned) { Say 'WARNING: -AllowUnsigned: the server installs this update even if its signature is missing or wrong.' Red }
+
 # ---------------------------------------------------------------- upload + install
 # Upload under a random name into the server account's home folder (no other account can write there), never a
 # fixed /tmp name that another account could create first and swap before it runs as root. The install login
@@ -155,14 +170,28 @@ if ($LASTEXITCODE -ne 0) { Fail 'Upload failed. Check the server address and you
 Say 'Connecting to the server to install it. If it asks, type your server password again.' Yellow
 Say '(The server backs up first and rolls back by itself if anything goes wrong.)' Gray
 Say ''
-# On the server. 90-92 mean the updater never started: 90 = the upload isn't the file checked above, 91 = no
-# updater in the zip, 92 = no private folder. The updater's own exit codes in that range are passed on as 1.
+# On the server. 90-93 mean the updater never started: 90 = the upload isn't the file checked above, 91 = no
+# updater in the zip, 92 = no private folder, 93 = the installed updater refused it (signature or version; it
+# says why), or the server pins a key its updater can't check. The updater's own exit codes in that range are
+# passed on as 1.
+# The signature is checked with the updater already installed on the server (a trusted copy) before anything
+# from the zip runs, even the zip's own updater. It's looked at through sudo: it may be root's alone. A server whose
+# updater predates signing skips that step, unless it pins a key: then nothing runs (93), or with --allow-unsigned
+# the zip's own updater does, after a warning.
 # (`$ is a $ for the server's shell, not for PowerShell.)
+$sigCmd = ''
+if ($sig) { $sigCmd = "echo '$sig' > update.zip.sig; " }
+$allow = ''
+if ($AllowUnsigned) { $allow = ' --allow-unsigned' }
+# (The same text as update-hearth.sh sends.)
+$noCheck = "echo 'This server pins an update signing key (/etc/hearth-update.pub), but its installed updater (/usr/local/bin/hearth-update) cannot check signatures. Nothing was installed. Check the zip on your computer (docs/SIGNING.md), then run again with --allow-unsigned (Windows: -AllowUnsigned).'; exit 93"
+if ($AllowUnsigned) { $noCheck = "echo 'WARNING: this server pins an update signing key, but its installed updater cannot check signatures. Going ahead because of --allow-unsigned.'" }
 $remote = "D=`$(mktemp -d) || exit 92; trap 'rm -rf `$D' EXIT; mv ~/$up `$D/update.zip || exit 92; cd `$D || exit 92; " +
           "command -v unzip >/dev/null 2>&1 || { ${sudo}apt-get update -qq && ${sudo}apt-get install -y -qq unzip; } >/dev/null 2>&1; " +
           "echo '$sum  update.zip' > update.zip.sha256; sha256sum -c --quiet update.zip.sha256 >/dev/null 2>&1 || exit 90; " +
+          "${sigCmd}V=/usr/local/bin/hearth-update; if ${sudo}grep -qs hearth-server-update-v1 `$V; then ${sudo}`$V --verify$allow `$D/update.zip || exit 93; elif ${sudo}test -e /etc/hearth-update.pub; then ${noCheck}; fi; " +
           "unzip -p update.zip hearth/scripts/hearth-update.sh > hearth-update.sh || exit 91; " +
-          "${sudo}bash hearth-update.sh `$D/update.zip; c=`$?; case `$c in 9[0-2]) c=1 ;; esac; exit `$c"
+          "${sudo}bash hearth-update.sh `$D/update.zip$allow; c=`$?; case `$c in 9[0-3]) c=1 ;; esac; exit `$c"
 & ssh @sshOpts -t -p $cfg.port $target $remote
 $code = $LASTEXITCODE
 Say ''
@@ -178,6 +207,7 @@ switch ($code) {
   90 { Fail "The upload doesn't match the file on this computer (damaged on the way?). Nothing was installed; try again." }
   91 { Fail "The zip you chose doesn't contain the updater (scripts/hearth-update.sh). Nothing was installed; use the newest Hearth download." }
   92 { Fail "Couldn't set the upload aside in a private folder on the server (is its disk full?). Nothing was installed." }
+  93 { Fail "The updater on the server refused this update (the lines above say why). Nothing was installed." }
 }
 # Anything else: explain it in plain words, then fetch the server's log so it can be shared.
 switch ($code) {

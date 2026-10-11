@@ -4,7 +4,7 @@ export const PERMS = {
   MENTION_EVERYONE: 1 << 4, MANAGE_MESSAGES: 1 << 5, CONNECT: 1 << 6, SPEAK: 1 << 7,
   CREATE_INVITE: 1 << 8, KICK_MEMBERS: 1 << 9, BAN_MEMBERS: 1 << 10, MANAGE_CHANNELS: 1 << 11,
   MANAGE_ROLES: 1 << 12, MANAGE_SERVER: 1 << 13, MANAGE_EMOJIS: 1 << 14, CREATE_THREADS: 1 << 15,
-  EMBED_LINKS: 1 << 16, MUTE_MEMBERS: 1 << 17, MOVE_MEMBERS: 1 << 18, ADMINISTRATOR: 1 << 30,
+  EMBED_LINKS: 1 << 16, MUTE_MEMBERS: 1 << 17, MOVE_MEMBERS: 1 << 18, VIEW_AUDIT_LOG: 1 << 19, ADMINISTRATOR: 1 << 30,
 };
 const P = PERMS;
 export const PERM_GROUPS = [
@@ -14,6 +14,7 @@ export const PERM_GROUPS = [
     ['MANAGE_ROLES', 'Manage roles', 'Create and edit roles below their own, and change channel permissions.', true],
     ['MANAGE_SERVER', 'Manage server', 'Change the name, icon, banner, theme and welcome message.', false],
     ['MANAGE_EMOJIS', 'Manage emoji', 'Upload, rename and delete custom emoji.', false],
+    ['VIEW_AUDIT_LOG', 'View audit log', 'See who kicked, banned or timed out whom, and who changed roles, channels, permissions and settings.', false],
     ['CREATE_INVITE', 'Create invites', 'Invite new people.', true],
   ]],
   ['Members', [

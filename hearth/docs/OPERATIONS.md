@@ -1,8 +1,8 @@
 # Running Hearth: logs, health, alerts and the doctor
 
 This page is for the person who runs a Hearth server. It covers what Hearth writes to its log, the health
-endpoints and what each one means, how to wire them into a reverse proxy or Docker, the `doctor` command, and the
-alerts the owner gets. The last section lists what Hearth still doesn't do.
+endpoints and what each one means, how to wire them into a reverse proxy or Docker, the `doctor` command, the
+alerts the owner gets, and how the updater checks an update. The last section lists what Hearth still doesn't do.
 
 Paths are relative to `hearth/`.
 
@@ -93,9 +93,13 @@ each event also goes to the server log with the network only.
 ## 2. Background jobs
 
 Everything Hearth does on a timer runs through `server/jobs.js`: rate-limit sweeps, upload clean-up, session
-purge, event reminders, the news bot's feed and tracker polling, backups, Last.fm polling, supporter expiry,
+purge, each server's audit log retention (`serveraudit.prune`), event reminders, the news bot's feed and tracker polling, backups, Last.fm polling, supporter expiry,
 membership reconciliation and retries, the socket session sweep, alert checks, and the small debounced
 broadcasts (presence, profile updates, watch-together).
+
+A `serveraudit` `hard_cap` warning means one server's audit log passed 200,000 entries and its oldest went,
+moderation entries from the last week included. Normal servers never get near that: look at who wrote the flood
+(it's in that server's log) before anything else.
 
 - An error in a job, thrown or rejected, is caught and logged (`component: jobs`, `op: run_failed`, with
   `job` and `errorCategory`). It never reaches the top level. (Before, one `SQLITE_BUSY` in a timer could crash
@@ -295,7 +299,49 @@ default. Turning alerts or alert emails **off** needs the password (and two-fact
 because it's what someone covering their tracks would do; it's recorded in the audit log. "Send a test alert"
 checks that they reach you.
 
-## 6. What's still missing
+## 6. Updates: checksums and signatures
+
+`hearth-update` (and the update tools, which run it) checks a private copy of each update zip before anything in
+it is unpacked or run:
+
+1. **Checksum:** `<zip>.sha256` next to it must match. Without one it prints the SHA-256 for you to compare.
+2. **Signature**, once this server has an update signing key pinned in `/etc/hearth-update.pub`: `<zip>.sig` must
+   be a valid signature by that key (docs/SIGNING.md, "Signing server updates"). The key is pinned from the
+   installed Hearth's `update-signing.pub` at its first update (when that file and the folders above it are
+   root's alone), or from the first update that brings one; after that it only changes when an update signed
+   with the current key brings a new one. Checking takes OpenSSL 3.0 or newer (Debian 12, Ubuntu 22.04) or, on
+   older systems, Node.js; a server with neither pins nothing and stays on checksums.
+3. **Version**, on a server that checks signatures: an older version is refused (`--allow-downgrade` overrides;
+   `--rollback` puts back your own backup instead).
+
+```sh
+hearth-update --status              # "update key: …" says which key is pinned, or that none is
+hearth-update --verify update.zip   # all three checks, nothing installed or changed (not even the pinned key);
+                                    # the zip's path is from where you are, its .sha256 and .sig next to it
+```
+
+What the update log says, and what to do:
+
+| Message | Meaning |
+|---|---|
+| `isn't signed … This server has no update signing key pinned yet` | Checked against the checksum only, as before signing. Fine until the publisher signs updates. |
+| `now only installs updates signed with the key this update brought: …` / `Pinned the update signing key that came with this Hearth` | A key was pinned. Compare it with the one in the release notes. |
+| `The update signing key is now …` | A key change, from an update the old key signed. |
+| `isn't signed (no ….sig next to it). Nothing was changed.` | Put the `.sig` from the release next to the zip and run again. |
+| `has a signature that doesn't match this server's update key` | Not the published zip, or signed with another key (a key change you skipped: install the release that changed it first). Don't override this unless you checked the zip some other way. |
+| `can't be checked: … isn't an update signing key` | `/etc/hearth-update.pub` is damaged. Every update is refused until it's fixed or deleted. |
+| `can't be checked: this server can't check Ed25519 signatures` | A key is pinned, but neither OpenSSL 3.0 or newer nor Node.js is installed (OpenSSL 1.1.1, as on Ubuntu 20.04 and Debian 11, can't check them). Install Node.js (Hearth's own, outside Docker) or a newer OpenSSL. |
+| `… but this server can't check Ed25519 signatures …, so it isn't pinned` | No key is pinned yet and this server couldn't check one, so updates stay on checksums. Install Node.js or OpenSSL 3.0+ and the next key-carrying update pins its key. |
+| `update-signing.pub (or a folder it's in) can be changed by an account other than root, so it isn't trusted` | The installed Hearth's own key isn't pinned (its folder belongs to Hearth's account, as in plain installs); the first update that brings a key pins that one. Compare it with the release notes. |
+| `is Hearth X, older than the installed Y` | Use `hearth-update --rollback` to go back, or, if you really mean it, put the zip and its `.sig` on the server and run `sudo hearth-update --allow-downgrade <zip>` there (the update tools don't do downgrades). |
+| `Going ahead anyway because of --allow-unsigned` / `installed WITHOUT a valid signature` | Someone overrode the check for this update. The full log stays in `/root/hearth-backups/last-update.log`. |
+
+The update tools stop with exit code **93** when the updater already on the server refuses the zip (the lines
+above it say why), or when the server pins a key but its installed updater can't check signatures (an older one
+was put back, or it's gone; `--allow-unsigned` goes ahead anyway, with a warning); 90–92 still mean the upload or
+the zip itself was wrong. In all four cases nothing ran.
+
+## 7. What's still missing
 
 - **Metrics export.** There's no Prometheus/OpenMetrics endpoint. Admin → Health and `/api/admin/health` are
   point-in-time; there's no history beyond the logs.

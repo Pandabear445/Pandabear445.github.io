@@ -419,6 +419,16 @@ CREATE TABLE IF NOT EXISTS admin_log (
   created_at INTEGER NOT NULL
 );
 `);
+// v20 (server audit): a report about a message or member inside a server also goes to that server's moderators
+// (server/serveraudit.js), unless the reporter opted out. server_id is set only then; server_status is the
+// moderators' own state ('open', 'handled', 'dismissed'), separate from staff's status above, so a moderator
+// closing it never closes it for instance staff.
+addColumn('reports', 'server_id', 'TEXT');
+addColumn('reports', 'server_status', 'TEXT');
+addColumn('reports', 'server_handled_by', 'TEXT');
+addColumn('reports', 'server_handled_at', 'INTEGER');
+addColumn('reports', 'server_note', "TEXT NOT NULL DEFAULT ''");
+db.exec('CREATE INDEX IF NOT EXISTS idx_reports_server ON reports(server_id, created_at) WHERE server_id IS NOT NULL');
 
 // v7: timed suspensions (staff roles live in instance_settings).
 addColumn('users', 'suspended_until', 'INTEGER');
@@ -664,6 +674,52 @@ CREATE TRIGGER IF NOT EXISTS admin_log_no_update BEFORE UPDATE ON admin_log BEGI
 CREATE TRIGGER IF NOT EXISTS admin_log_no_delete BEFORE DELETE ON admin_log BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
 `);
 }
+
+// v20 (server audit): each server's own audit log (server/serveraudit.js): who kicked, banned, timed out, changed
+// roles, channels, permissions, invites, emoji, webhooks and settings, and who deleted whose messages. Metadata
+// only, never message text. seq counts a server's entries (1, 2, 3…), so "the newest 10,000" is a cheap range.
+// Like admin_log it's append-only: the database refuses every change, and refuses deletes except the ones the
+// retention rules allow (the job in serveraudit.js): the server itself was deleted (the cascade), the entry is over
+// a year old, or it's beyond the newest 10,000 and at least 7 days old. So a flood of new entries can't push the
+// last week out, with two limits on disk use: beyond the newest 50,000, entries anyone can cause cheaply and in
+// bulk (invites, pins, reordering, settings: everything but SERVER_AUDIT_KEPT) go whatever their age, and beyond
+// the newest 200,000 everything does.
+// Moderation, which stays for at least a week below 200,000: what was done to people (roles given or taken by
+// someone else; not ones members picked themselves or got with a membership), their messages, permissions and roles,
+// ownership, webhooks and bots.
+const SERVER_AUDIT_KEPT = ['member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles',
+  'message_delete', 'message_bulk_delete', 'channel_overrides', 'channel_delete', 'role_create', 'role_update', 'role_delete',
+  'server_transfer', 'voice_disconnect', 'voice_move', 'voice_mute', 'voice_unmute',
+  'webhook_create', 'webhook_update', 'webhook_rotate', 'webhook_delete', 'bot_add', 'bot_update', 'bot_remove'];
+// The same rule as SQL, for the trigger below and the retention job (p: 'OLD.' or '').
+const serverAuditKeptSql = (p = '') => `(${p}action IN (${SERVER_AUDIT_KEPT.map((a) => `'${a}'`).join(', ')})
+    AND NOT (${p}action = 'member_roles' AND (${p}actor_id IS NULL OR ${p}actor_id = ${p}target_id)))`;
+db.exec(`
+CREATE TABLE IF NOT EXISTS server_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  actor_id TEXT,
+  action TEXT NOT NULL,
+  target_id TEXT,
+  channel_id TEXT,
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_server_audit_seq ON server_audit(server_id, seq);
+CREATE INDEX IF NOT EXISTS idx_server_audit_server ON server_audit(server_id, id);
+CREATE INDEX IF NOT EXISTS idx_server_audit_created ON server_audit(created_at);
+CREATE INDEX IF NOT EXISTS idx_server_audit_channel ON server_audit(channel_id, action) WHERE channel_id IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS server_audit_no_update BEFORE UPDATE ON server_audit BEGIN SELECT RAISE(ABORT, 'the server audit log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS server_audit_no_delete BEFORE DELETE ON server_audit
+  WHEN EXISTS (SELECT 1 FROM servers WHERE id = OLD.server_id)
+    AND OLD.created_at > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 31536000000
+    AND OLD.seq > (SELECT MAX(seq) FROM server_audit WHERE server_id = OLD.server_id) - 200000
+    AND (OLD.seq > (SELECT MAX(seq) FROM server_audit WHERE server_id = OLD.server_id) - 50000 OR ${serverAuditKeptSql('OLD.')})
+    AND (OLD.seq > (SELECT MAX(seq) FROM server_audit WHERE server_id = OLD.server_id) - 10000
+      OR OLD.created_at > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 604800000)
+  BEGIN SELECT RAISE(ABORT, 'the server audit log is append-only'); END;
+`);
 
 // v14: server folders (synced across your devices), personal update tracking, and study tools.
 addColumn('users', 'rail_layout', "TEXT NOT NULL DEFAULT ''");
@@ -1190,6 +1246,40 @@ CREATE TABLE IF NOT EXISTS member_timeouts (
 CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
 `);
 
+// v20 (threads): read state for threads. A thread's read marker is a read_states row keyed t:<root id>, and
+// "Mark as read" on a channel or server also writes ct:<channel id> ("every thread here is read up to"). A thread
+// reply's pings go in mention_marks under ct:<channel id> with the thread's root in thread_id, so they count in the
+// channel's badge until that thread is read. thread_activity is each thread's newest reply, so a channel's threads
+// list by latest reply is one index range instead of a look at every thread in it. Replies are only ever written by
+// POST /channels/:id/messages, which records them here; removals go through triggers, since messages are deleted in
+// many ways (a message, a thread, bulk and ban cleanups, deleted channels). An insert trigger would cost every message
+// insert (top-level ones too) about half as much again.
+addColumn('mention_marks', 'thread_id', 'TEXT');
+const hadThreadActivity = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_activity'").get();
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_mention_marks_thread ON mention_marks(thread_id, user_id, message_id) WHERE thread_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS thread_activity (
+  root_id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  last_reply_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_thread_activity_channel ON thread_activity(channel_id, last_reply_id);
+CREATE TRIGGER IF NOT EXISTS thread_activity_unreply AFTER DELETE ON messages WHEN OLD.thread_id IS NOT NULL BEGIN
+  DELETE FROM thread_activity WHERE root_id = OLD.thread_id AND NOT EXISTS (SELECT 1 FROM messages WHERE thread_id = OLD.thread_id);
+  UPDATE thread_activity SET last_reply_id = (SELECT MAX(id) FROM messages WHERE thread_id = OLD.thread_id)
+    WHERE root_id = OLD.thread_id AND last_reply_id = OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS thread_activity_root_gone AFTER DELETE ON messages WHEN OLD.thread_id IS NULL BEGIN
+  DELETE FROM thread_activity WHERE root_id = OLD.id;
+END;
+`);
+// Threads from before this table: filled once, from the replies already there (only those whose root still exists).
+if (!hadThreadActivity) {
+  db.prepare(`INSERT OR IGNORE INTO thread_activity (root_id, channel_id, last_reply_id)
+    SELECT t.thread_id, r.channel_id, t.last FROM (SELECT thread_id, MAX(id) AS last FROM messages WHERE thread_id IS NOT NULL GROUP BY thread_id) t
+    JOIN messages r ON r.id = t.thread_id AND r.thread_id IS NULL`).run();
+}
+
 // Server mutes (moderator toolkit): someone a moderator muted in voice for everyone. It stays when they leave the
 // call or the server and come back, until a moderator lifts it; it goes with the server or the account.
 db.exec(`
@@ -1282,4 +1372,4 @@ db.prepare = (sql) => {
   return st;
 };
 
-module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION };
+module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION, SERVER_AUDIT_KEPT, serverAuditKeptSql };

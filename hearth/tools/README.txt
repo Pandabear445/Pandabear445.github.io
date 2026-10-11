@@ -14,11 +14,16 @@ WINDOWS
   The first time, it asks for your server address and offers password-free login
   (you type the server password once; after that, updates need no password).
 
-CHECKSUMS
-  Each update comes as hearth-update-<version>.zip plus hearth-update-<version>.zip.sha256.
-  Keep both in the same folder. The tools refuse a zip that doesn't match its .sha256,
+CHECKSUMS AND SIGNATURES
+  Each update comes as hearth-update-<version>.zip plus hearth-update-<version>.zip.sha256,
+  and, once its publisher signs updates, hearth-update-<version>.zip.sig.
+  Keep them all in the same folder. The tools refuse a zip that doesn't match its .sha256,
   and always print the SHA-256 they install: compare it with the one in the release notes.
   (Without a .sha256 file they only print it, so compare it yourself.)
+  The server checks the .sig against the update key it pinned (the first update that brings
+  one pins it) and refuses an unsigned or wrongly signed zip, before anything in it runs.
+  Only if you checked the zip yourself: Update-Hearth.bat -AllowUnsigned path\to\update.zip
+  (Mac/Linux: ./update-hearth.sh --allow-unsigned path/to/update.zip).
 
 MAC / LINUX
   ./update-hearth.sh path/to/update.zip
@@ -28,7 +33,8 @@ MAC / LINUX
   ./update-hearth.sh --setup         change server
 
 WHAT IT DOES ON THE SERVER
-  0. Puts the upload in a private temporary folder and checks it again before anything runs.
+  0. Puts the upload in a private temporary folder and checks it again before anything runs:
+     its checksum, and its signature with the updater already installed there.
   1. Backs up the program files and the database (in /root/hearth-backups, last 5 kept).
   2. Copies in the new files. Never touches: data/, .env, docker-compose.yml, deploy/Caddyfile.
   3. Builds the new version while the old one keeps running. If that fails, nothing changes.
@@ -37,6 +43,9 @@ WHAT IT DOES ON THE SERVER
 
 On the server itself you can also run:
   hearth-update /path/to/update.zip      install an update
+  hearth-update --verify /path/to/update.zip   only check it (checksum, signature, version)
+  hearth-update --allow-downgrade /path/to/update.zip   install an older signed version on purpose
+                                         (the tools here don't do that; --rollback is usually what you want)
   hearth-update --rollback               undo the last update
   hearth-update --list                   list the saved backups
   hearth-update --rollback <name>        go back to a specific backup from --list

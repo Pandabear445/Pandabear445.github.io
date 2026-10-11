@@ -67,7 +67,7 @@ const parseList = (s, d = []) => { try { const v = JSON.parse(s); return Array.i
 const sign = (secret, ts, body) => crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
 
 module.exports = function setupBots(ctx) {
-  const { api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, checkWords,
+  const { api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, serverAudit, checkWords,
     perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer,
     getIo, features, isStaff, isInstanceAdmin, maintenance, newsBot } = ctx;
   const now = () => Date.now();
@@ -893,6 +893,7 @@ module.exports = function setupBots(ctx) {
     db.prepare('INSERT INTO bot_installations (id, bot_id, server_id, installed_by, scopes, channels, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)')
       .run(id, bot.id, s.id, req.userId, JSON.stringify(scopes), JSON.stringify(channels), now());
     auditLog(req, 'bot_installed', s.id, `${bot.name} (${bot.id}): ${scopes.join(' ') || 'no scopes'}; channels ${channels === '*' ? 'all public' : channels.length}`);
+    serverAudit(s, req.userId, 'bot_add', bot.id, { name: bot.name, scopes, channels: channels === '*' ? 'all' : channels.length });
     const inst = db.prepare('SELECT * FROM bot_installations WHERE id = ?').get(id);
     if (bot.webhook_url) enqueue('bot.installed', bot, inst, { serverId: s.id, serverName: s.name, scopes, channelIds: allowedChannels(inst).map((c) => c.id), allChannels: channels === '*', installedBy: req.userId });
     io().to(`server:${s.id}`).emit('user:update', publicUser(getUserRow(bot.id)));
@@ -922,7 +923,12 @@ module.exports = function setupBots(ctx) {
       db.prepare('UPDATE bot_installations SET enabled = ? WHERE id = ?').run(b.enabled ? 1 : 0, inst.id);
       changes.push(b.enabled ? 'resumed' : 'paused');
     }
-    if (changes.length) auditLog(req, 'bot_access_changed', s.id, `${bot.name} (${bot.id}): ${changes.join(', ')}`);
+    if (changes.length) {
+      auditLog(req, 'bot_access_changed', s.id, `${bot.name} (${bot.id}): ${changes.join(', ')}`);
+      serverAudit(s, req.userId, 'bot_update', bot.id, { name: bot.name, scopes: b.scopes !== undefined || b.channels !== undefined ? scopes : undefined,
+        channels: b.scopes !== undefined || b.channels !== undefined ? (channels === '*' ? 'all' : channels.length) : undefined,
+        paused: b.enabled !== undefined && !!b.enabled !== !!inst.enabled ? !b.enabled : undefined });
+    }
     emitServer(s.id);
     res.json(installedOut(db.prepare('SELECT * FROM bot_installations WHERE id = ?').get(inst.id)));
   });
@@ -939,6 +945,7 @@ module.exports = function setupBots(ctx) {
     for (const it of interactions.values()) if (it.installationId === inst.id) finish(it, 'failed', { error: 'The bot was removed from this server.' });
     if (bot.webhook_url) enqueue('bot.uninstalled', bot, inst, { serverId: s.id });
     auditLog(req, 'bot_uninstalled', s.id, `${bot.name} (${bot.id})`);
+    serverAudit(s, req.userId, 'bot_remove', bot.id, { name: bot.name });
     emitServer(s.id);
     res.json({ ok: true });
   });

@@ -251,7 +251,7 @@ function updateLab({ owner = 'alice', progOwner = owner, proc = '', newLock = fa
   // The stubs make the script believe it's root, so first make sure it keeps everything in the scratch folder
   // (a version without these settings would write to /root, /etc and /usr/local/bin).
   const text = read('scripts/hearth-update.sh');
-  for (const v of ['HEARTH_BACKUP_ROOT', 'HEARTH_UPDATE_CONF', 'HEARTH_UPDATE_BIN', 'HEARTH_UPDATE_LOCK']) assert.ok(text.includes(`\${${v}:-`), `hearth-update.sh honours ${v}`);
+  for (const v of ['HEARTH_BACKUP_ROOT', 'HEARTH_UPDATE_CONF', 'HEARTH_UPDATE_BIN', 'HEARTH_UPDATE_LOCK', 'HEARTH_UPDATE_PUBKEY']) assert.ok(text.includes(`\${${v}:-`), `hearth-update.sh honours ${v}`);
   const t = tmp();
   const app = path.join(t, 'app');
   for (const d of ['server', 'data', 'node_modules']) fs.mkdirSync(path.join(app, d), { recursive: true });
@@ -319,6 +319,7 @@ esac`);
   const env = {
     ...process.env, PATH: `${bin}:${process.env.PATH}`, HEARTH_DIR: app, HEARTH_BACKUP_ROOT: path.join(t, 'backups'),
     HEARTH_UPDATE_CONF: path.join(t, 'conf'), HEARTH_UPDATE_BIN: path.join(t, 'hearth-update'), HEARTH_UPDATE_LOCK: path.join(t, 'lock'),
+    HEARTH_UPDATE_PUBKEY: path.join(t, 'hearth-update.pub'),
   };
   const run = (...args) => spawnSync('bash', [path.join(ROOT, 'scripts/hearth-update.sh'), ...args], { env, encoding: 'utf8', timeout: 60000, input: '' });
   const calls_ = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '');
@@ -623,7 +624,7 @@ test('update tools: "nothing was installed" only when the updater never ran; oth
   } finally { lab.done(); }
 });
 
-test('update tools: the install command really checks the upload and keeps 90-92 for its own checks', { skip: toolSkip }, () => {
+test('update tools: the install command really checks the upload and keeps 90-93 for its own checks', { skip: toolSkip }, () => {
   // Run the exact command the tool sends, here, as the "server": a scratch home folder with the upload in it,
   // and a sudo that just runs the command.
   const lab = toolLab();
@@ -652,7 +653,9 @@ test('update tools: the install command really checks the upload and keeps 90-92
       fs.rmSync(path.join(server, 'tmp'), { recursive: true, force: true });
       fs.mkdirSync(path.join(server, 'tmp'));
       fs.copyFileSync(upload, path.join(server, up));
-      const r = spawnSync('sh', ['-c', remote], { env: { ...process.env, HOME: server, TMPDIR: path.join(server, 'tmp'), PATH: `${sbin}:${process.env.PATH}`, UPDATER_CODE: String(code) }, encoding: 'utf8' });
+      // No updater installed and no key pinned on this "server" (the test machine's own must not count): the
+      // signature check by the installed updater is test/update-signing.test.js's.
+      const r = spawnSync('sh', ['-c', remote.replaceAll('/usr/local/bin/hearth-update', path.join(server, 'no-installed-updater')).replaceAll('/etc/hearth-update.pub', path.join(server, 'no-pinned-key'))], { env: { ...process.env, HOME: server, TMPDIR: path.join(server, 'tmp'), PATH: `${sbin}:${process.env.PATH}`, UPDATER_CODE: String(code) }, encoding: 'utf8' });
       return { status: r.status, out: r.stdout + r.stderr, left: fs.readdirSync(path.join(server, 'tmp')), upLeft: fs.existsSync(path.join(server, up)) };
     };
     let r = onServer(good);
@@ -667,29 +670,47 @@ test('update tools: the install command really checks the upload and keeps 90-92
     assert.ok(!fs.existsSync(path.join(server, 'ran')));
     // No updater inside: 91.
     assert.equal(onServer(noUpdater).status, 91);
-    // The updater's own failures come through as they are, except 90-92, which can't be mistaken for the above.
+    // The updater's own failures come through as they are, except 90-93, which can't be mistaken for the above.
     assert.equal(onServer(good, { code: 12 }).status, 12);
     assert.equal(onServer(good, { code: 90 }).status, 1);
     assert.equal(onServer(good, { code: 92 }).status, 1);
+    assert.equal(onServer(good, { code: 93 }).status, 1);
   } finally { lab.done(); }
 });
 
 test('the Windows update tool sends exactly the same install command as the Mac/Linux one', { skip: toolSkip }, () => {
   const lab = toolLab();
   try {
-    assert.equal(lab.run([lab.zip]).status, 0);
-    const { up, remote } = sent(lab.calls());
     const sum = crypto.createHash('sha256').update(fs.readFileSync(lab.zip)).digest('hex');
-    // PowerShell: $remote = "..." + "..." (`$ is a literal $; ${sudo}, $up and $sum are its own variables).
+    // PowerShell: $remote = "..." + "..." (`$ is a literal $; ${sudo}, $up, $sum, ${sigCmd}, $allow and ${noCheck} are
+    // its own variables: $sigCmd = "echo '<signature>' > update.zip.sig; " when there's a .sig, $allow =
+    // ' --allow-unsigned', and $noCheck what a server that pins a key but has an older updater does).
     const ps = read('tools/Update-Hearth.ps1');
     const block = ps.slice(ps.indexOf('$remote = '), ps.indexOf('\n& ssh @sshOpts -t -p $cfg.port $target $remote'));
     const parts = [...block.matchAll(/"((?:[^"`]|`.)*)"/g)].map((m) => m[1]);
-    const psRemote = parts.join('').replace(/\$\{sudo\}/g, 'sudo ').replace(/\$up\b/g, up).replace(/\$sum\b/g, sum).replace(/`\$/g, '$');
-    assert.equal(psRemote, remote);
+    const noCheck = [...ps.matchAll(/\$noCheck = "([^"`$]*)"/g)].map((m) => m[1]);
+    assert.equal(noCheck.length, 2, 'one for a normal update, one for -AllowUnsigned');
+    assert.match(noCheck[0], /; exit 93$/);
+    assert.doesNotMatch(noCheck[1], /exit 93/);
+    const psRemote = (up, sigCmd, allow) => parts.join('').replace(/\$\{sudo\}/g, 'sudo ').replace(/\$up\b/g, up).replace(/\$sum\b/g, sum)
+      .replace(/\$\{sigCmd\}/g, sigCmd).replace(/\$allow\b/g, allow).replace(/\$\{noCheck\}/g, noCheck[allow ? 1 : 0]).replace(/`\$/g, '$');
+    assert.match(ps, /\$sigCmd = "echo '\$sig' > update\.zip\.sig; "/);
+    assert.match(ps, /\$allow = ' --allow-unsigned'/);
+    // Unsigned, signed, and signed with --allow-unsigned (-AllowUnsigned).
+    const sig = crypto.randomBytes(64).toString('base64');
+    for (const [withSig, args, allow] of [[false, [], ''], [true, [], ''], [true, ['--allow-unsigned'], ' --allow-unsigned']]) {
+      if (withSig) fs.writeFileSync(lab.zip + '.sig', sig + '\n');
+      lab.reset();
+      assert.equal(lab.run([...args, lab.zip]).status, 0);
+      const { up, remote } = sent(lab.calls());
+      assert.equal(psRemote(up, withSig ? `echo '${sig}' > update.zip.sig; ` : '', allow), remote);
+    }
     assert.doesNotMatch(ps, /'mktemp -d'/, 'no separate login just to make the folder');
-    // And it handles the codes the same way: 90-92 explained without a stale log, everything else fetches it.
-    for (const c of ['90', '91', '92']) assert.match(ps, new RegExp(`^\\s+${c} \\{ Fail `, 'm'));
+    // And it handles the codes the same way: 90-93 explained without a stale log, everything else fetches it.
+    for (const c of ['90', '91', '92', '93']) assert.match(ps, new RegExp(`^\\s+${c} \\{ Fail `, 'm'));
     assert.match(ps, /\$logText = & ssh/);
+    // The same check of a .sig before it goes into the command.
+    assert.match(ps, /\$sig -cnotmatch '\^\[A-Za-z0-9\+\/\]\{86\}==\$'/);
   } finally { lab.done(); }
 });
 

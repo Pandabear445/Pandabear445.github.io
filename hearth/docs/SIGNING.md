@@ -3,7 +3,8 @@
 This page explains, in plain language, why Windows and Android warn people before they install the Hearth
 apps, what you can buy or set up to make those warnings go away (or get smaller), what it costs, and exactly
 which GitHub settings to fill in. It also covers signing the desktop app's updates, which protects people's apps
-from a server that's been broken into. The build (`.github/workflows/hearth-apps.yml`) already knows how to sign:
+from a server that's been broken into, and signing server updates, which protects servers from a swapped update
+zip. The build (`.github/workflows/hearth-apps.yml`) already knows how to sign:
 it signs automatically as soon as the secrets below exist, and builds unsigned apps (like today) when they
 don't.
 
@@ -23,6 +24,7 @@ Prices and rules below were checked in October 2026. They change, so check the l
 | Android: "Install unknown apps", Play Protect "unrecognised app" | Install from **Google Play** (internal testing for friends) | **$25 once** | an evening, plus Google's ID check |
 | Browser padlock / "Not secure" on your website | Already done: Caddy gets a real TLS certificate | free | none |
 | Desktop apps installing an update someone else put on your server | Your own **update signing key** (`UPDATE_SIGNING_KEY`, see [Signing desktop updates](#signing-desktop-updates)) | **free** | ten minutes |
+| Servers installing a swapped update zip (it carries the code that does the encryption) | Your own **server update signing key** (`update-signing.pub`, see [Signing server updates](#signing-server-updates)) | **free** | ten minutes |
 
 ## First: the website certificate is a different thing
 
@@ -290,6 +292,115 @@ refuse the update. To sign files you built yourself:
 - Apps built before this feature, and fork builds without the secret, can't verify signatures. The first update
   from such an app to a signed build is installed the old way (after asking).
 - Forks should make their own key; they can't sign with yours.
+
+---
+
+## Signing server updates
+
+Also free, and separate from the desktop key: an **update signing key for server updates** (Ed25519). A Hearth
+server sends every browser and app the code that does the encryption, so whoever gets a server to install their
+update zip can quietly take that encryption apart for everyone on it. The `.sha256` next to each zip only catches
+a damaged download: someone who can swap the zip (on the download page, in a chat, on the way) can swap the
+`.sha256` too. With a key of your own, servers only install update zips you signed.
+
+**How it works:**
+
+- `scripts/make-update-zip.sh` signs each zip with your private key and writes `hearth-update-<version>.zip.sig`
+  next to it: an Ed25519 signature over `hearth-server-update-v1`, a newline, the zip's SHA-256 (hex) and a
+  newline. The label keeps a signature made for anything else (a desktop update, say) from passing as one.
+- The public half is committed as `hearth/update-signing.pub`, so it's inside every update and every install.
+- Each server trusts one key, pinned in **`/etc/hearth-update.pub`**: root's, outside the Hearth folder, so once
+  it's pinned neither Hearth itself nor an npm install script can replace it. It's the key the installed Hearth
+  came with (pinned at its first update, and only when that `update-signing.pub` and every folder above it can
+  be changed by root alone: in a plain install the Hearth folder is Hearth's own account's, and that account
+  mustn't choose the key), or else the key the first update that brings one carries.
+- From then on `hearth-update` and the update tools refuse a zip without a valid signature by that key, before
+  anything in it is unpacked or run: it says why and "Nothing was changed". The update tools have the updater
+  that's already on the server (`/usr/local/bin/hearth-update --verify`) check it, not the one inside the zip.
+  Everything is checked on a private copy of the zip, so it can't change between the check and the install.
+- A server that checks signatures also never installs an older version by itself (an old, signed update could
+  bring back problems fixed since). `hearth-update --rollback` puts back your own backup as before;
+  `sudo hearth-update --allow-downgrade <zip>` on the server installs an older signed zip on purpose (the
+  one-click tools don't do downgrades).
+- Servers check with **OpenSSL 3.0 or newer** (Debian 12, Ubuntu 22.04 and later), so Docker hosts don't need
+  Node. OpenSSL 1.1.1 (Debian 11, Ubuntu 20.04) can't check Ed25519 signatures at all; there the updater uses
+  Node instead, which Hearth needs outside Docker anyway. A server with neither pins no key and stays on
+  checksums only (it says so in the update log and in `hearth-update --status`); one that already pinned a key
+  refuses updates until one of them is installed. `hearth-update --status` shows the pinned key, and
+  `hearth-update --verify <zip>` checks a zip without installing anything.
+
+**Set it up once:**
+
+1. Make a key pair on your own computer: `node hearth/scripts/update-key.js keygen`. The private key goes to
+   `~/.config/hearth/update-signing.key`, readable only by you (`--key <file>` puts it elsewhere); the public
+   half goes to `hearth/update-signing.pub`. Nothing secret is printed.
+2. **Back up the private key** offline (a password manager, an encrypted USB stick). Never commit it (`*.key` is
+   ignored by git anyway) and never put it on a server.
+3. Commit `hearth/update-signing.pub`.
+4. Make releases as before: `bash scripts/make-update-zip.sh` finds the key in its usual place (or in
+   `HEARTH_UPDATE_KEY_FILE=/path/to/key`, or the key itself in `HEARTH_UPDATE_KEY`, for a CI job) and writes the
+   `.sig`. Once `update-signing.pub` is committed it refuses to make an unsigned zip, because servers that pinned
+   the key would refuse it (`--unsigned` makes one anyway).
+5. Hand out the zip, its `.sha256` and its `.sig`, and put the SHA-256 and your public key in the release notes.
+   To check a zip yourself: `node scripts/update-key.js verify hearth-update-<version>.zip`.
+
+Servers move to signed updates by themselves: the first update that carries `update-signing.pub` is installed the
+old way (checksum only) and pins its key; every later one has to be signed. The updater prints the key it pinned:
+operators who want to be sure compare it with the one in your release notes.
+
+**Changing the key:** a new key is only accepted from an update the old key signed (a key that comes inside a zip
+can't vouch for that zip, or anyone could ship their own key with their own zip).
+
+1. `node scripts/update-key.js keygen --key ~/.config/hearth/update-signing-new.key` (this replaces
+   `update-signing.pub` with the new public half). Commit it.
+2. Make the next release **signed with the old key** (still the default one), naming the new one:
+   `bash scripts/make-update-zip.sh --new-key ~/.config/hearth/update-signing-new.key`. Servers check it against
+   the old key, install it and switch to the new key; `make-update-zip.sh` says `KEY CHANGE` and from which key to
+   which. Without `--new-key` (or with a key that isn't the committed one) it makes nothing: a key change has to
+   come from whoever holds the new key, never from a commit alone. If it ever stops with "update-signing.pub in the
+   last commit is …, but you sign with …" and you didn't change the key, someone else did: look at
+   `git log -p -- hearth/update-signing.pub` before anything else.
+3. Then sign with the new key: move it to `~/.config/hearth/update-signing.key` (keep the old one backed up for a
+   while).
+
+Servers have to install that release before any later one: a server that skips it refuses the later ones
+("doesn't match this server's update key"). Say so in its release notes.
+
+**Lost or leaked key:** make a new one (`keygen` as in step 1, moving the old key file away first if you still have
+it, so the new one becomes the default), commit it and sign the next release with it. Every server
+then refuses that release, so each operator checks the zip another way (its SHA-256 from a place they trust) and
+installs it once with `--allow-unsigned` (`Update-Hearth.bat -AllowUnsigned`, `./update-hearth.sh --allow-unsigned`
+or `hearth-update --allow-unsigned`), which pins the key it brings. With a leaked key, tell operators straight
+away: until they move to the new key, a zip signed with the leaked one would be accepted.
+
+**Switching it off:** removing `update-signing.pub` from the repository unpins nothing (a release can't switch the
+check off). On each server: `sudo rm /etc/hearth-update.pub`, and delete `update-signing.pub` from the Hearth folder,
+or the next update pins it again.
+
+**Checking a signature by hand** (what the server does, with OpenSSL 3.0 or newer; with Node anywhere:
+`node scripts/update-key.js verify hearth-update-1.2.3.zip --pub update-signing.pub`):
+
+```bash
+printf 'hearth-server-update-v1\n%s\n' "$(sha256sum hearth-update-1.2.3.zip | cut -d' ' -f1)" > msg
+base64 -d hearth-update-1.2.3.zip.sig > sig.bin
+{ echo '-----BEGIN PUBLIC KEY-----'; grep -v '^#' update-signing.pub; echo '-----END PUBLIC KEY-----'; } > key.pem
+openssl pkeyutl -verify -pubin -inkey key.pem -rawin -in msg -sigfile sig.bin
+```
+
+**Good to know:**
+
+- The first key a server pins is trusted the first time it's seen. Before that, only the checksum protects the
+  update that brings it, so compare the pinned key (in the update log and `hearth-update --status`) with yours.
+- The one-click tools rely on the updater already installed on the server (they read it through `sudo`, so it may
+  be root's alone). On a server that has never run `hearth-update`, the zip's own updater checks itself; install
+  the updater from your current Hearth once to close that gap:
+  `sudo install -m 755 scripts/hearth-update.sh /usr/local/bin/hearth-update`. A server that pins a key but whose
+  installed updater can't check signatures (deleted, or an older one put back) gets nothing from the tools (exit
+  93) unless you check the zip yourself and pass `--allow-unsigned`.
+- `--allow-unsigned` switches the check off for that one update, by design, and says so loudly in the log.
+- Root on the server can change the pinned key. Signing protects the way updates reach a server, not a server
+  that's already been broken into.
+- Forks make their own key; servers that pinned yours then need one `--allow-unsigned` update to move to it.
 
 ---
 

@@ -222,7 +222,7 @@ where the docs now state the behaviour.
 | admin-8 | medium | vulnerability | Plaintext database snapshot is written inside data/backups/encrypted/ (the folder the docs say to rclone off-site) and is never cleaned up after a crash | Fixed | `admin-hardening.test.js` |
 | admin-9 | low | bug | Creator-membership invoices are also recorded as instance donations by /api/pay/stripe | Fixed | `admin-hardening.test.js` |
 | admin-10 | low | bug | 'Roles with moderator powers can't be sold' is only checked when a tier is created or edited; later role edits or channel overrides bypass it | Fixed | `admin-hardening.test.js` |
-| admin-11 | low | vulnerability | Server update packages are not authenticated; the Mac/Linux tool silently installs the newest *hearth*/*update* zip from ~/Downloads as root | Partly fixed | `infra-hardening.test.js` |
+| admin-11 | low | vulnerability | Server update packages are not authenticated; the Mac/Linux tool silently installs the newest *hearth*/*update* zip from ~/Downloads as root | Partly fixed (signing done since: §5) | `infra-hardening.test.js`, `update-signing.test.js` |
 | admin-12 | low | limitation | Supporter payments ignore refunds and chargebacks; a one-off payment can grant up to 400 days | Deferred | — (SECURITY.md §4; RUNNING-HEARTH.md) |
 
 ### Client rendering (xss, 9 findings)
@@ -320,7 +320,7 @@ where the docs now state the behaviour.
 | voice-1 | Watch-together state is sent whole on every change. | Delta updates change the protocol; amplification is bounded (64 KB state, 4 broadcasts a second). |
 | voice-4 | No per-session socket cap and no per-network handshake limit. | Tabs share one session; a NAT full of users reconnecting after a restart would be locked out. The per-user cap of 30 sockets and shared event budget cover it. |
 | voice-9 | Anyone who can sign up gets relay logins; no default total bandwidth cap; existing installs need `setup-turn.sh` again. | Product decision; the right total depends on each VPS plan. |
-| admin-11 | Server update zips are checksum-checked, not signed. | Needs a release signing key and a key-management decision (minisign or `ssh-keygen -Y` design recorded). |
+| admin-11 | Done since: zips are signed (Ed25519, `scripts/update-key.js`) and each server pins one key in `/etc/hearth-update.pub`. What stays: the first key is trusted on first use, a server that never ran `hearth-update` has no trusted updater to check the tools' upload, and a server with neither OpenSSL 3.0+ nor Node stays on checksums. | The owner makes the key (none is committed); see docs/SIGNING.md, "Signing server updates". |
 | infra-1 | Updates come from whatever server the app is connected to; `data/downloads` is writable by Hearth; the SignPath certificate thumbprint isn't pinned. | Signed updates make the feed's origin irrelevant for builds with a key; the rest are deploy changes or need external information. Apps released before signing install the hop to the first signed build the old way. |
 | infra-2 | No always-visible native "sharing your screen" indicator; an old-style capture request gets the whole screen for about 3 s after a pick. | UX work; Electron can't tell the two request kinds apart, so the window is shortened, not closed. |
 | infra-3 | Using a non-root deploy user is up to the operator. | The workflow can't enforce VPS and GitHub settings; the docs recommend it. |
@@ -473,7 +473,8 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
    corrected. New tests should use values that don't look like keys.
 2. Set the `UPDATE_SIGNING_KEY` secret (if it isn't set) and `VPS_HOST_FINGERPRINT`, and publish one signed
    release so installed apps move to signed updates.
-3. Sign server update zips (`admin-11`), and pin the trust anchor in `hearth-update`.
+3. Done: server update zips are signed (`admin-11`) and `hearth-update` pins the trust anchor. Make the key
+   (`node scripts/update-key.js keygen`), commit `update-signing.pub` and publish one signed release.
 4. Make step-up always ask for a code for password, email, recovery-key and key-export changes (`auth-6`), and rotate
    the current session token on password change (`auth-11`).
 5. Bind message id, reply, thread, time and edit version into the ciphertext (`crypto-7`), and the member list into

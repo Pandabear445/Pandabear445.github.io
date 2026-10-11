@@ -408,7 +408,7 @@ function defuse(text, allow, roleName) {
 }
 
 module.exports = function setupWebhooks(ctx) {
-  const { api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
+  const { api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
     getIo, maintenance, ipBanned, bannedMsg, stillSuspended, botPost, notifyChannelMessage, cleanIp } = ctx;
   const now = () => Date.now();
   const io = () => getIo() || { to: () => ({ emit() {} }) };
@@ -658,6 +658,7 @@ module.exports = function setupWebhooks(ctx) {
         .run(id, c.id, s.id, userId, name, t.hash, pings ? 1 : 0, req.userId, now());
     })();
     auditLog(req, 'webhook_created', s.id, `${name} (${id}) in #${c.name}${pings ? '; may ping' : ''}`);
+    serverAudit(s, req.userId, 'webhook_create', id, { name, channel: chanRef(s, c), pings: pings || undefined }, c.id);
     changed(s, c);
     res.json({ webhook: hookOut(fresh(id), s, req.userId), token: t.token, path: t.path });
   });
@@ -693,6 +694,9 @@ module.exports = function setupWebhooks(ctx) {
     }
     if (changes.length) {
       auditLog(req, 'webhook_changed', s.id, `${w.name} (${w.id}) in #${c.name}: ${changes.join(', ')}`);
+      const now2 = fresh(w.id);
+      serverAudit(s, req.userId, 'webhook_update', w.id, { name: now2.name, channel: chanRef(s, c),
+        renamed: now2.name !== w.name ? { from: w.name, to: now2.name } : undefined, pings: !!now2.allow_mentions !== !!w.allow_mentions ? !!now2.allow_mentions : undefined }, c.id);
       changed(s, c);
     }
     res.json({ webhook: hookOut(fresh(w.id), s, req.userId) });
@@ -712,6 +716,7 @@ module.exports = function setupWebhooks(ctx) {
     db.prepare('UPDATE channel_webhooks SET token_hash = ?, rotated_at = ?, created_by = ? WHERE id = ?').run(t.hash, now(), req.userId, w.id);
     const from = w.created_by && w.created_by !== req.userId ? `; the address was ${(getUserRow(w.created_by) || {}).username || w.created_by}’s` : '';
     auditLog(req, 'webhook_token_rotated', s.id, `${w.name} (${w.id}) in #${c.name}${from}`);
+    serverAudit(s, req.userId, 'webhook_rotate', w.id, { name: w.name, channel: chanRef(s, c) }, c.id);
     changed(s, c);
     res.json({ webhook: hookOut(fresh(w.id), s, req.userId), token: t.token, path: t.path });
   });
@@ -730,6 +735,7 @@ module.exports = function setupWebhooks(ctx) {
       toChannel(c).emit('user:update', publicUser(getUserRow(w.bot_user_id)));
     } else db.prepare('DELETE FROM channel_webhooks WHERE id = ?').run(w.id);
     auditLog(req, 'webhook_deleted', s.id, `${w.name} (${w.id}) in #${c.name}`);
+    serverAudit(s, req.userId, 'webhook_delete', w.id, { name: w.name, channel: chanRef(s, c) }, c.id);
     changed(s, c);
     res.json({ ok: true });
   });

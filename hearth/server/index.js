@@ -14,7 +14,7 @@ const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
-const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION } = require('./db');
+const { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION, serverAuditKeptSql } = require('./db');
 const { readOrCreate } = require('./secretfile');
 // User ids in the access log are keyed hashes: groupable, but not checkable against a list of ids.
 log.setUserHashKey(atRestKey);
@@ -133,6 +133,14 @@ let ACT = { activityFor: () => null, recentFor: () => undefined };
 let ACCT = null; // server/accounts.js: email, recovery key, two-factor
 let STORE = null; // server/storage.js: resumable uploads, storage reports
 let BOTS = null; // server/bots.js: installed bots, their API and webhooks
+let SA = null; // server/serveraudit.js: each server's own audit log and its moderators' report inbox
+// An entry in a server's own audit log (see server/serveraudit.js): (server or id, actorId, action, targetId, detail,
+// channelId). Never message text. Many actions also still go to the instance audit log (auditLog) as before.
+const serverAudit = (...a) => { if (SA) SA.record(...a); };
+// The same for what any member can do over and over cheaply: at most 10 an hour per person and kind (kind first).
+const serverAuditCapped = (...a) => { if (SA) SA.recordCapped(...a); };
+// A channel as those entries keep it ({ id, name, private }): readers who can't see it don't get its name.
+const chanRef = (s, c) => (SA ? SA.channelRef(s, c) : null);
 
 // ---------------------------------------------------------------- serialization
 const getUserRow = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
@@ -2096,24 +2104,38 @@ api.patch('/servers/:id', auth, (req, res) => {
   const body = req.body || {};
   const onlyOrder = Object.keys(body).every((k) => k === 'categoryOrder');
   if (srv.kind !== 'group' && !can(srv, req.userId, onlyOrder ? PM.MANAGE_CHANNELS : PM.MANAGE_SERVER)) fail(403, 'You need the Manage Server permission.');
-  if (body.description !== undefined) db.prepare('UPDATE servers SET description = ? WHERE id = ?').run(String(body.description || '').slice(0, 300), srv.id);
+  const changes = []; // for the server's audit log: what changed (not the new text)
+  if (body.description !== undefined) {
+    const description = String(body.description || '').slice(0, 300);
+    if (description !== (srv.description || '')) changes.push('description');
+    db.prepare('UPDATE servers SET description = ? WHERE id = ?').run(description, srv.id);
+  }
   if (body.theme && typeof body.theme === 'object') {
     const cur = themeOf(srv);
     const next = cleanTheme(body.theme, cur);
+    // Compared with keys in a fixed order: the same background saved again isn't a change.
+    const stable = (v) => JSON.stringify(v === undefined ? null : v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a.localeCompare(b))) : x));
+    for (const k of ['accent', 'welcome', 'roleColors', 'iconShape', 'bannerCrop', 'background']) if (stable(cur[k]) !== stable(next[k])) changes.push(k);
     db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(next), srv.id);
     // Switching the background from a picture to colours drops the picture: remove its file too.
     const oldImage = cur.background && cur.background.image;
     if (oldImage && oldImage !== (next.background && next.background.image)) removeUpload(oldImage);
   }
+  let reordered = false;
   if (Array.isArray(body.categoryOrder)) {
     const order = [...new Set(body.categoryOrder.map((c) => String(c).trim().slice(0, 32)).filter(Boolean))].slice(0, 50);
+    reordered = JSON.stringify(order) !== (srv.category_order || '[]');
     db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify(order), srv.id);
   }
+  let renamed = null;
   if (body.name !== undefined) {
     const name = String(body.name || '').trim().slice(0, 64);
     if (!name && srv.kind !== 'group') fail(400, 'Server name cannot be empty.');
+    if (name !== srv.name) { renamed = { from: srv.name, to: name }; changes.unshift('name'); }
     db.prepare('UPDATE servers SET name = ? WHERE id = ?').run(name, req.params.id);
   }
+  if (changes.length) serverAudit(srv, req.userId, 'server_update', null, { changes, name: renamed || undefined });
+  if (reordered) serverAudit(srv, req.userId, 'category_reorder');
   emitServer(srv.id);
   res.json(serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(srv.id), req.userId));
 });
@@ -2125,6 +2147,7 @@ api.post('/servers/:id/icon', auth, limited('image', uploadImage, 'icon'), (req,
   if (!req.file) fail(400, 'Choose an image.');
   db.prepare('UPDATE servers SET icon = ? WHERE id = ?').run('/uploads/' + req.file.filename, srv.id);
   removeUpload(srv.icon);
+  serverAudit(srv, req.userId, 'server_update', null, { changes: ['icon'] });
   emitServer(srv.id);
   res.json(serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(srv.id), req.userId));
 });
@@ -2212,6 +2235,7 @@ api.delete('/servers/:id/members/:uid', auth, (req, res) => {
   if (!isMember(s.id, req.params.uid)) fail(404, 'That person is not in this server.');
   if (perms.top(s, req.params.uid) >= perms.top(s, req.userId)) fail(403, 'You can only remove people whose highest role is below yours.');
   removeMember(s.id, req.params.uid);
+  serverAudit(s, req.userId, 'member_kick', req.params.uid);
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -2265,6 +2289,10 @@ api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
       if ((perms.channel(s, { id: chId }, uid) & ~before) & lifted.get(chId) & ~my) fail(403, 'You can\u2019t take that role away: it limits them in a channel where you don\u2019t have that permission yourself.');
     }
   })();
+  if (changed.length) {
+    const named = (list) => list.map((r) => ({ id: r.id, name: r.name }));
+    serverAudit(s, req.userId, 'member_roles', uid, { added: named(changed.filter((r) => wanted.has(r.id))), removed: named(changed.filter((r) => !wanted.has(r.id))) });
+  }
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -2278,6 +2306,7 @@ api.post('/servers/:id/transfer', auth, wrap(async (req, res) => {
   db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(to, s.id);
   // Nobody can act on the owner, so a server mute they had would never be lifted.
   db.prepare('DELETE FROM voice_mutes WHERE server_id = ? AND user_id = ?').run(s.id, to);
+  serverAudit(s, req.userId, 'server_transfer', to, { from: s.owner_id });
   emitServer(s.id);
   const toName = (getUserRow(to) || {}).username || to;
   auditLog(req, 'server_transferred', s.id, `${s.name} \u2192 ${toName}`);
@@ -2297,9 +2326,23 @@ api.post('/servers/:id/invites', auth, (req, res) => {
   // apps that leave it out don't make permanent links by accident.
   const hours = b.expiresHours === undefined || b.expiresHours === null || b.expiresHours === '' ? 168
     : Math.max(0, Math.min(24 * 30, parseInt(b.expiresHours, 10) || 0));
+  // The app's invite dialog asks with reuse: the same kind of link this person made here in the last 10 minutes,
+  // still unused, comes back instead of a new one, so opening the dialog again doesn't make (and log) another.
+  if (b.reuse === true) {
+    const t = now();
+    const same = db.prepare(`SELECT code FROM invites WHERE server_id = ? AND creator_id = ? AND max_uses = ? AND uses = 0 AND created_at > ?
+        AND ${hours ? 'expires_at - created_at = ?' : 'expires_at IS NULL'} ORDER BY created_at DESC LIMIT 1`)
+      .get(s.id, req.userId, maxUses, t - 10 * 60000, ...(hours ? [hours * 3600000] : []));
+    if (same) return res.json({ code: same.code, reused: true });
+  }
+  // Each one is a row and an audit log entry: a script making them in a loop would bury the server's log (which
+  // also writes at most 10 an hour per person: SA.recordCapped).
+  rateLimit('invite:' + req.userId, 60, 10 * 60000);
   const code = randomCode(8);
+  const t = now();
   db.prepare('INSERT INTO invites (code, server_id, creator_id, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(code, s.id, req.userId, maxUses, hours ? now() + hours * 3600000 : null, now());
+    .run(code, s.id, req.userId, maxUses, hours ? t + hours * 3600000 : null, t);
+  serverAuditCapped('invite_create', s, req.userId, 'invite_create', code, { maxUses, hours });
   res.json({ code });
 });
 
@@ -2314,11 +2357,16 @@ api.get('/servers/:id/invites', auth, (req, res) => {
 });
 // Revoke an invite: whoever made it, or anyone with Manage Server in the invite's own server.
 api.delete('/invites/:code', auth, (req, res) => {
+  rateLimit('invitedel:' + req.userId, 60, 10 * 60000); // each one is an audit log entry, like making one
   const inv = db.prepare('SELECT * FROM invites WHERE code = ?').get(String(req.params.code));
   if (!inv) fail(404, 'That invite does not exist.');
   const s = requireServer(inv.server_id, req.userId);
   if (inv.creator_id !== req.userId && !can(s, req.userId, PM.MANAGE_SERVER)) fail(403, 'Only the person who made this invite (or someone with Manage Server) can revoke it.');
   db.prepare('DELETE FROM invites WHERE code = ?').run(inv.code);
+  // Revoking your own is as cheap as making one, so it's capped the same way; a moderator revoking someone
+  // else's (after a raid, say) is always written.
+  if (inv.creator_id === req.userId) serverAuditCapped('invite_revoke', s, req.userId, 'invite_revoke', inv.code, { creatorId: inv.creator_id, uses: inv.uses });
+  else serverAudit(s, req.userId, 'invite_revoke', inv.code, { creatorId: inv.creator_id, uses: inv.uses });
   res.json({ ok: true });
 });
 
@@ -2557,8 +2605,10 @@ const cleanCategory = (c) => String(c || '').trim().slice(0, 32);
 api.post('/servers/:id/channel-order', auth, (req, res) => {
   const s = requireAdmin(req.params.id, req.userId);
   const ids = Array.isArray((req.body || {}).ids) ? req.body.ids.map(String) : [];
-  const upd = db.prepare('UPDATE channels SET position = ? WHERE id = ? AND server_id = ?');
-  db.transaction(() => ids.forEach((id, i) => upd.run(i, id, s.id)))();
+  const upd = db.prepare('UPDATE channels SET position = ? WHERE id = ? AND server_id = ? AND position != ?');
+  let moved = 0;
+  db.transaction(() => ids.forEach((id, i) => { moved += upd.run(i, id, s.id, i).changes; }))();
+  if (moved) serverAudit(s, req.userId, 'channel_reorder', null, { count: moved });
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -2571,6 +2621,7 @@ api.post('/servers/:id/categories/rename', auth, (req, res) => {
   let order = [];
   try { order = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
   db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify([...new Set(order.map((c) => (c === from ? to : c)))]), s.id);
+  if (from !== to) serverAudit(s, req.userId, 'category_rename', null, { from, to });
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -2592,6 +2643,7 @@ api.post('/servers/:id/channels', auth, (req, res) => {
   db.prepare('INSERT INTO channels (id, server_id, name, type, position, created_at, category) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, type, pos, now(), category);
   const row = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
   const ch = serializeChannel(row);
+  serverAudit(s, req.userId, 'channel_create', id, { channel: chanRef(s, row), type, category }, id);
   emitServer(s.id);
   BOTS.event('channel.created', s.id, { channelId: id, name: row.name, type: row.type, category: row.category }, { channel: row, actorId: req.userId });
   res.json(ch);
@@ -2610,9 +2662,16 @@ api.patch('/channels/:id', auth, (req, res) => {
   const name = req.body.name !== undefined ? cleanChannelName(req.body.name, c.type) : c.name;
   const topic = req.body.topic !== undefined ? String(req.body.topic).slice(0, 300) : c.topic;
   const category = req.body.category !== undefined ? (cleanCategory(req.body.category) || c.category) : c.category;
-  if (req.body.slowmode !== undefined) db.prepare('UPDATE channels SET slowmode = ? WHERE id = ?').run(Math.max(0, Math.min(21600, parseInt(req.body.slowmode, 10) || 0)), c.id);
+  const slowmode = req.body.slowmode !== undefined ? Math.max(0, Math.min(21600, parseInt(req.body.slowmode, 10) || 0)) : c.slowmode || 0;
   if (!name) fail(400, 'Channel name cannot be empty.');
-  db.prepare('UPDATE channels SET name = ?, topic = ?, category = ? WHERE id = ?').run(name, topic, category, c.id);
+  db.prepare('UPDATE channels SET name = ?, topic = ?, category = ?, slowmode = ? WHERE id = ?').run(name, topic, category, slowmode, c.id);
+  // The server's audit log says what changed; a topic's new text isn't repeated there.
+  const changes = {};
+  if (name !== c.name) changes.name = { from: c.name, to: name };
+  if (topic !== c.topic) changes.topic = true;
+  if (category !== c.category) changes.category = { from: c.category, to: category };
+  if (slowmode !== (c.slowmode || 0)) changes.slowmode = { from: c.slowmode || 0, to: slowmode };
+  if (Object.keys(changes).length) { const srv = serverOf(c); serverAudit(srv, req.userId, 'channel_update', c.id, { channel: chanRef(srv, c), changes }, c.id); }
   const ch = serializeChannel(db.prepare('SELECT * FROM channels WHERE id = ?').get(c.id));
   emitServer(c.server_id);
   res.json(ch);
@@ -2624,8 +2683,11 @@ api.delete('/channels/:id', auth, (req, res) => {
   if (m) [...m.keys()].forEach((uid) => leaveVoice(uid, true));
   // Bots hear about it first, while the channel (and who could see it) still exists.
   BOTS.event('channel.deleted', c.server_id, { channelId: c.id, name: c.name, type: c.type }, { channel: c, actorId: req.userId });
+  const srv = serverOf(c);
+  const ref = chanRef(srv, c); // while its permissions (who could see it) still exist
   forgetMessages(db.prepare('SELECT id FROM messages WHERE channel_id = ?').all(c.id).map((r) => r.id));
   db.prepare('DELETE FROM channels WHERE id = ?').run(c.id);
+  serverAudit(srv, req.userId, 'channel_delete', c.id, { channel: ref, type: c.type }, c.id);
   emitServer(c.server_id);
   res.json({ ok: true });
 });
@@ -2658,7 +2720,10 @@ api.get('/channels/:id/messages', auth, (req, res) => {
   // Thread replies live in their thread, not the main channel.
   const { rows, hasMore, hasNewer } = pageRows('messages', 'channel_id', c.id, req.query, 'AND thread_id IS NULL');
   const reactions = reactionsFor(rows.map((r) => r.id));
-  res.json({ messages: rows.map((r) => serializeMessage(r, c, reactions)), hasMore, hasNewer });
+  const messages = rows.map((r) => serializeMessage(r, c, reactions));
+  // Your own unread and ping counts for the threads these messages start ("2 new replies" on each).
+  const threads = USE ? USE.threadStates(req.userId, c, messages.filter((m) => m.threadCount).map((m) => m.id)) : {};
+  res.json({ messages, hasMore, hasNewer, threads });
 });
 
 // Who gets a push for a channel message. The sender's app tells us which members it @mentions
@@ -2681,6 +2746,9 @@ function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, ever
   const rootAuthor = threadId && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(threadId) || {}).author_id;
   const replied = [replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && reaches(u));
   if (USE && !threadId && srv.kind !== 'group') USE.recordMentions(id, 'c:' + c.id, [...mentioned, ...replied], pingAll);
+  // In a thread: @mentions, a reply to your message and a valid @everyone count in the channel's badge until the
+  // thread is read. Every reply in a thread you started isn't a ping (the thread's own unread count shows those).
+  if (USE && threadId) USE.recordMentions(id, 'ct:' + c.id, [...mentioned, ...replied.filter((u) => u === replyAuthor)], pingAll, threadId);
   if (srv.kind === 'group') {
     const named = new Set(mentioned);
     pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: srv.name ? `in ${srv.name}` : 'in your group', ...base }, what('mention'));
@@ -2738,16 +2806,25 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   if (threadId) {
     const root = db.prepare('SELECT id, thread_id FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
     if (!root || root.thread_id) fail(404, 'That thread no longer exists.');
+    threadId = root.id; // the stored id, whatever shape the request gave it in
   }
   const id = newId();
-  db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(id, c.id, req.userId, '', ciphertext, ep, replyTo, now(), threadId);
+  db.transaction(() => {
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, c.id, req.userId, '', ciphertext, ep, replyTo, now(), threadId);
+    // A reply moves its thread to the top of the channel's Threads list (deleting one is handled in db.js).
+    if (threadId) {
+      db.prepare(`INSERT INTO thread_activity (root_id, channel_id, last_reply_id) VALUES (?, ?, ?)
+        ON CONFLICT(root_id) DO UPDATE SET last_reply_id = excluded.last_reply_id WHERE excluded.last_reply_id > thread_activity.last_reply_id`).run(threadId, c.id, id);
+    }
+  })();
   attachBlobs(files, req.userId, id);
   const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
   withNonce(msg, req.body);
   toChannel(c).emit('message:new', msg);
   notifyChannelMessage(c, id, req.userId, replyTo, threadId, (req.body || {}).mentions, (req.body || {}).everyone);
   if (USE && !threadId) USE.markSent(req.userId, 'c:' + c.id, id);
+  else if (USE) USE.markThreadSent(req.userId, c, threadId, id);
   // Bots get who, where and when: never the text, which is end-to-end encrypted.
   BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId: req.userId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null }, { channel: c, actorId: req.userId });
   if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
@@ -2777,6 +2854,8 @@ api.delete('/messages/:id', auth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   if (m.author_id !== req.userId && !canIn(s, c, req.userId, PM.MANAGE_MESSAGES)) fail(403, 'You can only delete your own messages.');
   deleteMessageTree(m.id);
+  // Someone else's message: the server's audit log says whose and where, never what it said.
+  if (m.author_id !== req.userId) serverAudit(s, req.userId, 'message_delete', m.author_id, { channel: chanRef(s, c), thread: m.thread_id ? true : undefined }, c.id);
   toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
   if (m.thread_id) toChannel(c).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
   BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
@@ -2815,6 +2894,7 @@ api.post('/channels/:id/messages/bulk-delete', auth, (req, res) => {
   const doomed = rows.filter((r) => below(r.author_id) && [...(others.get(r.id) || [])].every(below));
   const out = purgeChannelMessages(doomed, req.userId);
   if (out.messages) {
+    serverAudit(s, req.userId, 'message_bulk_delete', null, { channel: chanRef(s, c), count: out.messages, replies: out.replies || undefined, kept: rows.length - doomed.length || undefined }, c.id);
     auditLog(req, 'messages_bulk_deleted', c.id, `${out.messages} message${out.messages === 1 ? '' : 's'}${out.replies ? ` (and ${out.replies} thread repl${out.replies === 1 ? 'y' : 'ies'})` : ''} in #${c.name} in server "${s.name}" (${s.id})`);
   }
   res.json({ ok: true, deleted: out.messages, replies: out.replies, kept: rows.length - doomed.length });
@@ -2827,7 +2907,10 @@ api.get('/messages/:id/thread', auth, (req, res) => {
   // Paged like a channel (newest replies first, ?before=id for older ones): a thread can be any size.
   const { rows, hasMore, hasNewer } = pageRows('messages', 'thread_id', root.id, { limit: '100', ...req.query });
   const reactions = reactionsFor([root.id, ...rows.map((r) => r.id)]);
-  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)), hasMore, hasNewer });
+  // state: where you'd read up to (the app's "New" line), before opening it marks the thread read, and the channel's
+  // thread pings (threadMentions), which set its badge right whenever a thread is opened.
+  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)), hasMore, hasNewer,
+    state: USE ? USE.threadStateWithBadge(req.userId, root.id, c) : null });
 });
 
 // Where does a message live? Used by message links, search results and notifications.
@@ -2853,7 +2936,7 @@ function pinTarget(id, userId) {
     const c = requireChannel(m.channel_id, userId);
     const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
     if (s.kind !== 'group' && !canIn(s, c, userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission to pin messages here.');
-    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at };
+    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at, server: s, channel: c, authorId: m.author_id };
   }
   const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
   if (!dm) fail(404, 'Message not found.');
@@ -2869,6 +2952,7 @@ api.post('/messages/:id/pin', auth, (req, res) => {
     if (n >= MAX_PINS) fail(400, `This conversation already has ${MAX_PINS} pinned messages. Unpin one first.`);
   }
   if (t.channelId && USE && !t.pinned) USE.logPin(t.channelId, req.params.id, req.userId, 'pin');
+  if (t.channelId && !t.pinned) serverAudit(t.server, req.userId, 'message_pin', t.authorId, { channel: chanRef(t.server, t.channel) }, t.channelId);
   const at = now();
   db.prepare(`UPDATE ${t.table} SET pinned_at = ?, pinned_by = ? WHERE id = ?`).run(at, req.userId, req.params.id);
   (typeof t.room === 'object' && !Array.isArray(t.room) ? t.room : io.to(t.room)).emit('pin:update', { ...t.payload, pinnedAt: at, pinnedBy: req.userId });
@@ -2877,6 +2961,7 @@ api.post('/messages/:id/pin', auth, (req, res) => {
 api.delete('/messages/:id/pin', auth, (req, res) => {
   const t = pinTarget(req.params.id, req.userId);
   if (t.channelId && USE && t.pinned) USE.logPin(t.channelId, req.params.id, req.userId, 'unpin');
+  if (t.channelId && t.pinned) serverAudit(t.server, req.userId, 'message_unpin', t.authorId, { channel: chanRef(t.server, t.channel) }, t.channelId);
   db.prepare(`UPDATE ${t.table} SET pinned_at = NULL, pinned_by = NULL WHERE id = ?`).run(req.params.id);
   (typeof t.room === 'object' && !Array.isArray(t.room) ? t.room : io.to(t.room)).emit('pin:update', { ...t.payload, pinnedAt: null });
   res.json({ ok: true });
@@ -3051,6 +3136,7 @@ api.post('/servers/:id/media/:kind', auth, limited('image', uploadImage, 'file')
   if (req.params.kind === 'banner') { removeUpload(th.banner); th.banner = url; th.bannerCrop = null; }
   else { removeUpload(th.background && th.background.image); th.background = { ...(th.background || {}), kind: 'image', image: url, dim: (th.background && th.background.dim) || 0.3 }; }
   db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(th), s.id);
+  serverAudit(s, req.userId, 'server_update', null, { changes: [req.params.kind] });
   emitServer(s.id);
   res.json(serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(s.id), req.userId));
 });
@@ -3060,6 +3146,7 @@ api.delete('/servers/:id/media/:kind', auth, (req, res) => {
   if (req.params.kind === 'banner') { removeUpload(th.banner); th.banner = ''; }
   else if (req.params.kind === 'background') { removeUpload(th.background && th.background.image); th.background = { kind: 'none' }; }
   db.prepare('UPDATE servers SET theme = ? WHERE id = ?').run(JSON.stringify(th), s.id);
+  if (['banner', 'background'].includes(req.params.kind)) serverAudit(s, req.userId, 'server_update', null, { changes: [req.params.kind], removed: true });
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -3079,8 +3166,10 @@ api.post('/servers/:id/roles', auth, (req, res) => {
   const pos = Number.isFinite(myTop) ? Math.max(1, myTop) : maxPos + 1;
   db.prepare('UPDATE roles SET position = position + 1 WHERE server_id = ? AND position >= ? AND id != ?').run(s.id, pos, s.id);
   const id = newId();
+  const permissions = (parseInt(b.permissions, 10) || 0) & mine & ALL_PERMS;
   db.prepare('INSERT INTO roles (id, server_id, name, color, icon, position, permissions, hoist, mentionable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(id, s.id, name, cleanColor(b.color), cleanIcon(b.icon), pos, (parseInt(b.permissions, 10) || 0) & mine & ALL_PERMS, b.hoist ? 1 : 0, b.mentionable ? 1 : 0, now());
+    .run(id, s.id, name, cleanColor(b.color), cleanIcon(b.icon), pos, permissions, b.hoist ? 1 : 0, b.mentionable ? 1 : 0, now());
+  serverAudit(s, req.userId, 'role_create', id, { name, permissions });
   emitServer(s.id);
   res.json({ id });
 });
@@ -3105,9 +3194,17 @@ api.patch('/roles/:id', auth, (req, res) => {
   // Members can pick it themselves: never with moderator powers (server/selfroles.js says what else it takes).
   const selfAssign = everyone ? false : b.selfAssign !== undefined ? !!b.selfAssign : !!r.self_assign;
   SELF.checkEdit(s, r, req.userId, selfAssign, permissions);
+  const next = { name, color: everyone ? '' : b.color !== undefined ? cleanColor(b.color) : r.color, icon: everyone ? '' : b.icon !== undefined ? cleanIcon(b.icon) : r.icon,
+    hoist: everyone ? 0 : b.hoist !== undefined ? (b.hoist ? 1 : 0) : r.hoist, mentionable: everyone ? 0 : b.mentionable !== undefined ? (b.mentionable ? 1 : 0) : r.mentionable };
   db.prepare('UPDATE roles SET name = ?, color = ?, icon = ?, permissions = ?, hoist = ?, mentionable = ?, self_assign = ? WHERE id = ?').run(
-    name, everyone ? '' : b.color !== undefined ? cleanColor(b.color) : r.color, everyone ? '' : b.icon !== undefined ? cleanIcon(b.icon) : r.icon,
-    permissions, everyone ? 0 : b.hoist !== undefined ? (b.hoist ? 1 : 0) : r.hoist, everyone ? 0 : b.mentionable !== undefined ? (b.mentionable ? 1 : 0) : r.mentionable, selfAssign ? 1 : 0, r.id);
+    next.name, next.color, next.icon, permissions, next.hoist, next.mentionable, selfAssign ? 1 : 0, r.id);
+  // For the server's audit log: what changed, with the permissions given and taken away.
+  const changes = {};
+  for (const k of ['name', 'color', 'icon']) if (next[k] !== r[k]) changes[k] = { from: r[k], to: next[k] };
+  for (const k of ['hoist', 'mentionable']) if (!!next[k] !== !!r[k]) changes[k] = !!next[k];
+  if (selfAssign !== !!r.self_assign) changes.selfAssign = selfAssign;
+  if (permissions !== r.permissions) changes.permissions = { added: permissions & ~r.permissions, removed: r.permissions & ~permissions };
+  if (Object.keys(changes).length) serverAudit(s, req.userId, 'role_update', r.id, { name: next.name, changes });
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -3117,8 +3214,10 @@ api.delete('/roles/:id', auth, (req, res) => {
   // Paying members would silently lose what they pay for, and the membership would keep selling nothing.
   const tier = MEMB.tierForRole(r.id);
   if (tier) fail(409, `This role is sold as the "${tier.name}" membership. Give that membership another role, or stop selling it and wait for its members to end, first.`);
+  const holders = db.prepare('SELECT COUNT(*) AS n FROM member_roles WHERE role_id = ?').get(r.id).n;
   db.prepare('DELETE FROM roles WHERE id = ?').run(r.id);
   db.prepare("DELETE FROM channel_overrides WHERE target_type = 'role' AND target_id = ?").run(r.id);
+  serverAudit(s, req.userId, 'role_delete', r.id, { name: r.name, count: holders || undefined });
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -3132,7 +3231,9 @@ api.post('/servers/:id/roles/order', auth, (req, res) => {
   const slots = movable.map((r) => r.position).sort((a, b) => b - a);
   const order = ids.filter((id) => movable.some((r) => r.id === id));
   if (order.length !== movable.length) fail(400, 'Include every role you can move.');
-  db.transaction(() => order.forEach((id, i) => db.prepare('UPDATE roles SET position = ? WHERE id = ?').run(slots[i], id)))();
+  let moved = 0;
+  db.transaction(() => order.forEach((id, i) => { moved += db.prepare('UPDATE roles SET position = ? WHERE id = ? AND position != ?').run(slots[i], id, slots[i]).changes; }))();
+  if (moved) serverAudit(s, req.userId, 'role_reorder', null, { count: moved });
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -3197,6 +3298,16 @@ api.put('/channels/:id/overrides', auth, (req, res) => {
       fail(403, 'That would take permissions in this channel away from people at or above your highest role.');
     }
   })();
+  // The server's audit log: each override added, changed or removed, with what it allows and denies before and after.
+  const changedOv = [];
+  for (const k of new Set([...old.keys(), ...next.keys()])) {
+    const o = old.get(k) || { allow: 0, deny: 0 }; const n = next.get(k) || { allow: 0, deny: 0 };
+    if (o.allow === n.allow && o.deny === n.deny) continue;
+    const t = old.get(k) || next.get(k);
+    const name = t.type === 'role' ? (t.id === s.id ? '@everyone' : (db.prepare('SELECT name FROM roles WHERE id = ?').get(t.id) || {}).name || '') : '';
+    changedOv.push({ type: t.type, id: t.id, name, allow: n.allow, deny: n.deny, was: { allow: o.allow, deny: o.deny } });
+  }
+  if (changedOv.length) serverAudit(s, req.userId, 'channel_overrides', c.id, { channel: chanRef(s, c), changes: changedOv }, c.id);
   emitServer(s.id); // anyone who just lost access leaves the voice channel (recheckVoice)
   res.json({ ok: true });
 });
@@ -3222,12 +3333,23 @@ api.post('/servers/:id/bans', auth, wrap(async (req, res) => {
   if (isMember(s.id, uid) && perms.top(s, uid) >= perms.top(s, req.userId)) fail(403, 'You can only ban people whose highest role is below yours.');
   // The moderator toolkit waits while you're timed out (like posting does); a plain ban doesn't, as before.
   if (hours && perms.timedOut(s.id, req.userId)) fail(403, 'You\u2019re timed out in this server for now, so you can\u2019t delete their messages.', 'timed_out');
-  db.prepare('INSERT OR REPLACE INTO bans (server_id, user_id, banned_by, reason, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, uid, req.userId, String((req.body || {}).reason || '').slice(0, 300), now());
+  const reason = String((req.body || {}).reason || '').slice(0, 300);
+  db.prepare('INSERT OR REPLACE INTO bans (server_id, user_id, banned_by, reason, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, uid, req.userId, reason, now());
   // Invites a banned person made stop working too: they could have handed them to a new account.
-  db.prepare('DELETE FROM invites WHERE server_id = ? AND creator_id = ?').run(s.id, uid);
-  if (isMember(s.id, uid)) removeMember(s.id, uid);
+  const invites = db.prepare('DELETE FROM invites WHERE server_id = ? AND creator_id = ?').run(s.id, uid).changes;
+  const wasMember = isMember(s.id, uid);
+  if (wasMember) removeMember(s.id, uid);
   emitServer(s.id);
-  const out = hours ? await purgeRecentBy(s, uid, now() - hours * 3600000, req.userId) : { messages: 0, replies: 0, kept: 0 };
+  let out = { messages: 0, replies: 0, kept: 0 };
+  // One entry in the server's audit log for the ban and its cleanup, written once the cleanup is done (or failed).
+  let cleaned = !hours;
+  try {
+    if (hours) out = await purgeRecentBy(s, uid, now() - hours * 3600000, req.userId);
+    cleaned = true;
+  } finally {
+    serverAudit(s, req.userId, 'member_ban', uid, { reason: reason || undefined, hours: hours || undefined, count: hours ? out.messages : undefined,
+      replies: out.replies || undefined, kept: out.kept || undefined, invites: invites || undefined, member: wasMember ? undefined : false, failed: cleaned ? undefined : true });
+  }
   if (hours) {
     const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
     auditLog(req, 'ban_messages_deleted', uid, `${n(out.messages, 'message', 'messages')}${out.replies ? ` (and ${n(out.replies, 'thread reply', 'thread replies')} by others)` : ''}`
@@ -3237,7 +3359,9 @@ api.post('/servers/:id/bans', auth, wrap(async (req, res) => {
 }));
 api.delete('/servers/:id/bans/:uid', auth, (req, res) => {
   const s = requirePerm(req.params.id, req.userId, PM.BAN_MEMBERS, 'You need the Ban Members permission.');
-  db.prepare('DELETE FROM bans WHERE server_id = ? AND user_id = ?').run(s.id, req.params.uid);
+  rateLimit('ban:' + req.userId, 30, 60000); // the same allowance as banning: each one is an audit log entry
+  const ban = db.prepare('SELECT reason FROM bans WHERE server_id = ? AND user_id = ?').get(s.id, req.params.uid);
+  if (ban && db.prepare('DELETE FROM bans WHERE server_id = ? AND user_id = ?').run(s.id, req.params.uid).changes) serverAudit(s, req.userId, 'member_unban', req.params.uid);
   res.json({ ok: true });
 });
 
@@ -3285,6 +3409,7 @@ api.post('/servers/:id/voice/:uid/disconnect', auth, (req, res) => {
   if (!canIn(s, c, req.userId, PM.MOVE_MEMBERS)) fail(403, `You need the Move Members permission in #${c.name}.`);
   evictFromVoice(uid, c.id);
   leaveVoice(uid, true, 'moderator');
+  serverAudit(s, req.userId, 'voice_disconnect', uid, { channel: chanRef(s, c) }, c.id);
   auditLog(req, 'voice_disconnect', uid, `from #${c.name} in server "${s.name}" (${s.id})`);
   res.json({ ok: true });
 });
@@ -3302,6 +3427,7 @@ api.post('/servers/:id/voice/:uid/move', auth, (req, res) => {
   evictFromVoice(uid, c.id, to.id);
   leaveVoice(uid);
   io.to(socketId).emit('voice:moved', { channelId: c.id, to: to.id, serverId: s.id });
+  serverAudit(s, req.userId, 'voice_move', uid, { channel: chanRef(s, c), toChannel: chanRef(s, to) }, c.id);
   auditLog(req, 'voice_move', uid, `from #${c.name} to #${to.name} in server "${s.name}" (${s.id})`);
   res.json({ ok: true });
 });
@@ -3314,6 +3440,7 @@ function setVoiceMute(req, res, on) {
     ? db.prepare('INSERT OR IGNORE INTO voice_mutes (server_id, user_id, by_id, created_at) VALUES (?, ?, ?, ?)').run(s.id, uid, req.userId, now()).changes
     : db.prepare('DELETE FROM voice_mutes WHERE server_id = ? AND user_id = ?').run(s.id, uid).changes;
   if (changed) {
+    serverAudit(s, req.userId, on ? 'voice_mute' : 'voice_unmute', uid, c ? { channel: chanRef(s, c) } : {}, c ? c.id : null);
     auditLog(req, on ? 'voice_mute' : 'voice_unmute', uid, `in server "${s.name}" (${s.id})${c ? `, while in #${c.name}` : ''}`);
     emitServer(s.id); // recheckVoice tells their app and everyone in the call; moderators get the new list
   }
@@ -3346,6 +3473,7 @@ function addEmoji(s, name, url, animated, userId) {
   checkEmojiRoom(s, name);
   const id = newId();
   db.prepare('INSERT INTO emojis (id, server_id, name, url, animated, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, url, animated ? 1 : 0, userId, now());
+  serverAudit(s, userId, 'emoji_create', id, { name, animated: animated ? true : undefined });
   emitServer(s.id);
   return { id, name, animated: !!animated };
 }
@@ -3396,6 +3524,7 @@ api.patch('/emojis/:id', auth, (req, res) => {
   if (name.length < 2) fail(400, 'Emoji names need at least 2 characters.');
   if (db.prepare('SELECT 1 FROM emojis WHERE server_id = ? AND name = ? AND id != ?').get(e.server_id, name, e.id)) fail(409, 'That name is taken.');
   db.prepare('UPDATE emojis SET name = ? WHERE id = ?').run(name, e.id);
+  if (name !== e.name) serverAudit(e.server_id, req.userId, 'emoji_rename', e.id, { from: e.name, to: name });
   emitServer(e.server_id);
   res.json({ ok: true });
 });
@@ -3405,6 +3534,7 @@ api.delete('/emojis/:id', auth, (req, res) => {
   requirePerm(e.server_id, req.userId, PM.MANAGE_EMOJIS, 'You need the Manage Emoji permission.');
   db.prepare('DELETE FROM emojis WHERE id = ?').run(e.id);
   removeUpload(e.url);
+  serverAudit(e.server_id, req.userId, 'emoji_delete', e.id, { name: e.name });
   emitServer(e.server_id);
   res.json({ ok: true });
 });
@@ -4359,6 +4489,7 @@ api.post('/reports', auth, (req, res) => {
   let targetId = String(b.targetId || '');
   const context = { kind: ctx.kind === 'message' ? 'message' : 'user' };
   const evidence = [];
+  let inServer = null; // the server whose moderators can see it too (server/serveraudit.js), if any
   if (context.kind === 'message') {
     const id = String(ctx.messageId || '');
     const cm = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
@@ -4371,6 +4502,7 @@ api.post('/reports', auth, (req, res) => {
       Object.assign(context, { messageId: id, channelId: c.id, channelName: c.name, serverId: srv.id, serverName: srv.kind === 'group' ? 'Group DM' : srv.name });
       inConvo = (mid) => db.prepare('SELECT author_id, created_at FROM messages WHERE id = ? AND channel_id = ?').get(mid, c.id);
       targetId = cm.author_id;
+      if (srv.kind !== 'group') inServer = srv;
     } else {
       const d = requireDm(dm.dm_id, req.userId);
       Object.assign(context, { messageId: id, dmId: d.id });
@@ -4385,6 +4517,14 @@ api.post('/reports', auth, (req, res) => {
     if (!evidence.some((e) => e.reported)) fail(400, 'Include the reported message.');
   }
   if (!getUserRow(targetId) || targetId === req.userId) fail(400, 'You can\u2019t report that account.');
+  // A member reported from inside a server (their profile there): that server, if both of them are in it. Anything
+  // else is ignored rather than refused, so this can't be used to find out who is in which server.
+  if (context.kind === 'user' && ctx.serverId !== undefined) {
+    const ms = SA.memberServer(ctx.serverId, req.userId, targetId);
+    if (ms) { inServer = ms; Object.assign(context, { serverId: ms.id, serverName: ms.name }); }
+  }
+  // The server's moderators see it too, unless the reporter unticked that (or it's for instance staff alone).
+  const toServer = inServer && SA.shares(category, b.toServer === false) ? inServer.id : null;
   // Reporting the same message again while staff haven't closed the first report adds nothing: the first one stands.
   if (context.messageId) {
     const dup = db.prepare(`SELECT id FROM reports WHERE reporter_id = ? AND status IN ('open','reviewing') AND json_valid(context)
@@ -4394,10 +4534,12 @@ api.post('/reports', auth, (req, res) => {
   const target = getUserRow(targetId);
   const ips = [...new Set([target.last_ip, ...ipsOf(targetId).map((x) => x.ip)].filter(Boolean))].slice(0, 20);
   const id = newId();
-  db.prepare(`INSERT INTO reports (id, reporter_id, target_id, category, details, context, evidence, target_ips, reporter_ip, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, req.userId, targetId, category, String(b.details || '').slice(0, 2000), JSON.stringify(context), JSON.stringify(evidence), JSON.stringify(ips), cleanIp(req.ip), now());
+  db.prepare(`INSERT INTO reports (id, reporter_id, target_id, category, details, context, evidence, target_ips, reporter_ip, created_at, server_id, server_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, req.userId, targetId, category, String(b.details || '').slice(0, 2000), JSON.stringify(context), JSON.stringify(evidence), JSON.stringify(ips), cleanIp(req.ip), now(),
+    toServer, toServer ? 'open' : null);
   io.to('admins').emit('admin:report', { id, category });
-  res.json({ ok: true, id });
+  if (toServer) SA.reportChanged(toServer, id, true);
+  res.json({ ok: true, id, toServer: !!toServer });
 });
 
 // ---------------------------------------------------------------- admin API (instance administrators only)
@@ -4569,6 +4711,8 @@ api.get('/admin/reports', auth, staffOnly, (req, res) => {
     targetIps: JSON.parse(r.target_ips || '[]'), context: JSON.parse(r.context || '{}'),
     evidence: JSON.parse(r.evidence || '[]').map((e) => ({ ...e, author: brief(e.authorId) })),
     priorReports: db.prepare('SELECT COUNT(*) n FROM reports WHERE target_id = ? AND id != ?').get(r.target_id, r.id).n,
+    // Also sent to that server's moderators (server/serveraudit.js), and where they are with it: while the server exists.
+    serverInbox: r.server_id && r.server_status && db.prepare('SELECT 1 FROM servers WHERE id = ?').get(r.server_id) ? { serverId: r.server_id, status: r.server_status, handledBy: brief(r.server_handled_by), handledAt: r.server_handled_at, note: r.server_note || '' } : null,
   })));
 });
 // Staff can't close (or reopen) reports about themselves or about staff at their level or above: those are for
@@ -4608,6 +4752,7 @@ api.delete('/admin/messages/:id', auth, staffOnly, (req, res) => {
     const above = db.prepare('SELECT DISTINCT author_id FROM messages WHERE thread_id = ?').all(m.id).map((x) => x.author_id).find((a) => !outranks(a));
     if (above) fail(403, `This thread has replies by ${staffRole(above) === 'owner' ? 'the owner' : 'staff at your level or above'}, so someone ranked above them has to remove it.`);
     deleteMessageTree(m.id);
+    if (c && !group) { const srv = serverOf(c); serverAudit(srv, null, 'message_delete', m.author_id, { channel: chanRef(srv, c), thread: m.thread_id ? true : undefined, staff: true }, c.id); }
     if (c) toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
     if (c) BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
   } else {
@@ -4747,6 +4892,8 @@ api.post('/admin/servers/:id/transfer', auth, adminOnly, (req, res) => {
   if (!isMember(srv.id, row.id)) fail(400, `${row.username} isn\u2019t a member of ${srv.name}.`);
   db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(row.id, srv.id);
   db.prepare('DELETE FROM voice_mutes WHERE server_id = ? AND user_id = ?').run(srv.id, row.id); // as in POST /servers/:id/transfer
+  // In the server's own log as done by the instance's staff, without saying which of them (that's in admin_log).
+  serverAudit(srv, null, 'server_transfer', row.id, { from: srv.owner_id, staff: true });
   emitServer(srv.id);
   adminLog(req, 'server_transferred', srv.id, `${srv.name} \u2192 ${row.username}`);
   res.json({ ok: true });
@@ -5243,7 +5390,7 @@ const MONEY = require('./money')({ api, auth, db, fail, wrap, rateLimit, getSett
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), onChange: () => io && io.emit('config:update', { funding: fundingPublic(), support: MONEY.available() }) });
 // Creator memberships (server/memberships.js): server owners sell monthly tiers that give a role.
 const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
-  isMember, emitServer, seal, unseal, newId, brief, PM, auditLog, stepUp, sealSecret, openSecret, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
+  isMember, emitServer, seal, unseal, newId, brief, PM, auditLog, serverAudit, stepUp, sealSecret, openSecret, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data),
   mailPublicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''); } });
 // Resumable uploads, storage reports and orphan cleanup (server/storage.js).
 STORE = require('./storage')({ api, auth, db, fail, wrap, rateLimit, limitNet, HttpError, quotaOf, overLimit, uploadLimits, fmtMb, MB, getUserRow,
@@ -5251,19 +5398,21 @@ STORE = require('./storage')({ api, auth, db, fail, wrap, rateLimit, limitNet, H
 // Message search (server/search.js): filters by where, who and when; the search words stay in the app.
 require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
 // Bots and integrations (server/bots.js): installs, scopes, the bot API, signed webhooks, slash commands.
-BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, checkWords,
+BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, serverAudit, checkWords,
   perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
   getIo: () => io, features, isStaff, isInstanceAdmin, maintenance, newsBot: NEWS_BOT_ID });
 // Incoming webhooks (server/webhooks.js): Discord- and Slack-style addresses per channel, posting as a bot.
-require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
+require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
   getIo: () => io, maintenance, ipBanned, bannedMsg: BANNED_MSG, stillSuspended, botPost: BOTS.botPost, notifyChannelMessage, cleanIp });
 // Saved messages, read state, notification preferences, pin history, timeouts, data export (server/usability.js).
-USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
+USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, serverAudit, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
   requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf });
 // Roles members can pick themselves (server/selfroles.js).
 SELF = require('./selfroles')({ api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL: ALL_PERMS, CHANNEL_SCOPED, MEMB,
-  emitServer: (sid) => io && emitServer(sid), recheckVoice });
+  emitServer: (sid) => io && emitServer(sid), recheckVoice, serverAudit });
+// Each server's own audit log and its moderators' report inbox (server/serveraudit.js).
+SA = require('./serveraudit')({ api, auth, db, fail, rateLimit, perms, PM, ALL: ALL_PERMS, requireServer, isMember, getIo: () => io, keptSql: serverAuditKeptSql });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();
@@ -5813,6 +5962,9 @@ function setupSockets(server) {
         cb({ error: e.message || 'Error' });
       }
     };
+
+    // An open Audit log tab (Server settings) hears about new entries, while its reader may still read them.
+    socket.on('audit:watch', guard((p = {}) => SA.watch(socket, p)));
 
     // "Is typing…" goes only where the person could actually send: not in channels where they can't post,
     // and never to someone who blocked them (or whom they blocked).
