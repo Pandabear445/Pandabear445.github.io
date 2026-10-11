@@ -3241,6 +3241,9 @@ async function loadMessages(key, mode = 'latest') {
     const fresh = res.messages.filter((m) => !known.has(m.id));
     store.list = [...store.list, ...fresh].sort((a, b) => (a.id < b.id ? -1 : 1));
     if (mode !== 'newer') store.hasMore = res.hasMore;
+    // The page that reaches the start says whether the server left older messages out for you (joined a server where
+    // new members can't read back).
+    if (mode !== 'newer' && !res.hasMore) store.hidden = !!res.hidden;
     if (mode !== 'older') store.hasNewer = !!res.hasNewer;
     store.loaded = true;
     const newLines = mergeTimerEvents(store, res.timerEvents);
@@ -3315,7 +3318,7 @@ function prependOlder(sc, store, fresh) {
   // A timer line kept from before (a trimmed page) that now falls among these: a full redraw puts it in its place.
   if (firstMsg && older.length && store.events && [...store.events.values()].some((e) => e.at <= firstMsg.createdAt && (!store.hasMore || e.at >= older[0].createdAt))) return false;
   const frag = document.createDocumentFragment();
-  if (!store.hasMore) frag.append(welcomeBlock());
+  if (!store.hasMore) frag.append(...historyStart(store));
   let prev = null;
   for (const m of older) {
     if (!prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()) {
@@ -3528,7 +3531,7 @@ function renderMessages(stick) {
     sc.append(h('div', { class: 'msg-skeleton', 'aria-label': 'Loading messages' }, [1, 2, 3, 4].map(() => h('div', { class: 'sk-row' }, h('span', { class: 'sk-av' }), h('span', { class: 'sk-lines' }, h('i'), h('i'))))));
     return;
   }
-  if (!store.hasMore) sc.append(welcomeBlock());
+  if (!store.hasMore) sc.append(...historyStart(store));
   const lastRead = S.unreadMarker === key ? S.markerId : null;
   let newShown = false;
   let prev = null; // the message above, for grouping (anything drawn in between breaks the group)
@@ -3588,6 +3591,12 @@ async function jumpToFirstUnread() {
   if (!loadedFrom || loadedFrom > S.markerId) await loadMessages(key, { around: S.markerId });
   const div = $('#new-div');
   if (div) div.scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+}
+// The top of a conversation once its first message is loaded: the welcome, and in a server that keeps what came before
+// from new members, one line saying so when the server left messages out for you (store.hidden), instead of a row
+// per message you could never open.
+function historyStart(store) {
+  return [welcomeBlock(), store && store.hidden ? h('div', { class: 'sys-line history-hidden', role: 'note' }, icon('lock'), h('span', null, 'Messages from before you joined are hidden in this server')) : null].filter(Boolean);
 }
 function welcomeBlock() {
   if (S.view.type === 'dm') {
@@ -3832,7 +3841,8 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text, blur = n
   } else if (m.replyTo || (bind && bind.notes.includes('replyGone'))) {
     // Also when its sender replied to a message that was gone by the time it was posted (the server rightly leaves
     // the reply out then): no flag for that, unless the server can still find the original (bindingOfMessage).
-    el.append(h('div', { class: 'msg-reply gone' }, h('span', { class: 'reply-spine' }), 'Original message is no longer available'));
+    // replyHidden: the server left out a quote from before you joined (new members can't read back in this server).
+    el.append(h('div', { class: 'msg-reply gone' }, h('span', { class: 'reply-spine' }), m.replyHidden ? 'Replying to a message from before you joined' : 'Original message is no longer available'));
   }
   const gutter = h('div', { class: 'msg-gutter', dataset: { time: fmtTime(m.createdAt) } });
   if (isGrouped) gutter.append(h('time', { class: 'msg-hover-time', datetime: new Date(m.createdAt).toISOString() }, fmtTime(m.createdAt)));
@@ -6050,6 +6060,12 @@ function keyNotice() {
   }
   const st = sec.stateOf(S.view.serverId);
   if (!st || sec.currentKey(S.view.serverId) || st.needsRotation || !st.keyEpoch) return null;
+  // Joined a server where new members can't read what came before (since: where your history starts): the key you
+  // get is the next one, which the members' apps make for you; nobody can share you the current one.
+  if (st.since && st.since.epoch > st.keyEpoch) {
+    return h('div', { class: 'key-bar' }, h('span', { class: 'spinner' }),
+      h('span', null, 'Your encryption key is on its way. This server gives new members a fresh key, which can take a few minutes.'));
+  }
   return h('div', { class: 'key-bar' }, h('span', { class: 'spinner' }),
     h('span', null, 'Waiting for another member to come online and share this conversation\u2019s encryption key with you.'));
 }
@@ -7117,9 +7133,13 @@ async function openGetVerified() {
 function openServerSecurity(server) {
   if (!server) return;
   const st = sec.stateOf(server.id) || { keyEpoch: 0, missing: [] };
-  const holders = server.memberIds.length - (st.missing || []).length - (st.held || []).length;
-  const waiting = server.memberIds.filter((id) => sec.heldBack(server.id, id)).map(getUser);
-  const changed = server.memberIds.map(getUser).filter((u) => sec.keyChanged(u) && !waiting.some((w) => w.id === u.id));
+  // held: members waiting to be verified (crypto-2). newcomers: new members who get the next key, not this one (the
+  // server hides older messages from new members); someone held is named as held only.
+  const held = server.memberIds.filter((id) => sec.heldBack(server.id, id)).map(getUser);
+  const newcomers = (st.waiting || []).filter((id) => server.memberIds.includes(id) && !held.some((u) => u.id === id));
+  const without = new Set([...(st.missing || []), ...(st.held || []), ...(st.waiting || [])].filter((id) => server.memberIds.includes(id)));
+  const holders = server.memberIds.length - without.size;
+  const changed = server.memberIds.map(getUser).filter((u) => sec.keyChanged(u) && !held.some((w) => w.id === u.id));
   const label = isGroup(server) ? 'this group' : server.name;
   modal({
     title: 'End-to-end encryption',
@@ -7130,8 +7150,9 @@ function openServerSecurity(server) {
       h('div', { class: 'kv' }, h('span', null, 'Key version'), h('strong', null, st.keyEpoch ? `#${st.keyEpoch}` : 'Not set up yet')),
       st.keyCreatorId ? h('div', { class: 'kv' }, h('span', null, 'Made by'), h('strong', null, `${nameInServer(server, getUser(st.keyCreatorId))}${st.keyCreatedAt ? `, ${new Date(st.keyCreatedAt).toLocaleString()}` : ''}`)) : null,
       h('div', { class: 'kv' }, h('span', null, 'Members with the current key'), h('strong', null, `${Math.max(0, holders)} of ${server.memberIds.length}`)),
+      newcomers.length ? h('p', { class: 'field-hint' }, `${newcomers.length === 1 ? 'One new member gets' : `${newcomers.length} new members get`} the next key instead: this server hides messages from before someone joined, so the apps make a new key for them shortly.`) : null,
       changed.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `Security key changed for ${changed.map(displayName).join(', ')}. Verify them from their profile before the key can be shared.`)) : null,
-      waiting.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `${waiting.map(displayName).join(', ')} reset ${waiting.length === 1 ? 'their password' : 'their passwords'} without a recovery key. Nobody\u2019s app shares this key with them until a member here who knew them before verifies them (their profile \u2192 Verify encryption).`)) : null,
+      held.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `${held.map(displayName).join(', ')} reset ${held.length === 1 ? 'their password' : 'their passwords'} without a recovery key. Nobody\u2019s app shares this key with them until a member here who knew them before verifies them (their profile \u2192 Verify encryption).`)) : null,
       sec.isHeld(server.id, S.me.id) ? h('p', { class: 'key-bar' }, icon('shield'), h('span', null, 'You reset your password without your recovery key: someone here who knew you before has to verify you before you get this key.'), h('button', { class: 'btn sm ghost', onclick: () => openGetVerified() }, 'Get verified')) : null,
       h('p', { class: 'field-hint' }, 'To make sure nobody is impersonating a member, compare safety numbers with them from their profile (\u22ef \u2192 Verify encryption).')),
     actions: [
@@ -7475,6 +7496,17 @@ function openServerSettings(server, startTab = 'overview') {
         h('button', { class: 'btn ghost sm', onclick: () => pickFile((f) => run(() => upload2(`/servers/${s.id}/media/banner`, f), 'Banner updated.')) }, th.banner ? 'Change banner' : 'Upload banner'),
         th.banner ? h('button', { class: 'btn ghost sm', onclick: () => openCropper({ src: th.banner, kind: 'banner', crop: th.bannerCrop, onSave: (crop) => run(() => api('PATCH', `/servers/${s.id}`, { theme: { bannerCrop: crop } }), 'Banner position saved.') }) }, 'Adjust') : null,
         th.banner ? h('button', { class: 'btn ghost sm', onclick: () => run(() => api('DELETE', `/servers/${s.id}/media/banner`)) }, 'Remove') : null));
+    // "New members can't read messages from before they joined" (server/joinhistory.js). Group chats don't have it.
+    if (isGroup(s)) return;
+    add(body, h('h3', null, 'Privacy'),
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'New members can’t read messages from before they joined'),
+        h('span', { class: 'field-hint' }, 'Each time someone joins, everyone’s apps switch to a new encryption key, and the newcomer only gets keys from then on. People already here keep everything. Turning this on switches keys once right away.')),
+      h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!s.hideHistory, onchange: (e) => {
+        const box = e.target;
+        // Refused (say, changed too often): the switch goes back to what the server has.
+        run(() => api('PATCH', `/servers/${s.id}`, { hideHistory: box.checked }), box.checked ? 'New members will only see messages from after they join.' : 'New members can read earlier messages again.')
+          .then(() => { box.checked = !!live().hideHistory; });
+      } }), h('span', { class: 'switch-track' }))));
   }
 
   function appearance(s) {

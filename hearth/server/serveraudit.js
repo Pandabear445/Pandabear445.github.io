@@ -107,7 +107,7 @@ function trim(d) {
 
 module.exports = function setupServerAudit(ctx) {
   // keptSql: db.js's serverAuditKeptSql, the moderation kinds the 50,000 ceiling leaves alone.
-  const { api, auth, db, fail, rateLimit, perms, PM, ALL, requireServer, isMember, getIo, keptSql } = ctx;
+  const { api, auth, db, fail, rateLimit, perms, PM, ALL, requireServer, isMember, getIo, keptSql, history = null } = ctx;
   const MOD = PM.MANAGE_MESSAGES | PM.KICK_MEMBERS | PM.BAN_MEMBERS;
   const serverRow = (id) => db.prepare('SELECT * FROM servers WHERE id = ?').get(id);
   const int = (v, what) => {
@@ -369,15 +369,27 @@ module.exports = function setupServerAudit(ctx) {
     }
     return s;
   }
+  // Whether a moderator whose history in the server starts at `since` (they joined with "New members can't read
+  // messages from before they joined" on, server/joinhistory.js) may see a shared message: by the same rules as the
+  // channel itself, or by when it was written once it's been deleted.
+  function evidenceSeen(e, since) {
+    if (!since || !history) return true;
+    const m = db.prepare('SELECT created_at, ciphertext IS NOT NULL AS ciphertext, epoch, thread_id FROM messages WHERE id = ?').get(String(e.id || ''));
+    return m ? history.visible(m, since) : Number(e.createdAt) >= since.at;
+  }
   // A report as a moderator sees it: never who reported it, their address or other reports. Of the messages shared,
-  // only the reported person's own: leaving out just the reporter's would point at them by what's missing.
-  function reportOut(r, userIds) {
+  // only the reported person's own: leaving out just the reporter's would point at them by what's missing. The
+  // reporter's app decrypted those, so a moderator whose history in the server starts later doesn't get the ones
+  // from before (evidenceHidden: how many); the report itself is theirs to handle as usual.
+  function reportOut(r, userIds, since = null) {
     const cx = contextOf(r);
     let evidence = [];
     try { evidence = JSON.parse(r.evidence || '[]'); } catch { /* none */ }
     if (!Array.isArray(evidence)) evidence = [];
-    evidence = evidence.filter((e) => e && e.authorId === r.target_id && e.authorId !== r.reporter_id)
-      .map((e) => ({ id: e.id, authorId: e.authorId, createdAt: e.createdAt, text: e.text, files: e.files, reported: !!e.reported }));
+    evidence = evidence.filter((e) => e && e.authorId === r.target_id && e.authorId !== r.reporter_id);
+    const shown = evidence.filter((e) => evidenceSeen(e, since));
+    const evidenceHidden = evidence.length - shown.length;
+    evidence = shown.map((e) => ({ id: e.id, authorId: e.authorId, createdAt: e.createdAt, text: e.text, files: e.files, reported: !!e.reported }));
     [r.target_id, r.server_handled_by, ...evidence.map((e) => e.authorId)].forEach((x) => x && userIds.add(x));
     return {
       id: r.id, category: r.category, details: r.details, createdAt: r.created_at, targetId: r.target_id,
@@ -386,6 +398,7 @@ module.exports = function setupServerAudit(ctx) {
       staffStatus: r.status,
       context: { kind: cx.kind || 'user', messageId: cx.messageId || null, channelId: cx.channelId || null, channelName: cx.channelName || null },
       evidence,
+      ...(evidenceHidden ? { evidenceHidden } : {}),
     };
   }
   const STATUSES = { open: ['open'], handled: ['handled'], dismissed: ['dismissed'], all: ['open', 'handled', 'dismissed'] };
@@ -401,9 +414,10 @@ module.exports = function setupServerAudit(ctx) {
     const shown = [];
     let next = null;
     const ev = perms.forServer(s, [req.userId]); // their permissions read once for the whole list
+    const since = history ? history.startOf(s.id, req.userId) : null;
     for (const r of rows) {
       if (shown.length === 50) { next = shown[shown.length - 1].createdAt; break; }
-      if (seesReport(s, req.userId, r, ev)) shown.push(reportOut(r, userIds));
+      if (seesReport(s, req.userId, r, ev)) shown.push(reportOut(r, userIds, since));
     }
     if (!next && rows.length === 200) next = rows[rows.length - 1].created_at;
     // How many open ones this person can act on (the tab's badge), from the newest 500.

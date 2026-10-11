@@ -390,7 +390,7 @@ module.exports = function setupScheduled(ctx) {
     let threadId = null;
     if (b.threadId) {
       if (!(cp & PM.CREATE_THREADS)) fail(403, 'You don’t have permission to reply in threads here.');
-      threadId = threadRootIn(c, b.threadId);
+      threadId = threadRootIn(c, b.threadId, req.userId);
       if (!threadId) fail(404, 'That thread no longer exists.');
     }
     const epoch = requireCurrentEpoch(c.server_id, b.epoch);

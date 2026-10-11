@@ -1376,3 +1376,118 @@ Every member's copy of a server carries `wordFilter` (`{ words, action, updatedA
   server).
 - Your list is sealed with your identity key: if a password reset makes a new identity, the old list can't be opened
   and the next save starts a new one (the settings page says so).
+
+## New members can't read messages from before they joined
+
+A server setting (`servers.hide_history`, v19), in **Server settings → Overview → Privacy**: the option
+ENGINEERING-REPORT crypto-13 left open. Rules and the key handling are in `server/joinhistory.js`; the routes it
+touches are in `server/index.js`, `server/usability.js`, `server/search.js`, `server/bots.js`, `server/disappear.js`,
+`server/scheduled.js` and `server/serveraudit.js` (report evidence); the app's side is the Overview switch,
+`historyStart`, the key bar and the encryption dialog's count in `public/js/app.js`, the waiting message in
+`public/js/secure.js` and Settings → Check my encryption (`public/js/settings.js`), and the audit sentence and the
+report note in `public/js/serveraudit.js`.
+
+**Off by default**, for new and existing servers: with it on, every join replaces the key for every member's app and
+newcomers wait a moment for theirs, and many communities want newcomers to read back (Discord's default too).
+
+**With it on**
+
+1. A join (an invite: the only way into a server) records where the newcomer's history starts: `members.key_from`
+   (the next key epoch) and `joined_at`. Members who were in before, and people who joined while it was off, have
+   none and see everything. Leaving drops it with the membership row; coming back starts again from then.
+2. The key needs replacing (`needs_rotation`, as after a kick), so the apps make a new one, wrapped to everyone in
+   the server, before the next message goes out (sends return 409 `rotate` until then). Joins close together share
+   it, and a flood can't keep everyone switching keys: a join waits until the current key is a minute old for each
+   key made in the last hour (at least one). Meanwhile `servers.join_rotate_at` holds the time (a restart keeps it),
+   messages keep flowing under the old key and the newcomer's app says "Your encryption key is on its way". Any key
+   made meanwhile, for whatever reason, covers them. A rejoin (same account) still replaces the key at once.
+3. The newcomer is only ever handed keys from `key_from` on: the key state (`GET /servers/:id/keys`, `/bootstrap`,
+   `server:add`, `keys:state`) carries only those rows, plus `since: { at, epoch }`; `missing` leaves out members
+   waiting for a newer key (so no app tries to share it; they're listed in `waiting`, so the encryption dialog counts
+   who holds the current key right) and `keys/share` skips them; `keys/self` doesn't touch their older rows (an
+   earlier membership's). The key their join asked for is made by an older member's app: while one is online, the
+   newcomer's own `keys/rotate` counts as a voluntary one (10 minutes, 12 an hour), so nobody can join just to put in
+   a key the others can't open. A newcomer alone in the server makes it themselves. A member held back until someone
+   verifies them (a reset without the recovery key, `crypto-2`) gets no key either way: the key a join asks for is
+   wrapped for everyone else, `keys/share` skips them, they don't count as an older member who could make it, and
+   once verified they're handed keys from their own `key_from` on, like any newcomer.
+4. Nothing from before is served to them. "Before" means written before `joined_at`, or locked with an epoch below
+   `key_from` (the few messages sent while their key was on its way, which they could never open):
+   - channel and voice-chat pages (`GET /channels/:id/messages`, every paging mode), with `hidden: true` on the page
+     that reaches the start when something was left out; the app then shows one line, *Messages from before you
+     joined are hidden in this server*, under the channel's welcome, instead of rows of locked messages;
+   - threads (`GET /messages/:id/thread` is 404 for an older first message; the Threads panel leaves those out),
+     pins and the pin history, search (every scope), saved messages (one saved during an earlier membership shows as
+     unavailable), the data export, unread and ping counts (a channel's thread pings too), jumps
+     (`/messages/:id/locate`), and acting on an older message unseen (react, pin, edit your own, vote, report it or
+     attach it as evidence: 404);
+   - a thread started before stays closed, replies written after the join included: every path above goes by the
+     thread's first message as well as the reply (search, locate, saving, reacting, pins, export, the thread's read
+     marker `POST /me/read { conv: 't:<root>' }`, thread pings), and replying into it (now or scheduled) is 404 like
+     a thread that doesn't exist;
+   - disappearing-timer changes from before they joined (`timerEvents` on history pages, the log in
+     `GET /channels/:id/disappearing`);
+   - as a moderator later on, the evidence of a report filed about a message from before: the report is in their
+     inbox to handle as usual, with `evidenceHidden: <count>` instead of those messages (the app says "from before you
+     joined, so it isn't shown"), since the reporter's app decrypted them;
+   - a reply's quote of an older message: `reply: null` with `replyHidden: true` ("Replying to a message from before
+     you joined");
+   - live events: a new message under a key from before theirs, edits, reactions, pins, poll updates and thread
+     counts of older messages (after a reply is deleted, bulk-deleted or disappears too), and replies in an older
+     thread don't reach them; pushes and mention marks skip them too. Link previews travel inside messages, so they
+     go with them; scheduled messages are only ever their author's own.
+5. Turning it on replaces the key once, so what's been said so far is under a key that's never handed out again
+   (only the current key ever is). Turning it off lets later joiners read back as before; whoever joined while it was
+   on keeps their start (they never got those keys). Each change is a `server_update` entry with
+   `changes: ['hideHistory']` and `hideHistory: true|false` in the server's audit log ("Ana turned on “New members
+   can't read messages from before they joined”"), at most 10 changes an hour per person in each server (one budget
+   for the whole server could be used up by one manager, ending on off, so that nobody could turn it back on).
+
+**Group chats** don't have it (400): anyone in a group can add people, and groups have no server settings.
+
+| Route | Who | What |
+|---|---|---|
+| `PATCH /servers/:id { hideHistory: true\|false }` | Manage Server | turns it on or off; on sets `needs_rotation`; not for group chats; anything but a boolean is 400; 10 changes an hour per person in each server (429) |
+
+The server's copy of a server carries `hideHistory`; the key state carries `since` for the members it applies to, and
+`waiting` (who's waiting for the next key) while anyone is.
+
+**Tests**
+
+- `test/join-history.test.js` (18 tests): the setting (off by default, Manage Server only, outsiders and group chats
+  refused, the audit log both ways, no entry for no change, the hourly limit, a key switch on turning it on and none
+  on turning it off; a co-manager using up their own changes and leaving it off doesn't stop the owner turning it
+  back on); keys with it on (only the epoch after the join, the current one never shared, not listed as
+  missing) and off (shared, history readable as before); a rejoin (no old rows handed back or rewritable, their own
+  older messages hidden and not editable); a join flood (the first join switches at once, the rest share one wait of
+  a gap per key made in the last hour, nothing under the old key reaches or is served to the waiting member, unread
+  counts too, a key made meanwhile cancels the wait); a wait that survives a restart; every way history is served
+  (pages and paging modes, threads and the Threads panel, pins and pin history, search in every scope, locate,
+  saving, reactions, polls, reports and evidence, export, unread counts, quotes); a message saved during an earlier
+  membership; voice channel chats and turning it off again; live events (edits, reactions, pins, thread replies and
+  counts of older messages skip the newcomer; a reply to an older message arrives without its quote); members
+  already in keep everything; a thread from before (a reply written after the join isn't found by search in any
+  scope, located, saved, reacted to, pinned for them, quoted, exported or read-marked, its @everyone ping doesn't
+  count, live reactions and thread counts after a bulk delete skip them, and nothing can be posted or scheduled into
+  it); the newcomer's own key change refused while an older member is online, allowed alone; report evidence for a
+  moderator who joined later; timer changes, the pin history of a message sent during the key wait, and `waiting` in
+  the key state; and the app's own key code (`secure.js`): the newcomer's device holds only the new key, reads what
+  came after with no locked rows, and an older member's device keeps both keys.
+- Browser flow (`npm run test:e2e`, "join history"): Dana leaves the server; Bob turns it on (the audit log says so)
+  and writes in #general and the Lounge's chat; Dana joins again with an invite and sees the one line, no earlier
+  messages and no locked rows, in #general and in the Lounge's chat; what's said after goes both ways; Alice, there
+  all along, sees everything; Bob turns it off again. (The flows' sign-ups from one network are used up by then, so a
+  first-time joiner is left to the server tests.)
+
+**Known limitations**
+
+- It's the server that decides when keys change and who is handed which (SECURITY.md §4, crypto-5): a malicious
+  server could skip the key change or list a newcomer as missing the current key. It keeps history from newcomers on
+  an honest server, like private channels.
+- Messages sent while a newcomer's key is on its way (only when joins come faster than the limit) stay hidden from
+  them for good, though they were written after they joined.
+- A thread whose first message is from before stays closed to the newcomer, replies written after they joined
+  included.
+- Deletions are announced to everyone who can see the channel (`message:delete`, `message:delete-bulk`), older
+  messages included: the event carries ids only, nothing the newcomer could open, and their app has nothing to
+  remove.

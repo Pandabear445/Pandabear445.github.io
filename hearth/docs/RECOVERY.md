@@ -167,9 +167,10 @@ epoch) and gives it to everyone still there.
     they saved, or ciphertext they got some other way.
 - **Messages after the removal** use the new key, which nobody wrapped for them. They can't read those, even with
   a copy of the database.
-- **Joining is not a key change.** A new member gets the **current** key. They can read what was said in the
-  current key period, including before they joined, but not older periods. To keep a new member out of recent
-  history, replace the key before inviting them.
+- **Joining is not a key change** (by default). A new member gets the **current** key. They can read what was said
+  in the current key period, including before they joined, but not older periods. To keep new members out of recent
+  history, turn on **New members can't read messages from before they joined** (Server settings → Overview →
+  Privacy): every join then makes a new key first, and nothing from before is shown to them.
 - **Coming back after being removed** always makes a new key first, so they can't read what was said while they
   were away.
 - A password reset without a recovery key works like a fresh join for that person, once a member there who knew

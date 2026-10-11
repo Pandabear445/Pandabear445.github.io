@@ -56,7 +56,8 @@ const arm = (at) => { if (current && at != null) current.arm(at); };
 
 module.exports = function setupDisappear(ctx) {
   const { api, auth, db, fail, rateLimit, newId, now, requireChannel, requireDm, requireManageableChannel, serverOf, isBlocked, getUserRow,
-    toChannel, getIo, emitTo, removeUpload, unseal, threadInfo, groupLast, bots, serverAudit = () => {}, chanRef = () => null } = ctx;
+    toChannel, getIo, emitTo, removeUpload, unseal, threadInfo, groupLast, bots, serverAudit = () => {}, chanRef = () => null,
+    toChannelAbout = (c) => toChannel(c), visibilityOf = () => null, historyStart = () => null } = ctx;
 
   // ---------------------------------------------------------------- the timer
   function parseTimer(v) {
@@ -74,16 +75,18 @@ module.exports = function setupDisappear(ctx) {
   }
 
   const logOut = (r) => ({ id: r.id, by: r.user_id, secs: r.secs, prev: r.prev_secs, at: r.created_at });
-  function recentLog(conv, n = 20) {
-    return db.prepare('SELECT * FROM disappear_log WHERE conv = ? ORDER BY created_at DESC, id DESC LIMIT ?').all(conv, n).map(logOut);
+  // from: the reader's history start in the server (server/joinhistory.js), when they joined with "New members can't
+  // read messages from before they joined" on: changes from before then are part of that history.
+  function recentLog(conv, n = 20, from = 0) {
+    return db.prepare('SELECT * FROM disappear_log WHERE conv = ? AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?').all(conv, from || 0, n).map(logOut);
   }
   // The timer changes that fall inside one page of history: from the page's first message (or the start, when
   // there's nothing older) up to its last (or now, when there's nothing newer). The apps show them between the
   // messages, by time. before: the ?before= id the page was asked with (it ends there). afterAt: for an ?after= page,
   // when its anchor message was sent (it starts there, not at its own first message, or a change made between the
-  // two pages would be on neither).
-  function eventsBetween(conv, rows, { hasMore, hasNewer, before = null, afterAt = null } = {}) {
-    const lo = afterAt != null ? afterAt : hasMore && rows.length ? rows[0].created_at : 0;
+  // two pages would be on neither). from: none before then (the reader's history start, server/joinhistory.js).
+  function eventsBetween(conv, rows, { hasMore, hasNewer, before = null, afterAt = null, from = null } = {}) {
+    const lo = Math.max(afterAt != null ? afterAt : hasMore && rows.length ? rows[0].created_at : 0, from || 0);
     let hi = hasNewer && rows.length ? rows[rows.length - 1].created_at + 1 : Number.MAX_SAFE_INTEGER;
     const b = before ? idTime(before) : null;
     if (b != null) hi = Math.min(hi, b);
@@ -149,7 +152,8 @@ module.exports = function setupDisappear(ctx) {
   api.get('/channels/:id/disappearing', auth, (req, res) => {
     rateLimit('disappear-read:' + req.userId, 60, 60000);
     const c = channelFor(req, false);
-    res.json({ conv: 'c:' + c.id, channelId: c.id, seconds: c.disappear_secs || 0, log: recentLog('c:' + c.id) });
+    const since = historyStart(c, req.userId);
+    res.json({ conv: 'c:' + c.id, channelId: c.id, seconds: c.disappear_secs || 0, log: recentLog('c:' + c.id, 20, since ? since.at : 0) });
   });
   api.get('/dms/:id/disappearing', auth, (req, res) => {
     rateLimit('disappear-read:' + req.userId, 60, 60000);
@@ -202,8 +206,9 @@ module.exports = function setupDisappear(ctx) {
           const srv = serverOf(c);
           room.emit('message:delete-bulk', { channelId: c.id, messages: list.map((r) => ({ id: r.id, threadId: r.thread_id || null })), expired: true,
             ...(srv && srv.kind === 'group' ? { last: groupLast(srv) } : {}) });
+          // Not to members the thread is from before (server/joinhistory.js): they never got it.
           for (const rootId of new Set(list.filter((r) => r.thread_id && !gone.has(r.thread_id)).map((r) => r.thread_id))) {
-            room.emit('thread:update', { rootId, channelId: c.id, threadCount: 0, ...threadInfo({ id: rootId }) });
+            toChannelAbout(c, visibilityOf(rootId)).emit('thread:update', { rootId, channelId: c.id, threadCount: 0, ...threadInfo({ id: rootId }) });
           }
         }
         const b = bots();

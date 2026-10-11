@@ -421,7 +421,12 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       err.code = 'rollback';
       throw err;
     }
-    const err = new Error('You don\u2019t have this server\u2019s encryption key yet. It arrives as soon as another member comes online.');
+    // Joined a server that keeps what came before from new members: the key is the next one, made for you (since:
+    // where your history starts, server/joinhistory.js), never the one in use when you joined.
+    const st = states.get(serverId);
+    const err = new Error(st && st.since && st.since.epoch > st.keyEpoch
+      ? 'Your encryption key for this server is on its way: it gives new members a fresh key, which can take a few minutes.'
+      : 'You don\u2019t have this server\u2019s encryption key yet. It arrives as soon as another member comes online.');
     err.code = 'no-key';
     throw err;
   }

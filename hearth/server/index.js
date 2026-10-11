@@ -64,6 +64,9 @@ if (process.env.TURN_URL) {
 
 // ---------------------------------------------------------------- helpers
 const now = () => Date.now();
+// "New members can't read messages from before they joined" (server/joinhistory.js, v19): who sees which messages,
+// and the key change a join asks for. (Its timer fires only once everything below is set up.)
+const HIST = require('./joinhistory')({ db, now, jobs, emitKeyState: (id) => emitKeyState(id) });
 const randomCode = (len) => {
   const chars = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
   const bytes = crypto.randomBytes(len);
@@ -283,29 +286,42 @@ function stillWaiting(row) {
     .all(row.id, r, row.id, r, row.id, r).map((x) => x.server_id);
 }
 // The part that's the same for every member (worked out once when it goes to everyone, see emitKeyState).
-// missing: who still needs the current key and may be given it; held: who is waiting to be verified first.
+// missing: who still needs the current key and may be given it; held: who is waiting to be verified first; waiting:
+// who joined with "New members can't read messages from before they joined" on and waits for a newer key.
 function serverKeyInfo(serverId) {
   const s = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(serverId);
   if (!s) return null;
   const held = heldIn(serverId);
+  // Not those waiting for a newer key (they joined with "New members can't read messages from before they joined"
+  // on, server/joinhistory.js): nobody may hand them this one, so no app should try. Nor anyone held back (crypto-2).
   const missing = s.key_epoch
-    ? db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND NOT EXISTS
+    ? db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND (m.key_from IS NULL OR m.key_from <= ?) AND NOT EXISTS
         (SELECT 1 FROM server_keys k WHERE k.server_id = m.server_id AND k.user_id = m.user_id AND k.epoch = ?)`)
-      .all(serverId, s.key_epoch).map((r) => r.user_id).filter((id) => !held.includes(id))
+      .all(serverId, s.key_epoch, s.key_epoch).map((r) => r.user_id).filter((id) => !held.includes(id))
     : [];
+  // They're listed apart (waiting), so the encryption dialog can count who holds the current key.
+  const waiting = s.key_epoch ? HIST.waitingFor(serverId, s.key_epoch) : [];
   // Who made the current key, so members (and moderators) can see who replaced it.
   const cur = s.key_epoch ? db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, s.key_epoch) : null;
-  return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, held, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
+  return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, held, waiting, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
 }
 // createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
 const keyOut = (k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at });
-const keyStateFrom = (serverId, info, keys) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, held: info.held, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt });
+// since: { at, epoch } for someone who joined with "New members can't read messages from before they joined" on
+// (server/joinhistory.js): their history starts then, with keys from that epoch (their app says it's waiting for
+// that key while the current one is older). Absent for everyone else.
+const keyStateFrom = (serverId, info, keys, since = null) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, held: info.held, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt,
+  ...(info.waiting.length ? { waiting: info.waiting } : {}), ...(since ? { since } : {}) });
+// Your own wrapped keys, from the first epoch you may hold: someone who joined with that setting on never gets older
+// rows back, even ones of their own from an earlier membership.
 function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
   if (!info) return null;
+  const m = db.prepare('SELECT joined_at, key_from FROM members WHERE server_id = ? AND user_id = ?').get(serverId, userId);
+  const from = (m && m.key_from) || 0;
   const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
       JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
-      WHERE k.server_id = ? AND k.user_id = ? ORDER BY k.epoch`).all(serverId, userId).map(keyOut);
-  return keyStateFrom(serverId, info, keys);
+      WHERE k.server_id = ? AND k.user_id = ? AND k.epoch >= ? ORDER BY k.epoch`).all(serverId, userId, from).map(keyOut);
+  return keyStateFrom(serverId, info, keys, m && m.key_from != null ? { at: m.joined_at, epoch: m.key_from } : null);
 }
 // Is this person connected right now? Updates for anyone who isn't would go nowhere (they get the current state
 // when their app starts), so a big server's fan-out only does work for the people actually online.
@@ -319,14 +335,17 @@ function emitKeyState(serverId) {
 function sendKeyState(serverId) {
   const info = serverKeyInfo(serverId);
   if (!info) return;
-  const online = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(serverId).map((m) => m.user_id).filter(connected);
-  if (!online.length) return;
-  // Everyone's own wrapped keys in one query (the same rows keyState reads one person at a time).
+  const rows = db.prepare('SELECT user_id, joined_at, key_from FROM members WHERE server_id = ?').all(serverId).filter((m) => connected(m.user_id));
+  if (!rows.length) return;
+  const online = rows.map((m) => m.user_id);
+  const since = new Map(rows.filter((m) => m.key_from != null).map((m) => [m.user_id, { at: m.joined_at, epoch: m.key_from }]));
+  // Everyone's own wrapped keys in one query (the same rows keyState reads one person at a time, from the same epoch).
   const keys = new Map(online.map((u) => [u, []]));
   for (const k of db.prepare(`SELECT k.user_id, k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
       JOIN server_epochs e ON e.server_id = k.server_id AND e.epoch = k.epoch
-      WHERE k.server_id = ? AND k.user_id IN (SELECT value FROM json_each(?)) ORDER BY k.user_id, k.epoch`).iterate(serverId, JSON.stringify(online))) keys.get(k.user_id).push(keyOut(k));
-  for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list));
+      JOIN members m ON m.server_id = k.server_id AND m.user_id = k.user_id
+      WHERE k.server_id = ? AND k.user_id IN (SELECT value FROM json_each(?)) AND k.epoch >= COALESCE(m.key_from, 0) ORDER BY k.user_id, k.epoch`).iterate(serverId, JSON.stringify(online))) keys.get(k.user_id).push(keyOut(k));
+  for (const [uid, list] of keys) io.to(`user:${uid}`).emit('keys:state', keyStateFrom(serverId, info, list, since.get(uid) || null));
 }
 
 const serializeChannel = (c) => ({ id: c.id, serverId: c.server_id, name: c.name, type: c.type, topic: c.topic, position: c.position, category: c.category, slowmode: c.slowmode || 0, disappear: c.type === 'text' || c.type === 'voice' ? c.disappear_secs || 0 : undefined, region: c.type === 'voice' ? c.rtc_region || null : undefined, regionVersion: c.type === 'voice' ? c.rtc_region_v || 0 : undefined });
@@ -412,6 +431,8 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
     bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn, wordFilter: common.wordFilter,
   };
   if (myBase & PM.MANAGE_ROLES) out.soldRoles = common.soldRoles;
+  // "New members can't read messages from before they joined" (server/joinhistory.js): the same for every member.
+  if (out.kind !== 'group') out.hideHistory = !!s.hide_history;
   if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
   const to = USE && out.kind !== 'group' ? USE.timeoutOf(s.id, uid) : null;
   if (to) out.timeout = { until: to.until, reason: to.reason };
@@ -495,11 +516,15 @@ function reactionsFor(ids) {
   return map;
 }
 
-function serializeMessage(row, channel, reactions) {
+// since: the reader's history start in this server (server/joinhistory.js startOf), when it has one: a quote of a
+// message from before it isn't sent (replyHidden: true, so the app can say why instead of "no longer available").
+function serializeMessage(row, channel, reactions, since = null) {
   let reply = null;
+  let replyHidden = false;
   if (row.reply_to) {
     // A quote that has disappeared is gone too (the app says the original is no longer available).
-    const r = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.reply_to);
+    let r = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.reply_to);
+    if (since && alive(r) && !HIST.visible(r, since)) { r = null; replyHidden = true; }
     // createdAt: apps only check a reply against keys its author had when it was written.
     if (alive(r) && r.ciphertext) reply = { id: r.id, authorId: r.author_id, ciphertext: r.ciphertext, epoch: r.epoch, createdAt: r.created_at, expiresAt: r.expires_at || null };
     else if (alive(r)) {
@@ -518,6 +543,7 @@ function serializeMessage(row, channel, reactions) {
     ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [], ...(data.embed ? { embed: newsEmbedOut(data.embed) } : {}), ...(data.bot ? { bot: true } : {}), ...(data.bot && data.webhook ? { webhook: webhookOut(data.webhook) } : {}) }),
     replyTo: row.reply_to,
     reply,
+    ...(replyHidden ? { replyHidden: true } : {}),
     threadId: row.thread_id || null,
     ...threadInfo(row),
     pinnedAt: row.pinned_at || null,
@@ -638,6 +664,41 @@ function toChannel(c, except) {
     .filter((u) => ev.channel(c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
   return rooms.length ? (except ? except.to(rooms) : io.to(rooms)) : { emit() {} };
 }
+// Just what server/joinhistory.js needs to tell who a message is from before (ciphertext: 1 or 0, whether it's
+// encrypted, rather than the ciphertext itself, and thread_id: a reply goes by its thread's first message too).
+const visibilityOf = (id) => HIST.rowOf(id);
+// toChannel for an event about one message (an edit, reactions, a pin, a thread's count): members it's from before
+// (server/joinhistory.js), or its thread's first message is, don't hear about it.
+function toChannelAbout(c, row, except) {
+  const op = toChannel(c, except);
+  const shut = HIST.shutOut(c.server_id, row);
+  return shut.length && op.except ? op.except(shut.map((u) => `user:${u}`)) : op;
+}
+// A serialized message as one member gets it: without the quote of a message from before their history in the server
+// starts (server/joinhistory.js). For the answers and copies that go to one person (the sender's own).
+function msgFor(msg, serverId, userId) {
+  if (!msg.reply) return msg;
+  const since = HIST.startOf(serverId, userId);
+  return since && !HIST.visible(visibilityOf(msg.replyTo), since) ? { ...msg, reply: null, replyHidden: true } : msg;
+}
+// A message itself (message:new, message:update) to everyone who can see the channel, except members it's from before;
+// those who can see it but not the message it replies to get it without the quote. A thread reply also skips members
+// the thread's first message is from before (they can't open that thread). skip: a user id that gets its own copy
+// (a scheduled message's author).
+function emitChannelMessage(c, row, event, msg, { skip = null } = {}) {
+  const shut = new Set(HIST.shutOut(c.server_id, row));
+  if (skip) shut.add(skip);
+  const quoted = msg.reply ? HIST.shutOut(c.server_id, visibilityOf(row.reply_to)).filter((u) => !shut.has(u)) : [];
+  let op = toChannel(c);
+  const out = [...shut, ...quoted];
+  if (out.length && op.except) op = op.except(out.map((u) => `user:${u}`));
+  op.emit(event, msg);
+  if (!quoted.length) return;
+  const srv = serverOf(c);
+  const ev = perms.forServer(srv, quoted);
+  const rooms = quoted.filter((u) => ev.channel(c, u) & PM.VIEW_CHANNEL).map((u) => `user:${u}`);
+  if (rooms.length) io.to(rooms).emit(event, { ...msg, reply: null, replyHidden: true });
+}
 const isBlocked = (a, b) => !!db.prepare('SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)').get(a, b, b, a);
 // outsideImages: what your apps do with an image link to another site in a message (xss-8). Loading it shows that
 // site your IP address, so by default they ask first ('ask' | 'always' | 'never'). Only your own apps read it.
@@ -648,6 +709,13 @@ function requireChannel(channelId, userId) {
   const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
   if (!c || !isMember(c.server_id, userId)) fail(404, 'Channel not found.');
   if (!(perms.channel(serverOf(c), c, userId) & PM.VIEW_CHANNEL)) fail(404, 'Channel not found.');
+  return c;
+}
+// requireChannel for one message: also "not found" when it's from before this member's history starts (they joined
+// with "New members can't read messages from before they joined" on, server/joinhistory.js), as if it didn't exist.
+function requireMessageChannel(m, userId, msg = 'Message not found.') {
+  const c = requireChannel(m.channel_id, userId);
+  if (HIST.hidden(c.server_id, userId, m)) fail(404, msg);
   return c;
 }
 function requireDm(dmId, userId) {
@@ -1067,8 +1135,9 @@ function purgeChannelMessages(rows, actorId) {
     // Open apps drop them all and redraw once (the batched form of message:delete).
     room.emit('message:delete-bulk', { channelId: c.id, messages: list.map((r) => ({ id: r.id, threadId: r.thread_id || null })) });
     // Threads that are still there but lost replies: their reply counts.
+    // Not to members the thread is from before (server/joinhistory.js): they never got it.
     for (const rootId of new Set(list.filter((r) => r.thread_id && !all.has(r.thread_id)).map((r) => r.thread_id))) {
-      room.emit('thread:update', { rootId, channelId: c.id, threadCount: 0, ...threadInfo({ id: rootId }) });
+      toChannelAbout(c, visibilityOf(rootId)).emit('thread:update', { rootId, channelId: c.id, threadCount: 0, ...threadInfo({ id: rootId }) });
     }
     BOTS.events('message.deleted', c.server_id, list.map((r) => ({ messageId: r.id, channelId: c.id, authorId: r.author_id, threadId: r.thread_id || null, deletedBy: actorId })), { channel: c, actorId });
   }
@@ -2508,6 +2577,17 @@ api.patch('/servers/:id', auth, (req, res) => {
   const body = req.body || {};
   const onlyOrder = Object.keys(body).every((k) => k === 'categoryOrder' || k === 'categoryOrderFrom');
   if (srv.kind !== 'group' && !can(srv, req.userId, onlyOrder ? PM.MANAGE_CHANNELS : PM.MANAGE_SERVER)) fail(403, onlyOrder ? 'You need the Manage Channels permission.' : 'You need the Manage Server permission.');
+  // Checked before anything is written. Group chats don't have it: anyone in one can add people, and it has no settings.
+  // Turning it on replaces the key once, so at most 10 changes an hour, per person in each server: not one budget for
+  // the whole server, which someone could use up (ending on off) so that nobody else could turn it back on for an
+  // hour. That's at most 5 new keys an hour from one person this way, while anyone with Manage Server may replace the
+  // key 30 times an hour anyway (limitVoluntary); every change is in the audit log.
+  const historyChange = body.hideHistory !== undefined && body.hideHistory !== !!srv.hide_history;
+  if (body.hideHistory !== undefined) {
+    if (srv.kind === 'group') fail(400, 'Group chats don’t have this setting.');
+    if (typeof body.hideHistory !== 'boolean') fail(400, 'hideHistory is true or false.');
+    if (historyChange) rateLimit(`hidehistory:${srv.id}:${req.userId}`, 10, HOUR_MS);
+  }
   // The category order is about channels: it needs Manage Channels however it comes (with other changes, or in a
   // group chat), and is worked out before anything is written, since it can be refused (server/channelorder.js).
   let categoryPlan = null;
@@ -2551,8 +2631,17 @@ api.patch('/servers/:id', auth, (req, res) => {
     if (name !== srv.name) { renamed = { from: srv.name, to: name }; changes.unshift('name'); }
     db.prepare('UPDATE servers SET name = ? WHERE id = ?').run(name, req.params.id);
   }
-  if (changes.length) serverAudit(srv, req.userId, 'server_update', null, { changes, name: renamed || undefined });
+  // "New members can't read messages from before they joined" (server/joinhistory.js); the entry says which way.
+  let hideHistory;
+  let rekey = false;
+  if (historyChange) {
+    hideHistory = body.hideHistory;
+    rekey = HIST.set(srv.id, hideHistory);
+    changes.push('hideHistory');
+  }
+  if (changes.length) serverAudit(srv, req.userId, 'server_update', null, { changes, name: renamed || undefined, hideHistory });
   if (reordered) serverAudit(srv, req.userId, 'category_reorder');
+  if (rekey) emitKeyState(srv.id);
   emitServer(srv.id);
   res.json(serializeServer(db.prepare('SELECT * FROM servers WHERE id = ?').get(srv.id), req.userId));
 });
@@ -2828,6 +2917,9 @@ api.post('/invites/:code/join', auth, (req, res) => {
   if (joined) {
     keyOnRejoin(sid, req.userId);
     db.prepare('INSERT INTO members (server_id, user_id, joined_at) VALUES (?, ?, ?)').run(sid, req.userId, now());
+    // "New members can't read messages from before they joined" (server/joinhistory.js): their history starts now,
+    // and the apps switch to a new key for them (at once, or shared with other joins close by).
+    HIST.joined(sid, req.userId);
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(inv.code);
     io.to(`server:${sid}`).emit('member:add', { serverId: sid, user: publicUser(getUserRow(req.userId)) });
     io.in(`user:${req.userId}`).socketsJoin(`server:${sid}`);
@@ -2903,12 +2995,22 @@ const membersBut = (serverId, userId) => db.prepare('SELECT COUNT(*) AS n FROM m
 //   - members reported this key broken, and they made it;
 //   - they reported it broken, while another member is online who neither made nor reported it (that member's
 //     app opened it fine, so it can make the next one). When everyone online reported it, it really is broken
-//     for them, and any of them may replace it at once.
+//     for them, and any of them may replace it at once;
+//   - they joined with "New members can't read messages from before they joined" on and are waiting for a newer key
+//     than this one (server/joinhistory.js: their join asked for it), while a member who isn't waiting is online
+//     (that member's app makes it). Alone, a newcomer may make it themselves, or they couldn't write at all. A member
+//     held back until verified (crypto-2) doesn't count: they can't make the key the others write with.
 function causedRotation(serverId, epoch, userId) {
   const ep = db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, epoch);
   if (!ep) return false;
   if (db.prepare(`SELECT 1 FROM former_members f JOIN members m ON m.server_id = f.server_id AND m.user_id = f.user_id
       WHERE f.server_id = ? AND f.user_id = ? AND m.joined_at > ?`).get(serverId, userId, ep.created_at)) return true;
+  const me = db.prepare('SELECT key_from FROM members WHERE server_id = ? AND user_id = ?').get(serverId, userId);
+  if (me && me.key_from != null && me.key_from > epoch) {
+    const held = heldIn(serverId);
+    return db.prepare('SELECT user_id FROM members WHERE server_id = ? AND user_id != ? AND (key_from IS NULL OR key_from <= ?)').all(serverId, userId, epoch)
+      .some((m) => !held.includes(m.user_id) && isOnline(m.user_id));
+  }
   const reporters = db.prepare('SELECT user_id FROM server_key_reports WHERE server_id = ? AND epoch = ?').all(serverId, epoch).map((r) => r.user_id);
   if (!reporters.length) return false;
   if (userId === ep.creator_id) return true;
@@ -2964,7 +3066,9 @@ api.post('/servers/:id/keys/rotate', auth, (req, res) => {
     db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur.key_epoch + 1, check, req.userId, t);
     const ins = db.prepare('INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
     given.forEach((m) => ins.run(s.id, cur.key_epoch + 1, m, wraps[m], req.userId, t));
-    db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0 WHERE id = ?').run(cur.key_epoch + 1, s.id);
+    // Everyone in the server now has this key (but whoever is held back, who gets it once verified), so anyone who
+    // joined waiting for a new one (server/joinhistory.js) isn't any more.
+    db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0, join_rotate_at = NULL WHERE id = ?').run(cur.key_epoch + 1, s.id);
   });
   tx();
   emitKeyState(s.id);
@@ -2972,7 +3076,8 @@ api.post('/servers/:id/keys/rotate', auth, (req, res) => {
 });
 
 // Give the current key to members who don't have it yet (new joiners). Not while the key needs replacing:
-// whoever just came back must get the next key, not this one.
+// whoever just came back must get the next key, not this one. Never to someone who joined with "New members can't
+// read messages from before they joined" on after this key was made (server/joinhistory.js): they wait for the next.
 api.post('/servers/:id/keys/share', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('share:' + req.userId, 60, 60 * 1000);
@@ -2988,8 +3093,9 @@ api.post('/servers/:id/keys/share', auth, (req, res) => {
   const ins = db.prepare('INSERT OR IGNORE INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
   let n = 0;
   const stale = staleWraps(pubs, Object.keys(wraps || {}));
+  const waiting = new Set(HIST.waitingFor(s.id, cur));
   for (const [uid, w] of Object.entries(wraps || {}).slice(0, 200)) {
-    if (stale.includes(uid) || held.includes(uid)) continue;
+    if (stale.includes(uid) || held.includes(uid) || waiting.has(uid)) continue;
     if (isMember(s.id, uid) && isWrapped(w)) n += ins.run(s.id, cur, uid, w, req.userId, now()).changes;
   }
   if (n) emitKeyState(s.id);
@@ -3038,11 +3144,14 @@ api.post('/servers/:id/keys/self', auth, (req, res) => {
   const wraps = (req.body || {}).wraps;
   if (!wraps || typeof wraps !== 'object' || Array.isArray(wraps)) fail(400, 'Missing wrapped keys.');
   const upd = db.prepare('UPDATE server_keys SET wrapped = ?, wrapper_id = ? WHERE server_id = ? AND user_id = ? AND epoch = ?');
+  // Not rows from before your history here starts (an earlier membership, server/joinhistory.js): they're never
+  // handed back, so they aren't yours to touch either (and the count doesn't tell you which you still have).
+  const from = (db.prepare('SELECT key_from FROM members WHERE server_id = ? AND user_id = ?').get(s.id, req.userId) || {}).key_from || 0;
   let n = 0;
   db.transaction(() => {
     for (const [e, w] of Object.entries(wraps).slice(0, 500)) {
       const ep = Number(e);
-      if (Number.isInteger(ep) && ep > 0 && isWrapped(w)) n += upd.run(w, req.userId, s.id, req.userId, ep).changes;
+      if (Number.isInteger(ep) && ep > 0 && ep >= from && isWrapped(w)) n += upd.run(w, req.userId, s.id, req.userId, ep).changes;
     }
   })();
   res.json({ updated: n });
@@ -3354,43 +3463,61 @@ const MAX_MESSAGE = 4000;
 
 // Page through a conversation: newest (default), ?before=id (older), ?after=id (newer) or ?around=id (jump).
 // Messages whose disappearing time has passed are skipped, so a page is full of live ones even before the sweep.
-function pageRows(table, col, containerId, q, extra = '') {
+// since: the reader's history start in a server (server/joinhistory.js), when they have one: nothing from before it.
+function pageRows(table, col, containerId, q, extra = '', since = null) {
   // Between 1 and 100 (SQLite reads a negative LIMIT as "no limit": the whole history in one go).
   const limit = Math.max(1, Math.min(100, parseInt(q.limit, 10) || 50));
-  const base = `SELECT * FROM ${table} WHERE ${col} = ? ${extra} AND ${LIVE}`;
+  const hist = HIST.where(since);
+  const base = `SELECT * FROM ${table} WHERE ${col} = ? ${extra}${hist.sql} AND ${LIVE}`;
+  const head = [containerId, ...hist.args];
   const t = now();
   if (q.around) {
-    const older = db.prepare(`${base} AND id <= ? ORDER BY id DESC LIMIT 26`).all(containerId, t, String(q.around));
-    const newer = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT 25`).all(containerId, t, String(q.around));
+    const older = db.prepare(`${base} AND id <= ? ORDER BY id DESC LIMIT 26`).all(...head, t, String(q.around));
+    const newer = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT 25`).all(...head, t, String(q.around));
     return { rows: [...older.reverse(), ...newer], hasMore: older.length === 26, hasNewer: newer.length === 25 };
   }
   if (q.after) {
-    const rows = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT ?`).all(containerId, t, String(q.after), limit);
+    const rows = db.prepare(`${base} AND id > ? ORDER BY id ASC LIMIT ?`).all(...head, t, String(q.after), limit);
     // Where the page before this one ended (its last message's time), so the timer changes in between land here.
     const from = db.prepare(`SELECT created_at FROM ${table} WHERE id = ? AND ${col} = ?`).get(String(q.after), containerId);
     return { rows, hasMore: true, hasNewer: rows.length === limit, afterAt: from ? from.created_at : DISAPPEAR.idTime(q.after) };
   }
   const rows = q.before
-    ? db.prepare(`${base} AND id < ? ORDER BY id DESC LIMIT ?`).all(containerId, t, String(q.before), limit)
-    : db.prepare(`${base} ORDER BY id DESC LIMIT ?`).all(containerId, t, limit);
+    ? db.prepare(`${base} AND id < ? ORDER BY id DESC LIMIT ?`).all(...head, t, String(q.before), limit)
+    : db.prepare(`${base} ORDER BY id DESC LIMIT ?`).all(...head, t, limit);
   return { rows: rows.reverse(), hasMore: rows.length === limit, hasNewer: false };
 }
 // The timer changes inside a history page (the apps draw them between the messages). A ?before= page ends where the
 // page after it began, and an ?after= page begins where the page before it ended, so no change falls between two.
-const timerEvents = (conv, page, q) => DIS.eventsBetween(conv, page.rows, { hasMore: page.hasMore, hasNewer: page.hasNewer,
-  before: q.before && !q.around && !q.after ? String(q.before) : null, afterAt: !q.around && q.after ? page.afterAt : null });
+// since: the reader's history start in the server (server/joinhistory.js): no change from before it.
+const timerEvents = (conv, page, q, since = null) => DIS.eventsBetween(conv, page.rows, { hasMore: page.hasMore, hasNewer: page.hasNewer,
+  before: q.before && !q.around && !q.after ? String(q.before) : null, afterAt: !q.around && q.after ? page.afterAt : null, from: since ? since.at : null });
 
 api.get('/channels/:id/messages', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
+  // Someone who joined with "New members can't read messages from before they joined" on gets nothing from before
+  // (server/joinhistory.js). The page that reaches the start says whether anything was left out (hidden), so the
+  // app shows one line there instead of a row per message it could never open.
+  const since = HIST.startOf(c.server_id, req.userId);
   // Thread replies live in their thread, not the main channel.
-  const page = pageRows('messages', 'channel_id', c.id, req.query, 'AND thread_id IS NULL');
+  const page = pageRows('messages', 'channel_id', c.id, req.query, 'AND thread_id IS NULL', since);
   const { rows, hasMore, hasNewer } = page;
   const reactions = reactionsFor(rows.map((r) => r.id));
-  const messages = rows.map((r) => serializeMessage(r, c, reactions));
+  const messages = rows.map((r) => serializeMessage(r, c, reactions, since));
   // Your own unread and ping counts for the threads these messages start ("2 new replies" on each).
   const threads = USE ? USE.threadStates(req.userId, c, messages.filter((m) => m.threadCount).map((m) => m.id)) : {};
-  res.json({ messages, hasMore, hasNewer, threads, timerEvents: timerEvents('c:' + c.id, page, req.query) });
+  const hidden = !!since && !hasMore && !req.query.after && hiddenBefore(c, since, rows[0]);
+  res.json({ messages, hasMore, hasNewer, threads, timerEvents: timerEvents('c:' + c.id, page, req.query, since), ...(hidden ? { hidden: true } : {}) });
 });
+// Whether a channel has top-level messages this reader doesn't get (server/joinhistory.js) before the first one they
+// do (or at all): one step in the channel index for those from before they joined, and a look through the few written
+// since then under an older key (the moment their own key was on its way).
+function hiddenBefore(c, since, first) {
+  const upTo = first ? first.id : '~';
+  if (db.prepare('SELECT 1 FROM messages WHERE channel_id = ? AND thread_id IS NULL AND id < ? AND id < ? LIMIT 1').get(c.id, since.floor, upTo)) return true;
+  return !!db.prepare('SELECT 1 FROM messages WHERE channel_id = ? AND thread_id IS NULL AND id >= ? AND id < ? AND ciphertext IS NOT NULL AND epoch < ? LIMIT 1')
+    .get(c.id, since.floor, upTo, since.epoch);
+}
 
 // Who gets a push for a channel message. The sender's app tells us which members it @mentions
 // (that's the only part of the message the server learns), plus replies and group DMs.
@@ -3399,7 +3526,10 @@ api.get('/channels/:id/messages', auth, (req, res) => {
 // mayEveryone: the caller already checked who may ping everyone (a channel webhook allowed to, see webhooks.js).
 function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, everyone, { mayEveryone = null } = {}) {
   const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
-  const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id).filter((u) => u !== senderId);
+  // Nobody hears about a message they won't be shown (server/joinhistory.js): one locked with a key from before
+  // theirs, or a reply in a thread from before they joined.
+  const unseen = new Set([id, threadId].filter(Boolean).flatMap((x) => HIST.shutOut(c.server_id, visibilityOf(x))));
+  const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id).filter((u) => u !== senderId && !unseen.has(u));
   const url = '/#m/' + id;
   const base = { tag: 'c:' + c.id, url, generic: 'New message' };
   const what = (kind) => ({ kind, serverId: srv.id, channelId: c.id });
@@ -3495,20 +3625,23 @@ api.post('/channels/:id/messages', auth, (req, res) => {
   const replyTo = replyIn(c, (req.body || {}).replyTo);
   let threadId = (req.body || {}).threadId || null;
   if (threadId) {
-    threadId = threadRootIn(c, threadId);
+    threadId = threadRootIn(c, threadId, req.userId);
     if (!threadId) fail(404, 'That thread no longer exists.');
   }
   const msg = postChannelMessage(c, req.userId, { ciphertext, epoch: ep, files, replyTo, threadId, mentions: (req.body || {}).mentions, everyone: (req.body || {}).everyone }, req.body);
-  res.json(msg);
+  // Replying to a message from before your history here starts (by its id) doesn't hand you its quote.
+  res.json(msgFor(msg, c.server_id, req.userId));
 });
 // The message a new one replies to, if it's really in this channel and hasn't disappeared (else none, as a reply to
 // a deleted message).
 const replyIn = (c, replyTo, t = now()) => (replyTo && alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(replyTo), c.id), t) ? String(replyTo) : null);
 // The stored id of a thread's first message in this channel (whatever shape the request gave it in), or null: none
-// there, or one that has disappeared.
-function threadRootIn(c, threadId, t = now()) {
-  const root = db.prepare('SELECT id, thread_id, expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
-  return alive(root, t) && !root.thread_id ? root.id : null;
+// there, or one that has disappeared. uid: who's replying, when it's someone the thread is closed to (it was started
+// before their history in the server starts, server/joinhistory.js) it's as if there were none.
+function threadRootIn(c, threadId, uid = null, t = now()) {
+  const root = db.prepare('SELECT id, thread_id, created_at, ciphertext IS NOT NULL AS ciphertext, epoch, expires_at FROM messages WHERE id = ? AND channel_id = ?').get(String(threadId), c.id);
+  if (!alive(root, t) || root.thread_id) return null;
+  return uid && HIST.hidden(c.server_id, uid, root) ? null : root.id;
 }
 // The disappearing timer a new message goes by: its conversation's at the moment it's posted. A scheduled message
 // also carries ttl, the timer its sender's app encrypted it for (inside it as x too, so readers' apps hide it by then
@@ -3542,26 +3675,29 @@ function postChannelMessage(c, authorId, { ciphertext, epoch, files, replyTo, th
   })();
   attachBlobs(files, authorId, id, expiresAt);
   DISAPPEAR.arm(expiresAt);
-  const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c);
+  const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
+  const msg = serializeMessage(row, c);
   withNonce(msg, body);
+  // Not to members still waiting for a newer key than it's locked with (server/joinhistory.js), and without the quote
+  // to those it's from before.
   if (scheduled) {
-    const others = toChannel(c);
-    (others.except ? others.except(`user:${authorId}`) : others).emit('message:new', msg);
-    io.to(`user:${authorId}`).emit('message:new', { ...msg, scheduled: true });
-  } else toChannel(c).emit('message:new', msg);
+    emitChannelMessage(c, row, 'message:new', msg, { skip: authorId });
+    io.to(`user:${authorId}`).emit('message:new', { ...msgFor(msg, c.server_id, authorId), scheduled: true });
+  } else emitChannelMessage(c, row, 'message:new', msg);
   notifyChannelMessage(c, id, authorId, replyTo, threadId, mentions, everyone);
   if (USE && !scheduled && !threadId) USE.markSent(authorId, 'c:' + c.id, id);
   else if (USE && !scheduled) USE.markThreadSent(authorId, c, threadId, id);
   // Bots get who, where and when: never the text, which is end-to-end encrypted.
   BOTS.event('message.created', c.server_id, { messageId: id, channelId: c.id, authorId, authorIsBot: false, createdAt: msg.createdAt, editedAt: null, threadId: threadId || null, replyTo: replyTo || null, expiresAt }, { channel: c, actorId: authorId });
-  if (threadId) toChannel(c).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
+  if (threadId) toChannelAbout(c, visibilityOf(threadId)).emit('thread:update', { rootId: threadId, channelId: c.id, ...threadInfo({ id: threadId }) });
   return msg;
 }
 
 api.patch('/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!alive(m) || m.author_id !== req.userId) fail(404, 'Message not found.');
-  const c = requireChannel(m.channel_id, req.userId);
+  // Your own message from before your history here starts (an earlier membership): you can't see it, so no edit.
+  const c = requireMessageChannel(m, req.userId);
   if (perms.timedOut(c.server_id, req.userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
   const { ciphertext, epoch } = req.body || {};
   validCipher(ciphertext);
@@ -3569,9 +3705,11 @@ api.patch('/messages/:id', auth, (req, res) => {
   // Editing an older server-encrypted message: drop its readable text, keep the file list for cleanup.
   const body = m.ciphertext ? m.body : seal({ content: '', attachments: unseal(m.body).attachments || [] });
   db.prepare('UPDATE messages SET body = ?, ciphertext = ?, epoch = ?, edited_at = ? WHERE id = ?').run(body, ciphertext, ep, now(), m.id);
-  const msg = serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(m.id), c);
-  toChannel(c).emit('message:update', msg);
-  res.json(msg);
+  const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(m.id);
+  const msg = serializeMessage(row, c);
+  // Locked with the current key now: members who joined after it was written must not get it (they hold that key).
+  emitChannelMessage(c, row, 'message:update', msg);
+  res.json(msgFor(msg, c.server_id, req.userId));
 });
 
 api.delete('/messages/:id', auth, (req, res) => {
@@ -3586,7 +3724,7 @@ api.delete('/messages/:id', auth, (req, res) => {
   // Someone else's message: the server's audit log says whose and where, never what it said.
   if (m.author_id !== req.userId) serverAudit(s, req.userId, 'message_delete', m.author_id, { channel: chanRef(s, c), thread: m.thread_id ? true : undefined }, c.id);
   toChannel(c).emit('message:delete', { id: m.id, channelId: c.id, threadId: m.thread_id || null });
-  if (m.thread_id) toChannel(c).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
+  if (m.thread_id) toChannelAbout(c, visibilityOf(m.thread_id)).emit('thread:update', { rootId: m.thread_id, channelId: c.id, threadCount: 0, ...threadInfo({ id: m.thread_id }) });
   BOTS.event('message.deleted', c.server_id, { messageId: m.id, channelId: c.id, authorId: m.author_id, threadId: m.thread_id || null, deletedBy: req.userId }, { channel: c, actorId: req.userId });
   res.json({ ok: true });
 });
@@ -3635,21 +3773,24 @@ api.post('/channels/:id/messages/bulk-delete', auth, (req, res) => {
 api.get('/messages/:id/thread', auth, (req, res) => {
   const root = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.id);
   if (!alive(root) || root.thread_id) fail(404, 'Thread not found.');
-  const c = requireChannel(root.channel_id, req.userId);
+  // A thread started before this member's history here starts (server/joinhistory.js) isn't theirs to open.
+  const c = requireMessageChannel(root, req.userId, 'Thread not found.');
+  const since = HIST.startOf(c.server_id, req.userId);
   // Paged like a channel (newest replies first, ?before=id for older ones): a thread can be any size.
-  const { rows, hasMore, hasNewer } = pageRows('messages', 'thread_id', root.id, { limit: '100', ...req.query });
+  const { rows, hasMore, hasNewer } = pageRows('messages', 'thread_id', root.id, { limit: '100', ...req.query }, '', since);
   const reactions = reactionsFor([root.id, ...rows.map((r) => r.id)]);
   // state: where you'd read up to (the app's "New" line), before opening it marks the thread read, and the channel's
   // thread pings (threadMentions), which set its badge right whenever a thread is opened.
-  res.json({ root: serializeMessage(root, c, reactions), messages: rows.map((r) => serializeMessage(r, c, reactions)), hasMore, hasNewer,
+  res.json({ root: serializeMessage(root, c, reactions, since), messages: rows.map((r) => serializeMessage(r, c, reactions, since)), hasMore, hasNewer,
     state: USE ? USE.threadStateWithBadge(req.userId, root.id, c) : null });
 });
 
 // Where does a message live? Used by message links, search results and notifications.
 api.get('/messages/:id/locate', auth, (req, res) => {
-  const m = db.prepare('SELECT id, channel_id, thread_id, expires_at FROM messages WHERE id = ?').get(req.params.id);
+  const m = db.prepare('SELECT id, channel_id, thread_id, ciphertext IS NOT NULL AS ciphertext, epoch, created_at, expires_at FROM messages WHERE id = ?').get(req.params.id);
   if (alive(m)) {
-    const c = requireChannel(m.channel_id, req.userId);
+    // One from before your history in that server starts (server/joinhistory.js) is answered like one you can't see.
+    const c = requireMessageChannel(m, req.userId, 'That message was deleted or you can’t see it.');
     return res.json({ kind: 'channel', channelId: c.id, serverId: c.server_id, threadId: m.thread_id || null });
   }
   const dm = !m && db.prepare('SELECT id, dm_id, expires_at FROM dm_messages WHERE id = ?').get(req.params.id);
@@ -3666,10 +3807,10 @@ function pinTarget(id, userId) {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
   if (m && !alive(m)) fail(404, 'Message not found.');
   if (m) {
-    const c = requireChannel(m.channel_id, userId);
+    const c = requireMessageChannel(m, userId);
     const s = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
     if (s.kind !== 'group' && !canIn(s, c, userId, PM.MANAGE_MESSAGES)) fail(403, 'You need the Manage Messages permission to pin messages here.');
-    return { table: 'messages', room: toChannel(c), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at, server: s, channel: c, authorId: m.author_id };
+    return { table: 'messages', room: toChannelAbout(c, m), payload: { messageId: m.id, channelId: c.id }, channelId: c.id, pinned: !!m.pinned_at, server: s, channel: c, authorId: m.author_id };
   }
   const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(id);
   if (!alive(dm)) fail(404, 'Message not found.');
@@ -3701,9 +3842,14 @@ api.delete('/messages/:id/pin', auth, (req, res) => {
 });
 api.get('/channels/:id/pins', auth, (req, res) => {
   const c = requireChannel(req.params.id, req.userId);
-  const rows = db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND pinned_at IS NOT NULL AND ${LIVE} ORDER BY pinned_at DESC LIMIT 50`).all(c.id, now());
+  // Only pins from after your history here starts (server/joinhistory.js), and no replies in a thread from before.
+  // The pins index is named: the extra conditions would otherwise lead SQLite to walk every message written in the
+  // channel since then (and sort them), for each look at the pins.
+  const since = HIST.startOf(c.server_id, req.userId);
+  const hist = HIST.where(since, { alias: 'messages.', threads: true });
+  const rows = db.prepare(`SELECT * FROM messages INDEXED BY idx_messages_pins WHERE channel_id = ? AND pinned_at IS NOT NULL${hist.sql} AND ${LIVE} ORDER BY pinned_at DESC LIMIT 50`).all(c.id, ...hist.args, now());
   const reactions = reactionsFor(rows.map((r) => r.id));
-  res.json(rows.map((r) => serializeMessage(r, c, reactions)));
+  res.json(rows.map((r) => serializeMessage(r, c, reactions, since)));
 });
 api.get('/dms/:id/pins', auth, (req, res) => {
   const d = requireDm(req.params.id, req.userId);
@@ -3721,10 +3867,10 @@ api.post('/messages/:id/reactions', auth, (req, res) => {
   let target;
   let payload;
   if (m) {
-    const c = requireChannel(m.channel_id, req.userId);
+    const c = requireMessageChannel(m, req.userId);
     const mine = db.prepare('SELECT 1 FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?').get(m.id, req.userId, emoji);
     if (!mine && !canIn(serverOf(c), c, req.userId, PM.ADD_REACTIONS)) fail(403, 'You don\u2019t have permission to react here.');
-    target = toChannel(c);
+    target = toChannelAbout(c, m);
     payload = { messageId: m.id, channelId: c.id };
   } else {
     const dm = db.prepare('SELECT * FROM dm_messages WHERE id = ?').get(req.params.id);
@@ -5265,10 +5411,11 @@ api.post('/reports', auth, (req, res) => {
     if (!alive(cm || dm)) fail(404, 'That message no longer exists.');
     let inConvo;
     if (cm) {
-      const c = requireChannel(cm.channel_id, req.userId);
+      const c = requireMessageChannel(cm, req.userId, 'That message no longer exists.');
       const srv = serverOf(c);
       Object.assign(context, { messageId: id, channelId: c.id, channelName: c.name, serverId: srv.id, serverName: srv.kind === 'group' ? 'Group DM' : srv.name });
-      inConvo = (mid) => db.prepare(`SELECT author_id, created_at FROM messages WHERE id = ? AND channel_id = ? AND ${LIVE}`).get(mid, c.id, now());
+      const since = HIST.startOf(c.server_id, req.userId); // only messages the reporter could see (server/joinhistory.js)
+      inConvo = (mid) => { const r = db.prepare(`SELECT author_id, created_at, ciphertext IS NOT NULL AS ciphertext, epoch, thread_id FROM messages WHERE id = ? AND channel_id = ? AND ${LIVE}`).get(mid, c.id, now()); return r && HIST.visible(r, since) ? r : null; };
       targetId = cm.author_id;
       if (srv.kind !== 'group') inServer = srv;
     } else {
@@ -5814,12 +5961,13 @@ api.delete('/profile-comments/:id', auth, (req, res) => {
 // number each person picked, so it can count votes without knowing what they're about.
 // act: voting or ending it, which a block stops in a DM like any other new interaction (reading it still works).
 function pollTarget(messageId, userId, act = false) {
-  const cm = db.prepare('SELECT id, channel_id, expires_at FROM messages WHERE id = ?').get(messageId);
+  const cm = db.prepare('SELECT id, channel_id, thread_id, ciphertext, epoch, created_at, expires_at FROM messages WHERE id = ?').get(messageId);
   if (cm && !alive(cm)) fail(404, 'That poll no longer exists.');
   if (cm) {
-    const c = requireChannel(cm.channel_id, userId);
+    // A poll from before your history in this server starts (server/joinhistory.js) is one you never saw.
+    const c = requireMessageChannel(cm, userId, 'That poll no longer exists.');
     if (act && perms.timedOut(c.server_id, userId)) fail(403, 'You\u2019re timed out in this server for now.', 'timed_out');
-    return { emit: (ev, data) => toChannel(c).emit(ev, data) };
+    return { emit: (ev, data) => toChannelAbout(c, cm).emit(ev, data) };
   }
   const dm = db.prepare('SELECT id, dm_id, expires_at FROM dm_messages WHERE id = ?').get(messageId);
   if (alive(dm)) {
@@ -6219,10 +6367,10 @@ const MEMB = require('./memberships')({ api, auth, db, fail, wrap, rateLimit, ge
 STORE = require('./storage')({ api, auth, db, fail, wrap, rateLimit, limitNet, HttpError, quotaOf, overLimit, uploadLimits, fmtMb, MB, getUserRow,
   removeUpload, fileName, UPLOAD_DIR, DATA_DIR, unseal, auditLog, stepUp, adminOnly, brief });
 // Message search (server/search.js): filters by where, who and when; the search words stay in the app.
-require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor });
+require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor, history: HIST });
 // Bots and integrations (server/bots.js): installs, scopes, the bot API, signed webhooks, slash commands.
 BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, serverAudit, checkWords,
-  perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
+  perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, toChannelAbout, emitChannelMessage, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
   getIo: () => io, features, isStaff, isInstanceAdmin, maintenance, newsBot: NEWS_BOT_ID });
 // Link previews (server/linkpreview.js): the sender's app asks for a page's title and picture, which then travel
 // inside the encrypted message. This server sees the link and who asked; readers fetch nothing.
@@ -6234,13 +6382,16 @@ require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, limitNet, 
 // Saved messages, read state, notification preferences, pin history, timeouts, data export (server/usability.js).
 USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, serverAudit, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
-  requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf });
+  requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf, history: HIST });
 // Disappearing messages (server/disappear.js): the timer routes, and the job that deletes messages whose time has
 // passed (it runs once right here, before anyone can connect).
 DIS = require('./disappear')({ api, auth, db, fail, rateLimit, newId, now, requireChannel, requireDm, requireManageableChannel, serverOf, isBlocked, getUserRow,
   // (io is declared further down: during the start-up sweep it doesn't exist yet, and there's nobody to tell.)
   toChannel: (c) => toChannel(c), getIo: () => { try { return io || null; } catch { return null; } }, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), removeUpload, unseal, threadInfo, groupLast,
-  bots: () => BOTS, serverAudit, chanRef });
+  bots: () => BOTS, serverAudit, chanRef,
+  // "New members can't read messages from before they joined" (server/joinhistory.js): thread counts of a thread from
+  // before someone joined don't reach them, nor do timer changes from before.
+  toChannelAbout: (c, row) => toChannelAbout(c, row), visibilityOf, historyStart: (c, uid) => HIST.startOf(c.server_id, uid) });
 // Away after inactivity and custom statuses that clear themselves (server/presence.js).
 PRES = require('./presence')({ api, auth, db, fail, rateLimit, limitNet, now, getUserRow, parseProfile, sanitizeProfile, checkWords, requireUnlocked,
   broadcastUser, broadcastPresence, presenceFor, selfUser });
@@ -6248,7 +6399,7 @@ PRES = require('./presence')({ api, auth, db, fail, rateLimit, limitNet, now, ge
 SELF = require('./selfroles')({ api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL: ALL_PERMS, CHANNEL_SCOPED, MEMB,
   emitServer: (sid) => io && emitServer(sid), recheckVoice, serverAudit });
 // Each server's own audit log and its moderators' report inbox (server/serveraudit.js).
-SA = require('./serveraudit')({ api, auth, db, fail, rateLimit, perms, PM, ALL: ALL_PERMS, requireServer, isMember, getIo: () => io, keptSql: serverAuditKeptSql });
+SA = require('./serveraudit')({ api, auth, db, fail, rateLimit, perms, PM, ALL: ALL_PERMS, requireServer, isMember, getIo: () => io, keptSql: serverAuditKeptSql, history: HIST });
 // Start a server from a Discord server template the person pastes (server/imports.js, server/discordmap.js).
 require('./imports')({ api, auth, db, fail, rateLimit, limitNet, countHit, hitsSoFar, newId, now, features, isStaff, ALL: ALL_PERMS, CHANNEL_SCOPED, PM,
   serializeServer, keyState, getIo: () => io, auditLog, requirePerm });

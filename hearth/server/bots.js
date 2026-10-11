@@ -69,7 +69,7 @@ const sign = (secret, ts, body) => crypto.createHmac('sha256', secret).update(`$
 
 module.exports = function setupBots(ctx) {
   const { api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, serverAudit, checkWords,
-    perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer,
+    perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, toChannelAbout, emitChannelMessage, reactionsFor, deleteMessageTree, emitServer,
     getIo, features, isStaff, isInstanceAdmin, maintenance, newsBot } = ctx;
   const now = () => Date.now();
   const io = () => getIo() || { to: () => ({ emit() {} }), sockets: { sockets: new Map() } };
@@ -407,7 +407,9 @@ module.exports = function setupBots(ctx) {
       .run(id, c.id, authorId, seal({ ...extra, content, attachments: [], bot: true }), replyTo, t, expiresAt);
     DISAPPEAR.arm(expiresAt);
     const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
-    toChannel(c).emit('message:new', serializeMessage(row, c));
+    // Like a member's message: without the quote for members the message it replies to is from before
+    // (server/joinhistory.js).
+    emitChannelMessage(c, row, 'message:new', serializeMessage(row, c));
     event('message.created', c.server_id, metaOf(row, c), { channel: c, actorId: authorId });
     return row;
   }
@@ -535,7 +537,7 @@ module.exports = function setupBots(ctx) {
     rateLimit(`botmsg:${req.bot.id}:${c.id}`, 10, 10000);
     db.prepare('UPDATE messages SET body = ?, edited_at = ? WHERE id = ?').run(seal({ content, attachments: [], bot: true }), now(), m.id);
     const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(m.id);
-    toChannel(c).emit('message:update', serializeMessage(row, c));
+    emitChannelMessage(c, row, 'message:update', serializeMessage(row, c));
     markOk(inst.id);
     res.json({ message: { ...metaOf(row, c), content } });
   });
@@ -554,7 +556,7 @@ module.exports = function setupBots(ctx) {
     if (!emoji || emoji.length > 64) fail(400, 'Pick an emoji (up to 64 characters).', 'bad_emoji');
     return { ...r, emoji };
   };
-  const emitReactions = (c, m) => toChannel(c).emit('reaction:update', { messageId: m.id, channelId: c.id, reactions: reactionsFor([m.id])[m.id] || [] });
+  const emitReactions = (c, m) => toChannelAbout(c, m).emit('reaction:update', { messageId: m.id, channelId: c.id, reactions: reactionsFor([m.id])[m.id] || [] });
   bapi.put('/messages/:id/reactions/:emoji', (req, res) => {
     const { m, c, inst, emoji } = reactionTarget(req);
     rateLimit('botreact:' + req.bot.id, 20, 10000);

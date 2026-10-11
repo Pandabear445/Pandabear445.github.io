@@ -197,10 +197,12 @@ export function sentence(e, users) {
     case 'voice_mute': return [[who, ' server-muted ', them, d.channel ? ` (in ${ch})` : '']];
     case 'voice_unmute': return [[who, ' lifted the server mute of ', them]];
     case 'server_update': {
-      const ch2 = (d.changes || []).filter((k) => k !== 'name').map((k) => SETTING[k] || k);
+      const ch2 = (d.changes || []).filter((k) => k !== 'name' && k !== 'hideHistory').map((k) => SETTING[k] || k);
       const out = [who];
       if (d.name) out.push(` renamed the server from ${quoted(d.name.from)} to ${quoted(d.name.to)}`);
       if (ch2.length) out.push(`${d.name ? ' and' : ''} ${d.removed ? 'removed' : 'changed'} ${list(ch2)}`);
+      // "New members can't read messages from before they joined" (the entry says which way it went).
+      if ((d.changes || []).includes('hideHistory')) out.push(`${d.name || ch2.length ? ' and' : ''} turned ${d.hideHistory ? 'on' : 'off'} ${quoted('New members can’t read messages from before they joined')}`);
       return [out];
     }
     case 'server_transfer': return [[who, ' made ', them, ' the owner', d.from ? ` (it was ${nameOf(users, d.from)})` : '']];
@@ -370,6 +372,8 @@ export async function reportsTab(s, body, { jumpTo = null, onCount = null } = {}
             h('div', { class: 'ev-body' }, h('div', { class: 'ev-meta' }, h('strong', null, a ? a.profile.displayName : 'Deleted user'), h('span', null, fmtStamp(e.createdAt)), e.reported ? h('span', { class: 'badge-tag bad' }, 'Reported') : null),
               h('div', { class: 'ev-text', html: e.text ? md(e.text) : '' }, e.text ? null : (e.files && e.files.length ? `[${e.files.join(', ')}]` : '(no text)'))));
         })) : null,
+      // This server hides messages from before someone joined (server/joinhistory.js): shared ones from before you did too.
+      r.evidenceHidden ? h('p', { class: 'field-hint' }, `${r.evidenceHidden === 1 ? 'One shared message is' : `${r.evidenceHidden} shared messages are`} from before you joined, so ${r.evidenceHidden === 1 ? 'it isn’t' : 'they aren’t'} shown: this server hides older messages from new members.`) : null,
       r.note || handler ? h('p', { class: 'stat-sub' }, [r.note ? `Note: ${r.note}` : '', handler && r.status !== 'open' ? `${r.status === 'handled' ? 'Handled' : 'Dismissed'} by ${handler}${r.handledAt ? `, ${fmtStamp(r.handledAt)}` : ''}` : ''].filter(Boolean).join(' — ')) : null,
       h('div', { class: 'report-actions' },
         jumpTo && r.context.messageId ? h('button', { class: 'btn ghost sm', onclick: () => jumpTo(r.context.messageId) }, 'Go to message') : null,

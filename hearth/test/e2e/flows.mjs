@@ -2935,6 +2935,79 @@ async function wordFilter(t) {
   await alice.message('The rambutan season is here').waitFor();
 }
 
+// ------------------------------------------------------------------ 30. new members can't read messages from before they joined
+// Dana (from flow 23) leaves the server. Bob (the owner) turns the setting on in Server settings → Overview, and the
+// audit log says so; he writes in #general and in the Lounge's chat. Dana comes back with an invite: as a new member
+// her app gets only the key the apps switch to for her, and instead of the earlier messages (or rows of locked ones)
+// she sees one line where her history starts, in #general and in the voice channel's chat. What's said after she
+// joined goes both ways; Alice, there all along, sees everything. Bob turns it off again. (A first-time joiner goes the
+// same way and the waits for a key under a flood of joins are in test/join-history.test.js; this instance's sign-ups
+// from one network are used up by the earlier flows.)
+async function joinHistory(t) {
+  const { alice, bob } = t.people;
+  const dana = await t.open('dana');
+  await dana.login('dana', t.pw.dana);
+  await dana.railButton(SERVER);
+  await dana.serverMenu('Leave server');
+  await dana.modal(`Leave ${SERVER}?`).locator('.modal-foot .btn.danger').click();
+  await dana.$(`#rail button[aria-label="${SERVER}"]`).waitFor({ state: 'detached' });
+
+  await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const setting = 'New members can’t read messages from before they joined';
+  await bob.serverMenu('Server settings');
+  const ss = bob.page.locator('.modal.server-settings');
+  const row = ss.locator('.toggle-row', { hasText: setting });
+  check(!(await row.locator('input[type=checkbox]').isChecked()), 'The setting should be off to start with.');
+  await row.locator('.switch').click();
+  await bob.toast('New members will only see messages from after they join.');
+  check(await ss.locator('.toggle-row', { hasText: setting }).locator('input[type=checkbox]').isChecked(), 'The switch should stay on once saved.');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: `bob turned on “${setting}”` }).waitFor();
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+  // (Turning it on switched keys once: Bob's message goes out under the new one.)
+  await bob.send('Before dana came back: quince jam');
+  await alice.openChannel('general');
+  await alice.message('Before dana came back: quince jam').waitFor();
+  await bob.channelRow('Lounge').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.send('Lounge before dana: medlar');
+  await bob.openChannel('general');
+
+  const link = await bob.inviteLink();
+  await dana.join(link, SERVER);
+  await dana.openChannel('general');
+  await dana.$('#messages .history-hidden', { hasText: 'Messages from before you joined are hidden in this server' }).waitFor();
+  check(!(await dana.message('quince jam').count()), 'Dana should not get a message from before she joined.');
+  check(!(await dana.$('#messages .msg-text.undecryptable').count()), 'Dana should see one line, not rows of messages she can’t open.');
+  // After she joined: both ways (her key arrives once the apps have switched).
+  await bob.send('After dana joined: fig');
+  await dana.message('After dana joined: fig').waitFor();
+  await dana.send('Hello again from dana: date');
+  await bob.message('Hello again from dana: date').waitFor();
+  await alice.message('Hello again from dana: date').waitFor();
+  check(!(await dana.$('#messages .msg-text.undecryptable').count()), 'Everything Dana is shown should open.');
+  // The Lounge's chat too.
+  await dana.channelRow('Lounge').click({ button: 'right' });
+  await dana.menuItem('Open chat').click();
+  await dana.$('#messages .history-hidden').waitFor();
+  check(!(await dana.message('medlar').count()), 'Dana should not get the Lounge chat from before she joined.');
+  check(!(await dana.$('#messages .msg-text.undecryptable').count()), 'No locked rows in the Lounge chat either.');
+  // Members who were there all along keep everything.
+  check(!(await alice.$('#messages .history-hidden').count()), 'Alice was in before: nothing is hidden for her.');
+  check(!!(await alice.message('Before dana came back: quince jam').count()), 'Alice still reads what came before.');
+  await dana.close();
+
+  // Off again, for whoever joins after this.
+  await bob.serverMenu('Server settings');
+  await ss.locator('.toggle-row', { hasText: setting }).locator('.switch').click();
+  await bob.toast('New members can read earlier messages again.');
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -2976,4 +3049,5 @@ export const FLOWS = [
   ['message binding: nothing earlier flagged; a reply moved, a message re-dated, replayed and rolled back in the database are each flagged after a reload, with details; deleting a copy clears the other', messageBinding],
   ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
   ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off', wordFilter],
+  ['join history: new members can’t read back (setting, audit log); someone joining again sees one line instead of locked rows, in a channel and a voice chat; later messages both ways', joinHistory],
 ];

@@ -832,7 +832,10 @@ function securitySections(app) {
         const st = app.sec.stateOf(sv.id);
         const held = app.sec.heldEpochs(sv.id);
         const ok = !st || !st.keyEpoch || held.includes(st.keyEpoch);
-        return { name: sv.name || 'group chat', ok, why: ok ? '' : 'waiting for another member to share it (happens automatically when one is online)' };
+        // Joined a server that hides older messages from new members: their key is the next one, not shared.
+        const fresh = st && st.since && st.since.epoch > st.keyEpoch;
+        return { name: sv.name || 'group chat', ok, why: ok ? '' : fresh ? 'your key is on its way: this server gives new members a fresh key, which can take a few minutes'
+          : 'waiting for another member to share it (happens automatically when one is online)' };
       });
       const mine = await runAccountChecks({ me: S.me, privateKey: S.privateKey, signKey: S.signKey, serverKeys });
       const all = [...generic, ...mine];

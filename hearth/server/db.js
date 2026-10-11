@@ -1565,6 +1565,22 @@ CREATE TABLE IF NOT EXISTS word_filters (
 `);
 addColumn('servers', 'word_filter', 'TEXT');
 
+// v19 (join history): "New members can't read messages from before they joined", a server setting (off by default;
+// server/joinhistory.js). hide_history: the setting. join_rotate_at: when a join that's waiting for the next key may
+// have it (joins close together share one new key; NULL when nobody is waiting). members.key_from: for someone who
+// joined while it was on, the first key epoch they may hold (their history starts at joined_at with that key); NULL
+// for everyone else, who see everything as before. It belongs to the membership, so leaving takes it with the row.
+// The partial indexes only hold those members: the one live events check per message, and the ones a message from
+// before some people joined is kept from.
+addColumn('servers', 'hide_history', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('servers', 'join_rotate_at', 'INTEGER');
+addColumn('members', 'key_from', 'INTEGER');
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_members_key_from ON members(server_id, key_from) WHERE key_from IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_members_history_joined ON members(server_id, joined_at) WHERE key_from IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_servers_join_rotate ON servers(join_rotate_at) WHERE join_rotate_at IS NOT NULL;
+`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;
