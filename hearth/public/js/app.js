@@ -3563,23 +3563,29 @@ function openLinkFromHash() {
 // skips calls you're already in, Do Not Disturb and rings already showing). Only calls the server rings ring here
 // (a DM call with the other person in it, a group chat's call), so a #call/ link to a server's voice channel,
 // which anyone can post, never shows a made-up "incoming call" from whoever is sitting in it.
-function openCallFromLink(room) {
-  const inCall = (userId) => (S.voice[room] || []).some((x) => x.userId === userId);
+// The room passed on is rebuilt from our own list of DMs and channels, never the link's text.
+function openCallFromLink(link) {
+  const inCall = (room, userId) => (S.voice[room] || []).some((x) => x.userId === userId);
+  let room = null;
   let from = null;
-  if (room.startsWith('dm:')) {
-    const d = S.dms.find((x) => x.id === room.slice(3));
+  if (link.startsWith('dm:')) {
+    const d = S.dms.find((x) => x.id === link.slice(3));
     if (!d) return toast('That call isn\u2019t available.');
     openDm(d.id);
-    if (d.userId && inCall(d.userId)) from = d.userId;
+    room = 'dm:' + d.id;
+    if (d.userId && inCall(room, d.userId)) from = d.userId;
   } else {
-    const s = serverOfChannel(room);
+    const s = serverOfChannel(link);
     if (!s) return toast('You don\u2019t have access to that call.');
     const c = textChannel(s);
     if (c) openChannel(c.id, s.id);
-    const ch = channelById(room);
-    if (isGroup(s) && ch && ch.type === 'voice') from = ((S.voice[room] || []).find((x) => x.userId !== S.me.id) || {}).userId || null;
+    const ch = channelById(link);
+    if (isGroup(s) && ch && ch.type === 'voice') {
+      room = ch.id;
+      from = ((S.voice[room] || []).find((x) => x.userId !== S.me.id) || {}).userId || null;
+    }
   }
-  if (from && !(voice && voice.channelId === room)) onRing({ room, from, video: false });
+  if (room && from && !(voice && voice.channelId === room)) onRing({ room, from, video: false });
 }
 
 // ---- message actions

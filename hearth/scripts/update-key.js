@@ -104,12 +104,24 @@ function privateKey(opt, env) {
 function keygen(opt) {
   const keyFile = path.resolve(opt.key || DEFAULT_KEY);
   const pubFile = path.resolve(opt.pub || DEFAULT_PUB);
-  if (fs.existsSync(keyFile)) throw new Fail(`${keyFile} already exists. Keep using it, or move it away first: a new key means servers that pinned the old one refuse updates signed with the new one (docs/SIGNING.md, "Changing the key").`);
-  const replacing = fs.existsSync(pubFile);
   const k = U.generateKeys();
   fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(keyFile, k.privateKeyPem, { mode: 0o600, flag: 'wx' });
-  fs.writeFileSync(pubFile, pubFileText(k.publicKey));
+  // Opening with 'wx' is the existence check, so nothing can slip a file in between a check and the write.
+  let fd;
+  try { fd = fs.openSync(keyFile, 'wx', 0o600); } catch (e) {
+    if (e.code === 'EEXIST') throw new Fail(`${keyFile} already exists. Keep using it, or move it away first: a new key means servers that pinned the old one refuse updates signed with the new one (docs/SIGNING.md, "Changing the key").`);
+    throw e;
+  }
+  try { fs.writeFileSync(fd, k.privateKeyPem); } finally { fs.closeSync(fd); }
+  // Same for the public key: open it once and learn from that open whether one was there.
+  let replacing = true;
+  let pfd;
+  try { pfd = fs.openSync(pubFile, 'r+'); } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    replacing = false;
+    pfd = fs.openSync(pubFile, 'wx');
+  }
+  try { fs.ftruncateSync(pfd, 0); fs.writeSync(pfd, pubFileText(k.publicKey), 0); } finally { fs.closeSync(pfd); }
   console.log(`Private key: ${keyFile} (only you can read it). Back it up somewhere safe and offline; never commit it.`);
   console.log(`Public key:  ${pubFile}\n             ${k.publicKey}`);
   if (replacing) console.log(`This replaced the old public key: sign the next update with the OLD private key and name the new one (bash scripts/make-update-zip.sh --new-key "${keyFile}"), so servers accept the change (docs/SIGNING.md, "Changing the key").`);

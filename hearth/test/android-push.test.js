@@ -693,9 +693,11 @@ test('android-push-20: a new page ends the call notification; "Change" lists eve
   // #call/ links: a ring card only for a DM call with the other person in it, or a group chat's call.
   const js = read('public', 'js', 'app.js');
   const link = js.slice(js.indexOf('function openCallFromLink('), js.indexOf('// ---- message actions'));
-  assert.match(link, /if \(d\.userId && inCall\(d\.userId\)\) from = d\.userId;/);
-  assert.match(link, /if \(isGroup\(s\) && ch && ch\.type === 'voice'\) from =/);
-  assert.match(link, /if \(from && !\(voice && voice\.channelId === room\)\) onRing\(\{ room, from, video: false \}\);/);
+  assert.match(link, /if \(d\.userId && inCall\(room, d\.userId\)\) from = d\.userId;/);
+  assert.match(link, /if \(isGroup\(s\) && ch && ch\.type === 'voice'\) \{\s*room = ch\.id;\s*from =/);
+  // The ringing room comes from our own DM and channel lists, not the link's text.
+  assert.match(link, /room = 'dm:' \+ d\.id;/);
+  assert.match(link, /if \(room && from && !\(voice && voice\.channelId === room\)\) onRing\(\{ room, from, video: false \}\);/);
   // The call notification names who or where only with previews set to "names" (Android shows it locked too).
   const title = js.slice(js.indexOf('function callTitle('), js.indexOf('function roomTitle('));
   assert.match(title, /if \(\(S\.notifySettings \|\| \{\}\)\.previews !== 'names'\) return 'In a call';/);
