@@ -122,3 +122,12 @@ The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-
   native code, CI). Waiting on a device test (mobile/README.md, "Not yet tested on a device") before an `app-v*`
   release. Left for later: the optional built-in Google push flavour, "dismiss" pushes for notifications read
   elsewhere, and signed payloads (docs/design/ANDROID-PUSH.md §15, §16.2).
+
+- The runners-up are built (schema v19; FEATURES.md, SECURITY.md rows 114–127): drag-and-drop channels and
+  categories (Move up / Move down from the keyboard), automatic Away and custom statuses that clear themselves, text
+  chat in voice channels, scheduled messages (Send later) and per-server nicknames. Notable limits: categories are
+  labels, not locks; Away reaches everyone on the instance as it happens, and in a browser only input in a Hearth
+  tab counts; everyone who can see a voice channel can read its chat, and the upgrade carries over only per-channel
+  limits on posting; the server holds scheduled messages until their time and is trusted with it, and Export my
+  data leaves out ones not sent yet; nicknames aren't in search's `from:` or bot events yet, and display names
+  don't drop invisible characters the way nicknames do.
