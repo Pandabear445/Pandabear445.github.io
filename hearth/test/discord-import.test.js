@@ -47,7 +47,10 @@ test('discord import: a preview returns the plan and the report, and creates not
   assert.equal(plan.channels.reduce((n, c) => n + c.overrides, 0), 10);
   assert.deepEqual(plan.channels.find((c) => c.name === 'announcements').notes, ['renamed', 'announcement']);
   // What won't come over is there before anything exists: permissions, channel kinds and settings.
-  assert.ok(plan.report.lost.some((l) => l.bit === 'MANAGE_NICKNAMES' && l.where.includes('Moderator')));
+  assert.ok(plan.report.lost.some((l) => l.bit === 'MANAGE_THREADS' && l.where.includes('Moderator')));
+  // Nicknames come over (Change Nickname for @everyone, Manage Nicknames for the moderators), so they aren't listed.
+  assert.ok(!plan.report.lost.some((l) => l.bit === 'MANAGE_NICKNAMES' || l.bit === 'CHANGE_NICKNAME'));
+  assert.ok(plan.roles.find((x) => x.name === 'Moderator').permissions & PERMS.MANAGE_NICKNAMES);
   // View Audit Log comes over as each server's own audit log, so it isn't listed as lost.
   assert.ok(!plan.report.lost.some((l) => l.bit === 'VIEW_AUDIT_LOG'));
   assert.ok(plan.roles.find((x) => x.name === 'Moderator').permissions & PERMS.VIEW_AUDIT_LOG);

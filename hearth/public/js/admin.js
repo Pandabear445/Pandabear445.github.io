@@ -162,6 +162,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('div', null, h('span', { class: 'field-label' }, 'Reported'), userCell(r.target, openUser), h('div', { class: 'ip-list' }, ...r.targetIps.map(ipChip))),
           h('div', null, h('span', { class: 'field-label' }, 'By'), userCell(r.reporter, openUser), r.reporterIp ? h('div', { class: 'ip-list' }, ipChip(r.reporterIp)) : null)),
         r.context.kind === 'message' ? h('p', { class: 'stat-sub' }, r.context.dmId ? 'In a direct message' : `In #${r.context.channelName} \u00b7 ${r.context.serverName}`) : h('p', { class: 'stat-sub' }, 'Report about the account'),
+        // The nickname they had in that server when reported (members saw it instead of their display name).
+        r.context.targetNickname ? h('p', { class: 'stat-sub' }, `Their nickname in ${r.context.serverName || 'that server'}: \u201C${r.context.targetNickname}\u201D`) : null,
         r.details ? h('blockquote', { class: 'report-details' }, r.details) : null,
         r.evidence.length ? h('div', { class: 'evidence' },
           h('p', { class: 'field-hint' }, 'Messages shared by the reporter from their device. Who sent them and when is checked by the server; the wording comes from the reporter.'),

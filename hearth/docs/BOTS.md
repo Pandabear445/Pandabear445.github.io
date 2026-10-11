@@ -93,7 +93,7 @@ Base URL: `https://<your hearth>/api/bot/v1`. JSON in and out. Every error looks
 - `GET /me` → `{ id, username, name, description, avatar, requestedScopes, token: { id, installationId }, webhook }`
 - `GET /installations` → `{ installations: [{ id, serverId, serverName, scopes, allChannels, channelIds, events, enabled, createdAt }] }`
 - `GET /installations/:id/channels` (`channels.read`) → `{ channels: [{ id, name, type, topic, category }] }`
-- `GET /installations/:id/members?after=<userId>` (`members.read`) → `{ members: [{ id, username, displayName, joinedAt }], next }` (1000 per page)
+- `GET /installations/:id/members?after=<userId>` (`members.read`) → `{ members: [{ id, username, displayName, nickname, joinedAt }], next }` (1000 per page; `nickname` is what they go by in this server, or null)
 
 ### Messages
 

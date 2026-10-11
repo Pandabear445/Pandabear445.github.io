@@ -689,15 +689,18 @@ CREATE TRIGGER IF NOT EXISTS admin_log_no_delete BEFORE DELETE ON admin_log BEGI
 // bulk (invites, pins, reordering, settings: everything but SERVER_AUDIT_KEPT) go whatever their age, and beyond
 // the newest 200,000 everything does.
 // Moderation, which stays for at least a week below 200,000: what was done to people (roles given or taken by
-// someone else; not ones members picked themselves or got with a membership), their messages, permissions and roles,
-// ownership, webhooks and bots.
+// someone else; not ones members picked themselves or got with a membership; nicknames changed by someone else, not
+// their own), their messages, permissions and roles, ownership, webhooks and bots.
 const SERVER_AUDIT_KEPT = ['member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles',
-  'message_delete', 'message_bulk_delete', 'channel_overrides', 'channel_delete', 'role_create', 'role_update', 'role_delete',
+  'member_nickname', 'message_delete', 'message_bulk_delete', 'channel_overrides', 'channel_delete', 'role_create', 'role_update', 'role_delete',
   'server_transfer', 'voice_disconnect', 'voice_move', 'voice_mute', 'voice_unmute',
   'webhook_create', 'webhook_update', 'webhook_rotate', 'webhook_delete', 'bot_add', 'bot_update', 'bot_remove'];
-// The same rule as SQL, for the trigger below and the retention job (p: 'OLD.' or '').
+// The same rule as SQL, for the trigger below and the retention job (p: 'OLD.' or ''). A nickname reset by instance
+// staff (no actor) counts as moderation, hence IS rather than = (NULL = x is NULL, which the trigger and the job
+// would each read their own way); a role with no actor came with a membership.
 const serverAuditKeptSql = (p = '') => `(${p}action IN (${SERVER_AUDIT_KEPT.map((a) => `'${a}'`).join(', ')})
-    AND NOT (${p}action = 'member_roles' AND (${p}actor_id IS NULL OR ${p}actor_id = ${p}target_id)))`;
+    AND NOT (${p}action = 'member_roles' AND (${p}actor_id IS NULL OR ${p}actor_id = ${p}target_id))
+    AND NOT (${p}action = 'member_nickname' AND ${p}actor_id IS ${p}target_id))`;
 db.exec(`
 CREATE TABLE IF NOT EXISTS server_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1504,6 +1507,17 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_messages(status, send_
 CREATE INDEX IF NOT EXISTS idx_scheduled_user ON scheduled_messages(user_id, send_at);
 CREATE INDEX IF NOT EXISTS idx_scheduled_server ON scheduled_messages(server_id, status) WHERE server_id IS NOT NULL;
 `);
+
+// v19 (nicknames): the name someone goes by in one server (server/nicknames.js); NULL for none, so their display
+// name shows there. It belongs to the membership: leaving, a kick or a ban takes it away with the row.
+addColumn('members', 'nickname', 'TEXT');
+// Everyone may set their own nickname by default (Change Nickname is in @everyone for new servers). Servers from
+// before this version get it once, as they upgrade to it, so it's on for them too. This never runs again on a
+// database already at v19, so a server that turns it off later keeps it off.
+if (hasData && fromVersion < 19) {
+  db.prepare("UPDATE roles SET permissions = permissions | ? WHERE id = server_id AND server_id IN (SELECT id FROM servers WHERE COALESCE(kind, 'server') != 'group')")
+    .run(PERMS.CHANGE_NICKNAME);
+}
 
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');

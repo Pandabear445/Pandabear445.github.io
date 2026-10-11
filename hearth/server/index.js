@@ -297,7 +297,14 @@ const NEWS_BOT_ID = require('./newsbot').BOT_ID;
 // not once per member (that made a big server's updates cost members × members).
 function serverCommon(s) {
   const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id);
-  const memberIds = db.prepare('SELECT user_id FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id).map((r) => r.user_id);
+  // Members, and the nicknames they go by here (server/nicknames.js: { userId: nickname }, only those who set one;
+  // group chats have none).
+  const memberIds = [];
+  const nicknames = {};
+  for (const r of db.prepare('SELECT user_id, nickname FROM members WHERE server_id = ? ORDER BY joined_at').all(s.id)) {
+    memberIds.push(r.user_id);
+    if (r.nickname && s.kind !== 'group') nicknames[r.user_id] = r.nickname;
+  }
   const memberRoles = {};
   db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
     WHERE mr.server_id = ?`).all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
@@ -309,7 +316,7 @@ function serverCommon(s) {
   const emojis = db.prepare('SELECT id, name, url, animated FROM emojis WHERE server_id = ? ORDER BY name').all(s.id).map((e) => ({ ...e, animated: !!e.animated }));
   const categoryOrder = ORDER.parseOrder(s.category_order);
   const out = {
-    channels, memberIds, memberRoles, roleDefs, emojis, categoryOrder,
+    channels, memberIds, nicknames, memberRoles, roleDefs, emojis, categoryOrder,
     // Bots working for this server (shown in the member list like on Discord): the news bot while it follows
     // something, and the bots installed here (server/bots.js).
     bots: [...(db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : []), ...(BOTS ? BOTS.serverBots(s.id) : [])],
@@ -358,7 +365,7 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
   // Only the categories this member has a channel in: a category of private channels doesn't give its name away.
   const cats = new Set(channels.map(ORDER.catOf));
   const out = {
-    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: common.memberIds,
+    id: s.id, name: s.name, icon: s.icon, ownerId: s.owner_id, kind: s.kind || 'server', channels, memberIds: common.memberIds, nicknames: common.nicknames,
     roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder.filter((k) => cats.has(k)),
     bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
   };
@@ -1599,6 +1606,9 @@ let DIS = null; // server/disappear.js: disappearing messages
 let SELF = null; // server/selfroles.js
 let PRES = null; // server/presence.js
 let SCHED = null; // server/scheduled.js
+let NICK = null; // server/nicknames.js
+// What someone is called in a server's notifications: their nickname there, else their display name.
+const nameIn = (serverId, uid) => (NICK && NICK.nicknameOf(serverId, uid)) || nameOf(uid);
 function pushTo(userIds, payload, what = { kind: 'other' }) {
   if (!vapid) return;
   const ids = [...new Set(userIds)];
@@ -3041,16 +3051,18 @@ function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, ever
     return pushTo(members.filter((u) => !named.has(u)), { title: nameOf(senderId), body: srv.name ? `New message in ${srv.name}` : 'New message in your group', ...base }, what('group'));
   }
   const where = `${c.type === 'voice' ? '\uD83D\uDD0A ' : '#'}${c.name} \u00b7 ${srv.name}`;
-  pushTo(mentioned, { title: `${nameOf(senderId)} mentioned you`, body: where, ...base }, what('mention'));
-  pushTo(replied, { title: `${nameOf(senderId)} replied to you`, body: where, ...base }, what('reply'));
+  // In a server, the sender goes by their nickname there (group chats have none).
+  const sender = nameIn(srv.id, senderId);
+  pushTo(mentioned, { title: `${sender} mentioned you`, body: where, ...base }, what('mention'));
+  pushTo(replied, { title: `${sender} replied to you`, body: where, ...base }, what('reply'));
   const told = new Set([...mentioned, ...replied]);
-  if (pingAll) pushTo(members.filter((u) => !told.has(u) && reaches(u)), { title: `${nameOf(senderId)} mentioned everyone`, body: where, ...base }, what('everyone'));
+  if (pingAll) pushTo(members.filter((u) => !told.has(u) && reaches(u)), { title: `${sender} mentioned everyone`, body: where, ...base }, what('everyone'));
   // People who picked "All messages" for this channel or server hear about the rest too. A voice channel's chat only
   // reaches those of them who follow it (see followsVoiceChat): a server set to "All messages" doesn't buzz for
   // every line said next to a call nobody asked to hear about.
   if (USE && !threadId && !pingAll) {
     pushTo(USE.wantsAll(srv, c).filter((u) => u !== senderId && !told.has(u) && reaches(u) && (c.type !== 'voice' || followsVoiceChat(c, u))),
-      { title: nameOf(senderId), body: where, ...base }, what('message'));
+      { title: sender, body: where, ...base }, what('message'));
   }
 }
 // v19 (voice chat): who follows a voice channel's chat. People in its call, people who opened it (opening it,
@@ -4888,6 +4900,9 @@ api.post('/reports', auth, (req, res) => {
     const ms = SA.memberServer(ctx.serverId, req.userId, targetId);
     if (ms) { inServer = ms; Object.assign(context, { serverId: ms.id, serverName: ms.name }); }
   }
+  // The name they went by in that server when reported (server/nicknames.js), so staff see what members saw.
+  const nick = inServer && NICK ? NICK.nicknameOf(inServer.id, targetId) : null;
+  if (nick) context.targetNickname = nick;
   // The server's moderators see it too, unless the reporter unticked that (or it's for instance staff alone).
   const toServer = inServer && SA.shares(category, b.toServer === false) ? inServer.id : null;
   // Reporting the same message again while staff haven't closed the first report adds nothing: the first one stands.
@@ -5049,10 +5064,12 @@ api.delete('/admin/notes/:id', auth, staffOnly, (req, res) => {
   adminLog(req, 'note_deleted', n.user_id);
   res.json({ ok: true });
 });
-// Clear an offensive profile: pictures, song, name, bio, status and links go back to the defaults.
+// Clear an offensive profile: pictures, song, name, bio, status and links go back to the defaults, and the
+// nicknames they set in servers go too (server/nicknames.js).
 api.post('/admin/users/:id/reset-profile', auth, staffOnly, (req, res) => {
   const r = requireOutranks(req, req.params.id);
   db.prepare("UPDATE users SET avatar = NULL, banner = NULL, background = NULL, song = NULL, page_bg = NULL, page = NULL, profile = '{}' WHERE id = ?").run(r.id);
+  NICK.clearAll(r.id);
   [r.avatar, r.banner, r.background, r.song, r.page_bg].forEach((u) => removeUpload(u));
   broadcastUser(r.id);
   adminLog(req, 'profile_reset', r.id, r.username);
@@ -5804,6 +5821,9 @@ SCHED = require('./scheduled')({ api, auth, db, fail, rateLimit, limitMessages, 
   // Voice channels' chats take scheduled messages like text channels; the disappearing timer a message was encrypted
   // for is checked when it's scheduled, as when it's sent (server/disappear.js).
   hasChat, checkTtl: (body, secs) => DIS.checkTtl(body, secs) });
+// Per-server nicknames (server/nicknames.js).
+NICK = require('./nicknames')({ api, auth, db, fail, rateLimit, limitNet, requireServer, isMember, perms, PM, ALL: ALL_PERMS, checkWords, requireUnlocked,
+  serverAudit, getIo: () => io });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();

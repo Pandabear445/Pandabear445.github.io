@@ -4,7 +4,8 @@ export const PERMS = {
   MENTION_EVERYONE: 1 << 4, MANAGE_MESSAGES: 1 << 5, CONNECT: 1 << 6, SPEAK: 1 << 7,
   CREATE_INVITE: 1 << 8, KICK_MEMBERS: 1 << 9, BAN_MEMBERS: 1 << 10, MANAGE_CHANNELS: 1 << 11,
   MANAGE_ROLES: 1 << 12, MANAGE_SERVER: 1 << 13, MANAGE_EMOJIS: 1 << 14, CREATE_THREADS: 1 << 15,
-  EMBED_LINKS: 1 << 16, MUTE_MEMBERS: 1 << 17, MOVE_MEMBERS: 1 << 18, VIEW_AUDIT_LOG: 1 << 19, ADMINISTRATOR: 1 << 30,
+  EMBED_LINKS: 1 << 16, MUTE_MEMBERS: 1 << 17, MOVE_MEMBERS: 1 << 18, VIEW_AUDIT_LOG: 1 << 19,
+  CHANGE_NICKNAME: 1 << 20, MANAGE_NICKNAMES: 1 << 21, ADMINISTRATOR: 1 << 30,
 };
 const P = PERMS;
 export const PERM_GROUPS = [
@@ -18,6 +19,8 @@ export const PERM_GROUPS = [
     ['CREATE_INVITE', 'Create invites', 'Invite new people.', true],
   ]],
   ['Members', [
+    ['CHANGE_NICKNAME', 'Change nickname', 'Set their own nickname in this server. DMs and profiles still show their display name.', false],
+    ['MANAGE_NICKNAMES', 'Manage nicknames', 'Change or reset the nicknames of people below them.', false],
     ['KICK_MEMBERS', 'Kick members', 'Remove people below them. They can rejoin with an invite.', false],
     ['BAN_MEMBERS', 'Ban members', 'Remove people below them and stop them from rejoining.', false],
   ]],

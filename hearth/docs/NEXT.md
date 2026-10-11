@@ -39,6 +39,7 @@ Suggested order:
 - Announcement channels: the one-click read-only override.
 - A basic stage: listen-only voice through the Speak permission.
 - Moderation: slow mode, and timeouts that survive rejoining.
+- Per-server nicknames (Change Nickname and Manage Nicknames), shown only inside that server.
 - Invites: they can expire and have a use limit.
 - Events: RSVP, reminders and .ics export.
 - Messaging:

@@ -696,8 +696,8 @@ module.exports = function setupUsability(ctx) {
     const uid = req.userId;
     const me = getUserRow(uid);
     const person = (id) => { const r = getUserRow(id); return r ? { id: r.id, username: r.username, displayName: nameOf(id) } : { id }; };
-    const servers = db.prepare('SELECT s.*, m.joined_at FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ? ORDER BY m.joined_at').all(uid).map((s) => ({
-      id: s.id, name: s.name, kind: s.kind || 'server', joinedAt: s.joined_at, owner: s.owner_id === uid,
+    const servers = db.prepare('SELECT s.*, m.joined_at, m.nickname AS my_nickname FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ? ORDER BY m.joined_at').all(uid).map((s) => ({
+      id: s.id, name: s.name, kind: s.kind || 'server', joinedAt: s.joined_at, owner: s.owner_id === uid, nickname: s.my_nickname || undefined,
       roles: db.prepare('SELECT r.name FROM member_roles mr JOIN roles r ON r.id = mr.role_id WHERE mr.server_id = ? AND mr.user_id = ?').all(s.id, uid).map((r) => r.name),
       // Voice channels' chats (v19) are conversations too, and export like text channels.
       channels: chatChannels(s).sort((a, b) => a.position - b.position || a.created_at - b.created_at)

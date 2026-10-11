@@ -55,7 +55,7 @@ const SETTING = {
 // Kinds of entries for the filter (the server takes the action names).
 export const AUDIT_KINDS = [
   ['', 'Everything'],
-  ['members', 'Members', ['member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles']],
+  ['members', 'Members', ['member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles', 'member_nickname']],
   ['messages', 'Messages', ['message_delete', 'message_bulk_delete', 'message_pin', 'message_unpin']],
   ['roles', 'Roles', ['role_create', 'role_update', 'role_delete', 'role_reorder']],
   ['channels', 'Channels and permissions', ['channel_create', 'channel_update', 'channel_delete', 'channel_reorder', 'channel_overrides', 'category_reorder', 'category_rename']],
@@ -116,6 +116,17 @@ export function sentence(e, users) {
       if (d.self) return [[them, add.length ? ` picked the role ${list(add)}` : ` dropped the role ${list(rem)}`], d.last ? 'They changed their roles a lot: more changes this hour aren’t listed.' : null];
       if (d.membership) return [[them, add.length ? ` got ${list(add)} with their membership` : '', add.length && rem.length ? ' and' : '', rem.length ? ` lost ${list(rem)} as their membership ended` : '']];
       return [[who, add.length ? ` gave ${list(add)} to ` : ' took ', ...(add.length ? [them] : [list(rem), ' away from ', them]), add.length && rem.length ? ` and took away ${list(rem)}` : '']];
+    }
+    // Nicknames (server/nicknames.js): people's own, a moderator's, or instance staff clearing them with a profile.
+    // Once the person's account is deleted, the server leaves the names out (erased).
+    case 'member_nickname': {
+      const from = d.from ? quoted(d.from) : null; const to = d.to ? quoted(d.to) : null;
+      if (d.erased) return [d.self ? [them, ' changed their nickname'] : [who, ' changed the nickname of ', them], 'The names aren\u2019t shown: their account was deleted.'];
+      if (d.self) {
+        return [to ? (from ? [them, ` changed their nickname from ${from} to ${to}`] : [them, ` set their nickname to ${to}`]) : [them, ` removed their nickname${from ? ` (${from})` : ''}`]];
+      }
+      if (!to) return [[who, ' removed the nickname of ', them, from ? ` (${from})` : ''], d.staff ? 'Their profile was reset by staff.' : null];
+      return [from ? [who, ' changed the nickname of ', them, ` from ${from} to ${to}`] : [who, ' gave ', them, ` the nickname ${to}`]];
     }
     case 'message_delete': return [[who, d.staff ? ' removed a reported message by ' : ` deleted a ${d.thread ? 'thread reply' : 'message'} by `, them, ` in ${ch}`]];
     case 'message_bulk_delete': return [[who, ` deleted ${plural(d.count || 0, 'message', 'messages')} at once in ${ch}`, d.replies ? ` (and ${plural(d.replies, 'thread reply', 'thread replies')})` : ''],

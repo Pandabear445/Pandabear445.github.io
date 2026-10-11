@@ -52,7 +52,7 @@ const WHY_LOST = {
   MODERATE_MEMBERS: 'in Hearth, timeouts need Kick members', MANAGE_EVENTS: 'in Hearth it’s part of Manage server and Manage channels',
   MANAGE_WEBHOOKS: 'in Hearth it’s part of Manage channels', CREATE_GUILD_EXPRESSIONS: 'in Hearth it’s part of Manage emoji',
   CREATE_PUBLIC_THREADS: 'Hearth’s Reply in threads needs both thread permissions', SEND_MESSAGES_IN_THREADS: 'Hearth’s Reply in threads needs both thread permissions',
-  CHANGE_NICKNAME: 'Hearth has no per-server nicknames', MANAGE_NICKNAMES: 'Hearth has no per-server nicknames',
+  CHANGE_NICKNAME: 'only for the whole server', MANAGE_NICKNAMES: 'only for the whole server',
   CREATE_INSTANT_INVITE: 'Hearth invites are for the whole server', MUTE_MEMBERS: 'a Hearth server mute holds in every voice channel',
   KICK_MEMBERS: 'only for the whole server', BAN_MEMBERS: 'only for the whole server',
   // Granted in one channel only (these come over, but do less there than in Discord).

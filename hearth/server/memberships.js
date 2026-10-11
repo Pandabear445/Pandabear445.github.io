@@ -21,7 +21,7 @@ module.exports = function setupMemberships(ctx) {
   const MAX_TIERS = 5;
   // A role you can buy can't come with moderator powers. Reading the audit log counts: it shows who moderated whom.
   const POWERFUL = PM.ADMINISTRATOR | PM.MANAGE_SERVER | PM.MANAGE_ROLES | PM.MANAGE_CHANNELS | PM.MANAGE_MESSAGES
-    | PM.MANAGE_EMOJIS | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MUTE_MEMBERS | PM.MOVE_MEMBERS | PM.VIEW_AUDIT_LOG;
+    | PM.MANAGE_EMOJIS | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MUTE_MEMBERS | PM.MOVE_MEMBERS | PM.VIEW_AUDIT_LOG | PM.MANAGE_NICKNAMES;
   const LIVE = ['active', 'past_due']; // past_due: Stripe is still retrying the card, so they keep access meanwhile
 
   // ------------------------------------------------------------------ settings (Admin → Money)

@@ -269,8 +269,8 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
     private if it was when deleted. Open Audit log tabs update live (`audit:watch`, `audit:new`, at most every
     2 seconds; the tab fetches at most every 3).
   - Append-only (database triggers), kept for a year and up to each server's newest 10,000 entries, never fewer
-    than the last 7 days. Beyond 50,000, only moderation stays (kicks, bans, timeouts, roles given by others,
-    deleted messages, permissions, roles, ownership, voice, webhooks, bots); beyond 200,000 nothing does
+    than the last 7 days. Beyond 50,000, only moderation stays (kicks, bans, timeouts, roles and nicknames changed
+    by others, deleted messages, permissions, roles, ownership, voice, webhooks, bots); beyond 200,000 nothing does
     (`serveraudit.prune`, hourly).
   - Invite creation is now limited (60 per 10 minutes per person), and so are revoking invites (60 per 10 minutes)
     and unbans (with bans, 30 a minute): each one is an entry, and a loop shouldn't bury the log. Making invites,
@@ -280,6 +280,36 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
     server's moderators (Server settings → Reports), without the reporter: category, note, and the reported
     person's own messages from the reporter's chosen evidence (the rest stays with staff). Moderators mark them handled or dismissed (their own `server_status`); staff keep their own status
     and see the moderators' in Admin → Reports. The reporter can opt out; child-safety reports are staff-only.
+- **Nicknames** (v19, `server/nicknames.js`): the name someone goes by in one server.
+  - Two new permissions: **Change Nickname** (`1 << 20`, your own; in @everyone by default, and given once to
+    @everyone of servers from before v19 when the database upgrades) and **Manage Nicknames** (`1 << 21`, other
+    people's, only below your highest role and never the owner's; a moderator power, so never on a role that's sold
+    or self-picked). Both are server-wide. A timeout takes Change Nickname away (`TALK`) and stops Manage Nicknames
+    too; group chats have no nicknames.
+  - `PUT /servers/:id/members/:uid/nickname { nickname }` sets one (empty or null removes it) and `DELETE` removes
+    it. 32 characters after trimming, the instance's word filter (checked with every invisible character removed),
+    control, direction and invisible (default-ignorable) characters dropped except zero-width joiners, variation
+    selectors and flag tag sequences, a name with nothing visible left refused, a locked profile refused for your
+    own. 20 a minute and 200 an hour per person, and your own set at most 10 times an hour per server (removing it
+    always works).
+  - Stored in `members.nickname`, so it goes when the person leaves. Every member's copy of the server has
+    `nicknames: { userId: nickname }`; changes go live as `member:nick { serverId, userId, nickname }` to the
+    server's room. The app shows them in that server only (member list, messages, replies, reactions, @mention
+    suggestions, typing, notifications, pins, threads, voice, voice channels' chats, the lines saying who changed
+    the disappearing-messages timer) and keeps the display name in DMs and profiles; a profile card opened in the
+    server adds a "Nickname in …" line. Push titles for server messages use it too (voice channels' chats included;
+    the Android app shows the push title as it comes). A scheduled message is posted as its sender, so readers see
+    the nickname they have when it goes out.
+  - Importing from Discord brings Change Nickname and Manage Nicknames over to the roles that had them (both
+    server-wide, as in Discord); they're no longer listed as lost (docs/IMPORT.md).
+  - Audit log: `member_nickname` with `from` and `to`, every change; your own are `self: true` (the 10-an-hour
+    limit on them refuses the change instead of leaving it out of the log, so no name goes unrecorded). Instance
+    staff resetting a profile clear its nicknames everywhere (`staff: true` entries). Once the person's account is
+    deleted, the listing leaves out `from` and `to` (`erased: true`): the append-only rows keep the strings until
+    retention removes them, but nobody reads them through the app. A member report made inside a server records
+    the nickname they had there for staff (`targetNickname`).
+  - Manage Nicknames reaches by role order, so self-assignable roles have to sit below every role with it, as with
+    Kick, Ban and Manage Roles (`server/selfroles.js` REACH).
 - **Reports**:
   - Reporters can see the status of their own reports (`GET /me/reports`, without staff notes).
   - Reporting the same message again while the first report is still open returns the existing report
@@ -303,6 +333,7 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
 | `POST/DELETE /servers/:id/members/:uid/timeout` | Kick Members + role order | audit-logged; 30/min |
 | `POST /servers/:id/voice/:uid/disconnect`, `/move` | Move Members (per channel) + role order | audit-logged; 60/min |
 | `POST/DELETE /servers/:id/voice/:uid/mute` | Mute Members (server-wide) + role order | audit-logged; 60/min |
+| `PUT/DELETE /servers/:id/members/:uid/nickname` | your own: Change Nickname or Manage Nicknames; others: Manage Nicknames + role order | audit-logged; 20/min, 200/hour; setting your own 10/hour per server |
 | `POST /channels/:id/messages/bulk-delete` | Manage Messages in the channel (text or voice) | 100 messages, 14 days; audit-logged; 10/min |
 | `POST /servers/:id/bans` `{ userId, reason, deleteHours }` | Ban Members + role order | cleanup audit-logged; 30/min |
 | `GET /me/reports` | session | your own only |

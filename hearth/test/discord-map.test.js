@@ -46,7 +46,8 @@ const TABLE = [
   ['BAN_MEMBERS', ['BAN_MEMBERS']], ['MANAGE_CHANNELS', ['MANAGE_CHANNELS']], ['MANAGE_ROLES', ['MANAGE_ROLES']],
   ['MANAGE_SERVER', ['MANAGE_GUILD']], ['MANAGE_EMOJIS', ['MANAGE_GUILD_EXPRESSIONS']],
   ['CREATE_THREADS', ['SEND_MESSAGES_IN_THREADS', 'CREATE_PUBLIC_THREADS']], ['EMBED_LINKS', ['EMBED_LINKS']],
-  ['MUTE_MEMBERS', ['MUTE_MEMBERS']], ['MOVE_MEMBERS', ['MOVE_MEMBERS']], ['VIEW_AUDIT_LOG', ['VIEW_AUDIT_LOG']], ['ADMINISTRATOR', ['ADMINISTRATOR']],
+  ['MUTE_MEMBERS', ['MUTE_MEMBERS']], ['MOVE_MEMBERS', ['MOVE_MEMBERS']], ['VIEW_AUDIT_LOG', ['VIEW_AUDIT_LOG']],
+  ['CHANGE_NICKNAME', ['CHANGE_NICKNAME']], ['MANAGE_NICKNAMES', ['MANAGE_NICKNAMES']], ['ADMINISTRATOR', ['ADMINISTRATOR']],
 ];
 
 test('mapRolePermissions maps every Hearth permission from its Discord permission, one at a time', () => {
@@ -69,9 +70,11 @@ test('mapRolePermissions: Reply in threads needs both SEND_MESSAGES_IN_THREADS a
 test('mapRolePermissions lists what Hearth has no permission for, unless a broader Hearth permission covers it', () => {
   const lostOf = (...n) => M.mapRolePermissions(bits(...n)).lost;
   assert.deepEqual(lostOf('VIEW_AUDIT_LOG', 'MANAGE_NICKNAMES', 'DEAFEN_MEMBERS', 'PRIORITY_SPEAKER', 'MANAGE_THREADS'),
-    ['PRIORITY_SPEAKER', 'DEAFEN_MEMBERS', 'MANAGE_NICKNAMES', 'MANAGE_THREADS']);
-  // View Audit Log has a Hearth equivalent (each server's own audit log), so it comes over instead of being lost.
-  assert.deepEqual(M.mapRolePermissions(bits('VIEW_AUDIT_LOG', 'MANAGE_NICKNAMES')), { permissions: H.VIEW_AUDIT_LOG, lost: ['MANAGE_NICKNAMES'] });
+    ['PRIORITY_SPEAKER', 'DEAFEN_MEMBERS', 'MANAGE_THREADS']);
+  // View Audit Log has a Hearth equivalent (each server's own audit log), so it comes over instead of being lost; so
+  // do Change Nickname and Manage Nicknames (per-server nicknames).
+  assert.deepEqual(M.mapRolePermissions(bits('VIEW_AUDIT_LOG', 'MANAGE_NICKNAMES')), { permissions: H.VIEW_AUDIT_LOG | H.MANAGE_NICKNAMES, lost: [] });
+  assert.deepEqual(M.mapRolePermissions(bits('CHANGE_NICKNAME')), { permissions: H.CHANGE_NICKNAME, lost: [] });
   // Pinning and skipping slowmode are part of Manage Messages in Hearth, timeouts part of Kick Members.
   assert.deepEqual(lostOf('PIN_MESSAGES', 'BYPASS_SLOWMODE', 'MODERATE_MEMBERS'), ['MODERATE_MEMBERS', 'PIN_MESSAGES', 'BYPASS_SLOWMODE']);
   assert.deepEqual(lostOf('PIN_MESSAGES', 'BYPASS_SLOWMODE', 'MANAGE_MESSAGES'), []);
@@ -130,10 +133,10 @@ test('mapOverwrite drops Create Invite and other server-wide permissions, and re
 // ------------------------------------------------------------------ the sample template
 test('planFromTemplate(sample): @everyone becomes Hearth\'s default, and what it loses or gains is listed', () => {
   const p = plan();
-  assert.equal(p.everyone.permissions, 98767);
+  assert.equal(p.everyone.permissions, 1147343);
   assert.equal(p.everyone.permissions, DEFAULT_EVERYONE);
   assert.equal(p.everyone.dangerous, false);
-  assert.deepEqual(p.everyone.lost, ['CHANGE_NICKNAME', 'REQUEST_TO_SPEAK', 'CREATE_PRIVATE_THREADS', 'USE_EXTERNAL_STICKERS', 'USE_SOUNDBOARD', 'USE_EXTERNAL_SOUNDS', 'USE_EXTERNAL_APPS']);
+  assert.deepEqual(p.everyone.lost, ['REQUEST_TO_SPEAK', 'CREATE_PRIVATE_THREADS', 'USE_EXTERNAL_STICKERS', 'USE_SOUNDBOARD', 'USE_EXTERNAL_SOUNDS', 'USE_EXTERNAL_APPS']);
   // In Hearth anyone who can post can make events; Discord's @everyone here couldn't.
   assert.deepEqual(p.everyone.widened, ['CREATE_EVENTS']);
   assert.equal(p.name, 'Pinecone Club');
@@ -148,7 +151,7 @@ test('planFromTemplate(sample): roles keep Discord order as positions 1..6, with
     ['2', 'Member', 2, 0, [], null],
     ['3', 'Event Host', 3, H.MENTION_EVERYONE, ['PRIORITY_SPEAKER', 'MANAGE_EVENTS'], null],
     ['4', 'Builder', 4, H.MANAGE_CHANNELS | H.MANAGE_ROLES | H.MANAGE_EMOJIS, [], null],
-    ['5', 'Moderator', 5, H.MENTION_EVERYONE | H.MANAGE_MESSAGES | H.KICK_MEMBERS | H.BAN_MEMBERS | H.MUTE_MEMBERS | H.MOVE_MEMBERS | H.VIEW_AUDIT_LOG, ['MANAGE_NICKNAMES', 'MANAGE_THREADS'], null],
+    ['5', 'Moderator', 5, H.MENTION_EVERYONE | H.MANAGE_MESSAGES | H.KICK_MEMBERS | H.BAN_MEMBERS | H.MUTE_MEMBERS | H.MOVE_MEMBERS | H.VIEW_AUDIT_LOG | H.MANAGE_NICKNAMES, ['MANAGE_THREADS'], null],
     ['6', 'Admin', 6, H.ADMINISTRATOR, [], null],
   ]);
   assert.equal(role(p, '6').admin, true);
@@ -260,8 +263,7 @@ test('planFromTemplate(sample): member overrides, NSFW, user limits, category pe
 test('planFromTemplate(sample): every Discord permission that can\'t come over is in the report, with who had it', () => {
   const p = plan();
   assert.deepEqual(p.report.lost, [
-    { bit: 'PRIORITY_SPEAKER', where: ['Event Host'] }, { bit: 'CHANGE_NICKNAME', where: ['@everyone'] },
-    { bit: 'MANAGE_NICKNAMES', where: ['Moderator'] }, { bit: 'REQUEST_TO_SPEAK', where: ['@everyone'] }, { bit: 'MANAGE_EVENTS', where: ['Event Host'] },
+    { bit: 'PRIORITY_SPEAKER', where: ['Event Host'] }, { bit: 'REQUEST_TO_SPEAK', where: ['@everyone'] }, { bit: 'MANAGE_EVENTS', where: ['Event Host'] },
     { bit: 'MANAGE_THREADS', where: ['Moderator'] }, { bit: 'CREATE_PRIVATE_THREADS', where: ['@everyone'] }, { bit: 'USE_EXTERNAL_STICKERS', where: ['@everyone'] },
     { bit: 'USE_SOUNDBOARD', where: ['@everyone'] }, { bit: 'USE_EXTERNAL_SOUNDS', where: ['@everyone'] }, { bit: 'USE_EXTERNAL_APPS', where: ['@everyone'] },
   ]);

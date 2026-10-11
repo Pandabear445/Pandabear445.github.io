@@ -504,9 +504,10 @@ module.exports = function setupBots(ctx) {
     needScope(inst, 'members.read');
     markOk(inst.id);
     const after = String(req.query.after || '');
-    const rows = db.prepare(`SELECT m.user_id, m.joined_at, u.username, u.profile FROM members m JOIN users u ON u.id = m.user_id
+    // nickname: what they go by in this server (server/nicknames.js), or null.
+    const rows = db.prepare(`SELECT m.user_id, m.joined_at, m.nickname, u.username, u.profile FROM members m JOIN users u ON u.id = m.user_id
         WHERE m.server_id = ? AND m.user_id > ? ORDER BY m.user_id LIMIT 1000`).all(inst.server_id, after);
-    res.json({ members: rows.map((r) => { let p = {}; try { p = JSON.parse(r.profile || '{}'); } catch { /* */ } return { id: r.user_id, username: r.username, displayName: p.displayName || r.username, joinedAt: r.joined_at }; }), next: rows.length === 1000 ? rows[rows.length - 1].user_id : null });
+    res.json({ members: rows.map((r) => { let p = {}; try { p = JSON.parse(r.profile || '{}'); } catch { /* */ } return { id: r.user_id, username: r.username, displayName: p.displayName || r.username, nickname: r.nickname || null, joinedAt: r.joined_at }; }), next: rows.length === 1000 ? rows[rows.length - 1].user_id : null });
   });
   // Message metadata (never content: people's messages are end-to-end encrypted, and other bots' posts aren't
   // this bot's business either).

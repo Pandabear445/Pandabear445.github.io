@@ -73,6 +73,9 @@ const MAP = [
   // Each server's own audit log (server/serveraudit.js): who kicked, banned or timed out whom, and who changed
   // roles, channels, permissions and settings, like Discord's. Server-wide only, in both.
   ['VIEW_AUDIT_LOG', ['VIEW_AUDIT_LOG']],
+  // Per-server nicknames (server/nicknames.js): your own, and other people's below you. Server-wide only, in both.
+  ['CHANGE_NICKNAME', ['CHANGE_NICKNAME']],
+  ['MANAGE_NICKNAMES', ['MANAGE_NICKNAMES']],
   ['ADMINISTRATOR', ['ADMINISTRATOR']],
 ].map(([h, ds]) => { const [lo, hi] = split(ds.reduce((m, d) => m | D(d), 0n)); return { hearth: P[h], lo, hi }; });
 

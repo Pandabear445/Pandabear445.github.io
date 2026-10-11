@@ -5,7 +5,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { startServer, hex } = require('./helpers');
 
-const P = { VIEW: 1, SEND: 2, MENTION_EVERYONE: 16, MANAGE_MESSAGES: 32, CONNECT: 64, SPEAK: 128, KICK: 1 << 9, BAN: 1 << 10, MANAGE_CHANNELS: 1 << 11, MANAGE_ROLES: 1 << 12, ADMIN: 1 << 30 };
+const P = { VIEW: 1, SEND: 2, MENTION_EVERYONE: 16, MANAGE_MESSAGES: 32, CONNECT: 64, SPEAK: 128, KICK: 1 << 9, BAN: 1 << 10, MANAGE_CHANNELS: 1 << 11, MANAGE_ROLES: 1 << 12, MANAGE_NICKNAMES: 1 << 21, ADMIN: 1 << 30 };
 let srv;
 const socks = [];
 const as = (u, method, p, body) => srv.api(method, p, { token: u.token, ip: u.ip, body });
@@ -327,7 +327,7 @@ test('selfroles: a moderator’s change touches only the role it names, so it ca
   assert.deepEqual(rolesOf(server.id, member.id), [regular.id]);
 });
 
-test('selfroles: only roles that can kick, ban or manage roles keep marked roles below them', async () => {
+test('selfroles: only roles that can kick, ban, manage roles or manage nicknames keep marked roles below them', async () => {
   const { owner, member, server, modRole, game, text } = await club();
   // Bottom of the list: a role that only manages emoji, and one that only manages messages in one channel.
   const emoji = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name: 'Emoji artist', permissions: 1 << 14 })).json;
@@ -340,7 +340,7 @@ test('selfroles: only roles that can kick, ban or manage roles keep marked roles
   // Neither of them reaches anyone (no kick, ban, timeout or role changes), so being above them changes nothing.
   assert.equal((await view(member, server.id)).roleDefs.find((x) => x.id === game.id).selfAssignIssue, undefined);
   // Each power that does check role order keeps marked roles below it.
-  for (const [name, bits] of [['kicker', P.KICK], ['banner', P.BAN], ['role-manager', P.MANAGE_ROLES], ['admin', P.ADMIN]]) {
+  for (const [name, bits] of [['kicker', P.KICK], ['banner', P.BAN], ['role-manager', P.MANAGE_ROLES], ['nickname-manager', P.MANAGE_NICKNAMES], ['admin', P.ADMIN]]) {
     const low = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name, permissions: bits })).json;
     const ids = (await view(owner, server.id)).roleDefs.filter((x) => !x.everyone && x.id !== low.id).map((x) => x.id);
     await as(owner, 'POST', `/servers/${server.id}/roles/order`, { ids: [...ids, low.id] });

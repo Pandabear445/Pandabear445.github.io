@@ -9,10 +9,10 @@
 // Nothing here hands out power:
 //   - a role with moderator powers or Mention @everyone (itself or through a channel override) can't be marked
 //     or picked, and a marked role can't be given them later (the role editor and channel permissions refuse);
-//   - a role that sits at or above a role that can kick, ban or manage roles (or is an Administrator) can't be
-//     picked: everyone who did would be out of that role's reach (kicks, bans, timeouts and role changes only work
-//     on people below you). Other powers (Manage Messages, Emojis, Channels, Server) don't look at role order, so
-//     roles that only have those don't count here;
+//   - a role that sits at or above a role that can kick, ban, manage roles or manage nicknames (or is an
+//     Administrator) can't be picked: everyone who did would be out of that role's reach (kicks, bans, timeouts,
+//     role changes and other people's nicknames only work on people below you). Other powers (Manage Messages,
+//     Emojis, Channels, Server) don't look at role order, so roles that only have those don't count here;
 //   - marking a role takes what giving it to anyone would take (PUT /servers/:id/members/:uid/roles): Manage
 //     Roles, the role below your highest one, and every permission it has, server-wide and in each channel;
 //   - a role sold as a membership can't be marked (it would be free), and a marked role can't be sold;
@@ -44,8 +44,9 @@ module.exports = function setupSelfRoles(ctx) {
 
   // The powers that only reach people below you (perms.top): kick, ban and timeouts (Kick), role changes and
   // channel overrides (Manage Roles, which the overrides route needs server-wide, so a channel override can't
-  // give this reach). Administrator has them all.
-  const REACH = PM.ADMINISTRATOR | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MANAGE_ROLES;
+  // give this reach), and other people's nicknames (Manage Nicknames, server-wide only: a nickname moderator's one
+  // tool against an abusive name, which a picked role would otherwise put out of reach). Administrator has them all.
+  const REACH = PM.ADMINISTRATOR | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MANAGE_ROLES | PM.MANAGE_NICKNAMES;
   // The lowest role with that reach, or null. @everyone doesn't count: it sits at the bottom and holding it puts
   // nobody above anyone.
   const lowestModRole = (s) => db.prepare('SELECT id, name, position FROM roles WHERE server_id = ? AND id != ? AND (permissions & ?) != 0 ORDER BY position LIMIT 1')
@@ -59,7 +60,7 @@ module.exports = function setupSelfRoles(ctx) {
     const tier = MEMB.tierForRole(r.id);
     if (tier) return `it’s sold as the "${tier.name}" membership`;
     if (MEMB.powerful({ ...r, permissions }, BLOCKED)) return 'it has moderator powers or Mention @everyone (itself or in a channel)';
-    if (low && low.id !== r.id && r.position >= low.position) return `it sits above "${low.name}", a role that can kick, ban or manage roles`;
+    if (low && low.id !== r.id && r.position >= low.position) return `it sits above "${low.name}", a role that can kick, ban, manage roles or manage nicknames`;
     return null;
   }
 

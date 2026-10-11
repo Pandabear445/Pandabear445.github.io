@@ -3,7 +3,9 @@
 // Audit log: once a server has more than one moderator, its owner needs to answer "who kicked Sam?" or "who changed
 // #general's permissions?" without asking the instance's staff. Every moderation action and settings change inside
 // a server is written here: kicks, bans and unbans (with how many messages a ban's cleanup deleted), timeouts, role
-// changes (self-picked ones marked as such), roles, channels, channel permissions, invites, emoji, webhooks, bots,
+// changes (self-picked ones marked as such), nicknames (server/nicknames.js: old and new, which every member could
+// see anyway; not shown once that person's account is deleted), roles, channels, channel permissions, invites,
+// emoji, webhooks, bots,
 // voice moderation, moderators deleting other people's messages (one at a time or in bulk), pins, server settings
 // and ownership. Many of these also go to the instance audit log (admin_log) as before; this is the server's own copy.
 //   - Metadata only: who, what, to whom, where and when. Never what a message said (the server can't read it anyway).
@@ -60,7 +62,7 @@ const ACTIONS = [
   'server_update', 'server_transfer', 'category_reorder', 'category_rename',
   'channel_create', 'channel_update', 'channel_delete', 'channel_reorder', 'channel_overrides',
   'role_create', 'role_update', 'role_delete', 'role_reorder',
-  'member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles',
+  'member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles', 'member_nickname',
   'message_delete', 'message_bulk_delete', 'message_pin', 'message_unpin',
   'invite_create', 'invite_revoke', 'emoji_create', 'emoji_rename', 'emoji_delete',
   'webhook_create', 'webhook_update', 'webhook_rotate', 'webhook_delete', 'bot_add', 'bot_update', 'bot_remove',
@@ -188,6 +190,13 @@ module.exports = function setupServerAudit(ctx) {
       return now.gone ? { name: x.name, deleted: true } : { hidden: true, deleted: true };
     };
     const userIds = new Set();
+    // People whose accounts are deleted. A nickname is a name someone chose for themselves (often their real one),
+    // and deleting the account erases their profile: the entries stay, but no longer say the names.
+    const erased = new Map();
+    const deleted = (id) => {
+      if (!erased.has(id)) erased.set(id, typeof id === 'string' && !!db.prepare('SELECT 1 FROM users WHERE id = ? AND deleted_at IS NOT NULL').get(id));
+      return erased.get(id);
+    };
     const entry = (r) => {
       let d = {};
       try { d = JSON.parse(r.detail) || {}; } catch { /* unreadable: shown without details */ }
@@ -197,6 +206,9 @@ module.exports = function setupServerAudit(ctx) {
         const kept = { channel: detail.channel };
         for (const k of SAFE_KEYS) if (k in d) kept[k] = d[k];
         detail = kept;
+      }
+      if (r.action === 'member_nickname' && deleted(r.target_id)) {
+        delete detail.from; delete detail.to; detail.erased = true;
       }
       let targetId = r.target_id;
       if (r.action.startsWith('invite_') && targetId && !manageServer) targetId = `${targetId.slice(0, 2)}…`;

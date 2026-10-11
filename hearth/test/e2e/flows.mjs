@@ -1715,7 +1715,7 @@ async function discordImport(t) {
   await p.locator('.muted-p', { hasText: 'Creates 6 roles, 4 categories and 11 channels' }).waitFor();
   // What doesn't come over is listed before creating.
   const skipped = p.locator('.di-section', { hasText: 'These will be skipped' });
-  for (const text of ['Manage nicknames: Moderator', 'Category Archive: no channels left in it', 'Age-restricted (NSFW) flag: channel-8', 'Verification level']) {
+  for (const text of ['Manage threads: Moderator', 'Category Archive: no channels left in it', 'Age-restricted (NSFW) flag: channel-8', 'Verification level']) {
     await skipped.locator('li', { hasText: text }).waitFor();
   }
   await p.locator('.warn-box li', { hasText: 'Read message history (channel-8)' }).waitFor();
@@ -2244,6 +2244,78 @@ async function sendLater(t) {
   await ad.locator('.modal-x').click();
 }
 
+// ------------------------------------------------------------------ 26. nicknames
+// Alice picks a nickname in the server: bob sees it in the member list, on her messages and in @mention suggestions
+// (picking it still writes her username), while her profile card keeps her display name and says what she's called
+// here. Bob (the owner) changes it for her from the member menu, then removes it; her own app follows each time,
+// and the audit log has all three.
+async function nicknames(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await alice.serverMenu('Change nickname');
+  const mine = await alice.dialog('Change your nickname');
+  await mine.locator('input').fill('Hall Alice');
+  await mine.locator('.modal-foot .btn.primary').click();
+  await alice.toast('Your nickname in E2E Hall is now Hall Alice.');
+  await bob.showMembers();
+  await bob.member('Hall Alice').waitFor();
+  check(!(await bob.member('Alice Wonder').count()), 'Bob’s member list should show Alice’s nickname instead of her display name.');
+  // Bob speaks first, so her message starts a new group and shows her name.
+  await bob.send('Anyone here? pear');
+  await alice.message('Anyone here? pear').waitFor();
+  await alice.send('Nickname check: quince');
+  await bob.message('Nickname check: quince').locator('.msg-name', { hasText: 'Hall Alice' }).waitFor();
+
+  // Her profile card leads with her display name, and says what she goes by here.
+  await bob.member('Hall Alice').click();
+  const pop = bob.page.locator('.pop-profile');
+  await pop.locator('.pc-name', { hasText: 'Alice Wonder' }).waitFor();
+  await pop.locator('.pc-nick', { hasText: 'Hall Alice' }).waitFor();
+  await bob.page.keyboard.press('Escape');
+  await pop.waitFor({ state: 'detached' });
+
+  // @mention suggestions find her by the nickname and show it; picking her writes her username.
+  const box = bob.$('#composer-input');
+  await box.fill('@hall');
+  const suggestion = bob.page.locator('.suggest-item', { hasText: 'Hall Alice' });
+  await suggestion.waitFor();
+  await suggestion.click();
+  const written = await box.inputValue();
+  check(/^@alice\w* $/.test(written), `Picking the suggestion should write her username, not the nickname (wrote “${written}”).`);
+  await box.fill('');
+
+  // Bob is above her: he changes it from the member menu, and her own app follows.
+  await bob.member('Hall Alice').click({ button: 'right' });
+  await bob.menuItem('Change nickname…').click();
+  let theirs = await bob.dialog('Change Alice Wonder');
+  await theirs.locator('input').fill('Quince Queen');
+  await theirs.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  await alice.showMembers();
+  await alice.member('Quince Queen').waitFor();
+  // Removing it: back to her display name in the server, on her messages too.
+  await bob.member('Quince Queen').click({ button: 'right' });
+  await bob.menuItem('Change nickname…').click();
+  theirs = await bob.dialog('Change Alice Wonder');
+  await theirs.locator('.modal-foot .btn', { hasText: 'Remove nickname' }).click();
+  await bob.noModals();
+  await alice.member('Alice Wonder').waitFor();
+  await bob.message('Nickname check: quince').locator('.msg-name', { hasText: 'Alice Wonder' }).waitFor();
+
+  // The server's audit log has each change, the first marked as her own.
+  await bob.serverMenu('Server settings');
+  const ss = bob.page.locator('.modal.server-settings');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: 'Alice Wonder set their nickname to “Hall Alice”' }).waitFor();
+  await ss.locator('.audit-row', { hasText: 'bob changed the nickname of Alice Wonder from “Hall Alice” to “Quince Queen”' }).waitFor();
+  await ss.locator('.audit-row', { hasText: 'bob removed the nickname of Alice Wonder (“Quince Queen”)' }).waitFor();
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -2280,4 +2352,5 @@ export const FLOWS = [
   ['away and status: Away after inactivity and back on input; a custom status that clears itself, live', awayAndStatus],
   ['voice chat: open beside the call, both ways, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
   ['send later: schedule from the send button, edit, reschedule and send now from the list; cancel one in a DM; re-encrypted by itself when the key changes, never from a copy it can’t confirm; a signed-out session’s message waits for Keep; overdue ones ask first', sendLater],
+  ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
 ];

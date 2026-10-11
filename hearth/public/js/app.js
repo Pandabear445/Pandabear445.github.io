@@ -17,7 +17,7 @@ import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searc
 import { Voice } from './voice.js';
 import { openCallDiagnostics } from './call-diagnostics.js';
 import { createSecure } from './secure.js';
-import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
+import { avatarEl, nameEl, displayName, displayNameIn, nicknameIn, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
 import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, repeatLabel, upcomingSection, onEventStarting, remindItems, startReminders, purgeReminders, reminderDeadlines, stopVoice } from './features.js';
@@ -757,10 +757,13 @@ function startApp() {
       // they rejoin: the role menu sends the roles someone has plus the new one, and saving a channel's
       // permissions sends all of its overrides.
       if (s.memberRoles) delete s.memberRoles[userId];
+      if (s.nicknames) delete s.nicknames[userId];
       s.channels.forEach((c) => { if (c.overrides) c.overrides = c.overrides.filter((o) => !(o.type === 'member' && o.id === userId)); });
     }
     if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
   });
+  // A nickname set, changed or removed in one of your servers (server/nicknames.js).
+  socket.on('member:nick', ({ serverId, userId, nickname } = {}) => applyNick(serverId, userId, typeof nickname === 'string' ? nickname : null));
   socket.on('channel:create', (ch) => {
     const s = S.servers.find((x) => x.id === ch.serverId);
     if (s && !s.channels.find((c) => c.id === ch.id)) s.channels.push(ch);
@@ -999,10 +1002,7 @@ function refreshUserBits(id) {
     if (el.dataset.speak) fresh.dataset.speak = el.dataset.speak;
     el.replaceWith(fresh);
   });
-  $$(`[data-user-name="${id}"]`).forEach((el) => {
-    const fresh = nameEl(u, { tag: el.tagName.toLowerCase(), cls: [...el.classList].filter((c) => !c.startsWith('fx-') && c !== 'uname' && c !== 'grad' && !c.startsWith('font-')).join(' ') });
-    el.replaceWith(fresh);
-  });
+  $$(`[data-user-name="${id}"]`).forEach((el) => redrawName(el, u));
   if (id === S.me.id) renderUserPanel();
   if (S.panel === 'members' || S.view.type === 'dm') renderPanel();
   if (['friends', 'home'].includes(S.view.type) && S.view.tab !== 'add') renderMain();
@@ -1040,6 +1040,30 @@ function showMyPresence() {
   });
   const sub = $('#user-panel .me-sub');
   if (sub) sub.textContent = mySubLine(); else renderUserPanel();
+}
+
+// Draws one name again for this person, in the server it was drawn for (their nickname there) and with the role
+// color it had: both are kept on the element (profile-ui.js nameEl).
+function redrawName(el, u) {
+  const server = el.dataset.nameIn ? S.servers.find((s) => s.id === el.dataset.nameIn) : null;
+  el.replaceWith(nameEl(u, { tag: el.tagName.toLowerCase(), server, roleColor: el.dataset.roleColor || '',
+    cls: [...el.classList].filter((c) => !c.startsWith('fx-') && c !== 'uname' && c !== 'grad' && !c.startsWith('font-')).join(' ') }));
+}
+// Someone's nickname in a server changed (server/nicknames.js): the names drawn for that server follow, and the
+// lists that sort or search by name, the typing line and call tiles are drawn again.
+function applyNick(serverId, userId, nickname) {
+  const s = S.servers.find((x) => x.id === serverId);
+  if (!s || isGroup(s)) return;
+  const nicks = (s.nicknames ||= {});
+  if ((nicks[userId] || null) === (nickname || null)) return;
+  if (nickname) nicks[userId] = nickname; else delete nicks[userId];
+  const u = S.users[userId];
+  if (u && S.me) $$(`[data-user-name="${userId}"][data-name-in="${serverId}"]`).forEach((el) => redrawName(el, u));
+  if (S.view.serverId !== serverId) return;
+  if (S.panel === 'members') renderPanel();
+  renderTyping();
+  renderCallStages();
+  if (S.view.type === 'voice') renderMain();
 }
 
 // ======================================================================= conversation previews (decrypted locally)
@@ -1199,7 +1223,9 @@ function shownDay(sc, before = null) {
 }
 // "Alice turned on disappearing messages: 1 week · 3:04 PM"
 function sysLineEl(e) {
-  const text = sysLineText(e, S.me.id, (id) => displayName(getUser(id)));
+  // Drawn in the conversation on screen: in a server channel (a voice channel's chat too), whoever changed it goes by
+  // their nickname there; in DMs and group chats, their display name.
+  const text = sysLineText(e, S.me.id, (id) => nameInServer(currentServer(), getUser(id)));
   return h('div', { class: 'sys-line', role: 'note' }, icon('timer'), h('span', null, text),
     h('time', { datetime: new Date(e.at).toISOString(), title: new Date(e.at).toLocaleString() }, fmtStamp(e.at)));
 }
@@ -1378,6 +1404,13 @@ const isGroup = (server) => !!server && server.kind === 'group';
 const realServers = () => S.servers.filter((s) => s.kind !== 'group');
 const groups = () => S.servers.filter((s) => s.kind === 'group');
 const serverOfChannel = (channelId) => S.servers.find((s) => s.channels.some((c) => c.id === channelId));
+// The name someone goes by where it's shown (profile-ui.js displayNameIn): inside a server, their nickname there;
+// in DMs, group chats and anywhere outside a server, their display name.
+const nameInServer = (server, u) => displayNameIn(server, u);
+const serverById = (id) => (id ? S.servers.find((s) => s.id === id) || null : null);
+// A message's server (null for DMs), for its author's name.
+const msgServer = (m) => (!m || m.dmId ? null : serverById(m.serverId) || (m.channelId ? serverOfChannel(m.channelId) || null : null));
+const nameInMsg = (m, u) => displayNameIn(msgServer(m), u);
 const channelById = (id) => { for (const s of S.servers) { const c = s.channels.find((x) => x.id === id); if (c) return c; } return null; };
 
 // ---- voice channel chats
@@ -1469,7 +1502,7 @@ function onCallRegion(p) {
   const before = S.callNet && S.callNet.room === p.room ? S.callNet.region : undefined;
   applyCallRegion(p);
   if (voice && voice.channelId === p.room && p.by && before !== undefined && before !== S.callNet.region) {
-    const who = p.by === S.me.id ? 'You' : displayName(getUser(p.by));
+    const who = p.by === S.me.id ? 'You' : nameInServer(serverOfChannel(p.room), getUser(p.by));
     toast(`${who} moved the call to ${p.region ? regionName(p.region) : 'automatic region'}. Everyone is switching over.`);
   }
 }
@@ -2484,7 +2517,7 @@ function renderSidebarVoiceUsers() {
       if (S.speaking.has(u.id)) av.classList.add('speaking');
       el.append(h('button', { class: 'vc-user', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, u.id, 'right'),
         oncontextmenu: server ? (e) => contextMenu(e, memberMenuItems(server, u)) : null },
-        av, nameEl(u),
+        av, nameEl(u, { server }),
         h('span', { class: 'vc-flags' }, st.serverMuted ? h('span', { class: 'server-muted', 'data-tip': 'Server muted by a moderator', role: 'img', 'aria-label': 'Server muted' }, icon('micOff', 'ic flag'))
           : st.deafened ? icon('headphonesOff', 'ic flag') : st.muted ? icon('micOff', 'ic flag') : null)));
     }
@@ -3467,7 +3500,7 @@ const tooOldForBulk = (m) => Date.now() - new Date(m.createdAt).getTime() > BULK
 function selectBox(el, m, ctx) {
   const sel = S.select;
   if (!sel || ctx !== 'main' || sel.key !== keyOfMessage(m)) return el;
-  const who = displayName(getUser(m.authorId));
+  const who = nameInMsg(m, getUser(m.authorId));
   const old = tooOldForBulk(m);
   const on = sel.ids.has(m.id);
   el.classList.toggle('selected', on);
@@ -3572,25 +3605,26 @@ function messageElRevealed(m, prev, ctx) {
   return fillMessage(el, m, prev, ctx, { author: getUser(m.authorId), mine: false, isGrouped: false, text: textOf(m) });
 }
 function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
+  // In a server, people go by their nicknames there (none in DMs and group chats).
+  const server = msgServer(m);
   if (m.reply) {
     const ru = getUser(m.reply.authorId);
     const rd = m.reply.dec;
     const rtext = rd && !rd.error && !rd.pending ? rd.t : '';
-    el.append(h('button', { class: 'msg-reply', 'aria-label': `Replying to ${displayName(ru)}. Jump to original.`, onclick: () => jumpToMessage(keyOfMessage(m), m.reply.id) },
-      h('span', { class: 'reply-spine' }), avatarEl(ru, 16), nameEl(ru, { cls: 'reply-name' }),
+    el.append(h('button', { class: 'msg-reply', 'aria-label': `Replying to ${nameInServer(server, ru)}. Jump to original.`, onclick: () => jumpToMessage(keyOfMessage(m), m.reply.id) },
+      h('span', { class: 'reply-spine' }), avatarEl(ru, 16), nameEl(ru, { cls: 'reply-name', server }),
       h('span', { class: 'reply-text', html: rtext ? md(rtext, { inline: true }) : '<em>Attachment or encrypted message</em>' })));
   } else if (m.replyTo) {
     el.append(h('div', { class: 'msg-reply gone' }, h('span', { class: 'reply-spine' }), 'Original message is no longer available'));
   }
   const gutter = h('div', { class: 'msg-gutter', dataset: { time: fmtTime(m.createdAt) } });
   if (isGrouped) gutter.append(h('time', { class: 'msg-hover-time', datetime: new Date(m.createdAt).toISOString() }, fmtTime(m.createdAt)));
-  else gutter.append(h('button', { class: 'msg-av', 'data-pop-anchor': '', 'aria-label': `View ${displayName(author)}'s profile`, onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, avatarEl(hookFace(author, m), 40)));
+  else gutter.append(h('button', { class: 'msg-av', 'data-pop-anchor': '', 'aria-label': `View ${nameInServer(server, author)}'s profile`, onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, avatarEl(hookFace(author, m), 40)));
   const body = h('div', { class: 'msg-body' });
   if (!isGrouped) {
-    const server = m.serverId && S.servers.find((s) => s.id === m.serverId);
     const rs = roleStyle(server, author.id);
     body.append(h('div', { class: 'msg-head' },
-      h('button', { class: 'msg-name', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, nameEl(hookFace(author, m), { roleColor: rs.color })),
+      h('button', { class: 'msg-name', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, nameEl(hookFace(author, m), { roleColor: rs.color, server })),
       isBotPost(author, m) ? h('span', { class: 'bot-tag' }, 'BOT') : null,
       rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
       rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
@@ -3636,7 +3670,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
   if (m.reactions && m.reactions.length) {
     body.append(h('div', { class: 'reactions' }, m.reactions.map((r) => {
       const mineR = r.userIds.includes(S.me.id);
-      const names = r.userIds.slice(0, 6).map((id) => displayName(getUser(id))).join(', ') + (r.userIds.length > 6 ? ` and ${r.userIds.length - 6} more` : '');
+      const names = r.userIds.slice(0, 6).map((id) => nameInServer(server, getUser(id))).join(', ') + (r.userIds.length > 6 ? ` and ${r.userIds.length - 6} more` : '');
       const label = r.emoji.startsWith('<') ? r.emoji.replace(/^<a?(:[A-Za-z0-9_]+:).*$/, '$1') : r.emoji;
       return h('button', { class: `reaction${mineR ? ' mine' : ''}`, 'data-tip': `${names} reacted with ${label}`, 'aria-pressed': String(mineR), 'aria-label': `${label} ${r.userIds.length}`, onclick: () => react(m, r.emoji) },
         emojiNode(r.emoji, 'r-emoji'), h('span', { class: 'r-count' }, r.userIds.length));
@@ -4323,7 +4357,7 @@ async function onNewMessage(key, m) {
   if ((mentioned || repliedToMe) && !S.blocked.has(m.authorId)) {
     addInbox({
       type: mentioned ? 'mention' : 'reply', userId: m.authorId, msgId: m.id,
-      title: `${displayName(getUser(m.authorId))} ${mentioned ? 'mentioned you' : 'replied to you'} in ${whereLabel(m)}`,
+      title: `${nameInMsg(m, getUser(m.authorId))} ${mentioned ? 'mentioned you' : 'replied to you'} in ${whereLabel(m)}`,
       text: textOf(m).slice(0, 140), ...expOf(m),
     });
   }
@@ -4342,7 +4376,7 @@ function notify(author, body, key, msgId = null) {
   try {
     const priv = key.startsWith('d:') || isGroup(serverOfChannel(key.slice(2)));
     const shown = priv && isSharing() && !shareAllowed.has(key) ? 'New message (hidden while you share your screen)' : body.slice(0, 140);
-    const n = new Notification(displayName(author), { body: shown, icon: author.avatar || undefined, tag: key });
+    const n = new Notification(key.startsWith('c:') ? nameInServer(serverOfChannel(key.slice(2)), author) : displayName(author), { body: shown, icon: author.avatar || undefined, tag: key });
     rememberNotification(key, n, msgId); // a disappearing message's notification closes when it goes
     n.onclick = () => { window.focus(); if (window.hearthDesktop) window.hearthDesktop.focus(); if (key.startsWith('d:')) openDm(key.slice(2)); else { const s = serverOfChannel(key.slice(2)); if (s) openChannel(key.slice(2), s.id); } n.close(); };
   } catch { /* ignore */ }
@@ -4422,7 +4456,8 @@ function renderTyping() {
     const t = S.typing[key];
     const ids = t ? [...t.keys()].filter((id) => id !== S.me.id) : [];
     if (!ids.length) return;
-    const names = ids.map((id) => displayName(getUser(id)));
+    const sv = key && key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
+    const names = ids.map((id) => nameInServer(sv, getUser(id)));
     const text = names.length === 1 ? `${names[0]} is typing\u2026` : names.length < 4 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]} are typing\u2026` : 'Several people are typing\u2026';
     el.append(h('span', { class: 'dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i')), h('span', null, text));
   });
@@ -4534,7 +4569,7 @@ async function onThreadMessage(m) {
   // (After it's in the thread: the timer looks there for the soonest deadline.)
   if (disappears(m)) armClientExpiry();
   if (m.authorId !== S.me.id && (mentionsMe(m) || (m.reply && m.reply.authorId === S.me.id)) && !S.blocked.has(m.authorId)) {
-    addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${displayName(getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140), ...expOf(m) });
+    addInbox({ type: mentionsMe(m) ? 'mention' : 'reply', userId: m.authorId, msgId: m.id, title: `${nameInMsg(m, getUser(m.authorId))} ${mentionsMe(m) ? 'mentioned you' : 'replied to you'} in a thread in ${whereLabel(m)}`, text: textOf(m).slice(0, 140), ...expOf(m) });
     if (!quiet() && notifyLevel('c:' + m.channelId) !== 'muted') claimOnce(m.id).then((ok) => { if (ok) playSound(mentionKind(m) || 'reply'); });
   }
 }
@@ -4632,7 +4667,9 @@ function membersPanel(el) {
   const draw = () => {
     clear(list);
     const q = search.value.trim().toLowerCase();
-    const users = server.memberIds.map(getUser).filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q));
+    // Search finds people by username, display name or nickname here; the list shows and sorts by the nickname.
+    const users = server.memberIds.map(getUser).filter((u) => !q || u.username.toLowerCase().includes(q) || displayName(u).toLowerCase().includes(q)
+      || nicknameIn(server, u.id).toLowerCase().includes(q));
     const changedKeys = sec.keysChanged(users);
     // Like Discord: online people grouped under their highest "show separately" role, then Online, then Offline.
     const hoisted = (server.roleDefs || []).filter((r) => r.hoist && !r.everyone).sort((a, b) => b.position - a.position);
@@ -4643,7 +4680,7 @@ function membersPanel(el) {
       const top = memberRoles(server, u.id).find((r) => r.hoist);
       if (top && sections.has(top.id)) sections.get(top.id).push(u); else online.push(u);
     }
-    const byName = (a, b) => displayName(a).localeCompare(displayName(b));
+    const byName = (a, b) => nameInServer(server, a).localeCompare(nameInServer(server, b));
     const row = (u) => {
       const p = u.profile || {};
       const cs = p.customStatus && (p.customStatus.text || p.customStatus.emoji) ? `${p.customStatus.emoji || ''} ${p.customStatus.text || ''}`.trim() : '';
@@ -4654,7 +4691,7 @@ function membersPanel(el) {
         oncontextmenu: (e) => contextMenu(e, memberMenuItems(server, u)),
       }, avatarEl(u, 34, { status: true, meId: S.me.id }),
       h('span', { class: 'member-text' },
-        h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color }),
+        h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color, server }),
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
           changedKeys.has(u.id) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
@@ -4689,6 +4726,7 @@ function memberMenuItems(server, u) {
     { label: 'View profile', icon: 'user', action: () => openProfileModal(u.id) },
     !me ? { label: 'Message', icon: 'message', action: () => openDmWith(u.id) } : null,
     { label: 'Copy username', icon: 'copy', action: () => { copyText(u.username); toast('Copied.'); } },
+    mayNickname(server, u) ? { label: me ? 'Change my nickname\u2026' : 'Change nickname\u2026', icon: 'edit', action: () => openNickname(server, u) } : null,
   ];
   if (isGroup(server)) return items;
   const isOwnerTarget = server.ownerId === u.id;
@@ -4710,13 +4748,48 @@ function memberMenuItems(server, u) {
   if (!me && !isOwnerTarget && theirTop < myTop) {
     items.push(...voiceModItems(server, u));
     if (can(server, PERMS.KICK_MEMBERS) || can(server, PERMS.BAN_MEMBERS)) items.push('-');
-    if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Time out ${displayName(u)}\u2026`, icon: 'timer', action: () => openTimeout(server, u) });
-    if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Kick ${displayName(u)}`, icon: 'logout', danger: true, action: async () => {
-      if (await confirmDialog({ title: `Kick ${displayName(u)}?`, text: 'They can rejoin with an invite. The server\u2019s encryption key is replaced automatically so they can\u2019t read new messages.', confirm: 'Kick', danger: true })) api('DELETE', `/servers/${server.id}/members/${u.id}`).catch((e) => toast(e.message, 'error'));
+    if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Time out ${nameInServer(server, u)}\u2026`, icon: 'timer', action: () => openTimeout(server, u) });
+    if (can(server, PERMS.KICK_MEMBERS)) items.push({ label: `Kick ${nameInServer(server, u)}`, icon: 'logout', danger: true, action: async () => {
+      if (await confirmDialog({ title: `Kick ${nameInServer(server, u)}?`, text: 'They can rejoin with an invite. The server\u2019s encryption key is replaced automatically so they can\u2019t read new messages.', confirm: 'Kick', danger: true })) api('DELETE', `/servers/${server.id}/members/${u.id}`).catch((e) => toast(e.message, 'error'));
     } });
-    if (can(server, PERMS.BAN_MEMBERS)) items.push({ label: `Ban ${displayName(u)}`, icon: 'ban', danger: true, action: () => openBan(server, u) });
+    if (can(server, PERMS.BAN_MEMBERS)) items.push({ label: `Ban ${nameInServer(server, u)}`, icon: 'ban', danger: true, action: () => openBan(server, u) });
   }
   return items;
+}
+// Nicknames (server/nicknames.js): your own needs Change Nickname (or Manage Nicknames), someone else's needs Manage
+// Nicknames and them below your highest role (never the owner); nobody's while you're timed out. The server checks
+// it all again.
+function mayNickname(server, u) {
+  if (!server || isGroup(server) || !u || !server.memberIds.includes(u.id)) return false;
+  if (server.timeout && server.timeout.until > Date.now()) return false;
+  if (u.id === S.me.id) return can(server, PERMS.CHANGE_NICKNAME) || can(server, PERMS.MANAGE_NICKNAMES);
+  if (!can(server, PERMS.MANAGE_NICKNAMES) || server.ownerId === u.id) return false;
+  const top = (id) => (server.ownerId === id ? Infinity : Math.max(0, ...memberRoles(server, id).map((r) => r.position)));
+  return top(u.id) < top(S.me.id);
+}
+// What someone goes by in this server instead of their display name. DMs and profiles keep the display name.
+function openNickname(server, u) {
+  const me = u.id === S.me.id;
+  const cur = nicknameIn(server, u.id);
+  const global = displayName(u);
+  const inp = h('input', { class: 'input', maxlength: '32', value: cur, placeholder: global, autocomplete: 'off' });
+  const save = async (nickname) => {
+    const r = await api('PUT', `/servers/${server.id}/members/${u.id}/nickname`, { nickname });
+    // Shown at once here; everyone else's app hears it from the server (member:nick).
+    applyNick(server.id, u.id, r.nickname);
+    if (r.nickname) toast(me ? `Your nickname in ${server.name} is now ${r.nickname}.` : `${global} is now ${r.nickname} in ${server.name}.`);
+    else toast(me ? `Nickname removed: you show as ${global} in ${server.name}.` : `${global}\u2019s nickname was removed.`);
+  };
+  modal({ title: me ? 'Change your nickname' : `Change ${global}\u2019s nickname`, size: 'sm',
+    body: h('div', { class: 'stack' }, field('Nickname', inp, me
+      ? `What people in ${server.name} see instead of your display name. DMs and your profile still show ${global}. Up to 32 characters; leave it empty to go back to ${global}. Each change is listed in the server\u2019s audit log.`
+      : `What people in ${server.name} see instead of their display name (${global}). Up to 32 characters; leave it empty to remove it. It\u2019s listed in the server\u2019s audit log.`)),
+    actions: [
+      cur ? { label: 'Remove nickname', action: () => save('') } : null,
+      { label: 'Cancel' },
+      { label: 'Save', kind: 'primary', action: () => save(inp.value.trim()) },
+    ].filter(Boolean) });
+  setTimeout(() => inp.select(), 50);
 }
 // Timeouts: they keep reading but can't post, react or talk until it ends. The server checks permissions and
 // role order again, and logs it.
@@ -4725,23 +4798,23 @@ function openTimeout(server, u) {
   const len = h('select', { class: 'input', 'aria-label': 'How long' },
     [[5, '5 minutes'], [10, '10 minutes'], [60, '1 hour'], [1440, '1 day'], [10080, '1 week'], [40320, '28 days']].map(([v, l]) => h('option', { value: String(v) }, l)));
   len.value = '60';
-  modal({ title: `Time out ${displayName(u)}?`, size: 'sm',
+  modal({ title: `Time out ${nameInServer(server, u)}?`, size: 'sm',
     body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They can still read, but can\u2019t send messages, react, start threads or talk in calls until it ends.'), field('For', len), field('Reason', reason)),
     actions: [
       { label: 'Remove timeout', action: () => api('DELETE', `/servers/${server.id}/members/${u.id}/timeout`).then(() => toast('Timeout removed.')) },
       { label: 'Cancel' },
-      { label: 'Time out', kind: 'danger', action: () => api('POST', `/servers/${server.id}/members/${u.id}/timeout`, { minutes: Number(len.value), reason: reason.value }).then((r) => toast(`${displayName(u)} is timed out until ${fmtStamp(r.until)}.`)) }] });
+      { label: 'Time out', kind: 'danger', action: () => api('POST', `/servers/${server.id}/members/${u.id}/timeout`, { minutes: Number(len.value), reason: reason.value }).then((r) => toast(`${nameInServer(server, u)} is timed out until ${fmtStamp(r.until)}.`)) }] });
 }
 function openBan(server, u) {
   const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'Optional — moderators see it (in Bans and the audit log)' });
   // Cleanup after a raid or a spammer: their messages in this server's channels from that window go too.
   const wipe = h('select', { class: 'input', 'aria-label': 'Delete their messages from the last' },
     [[0, 'Don\u2019t delete any'], [1, 'Last hour'], [24, 'Last 24 hours'], [168, 'Last 7 days']].map(([v, l]) => h('option', { value: String(v) }, l)));
-  modal({ title: `Ban ${displayName(u)}?`, size: 'sm',
+  modal({ title: `Ban ${nameInServer(server, u)}?`, size: 'sm',
     body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'They\u2019re removed now and can\u2019t rejoin, even with an invite, until someone unbans them.'), field('Reason', reason),
       field('Delete their messages', wipe, 'From every channel in this server, with their files. A thread they started goes with its replies, unless it has replies you couldn\u2019t delete yourself. This can\u2019t be undone.')),
     actions: [{ label: 'Cancel' }, { label: 'Ban', kind: 'danger', action: () => api('POST', `/servers/${server.id}/bans`, { userId: u.id, reason: reason.value, deleteHours: Number(wipe.value) })
-      .then((r) => toast((r.deleted ? `${displayName(u)} is banned and ${r.deleted} of their message${r.deleted === 1 ? ' was' : 's were'} deleted.` : `${displayName(u)} is banned.`)
+      .then((r) => toast((r.deleted ? `${nameInServer(server, u)} is banned and ${r.deleted} of their message${r.deleted === 1 ? ' was' : 's were'} deleted.` : `${nameInServer(server, u)} is banned.`)
         + (r.kept ? ` ${r.kept} thread${r.kept === 1 ? '' : 's'} they started ${r.kept === 1 ? 'was' : 'were'} kept: ${r.kept === 1 ? 'it has' : 'they have'} replies you can\u2019t delete.` : ''))) }] });
 }
 // Voice moderation: server mute (Mute Members, for the whole server, whether or not they're in a call right now),
@@ -4753,7 +4826,7 @@ const isServerMuted = (server, u) => (server.voiceMutes || []).includes(u.id)
 function voiceModItems(server, u) {
   if (isGroup(server)) return [];
   const vc = (server.channels || []).find((c) => c.type === 'voice' && (S.voice[c.id] || []).some((x) => x.userId === u.id));
-  const name = displayName(u);
+  const name = nameInServer(server, u);
   const run = (p, done) => p.then(() => toast(done)).catch((e) => toast(e.message, 'error'));
   const out = [];
   if (can(server, PERMS.MUTE_MEMBERS)) {
@@ -4770,10 +4843,10 @@ function voiceModItems(server, u) {
 }
 function openMoveVoice(server, u, from, dest) {
   const to = h('select', { class: 'input', 'aria-label': 'Voice channel' }, dest.map((c) => h('option', { value: c.id }, c.name)));
-  modal({ title: `Move ${displayName(u)}?`, size: 'sm',
+  modal({ title: `Move ${nameInServer(server, u)}?`, size: 'sm',
     body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, `They leave ${from.name} and join the channel you pick, if they\u2019re allowed to connect there.`), field('Move to', to)),
     actions: [{ label: 'Cancel' }, { label: 'Move', kind: 'primary', action: () => api('POST', `/servers/${server.id}/voice/${u.id}/move`, { channelId: to.value })
-      .then(() => toast(`${displayName(u)} was moved to ${(dest.find((c) => c.id === to.value) || {}).name || 'another channel'}.`)) }] });
+      .then(() => toast(`${nameInServer(server, u)} was moved to ${(dest.find((c) => c.id === to.value) || {}).name || 'another channel'}.`)) }] });
 }
 
 function dmProfilePanel(el) {
@@ -4801,10 +4874,11 @@ async function pinsPanel(el) {
     clear(list);
     if (key.startsWith('c:')) pinHistory(el, key.slice(2));
     if (!pins.length) { list.append(h('div', { class: 'panel-empty' }, icon('pin'), h('p', null, 'No pinned messages yet. Pin important messages from the \u22ef menu so everyone can find them.'))); return; }
+    const pinServer = key.startsWith('c:') ? serverOfChannel(key.slice(2)) : null;
     pins.forEach((m) => {
       const u = getUser(m.authorId);
       list.append(h('div', { class: 'pin-card' },
-        h('div', { class: 'pin-meta' }, avatarEl(u, 20), nameEl(u), h('span', null, fmtStamp(m.createdAt))),
+        h('div', { class: 'pin-meta' }, avatarEl(u, 20), nameEl(u, { server: pinServer }), h('span', null, fmtStamp(m.createdAt))),
         h('div', { class: 'pin-text', html: readable(m) ? md(textOf(m) || (filesOf(m).length ? '_Attachment_' : ''), { mentionName: S.me.username }) : '<em>Encrypted message</em>' }),
         h('div', { class: 'pin-actions' },
           h('button', { class: 'btn ghost sm', onclick: () => jumpToMessage(key, m.id) }, 'Jump'),
@@ -4818,7 +4892,7 @@ async function pinHistory(el, channelId) {
     const log = await api('GET', `/channels/${channelId}/pins/log`);
     if (!log.length || currentKey() !== 'c:' + channelId || panelMode() !== 'pins') return;
     el.append(h('details', { class: 'pin-history' }, h('summary', null, 'Pin history'),
-      h('ul', null, log.slice(0, 20).map((x) => h('li', null, nameEl(getUser(x.userId)), ` ${x.action === 'pin' ? 'pinned' : 'unpinned'} a message \u00b7 ${fmtStamp(x.at)} `,
+      h('ul', null, log.slice(0, 20).map((x) => h('li', null, nameEl(getUser(x.userId), { server: serverOfChannel(channelId) }), ` ${x.action === 'pin' ? 'pinned' : 'unpinned'} a message \u00b7 ${fmtStamp(x.at)} `,
         h('button', { class: 'link-btn', onclick: () => jumpToMessage('c:' + channelId, x.messageId) }, 'Jump'))))));
   } catch { /* the pins still show */ }
 }
@@ -5024,6 +5098,7 @@ function threadCard(t) {
   const author = getUser(t.root.authorId);
   const face = hookFace(author, t.root);
   const bot = isBotPost(author, t.root);
+  const tServer = msgServer(t.root);
   const flag = readable(t.root) ? postFlag(t.root, author) : null;
   const text = readable(t.root) ? textOf(t.root) : '';
   const preview = h('span', { class: 'thread-card-text', html: text
@@ -5037,10 +5112,10 @@ function threadCard(t) {
   const people = (t.participants || []).filter((id) => !S.blocked.has(id));
   return h('button', {
     class: `thread-card${fresh ? ' unread' : ''}`, type: 'button', dataset: { root: t.rootId },
-    'aria-label': `Thread by ${displayName(face)}${bot ? ` (${flag ? flag.label.toLowerCase().replace(' \u00b7 ', ', ') : 'bot'})` : ''}: ${count}${fresh ? `, ${newLabel(fresh)}${pinged ? ', mentions you' : ''}` : ''}${when ? `, ${when.toLowerCase()}` : ''}. Open thread`,
+    'aria-label': `Thread by ${nameInServer(tServer, face)}${bot ? ` (${flag ? flag.label.toLowerCase().replace(' \u00b7 ', ', ') : 'bot'})` : ''}: ${count}${fresh ? `, ${newLabel(fresh)}${pinged ? ', mentions you' : ''}` : ''}${when ? `, ${when.toLowerCase()}` : ''}. Open thread`,
     onclick: () => openThread(t.root, null, { from: 'threads' }),
   },
-  h('span', { class: 'thread-card-head' }, avatarEl(face, 20), nameEl(face), bot ? h('span', { class: 'bot-tag' }, 'BOT') : null,
+  h('span', { class: 'thread-card-head' }, avatarEl(face, 20), nameEl(face, { server: tServer }), bot ? h('span', { class: 'bot-tag' }, 'BOT') : null,
     fresh ? h('span', { class: `thread-new${pinged ? ' ping' : ''}` }, `${pinged ? '@ ' : ''}${newLabel(fresh)}`) : null),
   preview,
   flag ? h('span', { class: 'msg-flag thread-card-flag' }, flag.label) : null,
@@ -5186,6 +5261,8 @@ function createComposer({ id, key, threadId, placeholder }) {
 
   // ---- @mention autocomplete
   let sugg = { items: [], i: 0, start: -1 };
+  // The server this box writes in (null in DMs), for people's nicknames there.
+  const suggServer = () => { const kk = key(); return kk.startsWith('c:') ? serverOfChannel(kk.slice(2)) || null : null; };
   // Autocomplete: @people, @roles, @everyone (if allowed) and :emoji: (standard + custom from all your servers)
   const candidates = () => {
     const kk = key();
@@ -5215,7 +5292,7 @@ function createComposer({ id, key, threadId, placeholder }) {
         : c.role ? h('span', { class: 'suggest-at role', style: c.role.color ? { color: c.role.color } : null }, c.role.icon || icon('shield'))
           : avatarEl(c, 24),
     h('span', { class: 'suggest-name', style: c.role && c.role.color ? { color: c.role.color } : null },
-      c.cmd ? SLASH.usage(c.cmd) : c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : displayName(c)),
+      c.cmd ? SLASH.usage(c.cmd) : c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : nameInServer(suggServer(), c)),
     h('span', { class: 'suggest-hint' }, c.cmd ? `${c.cmd.botName} \u00b7 ${c.cmd.description}` : c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
     suggest.hidden = !sugg.items.length;
   };
@@ -5242,7 +5319,9 @@ function createComposer({ id, key, threadId, placeholder }) {
     const m = before.match(/(^|\s)@([\w.]{0,24})$/);
     if (!m) return closeSuggest();
     const q = m[2].toLowerCase();
-    const items = candidates().filter((c) => (c.special ? c.special.startsWith(q) : c.role ? c.role.name.toLowerCase().includes(q) : (c.username.toLowerCase().startsWith(q) || displayName(c).toLowerCase().includes(q)))).slice(0, 8);
+    const sv = suggServer();
+    const items = candidates().filter((c) => (c.special ? c.special.startsWith(q) : c.role ? c.role.name.toLowerCase().includes(q)
+      : (c.username.toLowerCase().startsWith(q) || displayName(c).toLowerCase().includes(q) || nicknameIn(sv, c.id).toLowerCase().includes(q)))).slice(0, 8);
     sugg = { items, i: 0, start: pos - m[2].length - 1, kind: 'at' };
     drawSuggest();
   };
@@ -5398,7 +5477,11 @@ function createComposer({ id, key, threadId, placeholder }) {
       if (last) { e.preventDefault(); S.editing = last.id; replaceMessageEl(last); }
     }
   });
-  ta.addEventListener('blur', () => setTimeout(closeSuggest, 120));
+  // Leaving the box closes the list a moment later (so a click on an item still lands), unless the person is back in
+  // it by then: otherwise coming straight back to type "@" would see the new list vanish under them.
+  let blurTimer = null;
+  ta.addEventListener('blur', () => { clearTimeout(blurTimer); blurTimer = setTimeout(closeSuggest, 120); });
+  ta.addEventListener('focus', () => { clearTimeout(blurTimer); blurTimer = null; });
   ta.addEventListener('paste', (e) => {
     const files = [...(e.clipboardData.files || [])];
     if (files.length) { e.preventDefault(); addFiles(files); return; }
@@ -5432,7 +5515,7 @@ function createComposer({ id, key, threadId, placeholder }) {
     if (state.replyTo) {
       const ru = getUser(state.replyTo.authorId);
       extras.append(h('div', { class: 'reply-bar' }, icon('reply', 'ic'),
-        h('span', { class: 'reply-bar-text' }, 'Replying to ', h('strong', null, displayName(ru)),
+        h('span', { class: 'reply-bar-text' }, 'Replying to ', h('strong', null, nameInMsg(state.replyTo, ru)),
           h('span', { class: 'reply-bar-quote' }, (textOf(state.replyTo) || 'Attachment').slice(0, 120))),
         ibtn('close', 'Cancel reply (Esc)', () => setReply(null), { cls: 'sm' })));
     }
@@ -6260,7 +6343,7 @@ function openSearch({ scope = null } = {}) {
     if (m.editedAt) badges.push(h('span', { class: 'search-badge' }, 'Edited'));
     return item('m:' + m.id, {
       cls: `search-msg${deleted ? ' gone' : ''}`, disabled: deleted, av: avatarEl(u, 30),
-      title: h('span', null, h('strong', null, displayName(u)), h('span', { class: 'search-where' }, ` · ${whereLabel(m)}`)),
+      title: h('span', null, h('strong', null, nameInMsg(m, u)), h('span', { class: 'search-where' }, ` · ${whereLabel(m)}`)),
       sub: deleted ? h('span', { class: 'search-gone' }, 'This message was deleted after the search found it, or you can’t see it any more.')
         : body ? marked(body) : h('em', null, files.length ? 'Only attachments' : 'No text'),
       badges: deleted ? [] : badges,
@@ -6482,7 +6565,11 @@ function mutualServersEl(u) {
 }
 function openProfilePop(anchor, userId, side = 'right') {
   const u = getUser(userId);
-  const card = profileCard(u, { meId: S.me.id, compact: true, actions: relationshipActions(u), mutual: mutualServersEl(u) });
+  // Opened inside a server (its member list, messages, calls): their nickname there too, with Change when you may.
+  const sv = currentServer();
+  const nick = sv && sv.memberIds.includes(u.id) ? nicknameIn(sv, u.id) : '';
+  const nickname = nick ? { name: nick, place: sv.name, edit: mayNickname(sv, u) ? () => { closePopover(); openNickname(sv, u); } : null } : null;
+  const card = profileCard(u, { meId: S.me.id, compact: true, actions: relationshipActions(u), mutual: mutualServersEl(u), nickname });
   // The full page is the best part of a profile: make it one obvious click away.
   const open = () => openProfileModal(u.id);
   card.querySelector('.pc-inner')?.prepend(h('button', { class: 'btn primary pc-open-page', onclick: open }, icon('user'), u.id === S.me.id ? 'View my page' : 'View full profile'));
@@ -6594,7 +6681,7 @@ function openServerSecurity(server) {
       h('p', { class: 'muted-p' }, `Messages and files in ${label} are encrypted on your device with a key that only members have. The server stores scrambled data it can\u2019t read, and every message is signed by its sender.`),
       h('p', { class: 'muted-p' }, 'When someone leaves or is removed, the key is replaced automatically so they can\u2019t read anything new.'),
       h('div', { class: 'kv' }, h('span', null, 'Key version'), h('strong', null, st.keyEpoch ? `#${st.keyEpoch}` : 'Not set up yet')),
-      st.keyCreatorId ? h('div', { class: 'kv' }, h('span', null, 'Made by'), h('strong', null, `${displayName(getUser(st.keyCreatorId))}${st.keyCreatedAt ? `, ${new Date(st.keyCreatedAt).toLocaleString()}` : ''}`)) : null,
+      st.keyCreatorId ? h('div', { class: 'kv' }, h('span', null, 'Made by'), h('strong', null, `${nameInServer(server, getUser(st.keyCreatorId))}${st.keyCreatedAt ? `, ${new Date(st.keyCreatedAt).toLocaleString()}` : ''}`)) : null,
       h('div', { class: 'kv' }, h('span', null, 'Members with the current key'), h('strong', null, `${Math.max(0, holders)} of ${server.memberIds.length}`)),
       changed.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `Security key changed for ${changed.map(displayName).join(', ')}. Verify them from their profile before the key can be shared.`)) : null,
       h('p', { class: 'field-hint' }, 'To make sure nobody is impersonating a member, compare safety numbers with them from their profile (\u22ef \u2192 Verify encryption).')),
@@ -6632,6 +6719,7 @@ function serverMenuItems(server) {
     canManageServer(server) && can(server, PERMS.MANAGE_ROLES) ? { label: 'Roles', icon: 'shield', action: () => openServerSettings(server, 'roles') } : null,
     { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; S.thread = null; delete composers.thread; P.showMembers = true; renderAll(); } },
     pickableRoles(server, S.me.id).length ? { label: 'Pick your roles', icon: 'at', action: () => pickRoles(server) } : null,
+    mayNickname(server, S.me) ? { label: 'Change nickname', icon: 'edit', action: () => openNickname(server, S.me) } : null,
     server.memberships && !isOwner(server) ? { label: 'Memberships', icon: 'star', action: () => openMemberships(server) } : null,
     { label: fav ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => toggleFavorite('s:' + server.id) },
     ...folders.serverMenuExtras(server),
@@ -7028,7 +7116,7 @@ function openServerSettings(server, startTab = 'overview') {
         ...list2.map(([k, label, hint]) => tg(label, hint + (has(mine, PERMS[k]) ? '' : ' (You don\u2019t have this yourself, so you can\u2019t give it.)'), has(d.permissions, PERMS[k]), (on) => { d.permissions = on ? d.permissions | PERMS[k] : d.permissions & ~PERMS[k]; drawSelf(); })))));
       const holders = s.memberIds.filter((id) => ((s.memberRoles || {})[id] || []).includes(sel.id));
       const addSel = h('select', { class: 'input sm', 'aria-label': 'Add member to role' }, h('option', { value: '' }, 'Add member\u2026'),
-        s.memberIds.filter((id) => !holders.includes(id)).map((id) => h('option', { value: id }, displayName(getUser(id)))));
+        s.memberIds.filter((id) => !holders.includes(id)).map((id) => h('option', { value: id }, nameInServer(s, getUser(id)))));
       // Only this role changes (not the member's whole list as this window last saw it, which may be out of date).
       addSel.onchange = () => { const id = addSel.value; if (id) run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { add: [sel.id] })); };
       add(editor, 
@@ -7043,7 +7131,7 @@ function openServerSettings(server, startTab = 'overview') {
         h('h3', null, 'Permissions'), permsEl,
         sel.everyone ? null : h('h3', null, `Members \u2014 ${holders.length}`),
         sel.everyone ? null : h('div', { class: 'role-members' },
-          ...holders.map((id) => { const u = getUser(id); return h('span', { class: 'chip active' }, avatarEl(u, 20), displayName(u), locked ? null : h('button', { class: 'chip-x', 'aria-label': `Remove ${displayName(u)} from role`, onclick: () => run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { remove: [sel.id] })) }, icon('close'))); }),
+          ...holders.map((id) => { const u = getUser(id); return h('span', { class: 'chip active' }, avatarEl(u, 20), nameInServer(s, u), locked ? null : h('button', { class: 'chip-x', 'aria-label': `Remove ${nameInServer(s, u)} from role`, onclick: () => run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { remove: [sel.id] })) }, icon('close'))); }),
           locked ? null : mayGiveRole(s, sel) ? addSel : h('span', { class: 'field-hint' }, 'It has permissions you don\u2019t have, so you can\u2019t give it (you can take it away).')),
         locked ? null : h('div', { class: 'role-actions' },
           !sel.everyone ? h('button', { class: 'btn danger-ghost', onclick: async () => { if (await confirmDialog({ title: `Delete ${sel.name}?`, text: 'Everyone loses this role. This can\u2019t be undone.', confirm: 'Delete role', danger: true })) run(() => api('DELETE', `/roles/${sel.id}`), 'Role deleted.'); } }, 'Delete role') : h('span'),
@@ -7059,10 +7147,10 @@ function openServerSettings(server, startTab = 'overview') {
       clear(listEl);
       const term = q.value.trim().toLowerCase();
       const muted = new Set(s.voiceMutes || []);
-      s.memberIds.map(getUser).filter((u) => !term || u.username.toLowerCase().includes(term) || displayName(u).toLowerCase().includes(term)).forEach((u) => {
+      s.memberIds.map(getUser).filter((u) => !term || u.username.toLowerCase().includes(term) || displayName(u).toLowerCase().includes(term) || nicknameIn(s, u.id).toLowerCase().includes(term)).forEach((u) => {
         const rs = memberRoles(s, u.id);
         add(listEl, h('div', { class: 'ss-row' }, avatarEl(u, 32, { status: true, meId: S.me.id }),
-          h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id) }), h('span', null, u.username + (s.ownerId === u.id ? ' \u00b7 Owner' : '') + (muted.has(u.id) ? ' \u00b7 Server muted' : ''))),
+          h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id), server: s }), h('span', null, u.username + (s.ownerId === u.id ? ' \u00b7 Owner' : '') + (muted.has(u.id) ? ' \u00b7 Server muted' : ''))),
           h('span', { class: 'role-chips' }, ...rs.map((r) => h('span', { class: 'role-chip', style: r.color ? { '--rc': r.color } : null }, r.icon ? r.icon + ' ' : '', r.name))),
           ibtn('more', 'Manage', (e) => menu(e.currentTarget, memberMenuItems(s, u), { align: 'end' }), { cls: 'sm', attrs: { 'data-pop-anchor': '' } })));
       });
@@ -7076,9 +7164,9 @@ function openServerSettings(server, startTab = 'overview') {
       // Only someone below you can be unmuted by you (the server checks it again).
       const top = (id) => (s.ownerId === id ? Infinity : Math.max(0, ...memberRoles(s, id).map((r) => r.position)));
       add(body, h('h3', null, `Server muted \u2014 ${mutedNow.length}`), h('p', { class: 'muted-p' }, 'Nobody hears them in this server\u2019s voice channels until the mute is lifted.'),
-        h('div', { class: 'stack tight' }, mutedNow.map(getUser).map((u) => h('div', { class: 'ss-row' }, avatarEl(u, 30), h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id) }), h('span', null, u.username)),
+        h('div', { class: 'stack tight' }, mutedNow.map(getUser).map((u) => h('div', { class: 'ss-row' }, avatarEl(u, 30), h('span', { class: 'ss-row-name' }, nameEl(u, { roleColor: topColor(s, u.id), server: s }), h('span', null, u.username)),
           top(u.id) < top(S.me.id)
-            ? h('button', { class: 'btn ghost sm', 'aria-label': `Remove server mute for ${displayName(u)}`, onclick: () => run(() => api('DELETE', `/servers/${s.id}/voice/${u.id}/mute`), `${displayName(u)} can talk again.`) }, 'Remove mute')
+            ? h('button', { class: 'btn ghost sm', 'aria-label': `Remove server mute for ${nameInServer(s, u)}`, onclick: () => run(() => api('DELETE', `/servers/${s.id}/voice/${u.id}/mute`), `${nameInServer(s, u)} can talk again.`) }, 'Remove mute')
             : h('span', { class: 'field-hint' }, 'Above your highest role')))));
     }
     add(body, h('h3', null, `Members \u2014 ${s.memberIds.length}`), h('div', { class: 'friends-search' }, icon('search'), q), listEl);
@@ -7166,7 +7254,7 @@ function openServerSettings(server, startTab = 'overview') {
       if (!list.length) add(host, h('p', { class: 'muted-p' }, 'No invite links are active.'));
       list.forEach((i) => add(host, h('div', { class: 'ss-row' }, avatarEl(getUser(i.creatorId), 30),
         h('span', { class: 'ss-row-name' }, h('span', { class: 'mono' }, i.code),
-          h('span', null, [`by ${displayName(getUser(i.creatorId))}`, `${i.uses}${i.maxUses ? ` of ${i.maxUses}` : ''} use${i.uses === 1 && !i.maxUses ? '' : 's'}`,
+          h('span', null, [`by ${nameInServer(s, getUser(i.creatorId))}`, `${i.uses}${i.maxUses ? ` of ${i.maxUses}` : ''} use${i.uses === 1 && !i.maxUses ? '' : 's'}`,
             i.expiresAt ? `expires ${fmtStamp(i.expiresAt)}` : 'never expires'].join(' \u00b7 '))),
         h('button', { class: 'btn ghost sm danger-text', onclick: () => api('DELETE', `/invites/${encodeURIComponent(i.code)}`).then(() => { toast('Invite revoked.'); draw(); }).catch((e) => toast(e.message, 'error')) }, 'Revoke'))));
     } catch (e) { clear(host).append(h('p', { class: 'form-error' }, e.message)); }
@@ -7174,7 +7262,7 @@ function openServerSettings(server, startTab = 'overview') {
 
   function danger(s) {
     const transfer = h('select', { class: 'input', 'aria-label': 'New owner' }, h('option', { value: '' }, 'Choose a member'),
-      s.memberIds.filter((id) => id !== S.me.id).map((id) => h('option', { value: id }, `${displayName(getUser(id))} (${getUser(id).username})`)));
+      s.memberIds.filter((id) => id !== S.me.id).map((id) => h('option', { value: id }, `${nameInServer(s, getUser(id))} (${getUser(id).username})`)));
     add(body, h('h3', null, 'Danger zone'),
       h('div', { class: 'danger-zone' }, h('strong', null, 'Transfer ownership'), h('p', { class: 'muted-p' }, 'You\u2019ll keep your roles but lose owner powers.'),
         h('div', { class: 'row gap' }, transfer, h('button', { class: 'btn ghost', onclick: async () => {
@@ -7274,7 +7362,7 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
     ? ['VIEW_CHANNEL', 'CONNECT', 'SPEAK', 'MOVE_MEMBERS', 'MANAGE_CHANNELS', 'MANAGE_ROLES', ...VOICE_CHAT]
     : ['VIEW_CHANNEL', 'SEND_MESSAGES', 'CREATE_THREADS', 'EMBED_LINKS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'MANAGE_ROLES']).includes(k));
   const label = (o) => {
-    if (o.type === 'member') return displayName(getUser(o.id));
+    if (o.type === 'member') return nameInServer(server, getUser(o.id));
     const r = (server.roleDefs || []).find((x) => x.id === o.id);
     return r ? (r.everyone ? '@everyone' : r.name) : 'Deleted role';
   };
@@ -7302,7 +7390,7 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
     const sel = ovs.find((o) => `${o.type}:${o.id}` === selKey) || ovs[0];
     const addable = [
       ...(server.roleDefs || []).filter((r) => !ovs.some((o) => o.type === 'role' && o.id === r.id)).map((r) => ({ type: 'role', id: r.id, label: r.name })),
-      ...server.memberIds.filter((id) => !ovs.some((o) => o.type === 'member' && o.id === id)).map((id) => ({ type: 'member', id, label: displayName(getUser(id)) })),
+      ...server.memberIds.filter((id) => !ovs.some((o) => o.type === 'member' && o.id === id)).map((id) => ({ type: 'member', id, label: nameInServer(server, getUser(id)) })),
     ];
     const addSel = h('select', { class: 'input sm', 'aria-label': 'Add a role or member' }, h('option', { value: '' }, '+ Add role or member'),
       addable.map((a) => h('option', { value: `${a.type}:${a.id}` }, `${a.type === 'role' ? '\u25C6 ' : '\u25CF '}${a.label}`)));
@@ -7749,7 +7837,9 @@ function stageTiles(room) {
   return tiles;
 }
 function tileEl(room, t, big) {
-  const name = t.kind === 'screen' ? `${displayName(t.u)}\u2019s screen` : displayName(t.u);
+  // A server's voice channel shows nicknames there; DM and group calls the display name.
+  const shown = nameInServer(serverOfChannel(room), t.u);
+  const name = t.kind === 'screen' ? `${shown}\u2019s screen` : shown;
   const el = h('div', {
     class: `cs-tile kind-${t.kind}${big ? ' big' : ''}${t.kind !== 'screen' && S.speaking.has(t.u.id) ? ' speaking' : ''}`,
     dataset: { speak: t.kind === 'screen' ? '' : t.u.id, key: t.key }, tabindex: '0',
@@ -7781,9 +7871,9 @@ function tileEl(room, t, big) {
   if (!t.me && t.kind !== 'screen' && voice && voice.channelId === room) {
     el.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      const slider = h('input', { type: 'range', class: 'range', min: '0', max: '2', step: '0.05', value: String(voice.volumeFor(t.u.id)), 'aria-label': `Volume for ${displayName(t.u)}`, oninput: (ev) => voice.setVolume(t.u.id, +ev.target.value) });
+      const slider = h('input', { type: 'range', class: 'range', min: '0', max: '2', step: '0.05', value: String(voice.volumeFor(t.u.id)), 'aria-label': `Volume for ${shown}`, oninput: (ev) => voice.setVolume(t.u.id, +ev.target.value) });
       const pt = h('span', { style: { position: 'fixed', left: e.clientX + 'px', top: e.clientY + 'px' } }); document.body.append(pt);
-      popover(pt, h('div', { class: 'menu vol-pop' }, h('div', { class: 'menu-header' }, `Volume \u2014 ${displayName(t.u)}`), slider), { side: 'bottom' });
+      popover(pt, h('div', { class: 'menu vol-pop' }, h('div', { class: 'menu-header' }, `Volume \u2014 ${shown}`), slider), { side: 'bottom' });
       pt.remove();
     });
   }
@@ -7839,14 +7929,14 @@ function fillStage(el) {
   } else if (host) { host.remove(); host = null; }
   syncWatchDock();
   [...el.children].forEach((c) => { if (c !== host) c.remove(); });
-  const warn = hidden.length ? h('p', { class: 'cs-hidden-peers', role: 'alert' }, `Warning: you\u2019re connected to ${hidden.map((p) => displayName(getUser(p.userId))).join(', ')}, who the server doesn\u2019t list in this call. Leave the call if you didn\u2019t expect them.`) : null;
+  const warn = hidden.length ? h('p', { class: 'cs-hidden-peers', role: 'alert' }, `Warning: you\u2019re connected to ${hidden.map((p) => nameInServer(serverOfChannel(room), getUser(p.userId))).join(', ')}, who the server doesn\u2019t list in this call. Leave the call if you didn\u2019t expect them.`) : null;
   const rest = [warn, tiles.length ? body : h('div', { class: 'empty-state' }, h('p', null, 'No one\u2019s here yet.')), callControls(room)].filter(Boolean);
   if (host) { if (!host.parentNode) el.append(host); el.insertBefore(head, host); el.append(...rest); el.classList.add('watching'); }
   else { el.append(head, ...rest); el.classList.remove('watching'); }
 }
 const watchCtx = (room) => ({
   socket, me: S.me, isStaff: !!S.me.staffRole,
-  userName: (id) => (id ? displayName(getUser(id)) : 'someone'),
+  userName: (id) => (id ? nameInServer(serverOfChannel(room), getUser(id)) : 'someone'),
   openStart: (queue) => openWatchStart(room, queue),
 });
 // Open the page of the call you're in (voice channel, DM or group).
@@ -8013,7 +8103,7 @@ function watchChips(text) {
 }
 function renderCallStages() { $$('.call-stage').forEach(fillStage); }
 // What the diagnostics panel needs: names, and the relays' region names (never their addresses).
-const diagCtx = () => ({ voice, name: (id) => displayName(getUser(id)), relays: (S.iceServers || []).filter((e) => e.region).map((e) => ({ urls: e.urls, region: e.region })), region: () => (voice && voice.channelId ? regionName(callRegion(voice.channelId)) : '') });
+const diagCtx = () => ({ voice, name: (id) => nameInServer(voice && voice.channelId ? serverOfChannel(voice.channelId) : null, getUser(id)), relays: (S.iceServers || []).filter((e) => e.region).map((e) => ({ urls: e.urls, region: e.region })), region: () => (voice && voice.channelId ? regionName(callRegion(voice.channelId)) : '') });
 
 async function joinRoom(room, { video = false } = {}) {
   try {

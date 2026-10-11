@@ -9,12 +9,12 @@ import { PERMS, ALL } from './perms.js';
 const P = PERMS;
 // Moderator powers (the same list as server/memberships.js POWERFUL), and what self-assignable roles also can't have.
 const POWERFUL = P.ADMINISTRATOR | P.MANAGE_SERVER | P.MANAGE_ROLES | P.MANAGE_CHANNELS | P.MANAGE_MESSAGES
-  | P.MANAGE_EMOJIS | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MUTE_MEMBERS | P.MOVE_MEMBERS | P.VIEW_AUDIT_LOG;
+  | P.MANAGE_EMOJIS | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MUTE_MEMBERS | P.MOVE_MEMBERS | P.VIEW_AUDIT_LOG | P.MANAGE_NICKNAMES;
 export const SELF_BLOCKED = POWERFUL | P.MENTION_EVERYONE;
 const BLOCKED = SELF_BLOCKED;
-// The powers that only reach people below you (kick, ban, timeouts, role changes), as on the server: a marked
-// role has to sit below every role with one of them.
-const REACH = P.ADMINISTRATOR | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_ROLES;
+// The powers that only reach people below you (kick, ban, timeouts, role changes, other people's nicknames), as on
+// the server: a marked role has to sit below every role with one of them.
+const REACH = P.ADMINISTRATOR | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_ROLES | P.MANAGE_NICKNAMES;
 // Channel permissions, as the server checks them for overrides.
 const CHANNEL_SCOPED = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
   | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES;
@@ -43,7 +43,7 @@ export function selfAssignProblem(server, role, permissions, mine = ALL) {
   if (sold && !role.selfAssign) return `It’s sold as the "${sold}" membership, so members can’t pick it for free.`;
   const low = (server.roleDefs || []).filter((r) => !r.everyone && r.id !== role.id && (r.permissions & REACH))
     .sort((a, b) => a.position - b.position)[0];
-  if (low && role.position >= low.position) return `It sits above "${low.name}", a role that can kick, ban or manage roles: anyone who picked it would be out of that role’s reach. Move it below "${low.name}" first.`;
+  if (low && role.position >= low.position) return `It sits above "${low.name}", a role that can kick, ban, manage roles or manage nicknames: anyone who picked it would be out of that role’s reach. Move it below "${low.name}" first.`;
   if (!role.selfAssign) {
     if (permissions & ALL & ~mine) return 'It has permissions you don’t have, so you can’t let members pick it (that would give it to anyone).';
     // Channels this app knows about (ones you can see); the server also checks the rest.

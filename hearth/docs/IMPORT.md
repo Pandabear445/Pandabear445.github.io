@@ -75,6 +75,8 @@ what Discord did is listed before creating** (in the orange box, "Hearth will al
 | Mute members | Mute Members (roles only: a Hearth server mute holds in every voice channel) |
 | Move members | Move Members |
 | View audit log | View Audit Log (roles only, as in Discord: each server's own audit log) |
+| Change nickname | Change Nickname (roles only, as in Discord: your own nickname in this server) |
+| Manage nicknames | Manage Nicknames (roles only, as in Discord: other people's, below your highest role) |
 | Administrator | Administrator |
 
 **Covered by a broader Hearth permission.** These aren't reported as lost when the role gets the Hearth one:
@@ -99,9 +101,10 @@ allows it comes over, but Hearth shows someone's link previews only when they ha
 had any of these only per channel is listed under "Permissions Hearth can't set per channel".
 
 **No Hearth equivalent** (listed per role as "can't bring"): Priority Speaker, Send TTS Messages,
-View Server Insights, Deafen Members, Change Nickname, Manage Nicknames (Hearth has no per-server nicknames),
-Request to Speak, Manage Threads, Create Private Threads, Use External Stickers, View Monetization Analytics, Use
-Soundboard, Use External Sounds, Set Voice Channel Status and Use External Apps. Unknown bits are listed by number.
+View Server Insights, Deafen Members, Request to Speak, Manage Threads, Create Private Threads, Use External
+Stickers, View Monetization Analytics, Use Soundboard, Use External Sounds, Set Voice Channel Status and Use External
+Apps. Unknown bits are listed by number. (Change Nickname and Manage Nicknames come over: Hearth has per-server
+nicknames, server-wide permissions as in Discord.)
 
 **Allowed anyway in Hearth.** The preview lists each of these, with who or which channel, before creating:
 
