@@ -3,7 +3,7 @@
 A self-hosted place to hang out with your friends: servers with text and voice channels, direct messages, a friends list, and profiles you can customize as much as you like. Run it on your own computer or a cheap VPS and send your friends an invite link.
 
 - **Servers** with categories you can collapse and reorder, text and voice channels, invites, bans and per-server notification levels.
-- **Roles and permissions:** unlimited custom roles with colors, emoji badges, hierarchy, "show separately" in the member list and @mentions; 17 permissions; per-channel overrides for any role or person (private channels, read-only announcements, listen-only voice); slowmode per channel.
+- **Roles and permissions:** unlimited custom roles with colors, emoji badges, hierarchy, "show separately" in the member list and @mentions; roles members pick themselves (ping roles, pronouns, colors, opt-in channels); 17 permissions; per-channel overrides for any role or person (private channels, read-only announcements, listen-only voice); slowmode per channel.
 - **Make your server yours:** banner (positionable, GIFs animate), description, accent color, a server-wide background (presets, custom gradients or an image), welcome message, icon shape, role-colored names, and up to 200 custom emoji — animated GIF, WebP and APNG included, uploaded in bulk or grabbed straight from GIPHY — that members can use in any server or DM.
 - **Conversations** with replies, threads, reactions, pins, edits, forwarding, saved messages, @mentions (including @everyone and @channel), Markdown, spoilers, code blocks, GIFs, emoji search, and image/video/file attachments with a full-screen image viewer.
 - **GIFs, stickers and emoji in one picker, laid out like Discord's:** GIFs / Stickers / Emoji tabs, big Favorites, Trending and category tiles, a back arrow out of any category or search, results in two steady columns that keep loading as you scroll, and a star on every GIF. Through KLIPY or GIPHY, with a privacy proxy so they never see your members' IP addresses.
@@ -33,7 +33,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Owner tools:** server health (CPU, memory, disk, connections, responsiveness), one-click and automatic daily database backups with download, server name and tagline, feature switches (watch together, GIFs, comment walls, custom CSS, who can create servers), and a funding card with 💜 supporter badges and optional extra storage for supporters.
 - **Polls:** ask a question with 2–10 answers (single or multiple choice); votes update live for everyone and the poll creator can close it.
 - **Voice messages:** hold a conversation without typing — record from the mic button in any chat; they're end-to-end encrypted like every other file and play with a waveform and speed control.
-- **Events:** plan game nights and hangouts in any server with a time, place and description; members RSVP (going / maybe / can't), the next event shows at the top of the channel list and on Home under "Coming up", everyone gets a heads-up 15 minutes before, and events can be added to your calendar (.ics).
+- **Events:** plan game nights and hangouts in any server with a time, place and description; members RSVP (going / maybe / can't), the next event shows at the top of the channel list and on Home under "Coming up", everyone gets a heads-up 15 minutes before, and events can be added to your calendar (.ics). Events can **repeat** every week, every 2 weeks or every month (see [Events](#events-and-repeating-events)).
 - **Reminders:** right-click any message → *Remind me* (in 20 minutes, in 1 hour, tonight, tomorrow morning).
 - **People:** a directory of everyone you share a server with (search, online first, friends badge), and every profile card opens a full MySpace-style page with a big header — banner, avatar, name, headline, mood, status and when they joined.
 - **Games & music:** show the game you're playing ("Playing ELDEN RING · for 1h 20m") and the song you're listening to (album art, artist, "on Spotify" with an *Open in Spotify* button), in member lists, friends, profile cards and pages. The desktop app detects both by itself (any Steam game plus 60+ popular others like Fortnite, Valorant, League, Minecraft, Roblox; the Spotify app; Apple Music on Mac; any player on Linux). Anywhere else, link Last.fm (works with Spotify, Apple Music, YouTube Music, TIDAL, Deezer) or set it by hand by pasting a song link. Plus **favorite games** (up to 12 covers) and **recently played** with hours. Pictures come from Steam and Wikipedia, cached on your server.
@@ -173,6 +173,7 @@ Open the server name menu → **Server settings** (or **Roles**). Tabs appear ba
 
 - **Roles:** create roles, pick a color and an emoji badge, drag them up or down (higher roles outrank lower ones), toggle "show separately" and "@mentionable", and switch individual permissions on. You can only edit and hand out roles *below* your own highest role, and only roles whose permissions (including their per-channel overrides) you already have — so a moderator can't promote themselves, even to an Administrator role that sits lower. The owner and anyone with **Administrator** can do everything.
 - **Channel permissions:** right-click a channel → **Permissions**, **Make private** or **Make read-only**. Each permission can be set to allow (✓), deny (✕) or inherit (/) for @everyone, any role, or a specific person. Editing a channel or its permissions needs Manage Channels or Manage Roles *in that channel*, and you can only allow or deny what you have there. A moderator who isn't an Administrator can't take anything away from people at or above them, even through @everyone (the owner or an Administrator gives those roles their own access first); "Make private" and "Make read-only" keep the moderator's own access. Invites are for the whole server, so there's no per-channel invite permission.
+- **Roles members pick themselves:** in a role's settings, turn on **Members can pick this role themselves**. Everyone then finds it under **Pick your roles** in the server menu (and at the start of each channel), and can add or drop it whenever they like — handy for ping roles like @game-night, pronoun and color roles, and opt-in private channels (give the role access to the channel as usual). Picking a role works exactly like a moderator giving it: channels it opens appear within a moment (in a busy server, everyone's picks go out together), and dropping it closes them again (and takes you out of a voice channel you can no longer join right away). It can't hand out power: roles with moderator powers (Administrator, any Manage permission, Kick or Ban, itself or in a channel) or Mention @everyone can't be marked, and a marked role can't gain them later; a marked role has to sit below every role that can kick, ban or manage roles (those only work on people below you), so picking it never puts anyone out of a moderator's reach; and marking a role takes what giving it to anyone would (Manage Roles, the role below yours, and all its permissions, in each channel too). A role sold as a membership can't be marked, and the other way round. When you pick a role, it's refused if it would undo a limit another of your roles puts on you in a channel (say, a "quiet" role that can't post in #general); a moderator can still give it to you. That's only checked when you pick: a "quiet" role given to someone *after* they picked a role that allows posting there doesn't stop them (between roles, an allow beats a deny). To keep someone quiet for sure, time them out. Timed-out members can't change their roles until the timeout ends. Turning it off leaves the role with the people who have it; they just can't drop it themselves any more. Adding or removing a role for someone (the member menu, or a role's member list) changes just that role, so it never undoes a role they picked or dropped a moment before.
 - **Members:** add or remove roles, kick or ban (only people below you). Leaving, a kick or a ban removes the person's roles and per-channel permissions; rejoining starts from @everyone (roles from a membership they still pay for come back by themselves). **Bans** stop people rejoining through invites until unbanned, and revoke the invite links the banned person made.
 - **Invites:** new invite links expire after 7 days unless you choose otherwise (1 hour, 1 day, 30 days or never). **Server settings → Invites** (Manage Server) lists the links that still work and revokes them; anyone can revoke the links they made.
 - **Appearance:** accent color, server background (preset, custom gradient or image, with darkening), role-colored names, and a welcome message shown at the top of every channel. Members can turn server themes off for themselves under Settings → Appearance.
@@ -551,7 +552,7 @@ they paid for.
   pays them out), then make up to 5 memberships with a name, a monthly price, what members get and the role.
 - Money goes to the creator's own Stripe account; Hearth only stores Stripe ids and statuses, never card details.
   Roles with moderator powers can't be sold, and a sold role can't gain them later; a role a membership uses
-  can't be deleted while the membership is on sale or held. Nothing that's free changes: memberships only add what
+  can't be deleted while the membership is on sale or held. A role members can pick themselves can't be sold. Nothing that's free changes: memberships only add what
   a creator chooses to offer.
 
 ## News bot
@@ -596,6 +597,31 @@ end-to-end encrypted and are marked that way. Make one in Server settings → Bo
 Owner). Developer guide: `docs/BOTS.md`; example: `scripts/example-bot.js`. `BOT_WEBHOOK_ALLOW_PRIVATE=1` allows
 webhooks to private addresses (for bots on your own network).
 
+### Webhooks (Uptime Kuma, Grafana, Home Assistant, GitHub…)
+
+Anything that can post to a **Discord webhook URL** can post to a Hearth channel instead: right-click a text channel
+→ **Webhooks** (needs Manage Channels, or Manage Server, plus being able to send messages there), make one, and paste
+its address where the program asks for a Discord webhook. Discord-style posts (text, a display name, embeds with fields, footers and colours) and Slack-style
+posts work as they are; add `/slack` to the address for Slack tools, or `/github` for a GitHub repository's webhook.
+Embeds are turned into text with a coloured dot (🔴 down, 🟢 up…).
+
+- The address is the password: it's shown once (Hearth keeps only a hash), and **New address** replaces a leaked one.
+- Posts come from the webhook's bot, marked **"Webhook · not end-to-end encrypted"** (they come from outside, so the
+  server stores them sealed with its own key, like other bot posts). Everything people write stays end-to-end
+  encrypted.
+- They **don't ping anyone** unless you allow it: `@everyone`, `@here`, roles and names show as plain text. Only
+  someone who may mention @everyone in that channel can turn pings on. People who chose **All messages** for the
+  channel get push notifications for webhook posts either way.
+- A webhook **pauses** while the person who made its address is suspended, banned from the server or timed out (they
+  still know the address), and while its own account is suspended. A **New address** from another manager makes it
+  theirs and starts it again. Managers can only change webhooks whose address was made by someone below their
+  highest role (or by themselves).
+- Limits like Discord's (5 posts per 2 seconds per webhook, 30 a minute per channel). Nothing is fetched when a post
+  arrives; a post's avatar is loaded through this server's image proxy (public https images only) when people view
+  the post.
+
+Details, every field that's understood and the error codes: `docs/BOTS.md` ("Incoming webhooks").
+
 ## Monitoring and troubleshooting
 
 Hearth logs one JSON line per event (set `LOG_FORMAT=pretty` for readable lines). Secrets, tokens and message content
@@ -622,6 +648,17 @@ Organise the servers in your left bar into folders:
 - **Focus on a folder** (right-click it) to show only its servers, for example "School" during the week. Click the focus tile at the top of the bar to switch back.
 - **Mute a folder or mark it all as read** in one click.
 - **They follow you:** your folders are saved to your account, so every device shows the same arrangement.
+
+## Events and repeating events
+
+Open **Events** at the top of a server's channel list → **Plan an event**. Anyone who can send messages in the server can plan one; the person who made it, and people with Manage Server or Manage Channels, can change or delete it.
+
+- **Repeats:** *Does not repeat*, *Every week*, *Every 2 weeks* or *Every month* (on the same day of the month; an event on the 29th–31st falls on the last day of shorter months, then goes back to its day). **Ends:** never, on a date (that day is included), or after a number of times (counting the first one, up to 500). A repeating event can last up to 6 days, so one time always ends before the next starts, even in a week when the clocks go forward.
+- **One event, always the next time.** When a time ends, the event moves on to the next one: its start and end move, the 15-minute reminder is armed again, and **everyone answers again**. A "going" for this week isn't a "going" for next week, and reminders only go to people who said going or maybe, so old answers would remind people who weren't planning to come. The person who made the event is put down as going again, as when they made it (they can change that). Home's **Coming up** and the channel list show the next time and say "Every week" and so on.
+- **Same time on the clock.** A repeating event remembers the time zone of the person who planned it and stays at the same local time when the clocks change (8 pm stays 8 pm). Someone editing it from another time zone doesn't move it. Everyone in the server can see that time zone (the editor says so, and it's in the calendar file). Events made through the API without a time zone are kept in UTC and shift by an hour for people whose clocks change.
+- **Changes apply to this time and every later one.** Editing or deleting a repeating event changes the whole rest of the series; there are no exceptions for single dates (to skip one, people can just answer "can't go"). Choose *Does not repeat* to stop it after the current time. If a time ends while you have the event open to edit, saving puts your other changes on the next time; a changed time or repeat setting asks you to open it again, since it was based on the time that ended.
+- **Add to my calendar** downloads an .ics file with the repeat rule and the time zone, so calendar apps show every time. The zone's clock changes are written as yearly rules where they fit, and listed date by date for the next ten years where they don't (Israel, Egypt, Morocco, Chile and a few others).
+- **Not end-to-end encrypted:** the server needs the times to send reminders, so it can read event titles, descriptions and places (the app says so).
 
 ## Group chats
 
@@ -686,10 +723,13 @@ server/index.js     HTTP API, Socket.IO realtime, voice signaling
 server/db.js        SQLite schema, encrypted-key storage
 server/profile.js   Profile validation
 server/perms.js     Roles and permission rules
+server/selfroles.js Roles members pick themselves (and what keeps them from handing out power)
 public/             The web app (plain JavaScript modules, no build)
 public/js/e2ee.js   Encryption primitives (WebCrypto + Argon2id)
 public/js/secure.js Key management: group keys, rotation, verification
 public/js/features.js Polls, voice messages, events, reminders
+public/js/ics.js    Calendar files for events (repeat rule, time zone)
+server/recurrence.js Repeating events: the next time, on the event's own clock
 public/js/activity.js Games & music: playing / listening, favorite games
 server/activity.js  Game search and pictures, Last.fm, live activity
 server/regions.js   Linked regions (call relays) and their install script

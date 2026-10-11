@@ -55,6 +55,7 @@ const ipChip = (ip) => h('button', { class: 'ip-chip', 'data-tip': 'IP options',
 ]) }, ip);
 const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => b && onOpen && onOpen(b.id) }, avatarEl(asUser(b), 28),
   h('span', { class: 'adm-user-text' }, h('strong', null, b ? b.displayName : 'Deleted user'), h('span', null, b ? '@' + b.username : '')),
+  b && b.bot ? h('span', { class: 'bot-tag' }, 'BOT') : null,
   b && b.suspended ? h('span', { class: 'badge-tag bad' }, 'Suspended') : null, b ? roleTag(b.role) : null);
 
 export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin', confirm = null } = {}) {
@@ -905,6 +906,10 @@ async function userModal(id, refresh, myRank = 2) {
         roleTag(u.role),
         u.suspendedAt ? h('span', { class: 'badge-tag bad' }, `Suspended ${ago(u.suspendedAt)}${u.suspendedUntil ? ` until ${fmtStamp(u.suspendedUntil)}` : ''}${u.suspendReason ? `: ${u.suspendReason}` : ''}`) : null,
         h('span', { class: 'stat-sub' }, `Joined ${fmtStamp(u.createdAt)} \u00b7 ${u.servers.length} servers \u00b7 made ${u.reportsBy} reports`)),
+      // A channel webhook's account: suspending it, or the person who made its address, pauses it.
+      u.webhook ? h('p', { class: 'field-hint' }, `Channel webhook \u201c${u.webhook.name}\u201d${u.webhook.deleted ? ' (deleted)' : ''} in #${u.webhook.channel || '?'} \u00b7 ${u.webhook.server || '?'}. Its address was made by `,
+        u.webhook.madeBy ? userCell(u.webhook.madeBy, (x) => userModal(x, refresh, myRank)) : 'a deleted account',
+        '. Suspending either account pauses it.') : null,
       h('h4', null, 'IP addresses'),
       h('div', { class: 'adm-table' }, ...u.ips.map((x) => h('div', { class: 'adm-row three' }, ipChip(x.ip), h('span', { class: 'stat-sub' }, `first ${fmtStamp(x.firstSeen)}`), h('span', { class: 'stat-sub' }, `last ${ago(x.lastSeen)}`)))),
       h('p', { class: 'field-hint' }, `Email: ${u.emailMasked || 'none'} \u00b7 Two-factor: ${u.totpEnabled ? 'on' : 'off'} \u00b7 Recovery key: ${u.hasRecovery ? 'saved' : 'none'}`),

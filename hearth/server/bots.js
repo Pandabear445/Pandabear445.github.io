@@ -371,18 +371,24 @@ module.exports = function setupBots(ctx) {
   }
 
   // ------------------------------------------------------------------ posting as a bot
+  // The insert and live update every bot post shares (installed bots here, channel webhooks in webhooks.js).
+  // Stored like the news bot's posts: sealed with the server's at-rest key, marked as a bot post. `extra` is
+  // anything else the app shows with it (a webhook's name for this post, say).
+  function botPost(authorId, c, content, { replyTo = null, extra = {} } = {}) {
+    const id = newId();
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL)')
+      .run(id, c.id, authorId, seal({ ...extra, content, attachments: [], bot: true }), replyTo, now());
+    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
+    toChannel(c).emit('message:new', serializeMessage(row, c));
+    event('message.created', c.server_id, metaOf(row, c), { channel: c, actorId: authorId });
+    return row;
+  }
   function postAsBot(bot, inst, c, content, replyTo) {
     rateLimit(`botmsg:${bot.id}:${c.id}`, 10, 10000);
     rateLimit('botmsgh:' + bot.id, 1000, 3600000);
     let reply = replyTo ? String(replyTo) : null;
     if (reply && !db.prepare('SELECT 1 FROM messages WHERE id = ? AND channel_id = ?').get(reply, c.id)) reply = null;
-    const id = newId();
-    // Stored like the news bot's posts: sealed with the server's at-rest key, marked as a bot post.
-    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL)')
-      .run(id, c.id, bot.id, seal({ content, attachments: [], bot: true }), reply, now());
-    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
-    toChannel(c).emit('message:new', serializeMessage(row, c));
-    event('message.created', c.server_id, metaOf(row, c), { channel: c, actorId: bot.id });
+    const row = botPost(bot.id, c, content, { replyTo: reply });
     markOk(inst.id);
     return row;
   }
@@ -927,7 +933,7 @@ module.exports = function setupBots(ctx) {
   });
   api.delete('/servers/:id/bots/:botId/deliveries/dead', auth, limitUi, (req, res) => res.json({ cleared: clearDead(managedInstall(req)) }));
 
-  return { event, serverBots, SCOPES, EVENTS, sign, pump };
+  return { event, serverBots, botPost, SCOPES, EVENTS, sign, pump };
 };
 module.exports.sign = sign;
 module.exports.SCOPES = SCOPES;

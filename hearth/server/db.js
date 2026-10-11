@@ -342,6 +342,8 @@ CREATE TABLE IF NOT EXISTS bans (
 addColumn('servers', 'theme', "TEXT NOT NULL DEFAULT '{}'");
 addColumn('servers', 'description', "TEXT NOT NULL DEFAULT ''");
 addColumn('channels', 'slowmode', 'INTEGER NOT NULL DEFAULT 0');
+// Members can pick this role themselves (server/selfroles.js). Never one with moderator powers.
+addColumn('roles', 'self_assign', 'INTEGER NOT NULL DEFAULT 0');
 
 // Instance-wide settings an admin can change from the app (e.g. the GIPHY key), overriding .env.
 db.exec(`CREATE TABLE IF NOT EXISTS instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
@@ -501,6 +503,16 @@ CREATE TABLE IF NOT EXISTS event_rsvps (
   PRIMARY KEY (event_id, user_id)
 );
 `);
+// Repeating events: one row is the series, moved on to its next time when one ends (server/recurrence.js).
+// repeat: weekly | biweekly | monthly (NULL: once). repeat_left counts the times still to come including the
+// current one (NULL: no limit). repeat_tz is the time zone the times are kept in; repeat_anchor is the start the
+// rule was set from (its time of day, and for monthly its day of the month).
+addColumn('server_events', 'repeat', 'TEXT');
+addColumn('server_events', 'repeat_until', 'INTEGER');
+addColumn('server_events', 'repeat_left', 'INTEGER');
+addColumn('server_events', 'repeat_tz', 'TEXT');
+addColumn('server_events', 'repeat_anchor', 'INTEGER');
+db.exec('CREATE INDEX IF NOT EXISTS idx_events_repeat ON server_events(starts_at) WHERE repeat IS NOT NULL');
 
 // v11: games and music people play and like, linked regions (call relays), automatic supporter payments.
 db.exec(`
@@ -1072,6 +1084,40 @@ CREATE TABLE IF NOT EXISTS bot_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_bot_deliveries_due ON bot_deliveries(status, next_at);
 CREATE INDEX IF NOT EXISTS idx_bot_deliveries_bot ON bot_deliveries(bot_id, installation_id, created_at);
+`);
+
+// Incoming webhooks (server/webhooks.js): a secret address per channel that programs post to, the way they post to
+// Discord or Slack. Only a SHA-256 hash of the secret is kept. Each one posts as its own bot account (bot_user_id: a
+// users row with is_bot = 1 and no bots row, so it can't sign in or use the bot API). created_by is whoever made its
+// current address. A deleted webhook whose posts are still in the channel stays as a tombstone (deleted_at, with a
+// secret nobody has) so the posts keep their author. A row goes for good with its channel or server, or when a webhook
+// with no posts is deleted; nothing of its account is then shown anywhere, so the trigger wipes it like a deleted
+// person's account (a freed username, a placeholder name). Rows in users are never removed: each removal would scan
+// the whole messages table for that author.
+db.exec(`
+CREATE TABLE IF NOT EXISTS channel_webhooks (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  bot_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  allow_mentions INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  rotated_at INTEGER,
+  last_used_at INTEGER,
+  deleted_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_channel_webhooks_channel ON channel_webhooks(channel_id);
+CREATE INDEX IF NOT EXISTS idx_channel_webhooks_server ON channel_webhooks(server_id);
+CREATE INDEX IF NOT EXISTS idx_channel_webhooks_user ON channel_webhooks(bot_user_id);
+DROP TRIGGER IF EXISTS channel_webhooks_gone;
+CREATE TRIGGER IF NOT EXISTS channel_webhooks_retire AFTER DELETE ON channel_webhooks BEGIN
+  UPDATE users SET username = 'deleted-' || lower(hex(randomblob(6))), profile = '{"displayName":"Deleted webhook"}', avatar = NULL,
+    deleted_at = COALESCE(deleted_at, CAST(strftime('%s', 'now') AS INTEGER) * 1000)
+    WHERE id = OLD.bot_user_id AND is_bot = 1;
+END;
 `);
 
 // Test hook for the upgrade drill (scripts/upgrade-drill.sh, test/recovery-upgrade.test.js): the process dies here,

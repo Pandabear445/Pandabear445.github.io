@@ -195,6 +195,7 @@ export const icons = {
   music: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
   globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10A15 15 0 0 1 12 2z"/></svg>',
   coin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2-1.5-1.5-2.7-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7z"/></svg>',
+  repeat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11V10a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>',
   flame: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.8 1.6a1 1 0 0 0-1.6.6c-.5 2.9-2 4.6-3.6 6.3C6 10.2 4.5 12 4.5 15a7.5 7.5 0 0 0 15 0c0-2.4-1-4.4-2.2-6a1 1 0 0 0-1.7.4c-.2 1-.6 1.8-1.2 2.3.2-3.7-.9-7.3-1.6-10.1M12 21a3.5 3.5 0 0 1-3.5-3.5c0-1.8 1.4-3 2.5-4.4.3 1.2 1 2 2 2.2.2 0 .4 0 .5-.2 1.3 1 2 1.9 2 2.9A3.5 3.5 0 0 1 12 21"/></svg>',
 };
 

@@ -19,7 +19,7 @@ import { createSecure } from './secure.js';
 import { avatarEl, nameEl, displayName, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
-import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
+import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voiceEl, openEvents, onEventsUpdate, eventsFor, loadEvents, repeatLabel, upcomingSection, onEventStarting, remindItems, startReminders } from './features.js';
 import { rankRelays, chooseIce, relayTime, iceStale } from './relays.js';
 import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
@@ -31,7 +31,9 @@ import { createFolders } from './folders.js';
 import { createUpdates } from './updates.js';
 import { createRecall } from './recall-host.js';
 import { openMemberships, membershipsTab } from './memberships.js';
+import { openRolePicker, pickableRoles, selfAssignProblem, SELF_BLOCKED } from './selfroles.js';
 import { botsTab, createSlash, NEWS_BOT_ID } from './bots.js';
+import { webhooksPanel, onWebhooksUpdate } from './webhooks.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, quietNow } from './usability.js';
 import { trackViewport } from './viewport.js';
@@ -658,6 +660,7 @@ function startApp() {
       if (S.view.channelId && !server.channels.some((c) => c.id === S.view.channelId)) { toast('You no longer have access to that channel.'); return openServer(server.id); }
       renderSidebar(); renderHeader(); renderPanel();
       if (composers.main) composers.main.renderExtras();
+      refreshWelcomeRoles(server);
     }
     else if (server.kind === 'group' && !S.view.serverId) renderSidebar();
   });
@@ -730,6 +733,7 @@ function startApp() {
     if (m) { m.threadCount = threadCount || 0; m.threadLastAt = threadLastAt; if (currentKey() === 'c:' + channelId) replaceMessageEl(m); }
   });
   socket.on('bot:interaction', (x) => SLASH.onInteraction(x));
+  socket.on('webhooks:update', (x) => onWebhooksUpdate(x));
   socket.on('reaction:update', (p) => {
     const key = p.channelId ? 'c:' + p.channelId : 'd:' + p.dmId;
     const store = S.msgs[key];
@@ -960,6 +964,8 @@ const isAdmin = (server) => can(server, PERMS.MANAGE_CHANNELS); // can manage ch
 // both, so a per-channel deny hides what would only fail).
 const canEditChannel = (server, c) => isAdmin(server) && canIn(c, PERMS.MANAGE_CHANNELS);
 const canEditChannelPerms = (server, c) => can(server, PERMS.MANAGE_ROLES) && canIn(c, PERMS.MANAGE_ROLES);
+// A text channel's webhooks: Manage Channels there (as for editing it) or Manage Server; never in group chats.
+const canManageHooks = (server, c) => !!c && c.type === 'text' && !isGroup(server) && (can(server, PERMS.MANAGE_SERVER) || canEditChannel(server, c));
 // The owner and Administrators can change anything; anyone else's changes can't take their own access away.
 const isFullAdmin = (server) => isOwner(server) || can(server, PERMS.ADMINISTRATOR);
 // You can only give a role whose permissions you have yourself (the server also checks its channel overrides,
@@ -1697,7 +1703,8 @@ function renderServerSidebar(server, head, body) {
   if (!eventsLoaded.has(server.id)) { eventsLoaded.add(server.id); loadEvents(server.id).then(() => later(renderSidebar)); }
   const next = evs[0];
   body.append(h('button', { class: `ev-row${next ? ' has' : ''}`, onclick: () => openEvents(server) }, icon('book'),
-    h('span', { class: 'ev-row-text' }, next ? h('span', null, h('strong', null, next.title), h('small', null, new Date(next.startsAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }))) : 'Events'),
+    h('span', { class: 'ev-row-text' }, next ? h('span', null, h('strong', null, next.title), h('small', null, new Date(next.startsAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }),
+      next.repeat ? ` · ${repeatLabel(next).toLowerCase()}` : '')) : 'Events'),
     evs.length ? h('span', { class: 'badge inline' }, evs.length) : null));
   // Memberships this server sells (support the creator, get a role / private channels).
   if (server.memberships) body.append(h('button', { class: 'ev-row mb-row', onclick: () => (isOwner(server) ? openServerSettings(server, 'memberships') : openMemberships(server)) }, icon('star'), h('span', { class: 'ev-row-text' }, 'Memberships')));
@@ -1749,7 +1756,7 @@ function channelRow(c, server) {
   }, icon(mentions ? 'at' : channelIcon(c), 'ic ch-ic'), h('span', { class: 'ch-name' }, c.name),
   muted ? icon('bellOff', 'ic ch-muted') : null,
   mentions ? h('span', { class: 'badge' }, mentions) : null),
-  canEditChannel(server, c) || canEditChannelPerms(server, c) ? ibtn('gear', 'Edit channel', () => openEditChannel(c), { cls: 'sm ch-gear' }) : null);
+  canEditChannel(server, c) || canEditChannelPerms(server, c) || canManageHooks(server, c) ? ibtn('gear', 'Edit channel', () => openEditChannel(c), { cls: 'sm ch-gear' }) : null);
 }
 function channelMenuItems(c, server) {
   const k = 'c:' + c.id;
@@ -1769,6 +1776,7 @@ function channelMenuItems(c, server) {
     { label: 'Copy channel link', icon: 'link', action: () => { copyText(`${location.origin}/#c/${c.id}`); toast('Link copied.'); } },
     edit ? { label: 'Edit channel', icon: 'edit', action: () => openEditChannel(c) } : null,
     roles ? { label: 'Permissions', icon: 'shield', action: () => openEditChannel(c, 'perms') } : null,
+    canManageHooks(server, c) ? { label: 'Webhooks', icon: 'link', action: () => openEditChannel(c, 'hooks') } : null,
     roles && c.type === 'text' ? { label: 'Make read-only (announcements)', icon: 'megaphone', action: () => quickOverride(server, c, 'readonly') } : null,
     roles ? { label: 'Make private', icon: 'lock', action: () => quickOverride(server, c, 'private') } : null,
     admin ? { label: 'Move up', icon: 'arrowUp', action: () => moveChannel(server, c, -1) } : null,
@@ -2537,7 +2545,7 @@ function mentionKind(m) {
   if (m.dmId) return null;
   const server = S.servers.find((x) => x.id === m.serverId);
   const mine = server ? (server.memberRoles || {})[S.me.id] || [] : [];
-  for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id) && mayMentionRole(server, id, m.authorId)) return 'roleMention';
+  for (const [, id] of t.matchAll(/<@&([a-z0-9]{6,40})>/g)) if (mine.includes(id) && (hookPings(m) || mayMentionRole(server, id, m.authorId))) return 'roleMention';
   if (/(^|\s)@(everyone|channel|here)\b/i.test(t) && senderMayPingEveryone(m)) return 'everyone';
   return null;
 }
@@ -2587,7 +2595,16 @@ async function withKeyRetry(serverId, fn) {
 const GROUP_GAP = 7 * 60 * 1000;
 function grouped(m, prev) {
   return !!prev && prev.authorId === m.authorId && !m.reply && m.createdAt - prev.createdAt < GROUP_GAP
-    && new Date(prev.createdAt).toDateString() === new Date(m.createdAt).toDateString();
+    && new Date(prev.createdAt).toDateString() === new Date(m.createdAt).toDateString() && faceKey(prev) === faceKey(m);
+}
+// A webhook's posts can each carry their own name and picture, so they only group with posts that look the same.
+const faceKey = (m) => (m.webhook ? `${m.webhook.name || ''}\n${m.webhook.avatar || ''}` : '');
+// The name and picture a webhook post asked for (Uptime Kuma, Grafana…). The picture only loads through this server's
+// image proxy, and the profile behind both is still the webhook's own (its name shows in the label's tip).
+function hookFace(author, m) {
+  const w = m.dec && m.dec.bot && m.dec.webhook;
+  if (!w || (!w.name && !w.avatar)) return author;
+  return { id: `hook:${author.id}`, username: author.username, bot: true, profile: { displayName: w.name || displayName(author) }, avatar: w.avatar ? mediaNewsUrl(w.avatar) : author.avatar || null };
 }
 function renderMessages(stick) {
   const sc = $('#messages');
@@ -2673,7 +2690,20 @@ function welcomeBlock() {
   return h('div', { class: 'welcome' }, h('div', { class: 'welcome-ic' }, icon(channelIcon(c))), h('h2', null, `Welcome to #${c.name}`),
     h('p', null, c.topic || 'This is the start of the channel.'),
     th.welcome ? h('div', { class: 'server-welcome', html: md(th.welcome, { mentionName: S.me.username }) }) : null,
+    h('div', { class: 'welcome-roles-slot' }, welcomeRoles(server)),
     h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only members of this server can read it.'));
+}
+// "Pick your roles" at the start of a channel, while there's something to pick. Redrawn in place when a role is
+// marked or unmarked (server:update), since the message list itself isn't.
+function welcomeRoles(server) {
+  return pickableRoles(server, S.me.id).length ? h('button', { class: 'btn ghost sm welcome-roles', onclick: () => pickRoles(currentServer() || server) }, icon('at'), 'Pick your roles') : null;
+}
+function refreshWelcomeRoles(server) {
+  for (const slot of document.querySelectorAll('#messages .welcome-roles-slot')) {
+    const btn = welcomeRoles(server);
+    // Only when it appears or goes, so a focused button isn't swapped under the keyboard.
+    if (!!btn !== !!slot.firstChild) { clear(slot); if (btn) slot.append(btn); }
+  }
 }
 
 // ---- one message
@@ -2714,13 +2744,13 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
   }
   const gutter = h('div', { class: 'msg-gutter', dataset: { time: fmtTime(m.createdAt) } });
   if (isGrouped) gutter.append(h('time', { class: 'msg-hover-time', datetime: new Date(m.createdAt).toISOString() }, fmtTime(m.createdAt)));
-  else gutter.append(h('button', { class: 'msg-av', 'data-pop-anchor': '', 'aria-label': `View ${displayName(author)}'s profile`, onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, avatarEl(author, 40)));
+  else gutter.append(h('button', { class: 'msg-av', 'data-pop-anchor': '', 'aria-label': `View ${displayName(author)}'s profile`, onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, avatarEl(hookFace(author, m), 40)));
   const body = h('div', { class: 'msg-body' });
   if (!isGrouped) {
     const server = m.serverId && S.servers.find((s) => s.id === m.serverId);
     const rs = roleStyle(server, author.id);
     body.append(h('div', { class: 'msg-head' },
-      h('button', { class: 'msg-name', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, nameEl(author, { roleColor: rs.color })),
+      h('button', { class: 'msg-name', 'data-pop-anchor': '', onclick: (e) => openProfilePop(e.currentTarget, author.id, 'right') }, nameEl(hookFace(author, m), { roleColor: rs.color })),
       (author.bot || m.bot || (m.dec && m.dec.bot)) ? h('span', { class: 'bot-tag' }, 'BOT') : null,
       rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
       rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
@@ -2753,6 +2783,7 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     if (wc) body.append(wc);
     if (embed) body.append(newsCard(embed));
     if (m.dec && m.dec.bot && m.authorId === NEWS_BOT_ID) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by this server\u2019s news bot from a public feed, so it isn\u2019t end-to-end encrypted. Everything people write still is.' }, 'News bot \u00b7 public feed, not end-to-end encrypted'));
+    else if (m.dec && m.dec.bot && m.dec.webhook) body.append(h('div', { class: 'msg-flag', 'data-tip': `Posted by a program outside Hearth through this channel’s webhook “${displayName(author)}”, so it isn’t end-to-end encrypted. Everything people write still is.` }, 'Webhook \u00b7 not end-to-end encrypted'));
     else if (m.dec && m.dec.bot) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Posted by a bot this server added. Bot messages aren\u2019t end-to-end encrypted. Everything people write still is.' }, 'Bot \u00b7 not end-to-end encrypted'));
     else if (m.dec && m.dec.legacy) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Sent before end-to-end encryption was turned on. Protected by the server\u2019s encryption only, and nothing proves who wrote it: the server could have.' }, 'Older message \u2014 not end-to-end encrypted, sender not verified'));
     // Opened or signed with a key that isn't the person's current, trusted one (secure.js keysOf).
@@ -2855,9 +2886,12 @@ function canModerate(m) {
   if (m.dmId) return false;
   return canIn(channelById(m.channelId), PERMS.MANAGE_MESSAGES);
 }
+// A channel webhook pings only if it was allowed to (the server defused its mentions otherwise, before storing it).
+const hookPings = (m) => !!(m.dec && m.dec.bot && m.dec.webhook && m.dec.webhook.pings);
 // Whether this message's @everyone is highlighted and pings on this device. Push notifications are the server's own check.
 function senderMayPingEveryone(m) {
   if (m.dmId) return false;
+  if (m.dec && m.dec.bot && m.dec.webhook) return hookPings(m);
   const server = S.servers.find((x) => x.id === m.serverId);
   return !!server && has(basePerms(server, m.authorId), PERMS.MENTION_EVERYONE);
 }
@@ -3590,7 +3624,8 @@ function memberMenuItems(server, u) {
       items.push('-', { header: 'Roles' });
       assignable.forEach((r) => items.push({
         label: `${r.icon ? r.icon + ' ' : ''}${r.name}`, checked: current.includes(r.id),
-        action: () => api('PUT', `/servers/${server.id}/members/${u.id}/roles`, { roleIds: current.includes(r.id) ? current.filter((x) => x !== r.id) : [...current, r.id] }).catch((e) => toast(e.message, 'error')),
+        // Just this role: members change their own roles too, so the rest of this list may be out of date.
+        action: () => api('PUT', `/servers/${server.id}/members/${u.id}/roles`, current.includes(r.id) ? { remove: [r.id] } : { add: [r.id] }).catch((e) => toast(e.message, 'error')),
       }));
     }
   }
@@ -5033,6 +5068,7 @@ function serverMenuItems(server) {
     canManageServer(server) ? { label: 'Server settings', icon: 'gear', action: () => openServerSettings(server) } : null,
     canManageServer(server) && can(server, PERMS.MANAGE_ROLES) ? { label: 'Roles', icon: 'shield', action: () => openServerSettings(server, 'roles') } : null,
     { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; P.showMembers = true; renderAll(); } },
+    pickableRoles(server, S.me.id).length ? { label: 'Pick your roles', icon: 'at', action: () => pickRoles(server) } : null,
     server.memberships && !isOwner(server) ? { label: 'Memberships', icon: 'star', action: () => openMemberships(server) } : null,
     { label: fav ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => toggleFavorite('s:' + server.id) },
     ...folders.serverMenuExtras(server),
@@ -5049,6 +5085,10 @@ function serverMenuItems(server) {
     !isOwner(server) ? '-' : null,
     !isOwner(server) ? { label: 'Leave server', icon: 'logout', danger: true, action: () => leaveServer(server) } : null,
   ];
+}
+// Roles members can pick themselves (public/js/selfroles.js).
+function pickRoles(server) {
+  openRolePicker(server, { myId: S.me.id, live: () => S.servers.find((x) => x.id === server.id), nextUpdate: () => nextServerUpdate(server.id) });
 }
 async function leaveServer(server) {
   const group = isGroup(server);
@@ -5368,7 +5408,7 @@ function openServerSettings(server, startTab = 'overview') {
     const editor = h('div', { class: 'role-editor' });
     if (sel) {
       const locked = !editable(sel);
-      const d = { name: sel.name, color: sel.color, icon: sel.icon, hoist: sel.hoist, mentionable: sel.mentionable, permissions: sel.permissions };
+      const d = { name: sel.name, color: sel.color, icon: sel.icon, hoist: sel.hoist, mentionable: sel.mentionable, permissions: sel.permissions, selfAssign: !!sel.selfAssign };
       const nameIn = h('input', { class: 'input', maxlength: '32', value: d.name, disabled: sel.everyone || locked, oninput: (e) => { d.name = e.target.value; } });
       const iconIn = h('input', { class: 'input emoji-input', maxlength: '4', value: d.icon || '', placeholder: '\u2728', disabled: sel.everyone || locked, oninput: (e) => { d.icon = e.target.value; } });
       const swatches = ['#f2a541', '#ef5466', '#ff7ab6', '#b07cff', '#5c8dff', '#38c6d9', '#3fcf83', '#c4e05a', '#ffffff', ''];
@@ -5379,12 +5419,29 @@ function openServerSettings(server, startTab = 'overview') {
       const tg = (label, hint, val, on) => h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, label), hint ? h('span', { class: 'field-hint' }, hint) : null),
         h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!val, disabled: locked, onchange: (e) => on(e.target.checked) }), h('span', { class: 'switch-track' })));
       const mine = myPerms(s);
+      // "Members can pick this role themselves": off (and saying why) for roles that can't be, as the server
+      // would refuse. Rechecked as permissions are ticked below.
+      const selfHint = h('span', { class: 'field-hint' });
+      const selfIn = h('input', { type: 'checkbox', checked: d.selfAssign, onchange: (e) => { d.selfAssign = e.target.checked; drawSelf(); } });
+      const drawSelf = () => {
+        const why = selfAssignProblem(s, sel, d.permissions, mine);
+        // Turning it on needs no problem at all; a role that already has it only can't gain the powers it bars.
+        const refused = d.selfAssign && (sel.selfAssign ? !!(d.permissions & SELF_BLOCKED & ~sel.permissions) : !!why);
+        selfIn.disabled = locked || (!!why && !d.selfAssign);
+        selfHint.textContent = why ? (refused ? `${why} Turn this off, or saving won\u2019t work.` : why)
+          : 'They\u2019ll find it in Pick your roles in the server menu: good for ping roles like @game-night, pronouns, colors and opt-in channels.';
+        selfHint.classList.toggle('warn', !!why);
+      };
+      drawSelf();
+      const selfRow = h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Members can pick this role themselves'), selfHint),
+        h('span', { class: 'switch' }, selfIn, h('span', { class: 'switch-track' })));
       const permsEl = h('div', { class: 'perm-groups' }, PERM_GROUPS.map(([g, list2]) => h('div', { class: 'perm-group' }, h('div', { class: 'perm-group-label' }, g),
-        ...list2.map(([k, label, hint]) => tg(label, hint + (has(mine, PERMS[k]) ? '' : ' (You don\u2019t have this yourself, so you can\u2019t give it.)'), has(d.permissions, PERMS[k]), (on) => { d.permissions = on ? d.permissions | PERMS[k] : d.permissions & ~PERMS[k]; })))));
+        ...list2.map(([k, label, hint]) => tg(label, hint + (has(mine, PERMS[k]) ? '' : ' (You don\u2019t have this yourself, so you can\u2019t give it.)'), has(d.permissions, PERMS[k]), (on) => { d.permissions = on ? d.permissions | PERMS[k] : d.permissions & ~PERMS[k]; drawSelf(); })))));
       const holders = s.memberIds.filter((id) => ((s.memberRoles || {})[id] || []).includes(sel.id));
       const addSel = h('select', { class: 'input sm', 'aria-label': 'Add member to role' }, h('option', { value: '' }, 'Add member\u2026'),
         s.memberIds.filter((id) => !holders.includes(id)).map((id) => h('option', { value: id }, displayName(getUser(id)))));
-      addSel.onchange = () => { const id = addSel.value; if (id) run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { roleIds: [...((s.memberRoles || {})[id] || []), sel.id] })); };
+      // Only this role changes (not the member's whole list as this window last saw it, which may be out of date).
+      addSel.onchange = () => { const id = addSel.value; if (id) run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { add: [sel.id] })); };
       add(editor, 
         h('div', { class: 'role-editor-head' }, h('h3', null, sel.everyone ? '@everyone' : `Edit role \u2014 ${sel.name}`),
           locked ? h('span', { class: 'role-tag' }, 'Above your highest role') : null),
@@ -5392,11 +5449,12 @@ function openServerSettings(server, startTab = 'overview') {
           h('div', { class: 'row gap' }, field('Role name', nameIn), field('Icon', iconIn)),
           h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Color'), swEl),
           tg('Show separately in the member list', 'Members with this as their highest such role get their own section.', d.hoist, (v) => { d.hoist = v; }),
-          tg('Allow anyone to @mention this role', 'People with "Mention @everyone" can always mention it.', d.mentionable, (v) => { d.mentionable = v; })),
+          tg('Allow anyone to @mention this role', 'People with "Mention @everyone" can always mention it.', d.mentionable, (v) => { d.mentionable = v; }),
+          selfRow),
         h('h3', null, 'Permissions'), permsEl,
         sel.everyone ? null : h('h3', null, `Members \u2014 ${holders.length}`),
         sel.everyone ? null : h('div', { class: 'role-members' },
-          ...holders.map((id) => { const u = getUser(id); return h('span', { class: 'chip active' }, avatarEl(u, 20), displayName(u), locked ? null : h('button', { class: 'chip-x', 'aria-label': `Remove ${displayName(u)} from role`, onclick: () => run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { roleIds: ((s.memberRoles || {})[id] || []).filter((x) => x !== sel.id) })) }, icon('close'))); }),
+          ...holders.map((id) => { const u = getUser(id); return h('span', { class: 'chip active' }, avatarEl(u, 20), displayName(u), locked ? null : h('button', { class: 'chip-x', 'aria-label': `Remove ${displayName(u)} from role`, onclick: () => run(() => api('PUT', `/servers/${s.id}/members/${id}/roles`, { remove: [sel.id] })) }, icon('close'))); }),
           locked ? null : mayGiveRole(s, sel) ? addSel : h('span', { class: 'field-hint' }, 'It has permissions you don\u2019t have, so you can\u2019t give it (you can take it away).')),
         locked ? null : h('div', { class: 'role-actions' },
           !sel.everyone ? h('button', { class: 'btn danger-ghost', onclick: async () => { if (await confirmDialog({ title: `Delete ${sel.name}?`, text: 'Everyone loses this role. This can\u2019t be undone.', confirm: 'Delete role', danger: true })) run(() => api('DELETE', `/roles/${sel.id}`), 'Role deleted.'); } }, 'Delete role') : h('span'),
@@ -5591,8 +5649,9 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   if (!server) return;
   const fresh = () => (serverOfChannel(c.id) || server).channels.find((x) => x.id === c.id) || c;
   const ch0 = fresh();
-  const mayEdit = canEditChannel(server, ch0); const mayPerms = canEditChannelPerms(server, ch0);
-  let tab = mayEdit ? startTab : 'perms';
+  const mayEdit = canEditChannel(server, ch0); const mayPerms = canEditChannelPerms(server, ch0); const mayHooks = canManageHooks(server, ch0);
+  const TABS = [['overview', 'Overview', mayEdit], ['perms', 'Permissions', mayPerms], ['hooks', 'Webhooks', mayHooks]].filter((t) => t[2]);
+  let tab = TABS.some(([k]) => k === startTab) ? startTab : (TABS[0] || ['overview'])[0];
   // Overrides being edited: [{ type, id, allow, deny }]; @everyone always listed first.
   let ovs = (overrides || ch0.overrides || []).map((o) => ({ ...o }));
   if (!ovs.some((o) => o.type === 'role' && o.id === server.id)) ovs.unshift({ type: 'role', id: server.id, allow: 0, deny: 0 });
@@ -5615,11 +5674,21 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
   };
   const draw = () => {
     clear(tabs);
-    [['overview', 'Overview'], ['perms', 'Permissions']].filter(([k]) => (k === 'perms' ? mayPerms : mayEdit))
-      .forEach(([k, l]) => tabs.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
+    TABS.forEach(([k, l]) => tabs.append(h('button', { class: `seg-btn${tab === k ? ' active' : ''}`, onclick: () => { tab = k; draw(); } }, l)));
     clear(body);
+    // Save is for the Overview and Permissions tabs; webhooks save as you go, so it's hidden there.
+    const save = body.closest('.modal') && body.closest('.modal').querySelector('.modal-foot .btn.primary');
+    if (save) save.hidden = tab === 'hooks';
     if (tab === 'overview') {
       body.append(field('Channel name', name), ...(c.type === 'text' ? [field('Topic', topic), field('Slowmode', slow, 'How long people wait between messages. Anyone with Manage Messages skips it.')] : []), field('Category', cat.el));
+      return;
+    }
+    // Webhooks save as you go (webhooks.js). Enter in its fields stays there: the dialog would otherwise take it as
+    // "Save" and quietly save the other tabs too.
+    if (tab === 'hooks') {
+      const panel = h('div', { class: 'stack hooks-panel', onkeydown: (e) => { if (e.key === 'Enter') e.stopPropagation(); } });
+      body.append(panel);
+      webhooksPanel(fresh(), panel);
       return;
     }
     const sel = ovs.find((o) => `${o.type}:${o.id}` === selKey) || ovs[0];
@@ -5657,13 +5726,13 @@ function openEditChannel(c, startTab = 'overview', { overrides } = {}) {
     body: h('div', { class: 'stack' }, tabs, body),
     actions: [
       mayEdit ? { label: 'Delete channel', kind: 'danger-ghost', action: () => deleteChannel(c) } : null,
-      { label: 'Cancel' },
-      { label: 'Save', kind: 'primary', action: async () => {
+      { label: mayEdit || mayPerms ? 'Cancel' : 'Close' },
+      mayEdit || mayPerms ? { label: 'Save', kind: 'primary', action: async () => {
         // Each part only when it's yours to change here, so one refusal doesn't stop the other from saving.
         if (mayEdit) await api('PATCH', `/channels/${c.id}`, { name: name.value, topic: topic.value, category: cat.input.value.trim(), slowmode: +slow.value });
         if (mayPerms) await api('PUT', `/channels/${c.id}/overrides`, { overrides: ovs.filter((o) => o.allow || o.deny) });
         toast('Channel saved.');
-      } },
+      } } : null,
     ].filter(Boolean),
   });
   draw();

@@ -107,8 +107,9 @@ broadcasts (presence, profile updates, watch-together).
   stops failing, so Admin → Health shows them after a restart and `doctor` can read them from outside.
 
 Wake-up timers that touch the database run through the same wrapper (`jobs.job`): the bot delivery pump's
-wake-ups (`bots.deliveries`), the end of a call's reconnect grace window (`voice.grace_end`) and each timeout's
-expiry (`usability.end_timeouts`). Timers that only do arithmetic or clean memory aren't jobs: each socket's
+wake-ups (`bots.deliveries`), the end of a call's reconnect grace window (`voice.grace_end`), each timeout's
+expiry (`usability.end_timeouts`) and the batched server update after members pick their own roles
+(`selfroles.broadcast`). Timers that only do arithmetic or clean memory aren't jobs: each socket's
 1-second flood-allowance refill, the export-token sweep, slash-command answer timeouts, fetch timeouts and the
 shutdown timers.
 

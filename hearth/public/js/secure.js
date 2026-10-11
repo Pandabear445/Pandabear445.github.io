@@ -422,11 +422,27 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     const author = S.users[m.authorId];
     const bot = !!m.bot && (m.authorId === NEWS_BOT_ID || (!!author && !!author.bot));
     if (!bot && S.e2eeSince && Number(m.createdAt) > S.e2eeSince) return { forged: true, error: true, t: '', f: [] };
-    return { t: m.content || '', f: cleanFiles(m.attachments), legacy: true, verified: false, embed: m.embed || null, bot };
+    return { t: m.content || '', f: cleanFiles(m.attachments), legacy: true, verified: false, embed: m.embed || null, bot, webhook: bot ? hookOf(m.webhook) : null };
+  }
+  // A channel webhook's post: the name and picture the program asked for (the picture is an https address the app
+  // only loads through this server's image proxy), and whether it may ping.
+  function hookOf(w) {
+    if (!w || typeof w !== 'object') return null;
+    return {
+      id: String(w.id || ''), name: typeof w.name === 'string' && w.name ? w.name.slice(0, 64) : null,
+      avatar: typeof w.avatar === 'string' && /^https:\/\//.test(w.avatar) ? w.avatar : null, pings: w.pings === true,
+    };
+  }
+  // A bot post from an account this device hasn't loaded (a channel webhook's, or a bot removed since): load it first,
+  // so it's checked as a bot's instead of being hidden as a message only the server could have written.
+  async function loadBotAuthor(x) {
+    if (x && x.bot && x.authorId && !S.users[x.authorId]) { try { await userWithKeys(x.authorId); } catch { /* stays unknown */ } }
   }
 
   async function decryptChannelMessage(m) {
     if (m.dec && !m.dec.pending) return;
+    if (m.legacy) await loadBotAuthor(m);
+    if (m.reply && !m.reply.ciphertext) await loadBotAuthor(m.reply);
     if (m.legacy) m.dec = openLegacy(m);
     else {
       // If a key arrives while we're decrypting, try again so we never keep a stale "waiting" result.

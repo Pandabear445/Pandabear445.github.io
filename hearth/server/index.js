@@ -30,6 +30,7 @@ const { sanitizePage, parsePage } = require('./page');
 const { PERMS: PM, ALL: ALL_PERMS, DEFAULT_EVERYONE, CHANNEL_SCOPED, makePerms } = require('./perms');
 const { stripFile, ImageRejected } = require('./imagemeta');
 const { readLimited, cancel: cancelBody } = require('./fetchlimit');
+const recur = require('./recurrence');
 const perms = makePerms(db);
 
 // ---------------------------------------------------------------- config
@@ -256,8 +257,11 @@ function serverCommon(s) {
   const memberRoles = {};
   db.prepare(`SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
     WHERE mr.server_id = ?`).all(s.id).forEach((r) => { (memberRoles[r.user_id] ||= []).push(r.role_id); });
-  const roleDefs = db.prepare('SELECT * FROM roles WHERE server_id = ? ORDER BY position DESC').all(s.id)
-    .map((r) => ({ id: r.id, name: r.name, color: r.color, icon: r.icon, position: r.position, permissions: r.permissions, hoist: !!r.hoist, mentionable: !!r.mentionable, everyone: r.id === s.id }));
+  const roleRows = db.prepare('SELECT * FROM roles WHERE server_id = ? ORDER BY position DESC').all(s.id);
+  // Roles members can pick themselves (server/selfroles.js), and why one can't be picked right now.
+  const pickIssues = SELF ? SELF.issues(s, roleRows) : {};
+  const roleDefs = roleRows.map((r) => ({ id: r.id, name: r.name, color: r.color, icon: r.icon, position: r.position, permissions: r.permissions, hoist: !!r.hoist, mentionable: !!r.mentionable, everyone: r.id === s.id,
+    selfAssign: !!r.self_assign, ...(pickIssues[r.id] ? { selfAssignIssue: pickIssues[r.id] } : {}) }));
   const emojis = db.prepare('SELECT id, name, url, animated FROM emojis WHERE server_id = ? ORDER BY name').all(s.id).map((e) => ({ ...e, animated: !!e.animated }));
   let categoryOrder = [];
   try { categoryOrder = JSON.parse(s.category_order || '[]'); } catch { /* ignore */ }
@@ -266,6 +270,9 @@ function serverCommon(s) {
     // Bots working for this server (shown in the member list like on Discord): the news bot while it follows
     // something, and the bots installed here (server/bots.js).
     bots: [...(db.prepare('SELECT 1 FROM feeds WHERE server_id = ? AND paused = 0 LIMIT 1').get(s.id) ? [NEWS_BOT_ID] : []), ...(BOTS ? BOTS.serverBots(s.id) : [])],
+    // { roleId: membership name } for roles sold as memberships: the role editor says up front that they can't be
+    // ones members pick themselves. Only sent to people who manage roles (serializeServer).
+    soldRoles: s.kind !== 'group' ? MEMB.soldRoles(s.id) : {},
     // This server sells memberships (the app shows "Memberships" in its menu); owners see the tab either way.
     memberships: s.kind !== 'group' && MEMB.offers(s.id),
     membershipsOn: s.kind !== 'group' && MEMB.usable(),
@@ -300,6 +307,7 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
     roleDefs: common.roleDefs, memberRoles: common.memberRoles, myPerms: myBase, emojis: common.emojis, theme: themeOf(s), description: s.description || '', categoryOrder: common.categoryOrder,
     bots: common.bots, memberships: common.memberships, membershipsOn: common.membershipsOn,
   };
+  if (myBase & PM.MANAGE_ROLES) out.soldRoles = common.soldRoles;
   if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
   const to = USE && out.kind !== 'group' ? USE.timeoutOf(s.id, uid) : null;
   if (to) out.timeout = { until: to.until, reason: to.reason };
@@ -387,7 +395,7 @@ function serializeMessage(row, channel, reactions) {
     channelId: row.channel_id,
     serverId: channel.server_id,
     authorId: row.author_id,
-    ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [], ...(data.embed ? { embed: data.embed } : {}), ...(data.bot ? { bot: true } : {}) }),
+    ...(e2ee || { legacy: true, content: data.content || '', attachments: data.attachments || [], ...(data.embed ? { embed: data.embed } : {}), ...(data.bot ? { bot: true } : {}), ...(data.bot && data.webhook ? { webhook: data.webhook } : {}) }),
     replyTo: row.reply_to,
     reply,
     threadId: row.thread_id || null,
@@ -535,8 +543,11 @@ app.use((req, res, next) => {
   noteIgnoredXff(req.socket.remoteAddress, req.headers['x-forwarded-for']);
   next();
 });
-// Stripe signs the exact bytes it sends, so keep them for that one route.
-app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
+// Stripe signs the exact bytes it sends, so keep them for that one route. Incoming webhooks (/api/webhooks/, see
+// webhooks.js) read their own bodies, with a much smaller cap and only once the address is known to be right.
+// (Case-insensitive like Express's routing, which would send /API/Webhooks/… there too.)
+const jsonBody = (req) => !/^\/api\/webhooks\//i.test(req.originalUrl) && String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase() === 'application/json';
+app.use(express.json({ limit: '2mb', type: jsonBody, verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/pay/')) req.rawBody = buf; } }));
 // Strict browser security policy for the app's own pages:
 //   scripts       only files from this server (+ WebAssembly for password hashing) — no inline or injected code
 //   connections   fetch/XHR/WebSocket only back to this server (its API and live connection). This isn't a complete
@@ -1284,6 +1295,7 @@ function pushFailed(endpoint) {
 // what: { kind, serverId, channelId, dmId } — checked against each person's notification preferences and Do Not
 // Disturb schedule (server/usability.js), which also decides how much the lock screen shows.
 let USE = null; // server/usability.js
+let SELF = null; // server/selfroles.js
 function pushTo(userIds, payload, what = { kind: 'other' }) {
   if (!vapid) return;
   const ids = [...new Set(userIds)];
@@ -2075,7 +2087,10 @@ api.delete('/servers/:id/members/:uid', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Give/take roles. You can only hand out roles below your own highest role, and only roles whose permissions
+// Give/take roles: { add: [ids], remove: [ids] } changes just those roles, which is what the app sends (members
+// change their own roles too now, server/selfroles.js, and a list drawn a moment ago would undo what they picked
+// or dropped meanwhile). { roleIds: [ids] } sets the whole list, as before.
+// You can only hand out roles below your own highest role, and only roles whose permissions
 // you have yourself (or a Manage Roles holder could give anyone, themselves included, an Administrator role
 // that happens to sit lower in the list). A role's per-channel overrides count too: giving it can't allow, and
 // taking it away can't lift a deny on, anything you don't have in that channel yourself (or a lower role that
@@ -2088,9 +2103,16 @@ api.put('/servers/:id/members/:uid/roles', auth, (req, res) => {
   const mine = perms.base(s, req.userId);
   if (uid === s.owner_id && req.userId !== s.owner_id) fail(403, 'Only the owner can change the owner\u2019s roles.');
   if (uid !== req.userId && uid !== s.owner_id && perms.top(s, uid) >= myTop) fail(403, 'You can only change roles for people below you.');
-  const wanted = new Set((Array.isArray((req.body || {}).roleIds) ? req.body.roleIds : []).map(String));
-  const all = db.prepare('SELECT * FROM roles WHERE server_id = ? AND id != ?').all(s.id, s.id);
+  const b = req.body || {};
   const current = new Set(db.prepare('SELECT role_id FROM member_roles WHERE server_id = ? AND user_id = ?').all(s.id, uid).map((r) => r.role_id));
+  let wanted;
+  if (b.add !== undefined || b.remove !== undefined) {
+    if (![b.add, b.remove].every((x) => x === undefined || Array.isArray(x))) fail(400, 'add and remove are lists of role ids.');
+    const add = new Set((b.add || []).map(String)); const remove = new Set((b.remove || []).map(String));
+    if ([...add].some((id) => remove.has(id))) fail(400, 'A role can\u2019t be both added and removed.');
+    wanted = new Set([...current, ...add].filter((id) => !remove.has(id)));
+  } else wanted = new Set((Array.isArray(b.roleIds) ? b.roleIds : []).map(String));
+  const all = db.prepare('SELECT * FROM roles WHERE server_id = ? AND id != ?').all(s.id, s.id);
   const changed = all.filter((r) => current.has(r.id) !== wanted.has(r.id));
   const lifted = new Map(); // channel id -> deny bits of roles being taken away there
   const myIn = (chId) => perms.channel(s, { id: chId }, req.userId);
@@ -2512,7 +2534,8 @@ api.get('/channels/:id/messages', auth, (req, res) => {
 // (that's the only part of the message the server learns), plus replies and group DMs.
 // everyone: the sender's app says the message uses @everyone / @channel / @here; it counts only from someone
 // with Mention Everyone in this channel. Mentions and replies are also kept (mention_marks) for unread counts.
-function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, everyone) {
+// mayEveryone: the caller already checked who may ping everyone (a channel webhook allowed to, see webhooks.js).
+function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, everyone, { mayEveryone = null } = {}) {
   const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(c.server_id);
   const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(c.server_id).map((r) => r.user_id).filter((u) => u !== senderId);
   const url = '/#m/' + id;
@@ -2522,7 +2545,7 @@ function notifyChannelMessage(c, id, senderId, replyTo, threadId, mentions, ever
   const open = !perms.restricted(srv, c);
   const reaches = (u) => members.includes(u) && (open || (perms.channel(srv, c, u) & PM.VIEW_CHANNEL) !== 0);
   const mentioned = Array.isArray(mentions) ? [...new Set(mentions.slice(0, 50).map(String))].filter(reaches) : [];
-  const pingAll = srv.kind !== 'group' && everyone === true && canIn(srv, c, senderId, PM.MENTION_EVERYONE);
+  const pingAll = srv.kind !== 'group' && everyone === true && (mayEveryone === null ? canIn(srv, c, senderId, PM.MENTION_EVERYONE) : mayEveryone === true);
   const replyAuthor = replyTo && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(replyTo) || {}).author_id;
   const rootAuthor = threadId && (db.prepare('SELECT author_id FROM messages WHERE id = ?').get(threadId) || {}).author_id;
   const replied = [replyAuthor, rootAuthor].filter((u) => u && u !== senderId && !mentioned.includes(u) && reaches(u));
@@ -2911,9 +2934,12 @@ api.patch('/roles/:id', auth, (req, res) => {
   // A role sold as a membership can't get moderator powers (they'd be for sale).
   const tier = MEMB.tierForRole(r.id);
   if (tier && (permissions & MEMB.POWERFUL & ~r.permissions)) fail(400, `This role is sold as the "${tier.name}" membership, so it can't have moderator powers.`);
-  db.prepare('UPDATE roles SET name = ?, color = ?, icon = ?, permissions = ?, hoist = ?, mentionable = ? WHERE id = ?').run(
+  // Members can pick it themselves: never with moderator powers (server/selfroles.js says what else it takes).
+  const selfAssign = everyone ? false : b.selfAssign !== undefined ? !!b.selfAssign : !!r.self_assign;
+  SELF.checkEdit(s, r, req.userId, selfAssign, permissions);
+  db.prepare('UPDATE roles SET name = ?, color = ?, icon = ?, permissions = ?, hoist = ?, mentionable = ?, self_assign = ? WHERE id = ?').run(
     name, everyone ? '' : b.color !== undefined ? cleanColor(b.color) : r.color, everyone ? '' : b.icon !== undefined ? cleanIcon(b.icon) : r.icon,
-    permissions, everyone ? 0 : b.hoist !== undefined ? (b.hoist ? 1 : 0) : r.hoist, everyone ? 0 : b.mentionable !== undefined ? (b.mentionable ? 1 : 0) : r.mentionable, r.id);
+    permissions, everyone ? 0 : b.hoist !== undefined ? (b.hoist ? 1 : 0) : r.hoist, everyone ? 0 : b.mentionable !== undefined ? (b.mentionable ? 1 : 0) : r.mentionable, selfAssign ? 1 : 0, r.id);
   emitServer(s.id);
   res.json({ ok: true });
 });
@@ -2982,6 +3008,8 @@ api.put('/channels/:id/overrides', auth, (req, res) => {
     const prev = old.get(key(t)) || { allow: 0, deny: 0 };
     const allow = (((parseInt(o.allow, 10) || 0) & mine) | (prev.allow & ~mine)) & CHANNEL_SCOPED;
     const deny = (((parseInt(o.deny, 10) || 0) & mine) | (prev.deny & ~mine)) & CHANNEL_SCOPED & ~allow;
+    // Nor roles members can pick themselves.
+    if (t.type === 'role') SELF.checkOverride(t.id, allow & ~prev.allow);
     if (allow || deny) next.set(key(t), { ...t, allow, deny });
   }
   for (const k of new Set([...old.keys(), ...next.keys()])) {
@@ -4120,7 +4148,7 @@ function requireOutranks(req, targetId) {
   if (staffRank(req.userId) <= staffRank(targetId)) fail(403, `You can\u2019t do that to ${staffRole(targetId) === 'owner' ? 'the owner' : 'staff at your level or above'}.`);
   return r;
 }
-const brief = (uid) => { const r = uid && getUserRow(uid); return r ? { id: r.id, username: r.username, displayName: parseProfile(r).displayName || r.username, avatar: r.avatar, suspended: !!r.suspended_at, role: staffRole(r.id) } : null; };
+const brief = (uid) => { const r = uid && getUserRow(uid); return r ? { id: r.id, username: r.username, displayName: parseProfile(r).displayName || r.username, avatar: r.avatar, suspended: !!r.suspended_at, role: staffRole(r.id), bot: !!r.is_bot || undefined } : null; };
 let diskCache = { at: 0, bytes: 0 };
 function uploadsBytes() {
   if (Date.now() - diskCache.at < 5 * 60 * 1000) return diskCache.bytes;
@@ -4138,15 +4166,16 @@ api.get('/admin/stats', auth, staffOnly, (req, res) => {
     series.push({
       day: new Date(from).toISOString().slice(0, 10),
       messages: count('SELECT COUNT(*) n FROM messages WHERE created_at >= ? AND created_at < ?', from, to) + count('SELECT COUNT(*) n FROM dm_messages WHERE created_at >= ? AND created_at < ?', from, to),
-      signups: count('SELECT COUNT(*) n FROM users WHERE created_at >= ? AND created_at < ?', from, to),
+      signups: count('SELECT COUNT(*) n FROM users WHERE created_at >= ? AND created_at < ? AND is_bot = 0', from, to),
       active: count('SELECT COUNT(*) n FROM users WHERE last_seen_at >= ? AND last_seen_at < ?', from, to),
     });
   }
   let dbBytes = 0;
   try { dbBytes = fs.statSync(path.join(DATA_DIR, 'hearth.db')).size + (fs.existsSync(path.join(DATA_DIR, 'hearth.db-wal')) ? fs.statSync(path.join(DATA_DIR, 'hearth.db-wal')).size : 0); } catch { /* ignore */ }
   res.json({
-    users: count('SELECT COUNT(*) n FROM users'), online: onlineSockets.size,
-    newUsers24h: count('SELECT COUNT(*) n FROM users WHERE created_at > ?', t - day), newUsers7d: count('SELECT COUNT(*) n FROM users WHERE created_at > ?', t - 7 * day),
+    // People only: bots and channel webhooks have accounts too, but nobody signed up for them.
+    users: count('SELECT COUNT(*) n FROM users WHERE is_bot = 0'), online: onlineSockets.size,
+    newUsers24h: count('SELECT COUNT(*) n FROM users WHERE created_at > ? AND is_bot = 0', t - day), newUsers7d: count('SELECT COUNT(*) n FROM users WHERE created_at > ? AND is_bot = 0', t - 7 * day),
     active24h: count('SELECT COUNT(*) n FROM users WHERE last_seen_at > ?', t - day), active7d: count('SELECT COUNT(*) n FROM users WHERE last_seen_at > ?', t - 7 * day),
     messages24h: series[series.length - 1].messages, servers: count("SELECT COUNT(*) n FROM servers WHERE kind = 'server'"), groups: count("SELECT COUNT(*) n FROM servers WHERE kind = 'group'"),
     suspended: count('SELECT COUNT(*) n FROM users WHERE suspended_at IS NOT NULL'), openReports: count("SELECT COUNT(*) n FROM reports WHERE status IN ('open','reviewing')"),
@@ -4171,7 +4200,9 @@ api.get('/admin/online', auth, staffOnly, async (req, res) => {
 });
 api.get('/admin/users', auth, staffOnly, (req, res) => {
   const q = `%${String(req.query.q || '').trim().toLowerCase()}%`;
-  const only = req.query.filter === 'suspended' ? 'AND suspended_at IS NOT NULL' : '';
+  // Bot and webhook accounts show up when searched for (or suspended), not in the plain newest-first list: people can
+  // make a lot of them, and they'd push real sign-ups off the page.
+  const only = req.query.filter === 'suspended' ? 'AND suspended_at IS NOT NULL' : String(req.query.q || '').trim() ? '' : 'AND is_bot = 0';
   let rows = db.prepare(`SELECT id, username, created_at, last_seen_at, last_ip, suspended_at FROM users WHERE (lower(username) LIKE ? OR lower(profile) LIKE ? OR last_ip LIKE ?) ${only} ORDER BY created_at DESC LIMIT ${req.query.filter === 'staff' || req.query.filter === 'online' ? 2000 : 100}`).all(q, q, q);
   if (req.query.filter === 'staff') rows = rows.filter((r) => staffRole(r.id));
   if (req.query.filter === 'online') rows = rows.filter((r) => onlineSockets.has(r.id));
@@ -4195,8 +4226,16 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     servers: db.prepare("SELECT s.name, s.owner_id = ? AS owner FROM servers s JOIN members m ON m.server_id = s.id WHERE m.user_id = ? AND s.kind = 'server'").all(r.id, r.id),
     reportsAgainst: db.prepare('SELECT id, category, status, created_at AS createdAt FROM reports WHERE target_id = ? ORDER BY created_at DESC LIMIT 20').all(r.id),
     reportsBy: db.prepare('SELECT COUNT(*) n FROM reports WHERE reporter_id = ?').get(r.id).n,
+    webhook: webhookOf(r.id),
   });
 });
+// A channel webhook's account: where it posts and who made its current address (the one to talk to, or suspend:
+// suspending either pauses it).
+function webhookOf(uid) {
+  const w = db.prepare(`SELECT w.*, c.name AS channel_name, s.name AS server_name FROM channel_webhooks w
+      LEFT JOIN channels c ON c.id = w.channel_id LEFT JOIN servers s ON s.id = w.server_id WHERE w.bot_user_id = ?`).get(uid);
+  return w ? { id: w.id, name: w.name, channel: w.channel_name, server: w.server_name, madeBy: brief(w.created_by), deleted: !!w.deleted_at } : null;
+}
 api.post('/admin/users/:id/suspend', auth, staffOnly, (req, res) => {
   const r = requireOutranks(req, req.params.id);
   const hours = Math.max(0, Math.min(24 * 365, Number((req.body || {}).hours) || 0)); // 0 = until unsuspended
@@ -4644,30 +4683,101 @@ const eventOut = (e, uid) => {
     && mayEditEvent(e, serverOf(e), uid);
   return { id: e.id, serverId: e.server_id, title: e.title, description: e.description, location: e.location, channelId, startsAt: e.starts_at, endsAt: e.ends_at, createdBy: e.created_by,
     ...(channelHidden ? { channelHidden: true } : {}),
+    // A repeating event is its next time; repeatCount is how many times are left counting that one.
+    repeat: e.repeat || null,
+    ...(e.repeat ? { repeatUntil: e.repeat_until ?? null, repeatCount: e.repeat_left ?? null, timeZone: e.repeat_tz || 'UTC',
+      ...(e.repeat === 'monthly' ? { repeatDay: recur.wall(e.repeat_anchor ?? e.starts_at, e.repeat_tz || 'UTC').d } : {}) } : {}),
     going: rsvps.filter((r) => r.status === 'going').map((r) => r.user_id), maybe: rsvps.filter((r) => r.status === 'maybe').map((r) => r.user_id), no: rsvps.filter((r) => r.status === 'no').map((r) => r.user_id),
     mine: (rsvps.find((r) => r.user_id === uid) || {}).status || null };
 };
-// uid: who's saving it (they can only link a channel they can see); keep: the channel it already links to.
-function cleanEvent(b, srv, uid, keep = null) {
+// uid: who's saving it (they can only link a channel they can see); keep: the channel it already links to;
+// prev: the event as stored, when editing.
+function cleanEvent(b, srv, uid, keep = null, prev = null) {
   const title = String(b.title || '').trim().slice(0, 100);
   if (!title) fail(400, 'Give the event a name.');
   const startsAt = Number(b.startsAt);
-  if (!Number.isFinite(startsAt) || startsAt < now() - 3600000 || startsAt > now() + 400 * 86400000) fail(400, 'Pick a time in the next year.');
+  // Keeping the time it has is fine even once it has started (to stop a repeating event during one, say).
+  const kept = prev && startsAt === prev.starts_at;
+  if (!Number.isFinite(startsAt) || (!kept && (startsAt < now() - 3600000 || startsAt > now() + 400 * 86400000))) fail(400, 'Pick a time in the next year.');
   const endsAt = b.endsAt ? Number(b.endsAt) : null;
   if (endsAt && (!Number.isFinite(endsAt) || endsAt <= startsAt)) fail(400, 'The end has to be after the start.');
   const want = b.channelId ? String(b.channelId) : null;
   const channelId = want && (want === keep || eventChannelFor({ channel_id: want, server_id: srv.id }, uid)) ? want : null;
-  const out = { title, description: String(b.description || '').slice(0, 2000), location: String(b.location || '').slice(0, 120), startsAt, endsAt, channelId };
+  const out = { title, description: String(b.description || '').slice(0, 2000), location: String(b.location || '').slice(0, 120), startsAt, endsAt, channelId, ...cleanRepeat(b, startsAt, prev) };
+  // One time has to end before the next one starts, even in a week when the clocks go forward (by up to two
+  // hours in some zones), so less than the shortest week.
+  if (out.repeat && endsAt && endsAt - startsAt > 6 * 86400000) fail(400, 'A repeating event can last up to 6 days.');
+  // Nor can a repeating event be given a time that's already over: it would move on at once and clear
+  // everyone's answers.
+  if (out.repeat && startsAt + (endsAt ? endsAt - startsAt : recur.DEFAULT_LEN) <= now()) fail(400, 'Pick a time that hasn’t ended yet.');
   checkWords(out.title, out.description, out.location);
   return out;
+}
+// How an event repeats. Only "this time and every later one" can be changed: there are no one-off exceptions,
+// so the row always is the next time and editing it edits the rest of the series.
+function cleanRepeat(b, startsAt, prev) {
+  const every = b.repeat == null || b.repeat === '' || b.repeat === 'none' ? null : String(b.repeat);
+  if (!every) return { repeat: null, repeatUntil: null, repeatLeft: null, repeatTz: null, repeatAnchor: null };
+  if (!recur.KINDS.includes(every)) fail(400, 'An event can repeat every week, every 2 weeks or every month.');
+  // A series keeps the time zone it was planned in, so someone editing it from elsewhere doesn't move it.
+  // Without one (an API client that doesn't say), times are kept in UTC.
+  let tz = prev && prev.repeat && prev.repeat_tz;
+  if (!tz) {
+    tz = b.timeZone == null || b.timeZone === '' ? 'UTC' : recur.zone(b.timeZone);
+    if (!tz) fail(400, 'That time zone isn’t one this server knows.');
+  }
+  // The last date: a moment, or a day ("2026-12-20"), which lasts until midnight in the event's time zone.
+  let until = null;
+  if (b.repeatUntil != null && b.repeatUntil !== '') {
+    const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(b.repeatUntil));
+    // A day that isn't on the calendar (31 February) is refused, not rolled over into the next month.
+    if (day && !(+day[2] >= 1 && +day[2] <= 12 && +day[3] >= 1 && +day[3] <= recur.daysIn(+day[1], +day[2]))) fail(400, 'That last date doesn’t exist.');
+    until = day ? recur.fromWall(+day[1], +day[2], +day[3] + 1, 0, 0, tz) - 1 : Number(b.repeatUntil);
+  }
+  const count = b.repeatCount == null || b.repeatCount === '' ? null : Number(b.repeatCount);
+  if (until != null && count != null) fail(400, 'End it on a date or after a number of times, not both.');
+  if (until != null && (!Number.isFinite(until) || until < startsAt || until > startsAt + 5 * 366 * 86400000)) fail(400, 'Pick a last date after the first time, at most five years away.');
+  if (count != null && (!Number.isInteger(count) || count < 1 || count > 500)) fail(400, 'Pick between 1 and 500 times.');
+  // The rule's day and time come from the start it was set with; an edit that keeps both keeps them (so a
+  // monthly event on the 31st that's on the 30th this month still goes back to the 31st).
+  const anchor = prev && prev.repeat === every && prev.repeat_anchor != null && prev.starts_at === startsAt ? prev.repeat_anchor : startsAt;
+  return { repeat: every, repeatUntil: until, repeatLeft: count, repeatTz: tz, repeatAnchor: anchor };
+}
+// Moves repeating events whose time has ended on to their next time: new start and end, the reminder armed
+// again and everyone's answer cleared (a yes for this week isn't a yes for next week, and reminders go only to
+// people who said yes or maybe). The person who made it is put down as going again, as when they made it.
+// A series that's over is left as an ordinary past event.
+function rollRepeating() {
+  const t = now();
+  const due = db.prepare('SELECT * FROM server_events WHERE repeat IS NOT NULL AND starts_at <= ? AND COALESCE(ends_at, starts_at + ?) <= ? LIMIT 500').all(t, recur.DEFAULT_LEN, t);
+  if (!due.length) return;
+  const changed = new Set();
+  db.transaction(() => {
+    for (const e of due) {
+      changed.add(e.server_id);
+      const next = recur.advance({ startsAt: e.starts_at, endsAt: e.ends_at, every: e.repeat, tz: e.repeat_tz, anchor: e.repeat_anchor, until: e.repeat_until, left: e.repeat_left }, t);
+      if (!next) {
+        db.prepare('UPDATE server_events SET repeat = NULL, repeat_until = NULL, repeat_left = NULL, repeat_tz = NULL, repeat_anchor = NULL WHERE id = ?').run(e.id);
+        continue;
+      }
+      db.prepare('UPDATE server_events SET starts_at = ?, ends_at = ?, repeat_left = ?, reminded = 0 WHERE id = ?').run(next.startsAt, next.endsAt, next.left, e.id);
+      db.prepare('DELETE FROM event_rsvps WHERE event_id = ?').run(e.id);
+      // Only if they're still in the server with a working account.
+      db.prepare(`INSERT OR IGNORE INTO event_rsvps (event_id, user_id, status) SELECT ?, m.user_id, 'going' FROM members m JOIN users u ON u.id = m.user_id
+        WHERE m.server_id = ? AND m.user_id = ? AND u.suspended_at IS NULL AND u.deleted_at IS NULL`).run(e.id, e.server_id, e.created_by);
+    }
+  })();
+  changed.forEach((sid) => emitEvents(sid));
 }
 const emitEvents = (serverId) => io.to(`server:${serverId}`).emit('events:update', { serverId });
 api.get('/servers/:id/events', auth, (req, res) => {
   const srv = requireServer(req.params.id, req.userId);
+  rollRepeating(); // so a repeating event shows its next time right away, not up to a minute later
   res.json(db.prepare('SELECT * FROM server_events WHERE server_id = ? AND COALESCE(ends_at, starts_at + 3 * 3600000) > ? ORDER BY starts_at LIMIT 50').all(srv.id, now()).map((e) => eventOut(e, req.userId)));
 });
 // Everything coming up in all your servers (Home screen).
 api.get('/events', auth, (req, res) => {
+  rollRepeating();
   res.json(db.prepare(`SELECT e.* FROM server_events e JOIN members m ON m.server_id = e.server_id WHERE m.user_id = ? AND COALESCE(e.ends_at, e.starts_at + 3 * 3600000) > ? AND e.starts_at < ? ORDER BY e.starts_at LIMIT 20`)
     .all(req.userId, now(), now() + 14 * 86400000).map((e) => eventOut(e, req.userId)));
 });
@@ -4685,8 +4795,9 @@ api.post('/servers/:id/events', auth, (req, res) => {
   requireEventPoster(srv, req.userId);
   const e = cleanEvent(req.body || {}, srv, req.userId);
   const id = newId();
-  db.prepare('INSERT INTO server_events (id, server_id, title, description, location, channel_id, starts_at, ends_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(id, srv.id, e.title, e.description, e.location, e.channelId, e.startsAt, e.endsAt, req.userId, now());
+  db.prepare(`INSERT INTO server_events (id, server_id, title, description, location, channel_id, starts_at, ends_at, created_by, created_at, repeat, repeat_until, repeat_left, repeat_tz, repeat_anchor)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, srv.id, e.title, e.description, e.location, e.channelId, e.startsAt, e.endsAt, req.userId, now(), e.repeat, e.repeatUntil, e.repeatLeft, e.repeatTz, e.repeatAnchor);
   db.prepare("INSERT INTO event_rsvps (event_id, user_id, status) VALUES (?, ?, 'going')").run(id, req.userId);
   emitEvents(srv.id);
   res.json(eventOut(db.prepare('SELECT * FROM server_events WHERE id = ?').get(id), req.userId));
@@ -4699,11 +4810,22 @@ function requireEventEditor(eventId, uid) {
   return { e, srv };
 }
 api.patch('/events/:id', auth, (req, res) => {
+  rollRepeating(); // edit the time that's coming, not one that just ended
   const { e, srv } = requireEventEditor(req.params.id, req.userId);
+  rateLimit('event-edit:' + req.userId, 60, 3600000);
   requireEventPoster(srv, req.userId);
-  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id }, ...(req.body || {}) }, srv, req.userId, e.channel_id);
-  db.prepare('UPDATE server_events SET title = ?, description = ?, location = ?, channel_id = ?, starts_at = ?, ends_at = ?, reminded = CASE WHEN starts_at = ? THEN reminded ELSE 0 END WHERE id = ?')
-    .run(v.title, v.description, v.location, v.channelId, v.startsAt, v.endsAt, v.startsAt, e.id);
+  const b = req.body && typeof req.body === 'object' ? req.body : {};
+  // `from`: the start the editor was showing when it sends a new time or repeat rule. If the event has moved
+  // on since (its time ended while the editor was open) or someone else moved it, those are stale: they would
+  // take the series back to a time that's over, or count a time that has been. The app leaves the time and the
+  // rule out when they weren't changed, so other edits just apply to the next time.
+  if (b.from != null && Number(b.from) !== e.starts_at) fail(409, 'This event’s time has changed since you opened it. Open it again to make your changes.');
+  // How it ends (a date or a number of times) is replaced as a pair, so setting one clears the other.
+  const ends = Object.hasOwn(b, 'repeatUntil') || Object.hasOwn(b, 'repeatCount') ? { repeatUntil: b.repeatUntil ?? null, repeatCount: b.repeatCount ?? null } : { repeatUntil: e.repeat_until, repeatCount: e.repeat_left };
+  const v = cleanEvent({ ...{ title: e.title, description: e.description, location: e.location, startsAt: e.starts_at, endsAt: e.ends_at, channelId: e.channel_id, repeat: e.repeat }, ...b, ...ends }, srv, req.userId, e.channel_id, e);
+  db.prepare(`UPDATE server_events SET title = ?, description = ?, location = ?, channel_id = ?, starts_at = ?, ends_at = ?, reminded = CASE WHEN starts_at = ? THEN reminded ELSE 0 END,
+    repeat = ?, repeat_until = ?, repeat_left = ?, repeat_tz = ?, repeat_anchor = ? WHERE id = ?`)
+    .run(v.title, v.description, v.location, v.channelId, v.startsAt, v.endsAt, v.startsAt, v.repeat, v.repeatUntil, v.repeatLeft, v.repeatTz, v.repeatAnchor, e.id);
   emitEvents(srv.id);
   res.json(eventOut(db.prepare('SELECT * FROM server_events WHERE id = ?').get(e.id), req.userId));
 });
@@ -4714,6 +4836,7 @@ api.delete('/events/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 api.post('/events/:id/rsvp', auth, (req, res) => {
+  rollRepeating(); // an answer is for the time that's coming
   const e = db.prepare('SELECT * FROM server_events WHERE id = ?').get(req.params.id);
   if (!e) fail(404, 'That event no longer exists.');
   requireServer(e.server_id, req.userId);
@@ -4724,7 +4847,9 @@ api.post('/events/:id/rsvp', auth, (req, res) => {
   res.json(eventOut(e, req.userId));
 });
 // Reminders: 15 minutes before, everyone going (or maybe) gets a nudge — in the app and as a push notification.
+// Repeating events whose time has ended move on to their next time first.
 jobs.every('events.reminders', 60000, () => {
+  rollRepeating();
   const soon = db.prepare('SELECT * FROM server_events WHERE reminded = 0 AND starts_at <= ? AND starts_at > ?').all(now() + 15 * 60000, now() - 5 * 60000);
   for (const e of soon) {
     db.prepare('UPDATE server_events SET reminded = 1 WHERE id = ?').run(e.id);
@@ -4863,10 +4988,16 @@ require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, 
 BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, checkWords,
   perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
   getIo: () => io, features, isStaff, isInstanceAdmin, maintenance, newsBot: NEWS_BOT_ID });
+// Incoming webhooks (server/webhooks.js): Discord- and Slack-style addresses per channel, posting as a bot.
+require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
+  getIo: () => io, maintenance, ipBanned, bannedMsg: BANNED_MSG, stillSuspended, botPost: BOTS.botPost, notifyChannelMessage, cleanIp });
 // Saved messages, read state, notification preferences, pin history, timeouts, data export (server/usability.js).
 USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
   requireServer, requirePerm, requireChannel, requireDm, isMember, serverOf, serializeMessage, serializeDmMessage, reactionsFor, getUserRow, selfUser, nameOf });
+// Roles members can pick themselves (server/selfroles.js).
+SELF = require('./selfroles')({ api, auth, db, fail, rateLimit, limitNet, requireServer, perms, PM, ALL: ALL_PERMS, CHANNEL_SCOPED, MEMB,
+  emitServer: (sid) => io && emitServer(sid), recheckVoice });
 function fundingTotals() {
   const f = funding();
   const auto = MONEY.raisedThisMonth();

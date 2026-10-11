@@ -119,6 +119,44 @@ async function messages(t) {
   await alice.$('#messages .poll', { hasText: 'Lunch today?' }).locator('.poll-opt', { hasText: 'Salad' }).locator('.poll-count', { hasText: '1 · 100%' }).waitFor();
 }
 
+// ------------------------------------------------------------------ 3b. a channel webhook (what Uptime Kuma posts)
+async function webhooks(t) {
+  const { alice, bob } = t.people;
+  await alice.channelRow('general').click({ button: 'right' });
+  await alice.menuItem('Webhooks').click();
+  const settings = await alice.dialog('general — settings');
+  // The tab saves as it goes, so the dialog's Save is hidden, and Enter in the name field makes the webhook only
+  // (it once also pressed the dialog's Save, closing it and saving the other tabs).
+  check(!(await settings.locator('.modal-foot .btn.primary', { hasText: 'Save' }).isVisible()), 'Save should be hidden on the Webhooks tab.');
+  const channelSaves = [];
+  const watch = (r) => { if (/\/api\/channels\/[^/]+(\/overrides)?$/.test(r.url()) && ['PATCH', 'PUT'].includes(r.method())) channelSaves.push(r.url()); };
+  alice.page.on('request', watch);
+  await settings.locator('input[aria-label="New webhook name"]').fill('Uptime Kuma');
+  await settings.locator('input[aria-label="New webhook name"]').press('Enter');
+  const shown = await alice.dialog('Webhook “Uptime Kuma” made');
+  const url = await shown.locator('input[aria-label="Webhook address"]').inputValue();
+  check(url.startsWith(`${t.server.base}/api/webhooks/`), `The webhook address should be on this server (got ${url}).`);
+  await shown.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  await settings.locator('.hook-row', { hasText: 'Uptime Kuma' }).waitFor();
+  alice.page.off('request', watch);
+  check(!channelSaves.length, `Enter in the webhook name field shouldn’t save the channel (sent ${channelSaves.join(', ')}).`);
+  await settings.locator('.modal-x').click();
+  await alice.noModals();
+  // The program's side: a Discord-style post, no session.
+  const post = (body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await post({ username: 'Uptime Kuma', embeds: [{ title: 'Your service My API went down.', color: 16711680, fields: [{ name: 'Error', value: 'timeout of 48000ms exceeded' }] }] });
+  check(r.status === 204, `Posting to the webhook should answer 204 (got ${r.status}).`);
+  const msg = bob.message('Your service My API went down.');
+  await msg.locator('.msg-flag', { hasText: 'Webhook · not end-to-end encrypted' }).waitFor();
+  await msg.locator('.msg-name', { hasText: 'Uptime Kuma' }).waitFor();
+  await msg.locator('.bot-tag').waitFor();
+  // Its @everyone doesn't ping anyone (webhooks may only when allowed).
+  check((await post({ content: '@everyone the deploy finished' })).status === 204, 'The second post should be accepted.');
+  const ping = bob.message('the deploy finished');
+  await ping.waitFor();
+  check(!(await ping.evaluate((el) => el.classList.contains('mentioned'))), 'A webhook’s @everyone should not ping (it wasn’t allowed to).');
+}
+
 // ------------------------------------------------------------------ 4. direct messages and blocking
 async function directMessages(t) {
   const { alice, bob } = t.people;
@@ -383,6 +421,122 @@ async function roles(t) {
   await bc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('bob-made');
   await bc.locator('.modal-foot .btn.primary').click();
   await alice.channelRow('bob-made').waitFor();
+}
+
+// ------------------------------------------------------------------ 9. roles members pick themselves
+// Alice marks a role "Members can pick this role themselves" (the editor won't while it has a moderator power) and
+// lets it into a private channel; bob picks it from the server menu and the channel opens for him, then drops it
+// from the start of a channel and the channel goes again.
+async function selfRoles(t) {
+  const { alice, bob } = t.people;
+  // Nothing to pick yet: the start of bob's channel doesn't offer it.
+  await bob.openChannel('bob-made');
+  const welcomeBtn = () => bob.$('#messages .welcome button', { hasText: 'Pick your roles' });
+  check(!(await welcomeBtn().count()), 'Nothing to pick yet, so the channel start should not offer it.');
+  await alice.serverMenu('Roles');
+  const ss = alice.page.locator('.modal.server-settings');
+  await ss.locator('button', { hasText: 'Create role' }).click();
+  await ss.locator('.role-editor-head', { hasText: 'new role' }).waitFor();
+  await ss.locator('.role-editor .field', { hasText: 'Role name' }).locator('input').fill('game-night');
+  const selfRow = () => ss.locator('.role-editor .toggle-row', { hasText: 'Members can pick this role themselves' });
+  const permRow = (name) => ss.locator('.perm-groups .toggle-row').filter({ has: alice.page.locator('.toggle-label', { hasText: exact(name) }) });
+  // It sits above Keepers, but Keepers only manages channels, which doesn't reach anyone: it can be offered.
+  await selfRow().locator('.field-hint', { hasText: 'Pick your roles' }).waitFor();
+  // Ticking a moderator power turns the option off, and says why.
+  await permRow('Kick members').locator('.switch').click();
+  await selfRow().locator('.field-hint', { hasText: 'moderator powers' }).waitFor();
+  check(await selfRow().locator('input').isDisabled(), 'A role with Kick members should not be offered to members.');
+  await permRow('Kick members').locator('.switch').click();
+  await selfRow().locator('.field-hint', { hasText: 'Pick your roles' }).waitFor();
+  await selfRow().locator('.switch').click();
+  await ss.locator('.role-actions .btn.primary', { hasText: 'Save changes' }).click();
+  await alice.toast('Role saved.');
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+  // Bob's open channel offers it as soon as it's marked.
+  await welcomeBtn().waitFor();
+  // #game-night: only the role sees it.
+  await alice.serverMenu('Create channel');
+  const cc = await alice.dialog('Create channel');
+  await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('game-night');
+  await cc.locator('.modal-foot .btn.primary').click();
+  await alice.page.waitForSelector('#composer-input[placeholder="Message #game-night"]');
+  await alice.channelRow('game-night').locator('.ch-main').click({ button: 'right' });
+  await alice.menuItem('Make private').click();
+  const perms = await alice.dialog('game-night');
+  const add = perms.locator('select[aria-label="Add a role or member"]');
+  await add.selectOption(await add.locator('option', { hasText: 'game-night' }).getAttribute('value'));
+  await perms.locator('.ov-perms .ov-row', { hasText: 'View channels' }).locator('.tri-btn.allow').click();
+  await perms.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await alice.toast('Channel saved.');
+  await alice.noModals();
+  await alice.send('Board games on Friday: plum');
+  await bob.channelRow('game-night').waitFor({ state: 'detached' });
+
+  await bob.serverMenu('Pick your roles');
+  let picker = await bob.dialog('Pick your roles');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await bob.channelRow('game-night').waitFor();
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:checked').waitFor();
+  await picker.locator('.modal-x').click();
+  await bob.noModals();
+  await bob.openChannel('game-night');
+  await bob.message('Board games on Friday: plum').waitFor();
+  check(!(await bob.$('#messages .msg-text.undecryptable').count()), 'Bob should read #game-night with the server key he already has.');
+  // The start of a channel offers the same window.
+  await bob.$('#messages .welcome button', { hasText: 'Pick your roles' }).click();
+  picker = await bob.dialog('Pick your roles');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await bob.channelRow('game-night').waitFor({ state: 'detached' });
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:not(:checked)').waitFor();
+  await picker.locator('.modal-x').click();
+  await bob.noModals();
+}
+
+// ------------------------------------------------------------------ 9b. a weekly event
+async function events(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await alice.$('#sidebar-body .ev-row').click();
+  const list = await alice.dialog(`Events in ${SERVER}`);
+  await list.locator('button', { hasText: 'Plan an event' }).click();
+  const ed = await alice.dialog('Plan an event');
+  await ed.locator('.field', { hasText: 'Name' }).locator('input').fill('Board game night');
+  await ed.locator('.field', { hasText: 'Repeats' }).locator('select').selectOption('weekly');
+  // The editor says what that means: same weekday and time, on this person's clock, which everyone can see.
+  await ed.locator('.field-hint', { hasText: /^Every \w+day at .* time, also after the clocks change\. Everyone in the server sees this time zone/ }).waitFor();
+  await ed.locator('.field', { hasText: 'Ends' }).locator('select').selectOption('count');
+  await ed.locator('.field', { hasText: 'How many times' }).locator('input').fill('6');
+  await ed.locator('.modal-foot .btn.primary', { hasText: 'Create event' }).click();
+  await alice.toast('Event created.');
+  await list.locator('.ev-card', { hasText: 'Board game night' }).locator('.ev-repeat', { hasText: 'Every week · 6 times left' }).waitFor();
+  await list.locator('.modal-x').click();
+  await alice.noModals();
+  // Bob's sidebar shows it live, with how often it happens; he says he's going.
+  const row = bob.$('#sidebar-body .ev-row', { hasText: 'Board game night' });
+  await row.locator('small', { hasText: 'every week' }).waitFor();
+  await row.click();
+  const bl = await bob.dialog(`Events in ${SERVER}`);
+  const card = bl.locator('.ev-card', { hasText: 'Board game night' });
+  await card.locator('.chip', { hasText: exact('Going') }).click();
+  await card.locator('.ev-count', { hasText: '2 going' }).waitFor();
+  await bl.locator('.modal-x').click();
+  await bob.noModals();
+  // Alice stops it repeating (edits apply to this time and every later one); bob's copy updates.
+  await alice.$('#sidebar-body .ev-row').click();
+  const al = await alice.dialog(`Events in ${SERVER}`);
+  await al.locator('.ev-card', { hasText: 'Board game night' }).locator('button[aria-label="More"]').click();
+  await alice.menuItem('Edit').click();
+  const edit = await alice.dialog('Edit repeating event');
+  await edit.locator('.field', { hasText: 'Repeats' }).locator('select').selectOption('none');
+  await edit.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await alice.toast('Event updated.');
+  await al.locator('.ev-card', { hasText: 'Board game night' }).locator('.ev-repeat').waitFor({ state: 'detached' });
+  check(await al.locator('.ev-card', { hasText: 'Board game night' }).locator('.ev-count', { hasText: '2 going' }).count() === 1, 'Editing should keep the answers people gave.');
+  await al.locator('.modal-x').click();
+  await alice.noModals();
+  await bob.$('#sidebar-body .ev-row', { hasText: 'Board game night' }).locator('small', { hasText: 'every week' }).waitFor({ state: 'detached' });
 }
 
 // ------------------------------------------------------------------ 10 + 11. a voice call, and watching together in it
@@ -949,12 +1103,15 @@ export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
   ['messages: send, decrypt, edit, react, thread, delete, reply, pin, poll', messages],
+  ['webhooks: make one in channel settings, post like Uptime Kuma, no pings', webhooks],
   ['direct messages: both ways, block and unblock, friends', directMessages],
   ['attachments: image preview, byte-exact download, storage', attachments],
   ['pictures: avatar, custom emoji, server icon, GIF library', pictures],
   ['search: Ctrl+K words, from:, jump to the message', search],
   ['settings: display name, username, signed-in devices', settings],
   ['roles: private channel, overrides, Manage channels role', roles],
+  ['self-assign roles: marked in the role editor, picked by a member, opens a private channel', selfRoles],
+  ['events: a weekly event, RSVP, stop it repeating', events],
   ['voice: two people connected in a call', voiceCall],
   ['watch together: start, pause for everyone, stop; leave the call', watchTogether],
   ['dm call: ring, accept, hang up, decline', dmCall],
