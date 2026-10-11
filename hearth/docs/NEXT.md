@@ -131,3 +131,18 @@ The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-
   limits on posting; the server holds scheduled messages until their time and is trusted with it, and Export my
   data leaves out ones not sent yet; nicknames aren't in search's `from:` or bot events yet, and display names
   don't drop invisible characters the way nicknames do.
+
+- The batch-5 audit findings are in (1.29.0; SECURITY.md rows 128–138). Fixed: auth-6 (a fresh two-factor code for
+  every sensitive change, with a one-time step-up ticket for two-step ones), auth-11 (a new sign-in token on a
+  password change, turning on two-factor and "Log out all other devices" with the password), xss-8 (fonts served
+  by Hearth, outside images and watch-together video files wait for a click) and data-4 (pre-upgrade copies pruned
+  to `PRE_UPGRADE_KEEP`). Partly fixed: xss-7 (the security policy no longer names Google Fonts or allows blob:
+  frames), files-6 (GIF comments and profile songs' tags stripped), files-10 (server-signed per-picture links for
+  news, webhook avatars and album art, so `/media/news` is no longer an open proxy; webhook avatars only from known
+  hosts or `WEBHOOK_AVATAR_HOSTS`) and crypto-2 (an account reset without its recovery key is held out of key
+  sharing, invites and group adds until a member who knew them vouches, or an admin clears it with their password
+  and a fresh code). Left ([ENGINEERING-REPORT.md](ENGINEERING-REPORT.md) §5): pictures and media still load from
+  any https: site after a click; someone who follows a feed they host still picks what the news proxy fetches, and
+  GIF proxy links aren't signed; OGG songs and earlier uploads keep their metadata; pre-upgrade copies aren't
+  encrypted; a reset account's DMs and calls still rely on first-use trust, resets before 1.29.0 aren't marked, and
+  an admin whose every server holds an attacker's second account can still be cleared by those accounts.
