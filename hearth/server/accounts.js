@@ -4,8 +4,9 @@
 // How a reset works with end-to-end encryption: your password unlocks your private key, and the server never
 // has either. So an emailed reset link gets you back into the account, but your old key can only come back
 // if you also have your recovery key (which unlocks a second, separately encrypted copy of it). Without it,
-// the reset makes you new keys: friends' apps automatically re-share every server's key with you, but old
-// direct messages can't be read any more. The app explains this before anyone confirms.
+// the reset makes you new keys: once a member who knew you before has compared safety numbers with you and
+// verified you, their apps share every server's key with you again, but old direct messages can't be read any
+// more. The app explains this before anyone confirms.
 const crypto = require('crypto');
 
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -429,6 +430,15 @@ module.exports = function setupAccounts(ctx) {
         if (row.public_key) db.prepare('INSERT INTO user_key_history (user_id, public_key, sign_public_key, retired_at) VALUES (?, ?, ?, ?)').run(row.id, row.public_key, row.sign_public_key || null, now());
         db.prepare('UPDATE users SET public_key = ?, sign_public_key = NULL, enc_sign_private_key = NULL, enc_private_key_recovery = NULL, recovery_salt = NULL WHERE id = ?').run(b.publicKey, row.id);
         db.prepare('DELETE FROM server_keys WHERE user_id = ?').run(row.id);
+        // crypto-2: an email link alone made these keys, so it could be anyone who got into the inbox. Nobody's app
+        // hands them a server's or group's key until someone there who knew this person before checks them
+        // (index.js, POST /users/:id/keys/verify). Only when there's someone to protect: an account that shares no
+        // server or group with anyone is like a new one (and nobody could verify it). Still unverified from an
+        // earlier reset stays so, from now (whoever verifies must have known them before this reset), and what
+        // anyone verified for the old keys no longer counts.
+        const shares = db.prepare('SELECT 1 FROM members m JOIN members o ON o.server_id = m.server_id AND o.user_id != m.user_id WHERE m.user_id = ? LIMIT 1').get(row.id);
+        db.prepare('UPDATE users SET keys_reset_at = ?, keys_vouched_by = NULL, keys_vouched_at = NULL WHERE id = ?').run(shares || row.keys_reset_at ? now() : null, row.id);
+        db.prepare('DELETE FROM key_vouches WHERE user_id = ?').run(row.id);
       }
       db.prepare("DELETE FROM auth_tokens WHERE user_id = ? AND kind = 'reset'").run(row.id);
     })();
@@ -439,8 +449,9 @@ module.exports = function setupAccounts(ctx) {
     const token = createSession(req, row.id, { mfa: !!row.totp_enabled });
     secEvent('password_reset', cleanIp(req.ip), `${row.username}${keep ? ' (kept keys)' : ' (new keys)'}`);
     auditLog(req, keep ? 'password_reset_kept_keys' : 'password_reset_new_keys', row.id, row.username, row.id);
-    sendMail({ to: row.email, subject: `${brandName()}: your password was changed`, text: `The password for ${row.username} on ${brandName()} was just reset, and every device was signed out.\n\nIf this wasn't you, reset it again right away and tell the server owner.` }).catch(() => {});
     const fresh = getUserRow(row.id);
+    const verify = fresh.keys_reset_at ? '\n\nThe reset gave the account new encryption keys, so someone in your servers or groups has to verify you (compare safety numbers with you) before you can read new messages there again.' : '';
+    sendMail({ to: row.email, subject: `${brandName()}: your password was changed`, text: `The password for ${row.username} on ${brandName()} was just reset, and every device was signed out.${verify}\n\nIf this wasn't you, reset it again right away and tell the server owner.` }).catch(() => {});
     res.json({ token, user: selfUser(fresh), encPrivateKey: fresh.enc_private_key });
   }));
 

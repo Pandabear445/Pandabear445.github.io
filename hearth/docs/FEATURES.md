@@ -820,7 +820,10 @@ server's voice channels (`hasChat` in `server/index.js`); the app opens the chat
 
 - **Encryption:** the same server key and epoch (`requireCurrentEpoch`), the same ciphertext-only storage and the
   same `secure.js` path (the channel id is bound into every message, as for text channels). The server never sees
-  the text.
+  the text. Since the key is the server's, someone held back after a password reset without their recovery key
+  (`crypto-2`) has no key for the chat either until a member verifies them, and the bar above its box says so.
+- **Pictures from other sites:** an image link in the chat waits for a click like anywhere else (`xss-8`, Settings →
+  Privacy & safety → Outside images), since the chat's messages are drawn by the same code (`fillMessage`).
 - **Permissions:** View Channel to read it, Send Messages to write; Attach Files, Add Reactions, Mention @everyone,
   Show link previews and Manage Messages as in text channels, all per channel. **Connect isn't needed**: someone who
   may see a voice channel but not join its call can still chat, and can read what's said there. Timeouts take it

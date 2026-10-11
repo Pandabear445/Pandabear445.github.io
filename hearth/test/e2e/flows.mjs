@@ -971,7 +971,7 @@ async function androidApp(t) {
   delete t.people.droid;
 }
 
-// ------------------------------------------------------------------ 9. changes that need the password again
+// ------------------------------------------------------------------ 11b. changes that need the password again
 async function stepUp(t) {
   const { alice, bob } = t.people;
   // Deleting a server: the app asks for the password; a wrong one is refused in place, the right one deletes.
@@ -1712,7 +1712,7 @@ async function linkPreviews(t) {
   check(!bobAsked.length, `Bob's app should never contact the site or ask about the link (it asked for ${bobAsked.join(', ')}).`);
 }
 
-// ------------------------------------------------------------------ outside images and the app's own fonts (xss-8)
+// ------------------------------------------------------------------ 20b. outside images and the app’s own fonts (xss-8)
 // An image link to another site would show that site every reader's IP address, so it waits behind a placeholder
 // until clicked (Settings → Privacy & safety → Outside images: Ask first, Always load, Never load). The other site
 // here is answered by Bob's browser itself, counting what it's asked for.
@@ -2581,6 +2581,97 @@ async function nicknames(t) {
   await bob.noModals();
 }
 
+// ------------------------------------------------------------------ 27. reset without a recovery key (crypto-2)
+// New keys from an email link alone are held back until someone who knew the person checks them: her app says why,
+// she can't invite anyone meanwhile, a member sees the badge, compares safety numbers and verifies her, and then she
+// reads and writes again.
+async function resetVerify(t) {
+  const { bob } = t.people;
+  // Dana (from the away flow, a member of the server since then) signs in on a new device. (A new account here would
+  // be one sign-up too many for this network's hourly limit: every person in these flows signs up from 127.0.0.1.)
+  const dana = await t.open('dana');
+  await dana.login('dana', t.pw.dana);
+  await bob.railButton(SERVER);
+  await dana.railButton(SERVER);
+  await dana.openChannel('general');
+  await dana.send('Dana before her reset: quince');
+  await bob.openChannel('general');
+  await bob.message('Dana before her reset: quince').waitFor();
+  await bob.showMembers();
+  await bob.member('dana').waitFor();
+
+  // An email for resets, then she forgets her password (she never made a recovery key).
+  await dana.openSettings('Security');
+  await dana.$('.set-content button', { hasText: 'Add an email' }).click();
+  const add = await dana.dialog('Add an email');
+  await add.locator('input[type=email]').fill('dana@example.test');
+  await dana.confirmPassword('Add an email', t.pw.dana);
+  const mail = await t.server.mail('dana@example.test', /confirmation code is \d{6}/);
+  const confirm = await dana.dialog('Check your email');
+  await confirm.locator('input').fill(/code is (\d{6})/.exec(mail.subject)[1]);
+  await confirm.locator('.modal-foot .btn.primary').click();
+  await dana.toast('Email confirmed.');
+  await dana.closeSettings();
+  await dana.logout();
+  await dana.$('#to-forgot').click();
+  const forgot = await dana.dialog('Reset your password');
+  await forgot.locator('input.input').fill('dana');
+  await forgot.locator('.modal-foot .btn.primary').click();
+  await dana.toast('a reset link is on its way');
+  const reset = await t.server.mail('dana@example.test', /#reset=/);
+  await dana.page.goto(/(http\S+#reset=[\w-]+)/.exec(reset.text)[1]);
+  const fresh = newPassword();
+  const form = await dana.dialog('Choose a new password for dana');
+  await form.locator('.warn-box', { hasText: 'has to verify you' }).waitFor();
+  await form.locator('.field', { hasText: exact('New password') }).locator('input').fill(fresh);
+  await form.locator('.field', { hasText: 'Confirm new password' }).locator('input').fill(fresh);
+  await form.locator('.modal-foot .btn.primary').click();
+  await dana.toast('Ask a member to verify you');
+  t.pw.dana = fresh;
+  await dana.waitApp();
+
+  // Her app says why it can't read or send here; making an invite is refused with the reason.
+  await dana.railButton(SERVER);
+  await dana.openChannel('general');
+  const bar = dana.$('.key-bar', { hasText: 'once someone who knew you before verifies you' });
+  await bar.waitFor();
+  // A voice channel's chat uses the server's key too: the same bar there.
+  await dana.channelRow('Lounge').click({ button: 'right' });
+  await dana.menuItem('Open chat').click();
+  await dana.$('#members[data-mode="chat"] .key-bar', { hasText: 'once someone who knew you before verifies you' }).waitFor();
+  await dana.$('#main-head button[aria-label="Hide chat"]').click();
+  await dana.page.waitForSelector('#members', { state: 'hidden' });
+  await dana.openChannel('general');
+  await bar.waitFor();
+  // Who can verify her: the server lists Bob (in this server with her since before the reset).
+  await bar.locator('button', { hasText: 'Ask a member to verify you' }).click();
+  const ask = await dana.dialog('Ask a member to verify you');
+  await ask.locator('.ss-row', { hasText: 'bob' }).locator('button', { hasText: 'Compare safety numbers' }).waitFor();
+  await ask.locator('.modal-foot .btn', { hasText: 'Close' }).click();
+  await dana.noModals();
+  await dana.serverMenu('Invite people');
+  await dana.page.waitForFunction(() => /recovery key/.test((document.querySelector('.modal input[aria-label="Invite link"]') || {}).value || ''));
+  await dana.$('.modal .modal-x').click();
+  await dana.noModals();
+
+  // Bob sees the badge on her (a control of its own: the keyboard opens it too), compares safety numbers, and
+  // verifies her for everyone.
+  await bob.showMembers();
+  await bob.member('dana').locator('.key-warn[data-tip^="Reset their password without their recovery key"]').focus();
+  await bob.page.keyboard.press('Enter');
+  const dlg = bob.modal(/Security key changed|Verify encryption/);
+  await dlg.locator('.key-bar', { hasText: 'reset their password without their recovery key' }).waitFor();
+  await dlg.locator('.modal-foot .btn.primary', { hasText: 'verify and share keys' }).click();
+  await bob.toast('is verified. Everyone');
+  await bob.member('dana').locator('.key-warn[data-tip^="Reset their password"]').waitFor({ state: 'detached' });
+
+  // Her app hears it, gets the key from Bob's, and she talks again.
+  await dana.toast('You’re verified');
+  await bar.waitFor({ state: 'detached' });
+  await dana.send('Dana, verified again: lychee');
+  await bob.message('Dana, verified again: lychee').waitFor();
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -2619,4 +2710,5 @@ export const FLOWS = [
   ['voice chat: open beside the call, both ways, a picture link from another site waits for a click, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
   ['send later: schedule from the send button, edit, reschedule and send now from the list; cancel one in a DM; re-encrypted by itself when the key changes, never from a copy it can’t confirm; a signed-out session’s message waits for Keep; overdue ones ask first', sendLater],
   ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
+  ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
 ];

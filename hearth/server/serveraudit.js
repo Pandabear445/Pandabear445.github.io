@@ -174,7 +174,11 @@ module.exports = function setupServerAudit(ctx) {
   function viewer(s, uid) {
     const base = perms.base(s, uid);
     const admin = base === ALL;
-    const manageServer = (base & PM.MANAGE_SERVER) === PM.MANAGE_SERVER;
+    // Someone waiting to be verified here after a reset without their recovery key can't list this server's invites
+    // (crypto-2), so they don't see codes here either. Held until someone here vouched for them (index.js heldIn).
+    const unverified = !!db.prepare(`SELECT 1 FROM users u WHERE u.id = ? AND u.keys_reset_at IS NOT NULL AND NOT EXISTS
+        (SELECT 1 FROM key_vouches v WHERE v.user_id = u.id AND v.server_id = ? AND v.reset_at = u.keys_reset_at)`).get(uid, s.id);
+    const manageServer = (base & PM.MANAGE_SERVER) === PM.MANAGE_SERVER && !unverified;
     const seen = new Map();
     const channelNow = (id) => {
       if (!seen.has(id)) {

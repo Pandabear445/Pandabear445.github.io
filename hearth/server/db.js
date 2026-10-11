@@ -1529,6 +1529,29 @@ if (hasData && fromVersion < 19) {
     .run(PERMS.CHANGE_NICKNAME);
 }
 
+// v19 (crypto-2): a password reset without the recovery key gives the account brand-new keys, which anyone who got
+// into its email could do. keys_reset_at says when, for as long as the account is still held back somewhere: in a
+// server or group where nobody who knew them before has checked the new keys (compared safety numbers and said so),
+// nobody's app hands them that server's or group's key, and they can't invite anyone there or add people to it.
+// key_vouches: where someone did, for which reset. A member's word only counts in the servers and groups they're in
+// themselves (keys they hold anyway), so a second account someone put in a public server can't open the private
+// ones. Once every server and group they were in before the reset has one (or an instance admin verifies them),
+// keys_reset_at goes and keys_vouched_by/_at say who did it last, and when. Only accounts that share a server or
+// group with someone are marked, and none retroactively (see docs/ENGINEERING-REPORT.md). The partial index holds
+// only the few marked accounts: every key-state lookup asks which members of a server are marked.
+addColumn('users', 'keys_reset_at', 'INTEGER');
+addColumn('users', 'keys_vouched_by', 'TEXT');
+addColumn('users', 'keys_vouched_at', 'INTEGER');
+db.exec(`CREATE INDEX IF NOT EXISTS idx_users_keys_reset ON users(keys_reset_at) WHERE keys_reset_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS key_vouches (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  reset_at INTEGER NOT NULL,
+  voucher_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, server_id)
+);`);
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

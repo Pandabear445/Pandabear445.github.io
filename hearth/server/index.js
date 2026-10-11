@@ -224,6 +224,9 @@ function publicUser(row) {
     supporter: !!row.supporter || undefined,
     bot: !!row.is_bot || undefined,
     deleted: !!row.deleted_at || undefined,
+    // crypto-2: when a reset without the recovery key gave them new keys that nobody who knew them has verified yet
+    // (only while that's so; apps drop it when a full user object comes without it).
+    keysReset: row.keys_reset_at || undefined,
     activity: row.deleted_at ? undefined : ACT.activityFor(row) || undefined,
     recentGames: ACT.recentFor(row),
     createdAt: row.created_at,
@@ -245,6 +248,7 @@ function selfUser(row) {
   u.updatesUnread = NEWS ? NEWS.unreadUpdates(row.id) : 0;
   u.staffRole = staffRole(row.id);
   u.instanceAdmin = (STAFF_RANK[u.staffRole] || 0) >= 2;
+  u.keysReset = row.keys_reset_at || null; // said either way to your own apps, so they notice when you're verified
   if (ACCT) Object.assign(u, ACCT.selfExtras(row));
   return u;
 }
@@ -252,22 +256,50 @@ function selfUser(row) {
 // ---------------------------------------------------------------- end-to-end key state for a server
 // What one member needs to know: the current key epoch, their own wrapped keys, and who still
 // needs the current key. The server never sees the keys themselves.
+// crypto-2: the members of a server whose keys a password reset without the recovery key replaced (users.keys_reset_at),
+// and whom nobody in this server or group has verified since (key_vouches). Nobody hands them this server's key until
+// someone here does: the email link that made those keys could have been anyone's. Reads the few marked accounts (a
+// partial index), not the member list.
+const NOT_VOUCHED = 'NOT EXISTS (SELECT 1 FROM key_vouches v WHERE v.user_id = u.id AND v.server_id = m.server_id AND v.reset_at = u.keys_reset_at)';
+const heldIn = (serverId) => db.prepare(`SELECT u.id FROM users u INDEXED BY idx_users_keys_reset
+    JOIN members m ON m.server_id = ? AND m.user_id = u.id WHERE u.keys_reset_at IS NOT NULL AND ${NOT_VOUCHED}`).all(serverId).map((r) => r.id);
+const isHeld = (serverId, userId) => !!db.prepare(`SELECT 1 FROM users u JOIN members m ON m.server_id = ? AND m.user_id = u.id
+    WHERE u.id = ? AND u.keys_reset_at IS NOT NULL AND ${NOT_VOUCHED}`).get(serverId, userId);
+// Marked at all: still held back in at least one server or group they were in before the reset.
+const keysUnverified = (userId) => !!(getUserRow(userId) || {}).keys_reset_at;
+// Where a marked account still waits before the mark goes: every server and group they were in before the reset
+// (with someone else in it who could vouch: not a bot), and every one they've left since (leaving isn't being
+// verified there), that has no vouch yet. Servers they joined after the reset don't count (nobody there knew them
+// before); they're held there until this list is empty.
+const OTHER_PERSON = (col, self) => `EXISTS (SELECT 1 FROM members o JOIN users ou ON ou.id = o.user_id
+    WHERE o.server_id = ${col}${self ? ` AND o.user_id != ${self}` : ''} AND ou.is_bot = 0 AND ou.deleted_at IS NULL)`;
+function stillWaiting(row) {
+  if (!row || !row.keys_reset_at) return [];
+  const r = row.keys_reset_at;
+  return db.prepare(`SELECT s.server_id FROM (
+      SELECT m.server_id FROM members m WHERE m.user_id = ? AND m.joined_at < ? AND ${OTHER_PERSON('m.server_id', 'm.user_id')}
+      UNION SELECT f.server_id FROM former_members f WHERE f.user_id = ? AND f.left_at >= ? AND ${OTHER_PERSON('f.server_id')}) s
+    WHERE NOT EXISTS (SELECT 1 FROM key_vouches v WHERE v.user_id = ? AND v.server_id = s.server_id AND v.reset_at = ?)`)
+    .all(row.id, r, row.id, r, row.id, r).map((x) => x.server_id);
+}
 // The part that's the same for every member (worked out once when it goes to everyone, see emitKeyState).
+// missing: who still needs the current key and may be given it; held: who is waiting to be verified first.
 function serverKeyInfo(serverId) {
   const s = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(serverId);
   if (!s) return null;
+  const held = heldIn(serverId);
   const missing = s.key_epoch
     ? db.prepare(`SELECT m.user_id FROM members m WHERE m.server_id = ? AND NOT EXISTS
         (SELECT 1 FROM server_keys k WHERE k.server_id = m.server_id AND k.user_id = m.user_id AND k.epoch = ?)`)
-      .all(serverId, s.key_epoch).map((r) => r.user_id)
+      .all(serverId, s.key_epoch).map((r) => r.user_id).filter((id) => !held.includes(id))
     : [];
   // Who made the current key, so members (and moderators) can see who replaced it.
   const cur = s.key_epoch ? db.prepare('SELECT creator_id, created_at FROM server_epochs WHERE server_id = ? AND epoch = ?').get(serverId, s.key_epoch) : null;
-  return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
+  return { keyEpoch: s.key_epoch, needsRotation: !!s.needs_rotation, missing, held, keyCreatorId: cur ? cur.creator_id : null, keyCreatedAt: cur ? cur.created_at : null };
 }
 // createdAt: when the key was handed out, so an app only checks it against keys the sharer had back then.
 const keyOut = (k) => ({ epoch: k.epoch, wrapped: k.wrapped, wrapperId: k.wrapper_id, check: k.key_check, createdAt: k.created_at });
-const keyStateFrom = (serverId, info, keys) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt });
+const keyStateFrom = (serverId, info, keys) => ({ serverId, keyEpoch: info.keyEpoch, needsRotation: info.needsRotation, keys, missing: info.missing, held: info.held, keyCreatorId: info.keyCreatorId, keyCreatedAt: info.keyCreatedAt });
 function keyState(serverId, userId, info = serverKeyInfo(serverId)) {
   if (!info) return null;
   const keys = db.prepare(`SELECT k.epoch, k.wrapped, k.wrapper_id, k.created_at, e.key_check FROM server_keys k
@@ -2695,10 +2727,23 @@ api.post('/servers/:id/transfer', auth, wrap(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------- invites
+// crypto-2: someone whose keys a reset replaced, and whom nobody here has verified yet, can't bring anyone in here.
+// Whoever got into their email would otherwise invite a second account of theirs, or add it to a group, and that
+// one would be handed the key like any new member. Links made before the reset keep working (the real owner made
+// them, and people may be using them); a held-back account just can't see or list them.
+function requireNotHeld(serverId, userId, what) {
+  if (isHeld(serverId, userId)) fail(403, `Your password was reset without your recovery key, so you can\u2019t ${what} until someone here who knew you before verifies you. Ask one of them to compare safety numbers with you.`, 'keys_unverified');
+}
+// Things that reach beyond one server or group (starting a group chat, giving out staff roles): not until the mark is
+// gone everywhere.
+function requireKeysVerified(userId, what) {
+  if (keysUnverified(userId)) fail(403, `Your password was reset without your recovery key, so you can\u2019t ${what} until you\u2019re verified in your servers and groups. Ask a member who knew you before to compare safety numbers with you.`, 'keys_unverified');
+}
 api.post('/servers/:id/invites', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   if (s.kind === 'group') fail(400, 'Add people to a group from its member list.');
   if (!can(s, req.userId, PM.CREATE_INVITE)) fail(403, 'You don\u2019t have permission to create invites.');
+  requireNotHeld(s.id, req.userId, 'invite people');
   const b = req.body || {};
   const maxUses = Math.max(0, Math.min(1000, parseInt(b.maxUses || '0', 10) || 0));
   // A link expires after 7 days unless the request picks something else (0 = never), so API clients and older
@@ -2730,6 +2775,7 @@ api.post('/servers/:id/invites', auth, (req, res) => {
 const inviteOut = (i) => ({ code: i.code, creatorId: i.creator_id, uses: i.uses, maxUses: i.max_uses, expiresAt: i.expires_at, createdAt: i.created_at });
 api.get('/servers/:id/invites', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
+  requireNotHeld(s.id, req.userId, 'see invite links');
   const all = can(s, req.userId, PM.MANAGE_SERVER);
   res.json(db.prepare(`SELECT * FROM invites WHERE server_id = ? AND (? OR creator_id = ?) AND (expires_at IS NULL OR expires_at > ?)
       AND (max_uses = 0 OR uses < max_uses) ORDER BY created_at DESC LIMIT 200`).all(s.id, all ? 1 : 0, req.userId, now()).map(inviteOut));
@@ -2818,11 +2864,20 @@ function staleWraps(pubs, ids) {
 // Someone who was in this server before is back, e.g. after a kick with an invite they kept: switch to a new key,
 // so they can't read what was said while they were away. Known from former_members (kept through a password
 // reset, which deletes their key rows), or from key rows of theirs (people who left before that was recorded).
+// crypto-2: the same when the current key was made by someone held back here, after their reset (alone in the
+// server, the only time they may): those keys could be whoever got into their email, so a newcomer gets a key made
+// without them instead of theirs.
 function keyOnRejoin(serverId, userId) {
   if (db.prepare('SELECT 1 FROM former_members WHERE server_id = ? AND user_id = ?').get(serverId, userId)
-    || db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ? LIMIT 1').get(serverId, userId)) {
+    || db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ? LIMIT 1').get(serverId, userId)
+    || keyMadeWhileHeld(serverId)) {
     db.prepare('UPDATE servers SET needs_rotation = 1 WHERE id = ? AND key_epoch > 0').run(serverId);
   }
+}
+function keyMadeWhileHeld(serverId) {
+  const ep = db.prepare(`SELECT e.creator_id FROM servers s JOIN server_epochs e ON e.server_id = s.id AND e.epoch = s.key_epoch
+      JOIN users u ON u.id = e.creator_id WHERE s.id = ? AND u.keys_reset_at IS NOT NULL AND e.created_at >= u.keys_reset_at`).get(serverId);
+  return !!ep && isHeld(serverId, ep.creator_id);
 }
 
 api.get('/servers/:id/keys', auth, (req, res) => {
@@ -2877,6 +2932,9 @@ function limitVoluntary(s, epoch, userId) {
 // Start a new key epoch. The client generated a fresh random key and wrapped it to every member. A key that's
 // needed (someone left or came back, or members reported the current one broken) is never held up, except for
 // whoever caused that (causedRotation); any other new key is limited (limitVoluntary).
+// crypto-2: members waiting to be verified (heldIn) get no copy (one sent anyway, by an older app, is dropped), and
+// they can't make the key the others will write with either, unless nobody else is in the server.
+const KEYS_UNVERIFIED = 'Your password was reset without your recovery key, so this needs someone here who knew you before to verify you first: ask one of them to compare safety numbers with you.';
 api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   rateLimit('rotate:' + req.userId, 30, 60 * 1000);
@@ -2887,16 +2945,19 @@ api.post('/servers/:id/keys/rotate', auth, (req, res) => {
   const tx = db.transaction(() => {
     const cur = db.prepare('SELECT key_epoch, needs_rotation FROM servers WHERE id = ?').get(s.id);
     if (Number(epoch) !== cur.key_epoch + 1) fail(409, 'Someone else just refreshed the key.', 'epoch');
-    if (cur.key_epoch && !(cur.needs_rotation && !causedRotation(s.id, cur.key_epoch, req.userId))) limitVoluntary(s, cur.key_epoch, req.userId);
     const members = db.prepare('SELECT user_id FROM members WHERE server_id = ?').all(s.id).map((r) => r.user_id);
+    const held = heldIn(s.id);
+    if (held.includes(req.userId) && members.length > 1) fail(403, KEYS_UNVERIFIED, 'keys_unverified');
+    if (cur.key_epoch && !(cur.needs_rotation && !causedRotation(s.id, cur.key_epoch, req.userId))) limitVoluntary(s, cur.key_epoch, req.userId);
+    const given = members.filter((m) => m === req.userId || !held.includes(m));
     const ids = Object.keys(wraps);
-    if (ids.length !== members.length || !members.every((m) => isWrapped(wraps[m]))) fail(409, 'The member list changed. Try again.', 'members');
-    const stale = staleWraps(pubs, members);
+    if (!ids.every((id) => members.includes(id)) || !given.every((m) => isWrapped(wraps[m]))) fail(409, 'The member list changed. Try again.', 'members');
+    const stale = staleWraps(pubs, given);
     if (stale.length) fail(409, 'A member\u2019s keys just changed. Try again.', 'stale_keys');
     const t = now();
     db.prepare('INSERT INTO server_epochs (server_id, epoch, key_check, creator_id, created_at) VALUES (?, ?, ?, ?, ?)').run(s.id, cur.key_epoch + 1, check, req.userId, t);
     const ins = db.prepare('INSERT INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
-    members.forEach((m) => ins.run(s.id, cur.key_epoch + 1, m, wraps[m], req.userId, t));
+    given.forEach((m) => ins.run(s.id, cur.key_epoch + 1, m, wraps[m], req.userId, t));
     db.prepare('UPDATE servers SET key_epoch = ?, needs_rotation = 0 WHERE id = ?').run(cur.key_epoch + 1, s.id);
   });
   tx();
@@ -2914,15 +2975,19 @@ api.post('/servers/:id/keys/share', auth, (req, res) => {
   const cur = st.key_epoch;
   if (!cur || Number(epoch) !== cur || st.needs_rotation) fail(409, 'That key is out of date.', 'epoch');
   if (!db.prepare('SELECT 1 FROM server_keys WHERE server_id = ? AND epoch = ? AND user_id = ?').get(s.id, cur, req.userId)) fail(403, 'You do not have this key.');
+  const held = heldIn(s.id); // crypto-2: not until someone verifies them
+  // Nor from them: the only key they can hold here is one they made alone after the reset (keys/rotate), and a
+  // newcomer handed it would write with a key whoever has their account chose (keyOnRejoin makes a fresh one).
+  if (held.includes(req.userId)) fail(403, KEYS_UNVERIFIED, 'keys_unverified');
   const ins = db.prepare('INSERT OR IGNORE INTO server_keys (server_id, epoch, user_id, wrapped, wrapper_id, created_at) VALUES (?, ?, ?, ?, ?, ?)');
   let n = 0;
   const stale = staleWraps(pubs, Object.keys(wraps || {}));
   for (const [uid, w] of Object.entries(wraps || {}).slice(0, 200)) {
-    if (stale.includes(uid)) continue;
+    if (stale.includes(uid) || held.includes(uid)) continue;
     if (isMember(s.id, uid) && isWrapped(w)) n += ins.run(s.id, cur, uid, w, req.userId, now()).changes;
   }
   if (n) emitKeyState(s.id);
-  res.json({ shared: n, stale });
+  res.json({ shared: n, stale, held: held.filter((uid) => wraps && Object.hasOwn(wraps, uid)) });
 });
 // A member's app couldn't unlock the CURRENT key it was given (wrapped for keys it no longer has, e.g. right
 // after a password reset): drop it so the others share it again. Older keys are never dropped: nobody can
@@ -2976,6 +3041,127 @@ api.post('/servers/:id/keys/self', auth, (req, res) => {
   })();
   res.json({ updated: n });
 });
+
+// ---------------------------------------------------------------- verifying someone after a reset (crypto-2)
+// A reset without the recovery key makes new keys from an email link alone, so they're held back in every server and
+// group (heldIn) until someone vouches for them there. That's a member who compared safety numbers with the person
+// and pressed "Numbers match — verify and share keys": someone who was in a server or group with them before the
+// reset (a second account made or brought in afterwards can't), and isn't marked themselves. The app sends the public
+// key it compared, so a later reset can't ride on an earlier check.
+// A vouch only lifts the hold in the servers and groups the one vouching is in now (and in ones the person has left
+// since the reset, should they come back): keys they hold anyway. So a second account that whoever got into the
+// email put in some public server beforehand opens that server, which it reads already, and nothing else. Once every
+// server and group the person was in before the reset has had someone vouch (stillWaiting), the mark goes, and with
+// it the hold in servers they joined since. An instance admin can lift it everywhere at once from Admin → Users. All
+// of it goes in the audit log.
+function markVerified(target, byId) {
+  if (db.prepare('UPDATE users SET keys_reset_at = NULL, keys_vouched_by = ?, keys_vouched_at = ? WHERE id = ? AND keys_reset_at = ?')
+    .run(byId, now(), target.id, target.keys_reset_at).changes !== 1) return false;
+  db.prepare('DELETE FROM key_vouches WHERE user_id = ?').run(target.id);
+  return true;
+}
+// Everyone who has them on screen hears it now rather than with the next batch of profile updates, and before the
+// key states that follow: an app that still thought them unverified would skip them. Then the key state of every
+// server whose hold changed (all of theirs when the mark went).
+function vouchDone(target, serverIds, everywhere) {
+  if (everywhere) {
+    const row = getUserRow(target.id);
+    io.to(userAudience(target.id)).except(`user:${target.id}`).emit('user:update', publicUser(row));
+    io.to(`user:${target.id}`).emit('user:update', selfUser(row));
+    serverIds = db.prepare('SELECT server_id FROM members WHERE user_id = ?').all(target.id).map((m) => m.server_id);
+  }
+  serverIds.forEach((sid) => emitKeyState(sid));
+}
+const resetDay = (t) => new Date(t).toISOString().slice(0, 10);
+function vouchTarget(id) {
+  const target = getUserRow(String(id || ''));
+  if (!target || target.deleted_at || target.is_bot) fail(404, 'User not found.');
+  return target;
+}
+api.post('/users/:id/keys/verify', auth, (req, res) => {
+  rateLimit('keysverify:' + req.userId, 30, 60 * 60 * 1000);
+  const target = vouchTarget(req.params.id);
+  if (target.id === req.userId) fail(403, 'Someone else has to verify you: ask a member who knew you before to compare safety numbers with you.', 'self');
+  if (!target.keys_reset_at) return res.json({ ok: true, verified: false, released: [], everywhere: true });
+  if (keysUnverified(req.userId)) fail(403, 'Your own password was reset without your recovery key, so a member has to verify you before you can verify anyone.', 'keys_unverified');
+  if ((req.body || {}).publicKey !== target.public_key) fail(409, `${target.username}\u2019s keys changed again. Compare safety numbers with them once more.`, 'stale_keys');
+  const r = target.keys_reset_at;
+  // Both in the same server or group since before the reset: someone they met only afterwards (say in a server
+  // they joined since) can't tell whether it's really them.
+  const knew = db.prepare(`SELECT 1 FROM members mine JOIN members theirs ON theirs.server_id = mine.server_id AND theirs.user_id = ?
+      WHERE mine.user_id = ? AND mine.joined_at < ? AND theirs.joined_at < ? LIMIT 1`).get(target.id, req.userId, r, r);
+  if (!knew) fail(403, `Only someone who was in a server or group with ${target.username} before they reset their password can verify them.`, 'not_eligible');
+  let released = [];
+  let everywhere = false;
+  db.transaction(() => {
+    // The servers and groups this member is in where the person is too (or was, until they left after the reset)
+    // and nobody has vouched for them yet.
+    released = db.prepare(`SELECT mine.server_id FROM members mine WHERE mine.user_id = ? AND (
+        EXISTS (SELECT 1 FROM members t WHERE t.server_id = mine.server_id AND t.user_id = ?)
+        OR EXISTS (SELECT 1 FROM former_members f WHERE f.server_id = mine.server_id AND f.user_id = ? AND f.left_at >= ?))
+      AND NOT EXISTS (SELECT 1 FROM key_vouches v WHERE v.user_id = ? AND v.server_id = mine.server_id AND v.reset_at = ?)`)
+      .all(req.userId, target.id, target.id, r, target.id, r).map((x) => x.server_id);
+    const ins = db.prepare('INSERT OR REPLACE INTO key_vouches (user_id, server_id, reset_at, voucher_id, created_at) VALUES (?, ?, ?, ?, ?)');
+    released.forEach((sid) => ins.run(target.id, sid, r, req.userId, now()));
+    if (!stillWaiting(target).length) everywhere = markVerified(target, req.userId);
+  })();
+  if (released.length || everywhere) {
+    const by = getUserRow(req.userId);
+    auditLog(req, 'keys_verified', target.id, `${target.username}: new keys from a reset on ${resetDay(r)}, verified by ${by.username} in ${released.length} server(s) or group(s)`
+      + (everywhere ? '; verified everywhere now' : `; still held back in ${stillWaiting(target).length} they were in before`));
+  }
+  vouchDone(target, released, everywhere);
+  res.json({ ok: true, verified: released.length > 0 || everywhere, released, everywhere });
+});
+// For someone held back: who could lift that, so their app lists only people worth asking (with the servers and
+// groups each one's word would open). Members who aren't marked themselves and were in a server or group with them
+// before the reset, in a server or group where they're held now or one they've left since the reset.
+api.get('/me/verifiers', auth, (req, res) => {
+  rateLimit('verifiers:' + req.userId, 30, 60 * 1000);
+  const me = getUserRow(req.userId);
+  if (!me.keys_reset_at) return res.json({ waiting: false, users: [] });
+  const r = me.keys_reset_at;
+  const where = [...new Set([
+    ...db.prepare(`SELECT m.server_id FROM members m JOIN users u ON u.id = m.user_id WHERE m.user_id = ? AND u.keys_reset_at IS NOT NULL AND ${NOT_VOUCHED}`).all(me.id).map((x) => x.server_id),
+    ...stillWaiting(me),
+  ])].slice(0, 500);
+  const by = new Map();
+  if (where.length) {
+    db.prepare(`SELECT x.user_id, x.server_id FROM members x JOIN users u ON u.id = x.user_id
+        WHERE x.server_id IN (${where.map(() => '?').join(',')}) AND x.user_id != ? AND u.keys_reset_at IS NULL
+          AND u.deleted_at IS NULL AND u.suspended_at IS NULL AND u.is_bot = 0
+          AND EXISTS (SELECT 1 FROM members a JOIN members b ON b.server_id = a.server_id AND b.user_id = ?
+            WHERE a.user_id = x.user_id AND a.joined_at < ? AND b.joined_at < ?)
+        LIMIT 1000`).all(...where, me.id, me.id, r, r)
+      .forEach((x) => { if (!by.has(x.user_id)) by.set(x.user_id, []); by.get(x.user_id).push(x.server_id); });
+  }
+  const ids = [...by.keys()].slice(0, 50);
+  const rows = userRows(ids);
+  res.json({ waiting: true, users: ids.filter((id) => rows.get(id)).map((id) => ({ ...publicUser(rows.get(id)), serverIds: by.get(id) })) });
+});
+// From Admin → Users: for someone with nobody left who could verify them (or who can't wait); lifts it everywhere.
+// Not for yourself, and not while you're marked yourself (whoever took over your email could otherwise let
+// themselves in; nor can a marked owner hand out roles, see PUT /admin/staff).
+// It hands every server's and group's key to an account nobody there has checked, and can't be taken back, so it
+// takes the password and, with two-factor on, a fresh code (stepUp, auth-6), like handing over a staff role: a copied
+// admin session alone mustn't be able to let someone in. The checks above it come first, so a request that can't go
+// through doesn't use up a code.
+api.post('/admin/users/:id/keys/verify', auth, wrap(async (req, res) => {
+  requireInstanceAdmin(req.userId);
+  rateLimit('adminkeysverify:' + req.userId, 30, 60 * 60 * 1000);
+  const target = vouchTarget(req.params.id);
+  if (target.id === req.userId) fail(403, 'Another admin, or a member who knew you before, has to verify you.', 'self');
+  if (keysUnverified(req.userId)) fail(403, 'Your own password was reset without your recovery key, so a member has to verify you before you can verify anyone.', 'keys_unverified');
+  if (!target.keys_reset_at) fail(400, 'Their keys don\u2019t need verifying.');
+  await stepUp(req, req.body);
+  // (Only the reset checked above: a newer one meanwhile, or a member's vouch, leaves this changing nothing.)
+  const verified = db.transaction(() => markVerified(target, req.userId))();
+  if (verified) {
+    auditLog(req, 'keys_verified_by_admin', target.id, `${target.username}: new keys from a reset on ${resetDay(target.keys_reset_at)}, verified by ${getUserRow(req.userId).username}`);
+    vouchDone(target, [], true);
+  }
+  res.json({ ok: true, verified, everywhere: verified });
+}));
 
 // ---------------------------------------------------------------- channels
 const cleanCategory = (c) => String(c || '').trim().slice(0, 32);
@@ -4085,6 +4271,7 @@ api.post('/groups', auth, (req, res) => {
   const ids = [...new Set(((req.body || {}).userIds || []).map(String))].filter((u) => u !== req.userId);
   if (!ids.length) fail(400, 'Pick at least one person.');
   if (ids.length > GROUP_MAX - 1) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
+  requireKeysVerified(req.userId, 'start group chats');
   ids.forEach((u) => requireGroupAddable(req.userId, u));
   const id = newId();
   const t = now();
@@ -4108,6 +4295,7 @@ api.post('/groups', auth, (req, res) => {
 api.post('/groups/:id/members', auth, (req, res) => {
   const s = requireServer(req.params.id, req.userId);
   if (s.kind !== 'group') fail(400, 'Use an invite to add people to a server.');
+  requireNotHeld(s.id, req.userId, 'add people to this group');
   const uid = String((req.body || {}).userId || '');
   if (isMember(s.id, uid)) fail(409, 'They\u2019re already in this group.');
   if (db.prepare('SELECT COUNT(*) AS n FROM members WHERE server_id = ?').get(s.id).n >= GROUP_MAX) fail(400, `Group chats can have up to ${GROUP_MAX} people.`);
@@ -5171,6 +5359,7 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     canAct: r.id !== req.userId && staffRank(req.userId) > staffRank(r.id), myRole: staffRole(req.userId),
     storage: quotaOf(r.id), quotaOverride: r.upload_quota_mb, profileLocked: !!r.profile_locked, supporter: !!r.supporter,
     emailMasked: ACCT ? ACCT.mask(r.email) : '', totpEnabled: !!r.totp_enabled, hasRecovery: !!r.enc_private_key_recovery,
+    keysResetAt: r.keys_reset_at || null, keysWaiting: r.keys_reset_at ? stillWaiting(r).length : 0, keysVouched: r.keys_vouched_at ? { at: r.keys_vouched_at, by: brief(r.keys_vouched_by) } : null, self: r.id === req.userId,
     commentsWritten: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE author_id = ?').get(r.id).n,
     notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
       .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
@@ -5333,6 +5522,9 @@ api.put('/admin/staff', auth, ownerOnly, wrap(async (req, res) => {
   if (row.id === ownerId()) fail(400, 'You\u2019re the owner. To step down, hand ownership to someone else first.');
   const role = b.role === 'admin' || b.role === 'moderator' ? b.role : null;
   if (!role && envAdminName(row.id)) fail(400, `${row.username} is an admin through ADMIN_USERS (as ${envAdminName(row.id)}) in the server's .env file. Remove the name there and restart to take it away.`);
+  // crypto-2: an owner whose password was reset without the recovery key could be whoever got into their email,
+  // and a second account of theirs made admin could verify them (Admin → Users). Taking roles away still works.
+  if (role) requireKeysVerified(req.userId, 'give anyone a staff role');
   await stepUp(req, b);
   const roles = staffRoles();
   if (role) roles[row.id] = role; else delete roles[row.id];
@@ -5351,6 +5543,7 @@ api.post('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
   // A deleted account or a bot can never sign in, so it could never use (or hand back) ownership.
   if (row.deleted_at || row.is_bot) fail(400, 'That account can’t sign in, so it can’t own this server.');
   if (row.suspended_at) fail(400, 'Unsuspend them first.');
+  requireKeysVerified(req.userId, 'hand over ownership'); // crypto-2: see PUT /admin/staff
   const me = await stepUp(req, req.body);
   const roles = staffRoles();
   delete roles[row.id];

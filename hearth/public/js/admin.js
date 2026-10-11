@@ -919,6 +919,19 @@ async function userModal(id, refresh, myRank = 2) {
       h('h4', null, 'IP addresses'),
       h('div', { class: 'adm-table' }, ...u.ips.map((x) => h('div', { class: 'adm-row three' }, ipChip(x.ip), h('span', { class: 'stat-sub' }, `first ${fmtStamp(x.firstSeen)}`), h('span', { class: 'stat-sub' }, `last ${ago(x.lastSeen)}`)))),
       h('p', { class: 'field-hint' }, `Email: ${u.emailMasked || 'none'} \u00b7 Two-factor: ${u.totpEnabled ? 'on' : 'off'} \u00b7 Recovery key: ${u.hasRecovery ? 'saved' : 'none'}`),
+      // A reset without the recovery key: nobody's app shares server or group keys with them until someone vouches.
+      u.keysResetAt ? h('div', { class: 'row gap wrap' },
+        h('span', { class: 'badge-tag bad' }, `New keys from a password reset without the recovery key, ${ago(u.keysResetAt)} \u2014 not verified yet${u.keysWaiting ? ` in ${u.keysWaiting} ${u.keysWaiting === 1 ? 'server or group' : 'servers and groups'} they were in before` : ''}`),
+        // It can't be taken back, so it takes your password (and a fresh two-factor code when that's on), in one dialog.
+        myRank >= 2 && !u.self ? h('button', { class: 'chip', onclick: async () => {
+          try {
+            const r = await withPassword((x) => api('POST', `/admin/users/${u.id}/keys/verify`, x), { title: `Mark ${u.username}\u2019s new keys as verified?`, button: 'Mark as verified',
+              text: 'Only once you\u2019re sure it\u2019s really them and not someone who got into their email: for example, they read you the safety number from your profile in person or on a call. Everyone\u2019s apps then share the keys to all their servers and groups with them, including ones where nobody has verified them yet. This goes in the audit log.' });
+            if (!r) return;
+            toast('Marked as verified. Their servers\u2019 keys are being shared with them.'); m.close(); userModal(id, refresh, myRank);
+          } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+        } }, 'Mark as verified') : null) : null,
+      !u.keysResetAt && u.keysVouched ? h('p', { class: 'field-hint' }, `New keys from their last password reset were verified by ${u.keysVouched.by ? u.keysVouched.by.displayName : 'a deleted account'}, ${fmtStamp(u.keysVouched.at)}.`) : null,
       h('h4', null, `Signed-in devices \u2014 ${u.sessions.length}`),
       h('div', { class: 'adm-table' }, ...u.sessions.map((x) => h('div', { class: 'adm-row three' }, h('span', null, device(x.ua)), x.ip ? ipChip(x.ip) : h('span'), h('span', { class: 'stat-sub' }, `active ${ago(x.lastSeen)}`)))),
       u.reportsAgainst.length ? h('h4', null, `Reports about them \u2014 ${u.reportsAgainst.length}`) : null,

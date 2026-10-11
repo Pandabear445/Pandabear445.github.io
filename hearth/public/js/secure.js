@@ -20,6 +20,14 @@ function cleanPoll(p) {
   return { q: String(p.q || '').slice(0, 300), o, m: !!p.m };
 }
 
+// A user object from the server on top of what the app had. A whole one (it always has publicKey) that doesn't say
+// keysReset means they're verified now: the field is only sent while it's set, so it mustn't linger from before.
+export function mergeUser(old, x) {
+  const u = { ...(old || {}), ...x };
+  if (x && 'publicKey' in x && !('keysReset' in x)) delete u.keysReset;
+  return u;
+}
+
 export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () => {} }) {
   // A link preview the sender put in the message (linkpreview.js cleanLinks), as { l } or nothing at all.
   // Never throws: a bad preview must not make the message itself unreadable.
@@ -46,10 +54,23 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   async function userWithKeys(id) {
     let u = S.users[id];
     if (u && (u.publicKey || u.deleted)) return u;
-    if (!fetching.has(id)) fetching.set(id, api('GET', '/users/' + id).then((x) => { S.users[id] = { ...(S.users[id] || {}), ...x }; return S.users[id]; }).finally(() => fetching.delete(id)));
+    if (!fetching.has(id)) fetching.set(id, api('GET', '/users/' + id).then((x) => { S.users[id] = mergeUser(S.users[id], x); return S.users[id]; }).finally(() => fetching.delete(id)));
     u = await fetching.get(id);
     return u;
   }
+  // crypto-2: someone whose keys a password reset without their recovery key replaced, and who is still held back in
+  // at least one server or group they were in before (nobody there who knew them has verified them yet).
+  const awaitingVerify = (user) => !!user && !!user.keysReset;
+  // Held back in this server or group: the server keeps its key from them (and won't store one handed to them) until
+  // someone here verifies them, so the apps don't try either; their own app says to ask for it. A member's word only
+  // counts where they're a member, so someone can be held in one server and not in another: the server's list says
+  // which (a state without one falls back on the account-wide mark).
+  function isHeld(serverId, id) {
+    const st = states.get(serverId);
+    if (st && Array.isArray(st.held)) return st.held.includes(id);
+    return awaitingVerify(id === S.me.id ? S.me : S.users[id]);
+  }
+  const heldBack = (serverId, id) => id !== S.me.id && isHeld(serverId, id);
   function trust(user) {
     if (!user || user.id === S.me.id) return true;
     const ok = E2EE.checkPin(S.me.id, user) === 'ok';
@@ -176,6 +197,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   async function applyState(st) {
     if (!st) return;
+    const heldList = (x) => (Array.isArray(x && x.held) ? [...x.held].sort().join() : '');
+    const heldChanged = heldList(states.get(st.serverId)) !== heldList(st); // the member list's shields
     states.set(st.serverId, st);
     const mine = keysFor(st.serverId);
     const server = S.servers.find((s) => s.id === st.serverId);
@@ -241,7 +264,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (fresh.length) keepForMyself(st.serverId, fresh);
     (waiters.get(st.serverId) || []).forEach((r) => r());
     waiters.delete(st.serverId);
-    onKeysChanged(st.serverId, added);
+    onKeysChanged(st.serverId, added, heldChanged);
     maintain(st.serverId);
   }
 
@@ -286,8 +309,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!st || busy.has(serverId)) return;
     const server = S.servers.find((s) => s.id === serverId);
     if (!server) return;
-    const needsRotate = (st.needsRotation || !st.keyEpoch) && !held(serverId);
-    const needsShare = !needsRotate && st.missing && st.missing.some((id) => id !== S.me.id) && currentKey(serverId);
+    const needsRotate = (st.needsRotation || !st.keyEpoch) && !held(serverId) && mayMakeKey(server);
+    const shareWith = (st.missing || []).filter((id) => id !== S.me.id && !heldBack(serverId, id));
+    // Held back here yourself: the server takes no key from you to pass on (it might be one you made alone).
+    const needsShare = !needsRotate && !isHeld(serverId, S.me.id) && shareWith.length > 0 && currentKey(serverId);
     if (!needsRotate && !needsShare) return;
     busy.add(serverId);
     // Runs right away (no timers: background tabs throttle them). If several members do this at once,
@@ -295,12 +320,15 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     (async () => {
       try {
         if (needsRotate) await rotate(serverId);
-        else await share(serverId, st.missing.filter((id) => id !== S.me.id));
+        else await share(serverId, shareWith);
       } catch (e) {
-        if (!['epoch', 'members', ...LIMITED].includes(e.code)) console.warn('Key maintenance failed', e.message);
+        if (!['epoch', 'members', 'keys_unverified', ...LIMITED].includes(e.code)) console.warn('Key maintenance failed', e.message);
       } finally { busy.delete(serverId); }
     })();
   }
+  // While you wait to be verified here yourself, you can only make the key of a server nobody else is in (the server
+  // refuses otherwise: the others would be handed a key that your unverified keys chose).
+  const mayMakeKey = (server) => !isHeld(server.id, S.me.id) || server.memberIds.every((id) => id === S.me.id);
   // The server said "not you, not now" to a new key from us (we came back after being away, or we reported the
   // last key broken, so someone else makes the next one): don't keep asking for a minute.
   const LIMITED = ['rotate_too_soon', 'rate_limited'];
@@ -325,7 +353,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   }
   // Someone's keys changed under us: fetch them fresh before trying again.
   async function refreshUsers(ids) {
-    await Promise.all(ids.map((id) => api('GET', '/users/' + id).then((x) => { S.users[id] = { ...(S.users[id] || {}), ...x }; }).catch(() => {})));
+    await Promise.all(ids.map((id) => api('GET', '/users/' + id).then((x) => { S.users[id] = mergeUser(S.users[id], x); }).catch(() => {})));
   }
 
   async function rotate(serverId) {
@@ -334,7 +362,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!server || !st) return;
     const epoch = st.keyEpoch + 1;
     const raw = E2EE.newGroupKey();
-    const { wraps, pubs } = await wrapFor(serverId, epoch, raw, server.memberIds);
+    // Everyone but whoever waits to be verified (the server wouldn't keep their copy).
+    const { wraps, pubs } = await wrapFor(serverId, epoch, raw, server.memberIds.filter((id) => !heldBack(serverId, id)));
     const check = await E2EE.keyCheck(raw, serverId, epoch);
     const next = await api('POST', `/servers/${serverId}/keys/rotate`, { epoch, check, wraps, pubs }).catch(async (e) => {
       if (e.code === 'stale_keys') { await refreshUsers(server.memberIds.filter((id) => id !== S.me.id)); setTimeout(() => maintain(serverId), 500); }
@@ -349,7 +378,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     const ck = currentKey(serverId);
     const server = S.servers.find((s) => s.id === serverId);
     if (!ck || !server || !userIds.length) return;
-    const ids = userIds.filter((id) => server.memberIds.includes(id));
+    const ids = userIds.filter((id) => server.memberIds.includes(id) && !heldBack(serverId, id));
     if (!ids.length) return;
     const { wraps, pubs } = await wrapFor(serverId, ck.epoch, ck.raw, ids);
     const r = await api('POST', `/servers/${serverId}/keys/share`, { epoch: ck.epoch, wraps, pubs });
@@ -358,12 +387,19 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   // Wait until we can send in this server (rotating ourselves if the key needs refreshing).
   async function ready(serverId) {
+    const server = S.servers.find((s) => s.id === serverId);
+    // Waiting to be verified: nobody shares the key with you, so there's nothing to wait for here.
+    if (!currentKey(serverId) && server && !mayMakeKey(server)) {
+      const err = new Error('Your password was reset without your recovery key, so someone here who knew you before has to verify you before you can read or send messages here. Ask one of them to compare safety numbers with you.');
+      err.code = 'unverified';
+      throw err;
+    }
     for (let i = 0; i < 4; i++) {
       if (i && rolledBack(serverId)) break; // still older than a key we have, even after asking again
       const ck = currentKey(serverId);
       if (ck) return ck;
       const st = states.get(serverId);
-      if (st && (st.needsRotation || !st.keyEpoch) && !busy.has(serverId) && !held(serverId)) {
+      if (st && (st.needsRotation || !st.keyEpoch) && !busy.has(serverId) && !held(serverId) && (!server || mayMakeKey(server))) {
         busy.add(serverId);
         // Refused for us (see holds): another member's app makes the new key, so wait for it like for a share.
         try { await rotate(serverId); } catch (e) {
@@ -548,7 +584,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   }
 
   return {
-    ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain,
+    ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain, awaitingVerify, heldBack, isHeld,
     encryptChannel, decryptChannelMessage, encryptDm, decryptDmMessage, decryptAttachment,
     signSdp, verifySdp, keyChanged, keysChanged, acceptKeys, trust, userWithKeys, reset,
     heldEpochs: (serverId) => [...keysFor(serverId).keys()],

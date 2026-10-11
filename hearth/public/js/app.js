@@ -17,7 +17,7 @@ import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, m
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
 import { openCallDiagnostics } from './call-diagnostics.js';
-import { createSecure } from './secure.js';
+import { createSecure, mergeUser } from './secure.js';
 import { avatarEl, nameEl, displayName, displayNameIn, nicknameIn, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
@@ -378,8 +378,8 @@ async function openReset(token) {
   const noRec = h('input', { type: 'checkbox' });
   const code = h('input', { class: 'input', inputmode: 'numeric', autocomplete: 'one-time-code', placeholder: '123456 (or a backup code)' });
   const recBox = info.hasRecovery ? h('div', { class: 'stack' }, field('Recovery key', rec, 'With it, all your messages stay readable.'),
-    h('label', { class: 'row gap tight' }, noRec, h('span', { class: 'field-hint' }, 'I don\u2019t have it: start over with new keys (old direct messages can\u2019t be read any more)')))
-    : h('p', { class: 'warn-box' }, 'You don\u2019t have a recovery key, so this reset makes you new encryption keys: you\u2019ll get back into all your servers and friends, but your old direct messages can\u2019t be read any more. (That\u2019s the price of nobody, not even this server, being able to read them.)');
+    h('label', { class: 'row gap tight' }, noRec, h('span', { class: 'field-hint' }, 'I don\u2019t have it: start over with new keys (old direct messages can\u2019t be read any more, and a member has to verify you before you can read your servers and groups again)')))
+    : h('p', { class: 'warn-box' }, 'You don\u2019t have a recovery key, so this reset makes you new encryption keys: you\u2019ll get back into all your servers and friends, but your old direct messages can\u2019t be read any more, and someone in your servers or groups has to verify you (compare safety numbers with you) before you can read new messages there. (That\u2019s the price of nobody, not even this server, being able to read them.)');
   modal({ title: `Choose a new password for ${info.username}`, size: 'md', dismissable: true,
     body: h('div', { class: 'stack' }, field('New password', pw), field('Confirm new password', pw2), recBox, info.need2fa ? field('Two-factor code', code, 'From your authenticator app, or one of your backup codes.') : ''),
     actions: [{ label: 'Cancel' }, { label: 'Reset password', kind: 'primary', action: async () => {
@@ -405,7 +405,9 @@ async function openReset(token) {
       }
       const res = await api('POST', '/auth/reset', body);
       history.replaceState(null, '', '/');
-      toast(body.keepKeys ? 'Password reset. All your messages are still here.' : 'Password reset with new keys. Add a recovery key in Settings so this can\u2019t happen again.');
+      toast(body.keepKeys ? 'Password reset. All your messages are still here.'
+        : res.user && res.user.keysReset ? 'Password reset with new keys. Ask a member to verify you so you can read your servers and groups again, and add a recovery key in Settings so this can\u2019t happen again.'
+          : 'Password reset with new keys. Add a recovery key in Settings so this can\u2019t happen again.');
       await finishLogin(res, privateKey);
     } }] });
 }
@@ -633,9 +635,19 @@ function startApp() {
     if (presenceOnly) { setUser(u); showMyPresence(); return; }
     const roleBefore = S.me.staffRole;
     const outsideBefore = outsideMode(S.me.privacy);
+    const wasWaiting = sec.awaitingVerify(S.users[u.id]) || (u.id === S.me.id && sec.awaitingVerify(S.me));
     setUser(u); sec.trust(u); refreshUserBits(u.id);
     // Outside images changed on another device: the image links on screen follow the new choice.
     if (u.id === S.me.id && outsideMode(S.me.privacy) !== outsideBefore) later(redrawImageLinks);
+    // Verified after a reset without their recovery key (crypto-2): their servers' keys can go to them now.
+    if (wasWaiting && !sec.awaitingVerify(S.users[u.id])) {
+      S.servers.filter((s) => s.memberIds.includes(u.id)).forEach((s) => sec.maintain(s.id));
+      if (u.id === S.me.id) toast('You’re verified: members’ apps are sharing the keys to your servers and groups with you again.');
+    }
+    if (wasWaiting !== sec.awaitingVerify(S.users[u.id]) && (S.view.type === 'dm' || S.view.serverId)) {
+      if (S.panel === 'members') later(renderPanel);
+      later(renderHeader); if (composers.main) composers.main.renderExtras();
+    }
     // Given or lost a staff role: show or hide the admin dashboard right away.
     if (u.id === S.me.id && 'staffRole' in u && (u.staffRole || null) !== (roleBefore || null)) {
       if (S.view.type === 'admin' && !u.staffRole) setView({ type: 'home' }); else app.rerender();
@@ -1008,8 +1020,8 @@ async function loadBootstrap() {
 
 function setUser(u) {
   if (!u) return;
-  S.users[u.id] = { ...(S.users[u.id] || {}), ...u };
-  if (S.me && u.id === S.me.id) S.me = { ...S.me, ...u };
+  S.users[u.id] = mergeUser(S.users[u.id], u);
+  if (S.me && u.id === S.me.id) S.me = mergeUser(S.me, u);
 }
 function getUser(id) {
   const u = S.users[id];
@@ -2809,7 +2821,9 @@ function drawHeader(head) {
       headTools(
         sec.keyChanged(u)
           ? h('button', { class: 'head-badge warn', 'data-tip': 'This person\u2019s security key changed. Click to verify.', onclick: () => openSafetyNumber(u) }, icon('shield'), 'Key changed')
-          : encBadge(() => openSafetyNumber(u), 'Compare safety numbers'),
+          : resetUnverified(u)
+            ? h('button', { class: 'head-badge warn', 'data-tip': `${RESET_TIP}. Click to compare safety numbers.`, onclick: () => openSafetyNumber(u) }, icon('shield'), 'Not verified')
+            : encBadge(() => openSafetyNumber(u), 'Compare safety numbers'),
         timerButton(key),
         ...(() => {
           const room = dmRoom(d.id);
@@ -3335,8 +3349,12 @@ function mentionKind(m) {
 }
 const mentionsMe = (m) => !!mentionKind(m);
 
-async function onKeysChanged(serverId, added) {
+async function onKeysChanged(serverId, added, heldChanged) {
   if (!S.me) return;
+  // crypto-2: someone here was verified (or is held back now): their shield in the member list and, in a DM with
+  // them, the header's badge.
+  if (heldChanged && S.view.serverId === serverId && S.panel === 'members') later(renderPanel);
+  if (heldChanged && S.view.type === 'dm') { later(renderHeader); if (composers.main) composers.main.renderExtras(); }
   if (added) {
     const server = S.servers.find((s) => s.id === serverId);
     for (const c of server ? server.channels : []) {
@@ -4811,7 +4829,8 @@ function membersPanel(el) {
         h('span', { class: 'member-name' }, nameEl(u, { roleColor: rs.color, server }),
           rs.owner ? h('span', { class: 'role-icon', 'data-tip': 'Server owner' }, '\uD83D\uDC51') : null,
           rs.iconRole ? h('span', { class: 'role-icon', 'data-tip': rs.iconRole.name }, rs.iconRole.icon) : null,
-          changedKeys.has(u.id) ? h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'data-tip': 'Security key changed \u2014 click to verify', onclick: (e) => { e.stopPropagation(); openSafetyNumber(u); } }, icon('shield')) : null),
+          sec.heldBack(server.id, u.id) ? keyWarn(u, `${displayName(u)} reset their password without their recovery key. Verify them`, RESET_TIP)
+            : changedKeys.has(u.id) ? keyWarn(u, `${displayName(u)}\u2019s security key changed. Verify them`, 'Security key changed \u2014 click to verify') : null),
         activityLine(u) ? h('span', { class: 'member-status' }, activityLine(u)) : cs ? h('span', { class: 'member-status' }, cs) : null));
     };
     for (const r of hoisted) {
@@ -5799,9 +5818,22 @@ function keyNotice() {
         h('span', null, `${displayName(u)}'s security key changed. Sending is paused until you verify it.`),
         h('button', { class: 'btn sm ghost', onclick: () => openSafetyNumber(u) }, 'Verify'));
     }
+    if (u && resetUnverified(u)) {
+      return h('div', { class: 'key-bar' }, icon('shield'),
+        h('span', null, `${displayName(u)} reset their password without their recovery key, so their keys are new. Compare safety numbers before you share anything private.`),
+        h('button', { class: 'btn sm ghost', onclick: () => openSafetyNumber(u) }, 'Verify'));
+    }
     return null;
   }
   if (S.view.type !== 'channel' && !(S.view.type === 'voice' && S.view.chat)) return null;
+  // crypto-2: waiting to be verified here yourself, nobody shares this conversation's key with you (a voice channel's
+  // chat uses its server's key, so the same there).
+  const here = S.servers.find((x) => x.id === S.view.serverId);
+  if (here && sec.isHeld(here.id, S.me.id) && !sec.currentKey(here.id) && here.memberIds.some((id) => id !== S.me.id)) {
+    return h('div', { class: 'key-bar bad' }, icon('shield'),
+      h('span', null, 'You reset your password without your recovery key, so members’ apps share this conversation’s key with you once someone who knew you before verifies you here.'),
+      h('button', { class: 'btn sm ghost', onclick: () => openGetVerified() }, 'Ask a member to verify you'));
+  }
   const st = sec.stateOf(S.view.serverId);
   if (!st || sec.currentKey(S.view.serverId) || st.needsRotation || !st.keyEpoch) return null;
   return h('div', { class: 'key-bar' }, h('span', { class: 'spinner' }),
@@ -6768,24 +6800,54 @@ async function openProfileModal(userId) {
   });
   m = modal({ size: 'full', className: 'mys-modal', title: `${displayName(u)}'s profile`, body: h('div', { class: 'mys-host' }, h('button', { class: 'icon-btn mys-close', 'aria-label': 'Close', onclick: () => m.close() }, icon('close')), view), onClose: stopSong });
 }
+// crypto-2: someone whose keys a password reset without their recovery key replaced, until a member verifies them.
+const RESET_TIP = 'Reset their password without their recovery key \u2014 verify them before they can read new messages';
+// Someone whose new keys are still held back where you could do something about it: in a server or group you share
+// with them, or anywhere at all if you share none (then it's only a warning: direct messages aren't held back).
+function resetUnverified(u) {
+  if (!u || u.id === S.me.id || !sec.awaitingVerify(u)) return false;
+  const shared = S.servers.filter((s) => s.memberIds.includes(u.id));
+  return !shared.length || shared.some((s) => sec.heldBack(s.id, u.id));
+}
+// The shield on a member-list row: a control of its own inside the row's button, so Enter and Space open it too
+// (without also opening the row's profile card).
+function keyWarn(u, label, tip) {
+  const open = (e) => { e.preventDefault(); e.stopPropagation(); openSafetyNumber(u); };
+  return h('span', { class: 'key-warn', role: 'button', tabindex: '0', 'aria-label': label, 'data-tip': tip, onclick: open,
+    onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') open(e); } }, icon('shield'));
+}
 async function openSafetyNumber(u) {
   try {
     const user = await sec.userWithKeys(u.id);
     const groupsN = await E2EE.safetyNumber(S.me, user);
     const changed = sec.keyChanged(user);
+    // They're waiting to be verified, and you may be the one to do it (the server checks you knew them before).
+    const vouch = user.id !== S.me.id && sec.awaitingVerify(user) && !sec.awaitingVerify(S.me);
+    const name = displayName(user);
     modal({
       title: changed ? 'Security key changed' : 'Verify encryption',
       size: 'sm',
       body: h('div', { class: 'stack' },
-        changed ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `${displayName(user)}'s keys are different from the ones this browser saw before. That happens if someone \u2014 including whoever runs this server \u2014 tries to listen in. Only continue once the numbers match on both screens.`)) : null,
-        h('p', { class: 'muted-p' }, `Compare these numbers with ${displayName(user)} in person or on a call. If they match on both screens, nobody \u2014 not even the server \u2014 can read or fake your messages.`),
+        changed ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `${name}'s keys are different from the ones this browser saw before. That happens if someone \u2014 including whoever runs this server \u2014 tries to listen in. Only continue once the numbers match on both screens.`)) : null,
+        vouch ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `${name} reset their password without their recovery key, so their keys are new. Anyone who got into their email could have done that, so nobody\u2019s app shares a server\u2019s or group\u2019s keys with them until someone there who knew them before verifies them. Verifying them shares the keys of the servers and groups you\u2019re both in.`)) : null,
+        sec.awaitingVerify(S.me) && user.id !== S.me.id ? h('p', { class: 'key-bar' }, icon('shield'), h('span', null, `To get verified, ask ${name} to open your profile (\u22ef \u2192 Verify encryption), check these same numbers and press \u201cNumbers match \u2014 verify and share keys\u201d.`)) : null,
+        h('p', { class: 'muted-p' }, `Compare these numbers with ${name} in person or on a call. If they match on both screens, nobody \u2014 not even the server \u2014 can read or fake your messages.`),
         h('div', { class: 'safety' }, groupsN.map((g) => h('span', null, g)))),
       actions: [
-        { label: changed ? 'Not now' : 'Close' },
-        { label: changed ? 'Numbers match \u2014 trust new key' : 'Numbers match', kind: 'primary', action: () => {
+        { label: changed || vouch ? 'Not now' : 'Close' },
+        { label: vouch ? 'Numbers match \u2014 verify and share keys' : changed ? 'Numbers match \u2014 trust new key' : 'Numbers match', kind: 'primary', action: async () => {
           sec.acceptKeys(user);
           SCHED.onKeys(); // a scheduled DM waiting for their new key
-          toast(`${displayName(user)} is verified on this device.`);
+          if (vouch) {
+            // Tells the server too, with the key compared: everyone's apps share the keys of the servers and groups
+            // you're both in with them again (and of all theirs, once each one they were in has been verified).
+            try {
+              const r = await api('POST', `/users/${user.id}/keys/verify`, { publicKey: user.publicKey });
+              toast(r.everywhere ? `${name} is verified. Everyone’s apps share the keys to their servers and groups with them again.`
+                : r.verified ? `${name} is verified in the servers and groups you share. Where you aren’t a member, someone there has to verify them too.`
+                  : `${name} was already verified in the servers and groups you share. Where you aren’t a member, someone there has to verify them.`);
+            } catch (e) { toast(`${name} is verified on this device, but not for everyone: ${e.message}`, 'error'); }
+          } else toast(`${name} is verified on this device.`);
           renderHeader(); if (composers.main) composers.main.renderExtras();
           S.servers.filter((s) => s.memberIds.includes(user.id)).forEach((s) => sec.maintain(s.id));
         } },
@@ -6793,11 +6855,37 @@ async function openSafetyNumber(u) {
     });
   } catch (e) { toast(e.message, 'error'); }
 }
+// For someone waiting to be verified: why, and the people worth asking. The server says who: someone who was in a
+// server or group with you before the reset and is in one where you're held back now (their word only counts in the
+// servers and groups they're in). Each opens your safety number with them.
+async function openGetVerified() {
+  let r;
+  try { r = await api('GET', '/me/verifiers'); } catch (e) { return toast(e.message, 'error'); }
+  (r.users || []).forEach((x) => { const u = { ...x }; delete u.serverIds; setUser(u); });
+  const where = (ids) => ids.map((id) => S.servers.find((x) => x.id === id)).filter(Boolean).map((x) => (isGroup(x) ? groupName(x) : x.name));
+  const here = S.view.serverId;
+  const people = (r.users || []).map((u) => ({ u: getUser(u.id), ids: u.serverIds || [], names: where(u.serverIds || []) }))
+    .sort((a, b) => Number(b.ids.includes(here)) - Number(a.ids.includes(here)) || displayName(a.u).localeCompare(displayName(b.u)));
+  const m = modal({
+    title: 'Ask a member to verify you',
+    size: 'sm',
+    body: h('div', { class: 'stack' },
+      h('p', { class: 'muted-p' }, 'You reset your password without your recovery key, so your encryption keys are new. Anyone who got into your email could have done that, so members\u2019 apps don\u2019t share a server\u2019s or group\u2019s keys with you until someone there who knew you before checks that it\u2019s really you.'),
+      h('p', { class: 'muted-p' }, 'Compare safety numbers with one of them in person or on a call. When they match, they press \u201cNumbers match \u2014 verify and share keys\u201d on their side, and you can read new messages in the servers and groups you share with them again. (What was said before your reset stays locked to your old keys.)'),
+      !r.waiting ? h('p', { class: 'field-hint' }, 'You\u2019re verified everywhere already.')
+        : people.length ? h('div', { class: 'stack tight' }, ...people.map(({ u, names }) => h('div', { class: 'ss-row' }, avatarEl(u, 30),
+          h('span', { class: 'ss-row-name' }, nameEl(u), names.length ? h('span', null, names.slice(0, 3).join(', ') + (names.length > 3 ? ` +${names.length - 3}` : '')) : null),
+          h('button', { class: 'btn ghost sm', onclick: () => { m.close(); openSafetyNumber(u); } }, 'Compare safety numbers'))))
+          : h('p', { class: 'field-hint' }, 'Nobody who was in a server or group with you before your reset is in one where you\u2019re waiting now. Ask an admin of this Hearth server to verify you (Admin \u2192 Users).')),
+    actions: [{ label: 'Close' }],
+  });
+}
 function openServerSecurity(server) {
   if (!server) return;
   const st = sec.stateOf(server.id) || { keyEpoch: 0, missing: [] };
-  const holders = server.memberIds.length - (st.missing || []).length;
-  const changed = server.memberIds.map(getUser).filter((u) => sec.keyChanged(u));
+  const holders = server.memberIds.length - (st.missing || []).length - (st.held || []).length;
+  const waiting = server.memberIds.filter((id) => sec.heldBack(server.id, id)).map(getUser);
+  const changed = server.memberIds.map(getUser).filter((u) => sec.keyChanged(u) && !waiting.some((w) => w.id === u.id));
   const label = isGroup(server) ? 'this group' : server.name;
   modal({
     title: 'End-to-end encryption',
@@ -6809,6 +6897,8 @@ function openServerSecurity(server) {
       st.keyCreatorId ? h('div', { class: 'kv' }, h('span', null, 'Made by'), h('strong', null, `${nameInServer(server, getUser(st.keyCreatorId))}${st.keyCreatedAt ? `, ${new Date(st.keyCreatedAt).toLocaleString()}` : ''}`)) : null,
       h('div', { class: 'kv' }, h('span', null, 'Members with the current key'), h('strong', null, `${Math.max(0, holders)} of ${server.memberIds.length}`)),
       changed.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `Security key changed for ${changed.map(displayName).join(', ')}. Verify them from their profile before the key can be shared.`)) : null,
+      waiting.length ? h('p', { class: 'key-bar bad' }, icon('shield'), h('span', null, `${waiting.map(displayName).join(', ')} reset ${waiting.length === 1 ? 'their password' : 'their passwords'} without a recovery key. Nobody\u2019s app shares this key with them until a member here who knew them before verifies them (their profile \u2192 Verify encryption).`)) : null,
+      sec.isHeld(server.id, S.me.id) ? h('p', { class: 'key-bar' }, icon('shield'), h('span', null, 'You reset your password without your recovery key: someone here who knew you before has to verify you before you get this key.'), h('button', { class: 'btn sm ghost', onclick: () => openGetVerified() }, 'Get verified')) : null,
       h('p', { class: 'field-hint' }, 'To make sure nobody is impersonating a member, compare safety numbers with them from their profile (\u22ef \u2192 Verify encryption).')),
     actions: [
       { label: 'Close' },

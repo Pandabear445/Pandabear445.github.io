@@ -340,12 +340,20 @@ function createDrill() {
         const mine = await readDm(dA2, ctx.dmAC);
         assert.deepEqual(texts(mine), sorted(ctx.dmTexts.AC));
         // Group history: C's key copies were deleted with her old keys. Nobody hands her the current key until a
-        // member's app trusts her new key (A checks the safety number and accepts it).
+        // member who knew her before checks the safety number and verifies her for everyone (crypto-2): A trusting
+        // her new key on her own device isn't enough, since the email link alone could have been anyone's.
         const held0 = srv.sql('SELECT epoch FROM server_keys WHERE server_id = ? AND user_id = ?', sid, C.id);
         assert.deepEqual(held0, [], 'no server keys for C right after the reset');
+        const keysOfC = () => srv.sql('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ?', sid, C.id).length;
         dA2.sec.acceptKeys(dA2.S.users[C.id]);
         await use(dA2); dA2.sec.maintain(sid);
-        assert.ok(await until(() => srv.sql('SELECT 1 FROM server_keys WHERE server_id = ? AND user_id = ?', sid, C.id).length), 'A’s app re-shared the current key with C');
+        assert.equal(await until(keysOfC, 1500), false, 'held back: trusting her key on one device shares nothing');
+        assert.ok(dA2.sec.heldBack(sid, C.id), 'A’s app knows C waits to be verified here');
+        const v = await as(A, 'POST', `/users/${C.id}/keys/verify`, { publicKey: C.publicKey });
+        assert.equal(v.status, 200, v.text);
+        assert.equal(v.json.everywhere, true, 'A verifies her everywhere she was (the one server they share)');
+        await use(dA2); await dA2.sec.refresh(sid);
+        assert.ok(await until(keysOfC), 'A’s app re-shared the current key with C');
         const dC2 = await device(C, new Map());
         assert.deepEqual(dC2.sec.heldEpochs(sid), [2], 'only the current epoch comes back');
         const msgs = await readChannel(dC2, ch);
@@ -357,7 +365,8 @@ function createDrill() {
         ctx.dC = dC3;
         ctx.cOldDmsUnreadable = dms.length;
         return ['keepKeys without a recovery key: refused (400)', `C's ${dms.length} old DMs: unreadable on her side (expected), still readable on A's side`,
-          'A sees "security key changed"; DMs to C wait for verification', 'after A verifies: C gets the current server key (epoch 2) back, not epoch 1'];
+          'A sees "security key changed"; DMs to C wait for verification', 'server keys held back from C until A verifies her (crypto-2)',
+          'after A verifies: C gets the current server key (epoch 2) back, not epoch 1'];
       },
     },
     {

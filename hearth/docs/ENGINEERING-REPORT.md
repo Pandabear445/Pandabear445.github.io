@@ -78,22 +78,25 @@ encryption").
 | crypto | `3933a34` | 1 blocker, 3 major, 4 minor | `7f106a6` | 9 |
 
 (The last column counts findings closed by that batch, in full or part: 106 in all. A batch also fixed findings
-from other areas, e.g. `auth` fixed `admin-1` and `admin-3`. The 18 documented and 3 deferred findings belong to no
-batch.)
+from other areas, e.g. `auth` fixed `admin-1` and `admin-3`. The 18 findings documented and 3 deferred then belong to
+no batch; five of them (`auth-6`, `auth-11`, `xss-7`, `xss-8` and `crypto-2`) were fixed or partly fixed later, in
+1.29.0 (§3, §5).)
 
 ## 3. Results at a glance
 
 | Status | Count | Meaning |
 |---|---|---|
-| Fixed | 78 | The problem is closed in code and a test proves it. |
-| Partly fixed | 28 | The confirmed problem is closed; a remaining part was deferred (§5). |
-| Documented | 18 | No code change: the docs now say what the code does (overclaims corrected, limitations stated). |
-| Deferred | 3 | Not changed; documented as a limit (`auth-11`, `crypto-7`, `admin-12`). |
+| Fixed | 82 | The problem is closed in code and a test proves it. |
+| Partly fixed | 29 | The confirmed problem is closed; a remaining part was deferred (§5). |
+| Documented | 14 | No code change: the docs now say what the code does (overclaims corrected, limitations stated). |
+| Deferred | 2 | Not changed; documented as a limit (`crypto-7`, `admin-12`). |
 | **Total** | **127** | |
 
-By severity: 8 high (6 fixed, 2 partly fixed), 47 medium (36 fixed, 10 partly fixed, 1 documented), 67 low (35
-fixed, 14 partly fixed, 15 documented, 3 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
-vulnerabilities, 38 bugs, 19 overclaims, 14 limitations, 13 hardening, 3 performance.
+By severity: 8 high (6 fixed, 2 partly fixed), 47 medium (36 fixed, 11 partly fixed), 67 low (39
+fixed, 14 partly fixed, 12 documented, 2 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
+vulnerabilities, 38 bugs, 19 overclaims, 14 limitations, 13 hardening, 3 performance. Since 1.28.0 (in 1.29.0):
+`auth-6`, `auth-11`, `xss-8` and `data-4` are fixed, and `xss-7` and `crypto-2` partly fixed (they were documented,
+deferred or partly fixed); `files-6`, `files-10` and `crypto-8` stay partly fixed, with more of each done (§5).
 
 All fixes are **implemented**. Every fixed or partly fixed finding with a proving test below is **tested locally**
 (§6: 357 of 358 tests passed, 1 skipped) and **tested in CI** in the `tests` job at `dec63ee`, except the parts
@@ -128,7 +131,7 @@ where the docs now state the behaviour.
 | ID | Severity | Kind | Title | Status | Proving test |
 |---|---|---|---|---|---|
 | crypto-1 | high | bug | Server-channel history is lost for good when the member who handed out a key deletes their account or resets without a recovery key | Fixed | `crypto-hardening.test.js` |
-| crypto-2 | medium | overclaim | An attacker who controls only the victim's email (no 2FA) can read the victim's servers and groups, but the docs say 'not its messages' | Documented | — (SECURITY.md row 10, §4; README) |
+| crypto-2 | medium | overclaim | An attacker who controls only the victim's email (no 2FA) can read the victim's servers and groups, but the docs say 'not its messages' | Partly fixed (holding back reset accounts done since: §5) | `keys-reset-hardening.test.js` |
 | crypto-3 | medium | bug | Any member can rotate the server key without limit and with junk key bundles: blocks sending and grows storage without bound | Partly fixed | `crypto-hardening.test.js` |
 | crypto-4 | medium | bug | After someone deletes their account, the other person can no longer read any of their DMs, and all their channel messages show 'could not be verified' | Fixed | `crypto-hardening.test.js` |
 | crypto-5 | low | overclaim | The server alone decides the key epoch: a key handoff from a non-member is accepted, rotation can be suppressed or rolled back, and the 'watch the member list' advice doesn't hold | Partly fixed | `crypto-hardening.test.js` |
@@ -275,7 +278,7 @@ where the docs now state the behaviour.
 | data-13 | medium | bug | Any account can stall the whole server for 2.5-4 s per request with GET /api/me/study (100 MB in one synchronous response); sync also silently truncates at 5000 rows | Fixed | `data-hardening.test.js` |
 | data-3 | medium | performance | Join/leave triggers O(members^2) work (emitServer + emitKeyState) with no rate limit; one invited user can freeze a large server's instance | Partly fixed | `data-hardening.test.js` |
 | data-2 | medium | bug | Threads are fetched without LIMIT and deleted with one IN(?...) list: big threads stall the server, and over 32766 replies the root can't be viewed or deleted (files already gone) | Fixed | `data-hardening.test.js` |
-| data-4 | low | bug | Migrations are not atomic and the v12 step is not idempotent: an interrupted upgrade (or interrupted first start) leaves a permanent crash loop, and each restart writes another full DB copy | Partly fixed (pruning done since: §5) | `data-hardening.test.js` |
+| data-4 | low | bug | Migrations are not atomic and the v12 step is not idempotent: an interrupted upgrade (or interrupted first start) leaves a permanent crash loop, and each restart writes another full DB copy | Fixed (old copies pruned since 1.29.0, see crypto-8 in §5) | `data-hardening.test.js` |
 | data-6 | medium | vulnerability | Encrypted backup writes a plaintext DB snapshot into backups/encrypted/ and leaves it there if the process stops mid-backup | Fixed | `admin-hardening.test.js` |
 | data-7 | medium | bug | Any upload deleted while a backup streams aborts the whole encrypted backup and leaves a large .hbk.part that is never cleaned | Fixed | `admin-hardening.test.js` |
 | data-8 | medium | bug | Deleting a server cascade-deletes membership rows even when the Stripe cancellation failed, so subscribers keep being billed with no local record | Fixed | `admin-hardening.test.js` |
@@ -319,6 +322,7 @@ where the docs now state the behaviour.
 | voice-1 | Watch-together state is sent whole on every change. | Delta updates change the protocol; amplification is bounded (64 KB state, 4 broadcasts a second). |
 | voice-4 | No per-session socket cap and no per-network handshake limit. | Tabs share one session; a NAT full of users reconnecting after a restart would be locked out. The per-user cap of 30 sockets and shared event budget cover it. |
 | voice-9 | Anyone who can sign up gets relay logins; no default total bandwidth cap; existing installs need `setup-turn.sh` again. | Product decision; the right total depends on each VPS plan. |
+| crypto-2 | Done since (1.29.0): a reset without the recovery key marks the account (`users.keys_reset_at`) when it shares a server or group with anyone, and holds it back in each of them. In a server or group where it's held, the server keeps no key for it (shares and rotations skip it; an older app's copy is dropped), it can't make a key for others, hand on a key it made alone (a newcomer then gets a fresh key instead), create or list invites, see invite codes in that server's audit log, or add people to the group; the apps skip it and show why. A member who was in a server or group with the person before the reset (and isn't marked) compares safety numbers and vouches for the key they compared: that lifts the hold only in the servers and groups the voucher is in now (`key_vouches`), keys they hold anyway, so a second account an attacker put in a public server beforehand opens only that server. Once every server and group the person was in before the reset (including any left since) has a vouch, or an instance admin verifies them from Admin → Users, the mark goes everywhere. While marked anywhere they can't start group chats, give out staff roles or hand over ownership. Everything is in the audit log. What stays: invite links made before the reset keep working; resets before 1.29.0 aren't marked; a member of a server or group who is fooled into vouching opens that one; once the mark has gone, servers joined afterwards aren't held; a device that never saw someone's old key still writes new direct messages to the new key (first-use trust, as for any contact), and calls aren't held back; if every server an instance admin was in before their reset holds a second account of the attacker's, those can lift the admin's mark, and the admin can then verify other taken-over accounts from Admin → Users. | Old links were made by the real owner and may be in use, and a held-back account can't list them. Marking old resets now would cut people off from keys they were given long ago and may have been verified for on each device. A vouch is a member's own judgement, like inviting someone. DMs and calls follow the safety-number model; holding them too is a separate change. Admin verification is the way out for someone nobody can vouch for; tying it to more than the admin's own mark needs a record of when roles were given. |
 | admin-11 | Done since: zips are signed (Ed25519, `scripts/update-key.js`) and each server pins one key in `/etc/hearth-update.pub`. What stays: the first key is trusted on first use, a server that never ran `hearth-update` has no trusted updater to check the tools' upload, and a server with neither OpenSSL 3.0+ nor Node stays on checksums. | The owner makes the key (none is committed); see docs/SIGNING.md, "Signing server updates". |
 | xss-7 | Done since: the CSP comment says what the policy really does, and the policy no longer names Google Fonts or allows blob: frames (both unused). What stays: `img-src` and `media-src` still allow any https: site (an image link someone clicks open, a watch-together video file), so injected markup could still send data out in a picture address; the YouTube, Vimeo and Twitch frames and navigation stay too. | Narrowing them needs every outside picture and video to go through a proxy on the server, which would then fetch (and see) every link people open: a product decision. Image links now wait for a click by default (`xss-8`), so the everyday leak is gone. |
 | infra-1 | Updates come from whatever server the app is connected to; `data/downloads` is writable by Hearth; the SignPath certificate thumbprint isn't pinned. | Signed updates make the feed's origin irrelevant for builds with a key; the rest are deploy changes or need external information. Apps released before signing install the hop to the first signed build the old way. |
@@ -327,7 +331,6 @@ where the docs now state the behaviour.
 | infra-5 | Static `TURN_USERNAME`/`TURN_CREDENTIAL` still work. | Removing them would break existing deployments; the server warns at start-up. |
 | infra-12 | `trustedSelfSignedHosts` still accepts any certificate; the committed `defaultServer` is the author's server. | Desktop behaviour change and product decision; the docs now warn. |
 | data-3 / data-9 / data-10 | Full server views on role/channel edits; no `/bootstrap` rate limit; no admin-only indexes. | Protocol change; a 429 there breaks start-up; write cost on the busiest table. |
-| data-4 | Done since (1.29.0): old pre-upgrade copies are pruned (`PRE_UPGRADE_KEEP`, see crypto-8 above). Nothing else stays. | — |
 
 ## 6. Verification
 
@@ -447,8 +450,10 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 1. **A malicious or compromised server** can serve modified app code (web, desktop and Android all load it), add
    hidden members or call listeners, hold back or roll back key changes across reloads, and replay or re-thread
    messages. End-to-end encryption protects stored data, not a hostile host.
-2. **Email takeover without 2FA** gets the account with new keys, and with them each server's current key from any
-   member device that never saw the old key (`crypto-2`).
+2. **Email takeover without 2FA** gets the account with new keys. Since `crypto-2` those get no server's or group's
+   key, and can't bring anyone in there, until a member of it who knew the person verifies them (a member's word only
+   counts where they're a member); but anyone whose device never saw the old key still writes new direct messages to
+   the new key, and calls aren't held back.
 3. **Metadata** stays visible to the server: who talks to whom and when, file sizes, GIF picks and loads, search
    metadata, presence (to everyone on the instance) and profiles.
 4. **Private channels** share the server's key; only access checks separate them.
@@ -481,8 +486,9 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
    give the current session a new token (`auth-11`).
 5. Bind message id, reply, thread, time and edit version into the ciphertext (`crypto-7`), and the member list into
    key handoffs (`crypto-5`).
-6. Rotate the server key after a reset without a recovery key, or keep a reset account out of key sharing until a
-   member verifies it (`crypto-2`).
+6. Partly done: a reset account is kept out of each server's and group's key sharing, invites and group adds until a
+   member there (or an instance admin) verifies it (`crypto-2`). Left: direct messages and calls, and resets from
+   before 1.29.0.
 7. Per-region relay secrets and a rotate action (`voice-10`); a total bandwidth cap per region.
 8. Done: the app's fonts are served by Hearth itself and outside images wait for a click (`xss-8`). Still open:
    tighten `img-src` and `media-src` (`xss-7`), which needs a picture and video proxy on the server.

@@ -98,10 +98,25 @@ The reset link still gets you back in, but your device has to make **new encrypt
     and accept the new key.
   - A device of theirs that never knew your old key has nothing to compare against, so it accepts the new one the
     first time it sees it.
-- **Servers you're in:**
-  - **Current key period:** once a member's app trusts your new key, it hands you the server's current key again.
+- **Servers and group chats you're in:**
+  - **You show as not verified** in each of them until someone in it who was in a server or group with you before
+    your reset compares safety numbers with you and presses **Numbers match — verify and share keys**. Their word
+    counts in the servers and groups they're in themselves, so you may need one person from each. Until then nobody's
+    app hands you that server's or group's key (its voice channels' chats use the same key), the server keeps none handed to you anyway, and you can't make
+    invites there, see its invite links or add people to it. Someone who only got into your email can't read along
+    that way, nor bring in a second account to read for them: a second account they put in one of your public
+    servers can only open that server, which it reads already. Your app says **Ask a member to verify you** and lists
+    the people who can, with where their word counts.
+  - **Verified everywhere:** once every server and group you were in before the reset (including any you've left
+    since) has had someone verify you, or an instance admin marks you verified in Admin → Users (with their password and two-factor code), the mark goes, and
+    with it the hold in servers you've joined since. Until then you can't start group chats, give out staff roles
+    or hand over ownership of the instance.
+  - **Current key period:** once you're verified somewhere, members' apps hand you that server's current key again.
     You can read everything written under it, including messages from before your reset.
   - **Older key periods** (before the last key change): stay unreadable for you. Nobody can hand out an old key again.
+  - Invite links you made before the reset keep working: you made them, and people may be using them.
+  - Only accounts that share a server or group with someone are held back (with nobody to protect it's like a new
+    account, and nobody could verify it). Resets made before Hearth 1.29.0 weren't marked.
 - Your old posts still show as yours. A device that knew your old key shows them as verified. A device that never
   knew it shows "older key, not verified", because it only has the server's word for that old key.
 - Everything new works normally.
@@ -157,7 +172,8 @@ epoch) and gives it to everyone still there.
   history, replace the key before inviting them.
 - **Coming back after being removed** always makes a new key first, so they can't read what was said while they
   were away.
-- A password reset without a recovery key works like a fresh join for that person (see above).
+- A password reset without a recovery key works like a fresh join for that person, once a member there who knew
+  them before has verified them (see above).
 
 ---
 
