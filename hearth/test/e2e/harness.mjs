@@ -51,6 +51,37 @@ const freePort = () => new Promise((resolve, reject) => {
   s.on('error', reject);
 });
 
+// A stand-in web site for link previews: https://news.preview-site.net:<port>/, served from this process with a
+// throwaway certificate the server is told to trust. The server finds the name through a small preload (every
+// other name is looked up as usual), and may reach it on 127.0.0.1 because it's listed in
+// LINK_PREVIEW_ALLOW_PRIVATE (tests only). hits: the paths it was asked for.
+async function startPreviewSite(dir) {
+  const https = await import('node:https');
+  const selfsigned = createRequire(path.join(ROOT, 'package.json'))('selfsigned');
+  const host = 'news.preview-site.net';
+  const pems = await selfsigned.generate([{ name: 'commonName', value: host }], { keySize: 2048, algorithm: 'sha256', extensions: [{ name: 'subjectAltName', altNames: [{ type: 2, value: host }] }] });
+  const ca = path.join(dir, 'preview-site-ca.pem');
+  fs.writeFileSync(ca, pems.cert);
+  const preload = path.join(dir, 'preview-site-dns.js');
+  fs.writeFileSync(preload, `const dns = require('dns');
+require(${JSON.stringify(path.join(ROOT, 'server', 'netguard.js'))}).setResolver((name) => (name.toLowerCase() === ${JSON.stringify(host)}
+  ? [{ address: '127.0.0.1', family: 4 }] : dns.promises.lookup(name, { all: true, verbatim: true })));\n`);
+  const cover = makePng(320, 200);
+  const hits = [];
+  const server = https.createServer({ key: pems.private, cert: pems.cert }, (req, res) => {
+    hits.push(req.url);
+    if (req.url === '/cover.png') { res.writeHead(200, { 'content-type': 'image/png' }); return res.end(cover); }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html><html><head><title>Fallback title</title>
+      <meta property="og:title" content="Pineapple harvest report"><meta property="og:site_name" content="Preview Site">
+      <meta property="og:description" content="This year&#39;s crop, field by field."><meta property="og:image" content="/cover.png">
+      <script>document.title = 'never run'</script></head><body>Story</body></html>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  return { host, port, base: `https://${host}:${port}`, hits, ca, preload, close: () => new Promise((r) => { server.closeAllConnections(); server.close(() => r()); }) };
+}
+
 export async function startServer() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-e2e-data-'));
   const port = await freePort();
@@ -58,9 +89,11 @@ export async function startServer() {
   // Emails go out over SMTP, as on a real server, to a mail sink in this process (read with mails()); no SMTP
   // login, as the sink offers none. PUBLIC_URL is what reset links point at.
   const sink = await startSmtpSink();
+  const site = await startPreviewSite(dir);
   const env = {
     ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test',
     SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), SMTP_USER: '', SMTP_PASS: '', MAIL_FROM: 'hearth@chat.example.test', PUBLIC_URL: base,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --require ${site.preload}`.trim(), NODE_EXTRA_CA_CERTS: site.ca, LINK_PREVIEW_ALLOW_PRIVATE: site.host,
   };
   let log = '';
   const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -68,11 +101,11 @@ export async function startServer() {
   child.stderr.on('data', (d) => { log += d; });
   for (let i = 0; ; i++) {
     try { const r = await fetch(base + '/api/config'); if (r.ok) break; } catch { /* not up yet */ }
-    if (i > 300 || child.exitCode !== null) { await sink.close(); throw new Error(`Hearth didn't start:\n${log}`); }
+    if (i > 300 || child.exitCode !== null) { await sink.close(); await site.close(); throw new Error(`Hearth didn't start:\n${log}`); }
     await sleep(100);
   }
   return {
-    base, dir, port, get log() { return log; },
+    base, dir, port, site, get log() { return log; },
     // Every email the server has sent so far, oldest first: { to, subject, text }. Waits until mail has stopped
     // arriving first, since some are sent after the HTTP answer.
     async mails() { await sink.idle(); return sink.messages.map((m) => ({ ...m })); },
@@ -97,7 +130,7 @@ export async function startServer() {
         for (let i = 0; i < 60 && child.exitCode === null; i++) await sleep(50);
         if (child.exitCode === null) child.kill('SIGKILL');
       }
-      await sink.close();
+      await sink.close(); await site.close();
       if (!keep) fs.rmSync(dir, { recursive: true, force: true });
     },
   };

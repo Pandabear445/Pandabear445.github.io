@@ -1,7 +1,7 @@
 // Safe, small markdown: everything is HTML-escaped first, then a fixed set of patterns is applied.
 import { escapeHtml } from './util.js';
 
-const URL_RE = /\bhttps?:\/\/[^\s<]+[^\s<.,:;"')\]!?]/g;
+export const URL_RE = /\bhttps?:\/\/[^\s<]+[^\s<.,:;"')\]!?]/g;
 const IMAGE_URL_RE = /^https?:\/\/[^\s]+\.(gif|png|jpe?g|webp)(\?[^\s]*)?$/i;
 const MEDIA_HOST_RE = /^https?:\/\/(media\d*\.giphy\.com|i\.giphy\.com|media\.tenor\.com|c\.tenor\.com)\//i;
 
@@ -11,6 +11,17 @@ export function isImageUrl(url) {
 
 export function extractImageUrls(text) {
   return (String(text || '').match(URL_RE) || []).filter(isImageUrl).slice(0, 4);
+}
+
+// The links a message's text turns into (as render() makes them), leaving out code and, with skipSpoilers,
+// ||spoilers||. Link previews use this on both sides: the sender to pick a link, readers to check that a
+// preview belongs to a link really in the message.
+export function linkedUrls(text, { skipSpoilers = false } = {}) {
+  let s = String(text || '');
+  s = s.replace(/```(?:[a-zA-Z0-9_+-]{1,20}\n)?([\s\S]*?)```/g, ' ');
+  s = s.replace(/`([^`\n]+)`/g, ' ');
+  if (skipSpoilers) s = s.replace(/\|\|([^|\n]+)\|\|/g, ' ');
+  return s.match(URL_RE) || [];
 }
 
 export function isOnlyImageUrl(text) {

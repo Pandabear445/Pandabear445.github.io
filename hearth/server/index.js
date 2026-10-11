@@ -1518,6 +1518,8 @@ api.get('/config', (req, res) => {
     imageMb: uploadLimits().imageMb,
     songMb: uploadLimits().songMb,
     iceServers: [iceServers[0]], // STUN only here; TURN relay details are given to signed-in users
+    // Tests only (LINK_PREVIEW_ALLOW_PRIVATE): link previews for local stand-in sites on other ports.
+    ...(!['', '0'].includes(String(process.env.LINK_PREVIEW_ALLOW_PRIVATE || '').trim()) ? { linkPreviewAnyPort: true } : {}),
   });
 });
 
@@ -5374,7 +5376,8 @@ api.delete('/admin/users/:id/comments', auth, staffOnly, (req, res) => {
 // ---------------------------------------------------------------- owner tools
 // Branding, feature switches, funding, backups and server health.
 const brand = () => ({ name: (getSetting('brandName') || INSTANCE_NAME).slice(0, 40), tagline: (getSetting('brandTagline') || '').slice(0, 140) });
-const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, createServers: 'everyone', createBots: 'admins' };
+// linkPreviews: members may ask this server to fetch a page for a preview card (server/linkpreview.js).
+const FEATURE_DEFAULTS = { customCss: true, comments: true, watch: true, gifs: true, linkPreviews: process.env.LINK_PREVIEWS !== 'false', createServers: 'everyone', createBots: 'admins' };
 function features() {
   let v = {};
   try { v = JSON.parse(getSetting('features') || '{}') || {}; } catch { /* defaults */ }
@@ -5401,6 +5404,10 @@ require('./search')({ api, auth, db, fail, rateLimit, canIn, PM, requireServer, 
 BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, serverAudit, checkWords,
   perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer: (id) => emitServer(id),
   getIo: () => io, features, isStaff, isInstanceAdmin, maintenance, newsBot: NEWS_BOT_ID });
+// Link previews (server/linkpreview.js): the sender's app asks for a page's title and picture, which then travel
+// inside the encrypted message. This server sees the link and who asked; readers fetch nothing.
+require('./linkpreview')({ api, auth, fail, wrap, rateLimit, countHit, limitNet, features, version: require('../package.json').version,
+  publicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || ''); } });
 // Incoming webhooks (server/webhooks.js): Discord- and Slack-style addresses per channel, posting as a bot.
 require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
   getIo: () => io, maintenance, ipBanned, bannedMsg: BANNED_MSG, stillSuspended, botPost: BOTS.botPost, notifyChannelMessage, cleanIp });
@@ -5456,7 +5463,7 @@ api.put('/admin/owner', auth, ownerOnly, wrap(async (req, res) => {
   }
   if (b.features) {
     const f = features();
-    for (const k of ['customCss', 'comments', 'watch', 'gifs']) if (b.features[k] !== undefined) f[k] = !!b.features[k];
+    for (const k of ['customCss', 'comments', 'watch', 'gifs', 'linkPreviews']) if (b.features[k] !== undefined) f[k] = !!b.features[k];
     if (['everyone', 'staff'].includes(b.features.createServers)) f.createServers = b.features.createServers;
     if (['everyone', 'staff', 'admins'].includes(b.features.createBots)) f.createBots = b.features.createBots;
     setSetting('features', JSON.stringify(f));
@@ -5778,6 +5785,7 @@ const watchRooms = new Map(); // room -> { item, queue, playing, position, rate,
 // links are capped, and so is the state as a whole.
 const WATCH_URL_MAX = 2048;
 const WATCH_STATE_MAX = 64 * 1024;
+const { youtubeId } = require('./linkpreview');
 function parseWatchUrl(raw) {
   let u;
   const text = String(raw || '').trim();
@@ -5787,8 +5795,8 @@ function parseWatchUrl(raw) {
   const secs = (t) => { if (!t) return 0; if (/^\d+$/.test(t)) return +t; const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(t); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0; };
   if (!/^https?:$/.test(u.protocol)) fail(400, 'Paste a link to a video.');
   if (['youtube.com', 'youtube-nocookie.com'].includes(host) || host === 'youtu.be') {
-    const id = host === 'youtu.be' ? u.pathname.slice(1, 12) : (u.searchParams.get('v') || (u.pathname.match(/^\/(?:shorts|embed|live|v)\/([\w-]{11})/) || [])[1]);
-    if (!/^[\w-]{11}$/.test(id || '')) fail(400, 'That YouTube link doesn\u2019t point to a video.');
+    const id = youtubeId(u); // the same rules as link previews (server/linkpreview.js)
+    if (!id) fail(400, 'That YouTube link doesn\u2019t point to a video.');
     return { kind: 'youtube', src: id, start: secs(u.searchParams.get('t') || u.searchParams.get('start')), link: `https://www.youtube.com/watch?v=${id}` };
   }
   if (host === 'vimeo.com' || host === 'player.vimeo.com') {

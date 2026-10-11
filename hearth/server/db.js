@@ -419,7 +419,7 @@ CREATE TABLE IF NOT EXISTS admin_log (
   created_at INTEGER NOT NULL
 );
 `);
-// v20 (server audit): a report about a message or member inside a server also goes to that server's moderators
+// v19 (server audit): a report about a message or member inside a server also goes to that server's moderators
 // (server/serveraudit.js), unless the reporter opted out. server_id is set only then; server_status is the
 // moderators' own state ('open', 'handled', 'dismissed'), separate from staff's status above, so a moderator
 // closing it never closes it for instance staff.
@@ -675,7 +675,7 @@ CREATE TRIGGER IF NOT EXISTS admin_log_no_delete BEFORE DELETE ON admin_log BEGI
 `);
 }
 
-// v20 (server audit): each server's own audit log (server/serveraudit.js): who kicked, banned, timed out, changed
+// v19 (server audit): each server's own audit log (server/serveraudit.js): who kicked, banned, timed out, changed
 // roles, channels, permissions, invites, emoji, webhooks and settings, and who deleted whose messages. Metadata
 // only, never message text. seq counts a server's entries (1, 2, 3…), so "the newest 10,000" is a cheap range.
 // Like admin_log it's append-only: the database refuses every change, and refuses deletes except the ones the
@@ -1246,7 +1246,7 @@ CREATE TABLE IF NOT EXISTS member_timeouts (
 CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
 `);
 
-// v20 (threads): read state for threads. A thread's read marker is a read_states row keyed t:<root id>, and
+// v19 (threads): read state for threads. A thread's read marker is a read_states row keyed t:<root id>, and
 // "Mark as read" on a channel or server also writes ct:<channel id> ("every thread here is read up to"). A thread
 // reply's pings go in mention_marks under ct:<channel id> with the thread's root in thread_id, so they count in the
 // channel's badge until that thread is read. thread_activity is each thread's newest reply, so a channel's threads

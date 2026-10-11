@@ -1,7 +1,7 @@
 # Message usability and notifications
 
 This page covers saved messages, pins, unread tracking, notification preferences, drafts, data export and
-moderation (slow mode, timeouts, reports). It starts with what Hearth already had before this work (schema
+moderation (slow mode, timeouts, reports), and link previews (the last section). It starts with what Hearth already had before this work (schema
 v17), then describes what changed (schema v18). Paths are relative to `hearth/`.
 
 Message content stays end-to-end encrypted throughout. The server stores and sends message ids, times and the
@@ -427,3 +427,100 @@ device for one of them. It covers:
   server updates. The timeout end is swept every minute, plus an in-memory timer.
 - The server enforces the new pin rule (Manage Messages for your own message), and the app hides the action.
   Older app versions still show it and get a friendly 403.
+
+## Link previews
+
+Built by the sender, carried inside the encrypted message. Design and the reasons behind each choice:
+[design/LINK-PREVIEWS.md](design/LINK-PREVIEWS.md). No schema change: the only stored state is the
+`linkPreviews` key in the owner's `features` setting.
+
+**How it works**
+
+1. The composer (`public/js/app.js` `createComposer`) looks for the first https link in the box, outside code
+   and spoilers (`linkpreview.js` `findPreviewUrl`, using `markdown.js` `linkedUrls`). Image links, GIF media,
+   links to this server, IP addresses, reserved names and other ports are skipped. It looks on paste, as soon
+   as a space follows the link and the caret has left it, or after 1.2 s without typing, never when a draft is
+   put back. Editing inside a link counts as typing it: the chip goes, and the new link waits for the pause.
+2. In **Ask each time** mode (the default) a chip offers "Preview example.org?" and nothing leaves the device.
+   **Preview** (or **Always** mode) calls `POST /api/link-previews { url }`. In Always mode, links that look
+   private (sign-in, reset, invite and share links: `looksPrivate`) still ask.
+3. The server (`server/linkpreview.js`) checks the link, fetches the page through `netguard.request` and reads
+   its `<head>` in a worker thread: OpenGraph, then X/Twitter card tags, then `<title>` and
+   `<meta name=description>`. It fetches at most one picture and checks it by its bytes. YouTube links use
+   oEmbed and `i.ytimg.com` thumbnails (the watch page is never fetched); X post links use
+   `publish.twitter.com/oembed` text (x.com is never fetched).
+4. The app shrinks the picture to at most 400 px and 16 KiB (WebP, or JPEG where the browser can't make WebP;
+   `media.js` `previewThumb`). The chip shows the card with a **Remove link preview** button.
+5. Sending puts `l: [{ v: 1, url, title, desc, site, kind, img? }]` in the payload next to `t` and `f`, only
+   if the card is ready (sending never waits) and its link is still in the text. If the ciphertext would be
+   over 64,000 characters, the picture is dropped first, then the card (`payloadVariants`, `encryptFitting`).
+6. Readers' apps (`secure.js` `openGroup`/`openDm` → `cleanLinks`) keep the card only if its URL is one of the
+   message's links (outside code and spoilers), https, without credentials, without a mixed-script host or bidi
+   characters, with every field capped and the picture a real WebP/JPEG of at most 16 KiB. `linkCardEl` draws
+   it with text nodes only; the domain line is read from the link. The picture is a `data:` URL: nothing is
+   fetched to show a card.
+
+**Settings**: Settings → Chat → Link previews (*Ask each time*, *Always*, *Never*; and *Show link previews in
+messages*), kept per device in `hearth.chat`. Owner switch: Admin → Owner → Features → Link previews
+(`features.linkPreviews`; `LINK_PREVIEWS=false` starts it off). The role permission **Show link previews**
+(EMBED_LINKS) is now used: readers show cards only from senders who have it server-wide (DMs always; groups
+give it to everyone), since their apps can't see channel overrides, and the composer offers previews only where
+readers will show them: with the permission server-wide and in that channel (`perms.js` `mayEmbed` on both
+sides). A channel override can turn previews off, not on.
+
+**Edits, forwards, export**: an edit keeps the previews whose links are still in the text (and the poll, which
+edits used to drop); a link added in an edit gets none. Forwarding carries the card. The data export writes
+`link: { url, title, description, site }` (no picture).
+
+**API**
+
+| Route | Auth | Notes |
+|---|---|---|
+| `POST /link-previews` `{ url }` | session | 404 `off` when the owner switched it off; 400 `bad_url` / `own_server`; 429 `rate_limited` (20/min per account and per session, 60/min per network, 100 fetches/hour per account) or `busy` (2 in flight per account, 8 on the server; `Retry-After: 2`). Fetch problems answer 200 `{ preview: null, reason }` with `none`, `not_html`, `blocked`, `unreachable`, `timeout`, `challenge` or `busy` (over 60 fetches a minute to one site, from everyone together). |
+
+Fetch limits: https on port 443 only, at most 4 redirects for the page and 3 for the picture (each hop checked
+again), 512 KiB of page (unpacked), 2 MiB of picture (48 to 8192 px a side, at most 25 megapixels), 10 seconds
+for both together, 2 seconds to read the page. Answers are cached in memory per account (10 minutes for a
+preview, 2 for a failure; at most 20 per account, 2,000 and 48 MiB in all) and never shared between accounts.
+The job `linkpreview.cache_sweep` clears old entries every minute. The log gets one line per preview with the
+outcome and timing, never the link, host or title.
+
+**Tests**
+
+- `test/linkpreview.test.js` (23 tests, a local HTTPS stand-in site answering for many names, and a fake DNS):
+  OpenGraph, fallbacks and "first tag wins"; hostile HTML (comments, scripts, raw-text elements, entity tricks,
+  `javascript:` and `data:` picture links, 5,000 meta tags, pathological markup including the short quote
+  patterns that once made the tokenizer re-read each 8 KiB, each under a second for 512 KiB); named entities,
+  escaped angle brackets and empty comments; a parse that times out fails alone (jobs queued behind it and
+  sent just after still work, one reader thread is left); length caps and invisible
+  characters; charsets (BOM, header, `<meta>`, windows-1252, Shift_JIS, UTF-16 labels); URL refusals; private,
+  rebinding, NAT64, `OUTBOUND_BLOCK` and unlisted loopback names refused before connecting; redirects to http,
+  private names, IP literals, reserved names, this server and 5-hop chains; an endless page, a gzip bomb, a
+  late tag and a site that never answers; PDF, JSON, direct pictures, 404s; pictures that lie about their
+  type or size; challenge and consent pages; every rate limit and the in-flight cap; the per-account cache;
+  YouTube, X and GitHub; the owner switch (404, audit log, `/api/config`); signed-out and suspended sessions;
+  and that the log never names the link.
+- `test/linkpreview-client.test.js` (10 tests): which link the composer offers; `linkedUrls` matches `render()`;
+  what `cleanLinks` keeps and drops (links not in the text, homographs, bidi, oversized or mislabelled
+  pictures, junk); `looksPrivate`; a 4,000-character message with a full card fits, bigger ones drop the
+  picture then the card (real `encryptGroup`/`encryptDm`); older apps still read the text; `mayEmbed` and that
+  the composer and readers both use it; static checks that cards are built from text nodes and the 64,000
+  limit matches the server.
+- Browser flow (`npm run test:e2e`, "link previews"): the chip asks, a turned-down link goes out plain and
+  nothing is fetched, then Preview → card → send; the reader sees the card with the link's own domain and a
+  `data:` picture, and their app makes no request to the site or to `/api/link-previews`. Keyboard only: Enter
+  on Preview leaves the focus in the box, so the next Enter sends. In Always mode, three Backspaces inside a
+  link make no request until the pause, then one for the link as it is; the half-edited ones are never fetched.
+
+**Known limitations**
+
+- The server sees every link someone previews, who asked and when, and can match it to the encrypted message
+  sent just after. In Always mode that includes links typed and then deleted before sending.
+- A server-side GET can use up a one-time link (a magic sign-in or reset link) if someone previews it.
+- The site sees this server's address and can tell that someone on it previewed the link just now.
+- A modified app can send a card saying anything (the domain line can't lie), or send cards without the
+  permission: readers check the sender's server-wide permission only, as for @everyone. So a channel override
+  can't give someone previews, only take them away there.
+- Pages rendered only by JavaScript, or with their tags after 512 KiB, get a title-only card or none. X's embed
+  service has been unreliable, so X links often get no card.
+- A message with a picture is about 30 KB of ciphertext instead of about 0.5 KB.

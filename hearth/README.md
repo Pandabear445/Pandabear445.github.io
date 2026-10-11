@@ -398,6 +398,7 @@ All chats are end-to-end encrypted: your browser encrypts each message and file 
 | Direct messages and files | **No** — end-to-end encrypted |
 | Voice | **No** — encrypted between browsers (DTLS-SRTP), handshakes signed; a relay, when one is needed, only forwards encrypted packets |
 | Who's in which server, who messages whom and when, emoji reactions, server/channel names, avatars and profiles, file sizes, which GIFs people pick and load, and when and where (not what) you search | Yes |
+| Links you ask a **link preview** for (and that it was you, and when) | Yes: the server fetches the page for you. The preview itself then travels inside the encrypted message. See [Link previews](#link-previews) |
 | Messages sent before the encryption upgrade | Yes, with `data/secret.key` (shown in the app as "Older message — not end-to-end encrypted, sender not verified"; plaintext messages dated after encryption was switched on are hidden) |
 
 ### How it works
@@ -441,7 +442,7 @@ Your browser remembers everyone's keys the first time it sees them. If the serve
 - **Membership is controlled by the server.** A malicious host could add a hidden member to a server, who would then be given the key, or hold back a key change, or roll a key back across a page reload. Apps refuse a current key handed out by someone who isn't a member, won't go back to an older key during a session, and refuse to start if the server lists keys for your own account that your password doesn't unlock. For strong guarantees, compare safety numbers. The same goes for calls: a malicious host could add a hidden listener, since apps trust the server's list of who is in a call.
 - **No forward secrecy for history.** To let your full history follow you to every device, your long-term key can decrypt your past messages. If someone gets both your password and the server's data, they can read your history. Changing your password locks the same key with the new password; it doesn't replace the key. (Signal makes the opposite trade-off.)
 - **Metadata isn't hidden** — see the table above. Run the server on hardware you control and use HTTPS.
-- **Other sites can see your IP address** when the app loads its fonts (Google Fonts), picture links in messages (turn off Settings → Chat → "Show image links as previews"), direct video files in watch together, and the YouTube, Vimeo and Twitch players. GIFs, news pictures and game and music art go through the server instead.
+- **Other sites can see your IP address** when the app loads its fonts (Google Fonts), picture links in messages (turn off Settings → Chat → "Show image links as previews"), direct video files in watch together, and the YouTube, Vimeo and Twitch players. GIFs, news pictures and game and music art go through the server instead. Link preview cards load nothing at all: their picture is inside the message.
 - Treat a self-hosted server like any small website: keep the machine updated and use `REGISTRATION_CODE` or `REGISTRATION_OPEN=false` if you don't want strangers signing up.
 
 ---
@@ -495,7 +496,9 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 | `TURN_URL` / `TURN_SECRET` | — | TURN relay for calls and its shared secret (coturn's `static-auth-secret`); `scripts/setup-turn.sh` sets these up in the app instead |
 | `TURN_USERNAME` / `TURN_CREDENTIAL` | — | Legacy: one relay password for everyone that never expires (the server warns). Use `TURN_SECRET` |
 | `PUSH_ALLOW_PRIVATE` | off | `1` allows push endpoints on private/LAN addresses (tests, or a push service on your own network) |
-| `OUTBOUND_BLOCK` | — | Comma-separated addresses or ranges (CIDR) that feeds, pictures and push may never reach, on any port. For example this server's public IP when it's behind NAT, or your router's |
+| `OUTBOUND_BLOCK` | — | Comma-separated addresses or ranges (CIDR) that feeds, pictures, link previews and push may never reach, on any port. For example this server's public IP when it's behind NAT, or your router's |
+| `LINK_PREVIEWS` | `true` | `false` starts with link previews switched off (the owner can switch them in Admin → Owner → Features) |
+| `LINK_PREVIEW_ACCEPT_LANGUAGE` | `en` | The language sites are asked for when this server fetches a page for a preview (the same for everyone, so it doesn't single anyone out) |
 | `DATA_DIR` | `./data` | Where data lives |
 | `VAPID_SUBJECT` | `mailto:admin@example.com` | Contact address for push services — set your real email |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | auto | Push keys (default: generated into `data/vapid.json`) |
@@ -568,6 +571,21 @@ they paid for.
 In a server's **Server Settings → News bot** (needs Manage Server), follow a topic (Google News), a YouTube channel, a subreddit, a Steam game's news, a GitHub project's releases, or any RSS/Atom feed, and pick the channel to post in. Press **Preview** to see what it would find. When you follow something, the bot posts the newest item right away so you can see it working; after that it posts only new things — never a backlog of old news — at most 3 at a time, checking every 10 minutes. The bot shows as online in the member list of servers it posts in. Add keywords to post only matching items (for example `patch, update`). Bot posts show a **BOT** tag and a card with the picture, which loads through your server so readers' IPs aren't shared.
 
 Bot posts come from public feeds, so they aren't end-to-end encrypted (the server writes them). The bot can't sign in and can't read your encrypted messages. The server needs outgoing internet access to the sites you follow.
+
+## Link previews
+
+Paste or type an https link and the composer offers a small card for it: **Preview news.example.org?** Press **Preview** and the card (the page's title, a line of description, the site's name and a small picture) appears above the box, with an **×** to take it off. Send, and the card goes **inside the encrypted message**. People reading it see the card without their app contacting the linked site, or this server, for it: the picture is a small copy (at most 400 px, 16 KB) that the sender's app made and put in the message. Readers' apps also check the card belongs to a link really in the message, and always show the link's real domain under it, so a card can't hide where a link goes.
+
+What to know:
+
+- **Your Hearth server sees the links you preview, and that it was you.** Your browser can't fetch other sites itself, so the server fetches the page for you (and the site sees the server, not you). It can tell which conversation it was for from the encrypted message you send just after. It keeps the answer in memory for up to 10 minutes, for you only, and never writes the link to its log or disk. Links you don't preview stay private as always.
+- **Settings → Chat → Link previews:** *Ask each time* (the default: nothing leaves your device until you press Preview), *Always* (every link you type is fetched, except ones that look like sign-in, reset, invite or share links, which still ask), or *Never*. **Show link previews in messages** turns cards from others off on your device.
+- YouTube links use YouTube's own title and thumbnail service (the video page itself isn't fetched); X/Twitter post links use X's embed service for the text, when it answers. GitHub, news sites, shops and most other sites work through the usual OpenGraph tags.
+- Only `https` links on the usual port, with a real host name, get a preview. Links inside `code` or `||spoilers||`, image links (they show as pictures already) and links to this server don't. Editing a message keeps a preview whose link is still there; a link added in an edit gets none.
+- Server roles: **Show link previews** (on by default) decides whose cards show; members' apps enforce it, since the server can't see inside messages. It counts as a role permission: a channel override can turn previews off in that channel, but not on. Owners can switch previews off for everyone in **Admin → Owner → Features → Link previews**: the server then fetches nothing (cards already sent still show).
+- Limits: 20 previews a minute per person, 2 at once, 60 a minute from one network, 100 fetches an hour per person; a page is read up to 512 KB and its picture up to 2 MB, all within 10 seconds. Older apps that don't know about previews just show the link.
+
+Details: [docs/design/LINK-PREVIEWS.md](docs/design/LINK-PREVIEWS.md) and [docs/FEATURES.md](docs/FEATURES.md#link-previews).
 
 ## Search (Ctrl+K)
 

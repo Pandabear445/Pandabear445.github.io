@@ -4,12 +4,13 @@ import { androidApp } from './android.js';
 import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playSound, copyText, debounce } from './util.js';
 import { api, upload, getToken, setToken } from './api.js';
 import * as E2EE from './e2ee.js';
-import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers } from './markdown.js';
-import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor, mayMentionRole } from './perms.js';
+import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers, linkedUrls } from './markdown.js';
+import { findPreviewUrl, looksPrivate, payloadVariants, hostLabel, cleanText as cleanPreviewText, KINDS as PREVIEW_KINDS, TITLE_MAX, DESC_MAX, SITE_MAX } from './linkpreview.js';
+import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor, mayMentionRole, mayEmbed } from './perms.js';
 import { openCropper } from './cropper.js';
 import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
-import { prepareImage, makeQueue, whenVisible } from './media.js';
+import { prepareImage, makeQueue, whenVisible, previewThumb } from './media.js';
 import { isUploadUrl, safeDownloadHref } from './attachments.js';
 import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, mediaKind, typeLabel } from './files.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
@@ -120,7 +121,8 @@ const P = {
   set inbox(v) { LS.set(mine('inbox'), v.slice(0, 200)); },
   get lastChannel() { return LS.get(mine('lastChannel'), {}); },
   set lastChannel(v) { LS.set(mine('lastChannel'), v); },
-  get chat() { return { enterToSend: true, embeds: true, markdown: true, jumbo: true, ...LS.get('hearth.chat', {}) }; },
+  // linkPreviews: 'ask' | 'always' | 'never' (when I send a link); linkCards: show previews in messages.
+  get chat() { return { enterToSend: true, embeds: true, markdown: true, jumbo: true, linkPreviews: 'ask', linkCards: true, ...LS.get('hearth.chat', {}) }; },
   get showMembers() { return localStorage.getItem('hearth.members') !== 'off'; },
   set showMembers(v) { localStorage.setItem('hearth.members', v ? 'on' : 'off'); },
 };
@@ -2626,6 +2628,7 @@ async function decryptAll(key) {
 }
 const textOf = (m) => (m.dec && m.dec.t) || '';
 const filesOf = (m) => (m.dec && m.dec.f) || [];
+const linksOf = (m) => (m.dec && m.dec.l) || []; // link previews the sender built (already checked by secure.js)
 const readable = (m) => !!m.dec && !m.dec.error && !m.dec.pending;
 const keyOfMessage = (m) => (m.dmId ? 'd:' + m.dmId : 'c:' + m.channelId);
 // Does this message ping me? @username, or @everyone/@channel/@here in a server channel.
@@ -2976,7 +2979,10 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
       const html = chat.markdown ? md(text, { mentionName: S.me.username, everyone: senderMayPingEveryone(m) }) : escapeText(text);
       body.append(h('div', { class: `msg-text${chat.jumbo && isJumbo(text) ? ' jumbo' : ''}`, html: html + (m.editedAt ? '<span class="edited" title="Edited">(edited)</span>' : '') }));
     }
-    const embeds = chat.embeds ? extractImageUrls(text) : [];
+    // A link preview built by the sender: it came inside the encrypted message, so nothing is fetched to show it.
+    const links = chat.linkCards !== false && senderMayEmbed(m) ? linksOf(m) : [];
+    if (links.length) body.append(h('div', { class: 'msg-links' }, links.map(linkCardEl)));
+    const embeds = chat.embeds ? extractImageUrls(text).filter((u) => !links.some((l) => l.url === u)) : [];
     if (embeds.length) body.append(h('div', { class: 'msg-embeds' }, embeds.map((u) => h('div', { class: `embed-wrap${isGiphy(u) ? ' giphy' : ''}` },
       h('img', { class: 'embed-img', src: mediaUrl(u), alt: isGiphy(u) ? 'GIF' : 'Linked image', loading: 'lazy', referrerpolicy: 'no-referrer', onclick: (e) => openViewer(e.currentTarget) }),
       isGiphy(u) ? h('span', { class: 'giphy-tag' }, /klipy/i.test(u) ? 'KLIPY' : 'GIPHY') : null))));
@@ -3106,6 +3112,13 @@ function senderMayPingEveryone(m) {
   const server = S.servers.find((x) => x.id === m.serverId);
   return !!server && has(basePerms(server, m.authorId), PERMS.MENTION_EVERYONE);
 }
+// Whether this message's link previews show here. The server can't see inside messages, so members' apps
+// enforce Show link previews (EMBED_LINKS), from the sender's server-wide permission (channel overrides aren't
+// visible to other members, the same as @everyone above; perms.js mayEmbed). DMs always show them.
+function senderMayEmbed(m) {
+  if (m.dmId) return true;
+  return mayEmbed(S.servers.find((x) => x.id === m.serverId), m.authorId);
+}
 
 function messageMenuItems(m, ctx) {
   const mine = m.authorId === S.me.id;
@@ -3224,11 +3237,15 @@ function editBox(m, ctx) {
     if (!content.trim() && !filesOf(m).length) return deleteMessage(m);
     if (content === textOf(m)) return done();
     try {
-      const payload = { t: content, f: filesOf(m) };
-      if (m.dmId) await api('PATCH', `/dm-messages/${m.id}`, { ciphertext: await sec.encryptDm(m.dmId, payload) });
+      // The poll and any link preview whose link is still in the text stay with the message (an edit never
+      // fetches a new preview).
+      const still = linkedUrls(content, { skipSpoilers: true });
+      const kept = linksOf(m).filter((x) => still.includes(x.url));
+      const payload = { t: content, f: filesOf(m), ...(m.dec && m.dec.p ? { p: m.dec.p } : {}), ...(kept.length ? { l: kept } : {}) };
+      if (m.dmId) await api('PATCH', `/dm-messages/${m.id}`, { ciphertext: await encryptFitting(payload, (p) => sec.encryptDm(m.dmId, p)) });
       else {
         await withKeyRetry(m.serverId, async () => {
-          const { ciphertext, epoch } = await sec.encryptChannel(m.serverId, m.channelId, payload);
+          const { ciphertext, epoch } = await encryptFitting(payload, (p) => sec.encryptChannel(m.serverId, m.channelId, p));
           await api('PATCH', `/messages/${m.id}`, { ciphertext, epoch });
         });
       }
@@ -3292,7 +3309,8 @@ function openForward(m) {
       h('button', { class: 'quick-row', onclick: async () => {
         try {
           const fwd = `${note.value.trim() ? note.value.trim() + '\n' : ''}> Forwarded from ${displayName(getUser(m.authorId))}\n${textOf(m).split('\n').map((l) => '> ' + l).join('\n')}`;
-          await sendTo(d.key, null, { t: fwd, f: filesOf(m) }, null);
+          // A link preview goes along: the quoted text still has its link, so readers there keep the card.
+          await sendTo(d.key, null, { t: fwd, f: filesOf(m), ...(linksOf(m).length ? { l: linksOf(m) } : {}) }, null);
           mdl.close();
           toast(`Forwarded to ${d.label}.`);
         } catch (e) { toast(e.message, 'error'); }
@@ -4309,7 +4327,8 @@ const SLASH = createSlash({
 let drafts = createDrafts('signed-out');
 let lastTypingSent = 0;
 function createComposer({ id, key, threadId, placeholder }) {
-  const state = { replyTo: null, pending: [] };
+  // link: the link preview being offered or built for the link in the box (see checkLink below).
+  const state = { replyTo: null, pending: [], link: null };
   const k = key();
   const ta = h('textarea', { class: 'composer-input', rows: '1', maxlength: '4000', 'aria-label': 'Message', id: id === 'main' ? 'composer-input' : null });
   ta.placeholder = placeholder || placeholderFor(k);
@@ -4455,8 +4474,117 @@ function createComposer({ id, key, threadId, placeholder }) {
     closeSuggest(); update(); ta.focus();
   };
 
+  // ---- link previews
+  // A link in the box can carry a preview card. Asking for one sends the link to this server (which fetches the
+  // page), so by default the app only offers it ("Preview example.org?") and nothing leaves the device until the
+  // person says so. The card then goes inside the encrypted message; people reading it never contact the site.
+  const linkBox = h('div', { class: 'link-chip-wrap', role: 'status', 'aria-live': 'polite' });
+  const linkDismissed = new Set(); // links the person said no to, until the message is sent
+  let linkGen = 0; // bumps whenever an answer on its way would be out of date
+  let linkHide = 0;
+  const convKey = () => key() + (threadId() || '');
+  const linkMode = () => { const v = P.chat.linkPreviews; return v === 'always' || v === 'never' ? v : 'ask'; };
+  const previewOpts = () => ({ origin: location.host, anyPort: !!S.config.linkPreviewAnyPort });
+  const linksAllowedHere = () => {
+    if ((S.config.features || {}).linkPreviews === false || linkMode() === 'never') return false;
+    const kk = key();
+    if (!kk) return false;
+    if (!kk.startsWith('c:')) return true;
+    // This channel's permission, and the server-wide one readers check (senderMayEmbed): with only the first
+    // (a channel override allowing it), the page would be fetched for a card nobody, you included, would see.
+    const ch = channelById(kk.slice(2));
+    return !!ch && canIn(ch, PERMS.EMBED_LINKS) && mayEmbed(serverOfChannel(ch.id), S.me.id);
+  };
+  const setLink = (v) => { clearTimeout(linkHide); state.link = v; renderExtras(); };
+  // Looks for a link to offer a preview for. Never on its own when a draft is put back: only typing or pasting.
+  function checkLink() {
+    const sc = slashChannel();
+    const url = linksAllowedHere() && !(sc && SLASH.match(sc, ta.value)) ? findPreviewUrl(ta.value, previewOpts()) : null;
+    if (!url || linkDismissed.has(url)) { if (state.link) { linkGen++; setLink(null); } return; }
+    if (state.link && state.link.url === url && state.link.key === convKey()) return;
+    linkGen++;
+    if (linkMode() === 'always' && !looksPrivate(url)) return requestPreview(url);
+    setLink({ key: convKey(), url, status: linkMode() === 'always' ? 'private' : 'ask' });
+  }
+  // While typing, a link counts once a space follows it and the caret has left it (or after a pause), so
+  // half-typed links aren't offered (or, in "Always" mode, fetched). Editing inside a link counts as typing
+  // it: each Backspace in "…/story-one please" makes a new link, and none of them may be fetched until the pause.
+  const checkLinkSoon = debounce(() => checkLink(), 1200);
+  function onTypeForLink() {
+    const url = findPreviewUrl(ta.value, previewOpts());
+    // The link with a chip changed or went: the chip goes now (and any answer on its way is ignored).
+    if (state.link && state.link.url !== url) { linkGen++; setLink(null); }
+    const at = url ? ta.value.indexOf(url) : -1;
+    const inLink = at >= 0 && ta.selectionEnd >= at && ta.selectionEnd <= at + url.length;
+    if (at >= 0 && !inLink && /\s/.test(ta.value[at + url.length] || '')) checkLink(); else checkLinkSoon();
+  }
+  async function requestPreview(url) {
+    const gen = ++linkGen;
+    const k0 = convKey();
+    setLink({ key: k0, url, status: 'loading' });
+    const stale = () => gen !== linkGen || !state.link || state.link.url !== url || convKey() !== k0;
+    let next;
+    try {
+      const r = await api('POST', '/link-previews', { url });
+      if (stale()) return;
+      const p = r && r.preview;
+      let img = null;
+      if (p && p.image && typeof p.image.data === 'string') img = await previewThumb(E2EE.unb64(p.image.data), p.image.type).catch(() => null);
+      if (stale()) return;
+      const entry = p && { v: 1, url, title: cleanPreviewText(p.title, TITLE_MAX), desc: cleanPreviewText(p.description, DESC_MAX), site: cleanPreviewText(p.siteName, SITE_MAX),
+        kind: PREVIEW_KINDS.has(p.kind) ? p.kind : 'web', ...(img ? { img } : {}) };
+      next = entry && (entry.title || entry.desc || entry.img) ? { key: k0, url, status: 'ready', entry }
+        : { key: k0, url, status: 'none', msg: r && r.reason === 'busy' ? 'That site is busy. No preview this time.' : 'No preview for this link.' };
+    } catch (e) {
+      if (stale()) return;
+      next = { key: k0, url, status: 'none', msg: e.status === 429 || e.status === 404 || e.status === 400 ? e.message : 'Couldn’t get a preview.' };
+    }
+    setLink(next);
+    // A "no preview" note goes away by itself; that link isn't offered again until this message is sent.
+    if (next.status === 'none') linkHide = setTimeout(() => { if (state.link === next) { linkDismissed.add(url); setLink(null); } }, 4000);
+  }
+  function dismissLink() {
+    if (state.link) linkDismissed.add(state.link.url);
+    linkGen++;
+    setLink(null);
+    ta.focus();
+  }
+  function drawLinkChip() {
+    clear(linkBox);
+    const L = state.link;
+    linkBox.hidden = !L;
+    if (!L) return;
+    const host = hostLabel(L.url);
+    const x = (label) => ibtn('close', label, dismissLink, { cls: 'sm link-chip-x', attrs: { 'data-act': 'x' } });
+    let chip;
+    if (L.status === 'ask' || L.status === 'private') {
+      chip = h('div', { class: 'link-chip' }, icon('link', 'ic'),
+        h('div', { class: 'link-chip-text' },
+          L.status === 'ask' ? h('span', null, 'Preview ', h('strong', null, host), '?') : h('span', null, 'This link may be private (a sign-in, share or reset link).'),
+          h('span', { class: 'link-chip-hint' }, 'Your Hearth server fetches the page, so it sees this link. People reading don’t contact the site.')),
+        h('button', { class: 'btn sm', type: 'button', 'data-act': 'preview', onclick: () => { requestPreview(L.url); ta.focus(); } }, L.status === 'ask' ? 'Preview' : 'Preview anyway'),
+        L.status === 'ask' ? h('button', { class: 'btn ghost sm', type: 'button', 'data-act': 'always', 'data-tip': 'Preview links without asking (Settings → Chat)', onclick: () => {
+          LS.set('hearth.chat', { ...LS.get('hearth.chat', {}), linkPreviews: 'always' });
+          requestPreview(L.url);
+          ta.focus();
+        } }, 'Always') : null,
+        x('No preview for this link'));
+    } else if (L.status === 'loading') {
+      chip = h('div', { class: 'link-chip' }, h('span', { class: 'spinner sm' }), h('div', { class: 'link-chip-text' }, h('span', null, 'Getting a preview…'), h('span', { class: 'link-chip-hint' }, host)), x('Cancel link preview'));
+    } else if (L.status === 'ready') {
+      const e = L.entry;
+      chip = h('div', { class: 'link-chip ready' },
+        e.img ? h('img', { class: 'link-chip-img', src: `data:${e.img.type};base64,${e.img.data}`, alt: '' }) : icon('link', 'ic'),
+        h('div', { class: 'link-chip-text' }, h('strong', { class: 'link-chip-title' }, e.title || e.site || host), h('span', { class: 'link-chip-hint' }, `Link preview · ${host}`)),
+        x('Remove link preview'));
+    } else {
+      chip = h('div', { class: 'link-chip muted' }, icon('link', 'ic'), h('div', { class: 'link-chip-text' }, h('span', null, L.msg || 'No preview for this link.')), x('Dismiss'));
+    }
+    linkBox.append(chip);
+  }
+
   ta.addEventListener('input', () => {
-    autosize(); update(); checkSuggest(); renderCmdBar();
+    autosize(); update(); checkSuggest(); renderCmdBar(); onTypeForLink();
     drafts.set(key() + (threadId() || ''), ta.value);
     const kk = key();
     if (ta.value && Date.now() - lastTypingSent > 3000 && !threadId()) {
@@ -4483,7 +4611,10 @@ function createComposer({ id, key, threadId, placeholder }) {
   ta.addEventListener('blur', () => setTimeout(closeSuggest, 120));
   ta.addEventListener('paste', (e) => {
     const files = [...(e.clipboardData.files || [])];
-    if (files.length) { e.preventDefault(); addFiles(files); }
+    if (files.length) { e.preventDefault(); addFiles(files); return; }
+    // Pasting a link is a fresh "I want this one", even if its preview was turned down before.
+    for (const u of linkedUrls(e.clipboardData.getData('text') || '')) linkDismissed.delete(u);
+    setTimeout(checkLink, 0);
   });
 
   function addFiles(list) {
@@ -4503,6 +4634,9 @@ function createComposer({ id, key, threadId, placeholder }) {
     if (m) { replaceMessageEl(m); ta.focus(); }
   }
   function renderExtras() {
+    // Keyboard focus on the link chip outlives its redraw (a preview arriving, a note going away): it stays on
+    // the same button if there still is one, else it goes back to the box, never to the page.
+    const chipFocus = linkBox.contains(document.activeElement) ? document.activeElement.getAttribute('data-act') || '' : null;
     clear(extras);
     if (id === 'main') { const notice = keyNotice(); if (notice) extras.append(notice); }
     if (state.replyTo) {
@@ -4512,6 +4646,11 @@ function createComposer({ id, key, threadId, placeholder }) {
           h('span', { class: 'reply-bar-quote' }, (textOf(state.replyTo) || 'Attachment').slice(0, 120))),
         ibtn('close', 'Cancel reply (Esc)', () => setReply(null), { cls: 'sm' })));
     }
+    // A preview belongs to the conversation it was made in, and goes when previews stop being allowed here.
+    if (state.link && (state.link.key !== convKey() || !linksAllowedHere())) { linkGen++; clearTimeout(linkHide); state.link = null; }
+    drawLinkChip();
+    extras.append(linkBox);
+    if (chipFocus !== null) ((chipFocus && linkBox.querySelector(`[data-act="${chipFocus}"]`)) || ta).focus();
     if (state.pending.length) {
       extras.append(h('div', { class: 'pending-files' }, state.pending.map((p, i) => h('div', { class: 'pending' },
         p.url ? h('img', { src: p.url, alt: '' }) : h('div', { class: 'pending-ic' }, icon('file')),
@@ -4557,10 +4696,15 @@ function createComposer({ id, key, threadId, placeholder }) {
     const kk = key();
     const tid = threadId();
     const replyTo = state.replyTo ? state.replyTo.id : null;
+    // The link preview goes along only with the typed message, only once it's ready (sending never waits for
+    // one), and only if its link is still in the text. GIFs, polls and voice messages never carry one.
+    const linkState = overrideText == null ? state.link : null;
+    const links = linkState && linkState.status === 'ready' && !poll && !extra.files && linkedUrls(text, { skipSpoilers: true }).includes(linkState.url) ? [linkState.entry] : null;
     if (overrideText == null) {
       ta.value = '';
       drafts.delete(kk + (tid || ''));
       state.pending = [];
+      linkGen++; clearTimeout(linkHide); state.link = null; linkDismissed.clear();
     }
     const old = state.replyTo;
     state.replyTo = null;
@@ -4568,10 +4712,10 @@ function createComposer({ id, key, threadId, placeholder }) {
     renderExtras(); autosize(); update();
     const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)), (x) => x.toString(16).padStart(2, '0')).join('');
     if (id === 'main' && !tid) showPendingSend(kk, nonce, poll ? `\uD83D\uDCCA ${poll.q}` : files.some((f) => f.voice) ? '\uD83C\uDFA4 Voice message' : text, files.some((f) => f.voice) ? 0 : files.length, replyTo);
-    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll }));
+    queue = queue.then(() => deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState }));
     return queue;
   }
-  async function deliver({ kk, tid, text, files, replyTo, nonce, poll }) {
+  async function deliver({ kk, tid, text, files, replyTo, nonce, poll, links, linkState }) {
     const bar = upStatus.querySelector('.bar');
     const totalBytes = files.reduce((a, p) => a + (p.file ? p.file.size : 0), 0);
     let retrying = null;
@@ -4589,7 +4733,7 @@ function createComposer({ id, key, threadId, placeholder }) {
     uploading = ctl;
     try {
       const f = await uploadEncryptedFiles(kk, files, setProgress, { signal: ctl && ctl.signal, onStatus });
-      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}) }, replyTo, nonce);
+      const msg = await sendTo(kk, tid, { t: text, f, ...(poll ? { p: poll } : {}), ...(links ? { l: links } : {}) }, replyTo, nonce);
       files.forEach((p) => p.url && URL.revokeObjectURL(p.url));
       playSound('sent');
       // Normally the live connection delivers it first; this covers a slow or dropped connection.
@@ -4604,7 +4748,11 @@ function createComposer({ id, key, threadId, placeholder }) {
       if (e.cancelled) toast('Upload cancelled. Your message and files are back in the box.');
       else toast(e.message, 'error');
       // Give the words back so nothing is lost (unless they've already typed something new).
-      if (!poll && !files.some((f) => f.voice) && !ta.value.trim() && key() === kk) { ta.value = text; if (!state.pending.length) state.pending = files; renderExtras(); autosize(); update(); }
+      if (!poll && !files.some((f) => f.voice) && !ta.value.trim() && key() === kk) {
+        ta.value = text; if (!state.pending.length) state.pending = files;
+        if (linkState && !state.link && linkState.status === 'ready') state.link = linkState; // and its preview
+        renderExtras(); autosize(); update();
+      }
     } finally {
       if (uploading === ctl) uploading = null;
       setProgress(1);
@@ -4695,6 +4843,19 @@ function mentionedIds(server, text) {
     || ((server.memberRoles || {})[id] || []).some((r) => roleIds.has(r))));
 }
 
+// The longest ciphertext the server takes (validCipher in server/index.js; keep the two the same).
+const CIPHER_MAX = 64000;
+// Encrypts the payload, or if that comes out too long, the same message with less of its link preview: first
+// without the picture, then without the card (linkpreview.js payloadVariants). A message too long even then
+// goes as it is, and the server's usual "too big" answer applies.
+async function encryptFitting(payload, encrypt) {
+  let out;
+  for (const p of payloadVariants(payload)) {
+    out = await encrypt(p);
+    if ((typeof out === 'string' ? out : out.ciphertext).length <= CIPHER_MAX) return out;
+  }
+  return out;
+}
 async function sendTo(key, threadId, payload, replyTo, nonce) {
   const files = (payload.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
   if (key.startsWith('c:')) {
@@ -4702,13 +4863,13 @@ async function sendTo(key, threadId, payload, replyTo, nonce) {
     const server = serverOfChannel(channelId);
     if (!server) throw new Error('Channel not found.');
     return withKeyRetry(server.id, async () => {
-      const { ciphertext, epoch } = await sec.encryptChannel(server.id, channelId, payload);
+      const { ciphertext, epoch } = await encryptFitting(payload, (p) => sec.encryptChannel(server.id, channelId, p));
       // @everyone / @here: the server checks the sender may use it, then counts and pushes it as a ping.
       const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || '')) ? true : undefined;
       return api('POST', `/channels/${channelId}/messages`, { ciphertext, epoch, replyTo, threadId, files, mentions: mentionedIds(server, payload.t), everyone, nonce });
     });
   }
-  const ciphertext = await sec.encryptDm(key.slice(2), payload);
+  const ciphertext = await encryptFitting(payload, (p) => sec.encryptDm(key.slice(2), p));
   return api('POST', `/dms/${key.slice(2)}/messages`, { ciphertext, replyTo, files, nonce });
 }
 // "Sending…" copies of your own messages, shown until the real one arrives.
@@ -5800,6 +5961,22 @@ function newsCard(e) {
       e.summary ? h('span', { class: 'news-summary' }, e.summary.length > 220 ? `${e.summary.slice(0, 220)}\u2026` : e.summary) : null,
       h('span', { class: 'news-meta' }, [host, e.date ? fmtStamp(e.date) : ''].filter(Boolean).join(' \u00b7 '))),
     e.image ? h('img', { class: 'news-img', src: mediaNewsUrl(e.image), alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (ev) => ev.currentTarget.remove() }) : null);
+}
+// A link preview from inside a message (secure.js already checked it: an https link that's in the text, capped
+// fields, a small WebP/JPEG thumbnail). Text goes in as text nodes only, never as HTML. The picture is a data:
+// URL from the message itself, and the domain line is read from the link here, so the card can't hide where
+// the link goes.
+function linkCardEl(l) {
+  const host = hostLabel(l.url);
+  const big = !!l.img && l.img.w >= 280 && l.img.w / l.img.h >= 1.3;
+  const desc = [...(l.desc || '')]; // cut by characters, so an emoji is never split
+  return h('a', { class: `news-card link-card kind-${l.kind}${big ? ' big' : ''}`, href: l.url, title: l.url, target: '_blank', rel: 'noopener noreferrer nofollow' },
+    h('div', { class: 'news-text' },
+      h('span', { class: 'news-source' }, l.site || host),
+      l.title ? h('span', { class: 'news-title' }, l.title) : null,
+      desc.length ? h('span', { class: 'news-summary' }, desc.length > 220 ? `${desc.slice(0, 220).join('')}…` : l.desc) : null,
+      h('span', { class: 'news-meta' }, host)),
+    l.img ? h('img', { class: 'news-img link-img', src: `data:${l.img.type};base64,${l.img.data}`, alt: '', width: l.img.w, height: l.img.h, loading: 'lazy', decoding: 'async' }) : null);
 }
 
 function openServerSettings(server, startTab = 'overview') {

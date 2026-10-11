@@ -1,6 +1,24 @@
 # Design: link previews built by the sender, carried inside the encrypted message
 
-Status: proposal, ready to build · Target release: the one after 1.28.2 (`package.json`) · Schema: stays 18 · NEXT.md pick #6
+Status: built (after 1.29.0; the schema is unchanged) · NEXT.md pick #6 · User docs: README "Link previews", docs/FEATURES.md "Link previews"
+
+**Build notes: where the code differs from this document, and why.**
+- `LINK_PREVIEW_ALLOW_PRIVATE` takes `1` (any host) or a comma-separated list of host names that may be private. With a list, a test can still show that a redirect to some other private name is refused. Either form also allows ports other than 443, and `/api/config` then says `linkPreviewAnyPort: true` so the test apps offer and accept previews for the stand-in site's port. A normal server never sets it.
+- `LINK_PREVIEW_TIMEOUT_MS` (tests only, default 10,000) scales the 10 s budget, so the "site never answers" test runs in about 2 s.
+- Node's `TextDecoder('windows-1252')` decodes as ISO-8859-1 (0x80–0x9F become control characters), so `decodeHtml` decodes that family by hand.
+- `example.com`/`.net`/`.org` are refused with their subdomains, and `home`, `corp` and `localdomain` join the reserved names. A thumbnail must decode to at most 16,384 bytes: base64 length alone allows 16,385.
+- `secure.js` calls `cleanLinks` through one helper, `linksIn`, used by both `openGroup` and `openDm` (the static test checks the helper is used twice).
+- A paste clears an earlier "no" for the links pasted, so someone can bring a dismissed preview back.
+- Edits also keep the poll (`p`), fixing the existing problem noted in §14 risk 8.
+- The card is not added to the "sending…" copy (optional in §8.5).
+- The research brief proposed `GET /unfurl?url=` in `server/unfurl.js` and the picture as an encrypted attachment. This document's choices were kept: a `POST` route, so the link never sits in a query string that a reverse proxy might log, and an inline thumbnail (§6).
+- Not built: gating hot-linked image-URL embeds on EMBED_LINKS (§15 step 11, a behaviour change), and the a11y pass for the chip. The chip is a polite live region and its buttons are named. Keyboard focus on the chip survives its redraw (same button if it's still there, else the message box), and Preview, Always and Preview anyway put the focus back in the box, so the next Enter sends.
+- **Review fixes:**
+  - *Tokenizer (§5.4 step 3).* A broken tag is given up on from where its reading stopped (the unquoted `<` that cut it short, or the end of its 8 KiB), never from one character after its `<`. Restarting there let quoted values carry each tag's scan over the following `<`s, so short repeated quote patterns re-read every 8 KiB window once per tag (seconds for 512 KiB, every time reaching the 2 s limit). It never goes back now, and a step budget (4 × the page length) stops it if that ever stops being true. `<!-->` and `<!--->` are whole empty comments, as in browsers.
+  - *Text (§5.4 step 7).* Markup is dropped **before** entities are decoded, and only when shaped like a tag (`<b>`, `</p>`, `<!-- -->`; not `a < b > c` or `<3`). Stripping after decoding turned an escaped `List&lt;string&gt;` into `List`. Decoded text can contain `<` and `>`: the card is drawn with text nodes only, and a sender's app can put any text in a card anyway, so stripping was never a safety measure. The named table is HTML 4's whole set (Latin-1 letters, Greek, symbols, typography) plus the ASCII punctuation names, case-sensitive as in browsers, kept in a `Map` (so `&constructor;` stays as written).
+  - *Parser worker.* Each worker keeps its own jobs. A late `exit` from a worker that was replaced after a timeout used to fail the new worker's jobs and drop the reference to it, leaving its thread running. Now a worker only fails its own jobs and only clears itself; the jobs queued behind a page that timed out move to the new worker with a fresh time limit.
+  - *Detection (§8.5).* "Something follows it" means a space after the link **and** the caret outside it. Backspace inside a link with a chip (`…/story-one please`) makes a new link each time, so the chip goes at once and the new link waits for the 1.2 s pause, in Always mode too.
+  - *EMBED_LINKS (§8.5, §11).* The composer needs the permission in the channel **and** server-wide (`perms.js` `mayEmbed`, the same function readers use). With only the channel check, a channel override allowing it for someone without the role permission let the server fetch the page for a card nobody, sender included, was shown. A channel override can now turn previews off, not on.
 
 All code references are to files under `hearth/` and were checked against the current tree. Line numbers are approximate, to help you find things; function names are authoritative.
 
@@ -287,7 +305,7 @@ Unknown types (SVG, AVIF, ICO, BMP…) or dimensions out of range → `image: nu
 3. **Tokenizer.** Use indexOf and a small state machine, never regexes with nested quantifiers on unbounded input (unlike activity.js `og()`):
    - Skip `<!-- … -->` comments.
    - Skip the raw-text elements `script`, `style`, `noscript`, `template`, `textarea`, `xmp` up to their closing tags, found in the lowercase copy.
-   - Find the end of each tag while respecting quotes, scanning at most 8 KiB per tag; a tag that runs over is skipped by one character. Read at most 4,000 tags.
+   - Find the end of each tag while respecting quotes, scanning at most 8 KiB per tag; a tag that runs over or breaks is given up on from where its scan stopped (never back to just after its `<`; see the build notes). Read at most 4,000 tags.
    - Attribute parser: at most 32 attributes, names up to 64 characters, values up to 4096; handles double-quoted, single-quoted and unquoted values.
 4. **Collect the first value** of each of these. The first tag wins, which is the OpenGraph rule for repeated tags ([ogp.me #array](https://ogp.me/#array)).
    - `meta[property|name]`, key lowercased: `og:title`, `og:description`, `og:site_name`, `og:type`, `og:image`, `og:image:url`, `og:image:secure_url`, `og:image:width`, `og:image:height`, `twitter:card`, `twitter:title`, `twitter:description`, `twitter:image`, `twitter:image:src`, `description`, `application-name`.
@@ -302,8 +320,8 @@ Unknown types (SVG, AVIF, ICO, BMP…) or dimensions out of range → `image: nu
    - Image candidates, in order: `og:image:secure_url`, `og:image`, `og:image:url`, `twitter:image`, `twitter:image:src`, `image_src`. Resolve each against the **final** URL (`r.url`). An `http:` candidate becomes the same URL with `https:`. Skip `data:` and anything else. Take the first that parses.
 6. **`looksLikeChallenge`.** A title matching `/^(just a moment\.\.\.|attention required!|access denied|are you a robot|before you continue)/i` → `challenge`, with no preview.
 7. **`cleanText(s, max)`**, applied to every text field:
-   1. `decodeEntities` once: numeric entities for code points 1–0x10FFFF excluding surrogates, plus a named table (the same set as newsbot's `ENT`, plus `copy`, `reg`, `trade`, `laquo`, `raquo`, `middot`, `bull`).
-   2. Strip `<…>` fragments of up to 500 characters.
+   1. Strip tag-shaped `<…>` fragments of up to 500 characters (built: before decoding, see the build notes).
+   2. `decodeEntities` once: numeric entities for code points 1–0x10FFFF excluding surrogates, plus a named table (built: HTML 4's whole set and the ASCII punctuation names).
    3. Remove C0/C1 controls, U+200B, U+FEFF and the bidi controls U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069. U+200D (zero-width joiner, used in emoji) is kept.
    4. Collapse whitespace, normalize to NFC, trim.
    5. Cut by **code points**, not UTF-16 units, and add `…` when cut.
@@ -556,12 +574,12 @@ function linkCardEl(l) {
 **`createComposer()`**
 - New state: `state.link = null | { key, url, status: 'ask'|'private'|'loading'|'ready'|'none'|'error', entry, msg }` and `state.linkDismissed = new Set()`.
 - **Detection** (`checkLink()`):
-  - Runs at once on `paste`. On `input`, it runs only when the URL found is followed by whitespace, or after 1,200 ms of idle typing (`debounce` from `util.js`). This avoids fetching URLs that are still being typed.
+  - Runs at once on `paste`. On `input`, it runs only when the URL found is followed by whitespace and the caret is outside it (built: so editing inside a link counts as typing it), or after 1,200 ms of idle typing (`debounce` from `util.js`). This avoids fetching URLs that are still being typed.
   - It is skipped when:
     - `(S.config.features || {}).linkPreviews === false`;
     - `P.chat.linkPreviews === 'never'`;
     - a slash command is being typed (`slashChannel() && SLASH.match(…)`);
-    - the channel denies EMBED_LINKS (`ch && !canIn(ch, PERMS.EMBED_LINKS)`);
+    - the channel denies EMBED_LINKS (`ch && !canIn(ch, PERMS.EMBED_LINKS)`), or (built) the person lacks it server-wide (`!mayEmbed(server, S.me.id)`), which is what readers check;
     - the URL is in `state.linkDismissed`.
   - It **does not run on draft restore** (`ta.value = drafts.get(…)`), so switching channels never sends a request.
 - **Mode.** `'ask'` → status `ask`, with no network request. `'always'` → status `private` if `looksPrivate(url)`, else `requestPreview(url)`.
@@ -646,7 +664,7 @@ After `rec.text`: `if (m.dec.l && m.dec.l[0]) rec.link = { url: m.dec.l[0].url, 
   - A GIPHY *page* link (`giphy.com/gifs/…`) gets an ordinary OpenGraph card with a first-frame thumbnail, fetched by the server directly (not through `fetchGifMedia`), once, for that sender only.
 - **News-bot and bot posts:** they keep `m.dec.embed` → `newsCard()` with the `/media/news` proxy. Link cards never use `/media/news`.
 - **Watch together:** `watchChips(text)` is unchanged. A YouTube link shows both the card and the "Watch together" button.
-- **EMBED_LINKS:** now meaningful. The sender's composer offers previews only with `canIn(ch, PERMS.EMBED_LINKS)`; readers show cards only when `senderMayEmbed(m)`. Gating the existing image embeds the same way is a separate, optional commit (a behaviour change; §15 step 11).
+- **EMBED_LINKS:** now meaningful. The sender's composer offers previews only with `canIn(ch, PERMS.EMBED_LINKS)` and the server-wide permission readers check (`mayEmbed`); readers show cards only when `senderMayEmbed(m)`. Gating the existing image embeds the same way is a separate, optional commit (a behaviour change; §15 step 11).
 - **Spoilers and code:** a URL inside `||…||` or code is never previewed. Readers reject a preview whose URL appears only there (`skipSpoilers`).
 
 ---
@@ -802,7 +820,7 @@ Uses `import(pathToFileURL('public/js/linkpreview.js'))` and `e2ee.js`, as in `q
 4. **Database and bandwidth growth** of about 30 KB per previewed message. Bounded by `validCipher` and the message rate limits; dropped first when the message is too big.
 5. **Parser bugs** (regex backtracking, entity edge cases). Linear tokenizer, worker with a hard time limit, fuzz-style tests (#3, #4).
 6. **Third-party endpoints change.** X oEmbed is unreliable, YouTube thumbnail names aren't documented, and sites block unknown bots. Everything fails closed to "no preview".
-7. **EMBED_LINKS is enforced only by members' apps.** A modified client can send cards anyway; readers then apply `senderMayEmbed` to the server-wide permission only (channel overrides are invisible to them, the same as @everyone today).
+7. **EMBED_LINKS is enforced only by members' apps.** A modified client can send cards anyway; readers then apply `senderMayEmbed` to the server-wide permission only (channel overrides are invisible to them, the same as @everyone today). The composer applies the same rule to its own person, so a channel override can take previews away but can't give them.
 8. **Existing payload-whitelist bug.** `editBox()` already drops `p` (polls) when rebuilding the payload. Don't copy that pattern for `l`: carry `l` explicitly. Consider fixing `p` in the same commit as a separate change.
 
 ### Open questions

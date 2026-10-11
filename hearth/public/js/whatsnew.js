@@ -6,6 +6,10 @@ export const CHANGES = [
     'Pick your roles: moderators can let members choose roles themselves (ping roles like @game-night, pronouns, colors, opt-in channels) from the server menu or the start of any channel.',
     'Repeating events: every week, every 2 weeks or every month, at the same local time even when the clocks change, and in your calendar with every date.',
     'Moderator tools: disconnect, move or server-mute people in voice (new Move Members and Mute Members permissions), delete a banned person\u2019s messages from the last hour, day or week, and delete up to 100 recent messages at once.',
+    'Server audit log (Server settings \u2192 Audit log, with a new View Audit Log permission): who kicked, banned or timed out whom, and who changed roles, channels, permissions and settings, in plain sentences and never what anyone wrote. Reports about messages and members in a server now reach that server\u2019s moderators too (Server settings \u2192 Reports), without the reporter\u2019s name.',
+    'Threads you won\u2019t miss: a message that starts a thread shows how many replies are new to you, and the Threads button in a channel lists its threads, newest reply first.',
+    'Link previews: paste a link and press Preview to add a card with the page\u2019s title and picture. The card travels inside the encrypted message, so people reading never contact the site. Your server sees the links you preview; choose Ask, Always or Never in Settings \u2192 Chat.',
+    'For server owners: update zips can now be signed with your own key, and servers that pinned it refuse anything else (docs/SIGNING.md).',
   ] },
   { version: '1.28.2', items: [
     'Privacy: call relays (including other regions\u2019 relays) no longer get your account id, just a stand-in name that stays the same for you. They still see your IP address, as before.',

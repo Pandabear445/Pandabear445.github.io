@@ -1297,8 +1297,24 @@ function perServerNotifications(app) {
 }
 
 // ------------------------------------------------------------------ chat tab
+// Link previews (docs/design/LINK-PREVIEWS.md): whether the composer offers, builds or skips a preview for a link
+// you send, and whether previews other people built show in messages.
+function linkPreviewSection(app, c, set) {
+  const off = (app.S.config.features || {}).linkPreviews === false;
+  const mode = h('select', { class: 'input sm', 'aria-label': 'When I send a link', disabled: off, onchange: (e) => set('linkPreviews', e.target.value) },
+    h('option', { value: 'ask' }, 'Ask each time'), h('option', { value: 'always' }, 'Always'), h('option', { value: 'never' }, 'Never'));
+  mode.value = ['ask', 'always', 'never'].includes(c.linkPreviews) ? c.linkPreviews : 'ask';
+  return section('Link previews',
+    h('div', { class: 'toggle-row' },
+      h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'When I send a link'),
+        h('span', { class: 'field-hint' }, off ? 'This server has link previews turned off.'
+          : 'To build a preview, your Hearth server fetches the page for you, so it sees the link (not your message). The site sees the server, not you. “Always” also asks first for links that look private, like sign-in or reset links.')),
+      mode),
+    toggle('Show link previews in messages', c.linkCards !== false, (v) => set('linkCards', v), 'Built by the sender and sent inside the encrypted message: your device never contacts the linked site.'));
+}
+
 function chatTab(app) {
-  const cur = () => ({ enterToSend: true, embeds: true, markdown: true, jumbo: true, compressImages: true, ...JSON.parse(localStorage.getItem('hearth.chat') || '{}') });
+  const cur = () => ({ enterToSend: true, embeds: true, markdown: true, jumbo: true, compressImages: true, linkPreviews: 'ask', linkCards: true, ...JSON.parse(localStorage.getItem('hearth.chat') || '{}') });
   const set = (k, v) => { const c = cur(); c[k] = v; localStorage.setItem('hearth.chat', JSON.stringify(c)); app.rerender(); };
   const c = cur();
   return h('div', { class: 'set-form narrow' },
@@ -1312,6 +1328,7 @@ function chatTab(app) {
       toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'Pasted image URLs are loaded from the other site, which can see your IP address.'),
       toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers|| and > quotes.'),
       toggle('Large emoji when a message is only emoji', c.jumbo, (v) => set('jumbo', v))),
+    linkPreviewSection(app, c, set),
     section('Screen sharing',
       toggle('Hide DMs while I share my screen', c.hideDmsWhileSharing !== false, (v) => set('hideDmsWhileSharing', v), 'Direct messages and group chats are covered, and their previews and notifications hidden, while you share your screen. You can still open one with \u201cShow while sharing\u201d.')),
   );

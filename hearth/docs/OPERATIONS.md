@@ -86,6 +86,18 @@ Redaction happens centrally in `server/log.js`, so a careless log call can't lea
   172.19.0.3 was ignored", keep the address: you need it to set `TRUST_PROXY`.)
 - Message contents can't appear: the server never has them (they're end-to-end encrypted), and request bodies
   are never logged.
+- Link previews: the server does see the links people ask a preview for (it fetches them), but never logs
+  them. Each preview writes one `debug` line, `linkpreview preview`, with the outcome, the reason, the kind,
+  whether it came from the cache, the time taken and the picture's size: no link, host or title. Failures log
+  netguard's error code only (its messages can name the host). The access log names the route,
+  `/api/link-previews`, as for every request.
+
+**Link previews and you, the operator.** When a member presses Preview, this server downloads that page and
+one picture from it, holds them in memory for up to 10 minutes for that member only, and sends them to their
+app. Nothing is written to disk or backed up. Like the news bot, it means your server fetches pages your members
+choose. To stop it: **Admin → Owner → Features → Link previews** (or `LINK_PREVIEWS=false` before first start);
+the route then answers 404 and apps stop offering previews. Cards already sent still show: they're inside the
+messages. `OUTBOUND_BLOCK` applies to these fetches too.
 
 The security log (Admin → Security) still keeps the last 500 events in memory with full addresses for staff;
 each event also goes to the server log with the network only.

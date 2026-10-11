@@ -1344,6 +1344,87 @@ async function threads(t) {
   await bob.$('#members button[aria-label="Close panel"]').click();
 }
 
+// ------------------------------------------------------------------ 20. link previews
+// The sender's app asks for a preview only when told to; the card goes inside the encrypted message, so the
+// reader's app shows it without contacting the site (or asking this server about the link).
+async function linkPreviews(t) {
+  const { alice, bob } = t.people;
+  const site = t.server.site;
+  const url = `${site.base}/story`;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const bobAsked = [];
+  const onRequest = (r) => { const u = r.url(); if (u.includes(site.host) || u.includes(`:${site.port}/`) || u.includes('/api/link-previews')) bobAsked.push(u); };
+  bob.page.on('request', onRequest);
+  try {
+    const box = alice.$('#composer-input');
+    const chip = alice.$('.cw-main .link-chip');
+    // "Ask each time" (the default): the chip only offers. Nothing has been fetched yet.
+    await box.fill(`Have you seen this? ${url} `);
+    await chip.filter({ hasText: 'Your Hearth server fetches the page, so it sees this link.' }).waitFor();
+    check(!site.hits.length, `Nothing should be fetched before Alice asks for a preview (fetched ${site.hits.join(', ')}).`);
+    // No thanks: the link goes out as a plain link.
+    await chip.locator('button[aria-label="No preview for this link"]').click();
+    await chip.waitFor({ state: 'detached' });
+    await box.press('Enter');
+    await bob.message('Have you seen this?').waitFor();
+    check(!(await bob.message('Have you seen this?').locator('.link-card').count()), 'A message sent without a preview should not show a card.');
+    check(!site.hits.length, 'Turning the preview down should not fetch the page.');
+
+    // Yes please: the server fetches it for Alice, her app shrinks the picture, and the card travels encrypted.
+    await box.fill(`Pineapple news: ${url} `);
+    await chip.locator('button', { hasText: exact('Preview') }).click();
+    await alice.$('.cw-main .link-chip.ready', { hasText: 'Pineapple harvest report' }).waitFor();
+    check(site.hits.includes('/story') && site.hits.includes('/cover.png'), `The server should have fetched the page and its picture (got ${site.hits.join(', ')}).`);
+    await box.press('Enter');
+    const card = bob.message('Pineapple news:').locator('a.link-card');
+    await card.locator('.news-title', { hasText: 'Pineapple harvest report' }).waitFor();
+    check((await card.getAttribute('href')) === url, 'The card should open the link from the message.');
+    check((await card.locator('.news-meta').innerText()).trim() === `${site.host}:${site.port}`, 'The domain line should come from the link itself.');
+    check(/^data:image\/(webp|jpeg);base64,/.test(await card.locator('img.link-img').getAttribute('src') || ''), 'The picture should come from inside the message.');
+    check(!(await card.locator('.news-summary').innerText()).includes('<'), 'Text from the page is shown as text.');
+    await alice.message('Pineapple news:').locator('a.link-card').waitFor();
+
+    // Keyboard only: Enter on Preview gets the card and leaves the focus in the box, so the next Enter sends.
+    await box.fill(`Keyboard pick: ${site.base}/keys `);
+    await chip.locator('button', { hasText: exact('Preview') }).focus();
+    await alice.page.keyboard.press('Enter');
+    await alice.$('.cw-main .link-chip.ready').waitFor();
+    const focused = await alice.page.evaluate(() => (document.activeElement ? document.activeElement.id || document.activeElement.tagName : ''));
+    check(focused === 'composer-input', `After Preview, the focus should be back in the message box (it is on ${focused}).`);
+    await alice.page.keyboard.press('Enter');
+    await bob.message('Keyboard pick:').locator('a.link-card').waitFor();
+
+    // "Always": a link is fetched once it's finished. Backspace inside "…/story-twelve please" makes a new link
+    // each time; none of them is sent anywhere until the typing pauses, and then only the one in the box.
+    await box.fill(`Third story: ${site.base}/story-twelve please`);
+    await chip.locator('button', { hasText: exact('Always') }).click();
+    await alice.$('.cw-main .link-chip.ready').waitFor();
+    const asked = [];
+    const onAsk = (r) => { if (r.url().endsWith('/api/link-previews')) asked.push(r.postDataJSON().url); };
+    alice.page.on('request', onAsk);
+    try {
+      await box.press('End');
+      for (let i = 0; i < ' please'.length; i++) await box.press('ArrowLeft');
+      for (let i = 0; i < 3; i++) await box.press('Backspace');
+      check(!asked.length, `Editing inside a link should not ask for a preview before the pause (asked for ${asked.join(', ')}).`);
+      check(!(await chip.count()), 'The card for the link as it was should go as soon as the link changes.');
+      await alice.$('.cw-main .link-chip.ready').waitFor();
+    } finally { alice.page.off('request', onAsk); }
+    check(asked.length === 1 && asked[0] === `${site.base}/story-twe`, `After the pause, only the link in the box should be previewed (asked for ${asked.join(', ')}).`);
+    check(!site.hits.includes('/story-twelv') && !site.hits.includes('/story-twel'), `Half-edited links should never be fetched (the site got ${site.hits.join(', ')}).`);
+    await box.fill('');
+    await chip.waitFor({ state: 'detached' });
+  } finally { bob.page.off('request', onRequest); }
+  // Back to the default for whatever runs next.
+  await alice.openSettings('Chat');
+  await alice.page.locator('select[aria-label="When I send a link"]').selectOption('ask');
+  await alice.closeSettings();
+  check(!bobAsked.length, `Bob's app should never contact the site or ask about the link (it asked for ${bobAsked.join(', ')}).`);
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -1372,4 +1453,5 @@ export const FLOWS = [
   ['moderation: staff sign-out and suspension say why; unsuspend', moderation],
   ['smoke: every settings, admin and server settings page loads', smoke],
   ['threads: new replies and pings on the message and the Threads button, the Threads panel, read when opened', threads],
+  ['link previews: ask, turn down, preview, send; the reader sees the card and never contacts the site; keyboard; editing a link in Always mode', linkPreviews],
 ];

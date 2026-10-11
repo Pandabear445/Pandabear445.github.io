@@ -165,7 +165,8 @@ What's inside
                        reports you filed.
 - conversations/       One JSON file per channel, group chat or direct message you can read right now, with
                        every message the app could decrypt: who sent it, when, the text, replies, threads,
-                       reactions, polls and attachment details. Messages it couldn't decrypt are listed as such.
+                       reactions, polls, link previews and attachment details. Messages it couldn't decrypt
+                       are listed as such.
 - attachments/         The files attached to those messages, decrypted, up to the size limit below.
 - manifest.json        What was exported, what was skipped and why.
 
@@ -222,6 +223,8 @@ export async function runExport(ctx) {
         if (m.legacy) { rec.text = m.content || ''; rec.note = 'sent before end-to-end encryption'; } else if (ok) {
           rec.text = m.dec.t || '';
           if (m.dec.p) rec.poll = { question: m.dec.p.q, options: m.dec.p.o };
+          const lp = m.dec.l && m.dec.l[0];
+          if (lp) rec.link = { url: lp.url, title: lp.title, description: lp.desc, site: lp.site }; // the preview's words, not its picture
           rec.attachments = [];
           for (const f of m.dec.f || []) {
             const a = { name: f.name || 'file', type: f.type || '', size: f.size || 0 };

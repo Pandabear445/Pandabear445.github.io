@@ -24,7 +24,7 @@ export const PERM_GROUPS = [
   ['Text', [
     ['SEND_MESSAGES', 'Send messages', '', true],
     ['CREATE_THREADS', 'Reply in threads', '', true],
-    ['EMBED_LINKS', 'Show link previews', 'Image links in their messages show as pictures.', true],
+    ['EMBED_LINKS', 'Show link previews', 'Their links can carry a preview card. It counts as a role permission: a channel override can turn it off there, not on. Members’ apps enforce this, since the server can’t see inside messages.', true],
     ['ATTACH_FILES', 'Attach files', '', true],
     ['ADD_REACTIONS', 'Add reactions', 'Add new reactions (anyone can join existing ones).', true],
     ['MENTION_EVERYONE', 'Mention @everyone and @channel', 'Their @everyone notifies people.', true],
@@ -60,6 +60,11 @@ export function basePerms(server, userId) {
   for (const r of server.roleDefs || []) if (r.everyone || ((server.memberRoles || {})[userId] || []).includes(r.id)) p |= r.permissions;
   return p & P.ADMINISTRATOR ? ALL : p;
 }
+// Whether this person's link previews show: Show link previews as a server-wide (role) permission, since that
+// is what every member's app can work out (each app gets channel overrides worked out for its own person only).
+// Groups give it to everyone. The composer asks the same about you, so the server never fetches a page for a
+// card nobody would see.
+export const mayEmbed = (server, userId) => !!server && has(basePerms(server, userId), P.EMBED_LINKS);
 // Does a <@&role> in this person's message ping the role's members? Only if the role is mentionable or they may
 // mention everyone. The composer only offers those roles, but a hand-typed mention must not ping either.
 export function mayMentionRole(server, roleId, authorId) {
