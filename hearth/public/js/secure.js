@@ -8,6 +8,7 @@ import { api } from './api.js';
 import { cleanFiles } from './attachments.js';
 import { cleanLinks } from './linkpreview.js';
 import { cleanX } from './disappear.js';
+import { bindingOf } from './binding.js';
 
 // The news bot's account (server/newsbot.js): the only one that still posts plaintext channel messages.
 const NEWS_BOT_ID = 'newsbot00000000000001';
@@ -38,6 +39,11 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const l = cleanLinks(payload.l, String(payload.t || ''), { origin, anyPort: !!(S.config && S.config.linkPreviewAnyPort) });
       return l ? { l } : {};
     } catch { return {}; }
+  };
+  // Where the message says it belongs (binding.js, crypto-7), as { b } or nothing: the app checks it against what
+  // the server says. Never throws either.
+  const bindIn = (payload) => {
+    try { const b = bindingOf(payload); return b ? { b } : {}; } catch { return {}; }
   };
   const groupKeys = new Map(); // serverId -> Map(epoch -> Uint8Array)
   const states = new Map(); // serverId -> key state from the server
@@ -454,7 +460,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const { payload, signedBy } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: keys.map((k) => k.key), text });
       const how = signedBy ? keys.find((k) => k.key === signedBy).trust : null;
       return {
-        t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload),
+        t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload), ...bindIn(payload),
         verified: how === 'now' || how === 'pinned', ...(how && how !== 'now' ? { keyNote: how } : {}),
       };
     } catch {
@@ -542,7 +548,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       for (const { key, trust: how } of await dmKeys(dmId, at)) {
         try {
           const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub: key, dmId, authorId, text });
-          return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
+          return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload), ...bindIn(payload), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
         } catch { /* not this key */ }
       }
       throw new Error('Missing key');

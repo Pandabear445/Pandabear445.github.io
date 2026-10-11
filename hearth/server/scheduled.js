@@ -63,7 +63,8 @@
 //   PATCH  /scheduled-messages/:id                     { sendAt?, ciphertext?, draft?, epoch?, ttl?, mentions?, everyone?, sendNow? }
 //          reschedule (sendAt), or edit / re-encrypt / confirm (ciphertext with its draft; for a channel, mentions and
 //          everyone are replaced along with it)
-//   POST   /scheduled-messages/:id/send                send it now (refusals answered, the message left as it was)
+//   POST   /scheduled-messages/:id/send                send it now (refusals answered, the message left as it was); with
+//          { ciphertext, epoch?, ttl?, mentions?, everyone? } that new copy goes instead (the app's, saying "now" inside)
 //   DELETE /scheduled-messages/:id                     cancel, or dismiss a failed one (its files go too)
 // Socket events to the sender's own apps: scheduled:update (the item) and scheduled:remove ({ id, messageId }).
 const crypto = require('crypto');
@@ -423,6 +424,34 @@ module.exports = function setupScheduled(ctx) {
     res.json(serialize(r));
   });
 
+  // New ciphertext for one already scheduled (an edit, a re-encrypt, a confirmation, or Send now's copy): it takes the
+  // keys of now and this session, so a held one is pending again. Checked like a message sent now: the current epoch
+  // for a channel, the other person's current key for a DM, the conversation's disappearing timer (ttl, keeping the
+  // stricter of that and the one it was written for). Returns the columns that change; ciphertext and draft are
+  // checked by the caller.
+  function reencrypted(r, b, req, conv) {
+    const set = {};
+    const u = getUserRow(req.userId);
+    if (r.channel_id) set.epoch = requireCurrentEpoch(r.server_id, b.epoch);
+    else {
+      const d = db.prepare('SELECT user_a, user_b FROM dm_channels WHERE id = ?').get(r.dm_id);
+      const peer = getUserRow(peerOf(d, req.userId));
+      if (!peer || peer.deleted_at) fail(403, 'This account was deleted.', 'deleted');
+      set.peer_key = peerKey(peer);
+    }
+    // New ciphertext is checked against the conversation's disappearing timer as it is now, and keeps the stricter
+    // of that and the one it was written for (the app puts the same one inside it, x).
+    checkTtl(b, conv.disappear_secs);
+    set.ttl = keepTtl(r.ttl, ttlOf(b));
+    Object.assign(set, { ciphertext: b.ciphertext, own_key: ownKey(u, !!r.channel_id), session_id: req.session.id, updated_at: now(), status: 'pending', reason: null, told_at: null });
+    // Who it pings goes with the words: new words replace them, so an @everyone or @name edited out pings nobody.
+    if (r.channel_id) {
+      set.mentions = JSON.stringify(cleanMentions(b.mentions));
+      set.everyone = b.everyone === true ? 1 : 0;
+    }
+    return set;
+  }
+
   // Reschedule (sendAt), or edit, re-encrypt or confirm (ciphertext with the sender's copy, and the current epoch for a
   // channel). New ciphertext takes the keys of now and this session, so a held one is pending again. The conversation
   // must still be yours to open.
@@ -443,24 +472,7 @@ module.exports = function setupScheduled(ctx) {
       if (r.status === 'held' && r.send_at <= now() && set.send_at === undefined && b.sendNow !== true) {
         fail(409, 'Its time has passed. Send it now, or pick a new time.', 'overdue');
       }
-      const u = getUserRow(req.userId);
-      if (r.channel_id) set.epoch = requireCurrentEpoch(r.server_id, b.epoch);
-      else {
-        const d = db.prepare('SELECT user_a, user_b FROM dm_channels WHERE id = ?').get(r.dm_id);
-        const peer = getUserRow(peerOf(d, req.userId));
-        if (!peer || peer.deleted_at) fail(403, 'This account was deleted.', 'deleted');
-        set.peer_key = peerKey(peer);
-      }
-      // New ciphertext is checked against the conversation's disappearing timer as it is now, and keeps the stricter
-      // of that and the one it was written for (the app puts the same one inside it, x).
-      checkTtl(b, conv.disappear_secs);
-      set.ttl = keepTtl(r.ttl, ttlOf(b));
-      Object.assign(set, { ciphertext: b.ciphertext, own_key: ownKey(u, !!r.channel_id), session_id: req.session.id, updated_at: now(), status: 'pending', reason: null, told_at: null });
-      // Who it pings goes with the words: new words replace them, so an @everyone or @name edited out pings nobody.
-      if (r.channel_id) {
-        set.mentions = JSON.stringify(cleanMentions(b.mentions));
-        set.everyone = b.everyone === true ? 1 : 0;
-      }
+      Object.assign(set, reencrypted(r, b, req, conv));
     } else if (r.status === 'held') fail(409, 'This message needs re-encrypting first.', 'held');
     const cols = Object.keys(set);
     db.prepare(`UPDATE scheduled_messages SET ${cols.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...cols.map((k) => set[k]), r.id);
@@ -471,17 +483,27 @@ module.exports = function setupScheduled(ctx) {
   });
 
   // Send now. A refusal is answered and the message stays as it was (its time decides then); one that needs
-  // re-encrypting is marked held.
+  // re-encrypting is marked held. With new ciphertext ({ ciphertext, epoch?, ttl?, mentions?, everyone? }, checked like
+  // an edit), that copy is the one posted: the app re-encrypts it with the moment it really goes out inside it
+  // (public/js/binding.js), so readers' apps don't take it for a message this server re-dated. Refused, nothing
+  // changes, the copy is dropped.
   api.post('/scheduled-messages/:id/send', auth, (req, res) => {
     const r = own(req.params.id, req.userId);
     if (r.status === 'failed') fail(409, 'This one wasn’t sent. Dismiss it and write it again.', 'failed');
     limitMessages(req);
-    const p = prepare(r);
+    const b = req.body || {};
+    let go = r;
+    if (b.ciphertext !== undefined) {
+      const conv = r.channel_id ? requireChannel(r.channel_id, req.userId) : requireDm(r.dm_id, req.userId);
+      validCipher(b.ciphertext);
+      go = { ...r, ...reencrypted(r, b, req, conv) };
+    }
+    const p = prepare(go);
     if (p.gone) fail(404, 'Scheduled message not found.');
     if (p.hold) { mark(r, 'held', p.hold); fail(409, WHY[p.hold], 'held'); }
     if (p.fail) fail(p.fail === 'no_access' ? 404 : 403, WHY[p.fail], p.fail);
     if (p.later) fail(429, `Slowmode is on. You can send another message in ${Math.ceil((p.later - now()) / 1000)}s.`, 'slowmode');
-    res.json({ message: post(r, p) });
+    res.json({ message: post(go, p) });
   });
 
   api.delete('/scheduled-messages/:id', auth, (req, res) => {

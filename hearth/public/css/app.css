@@ -1707,6 +1707,11 @@ html.reduce-motion .pfx { display: none; }
 .head-badge.warn { color: color-mix(in oklab, var(--danger) 80%, var(--text)); background: rgb(239 84 102 / .12); border-color: rgb(239 84 102 / .35); }
 .msg-flag { display: inline-flex; margin-top: 4px; font-size: 11.5px; font-weight: 600; color: var(--muted); padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
 .msg-flag.bad { color: var(--danger); border-color: rgb(239 84 102 / .4); background: rgb(239 84 102 / .08); }
+/* The server may have moved, repeated or rolled back a message (binding.js): yellow, a button that explains why. The
+   text is mixed toward the theme's text colour so it stays readable on light and dark panels alike. */
+.msg-flag.warn { color: color-mix(in oklab, var(--idle) 62%, var(--text)); border-color: color-mix(in srgb, var(--idle) 55%, transparent); background: color-mix(in srgb, var(--idle) 12%, transparent); font-family: inherit; line-height: inherit; cursor: pointer; text-align: left; }
+.msg-flag.warn:hover { background: color-mix(in srgb, var(--idle) 20%, transparent); }
+.bind-list { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
 
 /* settings nav icons + sessions */
 .set-nav-btn { display: flex; align-items: center; gap: 10px; }

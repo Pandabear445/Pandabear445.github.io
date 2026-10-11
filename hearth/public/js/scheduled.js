@@ -11,6 +11,12 @@
 //   - later than that, only when you say so (Send now or a new time): a message sent days late might not be one
 //     you still want to send. Saving an edit of one like that asks too;
 //   - never one scheduled from a session that has been signed out since: that waits for you (Keep, Send now…).
+// The time it goes out is inside it (binding.js ts, so readers' apps can tell a message the server re-dated), so
+// Reschedule and Send now re-encrypt it too: Send now hands the server a copy that says "now" to post at once. Only
+// you change that time (scheduling it, Reschedule, Send now). Every other re-encrypt keeps the one in your own copy,
+// never the time the server says it has (its sendAt): otherwise a server could mark one held and "due", get this app
+// to re-encrypt it saying "now", and post it early with nothing to show for it. One the server has down for earlier
+// than your copy says isn't re-encrypted by itself at all; it waits for you.
 // It only ever re-encrypts from your own copy, never from the ciphertext the server hands back: the server (or
 // someone with a stolen session, who has no identity key) can't make one that opens, so it can't get this app to
 // re-sign a forged message, or one of your old messages under a newer key. One whose copy doesn't open here shows
@@ -33,6 +39,7 @@ import { api } from './api.js';
 import { modal, menu, confirmDialog, showError, field } from './ui.js';
 import { linkedUrls } from './markdown.js';
 import { label as timerLabel } from './disappear.js';
+import { bindingOf, bindScheduled } from './binding.js';
 
 const LATE_OK = 10 * 60 * 1000; // re-encrypted by itself (and sent at once) up to this long after its time
 const MAX_DAYS = 30;
@@ -42,6 +49,9 @@ const HERE_MAX = 100; // ids of scheduled messages this device made, kept per ac
 
 const keyOf = (it) => (it.dmId ? 'd:' + it.dmId : 'c:' + it.channelId);
 const readable = (dec) => !!dec && !dec.error;
+// When it's due: the time inside your own copy (binding.js ts), which only you set. A copy from before that has only
+// the server's time (and gets no time inside when it's re-encrypted, binding.js bindScheduled).
+const dueOf = (it, dec) => (readable(dec) && dec.b && dec.b.ts > 0 ? dec.b.ts : it.sendAt);
 const CANT_CONFIRM = 'This device can’t confirm you scheduled this message, so it won’t re-encrypt it. Cancel it if you don’t recognize it.';
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
@@ -95,6 +105,7 @@ const localInput = (t) => { const d = new Date(t - new Date(t).getTimezoneOffset
 //                              bound to keep = { ref, threadId }, and naming keep.sid inside it (the scheduled
 //                              message's id)
 //   withKeyRetry(serverId, fn) runs fn again once if the server says the key is out of date
+//   clock()                    now, by the server's clock as this app knows it (the time a message says it went out)
 //   refreshTimer(key)          fetches the conversation's disappearing timer (the server said it changed)
 //   placeOf(item)              where it goes: { label, dm } ("#general · Hearth HQ", "Ana", a group's name)
 //   onChange(key)              the list for that conversation changed (the composer bar redraws; the header's ⋯ menu
@@ -146,6 +157,7 @@ export function createScheduled(deps) {
   const waitsForYou = (it, dec) => it.status === 'held' && (it.reason === 'session_ended' || (!!dec && readable(dec) && !trusted(it, dec)));
   const shownDec = (it) => { const o = opened.get(it.id); return o && o.draft === it.draft ? o.dec : null; };
 
+  const clock = () => (deps.clock ? deps.clock() : Date.now());
   const changed = (key) => { deps.onChange(key); if (view && (!view.key || view.key === key)) view.draw(); };
   function apply(it) {
     if (gone.has(it.id)) return;
@@ -166,10 +178,11 @@ export function createScheduled(deps) {
   }
 
   // ------------------------------------------------------------------ opening and re-encrypting
-  // What it says, from your own copy (never from the ciphertext the server holds): { t, f, p?, l?, x?, sid? }, or
+  // What it says, from your own copy (never from the ciphertext the server holds): { t, f, p?, l?, x?, b?, sid? }, or
   // { error: true } when the copy is missing, doesn't open with your keys, or names another scheduled message (a
   // copy of that one, put here). x is the disappearing timer it was written for (seconds), which every re-encrypt
-  // keeps (see reseal); sid, the scheduled message it was sealed for (see the top of this file).
+  // keeps (see reseal); b is where it belongs (binding.js: its id, reply and thread, fixed when it was scheduled);
+  // sid, the scheduled message it was sealed for (see the top of this file).
   async function open(it) {
     const o = opened.get(it.id);
     if (o && o.draft === it.draft) return o.dec;
@@ -178,40 +191,55 @@ export function createScheduled(deps) {
       const p = it.draft && it.ref ? await deps.openDraft(it) : null;
       if (p && typeof p === 'object' && !Array.isArray(p) && (p.sid === undefined || p.sid === it.id)) {
         dec = { t: typeof p.t === 'string' ? p.t : '', f: Array.isArray(p.f) ? p.f : [], ...(p.p && typeof p.p === 'object' ? { p: p.p } : {}), l: Array.isArray(p.l) ? p.l : [],
-          ...(Number.isInteger(p.x) && p.x > 0 ? { x: p.x } : {}), ...(p.sid === it.id ? { sid: it.id } : {}) };
+          ...(Number.isInteger(p.x) && p.x > 0 ? { x: p.x } : {}), ...(bindingOf(p) ? { b: bindingOf(p) } : {}),
+          ...(p.sid === it.id ? { sid: it.id } : {}) };
       }
     } catch { /* doesn't open: can't confirm it's yours */ }
     opened.set(it.id, { draft: it.draft, dec });
     return dec;
   }
-  // New ciphertext for it with the conversation's current keys (and new words, or a new time, if given), always
-  // from your own copy. The poll, files and the link previews whose links are still in the text stay, as when
-  // editing a message. So does the disappearing timer it was written for: sealFor puts the stricter of that and the
-  // conversation's timer now inside it, and the server keeps the same one. A timer turned off or made longer since
-  // never makes it last longer than you wrote it for, so re-encrypting it (by itself after a key change, or for an
-  // edit, Keep or Send now) never needs asking about the timer the way sending a message you wrote earlier does.
+  // New ciphertext for it with the conversation's current keys (and new words, if given), always from your own copy.
+  // The poll, files and the link previews whose links are still in the text stay, as when editing a message. So does
+  // the disappearing timer it was written for: sealFor puts the stricter of that and the conversation's timer now
+  // inside it, and the server keeps the same one. A timer turned off or made longer since never makes it last longer
+  // than you wrote it for, so re-encrypting it (by itself after a key change, or for an edit, Keep or Send now) never
+  // needs asking about the timer the way sending a message you wrote earlier does. Its id, reply and thread stay the
+  // ones it was scheduled with; at is the time it says it goes out (binding.js ts): readers' apps flag one the server
+  // posts more than a few minutes before that, or more than a day after. at: a time you just picked, or now for Send
+  // now; anything else keeps the time in your own copy (dueOf).
   // The new copy names this scheduled message (sid), so your apps re-encrypt it by themselves from then on.
-  // now: if its time has passed, it may go at once (the server refuses otherwise, 409 overdue).
-  async function reseal(it, { text, sendAt, now = false } = {}) {
+  async function sealed(it, { text, at }) {
     const dec = await open(it);
     if (!readable(dec)) throw new Error(CANT_CONFIRM);
     const t = text !== undefined ? text : dec.t || '';
     const still = linkedUrls(t, { skipSpoilers: true });
     const links = (dec.l || []).filter((x) => x && still.includes(x.url));
-    const payload = { t, f: dec.f || [], ...(dec.p ? { p: dec.p } : {}), ...(links.length ? { l: links } : {}) };
-    const patch = async () => api('PATCH', `/scheduled-messages/${it.id}`, {
-      ...(await deps.sealFor(keyOf(it), payload, { ref: it.ref, threadId: it.threadId, x: dec.x || 0, sid: it.id })), ...(sendAt ? { sendAt } : {}), ...(now ? { sendNow: true } : {}),
-    });
-    // Checked against the conversation's disappearing timer as it is now (ttl). Changed meanwhile (409
-    // disappear_changed): fetch it and encrypt again, once.
+    const payload = { t, f: dec.f || [], ...(dec.p ? { p: dec.p } : {}), ...(links.length ? { l: links } : {}),
+      ...bindScheduled(dec.b, { at: at || dueOf(it, dec) }) };
+    return deps.sealFor(keyOf(it), payload, { ref: it.ref, threadId: it.threadId, x: dec.x || 0, sid: it.id });
+  }
+  // request(body) with a freshly sealed copy (sealed above). Checked against the conversation's disappearing timer as
+  // it is now (ttl): changed meanwhile (409 disappear_changed), fetch it and encrypt again, once; the same for a key
+  // that changed under it (withKeyRetry).
+  async function withFresh(it, opts, request) {
+    const once = async () => request(await sealed(it, opts));
     const go = async () => {
-      try { return await patch(); } catch (e) {
+      try { return await once(); } catch (e) {
         if (!(e.status === 409 && e.code === 'disappear_changed') || !deps.refreshTimer) throw e;
         await deps.refreshTimer(keyOf(it));
-        return patch();
+        return once();
       }
     };
-    const fresh = it.serverId ? await deps.withKeyRetry(it.serverId, go) : await go();
+    return it.serverId ? deps.withKeyRetry(it.serverId, go) : go();
+  }
+  // Re-encrypts it in place (PATCH). sendAt: a new time you picked (it says that inside). now: you said Send now, so it
+  // may go at once (the server refuses otherwise, 409 overdue) and says now inside. auto: re-encrypted by itself after
+  // a key change: it may go at once too, if its time has just passed, but keeps the time in your own copy.
+  async function reseal(it, { text, sendAt, now = false, auto = false } = {}) {
+    const at = sendAt || (now ? clock() : null);
+    const fresh = await withFresh(it, { text, at }, async (body) => api('PATCH', `/scheduled-messages/${it.id}`, {
+      ...body, ...(sendAt ? { sendAt } : {}), ...(now || auto ? { sendNow: true } : {}),
+    }));
     apply(fresh);
     return fresh;
   }
@@ -222,9 +250,13 @@ export function createScheduled(deps) {
   // doesn't name it (it could be a copy of one you already sent or cancelled, put back): you confirm those yourself.
   // A try turned away as signed out (401) isn't held against it: the news that it's held can arrive just before this
   // tab has the new token, and it's tried again when the app reconnects with it (load).
+  // "Its time" is the one in your own copy (dueOf), not the server's: one due more than 10 minutes ago by your copy
+  // waits for you, and so does one the server has down for earlier than your copy says (only a server re-dating it
+  // does that; slow mode and retries only ever make it later). A server that marks one held and "due" therefore gets
+  // either nothing or a copy that still says when you scheduled it, which readers' apps flag if it goes out early.
   async function fixHeld({ force = false } = {}) {
     for (const it of [...items.values()]) {
-      if (it.status !== 'held' || it.reason === 'session_ended' || busy.has(it.id) || it.sendAt < Date.now() - LATE_OK) continue;
+      if (it.status !== 'held' || it.reason === 'session_ended' || busy.has(it.id)) continue;
       if (!force && tried.get(it.id) === it.ciphertext) continue;
       busy.add(it.id);
       try {
@@ -235,44 +267,51 @@ export function createScheduled(deps) {
           changed(keyOf(it));
           continue;
         }
-        await reseal(it, { now: true });
+        const due = dueOf(it, dec);
+        if (readable(dec) && (due < clock() - LATE_OK || it.sendAt < due)) continue;
+        await reseal(it, { auto: true });
         tried.delete(it.id);
       } catch (e) { if (!e || e.status !== 401) tried.set(it.id, it.ciphertext); } finally { busy.delete(it.id); }
     }
   }
 
+  // The time in your own copy, when it's open on this device and has one (else null).
+  function ownTime(it) {
+    const o = opened.get(it.id);
+    return o && o.draft === it.draft && readable(o.dec) && o.dec.b && o.dec.b.ts > 0 ? o.dec.b.ts : null;
+  }
+
   // ------------------------------------------------------------------ actions
-  // One whose time has passed goes out as soon as it's re-encrypted (the server does that by itself), so only one
-  // still ahead needs asking for.
+  // Re-encrypted with the moment it really goes out (binding.js ts), so readers' apps don't take it for a message the
+  // server re-dated, and handed over with "send it now": the server posts that copy, or, if it can't go now (slow mode,
+  // lost permission…), says why and leaves the scheduled one exactly as it was.
   async function sendNow(it) {
-    const go = async (x) => { if (x.sendAt > Date.now()) await api('POST', `/scheduled-messages/${x.id}/send`); };
+    const cur = items.get(it.id) || it;
     try {
-      if (it.status === 'held') await go(await reseal(it, { now: true }));
-      else {
-        try { await api('POST', `/scheduled-messages/${it.id}/send`); } catch (e) {
-          if (e.code !== 'held') throw e;
-          await go(await reseal(items.get(it.id) || it, { now: true }));
-        }
-      }
+      await withFresh(cur, { at: clock() }, async (body) => api('POST', `/scheduled-messages/${cur.id}/send`, body));
       toast('Sent.');
     } catch (e) {
       // Already gone out meanwhile (its time came while it was being re-encrypted).
       if (e.status === 404 && !items.has(it.id)) toast('Sent.'); else toast(e.message, 'error');
     }
   }
+  // Always re-encrypted: the time it goes out is inside it (binding.js ts).
   async function reschedule(it, sendAt) {
     try {
-      if (it.status === 'held') await reseal(it, { sendAt });
-      else apply(await api('PATCH', `/scheduled-messages/${it.id}`, { sendAt }));
+      await reseal(it, { sendAt });
       toast(`Rescheduled for ${whenPhrase(sendAt)}.`);
     } catch (e) { toast(e.message, 'error'); }
   }
   // Its time has passed while it was held: going on (keeping it, or saving an edit) would send it at once, so ask
-  // first. then({ now: true }) or then({ sendAt }).
+  // first. then({ now: true }) or then({ sendAt }). The server decides that its time has passed (it refuses to post an
+  // overdue one otherwise); when your own copy says a later time, that's said too.
   function askLate(it, then) {
+    const due = ownTime(it);
     modal({
       title: 'Its time has passed', size: 'sm',
-      body: h('p', { class: 'muted-p' }, `It was due ${whenPhrase(it.sendAt)}. Send it now, or pick a new time?`),
+      body: h('p', { class: 'muted-p' }, `It was due ${whenPhrase(it.sendAt)}.`,
+        due && due > it.sendAt + MIN ? ` (You scheduled it for ${whenPhrase(due)}: your server has an earlier time for it.)` : '',
+        ' Send it now, or pick a new time?'),
       actions: [{ label: 'Cancel' },
         { label: 'Pick a new time', action: () => { customTime((t) => then({ sendAt: t }), { title: 'Pick a new time', current: null }); } },
         { label: 'Send now', kind: 'primary', action: () => { then({ now: true }); } }],
@@ -431,9 +470,16 @@ export function createScheduled(deps) {
     // Why this device can't confirm it: every message your apps schedule carries a copy only your keys open.
     const doubt = dec && !readable(dec) && it.status !== 'failed'
       ? h('p', { class: 'sched-note bad' }, 'Each message your apps schedule carries a copy that only your own keys open, and this one’s doesn’t open here, so it isn’t re-encrypted or changed from here. If you didn’t schedule it, cancel it and sign out the sessions you don’t recognize (Settings → Signed-in devices).')
-      // Why it waits: your words, but this device can't tell they're still meant to go (see the top of this file).
-      : unbound ? h('p', { class: 'sched-note' }, 'Your app re-encrypts a scheduled message by itself only on the device that scheduled it, or once you’ve confirmed it, so this one waits for you. Keep it if you still want it sent. If you already sent or cancelled these words, cancel it and sign out the sessions you don’t recognize (Settings → Signed-in devices).')
-        : null;
+      : null;
+    // Why it waits: your words, but this device can't tell they're still meant to go (see the top of this file).
+    const waits = unbound
+      ? h('p', { class: 'sched-note' }, 'Your app re-encrypts a scheduled message by itself only on the device that scheduled it, or once you’ve confirmed it, so this one waits for you. Keep it if you still want it sent. If you already sent or cancelled these words, cancel it and sign out the sessions you don’t recognize (Settings → Signed-in devices).')
+      : null;
+    // The server has it down for earlier than you scheduled it (it only ever makes one later by itself: slow mode).
+    const own = it.status !== 'failed' ? ownTime(it) : null;
+    const moved = own && it.sendAt < own - MIN
+      ? h('p', { class: 'sched-note bad' }, `You scheduled it for ${whenPhrase(own)}, but your server has an earlier time for it. Your app won’t re-encrypt it by itself, and if it goes out early, everyone’s apps flag it. Reschedule it, send it now or cancel it.`)
+      : null;
     const where = all ? deps.placeOf(it) : null;
     return h('li', { class: `sched-item ${it.status}`, dataset: { sid: it.id } },
       h('div', { class: 'sched-head' }, icon(it.status === 'failed' ? 'ban' : 'clock'), h('strong', { class: 'sched-when' }, when),
@@ -443,7 +489,7 @@ export function createScheduled(deps) {
         it.ttl > 0 ? h('span', { class: 'sched-tag', title: 'Disappearing messages: it disappears this long after it\u2019s sent, or sooner if the conversation\u2019s timer is shorter by then.' }, `Disappears after ${timerLabel(it.ttl).toLowerCase()}`) : null),
       where ? h('button', { class: 'link-btn sched-where', type: 'button', onclick: () => { close(); deps.openKey(keyOf(it)); } }, where.label) : null,
       body,
-      doubt || (it.note && it.status !== 'pending' ? h('p', { class: `sched-note${it.status === 'failed' ? ' bad' : ''}` }, it.note) : null),
+      doubt || moved, waits, doubt || waits ? null : (it.note && it.status !== 'pending' ? h('p', { class: `sched-note${it.status === 'failed' ? ' bad' : ''}` }, it.note) : null),
       h('div', { class: 'sched-actions' }, actions));
   }
 

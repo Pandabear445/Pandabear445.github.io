@@ -2678,7 +2678,77 @@ async function nicknames(t) {
   await bob.noModals();
 }
 
-// ------------------------------------------------------------------ 27. reset without a recovery key (crypto-2)
+// ------------------------------------------------------------------ 27. a message the server moved, repeated or rolled back
+// Each message carries its own id, what it replies to, its thread, its time and its edit count inside the encryption
+// (public/js/binding.js). Nothing the earlier flows did in #general is flagged (edits, replies, threads, scheduled
+// messages sent now, late or re-encrypted after a key change). Then the test plays a malicious server in the
+// database: it moves a reply under another message, re-dates one, posts one again under a new id and serves another
+// from before its edit. After a reload, Bob's app shows one small yellow flag on each, whose details say which check
+// failed; everything else stays unflagged. Deleting one of the two copies clears the other's flag.
+async function messageBinding(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.message('Nickname check: quince').first().waitFor();
+  check(!(await bob.$('#messages .msg-flag.warn').count()), 'No message should be flagged before anything was tampered with.');
+  check(!(await alice.$('#messages .msg-flag.warn').count()), 'No message should be flagged on Alice’s side either.');
+
+  await bob.send('Binding: walnut');
+  await bob.send('Binding: hazel');
+  const walnut = alice.message('Binding: walnut').first();
+  await walnut.hover();
+  await walnut.locator('button[aria-label="Reply"]').click();
+  await alice.send('Binding reply: pecan');
+  await alice.send('Binding: chestnut');
+  const idOf = async (p, text) => p.message(text).first().getAttribute('data-mid');
+  const ids = { walnut: await idOf(alice, 'Binding: walnut'), hazel: await idOf(alice, 'Binding: hazel'), pecan: await idOf(alice, 'Binding reply: pecan'), chestnut: await idOf(alice, 'Binding: chestnut') };
+  const before = t.server.rows('SELECT ciphertext FROM messages WHERE id = ?', ids.chestnut)[0].ciphertext;
+  await alice.messageAction('Binding: chestnut', 'Edit message');
+  const box = alice.$('#messages textarea.edit-input');
+  await box.fill('Binding: chestnut, edited');
+  await box.press('Enter');
+  await bob.message('Binding: chestnut, edited').locator('.edited').waitFor(); // Bob's app has seen the edit
+  await bob.message('Binding reply: pecan').locator('.msg-reply .reply-text', { hasText: 'Binding: walnut' }).waitFor();
+  check(!(await bob.$('#messages .msg-flag.warn').count()), 'Sending, replying and editing should flag nothing.');
+
+  // The server's operator goes to work.
+  t.server.sql('UPDATE messages SET reply_to = ? WHERE id = ?', ids.hazel, ids.pecan);
+  t.server.sql('UPDATE messages SET created_at = created_at - ? WHERE id = ?', 3 * 3600000, ids.hazel);
+  const copy = Date.now().toString(36).padStart(9, '0') + crypto.randomBytes(5).toString('hex');
+  t.server.sql(`INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id)
+    SELECT ?, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id FROM messages WHERE id = ?`, copy, ids.walnut);
+  t.server.sql('UPDATE messages SET ciphertext = ? WHERE id = ?', before, ids.chestnut);
+  await bob.page.reload();
+  await bob.waitApp();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const flagOf = (text) => bob.message(text).locator('.msg-flag.warn');
+  await flagOf('Binding reply: pecan').waitFor();
+  const tip = async (text, n = 0) => (await flagOf(text).nth(n).getAttribute('data-tip')) || '';
+  check(/reply to a different message/.test(await tip('Binding reply: pecan')), `The flag on the moved reply should say so (it says “${await tip('Binding reply: pecan')}”).`);
+  check(/time doesn.t match.*about 3 hours earlier/.test(await tip('Binding: hazel')), `The re-dated message should be flagged for its time (“${await tip('Binding: hazel')}”).`);
+  check((await bob.message('Binding: walnut').count()) === 2 && (await flagOf('Binding: walnut').count()) === 2, 'Both copies of the repeated message should be flagged.');
+  check(/appears here twice/.test(await tip('Binding: walnut', 1)), `The copies should be flagged as repeated (“${await tip('Binding: walnut', 1)}”).`);
+  check(/older version/.test(await tip('Binding: chestnut')), `The message served from before its edit should be flagged (“${await tip('Binding: chestnut')}”).`);
+  check(await bob.$('#messages .msg-flag.warn').count() === 5, `Only the five tampered messages should be flagged (${await bob.$('#messages .msg-flag.warn').count()} are).`);
+  // The flag is a button: its details open in a dialog (for keyboards and touch screens too).
+  await flagOf('Binding reply: pecan').click();
+  const why = await bob.dialog('This message may have been tampered with');
+  await why.locator('li', { hasText: 'reply to a different message than the one shown' }).waitFor();
+  await why.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  // One of the two copies is deleted (Bob wrote it, so he can): the one left behind is no longer flagged as repeated.
+  await bob.messageAction('Binding: walnut', 'Delete message');
+  await bob.modal('Delete message?').locator('.modal-foot .btn.danger').click();
+  for (const until = Date.now() + 10000; (await bob.message('Binding: walnut').count()) !== 1 || (await flagOf('Binding: walnut').count()); await new Promise((r) => setTimeout(r, 100))) {
+    check(Date.now() < until, `Once one copy is deleted, the other should no longer be flagged (${await bob.message('Binding: walnut').count()} left, ${await flagOf('Binding: walnut').count()} flagged).`);
+  }
+  check(await bob.$('#messages .msg-flag.warn').count() === 3, 'The other three tampered messages should still be flagged.');
+}
+
+// ------------------------------------------------------------------ 28. reset without a recovery key (crypto-2)
 // New keys from an email link alone are held back until someone who knew the person checks them: her app says why,
 // she can't invite anyone meanwhile, a member sees the badge, compares safety numbers and verifies her, and then she
 // reads and writes again.
@@ -2807,5 +2877,6 @@ export const FLOWS = [
   ['voice chat: open beside the call, both ways, a picture link from another site waits for a click, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
   ['send later: schedule from the send button, edit, reschedule and send now from the list; cancel one in a DM; re-encrypted by itself when the key changes, never from a copy it can’t confirm; a signed-out session’s message waits for Keep; overdue ones ask first', sendLater],
   ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
+  ['message binding: nothing earlier flagged; a reply moved, a message re-dated, replayed and rolled back in the database are each flagged after a reload, with details; deleting a copy clears the other', messageBinding],
   ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
 ];

@@ -79,24 +79,25 @@ encryption").
 
 (The last column counts findings closed by that batch, in full or part: 106 in all. A batch also fixed findings
 from other areas, e.g. `auth` fixed `admin-1` and `admin-3`. The 18 findings documented and 3 deferred then belong to
-no batch; five of them (`auth-6`, `auth-11`, `xss-7`, `xss-8` and `crypto-2`) were fixed or partly fixed later, in
-1.29.0 (§3, §5).)
+no batch; six of them (`auth-6`, `auth-11`, `xss-7`, `xss-8`, `crypto-2` and `crypto-7`) were fixed or partly fixed
+later, in 1.29.0 (§3, §5).)
 
 ## 3. Results at a glance
 
 | Status | Count | Meaning |
 |---|---|---|
 | Fixed | 82 | The problem is closed in code and a test proves it. |
-| Partly fixed | 29 | The confirmed problem is closed; a remaining part was deferred (§5). |
+| Partly fixed | 30 | The confirmed problem is closed; a remaining part was deferred (§5). |
 | Documented | 14 | No code change: the docs now say what the code does (overclaims corrected, limitations stated). |
-| Deferred | 2 | Not changed; documented as a limit (`crypto-7`, `admin-12`). |
+| Deferred | 1 | Not changed; documented as a limit (`admin-12`). |
 | **Total** | **127** | |
 
 By severity: 8 high (6 fixed, 2 partly fixed), 47 medium (36 fixed, 11 partly fixed), 67 low (39
-fixed, 14 partly fixed, 12 documented, 2 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
+fixed, 15 partly fixed, 12 documented, 1 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
 vulnerabilities, 38 bugs, 19 overclaims, 14 limitations, 13 hardening, 3 performance. Since 1.28.0 (in 1.29.0):
-`auth-6`, `auth-11`, `xss-8` and `data-4` are fixed, and `xss-7` and `crypto-2` partly fixed (they were documented,
-deferred or partly fixed); `files-6`, `files-10` and `crypto-8` stay partly fixed, with more of each done (§5).
+`auth-6`, `auth-11`, `xss-8` and `data-4` are fixed, and `xss-7`, `crypto-2` and `crypto-7` partly fixed (they were
+documented, deferred or partly fixed); `files-6`, `files-10` and `crypto-8` stay partly fixed, with more of each done
+(§5).
 
 All fixes are **implemented**. Every fixed or partly fixed finding with a proving test below is **tested locally**
 (§6: 357 of 358 tests passed, 1 skipped) and **tested in CI** in the `tests` job at `dec63ee`, except the parts
@@ -136,7 +137,7 @@ where the docs now state the behaviour.
 | crypto-4 | medium | bug | After someone deletes their account, the other person can no longer read any of their DMs, and all their channel messages show 'could not be verified' | Fixed | `crypto-hardening.test.js` |
 | crypto-5 | low | overclaim | The server alone decides the key epoch: a key handoff from a non-member is accepted, rotation can be suppressed or rolled back, and the 'watch the member list' advice doesn't hold | Partly fixed | `crypto-hardening.test.js` |
 | crypto-6 | low | overclaim | The server can post plaintext 'legacy' channel messages as any member; they are shown as verified with only an 'Older message' label | Fixed | `crypto-hardening.test.js` |
-| crypto-7 | low | overclaim | Ciphertext isn't bound to message id, reply, thread, time or edit version: the server can replay, re-thread and undo edits | Deferred | — (SECURITY.md §1, §4; README) |
+| crypto-7 | low | overclaim | Ciphertext isn't bound to message id, reply, thread, time or edit version: the server can replay, re-thread and undo edits | Partly fixed (binding done since: §5) | `message-binding.test.js`, e2e › message binding |
 | crypto-8 | low | hardening | /bootstrap gives any session the password-wrapped identity key and its salt, and there is no way to rotate the identity key after a compromise | Partly fixed (copies pruned since: §5) | `crypto-hardening.test.js`, `data-hardening.test.js` |
 | crypto-9 | low | overclaim | The server learns which GIFs people send and view in end-to-end encrypted chats | Documented | — (SECURITY.md §4; README (GIFs)) |
 | crypto-10 | low | bug | Recall sync stops at 5000 items; on a new device this can overwrite the study profile and delete pictures | Fixed | `data-hardening.test.js` |
@@ -296,7 +297,6 @@ where the docs now state the behaviour.
 
 | ID | What stays | Why |
 |---|---|---|
-| crypto-7 | A message's id, reply, thread, time and edit version are not inside the ciphertext, so the server can replay, re-thread, re-date or roll back an edit. | A protocol change with false-positive risk (the server legitimately clears a reply whose target is gone). The recorded design adds a client UUID, reply, thread, time and edit counter to the encrypted payload, backward compatible, with a "may have been moved" flag. |
 | admin-12 | Refunds and chargebacks don't reduce supporter time; a one-off payment can give up to 400 days. | Needs product decisions (partial refunds, Ko-fi has no refund webhook) and a schema change to store charge ids. The manual workaround (unmark in Admin → Users) is logged. |
 
 **Deferred parts of partly fixed findings**
@@ -311,6 +311,7 @@ where the docs now state the behaviour.
 | authz-13 | A kicked (not banned) member's invite links keep working. | Revoking them would silently break links shared legitimately; owners can now list and revoke any link. |
 | crypto-3 | `keyState` is not paged. | Growth is now bounded (strict 600-character bundles, rotation limits); paging fits the message-pagination work. |
 | crypto-5 | The member list isn't bound into a key handoff, and nothing stops a rollback across page reloads. | A persisted maximum epoch would lock everyone out after a legitimate backup restore until an admin restore flow exists. |
+| crypto-7 | Done since (1.29.0, `public/js/binding.js`): every new message carries a random id, its reply, its thread, its time and an edit count inside the encrypted payload, and readers' apps flag one the server moved, re-dated, showed twice or served from before an edit. What stays: it's detection, not prevention; messages from older apps carry none of it; a rollback is caught only by a device that saw the newer edit (each device remembers at most 2000 edited messages, the author with the most entries losing their oldest first, so a server with very many accounts can still wear that down), and a replay only while both copies are loaded; a reply shown without its original reads as "no longer available", not as moved, only if the server also denies that original to the app's lookup (a thread reply shown outside its thread is always flagged: this server never does that by itself); the time check trusts the clock correction the server gives the sender's app at start-up (clamped to a day; a device further off is warned), and allows a scheduled message a day's lateness; a scheduled message's time comes only from its sender (their own copy, a time they pick, Send now), never from the server, but its `sch` mark tells every recipient's app it was scheduled and when it was due. | A device-local check can't know what it never saw; syncing edit counts between devices goes through the server it guards against. Older apps' messages can't be bound after the fact. The lateness a scheduled message is allowed needs a mark readers can see. |
 | crypto-8 | Done since (1.29.0): pre-upgrade database copies are pruned once an upgrade goes through, keeping the newest `PRE_UPGRADE_KEEP` (3 by default; `0` keeps all), never the one that upgrade made, and only files named exactly as Hearth names them. What stays: no "replace my identity key" feature; the copies aren't encrypted. | A new user-facing feature. The copies are plain SQLite files like `data/hearth.db` beside them, so a key on the same disk would add little; the encrypted backups are the copies meant to leave the machine. |
 | crypto-11 | A contact's first signing key is still pinned silently. | Flagging it would show a false "security key changed" for every contact of every older account. Uploads now need proof of possession. |
 | crypto-13 | No "new members can't read history" option; file blobs aren't padded. | Product decisions, and padding needs a versioned blob format. Same-account rejoin now forces a new key. |
@@ -448,8 +449,10 @@ handles metadata.
 The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 
 1. **A malicious or compromised server** can serve modified app code (web, desktop and Android all load it), add
-   hidden members or call listeners, hold back or roll back key changes across reloads, and replay or re-thread
-   messages. End-to-end encryption protects stored data, not a hostile host.
+   hidden members or call listeners, hold back or roll back key changes across reloads, and withhold messages.
+   Apps flag a message it replays, re-threads, re-dates or rolls back to before an edit (`crypto-7`, 1.29.0), on
+   messages from apps with that change and within the limits in §5. End-to-end encryption protects stored data,
+   not a hostile host.
 2. **Email takeover without 2FA** gets the account with new keys. Since `crypto-2` those get no server's or group's
    key, and can't bring anyone in there, until a member of it who knew the person verifies them (a member's word only
    counts where they're a member); but anyone whose device never saw the old key still writes new direct messages to
@@ -484,8 +487,8 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 4. Done: step-up always asks for a fresh code (`auth-6`; only starting a data export and clearing unused files keep
    the 10-minute grace), and a password change, turning on 2FA and "log out all other devices" with the password
    give the current session a new token (`auth-11`).
-5. Bind message id, reply, thread, time and edit version into the ciphertext (`crypto-7`), and the member list into
-   key handoffs (`crypto-5`).
+5. Done in 1.29.0 (in part, see §5): message id, reply, thread, time and edit version are bound into the ciphertext
+   (`crypto-7`). Still to do: bind the member list into key handoffs (`crypto-5`).
 6. Partly done: a reset account is kept out of each server's and group's key sharing, invites and group adds until a
    member there (or an instance admin) verifies it (`crypto-2`). Left: direct messages and calls, and resets from
    before 1.29.0.

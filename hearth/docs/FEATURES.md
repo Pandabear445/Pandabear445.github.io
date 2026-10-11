@@ -992,8 +992,17 @@ composer in `public/js/app.js` (`sendLater`, `sealFor`, `sendTo`). Schema: the `
    Recall use, which only the account's identity key derives), bound to `ref` (16 random bytes the app picks), the
    conversation and the thread. It posts `{ ciphertext, epoch, ref, draft, sendAt, replyTo, threadId, files,
    mentions, everyone }` to `POST /channels/:id/scheduled-messages` (or `{ ciphertext, ref, draft, sendAt, replyTo,
-   files }` to `POST /dms/:id/scheduled-messages`). Nothing in the format binds the message id or time (see
-   ARCHITECTURE.md §4), so the stored ciphertext is a valid message whenever it goes out.
+   files }` to `POST /dms/:id/scheduled-messages`). Inside the payload, `sendOnce` puts where it belongs (`binding.js`,
+   ARCHITECTURE.md §4): a new id `u`, `r` and `th`, and `ts` = its due time with `sch: 1`. Readers' apps flag one
+   posted more than 10 minutes before that or more than a day after (the server's own limit for posting late), so
+   every change of when it goes that the sender makes re-encrypts it (Reschedule: `ts` = the new time; Send now:
+   `ts` = now). Every other re-encrypt (an edit, Keep, one done by itself after a key change) keeps the `ts` of the
+   sender's own copy, never the server's `sendAt`, and its `u`, `r` and `th` stay those of that copy (a copy from
+   before these fields gets none: nothing of the server's is signed in). A held one is re-encrypted by itself only
+   while its copy's time is ahead or less than 10 minutes past and the server's `sendAt` isn't earlier than it (the
+   server only ever moves one later: slow mode, a retry); otherwise it waits for the sender, and the list says when
+   the server has an earlier time than the one they picked. Because of `sch`, every recipient's app can tell the
+   message was scheduled, and when it was due.
 3. Scheduling is checked like sending: you can see and post in the channel (Send Messages, Attach Files for
    files, Create Threads for a thread), aren't timed out, and the key epoch is current (409 `stale-key`
    otherwise, which the app's usual retry handles); in a DM, no block either way and the other account exists.
@@ -1126,7 +1135,7 @@ files as "Waiting with a scheduled message (due …)", and the admin storage rep
 | `POST /channels/:id/scheduled-messages` | can post in the channel, not timed out | see above; 30/min, plus the message limits |
 | `POST /dms/:id/scheduled-messages` | your DM, no block, the other account exists | see above |
 | `PATCH /scheduled-messages/:id` `{ sendAt?, ciphertext?, draft?, epoch?, ttl?, mentions?, everyone?, sendNow? }` | your own, the conversation still yours | new ciphertext needs its new `draft` (400 `draft`), replaces `mentions` and `everyone` (missing means none) and the session, keeps the stricter of its `ttl` and the conversation's timer now (`ttl` checked, 409 `disappear_changed`), and makes a held one pending; a held one whose time has passed needs `sendNow: true` or a `sendAt` with it (409 `overdue`); a held one can't just be rescheduled (409 `held`); a failed one can't be changed (409 `failed`); 60/min |
-| `POST /scheduled-messages/:id/send` | your own | sends now with the same checks; a refusal is answered (403, 404, 429 `slowmode`) and the message left as it was; 409 `held` marks it held |
+| `POST /scheduled-messages/:id/send` `{ ciphertext?, epoch?, ttl?, mentions?, everyone? }` | your own | sends now with the same checks; a refusal is answered (403, 404, 429 `slowmode`) and the message left as it was; 409 `held` marks it held. With new ciphertext (checked like a `PATCH`: current epoch, the other person's key, the timer), that copy is posted instead; the app always sends one, saying "now" inside (`binding.js`), so readers don't take it for a message the server posted early. Refused, the copy is dropped and nothing changes |
 | `DELETE /scheduled-messages/:id` | your own | cancels or dismisses; its files are deleted; 120/min |
 
 Anyone else's id (or a malformed one) answers 404 "Scheduled message not found.", like one that doesn't exist.
@@ -1190,15 +1199,26 @@ deletes its scheduled messages and their files at once.
   overdue: after a reload her app leaves it alone, the bar says it's waiting for her, the card says "was due today
   at …", saving an edit asks "Its time has passed" (and Cancel leaves it unsent), and **Keep** → **Send now** sends
   it to Bob.
+- `test/message-binding.test.js` (where a message belongs, crypto-7): posted at its time, a day late, or replying to
+  a message deleted before it went: no flag; the old copy posted two hours early by a plain `POST …/send`, or more
+  than a day late, flagged; `POST …/send` with a fresh copy posts that copy (the same `u`, no flag), and a refusal
+  (slow mode, a bad copy, a stale epoch, someone else's message) leaves the scheduled one exactly as it was. The
+  sender's `scheduled.js` (run in Node): a server that marks one held and "due now" (or due earlier than the copy
+  says) gets no re-encrypt; one it says is due three days late is re-encrypted with the copy's own time, so posting
+  it then is flagged; one just past its time keeps that time; one hours past waits; a copy from before these fields
+  gets no binding. The browser flow "message binding" checks that nothing the send-later flow sent is flagged.
 
 **Known limitations**
 
 - The server learns, ahead of time, that a message is coming, where, when, its size, and when and from which
   session it was written or edited. It holds a valid, signed message until the time, and is trusted to send it then
-  (not earlier, later or twice: the time and id aren't signed, as for any message) and to really delete one that's
-  cancelled. A dishonest server that kept a cancelled one (its ciphertext and the sender's copy) could bring it
-  back into the same conversation and thread, and after a key change the sender's app would re-encrypt it if it
-  were due within minutes. Holding a signed-out session's messages is the server's doing too: it protects against
+  and to really delete one that's cancelled. Since 1.29.0 the time it should go is inside it (`binding.js`), so
+  readers' apps flag one posted more than 10 minutes early or more than a day late, or twice while both copies are
+  loaded; within that day it can still hold one back, and it can't get the sender's app to put another time inside
+  (that time only ever comes from the sender's own copy or their own Reschedule or Send now). Recipients' apps can
+  tell a message was scheduled and when it was due (`sch`). A dishonest server that kept a cancelled one (its
+  ciphertext and the sender's copy) could bring it back into the same conversation and thread, and after a key
+  change the sender's app would re-encrypt it if it were due within minutes. Holding a signed-out session's messages is the server's doing too: it protects against
   a stolen session token, not against the server.
 - A message held because of a key change goes out late if the sender's app isn't opened before its time; over 10
   minutes late, the app asks before sending it.

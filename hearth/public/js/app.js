@@ -42,6 +42,7 @@ import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './a
 import { createDrafts, clearAllDrafts, clearLocalCopies, expireLocalCopies, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
 import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineParts, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer, stricter as stricterTimer } from './disappear.js';
 import { createScheduled } from './scheduled.js';
+import { bindNew, bindEdit, describe as describeBinding, createVersions, createCopies, createOriginals, noteMessage, bindingState } from './binding.js';
 import { trackViewport } from './viewport.js';
 import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel, onlyPresenceChanged } from './presence.js';
 
@@ -448,6 +449,8 @@ async function signOutHere() {
   clearLocalCopies();
   SCHED.reset();
   sec.reset();
+  copies.clear();
+  originals.clear();
   await E2EE.clearKeys();
   clearLocalCopies();
   lsCache.clear();
@@ -963,13 +966,23 @@ function rememberE2eeSince(t) {
   return out;
 }
 
+let clockWarned = false;
 async function loadBootstrap() {
   // Read markers, notification preferences and saved ids come alongside, so unread badges are right at start.
   const extras = Promise.all(['/me/unread', '/me/notify', '/me/saved/ids'].map((p) => api('GET', p).catch(() => null)));
   const asked = Date.now();
   const b = await api('GET', '/bootstrap');
-  // How far this device's clock is from the server's (at most a day either way), for disappearing messages.
-  if (Number.isFinite(b.serverNow)) S.clockOffset = Math.max(-86400000, Math.min(86400000, b.serverNow - Math.round((asked + Date.now()) / 2)));
+  // How far this device's clock is from the server's (at most a day either way), for disappearing messages and the
+  // time inside each message you send (binding.js ts). Further off than that, the times inside your messages are off
+  // too, and everyone's apps would flag them: say so, once.
+  if (Number.isFinite(b.serverNow)) {
+    const off = b.serverNow - Math.round((asked + Date.now()) / 2);
+    S.clockOffset = Math.max(-86400000, Math.min(86400000, off));
+    if (Math.abs(off) > 86400000 && !clockWarned) {
+      clockWarned = true;
+      setTimeout(() => toast(`This device’s clock is off by about ${Math.round(Math.abs(off) / 86400000)} day${Math.round(Math.abs(off) / 86400000) === 1 ? '' : 's'}. Set it right in its settings: until then, other people’s apps may flag the messages you send for their time.`, 'error'), 1500);
+    }
+  }
   S.me = b.me;
   drafts = createDrafts(S.me.id);
   S.mediaToken = b.mediaToken;
@@ -3330,6 +3343,76 @@ function jumpToLatest() {
 async function decryptMessage(m) {
   if (m.dmId) await sec.decryptDmMessage(m);
   else await sec.decryptChannelMessage(m);
+  noteBinding(m);
+}
+
+// ---- where a message belongs (binding.js, crypto-7): its id, reply, thread, time and edit count are inside it
+// The highest edit of each message this device has shown (kept across reloads), and the ids each message has
+// shown up under this session.
+const versions = createVersions({ getItem: (k) => localStorage.getItem(k), setItem: (k, v) => localStorage.setItem(k, v) },
+  () => (S.me && S.me.id ? 'hearth.msgv.' + S.me.id : ''));
+const copies = createCopies();
+// Called for every message as it's decrypted (binding.js noteMessage): a second id for the same message, or a newer
+// edit, redraws the other copies too, so each of them carries the flag.
+function noteBinding(m) {
+  for (const id of noteMessage(m, keyOfMessage(m), { versions, copies })) { const x = loadedMessage(id); if (x) later(() => replaceMessageEl(x)); }
+}
+// A message loaded anywhere in this conversation: its list, a thread, a thread's first message.
+function loadedMessage(id) {
+  for (const st of Object.values(S.msgs)) { const m = st && st.list && st.list.find((x) => x.id === id); if (m) return m; }
+  return findThreadMessage(id);
+}
+// Is a message with this id loaded in this conversation (and not disappeared)? A reply the server left out while the
+// original is right here was taken away, not lost.
+function loadedAlive(key, id) {
+  const t = nowServer();
+  const ok = (x) => !!x && x.id === id && !isExpired(x, t);
+  const st = S.msgs[key];
+  if (st && st.list.some(ok)) return true;
+  return Object.values(S.threads).some((th) => th.root && keyOfMessage(th.root) === key && (ok(th.root) || th.list.some(ok)));
+}
+// Replied-to messages that aren't loaded here, asked of the server once each (the lookup message links use): one it
+// can still find was taken away from the reply, not lost (binding.js createOriginals). Gone or not yours to see is
+// "gone"; no answer (offline, rate limited) is asked again the next time the reply is drawn.
+const originals = createOriginals(async (id) => {
+  try { await api('GET', `/messages/${encodeURIComponent(id)}/locate`); return true; } catch (e) {
+    if (e.status === 404 || e.status === 403) return false;
+    throw e;
+  }
+});
+// The loaded replies to that message, drawn again (it turned out to be still there: they're flagged now).
+function redrawRepliesTo(id) {
+  const all = [...Object.values(S.msgs).flatMap((st) => (st && st.list) || []), ...Object.values(S.threads).flatMap((th) => [th.root, ...(th.list || [])])];
+  for (const x of all) if (x && x.dec && x.dec.b && x.dec.b.r === id) later(() => replaceMessageEl(x));
+}
+// { issues, notes, … } for a message (binding.js bindingState), or null when it carries nothing to check. A reply
+// shown without its original, which isn't loaded here, says "no longer available" until the server is asked whether
+// that original is still there; if it is, the reply is flagged instead.
+function bindingOfMessage(m) {
+  const key = keyOfMessage(m);
+  const st = bindingState(m, key, { versions, copies, present: (id) => originals.found(id) || loadedAlive(key, id) });
+  if (st && st.notes.includes('replyGone')) originals.ask(st.b.r, () => redrawRepliesTo(st.b.r));
+  return st;
+}
+// Messages deleted or disappeared no longer count as copies of another: what's left of them is drawn again.
+function forgetBindings(key, gone) {
+  for (const id of copies.drop(key, gone)) { const x = loadedMessage(id); if (x) later(() => replaceMessageEl(x)); }
+}
+// The one small flag for a message the server may have moved, repeated or rolled back, naming what didn't match.
+function bindingFlag(m, st) {
+  const lines = describeBinding(st.issues, { m, b: st.b, copies: st.copies, top: st.top });
+  const label = 'The server may have moved, repeated or rolled back this message';
+  return h('button', {
+    type: 'button', class: 'msg-flag warn', 'data-tip': lines.join(' '), 'aria-label': `${label}. ${lines.join(' ')}`,
+    onclick: () => modal({
+      title: 'This message may have been tampered with', size: 'sm',
+      body: h('div', { class: 'stack' },
+        h('p', { class: 'muted-p' }, 'Its sender’s app put where it belongs, when it was sent and its edit count inside the encrypted message. What this server says about it doesn’t match:'),
+        h('ul', { class: 'bind-list' }, lines.map((l) => h('li', null, l))),
+        h('p', { class: 'field-hint' }, 'The words are the sender’s (the server can’t change those), but the server may have shown them somewhere else, at another time, more than once, or from before an edit. If it keeps happening, tell the server’s owner.')),
+      actions: [{ label: 'OK', kind: 'primary' }],
+    }),
+  }, '⚠ ', label);
 }
 async function decryptAll(key) {
   const store = S.msgs[key];
@@ -3669,6 +3752,7 @@ function messageElRevealed(m, prev, ctx) {
 function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
   // In a server, people go by their nicknames there (none in DMs and group chats).
   const server = msgServer(m);
+  const bind = bindingOfMessage(m);
   if (m.reply) {
     const ru = getUser(m.reply.authorId);
     const rd = m.reply.dec;
@@ -3676,7 +3760,9 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     el.append(h('button', { class: 'msg-reply', 'aria-label': `Replying to ${nameInServer(server, ru)}. Jump to original.`, onclick: () => jumpToMessage(keyOfMessage(m), m.reply.id) },
       h('span', { class: 'reply-spine' }), avatarEl(ru, 16), nameEl(ru, { cls: 'reply-name', server }),
       h('span', { class: 'reply-text', html: rtext ? md(rtext, { inline: true }) : '<em>Attachment or encrypted message</em>' })));
-  } else if (m.replyTo) {
+  } else if (m.replyTo || (bind && bind.notes.includes('replyGone'))) {
+    // Also when its sender replied to a message that was gone by the time it was posted (the server rightly leaves
+    // the reply out then): no flag for that, unless the server can still find the original (bindingOfMessage).
     el.append(h('div', { class: 'msg-reply gone' }, h('span', { class: 'reply-spine' }), 'Original message is no longer available'));
   }
   const gutter = h('div', { class: 'msg-gutter', dataset: { time: fmtTime(m.createdAt) } });
@@ -3727,6 +3813,9 @@ function fillMessage(el, m, prev, ctx, { author, mine, isGrouped, text }) {
     else if (m.dec && m.dec.keyNote === 'new') body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'This person\u2019s security key changed and you haven\u2019t verified the new one yet. Compare safety numbers from their profile.' }, '\u26a0 New key \u2014 not verified yet'));
     else if (m.dec && m.dec.keyNote === 'pinned') body.append(h('div', { class: 'msg-flag', 'data-tip': 'Written with a key this person had before they changed keys. This device trusted that key back then.' }, 'Written with an older key'));
     else if (m.dec && m.dec.verified === false && !m.dmId) body.append(h('div', { class: 'msg-flag bad', 'data-tip': 'The signature on this message does not match the sender\u2019s key.' }, '\u26a0 Sender could not be verified'));
+    if (bind && bind.issues.length) body.append(bindingFlag(m, bind));
+    // The first DM format bound nothing in (not even who wrote it): say so, quietly.
+    else if (m.dmId && m.dec && m.dec.legacyFormat) body.append(h('div', { class: 'msg-flag', 'data-tip': 'Encrypted by an early version of Hearth that didn\u2019t bind the conversation or the sender into the message, so the server could show it as written by either of you.' }, 'Older encryption format'));
   }
   if (m.reactions && m.reactions.length) {
     body.append(h('div', { class: 'reactions' }, m.reactions.map((r) => {
@@ -4095,7 +4184,10 @@ function editBox(m, ctx) {
       // preview).
       const still = linkedUrls(content, { skipSpoilers: true });
       const kept = linksOf(m).filter((x) => still.includes(x.url));
-      const payload = { t: content, f: filesOf(m), ...(m.dec && m.dec.p ? { p: m.dec.p } : {}), ...(m.dec && m.dec.x ? { x: m.dec.x } : {}), ...(kept.length ? { l: kept } : {}) };
+      // Where it belongs stays too (binding.js): the same id, reply, thread and time, one edit later. One sent by an
+      // app from before that stays without.
+      const payload = { t: content, f: filesOf(m), ...(m.dec && m.dec.p ? { p: m.dec.p } : {}), ...(m.dec && m.dec.x ? { x: m.dec.x } : {}), ...(kept.length ? { l: kept } : {}),
+        ...(m.dec && m.dec.b ? bindEdit(m.dec.b) : {}) };
       if (m.dmId) await api('PATCH', `/dm-messages/${m.id}`, { ciphertext: await encryptFitting(payload, (p) => sec.encryptDm(m.dmId, p)) });
       else {
         await withKeyRetry(m.serverId, async () => {
@@ -4557,6 +4649,8 @@ function onDeleteChannelMessages(channelId, list, { expired = false } = {}) {
     } else top.push(id);
   }
   if (S.thread && threads.has(S.thread.rootId)) renderPanel();
+  const replies = list.filter((x) => x.threadId).map((x) => x.id);
+  if (replies.length) forgetBindings('c:' + channelId, replies);
   if (top.length) onDeleteMessage('c:' + channelId, top, { expired });
   if (expired && removed.length) forgetCopies(removed, new Set(removed.map((x) => x.id)), 'c:' + channelId);
 }
@@ -4573,6 +4667,7 @@ function recheckThread(rootId) {
 }
 function onDeleteMessage(key, id, { expired = false } = {}) {
   const gone = new Set(Array.isArray(id) ? id : [id]);
+  forgetBindings(key, gone);
   // Threads these messages started go with them (their counts, and their cards in the Threads panel).
   if (key.startsWith('c:')) forgetThreads(key, gone);
   const store = S.msgs[key];
@@ -5302,6 +5397,7 @@ const SCHED = createScheduled({
   openDraft: (it) => openDraft(it.ref, it.dmId ? 'd:' + it.dmId : 'c:' + it.channelId, it.threadId, it.draft),
   sealFor: (key, payload, keep) => sealFor(key, payload, keep),
   withKeyRetry: (serverId, fn) => withKeyRetry(serverId, fn),
+  clock: () => nowServer(),
   // The conversation's disappearing timer changed under a re-encrypt (409 disappear_changed): fetch it, then try again.
   refreshTimer: (key) => refreshTimer(key),
   placeOf: (it) => {
@@ -5981,7 +6077,10 @@ async function sealFor(key, payload0, keep = null) {
 const draftId = (ref, key, threadId) => `${ref}|${key}|${threadId || ''}`;
 const sealDraft = async (ref, key, threadId, payload) => E2EE.sealVault(await myVaultKey(), 'scheduled', draftId(ref, key, threadId), payload);
 const openDraft = async (ref, key, threadId, text) => E2EE.openVault(await myVaultKey(), 'scheduled', draftId(ref, key, threadId), text);
-async function sendOnce(key, threadId, payload, replyTo, nonce, sendAt = null) {
+async function sendOnce(key, threadId, payload0, replyTo, nonce, sendAt = null) {
+  // Where it belongs goes inside it (binding.js): a new id, what it replies to, its thread and when it's sent, or for
+  // a scheduled one, when it's due. A forward comes through here too, so it's a new message with a new id.
+  const payload = { ...payload0, ...bindNew({ replyTo, threadId, at: sendAt || nowServer(), scheduled: !!sendAt }) };
   const files = (payload.f || []).flatMap((x) => [x.url, x.th && x.th.url]).filter(Boolean);
   const where = key.startsWith('c:') ? `/channels/${key.slice(2)}` : `/dms/${key.slice(2)}`;
   // A scheduled one gets an id of this app's choosing for its own copy (sealFor's keep).

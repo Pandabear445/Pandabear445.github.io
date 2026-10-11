@@ -474,7 +474,7 @@ All chats are end-to-end encrypted: your browser encrypts each message and file 
 | Your password | Never sent anywhere. Hardened in the browser with **Argon2id** (64 MiB memory, 3 passes, random salt). One half logs you in; the other unlocks your private keys. Older accounts are upgraded from PBKDF2 automatically at their next login. |
 | Your identity key | **ECDH P-256** key pair. The private half is stored on the server only after being locked (AES-256-GCM) with your password-derived key. |
 | Your signing key | **ECDSA P-256**. Signs channel messages, key handoffs and voice handshakes so nobody can impersonate you. |
-| Each message | **AES-256-GCM** with its own key, derived by **HKDF-SHA256** from the conversation key and a random 256-bit salt. The channel or DM, the author and the key version are bound in, so the server can't change a message's content, move it to another conversation or change who sent it. It can still replay a message, change what it replies to or which thread it's in, change its time, or serve a version from before an edit. |
+| Each message | **AES-256-GCM** with its own key, derived by **HKDF-SHA256** from the conversation key and a random 256-bit salt. The channel or DM, the author and the key version are bound in, so the server can't change a message's content, move it to another conversation or change who sent it. Inside it also go its own id, what it replies to, its thread, when it was sent and how many times it was edited, so apps flag a message the server replays, moves under another reply or thread, re-dates or serves from before an edit (see [Moved, repeated or rolled back messages](#moved-repeated-or-rolled-back-messages)). |
 | Each attachment | Its own random AES-256-GCM key, carried inside the encrypted message. The app only accepts attachments stored on this server. |
 | Message length | Padded before encrypting (to 256-byte steps, 1 KiB steps above 4 KiB), so the server can't tell "ok" from a sentence. File sizes are not padded: the server sees how big each file is. |
 | Sign-in sessions | The database stores only a SHA-256 hash of each session token, so a copy of the database can't be used to sign in as anyone. |
@@ -486,6 +486,17 @@ All chats are end-to-end encrypted: your browser encrypts each message and file 
 ### Verifying people
 
 Your browser remembers everyone's keys the first time it sees them. If the server ever hands out different keys for someone (the classic way to secretly listen in), you'll see **Security key changed**, sending to them pauses, and key sharing with them stops until you check. Someone who reset their password without their recovery key has a shield next to their name (**Not verified**) in each server and group until a member there who knew them before verifies them; nobody's app shares that server's or group's key with them until then. To verify someone, open a DM, click **End-to-end encrypted**, and compare the 60-digit safety number with them in person or on a call. Safety numbers cover people's current keys. Messages written with an older key are labelled: **"Written with an older key"** (a key this device trusted back then), or **"⚠ Older key — not verified"** (a key the server says they had before a password reset, which this device never confirmed, so the server could have written it). Server encryption details (key version, who made it, who holds it, "Replace key now") are under the **End-to-end encrypted** badge in any channel.
+
+### Moved, repeated or rolled back messages
+
+Every message your app sends carries, inside its encryption, a random id of its own, the message it replies to, the thread it's in, when it was sent and how many times it was edited. Everyone's apps compare that with what the server says, and when they don't match the message gets one small yellow flag: **⚠ The server may have moved, repeated or rolled back this message**. Hover over it or click it to see which check failed:
+
+- **a different reply or thread** than its sender wrote it in: shown as a reply to another message, or as no reply while the original is still there (your app asks the server about an original it hasn't loaded), or a thread reply shown outside its thread (Hearth deletes a thread's replies with its first message, so that never happens by itself);
+- **a time more than 10 minutes off** from when it was sent. A scheduled message may go out up to a day late (if the server was down, or slow mode held it), never early. The time inside it is the one you picked, or the moment you pressed **Send now**: your app never takes a time from the server, so re-encrypting one by itself (after a key change) keeps your time, and one the server has down for earlier than you picked waits for you;
+- **the same message more than once** in the conversation, under different ids;
+- **an older version** than one your device has already shown (each device remembers the latest edit it saw of up to 2,000 edited messages; when that's full, the author with the most entries loses their oldest, so one account editing a flood of messages pushes out its own).
+
+What happens normally is never flagged: a reply to a message that was deleted, or disappeared, before the reply went out just says **Original message is no longer available**, and editing, forwarding (a forward is a new message) and scheduling are all fine. The words themselves are always the sender's; this is about where and when the server shows them. Limits: messages from apps before this version, bots, webhooks and the news bot carry none of this and are never flagged; the checks run on each device, so a device that never saw an edit can't tell it was rolled back (and a server with very many accounts could wear down what a device remembers), and two copies are only spotted while both are loaded; the server can still hold a message back, or make a reply read as orphaned by denying its original everywhere (to your app's question too); and message times rely on the clock correction your app gets from the server when it starts (as disappearing messages do), at most a day either way: a device whose own clock is off by more than that is told so, since the times inside its messages would be off too. A scheduled message carries a mark saying it was scheduled, so everyone's apps can tell, and when it was due. Direct messages from the very first version of Hearth (which bound nothing in) say **Older encryption format**.
 
 ### Things to know
 
@@ -720,7 +731,10 @@ as usual.
   arrived in that conversation meanwhile stay unread (unlike a message you send yourself).
 - **Your list:** a bar above the message box says what's scheduled in that conversation (also in the ⋯ menu →
   **Scheduled messages**). From there you can **Edit** the words, **Reschedule**, **Send now** or **Cancel**. Up to
-  25 scheduled messages at a time.
+  25 scheduled messages at a time. The time it goes out is inside the encryption too (readers' apps flag one the
+  server posts early, or more than a day late), so Reschedule and Send now re-encrypt it on your device. Only you
+  change that time: when your app re-encrypts one by itself, it keeps the time you picked, never one the server
+  gives it, and if the server has it down for earlier than you picked, the list says so and it waits for you.
 - **If it can't go out at its time** (you were timed out, removed or banned, lost permission to post there, the
   channel, thread or DM is gone, they blocked you or deleted their account), it isn't sent: it shows as **Not sent**
   with the reason, and you're told (in the app, or by push if it's closed). Slow mode only delays it. One that came
@@ -743,8 +757,11 @@ as usual.
   get your app to re-sign their words, or an old message of yours, under your name.
 - **Honest limits:** the server is trusted to keep the time and to really delete a message you cancel (it holds a
   valid encrypted message, and your app's copy, until then: a dishonest server could bring back one you cancelled,
-  into the same conversation), and the message's time isn't signed. Holding a signed-out session's messages is done
-  by the server too. Server backups taken meanwhile keep a copy until they rotate out, as for any message.
+  into the same conversation). The time it should go is inside the message, so readers' apps flag one posted early
+  or more than a day late, but within that day the server can still hold it back. That also means everyone's apps
+  can tell the message was scheduled, and when it was due (it's marked inside, for that day of leeway). Holding a
+  signed-out session's messages is done by the server too. Server backups taken meanwhile keep a copy until they
+  rotate out, as for any message.
 
 Details: [docs/FEATURES.md](docs/FEATURES.md#scheduled-messages-send-later).
 
