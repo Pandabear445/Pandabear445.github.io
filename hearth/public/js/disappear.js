@@ -56,6 +56,9 @@ export function serverKept(m) {
 // A timer change between writing a message and sending it that would keep it longer than the timer it was written
 // under (turned off, or made longer): the app asks before sending it. A stricter one (turned on, made shorter) is fine.
 export const weaker = (wrote, now) => (Number(wrote) || 0) > 0 && (!(Number(now) > 0) || Number(now) > Number(wrote));
+// The timer a message re-encrypted later keeps (a scheduled one, scheduled.js): the conversation's now, unless that
+// is weaker than the one it was written under, which then stays. 0 = none.
+export const stricter = (wrote, now) => (weaker(wrote, now) ? Number(wrote) : Number(now) > 0 ? Number(now) : 0);
 // The soonest deadline still ahead, or null.
 export function nextDeadline(items, now) {
   let best = Infinity;

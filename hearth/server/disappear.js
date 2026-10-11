@@ -16,7 +16,8 @@
 // events a normal delete sends (message:delete-bulk, thread:update, dm:delete, saved:update).
 //
 // Routes
-//   PUT /channels/:id/disappearing  { seconds }   group chat: any member; server channel: Manage Channels there
+//   PUT /channels/:id/disappearing  { seconds }   group chat: any member; server channel: Manage Channels there (and
+//                                                 a channel_update entry in the server's audit log)
 //   PUT /dms/:id/disappearing       { seconds }   either person (not after a block, not to a deleted account)
 //   GET /channels/:id/disappearing                the timer and who changed it lately
 //   GET /dms/:id/disappearing
@@ -55,7 +56,7 @@ const arm = (at) => { if (current && at != null) current.arm(at); };
 
 module.exports = function setupDisappear(ctx) {
   const { api, auth, db, fail, rateLimit, newId, now, requireChannel, requireDm, requireManageableChannel, serverOf, isBlocked, getUserRow,
-    toChannel, getIo, emitTo, removeUpload, unseal, threadInfo, groupLast, bots } = ctx;
+    toChannel, getIo, emitTo, removeUpload, unseal, threadInfo, groupLast, bots, serverAudit = () => {}, chanRef = () => null } = ctx;
 
   // ---------------------------------------------------------------- the timer
   function parseTimer(v) {
@@ -130,7 +131,13 @@ module.exports = function setupDisappear(ctx) {
     rateLimit('disappear:' + req.userId, 10, 60000);
     const c = channelFor(req, true);
     const secs = parseTimer((req.body || {}).seconds);
-    res.json(setTimer({ table: 'channels', id: c.id, conv: 'c:' + c.id, uid: req.userId, secs, prev: c.disappear_secs || 0, room: () => toChannel(c), extra: { channelId: c.id } }));
+    const prev = c.disappear_secs || 0;
+    const out = setTimer({ table: 'channels', id: c.id, conv: 'c:' + c.id, uid: req.userId, secs, prev, room: () => toChannel(c), extra: { channelId: c.id } });
+    // A server channel's timer is one of its settings, so a change goes in the server's audit log with the rest
+    // (group chats have none). Messages disappearing by themselves aren't logged.
+    const srv = serverOf(c);
+    if (!out.unchanged && srv && srv.kind !== 'group') serverAudit(srv, req.userId, 'channel_update', c.id, { channel: chanRef(srv, c), changes: { disappear: { from: prev, to: secs } } }, c.id);
+    res.json(out);
   });
   api.put('/dms/:id/disappearing', auth, (req, res) => {
     rateLimit('disappear:' + req.userId, 10, 60000);

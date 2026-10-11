@@ -22,7 +22,10 @@
 // beside it, checked like a message sent then: 409 disappear_changed if the timer just changed) and this keeps ttl.
 // When it's posted, its deadline counts from that moment, by the conversation's timer then, and never later than the
 // ttl it was encrypted for (sendSecs in index.js): so it disappears no later than its sender expected, nor than the
-// conversation's setting says by then. Readers' apps take the earlier of the two as well.
+// conversation's setting says by then. Readers' apps take the earlier of the two as well. Re-encrypting it (an edit,
+// a key change) doesn't change that: the new ciphertext keeps the stricter of its ttl and the conversation's timer
+// now (keepTtl), so a timer turned off or made longer meanwhile never makes it last longer than its sender wrote it
+// for.
 //
 // Voice channels' chats take scheduled messages like text channels (a group's call has none); threads stay in text
 // channels.
@@ -102,6 +105,10 @@ module.exports = function setupScheduled(ctx) {
   // The disappearing timer the app encrypted it for (checked by checkTtl against the conversation's), or null when
   // the app didn't say (then the conversation's timer when it's posted decides alone).
   const ttlOf = (b) => (typeof b.ttl === 'number' ? b.ttl : null);
+  // New ciphertext for one already scheduled keeps the stricter of the timer it had and the conversation's now: a
+  // timer turned on or shortened since applies, but one turned off or made longer never lets it live longer than its
+  // sender wrote it for, whatever the app sends (the same as when it's posted untouched, see sendSecs).
+  const keepTtl = (had, ttl) => (had > 0 && !(ttl > 0 && ttl < had) ? had : ttl);
 
   // ------------------------------------------------------------------ keys
   // Fingerprints of the public keys a message was written with. A channel message is signed, so the sender's
@@ -438,9 +445,10 @@ module.exports = function setupScheduled(ctx) {
         if (!peer || peer.deleted_at) fail(403, 'This account was deleted.', 'deleted');
         set.peer_key = peerKey(peer);
       }
-      // New ciphertext is encrypted for the conversation's disappearing timer as it is now.
+      // New ciphertext is checked against the conversation's disappearing timer as it is now, and keeps the stricter
+      // of that and the one it was written for (the app puts the same one inside it, x).
       checkTtl(b, conv.disappear_secs);
-      set.ttl = ttlOf(b);
+      set.ttl = keepTtl(r.ttl, ttlOf(b));
       Object.assign(set, { ciphertext: b.ciphertext, own_key: ownKey(u, !!r.channel_id), session_id: req.session.id, updated_at: now(), status: 'pending', reason: null, told_at: null });
       // Who it pings goes with the words: new words replace them, so an @everyone or @name edited out pings nobody.
       if (r.channel_id) {

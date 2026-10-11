@@ -135,7 +135,8 @@ Use External Emoji is allowed anyway too, without a warning: custom emoji from a
 Hearth.
 
 An @everyone with Administrator needs its own confirmation ("everyone who joins could do anything"). An @everyone
-with moderator powers (Manage anything, Manage emoji, Kick, Ban, Mute or Move members) gets a warning, and so does
+with moderator powers (Manage anything, Manage emoji, Manage nicknames, View audit log, Kick, Ban, Mute or Move
+members) gets a warning, and so does
 a channel that gives @everyone Manage messages, Move members, Manage channel, Manage permissions or Mention
 @everyone (a template from someone else can carry these).
 

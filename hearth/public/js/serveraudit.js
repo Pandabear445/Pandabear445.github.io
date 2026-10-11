@@ -15,6 +15,7 @@ import { PERMS, PERM_GROUPS } from './perms.js';
 import { avatarEl } from './profile-ui.js';
 import { render as md } from './markdown.js';
 import { CATEGORY_LABEL } from './admin.js';
+import { label as timerLabel } from './disappear.js';
 
 // ------------------------------------------------------------------ live updates
 let sock = null;
@@ -155,6 +156,7 @@ export function sentence(e, users) {
       if (c.topic) bits.push('changed the topic');
       if (c.category) bits.push(`moved it to ${quoted(c.category.to)}`);
       if (c.slowmode) bits.push(c.slowmode.to ? `set slowmode to ${c.slowmode.to < 60 ? plural(c.slowmode.to, 'second', 'seconds') : duration(Math.round(c.slowmode.to / 60))}` : 'turned slowmode off');
+      if (c.disappear) bits.push(c.disappear.to ? `set disappearing messages to ${timerLabel(c.disappear.to).toLowerCase()}` : 'turned disappearing messages off');
       return [[who, ` changed ${ch}`], [bits.length ? `${bits.join('; ')}.`.replace(/^./, (x) => x.toUpperCase()) : null, d.voiceChat ? VOICE_CHAT_NOTE : null].filter(Boolean).join(' ') || null];
     }
     case 'channel_delete': return [[who, ` deleted ${theChannel(d, true)}`]];

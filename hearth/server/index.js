@@ -5802,7 +5802,7 @@ USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, aud
 DIS = require('./disappear')({ api, auth, db, fail, rateLimit, newId, now, requireChannel, requireDm, requireManageableChannel, serverOf, isBlocked, getUserRow,
   // (io is declared further down: during the start-up sweep it doesn't exist yet, and there's nobody to tell.)
   toChannel: (c) => toChannel(c), getIo: () => { try { return io || null; } catch { return null; } }, emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), removeUpload, unseal, threadInfo, groupLast,
-  bots: () => BOTS });
+  bots: () => BOTS, serverAudit, chanRef });
 // Away after inactivity and custom statuses that clear themselves (server/presence.js).
 PRES = require('./presence')({ api, auth, db, fail, rateLimit, limitNet, now, getUserRow, parseProfile, sanitizeProfile, checkWords, requireUnlocked,
   broadcastUser, broadcastPresence, presenceFor, selfUser });

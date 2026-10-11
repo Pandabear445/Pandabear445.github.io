@@ -735,3 +735,30 @@ test('retention: a year, the newest 10,000 per server (never less than a week), 
   assert.equal(srv.sql('SELECT COUNT(*) n FROM server_audit WHERE server_id = ? AND created_at < ? AND seq <= ?', a.server.id, t - 7 * 86400000, hi - 10000)[0].n, 0);
   assert.equal(srv.sql('SELECT COUNT(*) n FROM server_audit WHERE server_id = ? AND created_at < ?', a.server.id, t - 7 * 86400000)[0].n, 10, 'the 10 old ones still inside the newest 10,000 stay');
 });
+
+// The app's side (public/js/serveraudit.js), run in Node with its imports replaced by small fakes: what a change to a
+// channel's disappearing timer says in the log.
+test('the log says what a channel’s disappearing timer was set to, with its other settings', async () => {
+  const path = require('node:path');
+  const { register } = require('node:module');
+  const fakes = {
+    './util.js': 'export const h = (...a) => a; export const clear = (x) => x; export const icon = () => null; export const toast = () => {}; export const fmtStamp = String;',
+    './api.js': 'export const api = async () => ({});',
+    './ui.js': 'export const modal = () => ({}); export const field = () => null;',
+    './perms.js': 'export const PERMS = {}; export const PERM_GROUPS = [];',
+    './profile-ui.js': 'export const avatarEl = () => null;',
+    './markdown.js': 'export const render = (x) => x;',
+    './admin.js': 'export const CATEGORY_LABEL = {};',
+  };
+  const urls = Object.fromEntries(Object.entries(fakes).map(([k, src]) => [k, 'data:text/javascript,' + encodeURIComponent(src)]));
+  register('data:text/javascript,' + encodeURIComponent(`const urls = ${JSON.stringify(urls)};
+    export async function resolve(spec, ctx, next) {
+      if (ctx.parentURL && ctx.parentURL.endsWith('/public/js/serveraudit.js') && urls[spec]) return { url: urls[spec], shortCircuit: true };
+      return next(spec, ctx);
+    }`));
+  const { sentence } = await import(require('node:url').pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'serveraudit.js')).href);
+  const said = (changes) => sentence({ action: 'channel_update', actorId: 'u1', targetId: 'c1', detail: { channel: { id: 'c1', name: 'general' }, changes } }, { u1: { displayName: 'Ann' } })[1];
+  assert.equal(said({ disappear: { from: 0, to: 86400 } }), 'Set disappearing messages to 1 day.');
+  assert.equal(said({ disappear: { from: 86400, to: 0 } }), 'Turned disappearing messages off.');
+  assert.equal(said({ slowmode: { from: 0, to: 30 }, disappear: { from: 0, to: 3600 } }), 'Set slowmode to 30 seconds; set disappearing messages to 1 hour.');
+});

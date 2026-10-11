@@ -39,7 +39,7 @@ import { initServerAudit, auditTab, reportsTab } from './serveraudit.js';
 import { openDiscordImport } from './discord-import.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
 import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
-import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer } from './disappear.js';
+import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer, stricter as stricterTimer } from './disappear.js';
 import { createScheduled } from './scheduled.js';
 import { trackViewport } from './viewport.js';
 import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel } from './presence.js';
@@ -4921,7 +4921,9 @@ function threadPanel(el) {
   });
   if (t.hasNewer) list.append(h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => loadNewerReplies(e.currentTarget) }, 'Show newer replies'));
   ensureCurrentMessage(list);
-  const comp = createComposer({ id: 'thread', key: () => 'c:' + S.thread.channelId, threadId: () => S.thread.rootId, placeholder: 'Reply in thread\u2026' });
+  // Once the thread is closed (S.thread is null) the composer has no conversation: something still on a timer for it
+  // (the link check after a pause in typing) finds none instead of failing.
+  const comp = createComposer({ id: 'thread', key: () => (S.thread ? 'c:' + S.thread.channelId : null), threadId: () => (S.thread ? S.thread.rootId : null), placeholder: 'Reply in thread\u2026' });
   composers.thread = comp;
   el.append(list, comp.el);
   comp.renderExtras();
@@ -5378,7 +5380,8 @@ function createComposer({ id, key, threadId, placeholder }) {
   // While typing, a link counts once a space follows it and the caret has left it (or after a pause), so
   // half-typed links aren't offered (or, in "Always" mode, fetched). Editing inside a link counts as typing
   // it: each Backspace in "…/story-one please" makes a new link, and none of them may be fetched until the pause.
-  const checkLinkSoon = debounce(() => checkLink(), 1200);
+  // A composer that has left the page (its thread was closed or another one opened) has nothing to check any more.
+  const checkLinkSoon = debounce(() => { if (el.isConnected) checkLink(); }, 1200);
   function onTypeForLink() {
     const url = findPreviewUrl(ta.value, previewOpts());
     // The link with a chip changed or went: the chip goes now (and any answer on its way is ignored).
@@ -5787,12 +5790,17 @@ async function stillSend(key, wrote) {
 // for a channel (with its current key), { ciphertext, ttl } for a DM. Sending, scheduling and re-encrypting a
 // scheduled message all use it, so a scheduled message is exactly what sending it now would have sent: the text,
 // files, poll and link preview card, and the conversation's disappearing timer as it is now (x inside, ttl beside).
-// keep: { ref, threadId } for a scheduled message: then `draft` comes too, your own copy of what was encrypted (the
-// version that fitted), which only your keys open (sealDraft). Never anything readable: all of this goes to the server.
+// keep: { ref, threadId, x? } for a scheduled message: then `draft` comes too, your own copy of what was encrypted
+// (the version that fitted), which only your keys open (sealDraft). keep.x is the timer it was written for, when it's
+// being re-encrypted: x inside is then the stricter of that and the conversation's timer now (ttl still says the
+// conversation's, which the server checks; it keeps the same stricter one), so a timer turned off or made longer
+// since never makes it last longer than its sender wrote it for. Never anything readable: all of this goes to the
+// server.
 async function sealFor(key, payload0, keep = null) {
   const ttl = convSecs(key);
+  const secs = keep && Number.isInteger(keep.x) && keep.x > 0 ? stricterTimer(keep.x, ttl) : ttl;
   const { x, ...rest } = payload0;
-  const payload = ttl ? { ...rest, x: ttl } : rest;
+  const payload = secs ? { ...rest, x: secs } : rest;
   let fitted = payload; // encryptFitting tries smaller versions in turn and keeps the first that fits: the last one tried
   const out = { ttl };
   if (key.startsWith('c:')) {

@@ -10,6 +10,12 @@ Status: proposal for a builder agent. Target: Hearth 1.28.x (`package.json` says
 - Create Events is "widened": in Hearth anyone who can post makes events. So the sample's @everyone has one widened warning.
 - `invite_override_dropped` became the general note `dropped:<DISCORD_BIT>`, which also covers Mute Members and other server-wide bits in overrides.
 - The tables are a `// v19 (discord import)` block: schema 19 is unreleased and ships them with the rest of 1.29. `messages.import_id` waits for phase 3.
+- Since then Hearth has per-server nicknames (`server/nicknames.js`): Change Nickname and Manage Nicknames map to
+  Hearth's (server-wide only, as in Discord) and are no longer "can't bring". The sample's @everyone is therefore
+  `1147343` (Hearth's `DEFAULT_EVERYONE`, which now has Change Nickname), not `98767`, and Change Nickname is no
+  longer in its lost list. An @everyone with Manage Nicknames or View Audit Log gets the `everyone_manage` warning,
+  like Kick. The rows below that say otherwise (the lost-bits list, the @everyone value, the test names and
+  Appendix A) are superseded by this.
 - There is no `features.discordImport` switch, since Hearth doesn't contact Discord. "Who can create servers" governs imports.
 - Too many channels or categories is a `problems` entry: the preview still shows everything so people can untick, and create refuses.
 - Real Discord category names win over the "Text" and "Voice" groups for uncategorised channels (those become "Text (2)").
@@ -333,7 +339,7 @@ Rule:
 Unmappable Discord bits (listed per role in `lost`; source of the bit list: [Permissions](https://docs.discord.com/developers/topics/permissions)):
 - VIEW_AUDIT_LOG (1<<7); PRIORITY_SPEAKER (8); SEND_TTS_MESSAGES (12); VIEW_GUILD_INSIGHTS (19).
 - MUTE_MEMBERS (22), DEAFEN_MEMBERS (23), MOVE_MEMBERS (24). NEXT.md pick #4 (moderator toolkit) could map these later.
-- CHANGE_NICKNAME (26), MANAGE_NICKNAMES (27). Hearth has no per-server nicknames.
+- CHANGE_NICKNAME (26), MANAGE_NICKNAMES (27). Hearth has no per-server nicknames. (Superseded: it has them now, and both map; see "Built so far".)
 - MANAGE_WEBHOOKS (29); REQUEST_TO_SPEAK (32); MANAGE_EVENTS (33); MANAGE_THREADS (34); CREATE_PRIVATE_THREADS (36); USE_EXTERNAL_STICKERS (37); MODERATE_MEMBERS (40); VIEW_CREATOR_MONETIZATION_ANALYTICS (41); USE_SOUNDBOARD (42); CREATE_GUILD_EXPRESSIONS (43); CREATE_EVENTS (44); USE_EXTERNAL_SOUNDS (45); SET_VOICE_CHANNEL_STATUS (48); USE_EXTERNAL_APPS (50); PIN_MESSAGES (51); BYPASS_SLOWMODE (52).
 - In Hearth, events are managed with Manage Server or Manage Channels (the events route around `server/index.js:4677`). So MANAGE_EVENTS is lost unless the role also has those.
 
@@ -349,7 +355,7 @@ Unmappable Discord bits (listed per role in `lost`; source of the bit list: [Per
 ### 5.4 Roles
 
 - **@everyone** is `guild.roles[0]`, or for C-script input the role whose id equals the guild id. Its permissions go to the `roles` row with `id = server.id` (Hearth's @everyone convention: the `POST /servers` route in `server/index.js`).
-  - For the sample template the mapping yields `98767`, exactly Hearth's `DEFAULT_EVERYONE`.
+  - For the sample template the mapping yields `98767`, exactly Hearth's `DEFAULT_EVERYONE`. (Now `1147343`, with Change Nickname; see "Built so far".)
 - **Other roles:**
   - Sorted by `position` if every role has a numeric one, else by array index, ties by index.
   - Hearth `position` = 1..n in that order (@everyone stays 0). The owner is above everyone via `perms.top` → `Infinity`.
@@ -810,7 +816,7 @@ Fixtures:
 - `mapRolePermissions lists lost bits (MODERATE_MEMBERS, PIN_MESSAGES, BYPASS_SLOWMODE, MUTE/MOVE)`
 - `mapOverwrite: allow needs all mapped Discord bits, deny needs any; allow and deny never overlap`
 - `mapOverwrite drops Create Invite and non-channel bits from overrides`
-- `planFromTemplate(sample): @everyone is 98767 (Hearth's DEFAULT_EVERYONE)`
+- `planFromTemplate(sample): @everyone is 98767 (Hearth's DEFAULT_EVERYONE)` (now 1147343, see "Built so far")
 - `planFromTemplate(sample): roles keep Discord order as positions 1..6 with mapped bits` (Appendix A.2 table)
 - `planFromTemplate(sample): colours, hoist, mentionable and unicode role icons carry over`
 - `planFromTemplate(sample): categories in Discord order, uncategorised text first under "Text", empty "Archive" skipped`
@@ -1079,7 +1085,7 @@ Each commit runs `npm test` green.
 
 ### A.2 Expected plan (checked with a throwaway prototype of the rules above)
 
-- **@everyone** → `98767` (= Hearth `DEFAULT_EVERYONE`). Lost: USE_EXTERNAL_EMOJIS, CHANGE_NICKNAME, REQUEST_TO_SPEAK, CREATE_PRIVATE_THREADS, USE_EXTERNAL_STICKERS, USE_SOUNDBOARD, USE_EXTERNAL_SOUNDS, USE_EXTERNAL_APPS. No widened warnings (everyone has all of the widenable bits).
+- **@everyone** → `98767` (= Hearth `DEFAULT_EVERYONE`; now `1147343` with Change Nickname, which is no longer lost: see "Built so far"). Lost: USE_EXTERNAL_EMOJIS, CHANGE_NICKNAME, REQUEST_TO_SPEAK, CREATE_PRIVATE_THREADS, USE_EXTERNAL_STICKERS, USE_SOUNDBOARD, USE_EXTERNAL_SOUNDS, USE_EXTERNAL_APPS. No widened warnings (everyone has all of the widenable bits).
 
 | key | Hearth role | pos | colour | icon | hoist / mention | Hearth perms | lost |
 |---|---|---|---|---|---|---|---|

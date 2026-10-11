@@ -278,6 +278,108 @@ test('disappearing messages: scheduled for the timer in force, then posted with 
   srv.sql('UPDATE channels SET disappear_secs = 0 WHERE id = ?', ch.id);
 });
 
+test('disappearing messages: re-encrypting a scheduled message (a key change, an edit) keeps the timer it was written for; one turned off or made longer since never makes it last longer', async () => {
+  const ann = await user('rann'); const ben = await user('rben');
+  const ch = await room('secret');
+  assert.equal((await as(boss, 'PUT', `/channels/${ch.id}/disappearing`, { seconds: 3600 })).status, 200);
+  const benS = await sock(ben);
+  const benNew = collect(benS, 'message:new');
+  // Written under a 1-hour timer. A moderator turns it off, then the server's key changes, so it's held: the app
+  // re-encrypts it with the timer as it is now beside it (ttl 0, which the server checks).
+  const item = await schedule(ann, ch.id, { sendAt: soon(HOUR), ttl: 3600 });
+  assert.equal((await as(boss, 'PUT', `/channels/${ch.id}/disappearing`, { seconds: 0 })).status, 200);
+  srv.sql("UPDATE scheduled_messages SET status = 'held', reason = 'key' WHERE id = ?", item.id);
+  const ct = cipher();
+  const re = await as(ann, 'PATCH', `/scheduled-messages/${item.id}`, { draft: draft(), ciphertext: ct, epoch: 1, ttl: 0, sendAt: soon(1500) });
+  assert.equal(re.status, 200, re.text);
+  assert.equal(re.json.status, 'pending');
+  assert.equal(re.json.ttl, 3600, 'it keeps the timer it was written for');
+  const m = await until(() => benNew.find((x) => x.ciphertext === ct), 'the re-encrypted message');
+  assert.equal(m.expiresAt, m.createdAt + 3600 * 1000, 'and disappears when its sender expected, as it would have untouched');
+  // Made longer since: an edit keeps the shorter one. So does an app that doesn't say which timer it encrypted for.
+  srv.sql('UPDATE channels SET disappear_secs = 3600 WHERE id = ?', ch.id);
+  const b = await schedule(ann, ch.id, { sendAt: soon(HOUR), ttl: 3600 });
+  srv.sql('UPDATE channels SET disappear_secs = 86400 WHERE id = ?', ch.id);
+  assert.equal((await as(ann, 'PATCH', `/scheduled-messages/${b.id}`, { draft: draft(), ciphertext: cipher(), epoch: 1, ttl: 86400 })).json.ttl, 3600);
+  assert.equal((await as(ann, 'PATCH', `/scheduled-messages/${b.id}`, { draft: draft(), ciphertext: cipher(), epoch: 1 })).json.ttl, 3600);
+  // Shortened since: the conversation's timer applies.
+  srv.sql('UPDATE channels SET disappear_secs = 600 WHERE id = ?', ch.id);
+  assert.equal((await as(ann, 'PATCH', `/scheduled-messages/${b.id}`, { draft: draft(), ciphertext: cipher(), epoch: 1, ttl: 600 })).json.ttl, 600);
+  assert.equal(rowOf(b.id).ttl, 600);
+  // Written with none and turned on since: the conversation's.
+  srv.sql('UPDATE channels SET disappear_secs = 0 WHERE id = ?', ch.id);
+  const c = await schedule(ann, ch.id, { sendAt: soon(HOUR), ttl: 0 });
+  srv.sql('UPDATE channels SET disappear_secs = 3600 WHERE id = ?', ch.id);
+  assert.equal((await as(ann, 'PATCH', `/scheduled-messages/${c.id}`, { draft: draft(), ciphertext: cipher(), epoch: 1, ttl: 3600 })).json.ttl, 3600);
+  // A DM the same way.
+  const dm = (await as(ann, 'POST', '/dms', { userId: ben.id })).json;
+  srv.sql('UPDATE dm_channels SET disappear_secs = 86400 WHERE id = ?', dm.id);
+  const d = await scheduleDm(ann, dm.id, { sendAt: soon(HOUR), ttl: 86400 });
+  srv.sql('UPDATE dm_channels SET disappear_secs = 0 WHERE id = ?', dm.id);
+  assert.equal((await as(ann, 'PATCH', `/scheduled-messages/${d.id}`, { draft: draft(), ciphertext: cipher(), ttl: 0 })).json.ttl, 86400);
+  for (const x of [b, c, d]) await as(ann, 'DELETE', `/scheduled-messages/${x.id}`);
+});
+
+// The app's side (public/js/scheduled.js), run in Node with its imports replaced by small fakes: re-encrypting
+// passes the timer from the sender's own copy on to sealFor (which puts the stricter of it and the conversation's
+// timer inside the message), so a message re-encrypted by itself after a key change keeps it.
+test('the app re-encrypts a held message with the timer its own copy was written for', async () => {
+  const { register } = require('node:module');
+  const fakes = {
+    './util.js': `export const h = () => ({ append() {}, classList: { add() {} } }); export const clear = (x) => x; export const icon = () => null;
+      export const toast = (...a) => globalThis.__sched.toasts.push(a); export const fmtTime = (t) => String(t); export const copyText = async () => {};`,
+    './api.js': 'export const api = (...a) => globalThis.__sched.api(...a);',
+    './ui.js': 'export const modal = () => ({ box: null, close() {} }); export const menu = () => {}; export const confirmDialog = async () => false; export const showError = () => {}; export const field = () => null;',
+    './markdown.js': 'export const linkedUrls = () => [];',
+    './disappear.js': 'export const label = (s) => `${s} seconds`;',
+  };
+  const urls = Object.fromEntries(Object.entries(fakes).map(([k, src]) => [k, 'data:text/javascript,' + encodeURIComponent(src)]));
+  register('data:text/javascript,' + encodeURIComponent(`const urls = ${JSON.stringify(urls)};
+    export async function resolve(spec, ctx, next) {
+      if (ctx.parentURL && ctx.parentURL.endsWith('/public/js/scheduled.js') && urls[spec]) return { url: urls[spec], shortCircuit: true };
+      return next(spec, ctx);
+    }`));
+  const { createScheduled } = await import(require('node:url').pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'scheduled.js')).href);
+  const patches = []; const sealed = [];
+  globalThis.__sched = {
+    toasts: [],
+    api: async (method, p, body) => {
+      if (method !== 'PATCH') throw new Error(`unexpected ${method} ${p}`);
+      patches.push([p, body]);
+      const id = p.split('/').pop();
+      return { ...items[id], status: 'pending', reason: null, ciphertext: body.ciphertext, draft: body.draft };
+    },
+  };
+  const copies = { a: { t: 'see you at 9', f: [], x: 3600 }, b: { t: 'no timer', f: [] } };
+  const base = { serverId: 's1', channelId: 'c1', dmId: null, threadId: null, status: 'held', reason: 'key', sendAt: Date.now() + HOUR, ciphertext: 'old', files: 0 };
+  const items = {
+    a: { ...base, id: 'a', ref: 'a'.repeat(16), draft: 'x1:copy-a', ttl: 3600 },
+    b: { ...base, id: 'b', ref: 'b'.repeat(16), draft: 'x1:copy-b', ttl: 0 },
+  };
+  const sched = createScheduled({
+    me: () => ({ id: 'u1' }),
+    openDraft: async (it) => copies[it.id],
+    // The conversation's timer was turned off since: ttl 0 beside it.
+    sealFor: async (key, payload, keep) => { sealed.push({ key, payload, keep }); return { ciphertext: 'new-' + keep.ref, epoch: 2, ttl: 0, draft: 'x1:again' }; },
+    withKeyRetry: (serverId, fn) => fn(),
+    refreshTimer: async () => {},
+    placeOf: () => ({ label: '#secret', dm: false }),
+    onChange: () => {},
+    openKey: () => {},
+  });
+  sched.onUpdate(items.a);
+  await until(() => patches.length === 1, 'the first one re-encrypted by itself');
+  sched.onUpdate(items.b);
+  await until(() => patches.length === 2, 'the second one too');
+  const of = (ref) => sealed.find((x) => x.keep.ref === ref);
+  assert.equal(of(items.a.ref).key, 'c:c1');
+  assert.deepEqual(of(items.a.ref).keep, { ref: items.a.ref, threadId: null, x: 3600 }, 'the timer from its own copy goes to sealFor');
+  assert.equal(of(items.a.ref).payload.t, 'see you at 9');
+  assert.equal(of(items.b.ref).keep.x, 0, 'one written without a timer has none to keep');
+  assert.ok(patches.every(([, body]) => body.sendNow === true && body.epoch === 2));
+  assert.deepEqual(globalThis.__sched.toasts, []);
+});
+
 test('voice channels: their chats take scheduled messages like a text channel; threads stay in text channels; a group call has no chat', async () => {
   const ann = await user('vann'); const ben = await user('vben');
   const vc = (await as(boss, 'POST', `/servers/${server.id}/channels`, { name: `lounge${hex(2)}`, type: 'voice' })).json;

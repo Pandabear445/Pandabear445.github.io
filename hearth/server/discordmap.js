@@ -349,9 +349,11 @@ const VOICE_TYPES = new Map([[2, null], [13, 'stage']]);
 // in that stage (Discord's rule for unsuppressing yourself), and Speak.
 const STAGE_SPEAKER = S.MUTE_MEMBERS | S.SPEAK;
 const speaksOnStage = (dp) => !!(dp & S.ADMINISTRATOR) || (dp & STAGE_SPEAKER) === STAGE_SPEAKER;
-// Moderator powers that @everyone shouldn't have without the person importing knowing.
+// Moderator powers that @everyone shouldn't have without the person importing knowing. The same ones Hearth keeps
+// out of roles people buy or pick themselves (memberships.js POWERFUL): renaming the people below you (Manage
+// Nicknames) and reading the audit log (who moderated whom) count too.
 const EVERYONE_MANAGE = P.MANAGE_SERVER | P.MANAGE_ROLES | P.MANAGE_CHANNELS | P.MANAGE_MESSAGES | P.MANAGE_EMOJIS
-  | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MUTE_MEMBERS | P.MOVE_MEMBERS;
+  | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MUTE_MEMBERS | P.MOVE_MEMBERS | P.MANAGE_NICKNAMES | P.VIEW_AUDIT_LOG;
 const EVERYONE_CHANNEL_MANAGE = P.MANAGE_MESSAGES | P.MOVE_MEMBERS | P.MANAGE_CHANNELS | P.MANAGE_ROLES | P.MENTION_EVERYONE;
 // Lists of names in the report (who had a permission, which channels a note is about) stop here, with a count of
 // the rest: a hostile template could otherwise make the report, which is kept, as big as the template.

@@ -4,6 +4,15 @@ Status: design proposal for the release after Hearth 1.28.2. The schema moves fr
 It was written against commit `1a4b684`. Paths are relative to `hearth/`.
 Line numbers are hints taken from that commit; the function names are what counts.
 
+**Since then** (built; [FEATURES.md](../FEATURES.md) §7 describes the code as it is):
+- A server's voice channels have a text chat, and it takes a timer like a text channel (Manage Channels there).
+  Only a group's call is refused: 400 `Only text channels and voice channels’ chats have disappearing messages.`
+  (`bad_channel`). The "Voice channel" row in §4.1 is superseded.
+- Changing a server channel's timer is also a `channel_update` entry in that server's audit log
+  (`changes.disappear: { from, to }`); group chats and DMs have no audit log. Messages disappearing aren't logged.
+- Scheduled messages ("Send later") carry the timer they were written for: re-encrypting one keeps the stricter of
+  that and the conversation's timer at the time (FEATURES.md, Scheduled messages).
+
 ---
 
 ## 0. Decisions at a glance
@@ -144,7 +153,7 @@ All of this is metadata the server needs in order to delete. ARCHITECTURE.md §4
 | DM (`dm_channels`) | `PUT /api/dms/:id/disappearing` | Either participant (`requireDm`) | 404 for non-participants. 403 `You can’t message this person.` after a block in either direction (`isBlocked`). 403 code `deleted` when the other account is deleted. |
 | Group chat (a `servers` row with `kind='group'`, which has one text channel `chat`, created in `POST /groups`) | `PUT /api/channels/:id/disappearing` on the group's text channel | Any member (`requireChannel`) | 404 for non-members |
 | Server text channel | `PUT /api/channels/:id/disappearing` | Manage Channels in that channel (`requireManageableChannel`, index.js:2449). A per-channel deny is respected, and a channel you can't see is 404. | 403 `You don’t have permission to manage this channel.` |
-| Voice channel | — | — | 400 `Only text channels have disappearing messages.` code `bad_channel` |
+| Voice channel | — | — | 400 `Only text channels have disappearing messages.` code `bad_channel` (superseded: a server's voice channels have a chat and take a timer like a text channel; only a group's call is refused, see "Since then" above) |
 
 Timeouts don't apply: Manage Channels isn't in `TALK` (perms.js), and group chats have no timeouts.
 

@@ -74,8 +74,9 @@ const localInput = (t) => { const d = new Date(t - new Date(t).getTimezoneOffset
 //   me()                       the signed-in user
 //   openDraft(item)            your own copy of what it says (the payload), or throws if it doesn't open with your keys
 //   sealFor(key, payload, keep) { ciphertext, epoch?, mentions?, everyone?, ttl, draft } for a message to that
-//                              conversation now (its disappearing timer as it is now: x inside, ttl beside), with your
-//                              own copy bound to keep = { ref, threadId }
+//                              conversation now (ttl beside it: its disappearing timer as it is now; x inside: the
+//                              stricter of that and keep.x, the timer the message was written for), with your own copy
+//                              bound to keep = { ref, threadId }
 //   withKeyRetry(serverId, fn) runs fn again once if the server says the key is out of date
 //   refreshTimer(key)          fetches the conversation's disappearing timer (the server said it changed)
 //   placeOf(item)              where it goes: { label, dm } ("#general · Hearth HQ", "Ana", a group's name)
@@ -113,8 +114,9 @@ export function createScheduled(deps) {
   }
 
   // ------------------------------------------------------------------ opening and re-encrypting
-  // What it says, from your own copy (never from the ciphertext the server holds): { t, f, p?, l? }, or
-  // { error: true } when the copy is missing or doesn't open with your keys.
+  // What it says, from your own copy (never from the ciphertext the server holds): { t, f, p?, l?, x? }, or
+  // { error: true } when the copy is missing or doesn't open with your keys. x is the disappearing timer it was
+  // written for (seconds), which every re-encrypt keeps (see reseal).
   async function open(it) {
     const o = opened.get(it.id);
     if (o && o.draft === it.draft) return o.dec;
@@ -122,7 +124,8 @@ export function createScheduled(deps) {
     try {
       const p = it.draft && it.ref ? await deps.openDraft(it) : null;
       if (p && typeof p === 'object' && !Array.isArray(p)) {
-        dec = { t: typeof p.t === 'string' ? p.t : '', f: Array.isArray(p.f) ? p.f : [], ...(p.p && typeof p.p === 'object' ? { p: p.p } : {}), l: Array.isArray(p.l) ? p.l : [] };
+        dec = { t: typeof p.t === 'string' ? p.t : '', f: Array.isArray(p.f) ? p.f : [], ...(p.p && typeof p.p === 'object' ? { p: p.p } : {}), l: Array.isArray(p.l) ? p.l : [],
+          ...(Number.isInteger(p.x) && p.x > 0 ? { x: p.x } : {}) };
       }
     } catch { /* doesn't open: can't confirm it's yours */ }
     opened.set(it.id, { draft: it.draft, dec });
@@ -130,7 +133,11 @@ export function createScheduled(deps) {
   }
   // New ciphertext for it with the conversation's current keys (and new words, or a new time, if given), always
   // from your own copy. The poll, files and the link previews whose links are still in the text stay, as when
-  // editing a message. now: if its time has passed, it may go at once (the server refuses otherwise, 409 overdue).
+  // editing a message. So does the disappearing timer it was written for: sealFor puts the stricter of that and the
+  // conversation's timer now inside it, and the server keeps the same one. A timer turned off or made longer since
+  // never makes it last longer than you wrote it for, so re-encrypting it (by itself after a key change, or for an
+  // edit, Keep or Send now) never needs asking about the timer the way sending a message you wrote earlier does.
+  // now: if its time has passed, it may go at once (the server refuses otherwise, 409 overdue).
   async function reseal(it, { text, sendAt, now = false } = {}) {
     const dec = await open(it);
     if (!readable(dec)) throw new Error(CANT_CONFIRM);
@@ -139,10 +146,10 @@ export function createScheduled(deps) {
     const links = (dec.l || []).filter((x) => x && still.includes(x.url));
     const payload = { t, f: dec.f || [], ...(dec.p ? { p: dec.p } : {}), ...(links.length ? { l: links } : {}) };
     const patch = async () => api('PATCH', `/scheduled-messages/${it.id}`, {
-      ...(await deps.sealFor(keyOf(it), payload, { ref: it.ref, threadId: it.threadId })), ...(sendAt ? { sendAt } : {}), ...(now ? { sendNow: true } : {}),
+      ...(await deps.sealFor(keyOf(it), payload, { ref: it.ref, threadId: it.threadId, x: dec.x || 0 })), ...(sendAt ? { sendAt } : {}), ...(now ? { sendNow: true } : {}),
     });
-    // Encrypted for the conversation's disappearing timer as it is now. Changed meanwhile (409 disappear_changed):
-    // fetch it and encrypt again for that one, once.
+    // Checked against the conversation's disappearing timer as it is now (ttl). Changed meanwhile (409
+    // disappear_changed): fetch it and encrypt again, once.
     const go = async () => {
       try { return await patch(); } catch (e) {
         if (!(e.status === 409 && e.code === 'disappear_changed') || !deps.refreshTimer) throw e;

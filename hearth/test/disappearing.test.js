@@ -211,6 +211,31 @@ test('timer: each change is logged (who, from, to, when) and shown with the hist
   assert.equal(srv.sql('SELECT secs FROM disappear_log WHERE conv = ? ORDER BY created_at DESC LIMIT 1', conv)[0].secs, HOUR);
 });
 
+test('timer: a server channel’s change is in the server’s audit log with its other settings (a voice channel’s chat too); a group chat has no log', async () => {
+  const c = (await as(boss, 'POST', `/servers/${space.id}/channels`, { name: 'audited', type: 'text' })).json;
+  const vc = (await as(boss, 'POST', `/servers/${space.id}/channels`, { name: 'audited-voice', type: 'voice' })).json;
+  const updates = (id) => srv.sql("SELECT actor_id, detail FROM server_audit WHERE server_id = ? AND action = 'channel_update' AND target_id = ? ORDER BY seq", space.id, id)
+    .map((r) => ({ by: r.actor_id, ...JSON.parse(r.detail) }));
+  const k = await keeper(); k.uses += 3;
+  assert.equal((await setTimer(k, 'c:' + c.id, DAY)).status, 200);
+  assert.equal((await setTimer(k, 'c:' + c.id, DAY)).json.unchanged, true);
+  assert.equal((await setTimer(k, 'c:' + c.id, 0)).status, 200);
+  assert.deepEqual(updates(c.id).map((e) => [e.by, e.changes]), [[k.id, { disappear: { from: 0, to: DAY } }], [k.id, { disappear: { from: DAY, to: 0 } }]], 'each change, not the same value again');
+  assert.equal(updates(c.id)[0].channel.id, c.id);
+  assert.equal((await setTimer(k, 'c:' + vc.id, DAY)).status, 200);
+  assert.deepEqual(updates(vc.id).map((e) => e.changes), [{ disappear: { from: 0, to: DAY } }]);
+  // Readers of the log get it like any other change to a channel.
+  const log = (await as(boss, 'GET', `/servers/${space.id}/audit?action=channel_update&target=${vc.id}`)).json;
+  assert.deepEqual(log.entries.map((e) => [e.actorId, e.detail.changes]), [[k.id, { disappear: { from: 0, to: DAY } }]]);
+  // A group chat has no audit log (and a DM none at all).
+  const groupRows = () => srv.sql('SELECT COUNT(*) n FROM server_audit WHERE server_id = ?', group.id)[0].n;
+  const had = groupRows();
+  assert.equal((await setTimer(alice, 'c:' + groupChat.id, HOUR)).status, 200);
+  assert.equal(groupRows(), had);
+  useTimer('c:' + groupChat.id, 0);
+  useTimer('c:' + vc.id, 0);
+});
+
 test('timer: disappear:update reaches the DM pair, the group, and in a private channel only people who can see it', async () => {
   const [sa, sb, sc] = [await sock(alice), await sock(bob), await sock(carol)];
   const [ga, gb, gc] = [collect(sa, 'disappear:update'), collect(sb, 'disappear:update'), collect(sc, 'disappear:update')];
@@ -803,4 +828,15 @@ test('app: a timer turned off or made longer after a message was written is weak
   assert.equal(D.weaker(0, HOUR), false, 'turned on: sent with it');
   assert.equal(D.weaker(0, 0), false);
   assert.equal(D.weaker(undefined, 0), false);
+});
+
+test('app: a scheduled message re-encrypted later keeps the stricter of the timer it was written under and the one now', () => {
+  assert.equal(D.stricter(HOUR, 0), HOUR, 'turned off since: the one it was written under stays');
+  assert.equal(D.stricter(HOUR, DAY), HOUR, 'made longer since: the same');
+  assert.equal(D.stricter(DAY, HOUR), HOUR, 'made shorter: the new one');
+  assert.equal(D.stricter(0, HOUR), HOUR, 'turned on: the new one');
+  assert.equal(D.stricter(HOUR, HOUR), HOUR);
+  assert.equal(D.stricter(0, 0), 0);
+  assert.equal(D.stricter(undefined, 0), 0);
+  assert.equal(D.stricter(undefined, HOUR), HOUR);
 });

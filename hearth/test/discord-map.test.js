@@ -556,6 +556,17 @@ test('planFromTemplate warns about moderator powers for @everyone: server-wide (
   assert.ok(plan(g).report.warnings.some((w) => w.code === 'everyone_manage'));
   g.roles[0].permissions = d('VIEW_CHANNEL', 'SEND_MESSAGES');
   assert.ok(!plan(g).report.warnings.some((w) => w.code === 'everyone_manage'));
+  // Renaming everyone below you and reading the audit log are moderator powers in Hearth too (memberships.js
+  // POWERFUL), and both come over now: @everyone holding them is said, like Kick.
+  for (const bit of ['MANAGE_NICKNAMES', 'VIEW_AUDIT_LOG']) {
+    g.roles[0].permissions = d('VIEW_CHANNEL', 'SEND_MESSAGES', bit);
+    const p = plan(g);
+    assert.ok(p.report.warnings.some((w) => w.code === 'everyone_manage'), bit);
+    assert.ok(p.everyone.permissions & H[bit], `${bit} comes over`);
+  }
+  // Changing your own nickname isn't one (Hearth's @everyone has it by default).
+  g.roles[0].permissions = d('VIEW_CHANNEL', 'SEND_MESSAGES', 'CHANGE_NICKNAME');
+  assert.ok(!plan(g).report.warnings.some((w) => w.code === 'everyone_manage'));
   g.channels = [
     { id: 100, type: 0, name: 'general', position: 0, permission_overwrites: [{ id: 0, type: 0, allow: d('MANAGE_MESSAGES'), deny: '0' }] },
     { id: 101, type: 0, name: 'quiet', position: 1, permission_overwrites: [{ id: 0, type: 0, allow: '0', deny: d('SEND_MESSAGES') }] },

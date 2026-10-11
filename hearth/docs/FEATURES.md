@@ -259,7 +259,8 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
   - Every server-scoped moderation action and settings change also goes in that server's own log (`server_audit`):
     kicks, bans (with the cleanup's counts and the invites it revoked), unbans, timeouts, member role changes
     (picked by the member themselves: `self: true`, at most 20 such entries per member per hour; from a membership:
-    `membership: true`), roles, channels and categories, channel overrides (before and after), invites, emoji,
+    `membership: true`), roles, channels and categories (a channel's disappearing-messages timer too, as
+    `channel_update` `changes.disappear`), channel overrides (before and after), invites, emoji,
     webhooks, bots, voice disconnect/move/mute, moderators deleting other people's messages (single, bulk, and
     instance staff removing a reported one, shown as "<instance name> staff"), pins, server settings (which ones
     changed, not the new text) and ownership. Never message text. Handling reports isn't logged there (the
@@ -579,7 +580,10 @@ What this pass built, and where it differs from that design:
   conversation (not one budget for the whole conversation, which one person could use up to lock the timer for
   everyone else). The same value again changes nothing (no log line, no event). `GET` on the same paths gives `{ seconds, log }` (the last 20
   changes). Live: `disappear:update { conv, channelId | dmId, id, seconds, prev, by, at }` to whoever can see the
-  conversation (`toChannel`, or both DM users).
+  conversation (`toChannel`, or both DM users). In a server channel (a voice channel's chat too) a change is also a
+  `channel_update` entry in the server's audit log, `changes: { disappear: { from, to } }`, like the channel's other
+  settings ("Ana changed #general: set disappearing messages to 1 day"); group chats and DMs have no audit log, and
+  messages disappearing by themselves aren't logged.
 - **Shown.** `disappear_log` keeps who changed what and when (50 per conversation); history pages carry the changes
   that fall inside them (`timerEvents`) and the apps draw them between the messages, each under its own day's
   divider. Pages meet without gaps: a `?before=` page ends at its anchor's id time, an `?after=` page starts at its
@@ -989,7 +993,12 @@ it and encrypts again, once (`refreshTimer`). The row keeps `ttl`. When it's pos
 `postDmMessage` stamp its deadline from that moment (`created_at` is the send time), by the conversation's timer
 then, never later than `ttl` (`sendSecs` in `index.js`): turned on or shortened since, the conversation's timer
 wins; turned off or made longer, it still goes when its sender expected, so the server deletes it when readers' apps
-(which take the earlier of `expiresAt` and `createdAt + x`) hide it anyway. Its files get the same deadline when
+(which take the earlier of `expiresAt` and `createdAt + x`) hide it anyway. Re-encrypting it (an edit, Keep, Send now,
+or the app by itself after a key change) keeps that: `open()` keeps the `x` of the sender's own copy, `sealFor` puts
+the stricter of it and the conversation's timer now inside the new ciphertext (`stricter` in `disappear.js`), and
+`PATCH` stores the stricter of the row's `ttl` and the new one (`keepTtl`), whatever the app sends. So a timer turned
+off or made longer before a re-encrypt never makes the message last longer, and nothing needs asking (unlike sending a
+message written under an older timer, `stillSend`). Its files get the same deadline when
 they're handed over. A reply or thread that has disappeared by its time counts as gone (`replyIn`, `threadRootIn`
 check `alive`). The list shows "Disappears after …" on each one encrypted for a timer. A voice channel's chat takes
 scheduled messages like a text channel (`hasChat`; a group's call has no chat, 400), but threads stay in text
@@ -1063,7 +1072,7 @@ files as "Waiting with a scheduled message (due …)", and the admin storage rep
 | `GET /scheduled-messages` | session | your own, soonest first, with `max` and `maxDays`; key changes are checked first; 60/min |
 | `POST /channels/:id/scheduled-messages` | can post in the channel, not timed out | see above; 30/min, plus the message limits |
 | `POST /dms/:id/scheduled-messages` | your DM, no block, the other account exists | see above |
-| `PATCH /scheduled-messages/:id` `{ sendAt?, ciphertext?, draft?, epoch?, mentions?, everyone?, sendNow? }` | your own, the conversation still yours | new ciphertext needs its new `draft` (400 `draft`), replaces `mentions` and `everyone` (missing means none) and the session, and makes a held one pending; a held one whose time has passed needs `sendNow: true` or a `sendAt` with it (409 `overdue`); a held one can't just be rescheduled (409 `held`); a failed one can't be changed (409 `failed`); 60/min |
+| `PATCH /scheduled-messages/:id` `{ sendAt?, ciphertext?, draft?, epoch?, ttl?, mentions?, everyone?, sendNow? }` | your own, the conversation still yours | new ciphertext needs its new `draft` (400 `draft`), replaces `mentions` and `everyone` (missing means none) and the session, keeps the stricter of its `ttl` and the conversation's timer now (`ttl` checked, 409 `disappear_changed`), and makes a held one pending; a held one whose time has passed needs `sendNow: true` or a `sendAt` with it (409 `overdue`); a held one can't just be rescheduled (409 `held`); a failed one can't be changed (409 `failed`); 60/min |
 | `POST /scheduled-messages/:id/send` | your own | sends now with the same checks; a refusal is answered (403, 404, 429 `slowmode`) and the message left as it was; 409 `held` marks it held |
 | `DELETE /scheduled-messages/:id` | your own | cancels or dismisses; its files are deleted; 120/min |
 
