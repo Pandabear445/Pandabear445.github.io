@@ -43,7 +43,7 @@ const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24
 module.exports = function setupAccounts(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
     tokenId, requireInstanceAdmin, requireOutranks, auditLog, secEvent, cleanIp, emitKeyState, brandName, isB64ish, isSalt, atRestKey,
-    stepUp, createSession, revokeSessions, hitsSoFar, verifyCaptcha } = ctx;
+    stepUp, createSession, revokeSessions, rotateToken, hitsSoFar, refundHit, refundNet, verifyCaptcha } = ctx;
   const now = () => Date.now();
 
   // ------------------------------------------------------------------ sending email
@@ -149,10 +149,12 @@ module.exports = function setupAccounts(ctx) {
   api.post('/me/email', auth, wrap(async (req, res) => {
     rateLimit('email:' + req.userId, 6, 3600000);
     limitNet(req, 'email', 20, 3600000);
-    const row = await stepUp(req, req.body);
+    // A mistyped address (or email not set up) is turned down before the password and code are checked, so it
+    // doesn't use up a two-factor code: each change takes a fresh one (auth-6).
     const email = String((req.body || {}).email || '').trim().toLowerCase().slice(0, 254);
     if (!EMAIL_RE.test(email)) fail(400, 'That doesn’t look like an email address.');
     if (!mailReady()) fail(503, 'Email isn’t set up on this server yet. Ask the owner.');
+    const row = await stepUp(req, req.body);
     // An address another account already has gets the same answer here (otherwise this would tell anyone
     // which emails have accounts). Only that inbox learns why no code came; the pending code can't be guessed.
     const taken = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.userId);
@@ -201,8 +203,9 @@ module.exports = function setupAccounts(ctx) {
   // only that encrypted copy here. The recovery key itself never leaves your device.
   api.put('/me/recovery', auth, wrap(async (req, res) => {
     const b = req.body || {};
-    const row = await stepUp(req, b);
-    if (!isB64ish(b.encPrivateKeyRecovery, 4000) || !isSalt(b.recoverySalt)) fail(400, 'Bad key material.');
+    if (!isB64ish(b.encPrivateKeyRecovery, 4000) || !isSalt(b.recoverySalt)) fail(400, 'Bad key material.'); // (before a code is used up)
+    // The step-up ticket from fetching the locked key stands in for the code.
+    const row = await stepUp(req, b, 'authKey', { ticket: 'recovery' });
     db.prepare('UPDATE users SET enc_private_key_recovery = ?, recovery_salt = ? WHERE id = ?').run(b.encPrivateKeyRecovery, b.recoverySalt, req.userId);
     auditLog(req, row.enc_private_key_recovery ? 'recovery_key_replaced' : 'recovery_key_created', req.userId, row.username);
     notify(row, 'a recovery key was created', `A new recovery key was made for ${row.username}. Any older recovery key stopped working.`);
@@ -263,7 +266,14 @@ module.exports = function setupAccounts(ctx) {
     rateLimit('totp:' + row.id, 8, 15 * 60000);
     rateLimit('totpday:' + row.id, 30, 24 * 3600000);
     if (req) limitNet(req, 'totp', 20, 15 * 60000);
-    if (b.totp ? totpOk(row, b.totp) : backupOk(row, b.backupCode)) return;
+    if (b.totp ? totpOk(row, b.totp) : backupOk(row, b.backupCode)) {
+      // A right code isn't a guess, so it gives its tries back. Sensitive changes take a fresh code every time
+      // (auth-6); without this, a run of them (an owner going through team roles, say) would use up the limits that
+      // signing in shares. A code works once, so this gives nobody more guesses.
+      refundHit('totp:' + row.id); refundHit('totpday:' + row.id);
+      if (req) refundNet(req, 'totp');
+      return;
+    }
     secEvent('failed_2fa', req ? req.ip : '', row.username);
     if (countHit('totpwarn:' + row.id, 3600000) === 3) {
       auditLog(req, '2fa_failures', row.id, `${row.username}: 3 wrong codes after the right password`, row.id);
@@ -295,7 +305,9 @@ module.exports = function setupAccounts(ctx) {
     secEvent('2fa_enabled', cleanIp(req.ip), row.username);
     auditLog(req, '2fa_enabled', req.userId, row.username);
     notify(row, 'two-factor sign-in is on', `Two-factor sign-in was turned on for ${row.username}. Every other device was signed out.`);
-    res.json({ backupCodes, user: selfUser(getUserRow(req.userId)) });
+    // This device stays signed in with a new token, so a copy of the old one (which never passed two-factor) is
+    // signed out with the others (auth-11).
+    res.json({ backupCodes, user: selfUser(getUserRow(req.userId)), token: rotateToken(req) });
   });
   api.post('/me/2fa/disable', auth, wrap(async (req, res) => {
     const b = req.body || {};
@@ -308,6 +320,7 @@ module.exports = function setupAccounts(ctx) {
     secEvent('2fa_disabled', cleanIp(req.ip), row.username);
     auditLog(req, '2fa_disabled', req.userId, row.username);
     notify(row, 'two-factor sign-in was turned off', `Two-factor sign-in was turned off for ${row.username}.`);
+    broadcastUser(req.userId); // the account's other open windows stop asking for a code
     res.json(selfUser(getUserRow(req.userId)));
   }));
   api.post('/me/2fa/backup-codes', auth, (req, res) => {
@@ -324,6 +337,8 @@ module.exports = function setupAccounts(ctx) {
     db.prepare("UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_last_step = NULL, backup_codes = '[]' WHERE id = ?").run(r.id);
     auditLog(req, '2fa_removed', r.id, r.username);
     notify(r, 'two-factor sign-in was removed', `A server admin turned off two-factor sign-in for ${r.username} (usually because the phone was lost).`);
+    // Their open app stops asking for a code from the phone they may have lost.
+    broadcastUser(r.id);
     res.json({ ok: true });
   });
 

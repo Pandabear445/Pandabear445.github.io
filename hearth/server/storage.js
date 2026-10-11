@@ -376,9 +376,10 @@ module.exports = function setupStorage(ctx) {
   // ------------------------------------------------------------------ admin cleanup
   // Needs the password (and two-factor) again, and is audit-logged. Everything is worked out again here, in one
   // go with no await between finding and removing, so nothing that gained a reference meanwhile is touched.
+  // It only removes files nothing uses, so a two-factor sign-in in the last 10 minutes counts (grace, auth-6).
   api.post('/admin/storage/cleanup', auth, adminOnly, wrap(async (req, res) => {
     rateLimit('storclean:' + req.userId, 10, 60 * 60 * 1000);
-    await stepUp(req, req.body);
+    await stepUp(req, req.body, 'authKey', { grace: true });
     const graceMs = graceOf((req.body || {}).graceHours);
     const o = findOrphans(graceMs);
     if (o.unverifiable) fail(409, `${o.unverifiable} older messages couldn\u2019t be opened with this server\u2019s key, so it can\u2019t be sure which files they use. Nothing was deleted.`, 'unverifiable');

@@ -2,7 +2,7 @@
 // Layout: server rail | sidebar (home or server) | conversation | contextual right panel (members, pins, thread).
 import { androidApp } from './android.js';
 import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playSound, copyText, debounce } from './util.js';
-import { api, upload, getToken, setToken } from './api.js';
+import { api, upload, getToken, setToken, setTokenOwner, onTokenChange, tokenMovedFrom } from './api.js';
 import * as E2EE from './e2ee.js';
 import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers, linkedUrls } from './markdown.js';
 import { findPreviewUrl, looksPrivate, payloadVariants, hostLabel, cleanText as cleanPreviewText, KINDS as PREVIEW_KINDS, TITLE_MAX, DESC_MAX, SITE_MAX } from './linkpreview.js';
@@ -81,6 +81,12 @@ const S = {
 // The server's time now: disappearing messages are hidden by it, whatever this device's clock says.
 const nowServer = () => Date.now() + (S.clockOffset || 0);
 let socket;
+// The token the live connection last connected with. When this tab's token changes (this tab or another one of
+// this browser changed the password, turned on two-factor or signed out the other devices, and the server gave
+// the sign-in a new token), a connection still on the old one is made again with the new one. (One the server has
+// already closed for it comes back by itself: see tokenMoved in watchConnection, conn.js.)
+let socketToken = '';
+onTokenChange((t) => { if (socket && socket.connected && t !== socketToken) { socket.disconnect(); socket.connect(); } });
 let hadController = false; // was a service worker already in charge when the page loaded?
 let voice;
 let away = null; // automatic Away (presence.js)
@@ -301,7 +307,10 @@ function showSignIn() {
         const salt = E2EE.newKdfSalt();
         const next = await E2EE.deriveKeys(username, password, { kdf: 'argon2id', salt });
         const encPrivateKey = await E2EE.rewrapPrivateKey(wrapKey, next.wrapKey, res.encPrivateKey);
-        await api('POST', '/me/password', { oldAuthKey: authKey, newAuthKey: next.authKey, encPrivateKey, salt, keepSessions: true });
+        // (With two-factor on, the sign-in's step-up ticket stands in for the code just used.) The session gets a
+        // new token with the re-saved password.
+        const up = await api('POST', '/me/password', { oldAuthKey: authKey, newAuthKey: next.authKey, encPrivateKey, salt, keepSessions: true, ...(res.stepUpTicket ? { stepUpTicket: res.stepUpTicket } : {}) });
+        if (up.token) res.token = up.token;
       }
       await finishLogin(res, priv);
     } catch (ex) {
@@ -457,10 +466,14 @@ function startApp() {
   $('#auth').hidden = true;
   $('#app').hidden = false;
   $('#app').classList.add('loading');
-  socket = io({ auth: { token: getToken() }, transports: ['websocket', 'polling'] });
+  setTokenOwner(localStorage.getItem('hearth.userId'));
+  // Asked for the token on every (re)connect, so a token that changed meanwhile is the one used.
+  socket = io({ auth: (cb) => { socketToken = getToken(); cb({ token: socketToken }); }, transports: ['websocket', 'polling'] });
   // Tells the server when this app goes unused (and comes back), for automatic Away. Until the account has
   // loaded there's no setting yet, and while the status isn't Online it can't change anything: nothing is sent.
   // Being in a call counts as using Hearth (talking, or watching a shared screen without touching anything).
+  // (A connection made again with a new sign-in token starts out "in use" on the server like any new one, and
+  // presence.js reports again on 'connect'; the session id, which presence and scheduled holds go by, stays.)
   away = initAway({
     socket,
     minutes: () => (S.me && S.me.status === 'online' && Number.isFinite(S.me.awayAfter) ? S.me.awayAfter : 0),
@@ -535,6 +548,7 @@ function startApp() {
   } catch { /* storage off */ }
 
   socket.on('connect', async () => {
+    const used = getToken();
     try {
       // Back after a restart: same version → carry on; new version → switch to it.
       if (S.restarting || S.config.version) {
@@ -547,7 +561,9 @@ function startApp() {
       $('#app').classList.remove('loading');
       $('#conn-banner').hidden = true;
     } catch (e) {
-      if (e.status === 401) return logout();
+      // Turned away: unless another tab of this browser has just stored a newer token for this sign-in (then the
+      // connection is made again with it, above), this device was signed out.
+      if (e.status === 401) { if (await tokenMovedFrom(used, 5000)) return; return logout(); }
       toast(e.message, 'error');
     }
   });
@@ -559,12 +575,16 @@ function startApp() {
   // let back in. Any other connection the server closes (too many events at once, say) just reconnects.
   watchConnection(socket, {
     paused: () => !!S.restarting, // expected: the server is restarting for an update
+    tokenMoved: (ms) => tokenMovedFrom(socketToken, ms), // a new token for this sign-in (conn.js)
     onDown: () => { $('#conn-banner').hidden = false; },
     onSignedOut: (reason) => {
       if (loggingOut) return; // already signing out (this device's own "Log out", say): nothing more to explain
       const why = {
         password_changed: 'Your password was changed', password_reset: 'Your password was reset', '2fa_enabled': 'Two-factor sign-in was turned on',
         expired: 'Your sign-in expired', account_deleted: 'This account was deleted', suspended: 'This account was suspended', staff: 'A server admin signed you out',
+        // This device's sign-in token was replaced (a password change, two-factor turned on, or "Log out all other
+        // devices" with the password), and this device never got the new one: it only had a copy, say.
+        token_rotated: 'This sign-in was renewed on another device',
       }[reason];
       // 'logged_out' is this sign-in's own "Log out", pressed in another tab of this browser: nothing to explain.
       if (reason !== 'unauthorized' && reason !== 'logged_out') sessionStorage.setItem('hearth.signedOutWhy', `${why || 'This device was signed out'}. Sign in again.`);
@@ -1701,7 +1721,9 @@ function refreshThreadBits(rootId, channelId, badges = true) {
 }
 // Read on another device (or another tab): same badges here, and its notifications go away.
 function onReadUpdate(st) {
-  if (!st || !st.conv) return;
+  // (Not before the start-up data is in: a connection made a moment earlier, say just after a reload or a new
+  // sign-in token, can get one from another tab first. The start-up data brings the read state anyway.)
+  if (!st || !st.conv || !S.me) return;
   applyReadState(st.conv, st);
   if (!st.unread) closeNotifications(st.conv);
   updateTitle(); later(renderRail); later(renderSidebar);

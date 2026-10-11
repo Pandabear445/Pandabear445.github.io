@@ -626,11 +626,13 @@ CREATE TABLE IF NOT EXISTS feed_seen (
 
 // v13: sessions get a public id, an expiry and a revocation time, and the columns say what they hold.
 //   id            random, shown to the account (Settings → Sessions) to pick a device; not usable to sign in
-//   token_hash    SHA-256 of the sign-in token (the token itself is never stored)
+//   token_hash    SHA-256 of the sign-in token (the token itself is never stored); replaced in place when the
+//                 password changes, two-factor is turned on or the other devices are signed out (auth-11)
 //   last_used_at  last request; a session unused for SESSION_IDLE_DAYS expires
 //   expires_at    when it stops working even if used (SESSION_MAX_DAYS after sign-in)
 //   revoked_at    signed out (by the person, a password change/reset, 2FA, staff); rows are purged later
-//   mfa_at        when this sign-in passed two-factor (recent → sensitive changes don't ask again)
+//   mfa_at        when this sign-in last passed two-factor (recent → the two low-risk step-up changes, a data
+//                 export and clearing unused files, don't ask again; every other one always does, auth-6)
 {
   const cols = () => db.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name);
   if (cols().includes('token')) db.exec('ALTER TABLE sessions RENAME COLUMN token TO token_hash');
@@ -852,6 +854,10 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
 // it may be tried again, so a dead or hostile push service sits out instead of holding up everyone's sends.
 addColumn('push_subs', 'fails', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('push_subs', 'retry_at', 'INTEGER');
+// v19 (auth-11): …and the SHA-256 of the sign-in token it was made with. A session's token can be replaced in place
+// (a password change, two-factor turned on, "log out all other devices" with the password); a subscription made
+// with a copy of the old token then gets nothing more. Older rows have none and follow their session alone.
+addColumn('push_subs', 'token_hash', 'TEXT');
 
 // v17 (admin): owner tools hardening.
 // Subscriptions of a deleted server that Stripe hasn't confirmed as cancelled yet. The membership rows go with the

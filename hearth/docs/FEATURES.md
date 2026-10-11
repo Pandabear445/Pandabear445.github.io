@@ -1022,7 +1022,9 @@ queued. It goes out only once the person confirms it from a session still signed
 **Edit** or **Reschedule** in the list re-encrypt it from their own copy (which ties it to the new session). The app
 never does that by itself, a key change doesn't turn it into an ordinary key hold, and `POST …/send` and a
 reschedule alone answer 409 `held`. At its time the person is told it's waiting, as for any held one. A session
-that simply expires doesn't count.
+that simply expires doesn't count, and neither does a new sign-in token for the session itself (`rotateToken`: the
+device that changes the password, turns on two-factor or uses *Log out all other devices* with the password keeps
+its session id), so what that device scheduled stays as it was.
 
 **Key changes, decided honestly.** A channel message is locked with one epoch of the server key, and members who
 joined after a rotation never receive older keys; posting old ciphertext would make a message they can't open,
@@ -1120,7 +1122,8 @@ deletes its scheduled messages and their files at once.
   start-up orphan sweep keeps a waiting message's file; a session that ends (*Log out all other devices*, logging
   out, signing one out) holds what it scheduled (`session_ended`): not posted at its time, the sender told, not
   sendable or reschedulable as it is, not turned into a key hold by a key change, sent once confirmed with new
-  ciphertext, and what other sessions scheduled untouched; Settings → Storage and the admin report label a
+  ciphertext, and what other sessions scheduled untouched; a new sign-in token for the same session (`auth-11`)
+  holds nothing, and its messages are listed, sent and cancelled from the new token; Settings → Storage and the admin report label a
   scheduled message's file; static checks that `public/js/scheduled.js` never builds HTML and never decrypts the
   ciphertext it's given (it re-encrypts only from the vault-sealed copy, bound to ref, conversation and thread).
 - Browser flow (`npm run test:e2e`, "send later"): a right-click on Send offers the times; the clock schedules

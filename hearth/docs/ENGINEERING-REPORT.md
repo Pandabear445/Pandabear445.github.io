@@ -114,12 +114,12 @@ where the docs now state the behaviour.
 | auth-3 | medium | vulnerability | Instance-wide sign-up, sign-in and reset counters are consumed by captcha-less requests (cheap DoS for everyone) | Fixed | `auth-hardening.test.js` |
 | auth-4 | medium | bug | Outstanding password-reset links survive password change, email change and email removal | Fixed | `auth-hardening.test.js` |
 | auth-5 | medium | limitation | Any session token, including a stolen one, can fetch the password-wrapped identity key and its salt for offline password guessing | Fixed | `crypto-hardening.test.js` |
-| auth-6 | low | overclaim | Docs promise a fresh 2FA code for sensitive changes, but stepUp skips it for 10 minutes after any 2FA sign-in | Documented | — (SECURITY.md row 6, §4) |
+| auth-6 | low | overclaim | Docs promise a fresh 2FA code for sensitive changes, but stepUp skips it for 10 minutes after any 2FA sign-in | Fixed | `auth-hardening.test.js` |
 | auth-7 | low | bug | Push subscriptions are not tied to sessions: logged-out, revoked, password-changed and suspended devices keep getting notifications | Fixed | `outbound-hardening.test.js` |
 | auth-8 | low | bug | IP bans don't stop existing sessions over HTTP, and /auth/reset hands banned IPs a fresh session | Fixed | `auth-hardening.test.js` |
 | auth-9 | low | bug | Legacy PBKDF2 accounts: enumerable through /auth/params, and a full password change through the 'upgrade' flag skips revocation, audit log and email notice | Partly fixed | `auth-hardening.test.js` |
 | auth-10 | low | vulnerability | POST /me/email reveals whether an address belongs to another account | Fixed | `auth-hardening.test.js` |
-| auth-11 | low | hardening | The current session token is never rotated, so a copy of it survives password change, 2FA enable and 'log out other devices' | Deferred | — (SECURITY.md row 7, §4) |
+| auth-11 | low | hardening | The current session token is never rotated, so a copy of it survives password change, 2FA enable and 'log out other devices' | Fixed | `auth-hardening.test.js`, `outbound-hardening.test.js` |
 | auth-12 | low | bug | Any server-initiated socket disconnect makes the client revoke its own session and wipe its keys | Fixed | `voice-hardening.test.js` |
 | auth-13 | low | hardening | The 7-day media token in /bootstrap isn't bound to a session and outlives logout, suspension and account deletion | Fixed | `auth-hardening.test.js` |
 
@@ -293,7 +293,6 @@ where the docs now state the behaviour.
 
 | ID | What stays | Why |
 |---|---|---|
-| auth-11 | The session that changes the password, turns on 2FA or logs out other devices keeps its token, so a copy of that one token survives. | Rotating it changes the response contract and the client's token handling: tabs share one token in `localStorage`, and a naive server-only change would sign users out of their other tabs and wipe their keys. A design (rotate in place, tabs pick up the new token, sweeper closes sockets on the old one) is recorded. |
 | crypto-7 | A message's id, reply, thread, time and edit version are not inside the ciphertext, so the server can replay, re-thread, re-date or roll back an edit. | A protocol change with false-positive risk (the server legitimately clears a reply whose target is gone). The recorded design adds a client UUID, reply, thread, time and edit counter to the encrypted payload, backward compatible, with a "may have been moved" flag. |
 | admin-12 | Refunds and chargebacks don't reduce supporter time; a one-off payment can give up to 400 days. | Needs product decisions (partial refunds, Ko-fi has no refund webhook) and a schema change to store charge ids. The manual workaround (unmark in Admin → Users) is logged. |
 
@@ -475,8 +474,9 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
    release so installed apps move to signed updates.
 3. Done: server update zips are signed (`admin-11`) and `hearth-update` pins the trust anchor. Make the key
    (`node scripts/update-key.js keygen`), commit `update-signing.pub` and publish one signed release.
-4. Make step-up always ask for a code for password, email, recovery-key and key-export changes (`auth-6`), and rotate
-   the current session token on password change (`auth-11`).
+4. Done: step-up always asks for a fresh code (`auth-6`; only starting a data export and clearing unused files keep
+   the 10-minute grace), and a password change, turning on 2FA and "log out all other devices" with the password
+   give the current session a new token (`auth-11`).
 5. Bind message id, reply, thread, time and edit version into the ciphertext (`crypto-7`), and the member list into
    key handoffs (`crypto-5`).
 6. Rotate the server key after a reset without a recovery key, or keep a reset account out of key sharing until a

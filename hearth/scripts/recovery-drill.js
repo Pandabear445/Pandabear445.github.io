@@ -241,6 +241,10 @@ function createDrill() {
         assert.equal((await as(other, 'GET', '/bootstrap')).status, 401, 'the other session ended');
         assert.ok(await until(() => sock.disconnected), 'its live connection was cut');
         sock.close();
+        // This session stays, with a new token (auth-11): a copy of the old one stops working too.
+        assert.match(String(r.json.token || ''), /^[0-9a-f]{64}$/, 'this session gets a new token');
+        assert.equal((await as(A, 'GET', '/bootstrap')).status, 401, 'the old token of this session is out');
+        A.token = r.json.token;
         assert.equal((await as(A, 'GET', '/bootstrap')).status, 200, 'this session stays');
         const old = await signIn(A, A.password);
         assert.equal(old.status, 401, 'the old password is refused');
@@ -253,7 +257,7 @@ function createDrill() {
         const d = await device(A, new Map());
         assert.deepEqual(texts(await readChannel(d, ctx.ch)), sorted([...ctx.sent[1], ...ctx.sent[2]]));
         assert.deepEqual(texts(await readDm(d, ctx.dmAB)), sorted(ctx.dmTexts.AB));
-        return ['other session: 401, live connection closed', 'old password: 401', 'new password on a new device: all channel history and DMs open'];
+        return ['other session: 401, live connection closed', 'this session: a new token, the old one 401', 'old password: 401', 'new password on a new device: all channel history and DMs open'];
       },
     },
     {

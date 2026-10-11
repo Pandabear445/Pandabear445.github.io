@@ -172,8 +172,8 @@ function setupHealth(ctx) {
     const b = req.body || {};
     const before = alerts.config();
     const turningOff = (b.enabled === false && before.enabled) || (b.email === false && before.email);
+    if (b.cooldownMin !== undefined && !(+b.cooldownMin > 0)) fail(400, 'The cooldown is a number of minutes.'); // (before a code is used up)
     if (turningOff) await stepUp(req, b);
-    if (b.cooldownMin !== undefined && !(+b.cooldownMin > 0)) fail(400, 'The cooldown is a number of minutes.');
     const after = alerts.setConfig({ enabled: b.enabled, email: b.email, cooldownMin: b.cooldownMin });
     auditLog(req, 'alerts_settings', null, `alerts ${before.enabled ? 'on' : 'off'} → ${after.enabled ? 'on' : 'off'}, email ${before.email ? 'on' : 'off'} → ${after.email ? 'on' : 'off'}, cooldown ${before.cooldownMin} → ${after.cooldownMin} min`);
     res.json(after);

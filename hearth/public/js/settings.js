@@ -1,6 +1,6 @@
 // User settings: profile customization (all free), account, voice & audio, appearance.
 import { h, clear, icon, toast, playSound } from './util.js';
-import { api, upload } from './api.js';
+import { api, upload, setToken } from './api.js';
 import { EVENTS as SOUND_EVENTS, LIBRARY as SOUND_LIBRARY, soundPrefs, setSoundPrefs, resetSoundPrefs, setCustomSound, customSoundName } from './sounds.js';
 import * as E2EE from './e2ee.js';
 import { profileCard, FONT_STACKS, cropStyle, customFxLayer } from './profile-ui.js';
@@ -421,6 +421,7 @@ function accountTab(app, setDirty, go) {
   const oldPw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
   const newPw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
   const confirmPw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
+  const pwCode = codeField(S); // with two-factor on, a fresh code every time
   const msg = h('p', { class: 'form-error', role: 'alert' });
   const btn = h('button', { class: 'btn primary', onclick: async () => {
     msg.textContent = '';
@@ -429,16 +430,23 @@ function accountTab(app, setDirty, go) {
     btn.disabled = true;
     btn.textContent = 'Re-encrypting your key…';
     try {
+      pwCode.row.hidden = !S.me.totpEnabled; // (two-factor may have been turned on since this page was drawn)
+      const second = pwCode.value();
       const salt = E2EE.newKdfSalt();
-      const oldParams = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
-      const oldK = await E2EE.deriveKeys(S.me.username, oldPw.value, oldParams);
+      const oldK = await E2EE.deriveKeys(S.me.username, oldPw.value, kdfParams(S));
       const newK = await E2EE.deriveKeys(S.me.username, newPw.value, { kdf: 'argon2id', salt });
-      const locked = await lockedKey(oldK.authKey).catch((x) => { throw x.code === 'bad_password' ? new Error('Your current password is not right.') : x; });
+      // The code goes with the first request (the locked key); its step-up ticket stands in for it on the second.
+      let locked;
+      try { locked = await lockedKey(oldK.authKey, second); } catch (x) { throw x.code === 'bad_password' ? new Error('Your current password is not right.') : pwCode.error(x) || x; }
       let enc;
-      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, locked); } catch { throw new Error('Your current password is not right.'); }
-      await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }));
+      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, locked.encPrivateKey); } catch { throw new Error('Your current password is not right.'); }
+      let r;
+      try { r = await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }), locked.stepUpTicket); } catch (x) { throw pwCode.error(x) || x; }
+      // This device stays signed in with a new token (a copy of the old one stops working); every tab of this
+      // browser switches to it and reconnects.
+      if (r.token) setToken(r.token);
       S.me = { ...S.me, kdf: 'argon2id', kdfSalt: salt };
-      oldPw.value = ''; newPw.value = ''; confirmPw.value = '';
+      oldPw.value = ''; newPw.value = ''; confirmPw.value = ''; pwCode.input.value = '';
       toast('Password changed. Other devices were logged out.');
     } catch (e) {
       if (!e.cancelled) msg.textContent = e.message;
@@ -502,7 +510,7 @@ function accountTab(app, setDirty, go) {
         h('span', { class: 'field-hint' }, 'Open a DM and click \u201cEnd-to-end encrypted\u201d to compare safety numbers with a friend.'))),
     section('Change password',
       h('p', { class: 'muted-p' }, 'Your password locks your encryption key, so changing it re-locks the key on this device. Forgot it? Use \u201cForgot your password?\u201d on the sign-in screen (needs a confirmed email; keep a recovery key to keep your old messages).'),
-      field('Current password', oldPw), field('New password', newPw), field('Confirm new password', confirmPw), msg,
+      field('Current password', oldPw), field('New password', newPw), field('Confirm new password', confirmPw), pwCode.row, msg,
       h('div', null, btn)),
     section('Session',
       h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device'),
@@ -521,45 +529,87 @@ async function deleteAccount(app) {
     body: h('div', { class: 'stack' }, h('p', { class: 'warn-box' }, `Deleting ${S.me.username} for good.`), field('Username', confirmName)),
     actions: [{ label: 'Cancel' }, { label: 'Delete forever', kind: 'danger', action: async () => {
       if (confirmName.value.trim() !== S.me.username) throw new Error('That isn’t your username.');
-      await withCode((x) => api('DELETE', '/me', { authKey: keys.authKey, confirm: S.me.username, ...x }));
+      await withCode((x) => api('DELETE', '/me', { authKey: keys.authKey, confirm: S.me.username, ...x }), keys.ticket);
       sessionStorage.setItem('hearth.signedOutWhy', 'Your account was deleted.');
       app.logout();
     } }] });
 }
 
 // ------------------------------------------------------------------ account safety: email, recovery key, 2FA
-// Your password-locked private key. The server only hands it out with the password, plus a two-factor code when
-// that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). A
-// wrong password fails here.
-async function lockedKey(authKey) {
-  try { return (await withCode((x) => api('POST', '/me/keys/wrapped', { authKey, ...x }))).encPrivateKey; } catch (e) {
+const kdfParams = (S) => (S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' });
+// A typed two-factor code as the server takes it: 6 digits from the app, or a backup code.
+const codeArgs = (c) => (/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c });
+// The two-factor code field of the "Confirm it’s you" dialogs. With two-factor on, sensitive changes always take a
+// fresh code (a session token copied at sign-in plus a typed password mustn't be enough), so the field is there
+// from the start. For the two that don't need one right after a two-factor sign-in (shown: false), it appears if
+// the server asks.
+function codeField(S, { shown = true } = {}) {
+  const input = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code', spellcheck: 'false', autocapitalize: 'off' });
+  const spent = h('span', { class: 'field-hint', role: 'status', hidden: true }, 'That code has been used. Enter a new one to try again.');
+  const row = field('Code from your app (or a backup code)', input);
+  row.append(spent);
+  input.addEventListener('input', () => { spent.hidden = true; });
+  row.hidden = !(S.me.totpEnabled && shown);
+  return {
+    row, input,
+    // What to send with the request: the typed code, or nothing while the field is hidden or empty. Then the server
+    // says whether it wants one (need_2fa, below): what this app knows can be out of date, say if two-factor was
+    // just turned off for you by an admin because your phone was lost.
+    value() {
+      const c = row.hidden ? '' : input.value.trim().replace(/\s/g, '');
+      return c ? codeArgs(c) : {};
+    },
+    // The error to show in the dialog when the server turned the code down (or wants one), else null.
+    error(e) {
+      if (e.code === 'need_2fa') { row.hidden = false; input.focus(); return new Error('This change needs a code from your authenticator app (or one of your backup codes).'); }
+      if (e.code === 'bad_2fa') { input.value = ''; input.focus(); return e; }
+      // Turned down for another reason after the code was checked: each code works once, so it's spent. The field is
+      // emptied for the next try (sending it again would be "not right").
+      if (e.codeUsed && !row.hidden && input.value) { input.value = ''; spent.hidden = false; }
+      return null;
+    },
+  };
+}
+// Your password-locked private key. The server only hands it out with the password, plus a fresh two-factor code
+// when that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). With
+// a code it also hands back a step-up ticket, which stands in for that code on the next request of the same change
+// (each code works once, and that request wants one too). A wrong password fails here.
+async function lockedKey(authKey, code = {}) {
+  try { return await api('POST', '/me/keys/wrapped', { authKey, ...code }); } catch (e) {
     if (e.code === 'bad_password') throw Object.assign(new Error('That password isn’t right.'), { code: 'bad_password' });
     throw e;
   }
 }
-// Asks for the password again (sensitive changes). It must also unlock your key on this device. Resolves with
-// the derived keys plus the locked private key (encPrivateKey), or null if cancelled.
+// Asks for the password again, plus a two-factor code when it's on, for a change that needs your key unlocked on
+// this device (a recovery key) or is confirmed in a second step (deleting the account). The password must unlock
+// your key here. Resolves with the derived keys, the locked private key (encPrivateKey) and the step-up ticket for
+// the next request (ticket: pass it to withCode), or null if cancelled.
 function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'Continue' } = {}) {
   const S = app.S;
   return new Promise((resolve) => {
     const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    const code = codeField(S);
+    let derived = null; // the slow password step isn't repeated when only the code was wrong
     modal({ title, size: 'sm', onClose: () => resolve(null),
-      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw)),
+      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw), code.row),
       actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
         // (The password hashing library's own message for an empty one means nothing to people.)
         if (!pw.value) throw new Error('Enter your password.');
-        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
-        const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        const encPrivateKey = await lockedKey(keys.authKey);
-        try { await E2EE.unwrapPrivateKey(keys.wrapKey, encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
-        resolve({ ...keys, encPrivateKey });
+        const second = code.value();
+        if (!derived || derived.pw !== pw.value) derived = { pw: pw.value, keys: await E2EE.deriveKeys(S.me.username, pw.value, kdfParams(S)) };
+        const { keys } = derived;
+        let r;
+        try { r = await lockedKey(keys.authKey, second); } catch (e) { throw code.error(e) || e; }
+        try { await E2EE.unwrapPrivateKey(keys.wrapKey, r.encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
+        resolve({ ...keys, encPrivateKey: r.encPrivateKey, ticket: r.stepUpTicket || null });
       } }] });
   });
 }
-// Runs a sensitive request. If the server also wants a two-factor code (it does when two-factor is on, unless
-// this device passed it in the last few minutes), asks for one and sends the request again with it.
-function withCode(fn) {
-  return fn({}).catch((e) => {
+// Sends the next request of a change that began with askPassword (or lockedKey): its step-up ticket stands in for
+// the two-factor code. If the server still wants a code (no ticket, or it ran out: it lasts 5 minutes), asks for
+// one and sends the request again with it.
+function withCode(fn, ticket = null) {
+  return fn(ticket ? { stepUpTicket: ticket } : {}).catch((e) => {
     if (e.code !== 'need_2fa') throw e;
     return new Promise((resolve, reject) => {
       const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
@@ -568,7 +618,8 @@ function withCode(fn) {
         body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'This change needs a code from your authenticator app (or one of your backup codes).'), field('Code', code)),
         actions: [{ label: 'Cancel' }, { label: 'Continue', kind: 'primary', action: async () => {
           const c = code.value.trim().replace(/\s/g, '');
-          const out = await fn(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c });
+          if (!c) throw new Error('Enter the code from your authenticator app (or a backup code).');
+          const out = await fn(codeArgs(c));
           done = true; resolve(out);
         } }] });
     });
@@ -589,12 +640,35 @@ export function displayNameDialog(app, onDone) {
     } }] });
   setTimeout(() => inp.select(), 50);
 }
-// Password (and a two-factor code if needed) for a sensitive request: fn gets { authKey, totp|backupCode }.
-// Resolves to null if the person cancels.
-export async function confirmedCall(app, fn, opts) {
-  const keys = await askPassword(app, opts);
-  if (!keys) return null;
-  return withCode((x) => fn({ authKey: keys.authKey, ...x }));
+// Password (and a two-factor code when it's on) for a sensitive request, in one dialog: fn gets
+// { authKey, totp|backupCode } and what it returns is what this resolves to (null if the person cancels). A wrong
+// password or code is said in the dialog, which stays open; any other refusal closes it and rejects, for the
+// caller to show. grace: true for the two changes a two-factor sign-in in the last 10 minutes covers (starting a
+// data export, clearing unused files): their code field only shows if the server asks for one.
+export function confirmedCall(app, fn, { title = 'Confirm it’s you', text = '', button = 'Continue', grace = false, kind = 'primary' } = {}) {
+  const S = app.S;
+  return new Promise((resolve, reject) => {
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    const code = codeField(S, { shown: !grace });
+    let derived = null; let settled = false;
+    modal({ title, size: 'sm', onClose: () => { if (!settled) resolve(null); },
+      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw), code.row),
+      actions: [{ label: 'Cancel' }, { label: button, kind, action: async () => {
+        if (!pw.value) throw new Error('Enter your password.');
+        const second = code.value();
+        if (!derived || derived.pw !== pw.value) derived = { pw: pw.value, keys: await E2EE.deriveKeys(S.me.username, pw.value, kdfParams(S)) };
+        let out;
+        try { out = await fn({ authKey: derived.keys.authKey, ...second }); } catch (e) {
+          if (e.code === 'bad_password') { pw.focus(); throw new Error('That password isn’t right.'); }
+          const why = code.error(e);
+          if (why) throw why;
+          if (e.status === 429) throw e; // too many tries for now: said here, so the person can try again later
+          settled = true; reject(e); return undefined;
+        }
+        settled = true; resolve(out);
+        return undefined;
+      } }] });
+  });
 }
 function showSecretOnce({ title, intro, secret, filename, note }) {
   return new Promise((resolve) => {
@@ -626,13 +700,21 @@ function securitySections(app) {
   const addEmail = async () => {
     const email = h('input', { class: 'input', type: 'email', autocomplete: 'email', placeholder: 'you@example.com' });
     const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    const code = codeField(S); // with two-factor on, a fresh code every time
+    let derived = null;
     modal({ title: S.me.email ? 'Change your email' : 'Add an email', size: 'sm',
-      body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw)),
+      body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw), code.row),
       actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
         if (!pw.value) throw new Error('Enter your password.');
-        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
-        const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        setTimeout(() => withCode((x) => api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey, ...x })).then((r) => verifyEmail(r.sentTo)).catch(quiet), 150);
+        const second = code.value();
+        if (!derived || derived.pw !== pw.value) derived = { pw: pw.value, keys: await E2EE.deriveKeys(S.me.username, pw.value, kdfParams(S)) };
+        // Sent from here, so a wrong password or code is said in this dialog.
+        let r;
+        try { r = await api('POST', '/me/email', { email: email.value.trim(), authKey: derived.keys.authKey, ...second }); } catch (e) {
+          if (e.code === 'bad_password') { pw.focus(); throw new Error('That password isn’t right.'); }
+          throw code.error(e) || e;
+        }
+        setTimeout(() => verifyEmail(r.sentTo), 150);
       } }] });
   };
   const drawEmail = () => {
@@ -640,7 +722,7 @@ function securitySections(app) {
     if (S.me.email) {
       emailBox.append(h('div', { class: 'kv' }, h('span', null, 'Email'), h('strong', null, S.me.email, ' ', h('span', { class: 'rpill ok' }, 'Confirmed'))),
         h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: addEmail }, 'Change'),
-          h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app, { text: 'Without an email you can’t reset a forgotten password.' }); if (!k) return; withCode((x) => api('DELETE', '/me/email', { authKey: k.authKey, ...x })).then((u) => { refresh(u); toast('Email removed.'); }).catch(quiet); } }, 'Remove')));
+          h('button', { class: 'btn ghost sm', onclick: () => confirmedCall(app, (x) => api('DELETE', '/me/email', x), { text: 'Without an email you can’t reset a forgotten password.', button: 'Remove email' }).then((u) => { if (u) { refresh(u); toast('Email removed.'); } }).catch(quiet) }, 'Remove')));
     } else {
       emailBox.append(h('p', { class: 'muted-p' }, 'Add an email so you can reset your password if you ever forget it.'),
         S.config.emailEnabled ? h('div', null, h('button', { class: 'btn primary', onclick: addEmail }, 'Add an email'))
@@ -655,7 +737,7 @@ function securitySections(app) {
     const code = E2EE.newRecoveryCode();
     const salt = E2EE.newKdfSalt();
     const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), keys.encPrivateKey);
-    const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }));
+    const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }), keys.ticket);
     await showSecretOnce({ title: `${S.config.name} recovery key for ${S.me.username}`, intro: 'Save this key. If you forget your password, the email reset plus this key brings back everything, including your old messages. It’s shown only now.',
       secret: code, filename: `${S.config.name.replace(/\W+/g, '-')}-recovery-key-${S.me.username}.txt`, note: 'Anyone with this key AND access to your email could get into your account, so keep it private (a password manager is ideal).' });
     refresh(u);
@@ -666,7 +748,7 @@ function securitySections(app) {
       ? h('div', { class: 'kv' }, h('span', null, 'Recovery key'), h('span', { class: 'rpill ok' }, 'Saved'))
       : h('p', { class: 'warn-box' }, 'No recovery key yet. If you forget your password, an email reset gets you back in, but your old direct messages would be lost for good.'),
     h('div', { class: 'row gap' }, h('button', { class: `btn ${S.me.hasRecovery ? 'sm' : 'primary'}`, onclick: () => makeRecovery().catch(quiet) }, S.me.hasRecovery ? 'Make a new one' : 'Create a recovery key'),
-      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app); if (!k) return; withCode((x) => api('DELETE', '/me/recovery', { authKey: k.authKey, ...x })).then((u) => { refresh(u); toast('Recovery key removed.'); }).catch(quiet); } }, 'Remove') : ''));
+      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: () => confirmedCall(app, (x) => api('DELETE', '/me/recovery', x), { text: 'Without a recovery key, a password reset by email can’t bring back your old messages.', button: 'Remove recovery key' }).then((u) => { if (u) { refresh(u); toast('Recovery key removed.'); } }).catch(quiet) }, 'Remove') : ''));
   };
   // ---- two-factor
   const tfaBox = h('div', { class: 'stack' });
@@ -687,16 +769,18 @@ function securitySections(app) {
         h('div', { class: 'tfa-setup' }, qr, h('div', { class: 'stack' }, h('span', { class: 'field-label' }, 'Can’t scan? Type this key:'), h('code', { class: 'mono-sm' }, r.secret), field('Then enter the code it shows', code)))),
       actions: [{ label: 'Cancel' }, { label: 'Turn on', kind: 'primary', action: async () => {
         const res = await api('POST', '/me/2fa/enable', { code: code.value });
+        // This device stays signed in with a new token (a copy of the old one is signed out with the other devices);
+        // every tab of this browser switches to it and reconnects.
+        if (res.token) setToken(res.token);
         setTimeout(async () => {
           await showSecretOnce({ title: `${S.config.name} backup codes for ${S.me.username}`, intro: 'If you lose your phone, each of these codes signs you in once. Keep them somewhere safe.', secret: res.backupCodes.join('\n'), filename: `${S.config.name.replace(/\W+/g, '-')}-backup-codes-${S.me.username}.txt` });
           refresh(res.user); toast('Two-factor sign-in is on. Other devices were signed out.');
         }, 150);
       } }] });
   };
-  // The password and a code in one dialog, sent together. (Asking for the password first with askPassword fetches
-  // the locked key, which takes a code of its own once the last one is 10 minutes old. That used up the code on
-  // the phone, so the one asked for next was refused until the app showed a new one.) Nothing needs unlocking
-  // here, so the password is only checked by the server.
+  // The password and a code in one dialog, sent together. (Asking for the password first with askPassword would
+  // fetch the locked key, which takes a code of its own; this request wants one too, and codes work once.) Nothing
+  // needs unlocking here, so the password is only checked by the server.
   const disable2fa = () => {
     const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
@@ -1440,9 +1524,18 @@ function storageTab(app) {
 function sessionsTab(app) {
   const list = h('div', { class: 'stack' }, h('span', { class: 'spinner' }));
   const ended = h('div', { class: 'stack' });
-  const othersBtn = h('button', { class: 'btn danger', hidden: true, onclick: () => {
-    modal({ title: 'Log out all other devices?', size: 'sm', body: h('p', { class: 'muted-p' }, 'Every other device is signed out right away and has to sign in again (with your password, and your two-factor code if it’s on). This device stays signed in.'),
-      actions: [{ label: 'Cancel' }, { label: 'Log out others', kind: 'danger', action: async () => { const r = await api('POST', '/me/sessions/revoke-others'); toast(r.count ? `Signed out ${r.count} device${r.count === 1 ? '' : 's'}.` : 'No other devices were signed in.'); load(); } }] });
+  // Shown even when this is the only device listed: a copy of this device's own sign-in doesn't show up as another
+  // device. It takes the password (and a two-factor code when it's on), because this device gets a new sign-in
+  // token too, which signs out any copy of it: the server only does that for someone who knows the password.
+  const othersBtn = h('button', { class: 'btn danger', onclick: async () => {
+    try {
+      const r = await confirmedCall(app, (x) => api('POST', '/me/sessions/revoke-others', x), { title: 'Log out all other devices?', kind: 'danger', button: 'Log out others',
+        text: 'Every other device is signed out right away and has to sign in again (with your password, and your two-factor code if it’s on). This device stays signed in with a new sign-in, so a copy of it taken earlier stops working too.' });
+      if (!r) return;
+      // Every tab of this browser switches to the new token and reconnects.
+      if (r.token) setToken(r.token);
+      toast(r.count ? `Signed out ${r.count} device${r.count === 1 ? '' : 's'}.` : 'No other devices were signed in. This device has a new sign-in.'); load();
+    } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
   } }, 'Log out all other devices');
   const row = (x, live) => {
     const d = deviceOf(x.ua);
@@ -1463,7 +1556,6 @@ function sessionsTab(app) {
     try {
       const r = await api('GET', '/me/sessions');
       clear(list).append(...r.active.map((x) => row(x, true)));
-      othersBtn.hidden = r.active.length < 2;
       clear(ended);
       if (r.ended.length) ended.append(h('h4', { class: 'sub-title' }, 'Recently signed out'), ...r.ended.map((x) => row(x, false)));
       info.textContent = `A device that isn’t used for ${r.idleDays} days is signed out automatically, and every sign-in ends after ${r.maxDays} days.`;
@@ -1540,7 +1632,7 @@ function exportSection(app) {
   const cancel = h('button', { class: 'btn ghost sm', hidden: true, onclick: () => ctl && ctl.abort() }, 'Cancel');
   const start = h('button', { class: 'btn', onclick: async () => {
     let res;
-    try { res = await confirmedCall(app, (x) => api('POST', '/me/export', x), { title: 'Export your data', text: 'This makes a zip of your account and the messages you can read, on this device.', button: 'Start export' }); } catch (e) { quiet(e); return; }
+    try { res = await confirmedCall(app, (x) => api('POST', '/me/export', x), { title: 'Export your data', text: 'This makes a zip of your account and the messages you can read, on this device.', button: 'Start export', grace: true }); } catch (e) { quiet(e); return; }
     if (!res) return;
     ctl = new AbortController();
     start.disabled = true; cancel.hidden = false; bar.hidden = false;

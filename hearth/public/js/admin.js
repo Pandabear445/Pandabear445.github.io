@@ -361,7 +361,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       clean.disabled = true;
       try {
         const x = await withPassword((y) => api('POST', '/admin/storage/cleanup', { graceHours: grace, ...y }),
-          { title: 'Clean up unused files', text: `Deletes ${o.count} files (${fmtSize(o.bytes)}) that nothing uses and that are older than ${grace} hours. This can\u2019t be undone.` });
+          { title: 'Clean up unused files', text: `Deletes ${o.count} files (${fmtSize(o.bytes)}) that nothing uses and that are older than ${grace} hours. This can\u2019t be undone.`, grace: true });
         if (x) { toast(`Removed ${x.files} files (${fmtSize(x.bytes)}).`); storageReport(box); }
       } catch (e) { if (!e.cancelled) toast(e.message, 'error'); } finally { clean.disabled = false; }
     };

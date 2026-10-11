@@ -102,6 +102,9 @@ function countHit(key, windowMs) {
 }
 // How many hits a key has in its current window, without counting one.
 const hitsSoFar = (key) => { const b = buckets.get(key); return b && b.reset >= now() ? b.count : 0; };
+// Gives one hit back: a right password or two-factor code isn't a guess, so it mustn't use up a limit meant for
+// guesses (a run of confirmed changes would otherwise lock the account out of signing in).
+function refundHit(key) { const b = buckets.get(key); if (b && b.reset >= now() && b.count > 0) b.count -= 1; }
 // The "network" an address belongs to for rate limits: the address itself for IPv4, its /64 for IPv6 (a home
 // connection or a VPS usually gets a whole /64, so rotating addresses inside it changes nothing).
 function netOf(ip) {
@@ -113,6 +116,7 @@ function netOf(ip) {
   return full.slice(0, 4).map((x) => (parseInt(x, 16) || 0).toString(16)).join(':') + '::/64';
 }
 const limitNet = (req, name, max, windowMs) => rateLimit(`${name}:net:${netOf(req.ip)}`, max, windowMs);
+const refundNet = (req, name) => refundHit(`${name}:net:${netOf(req.ip)}`);
 // Sending messages: per account (bursts and per hour), per session, and per network (many accounts, one place).
 function limitMessages(req) {
   rateLimit('msg:' + req.userId, 30, 10000);
@@ -1463,8 +1467,13 @@ const pushUserOk = (row) => !!row && !row.deleted_at && !stillSuspended(row);
 // A subscription belongs to the session that turned it on: once that session is signed out, revoked or
 // expired, the device gets nothing more. Subscriptions saved before sessions were recorded go along with the
 // account's sessions as a whole (and are dropped when any of them is signed out; the app re-subscribes).
+// It also belongs to the token it was made with: once the session's token is replaced (rotateToken), one made
+// with a copy of the old token gets nothing more (the app subscribes again with the new one as it reconnects).
 function pushSubLive(uid, sub, t = now()) {
-  if (sub.session_id) return sessionLive(db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(sub.session_id, uid), t);
+  if (sub.session_id) {
+    const s = db.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?').get(sub.session_id, uid);
+    return sessionLive(s, t) && (!sub.token_hash || sub.token_hash === s.token_hash);
+  }
   return db.prepare('SELECT * FROM sessions WHERE user_id = ? AND revoked_at IS NULL').all(uid).some((x) => sessionLive(x, t));
 }
 function pushSubsFor(uid) {
@@ -1668,9 +1677,11 @@ api.post('/push/subscribe', auth, wrap(async (req, res) => {
     // Only the caller's own old row, and before the cap below, so the replaced one never pushes out another device.
     if (typeof replaces === 'string' && replaces !== sub.endpoint) db.prepare('DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?').run(replaces, req.userId);
     // Saving it again keeps its count of failed sends: subscribing again doesn't restart a dead push service's back-off.
-    db.prepare(`INSERT INTO push_subs (endpoint, user_id, keys, ua, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, keys = excluded.keys, ua = excluded.ua, created_at = excluded.created_at, session_id = excluded.session_id`)
-      .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh, auth: sub.keys.auth }), String(req.headers['user-agent'] || '').slice(0, 300), now(), req.session.id);
+    // (The token too: see pushSubLive. Taken from the token this very request used, so one that was in flight
+    // while the token was replaced doesn't count for the new one.)
+    db.prepare(`INSERT INTO push_subs (endpoint, user_id, keys, ua, created_at, session_id, token_hash) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, keys = excluded.keys, ua = excluded.ua, created_at = excluded.created_at, session_id = excluded.session_id, token_hash = excluded.token_hash`)
+      .run(sub.endpoint, req.userId, JSON.stringify({ p256dh: sub.keys.p256dh, auth: sub.keys.auth }), String(req.headers['user-agent'] || '').slice(0, 300), now(), req.session.id, tokenId(req.token));
     // Only the newest few per account are kept.
     db.prepare('DELETE FROM push_subs WHERE user_id = ? AND endpoint NOT IN (SELECT endpoint FROM push_subs WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)')
       .run(req.userId, req.userId, PUSH_MAX_PER_USER);
@@ -1851,7 +1862,11 @@ api.post('/auth/login', wrap(async (req, res) => {
   // Two-factor sign-in: the right password isn't enough on its own.
   ACCT.require2fa(row, req.body, req);
   const token = createSession(req, row.id, { mfa: !!row.totp_enabled });
-  res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key, device: deviceNote(row, device) });
+  // An old-format account re-saves its password right after signing in (the app's one-time upgrade, POST
+  // /me/password), which takes a fresh two-factor code. The code just typed here can't be used twice, so this
+  // sign-in comes with a step-up ticket for that one request (and nothing else: see stepUp).
+  const upgradeTicket = row.totp_enabled && row.kdf !== 'argon2id' ? { stepUpTicket: issueStepUpTicket(row.id, sessionFor(token).id, ['upgrade']) } : {};
+  res.json({ token, user: selfUser(row), encPrivateKey: row.enc_private_key, device: deviceNote(row, device), ...upgradeTicket });
 }));
 
 api.post('/auth/logout', auth, (req, res) => {
@@ -1859,9 +1874,17 @@ api.post('/auth/logout', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// "Is it really you?" before sensitive changes: the current password, plus a two-factor code when it's on
-// (unless this session passed two-factor in the last 10 minutes, e.g. you just signed in).
-async function stepUp(req, body, authKeyField = 'authKey') {
+// "Is it really you?" before sensitive changes: the current password, plus a two-factor code when it's on.
+// The code is asked for every time: a session token copied at sign-in plus a typed password must not be enough to
+// change the password, email or recovery key, take the locked key, delete the account, or hand over control, a
+// secret or money (auth-6). Only the two low-risk ones (starting a data export, clearing files nothing uses) pass
+// { grace: true } and skip the code for 10 minutes after this session last passed two-factor (signing in, say):
+// one only hands out what the session can fetch anyway, the other removes nothing anyone uses.
+// A step-up ticket (below) stands in for the code once, for the second request of a two-step change; `ticket` names
+// the change a route takes one for (none: tickets don't count there).
+// A request whose code (or ticket) was used up is marked (req.stepUpSpent): if it's refused after all, the answer
+// says so (codeUsed), and the app asks for a new code instead of sending the spent one again.
+async function stepUp(req, body, authKeyField = 'authKey', { grace = false, ticket = null } = {}) {
   const row = getUserRow(req.userId);
   const b = body || {};
   // 10 tries per 10 minutes, counted before the (slow) check so guesses sent in parallel are limited too. A right
@@ -1870,13 +1893,66 @@ async function stepUp(req, body, authKeyField = 'authKey') {
   rateLimit(limitKey, 10, 10 * 60 * 1000);
   const key = b[authKeyField];
   if (typeof key !== 'string' || !(await bcrypt.compare(key.slice(0, 128), row.auth_hash))) { secEvent('failed_stepup', req.ip, row.username); fail(401, 'Your password is not right.', 'bad_password'); }
-  const tries = buckets.get(limitKey);
-  if (tries && tries.count > 0) tries.count -= 1;
-  if (row.totp_enabled && !(req.session.mfa_at && now() - req.session.mfa_at < 10 * 60000)) {
-    ACCT.require2fa(row, b, req);
-    db.prepare('UPDATE sessions SET mfa_at = ? WHERE id = ?').run(now(), req.session.id);
-  }
+  refundHit(limitKey);
+  if (!row.totp_enabled) return row;
+  if (grace && req.session.mfa_at && now() - req.session.mfa_at < 10 * 60000) return row;
+  if (b.stepUpTicket !== undefined && useStepUpTicket(req, b.stepUpTicket, ticket)) { req.stepUpSpent = true; return row; }
+  ACCT.require2fa(row, b, req);
+  req.stepUpCode = true; // a code was typed for this very request (see /me/keys/wrapped)
+  req.stepUpSpent = true;
+  db.prepare('UPDATE sessions SET mfa_at = ? WHERE id = ?').run(now(), req.session.id);
   return row;
+}
+// Step-up tickets. Each two-factor code works once, but a few changes take two requests: the app fetches the
+// password-locked key, then saves it locked again (a new password, a recovery key) or goes on to the change. The
+// first request, which carried the password and a fresh code, hands back a ticket that stands in for the code on
+// the next one. It works once, within 5 minutes, from the same session, and only for the changes it was handed
+// out for (`purposes`: the locked key's for a new password, a recovery key or deleting the account; a sign-in's
+// only for the old-format password re-save). Only the app that sent the code ever sees it, so a copied session
+// token doesn't help. Kept in memory: after a restart the app just asks for a code again.
+const stepUpTickets = new Map(); // sha256(ticket) -> { userId, sessionId, purposes, expires }
+const STEP_UP_TICKET_MS = 5 * 60 * 1000;
+function issueStepUpTicket(userId, sessionId, purposes) {
+  const t = now();
+  for (const [k, v] of stepUpTickets) if (v.expires < t) stepUpTickets.delete(k);
+  // Tickets only come from right codes (a few per account per 15 minutes), so this is a backstop, not a limit.
+  while (stepUpTickets.size >= 20000) stepUpTickets.delete(stepUpTickets.keys().next().value);
+  const raw = crypto.randomBytes(32).toString('base64url');
+  stepUpTickets.set(tokenId(raw), { userId, sessionId, purposes, expires: t + STEP_UP_TICKET_MS });
+  return raw;
+}
+// Shown anywhere, a ticket is used up (so one that leaked can't be tried on route after route); it only counts for
+// a route that takes one, for one of the changes it was handed out for.
+function useStepUpTicket(req, raw, purpose) {
+  if (typeof raw !== 'string' || raw.length < 20 || raw.length > 100) return false;
+  const k = tokenId(raw);
+  const v = stepUpTickets.get(k);
+  if (!v) return false;
+  stepUpTickets.delete(k); // once, whatever happens next
+  return !!purpose && v.purposes.includes(purpose) && v.userId === req.userId && v.sessionId === req.session.id && v.expires > now();
+}
+
+// A new token for the session making this request, in place: the same session (its row in Signed-in devices, the
+// sid its live connections carry), but the old token stops working at once. Done when the password changes,
+// two-factor is turned on, and other devices are signed out with the password, so a copy of this device's own
+// token, taken earlier, is shut out too (auth-11). The app stores the new token, every tab of the browser picks it
+// up, and they reconnect. Live connections still on the old token are closed now, with reason 'token_rotated'
+// (and by the minute sweep in setupSockets, should one slip through). The session's push subscriptions go: one
+// may have been made with a copy of the token. The app's own windows subscribe again as they reconnect (and
+// pushSubLive refuses one made with the old token that was still on its way in).
+// Every caller has checked the password first (and two-factor, when it's on): a copied token alone must never be
+// able to push the original device off the session it shares, and keep it.
+function rotateToken(req) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const hash = tokenId(token);
+  const sid = req.session.id;
+  db.prepare('UPDATE sessions SET token_hash = ? WHERE id = ?').run(hash, sid);
+  // (Ones from before subscriptions recorded their session can't be told apart, so they go too, as in revokeSessions.)
+  db.prepare('DELETE FROM push_subs WHERE user_id = ? AND (session_id = ? OR session_id IS NULL)').run(req.userId, sid);
+  if (io) io.in(`user:${req.userId}`).fetchSockets().then((socks) => socks.forEach((x) => {
+    if (x.data.sid === sid && x.data.tokenHash !== hash) { x.emit('session:revoked', { reason: 'token_rotated' }); x.disconnect(true); }
+  })).catch(() => {});
+  return token;
 }
 
 // ---------------------------------------------------------------- changing a username
@@ -1884,15 +1960,22 @@ async function stepUp(req, body, authKeyField = 'authKey') {
 // salt is stored per account), except for accounts still on the old pbkdf2 format: those are upgraded at their
 // next sign-in and only then can be renamed. Staff powers that come from ADMIN_USERS are tied to the account
 // that first held the name, so a rename can't take them away or hand them to someone else.
+// The checks on the new name itself, all about things anyone can find out anyway (usernames are public). Returns
+// the name as it will be saved; the same as now means nothing to change.
+function checkNewName(row, wanted) {
+  const name = String(wanted || '').trim().replace(/^@/, '');
+  if (!USERNAME_RE.test(name)) fail(400, 'Usernames are 2\u201324 characters: letters, numbers, _ and . only.');
+  if (name === row.username) return name;
+  if (row.kdf !== 'argon2id') fail(400, 'This account still uses the old password format. Sign out and back in once (it upgrades by itself), then try again.');
+  const taken = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(name, row.id);
+  if (taken) fail(409, 'That username is taken.');
+  return name;
+}
 function renameUser(uid, wanted, beforeWrite) {
   const row = getUserRow(uid);
   if (!row) fail(404, 'User not found.');
-  const name = String(wanted || '').trim().replace(/^@/, '');
-  if (!USERNAME_RE.test(name)) fail(400, 'Usernames are 2\u201324 characters: letters, numbers, _ and . only.');
+  const name = checkNewName(row, wanted);
   if (name === row.username) return row;
-  if (row.kdf !== 'argon2id') fail(400, 'This account still uses the old password format. Sign out and back in once (it upgrades by itself), then try again.');
-  const taken = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(name, uid);
-  if (taken) fail(409, 'That username is taken.');
   // ADMIN_USERS names: only the account that holds one may take it back (an unclaimed one would bring powers).
   if (name.toLowerCase() !== row.username.toLowerCase() && envNameReserved(name, uid)) fail(409, 'That username is reserved.');
   // Staff powers already belong to the account, not the name: the owner is written down (ownerId) and
@@ -1911,6 +1994,9 @@ function renameUser(uid, wanted, beforeWrite) {
 // Change your own username: needs your password (and a two-factor code when that's on), like other account changes.
 api.post('/me/username', auth, wrap(async (req, res) => {
   rateLimit('rename-try:' + req.userId, 30, 3600 * 1000);
+  // A mistyped or taken name is turned down before the password and code are checked, so it doesn't use up a
+  // two-factor code (every change takes a fresh one: auth-6).
+  checkNewName(getUserRow(req.userId), (req.body || {}).username);
   const before = await stepUp(req, req.body);
   // Three actual changes a day, so a name can't be flipped back and forth to confuse people.
   const row = renameUser(req.userId, (req.body || {}).username, () => rateLimit('rename:' + req.userId, 3, 24 * 3600 * 1000));
@@ -1924,9 +2010,12 @@ api.post('/me/username', auth, wrap(async (req, res) => {
 api.post('/me/password', auth, wrap(async (req, res) => {
   rateLimit('pw:' + req.userId, 10, 10 * 60 * 1000);
   const { newAuthKey, encPrivateKey, salt, keepSessions } = req.body || {};
-  const row = await stepUp(req, req.body, 'oldAuthKey');
+  // (Checked first, so a request that could never go through doesn't use up a two-factor code.)
   if (typeof newAuthKey !== 'string' || !/^[0-9a-f]{64}$/.test(newAuthKey) || !isB64ish(encPrivateKey, 4000)) fail(400, 'Bad key material.');
   if (!isSalt(salt)) fail(400, 'This page is out of date. Reload and try again.');
+  // The step-up ticket from fetching the locked key stands in for the code; the one from signing in only for the
+  // old-format re-save (keepSessions).
+  const row = await stepUp(req, req.body, 'oldAuthKey', { ticket: keepSessions === true ? 'upgrade' : 'password' });
   db.prepare(`UPDATE users SET auth_hash = ?, enc_private_key = ?, kdf = 'argon2id', kdf_salt = ? WHERE id = ?`)
     .run(await bcrypt.hash(newAuthKey, 11), encPrivateKey, salt, req.userId);
   ACCT.dropResetLinks(req.userId); // a reset link sent before the change can't be used to undo it
@@ -1942,7 +2031,8 @@ api.post('/me/password', auth, wrap(async (req, res) => {
     auditLog(req, 'password_changed', req.userId, row.username);
     ACCT.notify(row, 'your password was changed', `The password for ${row.username} was just changed, and every other device was signed out.`);
   }
-  res.json({ ok: true });
+  // This device stays signed in with a new token; a copy of the old one stops working (auth-11).
+  res.json({ ok: true, token: rotateToken(req) });
 }));
 
 // Deleting your account. Needs your password (and a two-factor code when it's on). What happens:
@@ -1955,11 +2045,16 @@ api.post('/me/password', auth, wrap(async (req, res) => {
 // Owners first hand over or delete their servers; the instance owner first hands over ownership.
 api.delete('/me', auth, wrap(async (req, res) => {
   rateLimit('deleteme:' + req.userId, 5, 60 * 60 * 1000);
-  const row = await stepUp(req, req.body);
-  if ((req.body || {}).confirm !== row.username) fail(400, 'Type your username to confirm.', 'confirm');
-  if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
-  const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
-  if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
+  const mayGo = (row) => {
+    if ((req.body || {}).confirm !== row.username) fail(400, 'Type your username to confirm.', 'confirm');
+    if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
+    const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
+    if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
+  };
+  // Before the password and code too (a server still owned mustn't use up a two-factor code), and again after.
+  mayGo(getUserRow(req.userId));
+  const row = await stepUp(req, req.body, 'authKey', { ticket: 'delete-account' });
+  mayGo(row);
   // Who has them on screen, worked out before their servers and friendships go: they all see "Deleted user".
   const audience = userAudience(row.id);
   revokeSessions(row.id, { reason: 'account_deleted' });
@@ -2057,9 +2152,13 @@ api.post('/me/sign-key', auth, wrap(async (req, res) => {
 // It needs the password (not just a session): with only a stolen session, someone could otherwise take the
 // locked key away and guess the password offline, as fast as they like. Checked like any other sensitive
 // change (stepUp): the same guess limit, and a two-factor code when that's on, as signing in would need.
+// It always takes a fresh code (auth-6). The app fetches it as the first of two steps (re-locking it for a new
+// password or a recovery key, or deleting the account), so when a code was used here it also gets a step-up
+// ticket for the second, good for those three changes only.
 api.post('/me/keys/wrapped', auth, wrap(async (req, res) => {
   const row = await stepUp(req, req.body);
-  res.json({ encPrivateKey: row.enc_private_key, kdf: row.kdf, kdfSalt: row.kdf_salt });
+  const ticket = req.stepUpCode ? { stepUpTicket: issueStepUpTicket(req.userId, req.session.id, ['password', 'recovery', 'delete-account']) } : {};
+  res.json({ encPrivateKey: row.enc_private_key, kdf: row.kdf, kdfSalt: row.kdf_salt, ...ticket });
 }));
 
 // ---------------------------------------------------------------- bootstrap
@@ -4080,12 +4179,18 @@ api.delete('/me/sessions/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 // "Log out all other devices".
-api.post('/me/sessions/revoke-others', auth, (req, res) => {
+// With the password (and a fresh two-factor code when it's on), this device gets a new token too, even when nothing
+// else was signed in: someone who suspects a copied token presses this, and the copy may be of this device's own
+// (auth-11). Without them, only the other sessions end, as before: a copy of this device's token mustn't be able to
+// swap the token out from under the device it was copied from, and keep the session for itself.
+api.post('/me/sessions/revoke-others', auth, wrap(async (req, res) => {
   rateLimit('sessrevoke:' + req.userId, 60, 60 * 60 * 1000);
+  const rotate = (req.body || {}).authKey !== undefined;
+  if (rotate) await stepUp(req, req.body);
   const n = revokeSessions(req.userId, { except: req.session.id, reason: 'revoked' });
   if (n) auditLog(req, 'sessions_revoked_others', req.userId, `${n} device${n === 1 ? '' : 's'}`);
-  res.json({ ok: true, count: n });
-});
+  res.json({ ok: true, count: n, ...(rotate ? { token: rotateToken(req) } : {}) });
+}));
 
 // ---------------------------------------------------------------- instance settings + GIPHY
 // Instance staff, highest first:
@@ -4198,7 +4303,7 @@ const requireInstanceAdmin = (uid) => { if (!isInstanceAdmin(uid)) fail(403, 'On
 // Email, recovery key and two-factor sign-in (server/accounts.js).
 ACCT = require('./accounts')({ api, auth, db, fail, wrap, rateLimit, countHit, limitNet, getSetting, setSetting, getUserRow, selfUser, broadcastUser, bcrypt, seal, unseal,
   tokenId, requireInstanceAdmin: (uid) => requireInstanceAdmin(uid), requireOutranks: (req, id) => requireOutranks(req, id), auditLog, secEvent: (...a) => secEvent(...a), cleanIp,
-  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions, hitsSoFar, verifyCaptcha: (...a) => verifyCaptcha(...a) });
+  emitKeyState: (sid) => emitKeyState(sid), brandName: () => brand().name, isB64ish, isSalt, atRestKey, stepUp, createSession, revokeSessions, rotateToken, hitsSoFar, refundHit, refundNet, verifyCaptcha: (...a) => verifyCaptcha(...a) });
 // The key saved in the app wins over .env, so the admin never has to edit files. Keys saved in the app are
 // sealed with data/secret.key (sealSecret in db.js), like the SMTP password.
 const giphyKey = () => openSecret(getSetting('giphyKey')) || GIPHY_API_KEY;
@@ -6031,8 +6136,8 @@ api.delete('/admin/backups/:name', auth, ownerOnly, wrap(async (req, res) => {
 }));
 // The backup key, to keep in a password manager. Needs the password (and two-factor) again; always logged.
 api.post('/admin/backups/key', auth, ownerOnly, wrap(async (req, res) => {
+  if (process.env.BACKUP_KEY) fail(400, 'This server’s backup key is BACKUP_KEY in its .env file.'); // (before the code is used up)
   await stepUp(req, req.body);
-  if (process.env.BACKUP_KEY) fail(400, 'This server’s backup key is BACKUP_KEY in its .env file.');
   const key = BK.loadKey(DATA_DIR).toString('hex');
   auditLog(req, 'backup_key_viewed', null, '');
   res.json({ key });
@@ -6118,7 +6223,9 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   const expected = err instanceof HttpError; // our own, user-facing errors keep their message
   if (!expected) log.error('http', 'unhandled_error', err, { method: req.method, route: log.routeOf(req), outcome: 'error' });
   if (expected && err.retryAfter) res.setHeader('Retry-After', String(err.retryAfter));
-  res.status(status).json({ error: expected ? err.message : 'Something broke on the server.', code: err.code });
+  // A refusal that came after a two-factor code (or step-up ticket) was checked and used up says so: the app then
+  // asks for a new one instead of sending the spent one again (see stepUp).
+  res.status(status).json({ error: expected ? err.message : 'Something broke on the server.', code: err.code, ...(req.stepUpSpent ? { codeUsed: true } : {}) });
 });
 app.get(/^\/(?!api|uploads|socket\.io).*/, (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
@@ -6292,7 +6399,9 @@ function setupSockets(server) {
   // 256 KB: bigger ones only cost the server time to read.
   io = new Server(server, { pingInterval: 10000, pingTimeout: 8000, maxHttpBufferSize: 256 * 1024, allowRequest: (req, cb) => cb(null, directGuard(req.socket.remoteAddress)) });
   // Every minute: an open connection whose session has ended (signed out, expired, account suspended or
-  // deleted) is closed; one that's still fine counts as use, so an app left open never idles out.
+  // deleted) is closed; so is one still on a token its session has since replaced (rotateToken: a copy of the
+  // old token mustn't keep a live connection). One that's still fine counts as use, so an app left open never
+  // idles out.
   jobs.every('sockets.session_sweep', 60000, () => {
     const t = now();
     const touch = db.prepare('UPDATE sessions SET last_used_at = ? WHERE id = ?');
@@ -6302,6 +6411,10 @@ function setupSockets(server) {
       const u = s && db.prepare('SELECT suspended_at, suspended_until, deleted_at FROM users WHERE id = ?').get(s.user_id);
       if (!sessionLive(s, t) || !u || u.deleted_at || (u.suspended_at && (!u.suspended_until || u.suspended_until > t))) {
         sock.emit('session:revoked', { reason: s && s.revoke_reason ? s.revoke_reason : 'expired' });
+        sock.disconnect(true);
+      } else if (s.token_hash !== sock.data.tokenHash) {
+        // Not a sign-out: the app's own windows come back with the new token (public/js/conn.js).
+        sock.emit('session:revoked', { reason: 'token_rotated' });
         sock.disconnect(true);
       } else if (!seen.has(s.id) && t - (s.last_used_at || 0) > 5 * 60000) { seen.add(s.id); touch.run(t, s.id); }
     }
@@ -6321,6 +6434,7 @@ function setupSockets(server) {
     try { rateLimit('sockconn:' + s.user_id, 60, 60000); } catch { return next(new Error('rate_limited')); }
     socket.userId = s.user_id;
     socket.data.token = token;
+    socket.data.tokenHash = s.token_hash; // checked against the session's current token (rotateToken)
     socket.data.sid = s.id;
     socket.data.ip = socketIp(socket);
     socket.data.since = Date.now();

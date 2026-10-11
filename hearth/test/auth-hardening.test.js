@@ -7,6 +7,12 @@
 //     check gets harder instead of turning everyone away.
 //   - Reset links die when the password or email changes; IP bans cover existing sessions and the reset flow,
 //     but never stop anyone logging out.
+//   - With two-factor on, sensitive changes always take a fresh code, also right after a two-factor sign-in
+//     (auth-6): a request that can't go through doesn't use one up, a right code doesn't count against the guess
+//     limits, and a step-up ticket only stands in for the code on the change it was handed out for. A password
+//     change, turning on two-factor and logging out the other devices with the password give this device a new
+//     token, so a copy of the old one stops working, live connections and push subscriptions included; a copy alone
+//     can't get a new token and lock the original device out (auth-11).
 const { test, before, after, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -14,7 +20,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { startServer, confirmEmail, resetTokenFrom, newIp, hex, b64, sleep, solveCaptcha, solveCaptchas } = require('./helpers');
+const { pathToFileURL } = require('node:url');
+const { startServer, confirmEmail, enable2fa, resetTokenFrom, newIp, hex, b64, sleep, solveCaptcha, solveCaptchas } = require('./helpers');
 
 const as = (srv, u, method, p, body) => srv.api(method, p, { token: u.token, ip: u.ip, body });
 const role = async (srv, u) => (await as(srv, u, 'GET', '/bootstrap')).json.me.staffRole;
@@ -445,6 +452,7 @@ describe('reset links, IP bans and sessions', () => {
     assert.equal(pw.status, 200, pw.text);
     assert.equal((await srv.api('POST', '/auth/reset/info', { ip: newIp(), body: { token: link } })).status, 400);
     assert.equal((await useLink(link)).status, 400);
+    u.token = pw.json.token; // the session goes on with a new token (auth-11)
     assert.equal((await rs(u, 'GET', '/bootstrap')).status, 200, 'the owner is still signed in');
     // A new link works as usual.
     const fresh = await linkFor(u, email);
@@ -580,5 +588,407 @@ describe('reset links, IP bans and sessions', () => {
     assert.deepEqual(st.slice(0, 60), Array(60).fill(200));
     assert.equal(st[60], 429);
     assert.equal((await srv.api('GET', '/auth/params?username=x', { ip: '2001:db8:77:6::1' })).status, 200, 'another network is unaffected');
+  });
+});
+
+// ------------------------------------------------------------------ step-up codes and session tokens (auth-6, auth-11)
+// auth-6: with two-factor on, a token copied at sign-in plus the typed password used to be enough for any sensitive
+// change for 10 minutes. Now those always take a fresh code; only starting a data export and clearing unused files
+// still count a recent two-factor sign-in. auth-11: changing the password, turning on two-factor and logging out the
+// other devices give this device a new token in place, so a copy of the old one stops working, live connections too.
+describe('step-up codes and session tokens (auth-6, auth-11)', () => {
+  let srv;
+  before(async () => { srv = await startServer(); });
+  after(() => srv.stop());
+  const rs = (u, method, p, body) => as(srv, u, method, p, body);
+  const sha = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+  const until = async (fn, ms = 5000) => { for (let t = 0; t < ms; t += 50) { if (await fn()) return true; await sleep(50); } return false; };
+  const sessionOf = (token) => srv.sql('SELECT * FROM sessions WHERE token_hash = ?', sha(token))[0];
+  const newPw = (u) => ({ oldAuthKey: u.authKey, newAuthKey: hex(32), encPrivateKey: b64(60), salt: b64(16) });
+  // Someone with two-factor on who has just signed in with a code: the 10 minutes the old shortcut covered.
+  async function justSignedIn(u = null) {
+    if (!u) u = await srv.register();
+    const tf = await enable2fa(srv, u);
+    const r = await srv.login(u, { backupCode: tf.backupCodes.pop() });
+    assert.equal(r.status, 200, r.text);
+    u.token = r.json.token;
+    assert.ok(Date.now() - sessionOf(u.token).mfa_at < 60000, 'this sign-in passed two-factor just now');
+    return { u, codes: tf.backupCodes, tf };
+  }
+  // A live connection, and what the server said before closing it.
+  async function watched(token) {
+    const s = await srv.socket(token);
+    const said = [];
+    s.on('session:revoked', (p) => said.push(p));
+    return { s, said };
+  }
+
+  test('auth-6: right after a two-factor sign-in, changing the password or email still needs a code', async () => {
+    const { u, codes } = await justSignedIn();
+    const pw = newPw(u);
+    let r = await rs(u, 'POST', '/me/password', pw);
+    assert.deepEqual([r.status, r.json.code], [401, 'need_2fa'], 'the password alone isn’t enough, even minutes after signing in with a code');
+    r = await rs(u, 'POST', '/me/email', { authKey: u.authKey, email: `${u.username}@new.test` });
+    assert.deepEqual([r.status, r.json.code], [401, 'need_2fa']);
+    assert.equal((await srv.login(u)).json.code, 'need_2fa', 'the password didn’t change');
+    assert.equal(srv.sql("SELECT COUNT(*) n FROM auth_tokens WHERE user_id = ? AND kind = 'email'", u.id)[0].n, 0, 'no email code was sent');
+    // With a code, both go through.
+    r = await rs(u, 'POST', '/me/password', { ...pw, backupCode: codes.pop() });
+    assert.equal(r.status, 200, r.text);
+    u.token = r.json.token; u.authKey = pw.newAuthKey;
+    r = await rs(u, 'POST', '/me/email', { authKey: u.authKey, email: `${u.username}@new.test`, backupCode: codes.pop() });
+    assert.equal(r.status, 200, r.text);
+    // The session that turned two-factor on has just passed it too, and gets no shortcut either.
+    const v = await srv.register();
+    await enable2fa(srv, v);
+    assert.equal((await rs(v, 'POST', '/me/password', newPw(v))).json.code, 'need_2fa');
+    assert.equal((await rs(v, 'POST', '/me/email', { authKey: v.authKey, email: `${v.username}@new.test` })).json.code, 'need_2fa');
+  });
+
+  test('auth-6: the recovery key, the locked key, the username and deleting the account need a code right after sign-in too', async () => {
+    const { u, codes } = await justSignedIn();
+    const authKey = u.authKey;
+    for (const [method, p, body] of [
+      ['PUT', '/me/recovery', { authKey, encPrivateKeyRecovery: b64(150), recoverySalt: b64(16) }],
+      ['DELETE', '/me/recovery', { authKey }],
+      ['DELETE', '/me/email', { authKey }],
+      ['POST', '/me/keys/wrapped', { authKey }],
+      ['POST', '/me/username', { authKey, username: `n${hex(4)}` }],
+      ['DELETE', '/me', { authKey, confirm: u.username }],
+    ]) {
+      const r = await rs(u, method, p, body);
+      assert.deepEqual([r.status, r.json.code], [401, 'need_2fa'], `${method} ${p}`);
+    }
+    const row = srv.sql('SELECT username, deleted_at, enc_private_key_recovery FROM users WHERE id = ?', u.id)[0];
+    assert.deepEqual([row.username, row.deleted_at, row.enc_private_key_recovery], [u.username, null, null], 'nothing changed');
+    assert.equal((await rs(u, 'POST', '/me/keys/wrapped', { authKey, backupCode: codes.pop() })).status, 200, 'with a code it works');
+  });
+
+  test('auth-6: handing over control, a secret or money, or deleting for good needs a code right after sign-in; a data export and clearing unused files don’t', async () => {
+    const owner = srv.owner;
+    const { codes } = await justSignedIn(owner);
+    const authKey = owner.authKey;
+    const heir = await srv.register();
+    const s = (await rs(owner, 'POST', '/servers', { name: 'Step-up HQ' })).json;
+    const code = (await rs(owner, 'POST', `/servers/${s.id}/invites`, { expiresHours: 0 })).json.code;
+    assert.equal((await rs(heir, 'POST', `/invites/${code}/join`)).status, 200);
+    const bot = (await rs(owner, 'POST', '/bots', { name: `stepbot${hex(2)}`, scopes: [] })).json.bot;
+    assert.ok(bot && bot.id, 'a bot to make tokens for');
+    for (const [method, p, body] of [
+      ['PUT', '/admin/staff', { userId: heir.id, role: 'moderator', authKey }],
+      ['POST', '/admin/owner', { userId: heir.id, authKey }],
+      ['PUT', '/admin/owner', { funding: { url: 'https://ko-fi.com/elsewhere' }, authKey }],
+      ['POST', '/admin/backups/key', { authKey }],
+      ['PUT', '/admin/turn', { urls: 'turn:203.0.113.9:3478', authKey }],
+      ['POST', '/admin/regions', { name: 'Elsewhere', origin: 'https://chat.example.test', authKey }],
+      ['PUT', '/admin/alerts', { enabled: false, authKey }],
+      ['POST', `/bots/${bot.id}/tokens`, { authKey }],
+      ['POST', `/bots/${bot.id}/webhook-secret`, { authKey }],
+      ['POST', `/servers/${s.id}/transfer`, { userId: heir.id, authKey }],
+      ['DELETE', `/servers/${s.id}`, { authKey }],
+    ]) {
+      const r = await rs(owner, method, p, body);
+      assert.deepEqual([r.status, r.json && r.json.code], [401, 'need_2fa'], `${method} ${p}`);
+    }
+    assert.equal(srv.sql('SELECT owner_id FROM servers WHERE id = ?', s.id)[0].owner_id, owner.id, 'the server is still theirs');
+    assert.ok(!(await role(srv, heir)), 'no staff role was given');
+    // The two low-risk ones: a two-factor sign-in in the last 10 minutes still counts.
+    let r = await rs(owner, 'POST', '/me/export', { authKey });
+    assert.equal(r.status, 200, r.text);
+    r = await rs(owner, 'POST', '/admin/storage/cleanup', { authKey });
+    assert.equal(r.status, 200, r.text);
+    // …but only for those 10 minutes.
+    srv.sql('UPDATE sessions SET mfa_at = ? WHERE token_hash = ?', Date.now() - 11 * 60000, sha(owner.token));
+    assert.equal((await rs(owner, 'POST', '/me/export', { authKey })).json.code, 'need_2fa');
+    // With a code, the others go through as before.
+    r = await rs(owner, 'DELETE', `/servers/${s.id}`, { authKey, backupCode: codes.pop() });
+    assert.equal(r.status, 200, r.text);
+  });
+
+  test('auth-6: a step-up ticket stands in for the code once, only for the session that sent the code', async () => {
+    const { u, codes } = await justSignedIn();
+    const rec = () => ({ authKey: u.authKey, encPrivateKeyRecovery: b64(150), recoverySalt: b64(16) });
+    // Fetching the locked key with a code hands back a ticket for the next request of the same change.
+    let k = await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: codes.pop() });
+    assert.equal(k.status, 200, k.text);
+    const ticket = k.json.stepUpTicket;
+    assert.match(ticket, /^[\w-]{40,}$/);
+    let r = await rs(u, 'PUT', '/me/recovery', { ...rec(), stepUpTicket: ticket });
+    assert.equal(r.status, 200, r.text);
+    assert.equal((await rs(u, 'PUT', '/me/recovery', { ...rec(), stepUpTicket: ticket })).json.code, 'need_2fa', 'it works once');
+    // Another session (a copied token is one) can't use it, and trying uses it up.
+    k = await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: codes.pop() });
+    const other = { ...u, token: (await srv.login(u, { backupCode: codes.pop() })).json.token };
+    assert.equal((await rs(other, 'PUT', '/me/recovery', { ...rec(), stepUpTicket: k.json.stepUpTicket })).json.code, 'need_2fa');
+    assert.equal((await rs(u, 'PUT', '/me/recovery', { ...rec(), stepUpTicket: k.json.stepUpTicket })).json.code, 'need_2fa');
+    // A ticket comes only from a typed code: it isn't good for fetching the locked key again (which would hand out
+    // the next one, and so on).
+    k = await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: codes.pop() });
+    r = await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, stepUpTicket: k.json.stepUpTicket });
+    assert.deepEqual([r.status, r.json.code], [401, 'need_2fa']);
+    assert.equal(r.json.stepUpTicket, undefined);
+    // It doesn't stand in for the password, and a made-up one is just a missing code.
+    k = await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: codes.pop() });
+    assert.equal((await rs(u, 'PUT', '/me/recovery', { ...rec(), authKey: hex(32), stepUpTicket: k.json.stepUpTicket })).json.code, 'bad_password');
+    assert.equal((await rs(u, 'PUT', '/me/recovery', { ...rec(), stepUpTicket: 'x'.repeat(43) })).json.code, 'need_2fa');
+    // Without two-factor there's no code, so no ticket.
+    const plain = await srv.register();
+    const p = await rs(plain, 'POST', '/me/keys/wrapped', { authKey: plain.authKey });
+    assert.equal(p.status, 200);
+    assert.equal(p.json.stepUpTicket, undefined);
+  });
+
+  test('auth-6: an old-format account with two-factor re-saves its password right after signing in, with that sign-in’s ticket', async () => {
+    const u = await srv.register();
+    const { backupCodes } = await enable2fa(srv, u);
+    const elsewhere = (await srv.login(u, { backupCode: backupCodes.pop() })).json.token;
+    assert.equal((await srv.login(u, { backupCode: backupCodes.pop() })).json.stepUpTicket, undefined, 'an up-to-date account gets no ticket');
+    srv.sql("UPDATE users SET kdf = 'pbkdf2' WHERE id = ?", u.id); // from before the Argon2id upgrade
+    const r = await srv.login(u, { backupCode: backupCodes.pop() });
+    assert.equal(r.status, 200, r.text);
+    u.token = r.json.token;
+    const body = { ...newPw(u), keepSessions: true };
+    assert.equal((await rs(u, 'POST', '/me/password', body)).json.code, 'need_2fa', 'the code used to sign in can’t be used again');
+    const up = await rs(u, 'POST', '/me/password', { ...body, stepUpTicket: r.json.stepUpTicket });
+    assert.equal(up.status, 200, up.text);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: elsewhere, ip: u.ip })).status, 200, 'the upgrade keeps other devices signed in');
+    assert.equal((await srv.api('GET', '/bootstrap', { token: up.json.token, ip: u.ip })).status, 200);
+    // That ticket is good for the re-save only: not for deleting the account, a full password change or the locked
+    // key (and shown anywhere, it's used up).
+    u.authKey = body.newAuthKey;
+    srv.sql("UPDATE users SET kdf = 'pbkdf2' WHERE id = ?", u.id);
+    for (const [method, p, body] of [
+      ['DELETE', '/me', { authKey: u.authKey, confirm: u.username }],
+      ['POST', '/me/password', newPw(u)],
+      ['POST', '/me/keys/wrapped', { authKey: u.authKey }],
+    ]) {
+      const t = await srv.login(u, { backupCode: backupCodes.pop() });
+      assert.ok(t.json.stepUpTicket, 'an old-format sign-in with two-factor gets one');
+      const v = { ...u, token: t.json.token };
+      const r2 = await rs(v, method, p, { ...body, stepUpTicket: t.json.stepUpTicket });
+      assert.deepEqual([r2.status, r2.json.code], [401, 'need_2fa'], `${method} ${p}`);
+      assert.equal((await rs(v, 'POST', '/me/password', { ...newPw(u), keepSessions: true, stepUpTicket: t.json.stepUpTicket })).json.code, 'need_2fa', 'used up');
+    }
+    assert.equal(srv.sql('SELECT deleted_at FROM users WHERE id = ?', u.id)[0].deleted_at, null);
+  });
+
+  test('auth-6: the locked key’s step-up ticket is good for a new password, a recovery key or deleting the account, nothing else', async () => {
+    const { u, codes } = await justSignedIn();
+    const s = (await rs(u, 'POST', '/servers', { name: 'Ticket HQ' })).json;
+    const ticket = async () => (await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: codes.pop() })).json.stepUpTicket;
+    const rec = (t) => ({ authKey: u.authKey, encPrivateKeyRecovery: b64(150), recoverySalt: b64(16), stepUpTicket: t });
+    for (const [method, p, body] of [
+      ['DELETE', `/servers/${s.id}`, {}],
+      ['POST', '/me/email', { email: `${u.username}@ticket.test` }],
+      ['POST', '/me/username', { username: `n${hex(4)}` }],
+    ]) {
+      const t = await ticket();
+      const r = await rs(u, method, p, { ...body, authKey: u.authKey, stepUpTicket: t });
+      assert.deepEqual([r.status, r.json.code], [401, 'need_2fa'], `${method} ${p}`);
+      // …and trying it there used it up.
+      assert.equal((await rs(u, 'PUT', '/me/recovery', rec(t))).json.code, 'need_2fa');
+    }
+    assert.equal(srv.sql('SELECT COUNT(*) n FROM servers WHERE id = ?', s.id)[0].n, 1, 'the server is still there');
+    assert.equal(srv.sql('SELECT username FROM users WHERE id = ?', u.id)[0].username, u.username);
+    // Where it does count, it works.
+    const r = await rs(u, 'PUT', '/me/recovery', rec(await ticket()));
+    assert.equal(r.status, 200, r.text);
+  });
+
+  test('auth-6: a request that can’t go through is turned down before the code is used up; one turned down after says so', async () => {
+    const { u, codes } = await justSignedIn();
+    const left = () => JSON.parse(srv.sql('SELECT backup_codes FROM users WHERE id = ?', u.id)[0].backup_codes).length;
+    // A mistyped email: the code stays good, and the corrected request goes through with it.
+    let code = codes.pop();
+    let n = left();
+    let r = await rs(u, 'POST', '/me/email', { authKey: u.authKey, email: 'me@nowhere', backupCode: code });
+    assert.equal(r.status, 400, r.text);
+    assert.equal(r.json.codeUsed, undefined);
+    assert.equal(left(), n, 'the backup code wasn’t used');
+    r = await rs(u, 'POST', '/me/email', { authKey: u.authKey, email: `${u.username}@fixed.test`, backupCode: code });
+    assert.equal(r.status, 200, r.text);
+    // A taken username, the same.
+    const other = await srv.register();
+    code = codes.pop(); n = left();
+    r = await rs(u, 'POST', '/me/username', { authKey: u.authKey, username: other.username, backupCode: code });
+    assert.deepEqual([r.status, r.json.codeUsed], [409, undefined]);
+    assert.equal(left(), n);
+    r = await rs(u, 'POST', '/me/username', { authKey: u.authKey, username: `n${hex(4)}`, backupCode: code });
+    assert.equal(r.status, 200, r.text);
+    u.username = r.json.username;
+    // Broken key material for a new password or a recovery key, and deleting an account that still owns a server.
+    const s = (await rs(u, 'POST', '/servers', { name: 'Still mine' })).json;
+    code = codes.pop(); n = left();
+    for (const [method, p, body] of [
+      ['POST', '/me/password', { ...newPw(u), newAuthKey: 'nope' }],
+      ['PUT', '/me/recovery', { authKey: u.authKey, encPrivateKeyRecovery: '', recoverySalt: b64(16) }],
+      ['DELETE', '/me', { authKey: u.authKey, confirm: u.username }],
+    ]) {
+      r = await rs(u, method, p, { ...body, backupCode: code });
+      assert.equal(r.status, 400, `${method} ${p}: ${r.text}`);
+      assert.equal(left(), n, `${method} ${p} didn’t use the code`);
+    }
+    assert.equal(srv.sql('SELECT deleted_at FROM users WHERE id = ?', u.id)[0].deleted_at, null);
+    assert.ok(s.id);
+    // Turned down after the code was checked (here: a fourth name change in a day): the answer says the code is
+    // spent, so the app asks for a new one rather than sending it again.
+    for (let i = 0; i < 2; i++) {
+      r = await rs(u, 'POST', '/me/username', { authKey: u.authKey, username: `n${hex(4)}`, backupCode: codes.pop() });
+      assert.equal(r.status, 200, r.text);
+    }
+    code = codes.pop(); n = left();
+    r = await rs(u, 'POST', '/me/username', { authKey: u.authKey, username: `n${hex(4)}`, backupCode: code });
+    assert.deepEqual([r.status, r.json.codeUsed], [429, true], r.text);
+    assert.equal(left(), n - 1);
+    assert.equal((await rs(u, 'POST', '/me/username', { authKey: u.authKey, username: `n${hex(4)}`, backupCode: code })).json.code, 'bad_2fa', 'it can’t be used again');
+    // A wrong code or password isn't "spent".
+    r = await rs(u, 'POST', '/me/keys/wrapped', { authKey: hex(32), backupCode: codes[0] });
+    assert.deepEqual([r.json.code, r.json.codeUsed], ['bad_password', undefined]);
+  });
+
+  test('auth-6: a right code gives its tries back, so a run of confirmed changes doesn’t block signing in with two-factor', async () => {
+    const u = await srv.register();
+    const { backupCodes } = await enable2fa(srv, u);
+    // Nine changes in a row, each with its own code (more than the 8 tries per 15 minutes that codes share with
+    // signing in).
+    for (let i = 1; i <= 9; i++) {
+      const r = await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: backupCodes.pop() });
+      assert.equal(r.status, 200, `change ${i}: ${r.text}`);
+    }
+    const r = await srv.login(u, { backupCode: backupCodes.pop() });
+    assert.equal(r.status, 200, r.text);
+    // Wrong codes still count, as before.
+    const statuses = [];
+    for (let i = 0; i < 9; i++) statuses.push((await rs(u, 'POST', '/me/keys/wrapped', { authKey: u.authKey, backupCode: 'aaaaa-bbbbb' })).status);
+    assert.deepEqual(statuses, [401, 401, 401, 401, 401, 401, 401, 401, 429]);
+  });
+
+  test('auth-11: a password change gives this device a new token; the old one, and a live connection on it, stop working', async () => {
+    const u = await srv.register();
+    const old = u.token;
+    const sid = sessionOf(old).id;
+    const live = await watched(old);
+    const r = await rs(u, 'POST', '/me/password', newPw(u));
+    assert.equal(r.status, 200, r.text);
+    assert.match(r.json.token, /^[0-9a-f]{64}$/);
+    assert.notEqual(r.json.token, old);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: old, ip: u.ip })).status, 401, 'the old token (and any copy of it) is out');
+    assert.equal((await srv.api('GET', '/bootstrap', { token: r.json.token, ip: u.ip })).status, 200, 'the new one works');
+    const now = sessionOf(r.json.token);
+    assert.equal(now.id, sid, 'the same session, so its place in Signed-in devices stays');
+    assert.equal(now.revoked_at, null);
+    assert.ok(await until(() => live.s.disconnected), 'the connection on the old token is closed');
+    assert.deepEqual(live.said, [{ reason: 'token_rotated' }], 'and told why, which isn’t a sign-out');
+    await assert.rejects(srv.socket(old), /unauthorized/);
+    (await srv.socket(r.json.token)).close();
+  });
+
+  test('auth-11: turning on two-factor gives this device a new token too', async () => {
+    const u = await srv.register();
+    const old = u.token;
+    const sid = sessionOf(old).id;
+    const live = await watched(old);
+    await enable2fa(srv, u); // (the helper takes the new token from the answer)
+    assert.notEqual(u.token, old);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: old, ip: u.ip })).status, 401);
+    assert.equal((await rs(u, 'GET', '/bootstrap')).status, 200);
+    assert.equal(sessionOf(u.token).id, sid);
+    assert.ok(sessionOf(u.token).mfa_at, 'and it still counts as having passed two-factor');
+    assert.ok(await until(() => live.s.disconnected));
+    assert.deepEqual(live.said, [{ reason: 'token_rotated' }]);
+  });
+
+  test('auth-11: “log out all other devices” with the password gives this device a new token too, even with no other device signed in', async () => {
+    const u = await srv.register();
+    const second = (await srv.login(u)).json.token;
+    const old = u.token;
+    const live = await watched(old);
+    const r = await rs(u, 'POST', '/me/sessions/revoke-others', { authKey: u.authKey });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.count, 1);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: second, ip: u.ip })).status, 401, 'the other device is signed out');
+    assert.equal((await srv.api('GET', '/bootstrap', { token: old, ip: u.ip })).status, 401, 'so is a copy of this one');
+    assert.equal((await srv.api('GET', '/bootstrap', { token: r.json.token, ip: u.ip })).status, 200);
+    assert.ok(await until(() => live.s.disconnected));
+    assert.deepEqual(live.said, [{ reason: 'token_rotated' }]);
+    u.token = r.json.token;
+    const again = await rs(u, 'POST', '/me/sessions/revoke-others', { authKey: u.authKey });
+    assert.equal(again.json.count, 0);
+    assert.notEqual(again.json.token, u.token);
+    assert.equal((await rs(u, 'GET', '/bootstrap')).status, 401);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: again.json.token, ip: u.ip })).status, 200);
+    // With two-factor on, it takes a fresh code too, like a password change.
+    u.token = again.json.token;
+    const { backupCodes } = await enable2fa(srv, u);
+    assert.equal((await rs(u, 'POST', '/me/sessions/revoke-others', { authKey: u.authKey })).json.code, 'need_2fa');
+    const third = await rs(u, 'POST', '/me/sessions/revoke-others', { authKey: u.authKey, backupCode: backupCodes.pop() });
+    assert.equal(third.status, 200, third.text);
+    assert.match(third.json.token, /^[0-9a-f]{64}$/);
+  });
+
+  test('auth-11: a copy of the token alone can’t get a new one and lock the original device out', async () => {
+    const u = await srv.register();
+    const copy = u.token; // the same token, used from somewhere else
+    const elsewhere = { ...u, ip: newIp() };
+    const live = await watched(u.token);
+    const victimOther = (await srv.login(u)).json.token;
+    // Without the password, "log out all other devices" signs out the other sessions (as it always did), but this
+    // session keeps its token: no new one is handed out.
+    let r = await rs(elsewhere, 'POST', '/me/sessions/revoke-others');
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.token, undefined, 'no new token without the password');
+    assert.equal((await srv.api('GET', '/bootstrap', { token: victimOther, ip: u.ip })).status, 401);
+    // A wrong password (or a made-up one) changes nothing either.
+    r = await rs(elsewhere, 'POST', '/me/sessions/revoke-others', { authKey: hex(32) });
+    assert.deepEqual([r.status, r.json.code], [401, 'bad_password']);
+    await sleep(300);
+    assert.equal(live.s.connected, true, 'the original device’s connection stays');
+    assert.deepEqual(live.said, []);
+    assert.equal((await rs(u, 'GET', '/bootstrap')).status, 200, 'and it carries on');
+    // Its "Log out" still ends the session, copy included.
+    assert.equal((await rs(u, 'POST', '/auth/logout')).status, 200);
+    assert.equal((await srv.api('GET', '/bootstrap', { token: copy, ip: elsewhere.ip })).status, 401);
+    assert.ok(sessionOf(copy).revoked_at);
+  });
+
+  test('auth-11: the app’s connection comes back with the new token; a copy that never gets one is signed out, and told why', async () => {
+    const { watchConnection } = await import(pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'conn.js')).href);
+    const { io } = require('socket.io-client');
+    const u = await srv.register();
+    const old = u.token;
+    // This browser's tab: asks for the token on every connect, like app.js. Its new token arrives a moment after the
+    // server has already closed the connection (another tab changed the password and stores it).
+    let current = old;
+    let used = old;
+    const tab = io(srv.base, { auth: (cb) => { used = current; cb({ token: current }); }, transports: ['websocket'], reconnection: false, forceNew: true });
+    // A copy of the token elsewhere, running the same app code.
+    const copy = io(srv.base, { auth: { token: old }, transports: ['websocket'], reconnection: false, forceNew: true });
+    try {
+      await until(() => tab.connected && copy.connected);
+      const tabOut = []; const copyOut = [];
+      watchConnection(tab, { onSignedOut: (r) => tabOut.push(r), retryMs: 100, tokenMoved: (ms) => until(() => current !== used, ms) });
+      // (Nothing ever gives the copy a new token; it waits a little less than the app would, to keep this quick.)
+      watchConnection(copy, { onSignedOut: (r) => copyOut.push(r), retryMs: 100, tokenMoved: (ms) => sleep(Math.min(ms, 300)).then(() => false) });
+      const r = await rs(u, 'POST', '/me/password', newPw(u));
+      assert.equal(r.status, 200, r.text);
+      assert.ok(await until(() => !tab.connected), 'closed');
+      await sleep(300);
+      current = r.json.token;
+      assert.ok(await until(() => tab.connected, 5000), 'the tab is back, on the new token');
+      assert.equal(used, r.json.token);
+      assert.deepEqual(tabOut, [], 'and was never signed out (which would wipe the keys every tab here uses)');
+      assert.ok(await until(() => copyOut.length > 0, 12000), 'the copy is signed out');
+      assert.deepEqual(copyOut, ['token_rotated'], 'said as such, so the app can explain it');
+      assert.equal(copy.connected, false);
+    } finally { tab.close(); copy.close(); }
+  });
+
+  test('auth-11: the minute sweep closes a connection still on a token its session has replaced', { timeout: 90000 }, async () => {
+    const u = await srv.register();
+    const live = await watched(u.token);
+    // As if the token changed without this connection being closed then: only the sweep can catch it.
+    srv.sql('UPDATE sessions SET token_hash = ? WHERE token_hash = ?', sha(hex(32)), sha(u.token));
+    assert.ok(await until(() => live.s.disconnected, 75000), 'closed within a minute or so');
+    assert.deepEqual(live.said, [{ reason: 'token_rotated' }]);
   });
 });

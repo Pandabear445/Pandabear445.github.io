@@ -890,6 +890,37 @@ test('a session that ends: what it scheduled waits for its owner to confirm it f
   assert.notEqual(rowOf(mine.id).reason, 'session_ended', 'still not held for that (only for the key change above)');
 });
 
+test('a new sign-in token for the same session (auth-11) isn’t a sign-out: what it scheduled still goes out, from the new token', async () => {
+  const ann = await user('stok'); const ben = await user('stokb'); const ch = await room('tokens');
+  freshEpoch();
+  const benS = await sock(ben);
+  const benNew = collect(benS, 'message:new');
+  const a = await schedule(ann, ch.id, { sendAt: soon(HOUR) });
+  const b = await schedule(ann, ch.id, { sendAt: soon(HOUR) });
+  const sid = rowOf(a.id).session_id;
+  // "Log out all other devices" with the password, then a password change: each gives this session a new token.
+  const rv = await as(ann, 'POST', '/me/sessions/revoke-others', { authKey: ann.authKey });
+  assert.equal(rv.status, 200, rv.text);
+  assert.ok(rv.json.token && rv.json.token !== ann.token, 'a new token');
+  const old = ann.token;
+  ann.token = rv.json.token;
+  const newAuthKey = hex(32);
+  const pw = await as(ann, 'POST', '/me/password', { oldAuthKey: ann.authKey, newAuthKey, encPrivateKey: 'x'.repeat(80), salt: crypto.randomBytes(16).toString('base64') });
+  assert.equal(pw.status, 200, pw.text);
+  ann.authKey = newAuthKey;
+  ann.token = pw.json.token;
+  assert.equal((await srv.api('GET', '/scheduled-messages', { token: old, ip: ann.ip })).status, 401, 'the old token is out');
+  for (const x of [a, b]) {
+    const row = rowOf(x.id);
+    assert.equal(row.status, 'pending', 'not held: the session that wrote it is still signed in');
+    assert.equal(row.session_id, sid);
+  }
+  assert.equal((await list(ann)).filter((x) => x.id === a.id || x.id === b.id).length, 2, 'listed for the new token');
+  assert.equal((await as(ann, 'POST', `/scheduled-messages/${a.id}/send`)).status, 200, 'sent now from the new token');
+  await until(() => benNew.find((m) => m.ciphertext === a.ciphertext), 'posted');
+  assert.equal((await as(ann, 'DELETE', `/scheduled-messages/${b.id}`)).status, 200);
+});
+
 // ------------------------------------------------------------------ files, accounts, restarts
 async function uploadBlob(u) {
   const boundary = '----hearth' + crypto.randomBytes(8).toString('hex');

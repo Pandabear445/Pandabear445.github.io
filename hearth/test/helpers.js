@@ -184,6 +184,7 @@ async function enable2fa(srv, user) {
   const used = new Set();
   const e = await srv.api('POST', '/me/2fa/enable', { token: user.token, body: { code: await freshCode(secret, used) }, ip: user.ip });
   if (e.status !== 200) throw new Error('2fa enable: ' + e.text);
+  if (e.json.token) user.token = e.json.token; // this session goes on with a new token (auth-11)
   return { secret, backupCodes: e.json.backupCodes, used };
 }
 // The next not-yet-used code: codes work once, so a test that needs several waits for a new 30-second step.

@@ -113,6 +113,36 @@ test('away: only once every one of the person\'s apps is idle, and back as soon 
   assert.equal(await shownAs(b, a.id), 'offline');
 });
 
+test('away: a new sign-in token (auth-11) closes the windows on the old one; back on the new token they start in use and report again', async () => {
+  const { a, b } = await pair();
+  const watcher = await sock(b);
+  const s1 = await sock(a); const s2 = await sock(a);
+  const told = [];
+  s1.on('session:revoked', (p) => told.push(p));
+  await presenceOf(watcher, a.id, 2500);
+  const away = presenceOf(watcher, a.id);
+  assert.deepEqual(await idle(s1, true), { ok: true });
+  assert.deepEqual(await idle(s2, true), { ok: true });
+  assert.equal(await away, 'idle');
+  // The password changes on this device: the same session goes on with a new token, and both windows (on the old
+  // one) are closed, which leaves nobody here: Offline, not Away.
+  const off = presenceOf(watcher, a.id);
+  const r = await as(a, 'POST', '/me/password', { oldAuthKey: a.authKey, newAuthKey: hex(32), encPrivateKey: 'x'.repeat(80), salt: 'A'.repeat(24) });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(await off, 'offline');
+  assert.deepEqual(told, [{ reason: 'token_rotated' }]);
+  await assert.rejects(srv.socket(a.token), /unauthorized/, 'the old token can’t connect');
+  // Back with the new token: in use, then idle again by its own report.
+  a.token = r.json.token;
+  const on = presenceOf(watcher, a.id);
+  const s3 = await sock(a);
+  assert.equal(await on, 'online');
+  const again = presenceOf(watcher, a.id);
+  assert.deepEqual(await idle(s3, true), { ok: true });
+  assert.equal(await again, 'idle');
+  assert.equal((await me(a)).autoAway, true);
+});
+
 test('away: never over Do Not Disturb, Invisible or Away picked by hand, and "never" turns it off', async () => {
   const { a, b } = await pair();
   const watcher = await sock(b);

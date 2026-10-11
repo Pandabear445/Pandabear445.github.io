@@ -2,7 +2,7 @@
 // Everything goes through the real UI; the only shortcuts are reading state the UI already shows.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { exact, makePng, totp, newPassword } from './harness.mjs';
+import { exact, makePng, totp, newPassword, Person } from './harness.mjs';
 
 export function check(ok, message) { if (!ok) throw new Error(message); }
 const SERVER = 'E2E Hall';
@@ -1094,6 +1094,16 @@ async function recovery(t) {
   // A new password signs out her other devices.
   const phone = await t.open('alice-phone');
   await phone.login(name, t.pw.alice);
+  // …but not a second tab of this browser (the same storage): the sign-in gets a new token, which every tab here
+  // picks up, reconnecting with it (auth-11). Its errors count as alice's.
+  const tab2 = new Person('alice-tab2', alice.context, await alice.context.newPage(), alice.base);
+  tab2.pageErrors = alice.pageErrors; tab2.serverErrors = alice.serverErrors; tab2.log = alice.log; // (its log goes in alice's report)
+  tab2.page.setDefaultTimeout(20000);
+  await tab2.page.goto(alice.base);
+  await tab2.waitApp();
+  await tab2.railButton(SERVER);
+  await tab2.openChannel('general');
+  const oldToken = await alice.page.evaluate(() => localStorage.getItem('hearth.token'));
   const next = t.pw.alice + '-2';
   const box = alice.$('.set-content .set-section', { hasText: 'Change password' });
   await box.locator('.field', { hasText: 'Current password' }).locator('input').fill(t.pw.alice);
@@ -1107,6 +1117,28 @@ async function recovery(t) {
   await phone.close();
   delete t.people['alice-phone'];
   await alice.closeSettings();
+  // Both tabs hold the new token and are live on it: bob's message shows up in each as it's sent, and the second
+  // tab's own message reaches him.
+  await alice.page.waitForFunction((old) => { const v = localStorage.getItem('hearth.token'); return v && v !== old; }, oldToken);
+  check(await tab2.page.evaluate((old) => !!localStorage.getItem('hearth.token') && localStorage.getItem('hearth.token') !== old, oldToken), 'The second tab should share the new token.');
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.send('After the password change: plum');
+  await alice.message('After the password change: plum').waitFor();
+  await tab2.message('After the password change: plum').waitFor();
+  await tab2.send('The second tab is still here: pear');
+  await bob.message('The second tab is still here: pear').waitFor();
+  check(!(await tab2.$('#auth:not([hidden])').count()), 'The second tab should never have been signed out.');
+  // Its keys weren't wiped either: after a reload it opens straight into the app, messages readable.
+  await tab2.page.reload();
+  await tab2.waitApp();
+  await tab2.railButton(SERVER);
+  await tab2.openChannel('general');
+  await tab2.message('After the password change: plum').waitFor();
+  check(!(await tab2.$('#messages .msg-text.undecryptable').count()), 'After a reload, the second tab should still read the channel.');
+  await tab2.page.close();
 
   // Forgot it: the email link plus the recovery key keep every old message readable.
   await alice.logout();
@@ -1143,7 +1175,7 @@ async function recovery(t) {
 
 // ------------------------------------------------------------------ 14. two-factor sign-in
 async function twoFactor(t) {
-  const { alice } = t.people;
+  const { alice, bob } = t.people;
   await alice.openSettings('Security');
   await alice.$('.set-content button', { hasText: 'Set up two-factor sign-in' }).click();
   await alice.confirmPassword('Turn on two-factor sign-in', t.pw.alice);
@@ -1170,6 +1202,49 @@ async function twoFactor(t) {
   await f.locator('[name=totp]').fill(backup[0]);
   await f.locator('button[type=submit]').click();
   await alice.waitApp();
+
+  // Even right after signing in with a code, a sensitive change asks for the password and a code, in one dialog
+  // (auth-6). A new recovery key takes two requests (the locked key, then the new copy) on that one code: the
+  // first answer's step-up ticket stands in for it on the second.
+  const steps = [];
+  const onStep = (r) => { const p = new URL(r.url()).pathname; if (p.startsWith('/api/me/')) steps.push(`${r.method()} ${p}`); };
+  alice.page.on('request', onStep);
+  await alice.openSettings('Security');
+  await alice.$('.set-content button', { hasText: /^(Create a recovery key|Make a new one)$/ }).click();
+  const rk = await alice.dialog('Create a recovery key');
+  await rk.locator('input[type=password]').fill(t.pw.alice);
+  await rk.locator('input[autocomplete="one-time-code"]').fill(backup[1]);
+  await rk.locator('.modal-foot .btn.primary').click();
+  const rkShown = alice.modal('recovery key for');
+  await rkShown.locator('.secret-box code').waitFor();
+  check(!(await alice.modal('Enter your two-factor code').count()), 'One code should be enough for a new recovery key.');
+  await rkShown.locator('input[type=checkbox]').check();
+  await rkShown.locator('button', { hasText: exact('Done') }).click();
+  alice.page.off('request', onStep);
+  check(steps.includes('POST /api/me/keys/wrapped') && steps.includes('PUT /api/me/recovery'), `The locked key, then the new copy (asked for: ${steps.join(', ')}).`);
+  await alice.closeSettings();
+
+  // "Log out all other devices" asks for the password and a code too: this device then gets a new sign-in token, so
+  // a copy of it taken earlier stops working (auth-11). The app carries on with the new one, live connection included.
+  const tokenBefore = await alice.page.evaluate(() => localStorage.getItem('hearth.token'));
+  await alice.openSettings('Security', 'Signed-in devices');
+  await alice.$('.set-content button', { hasText: 'Log out all other devices' }).click();
+  const others = await alice.dialog('Log out all other devices?');
+  await others.locator('input[type=password]').fill(t.pw.alice);
+  await others.locator('input[autocomplete="one-time-code"]').fill(backup[2]);
+  await others.locator('.modal-foot .btn.danger').click();
+  await alice.toast(/Signed out \d+ device|No other devices were signed in/);
+  await alice.page.waitForFunction((old) => { const v = localStorage.getItem('hearth.token'); return v && v !== old; }, tokenBefore);
+  await alice.closeSettings();
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.send('After alice’s new sign-in: quince');
+  await alice.message('After alice’s new sign-in: quince').waitFor();
+  await alice.send('Still here with the new sign-in: fig');
+  await bob.message('Still here with the new sign-in: fig').waitFor();
+  check(!(await alice.$('#auth:not([hidden])').count()), 'Alice should still be signed in.');
 
   // Turning it off takes the password and one code, in one dialog, also when the last code was a while ago (this
   // sign-in's is made 11 minutes old here). Asking for the password used to fetch the locked key first, which then

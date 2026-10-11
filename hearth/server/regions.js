@@ -69,13 +69,15 @@ module.exports = function setupRegions(ctx) {
   // (like seeing the backup key), and adding, reinstalling, renaming or removing a region is always logged.
   api.post('/admin/regions', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
-    await stepUp(req, req.body);
     const b = req.body || {};
     const name = String(b.name || '').trim().slice(0, 40);
     if (!name) fail(400, 'Give the region a name, like "Frankfurt" or "US West".');
     if (rows().length >= 12) fail(400, 'Up to 12 regions.');
     const origin = cleanOrigin(b.origin);
     if (!origin) fail(400, 'Missing this server’s address.');
+    // (After the checks above, so a request that can't go through doesn't use up a two-factor code.)
+    await stepUp(req, req.body);
+    if (rows().length >= 12) fail(400, 'Up to 12 regions.'); // (again: the password check took a moment)
     ensureSecret();
     const id = newId(); const token = crypto.randomBytes(24).toString('hex');
     // Remember the address the admin uses: that's the one the region must check in at (behind a proxy, this
@@ -87,11 +89,12 @@ module.exports = function setupRegions(ctx) {
   // A new install command for an existing region (new token; the old one stops working).
   api.post('/admin/regions/:id/reinstall', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
-    await stepUp(req, req.body);
-    const r = db.prepare('SELECT * FROM regions WHERE id = ?').get(req.params.id);
-    if (!r) fail(404, 'No such region.');
+    if (!db.prepare('SELECT 1 FROM regions WHERE id = ?').get(req.params.id)) fail(404, 'No such region.');
     const origin = cleanOrigin((req.body || {}).origin);
     if (!origin) fail(400, 'Missing this server’s address.');
+    await stepUp(req, req.body); // (after the checks above, so they don't use up a two-factor code)
+    const r = db.prepare('SELECT * FROM regions WHERE id = ?').get(req.params.id);
+    if (!r) fail(404, 'No such region.');
     ensureSecret();
     const token = crypto.randomBytes(24).toString('hex');
     db.prepare('UPDATE regions SET token_hash = ?, setup_until = ?, stats = ? WHERE id = ?').run(sha(token), now() + 24 * 3600000, JSON.stringify({ ...parse(r.stats, {}), origin }), r.id);

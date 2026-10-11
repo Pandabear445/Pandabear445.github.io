@@ -672,7 +672,8 @@ module.exports = function setupUsability(ctx) {
   // ---------------------------------------------------------------- export my data
   // Starting an export needs the password (and a two-factor code when that's on). It gives a token that works
   // for 30 minutes, only from the session that asked, for at most EXPORT_MAX_MESSAGES messages. The server hands
-  // out what this account can already read (ciphertext); the app decrypts it and packs the download.
+  // out what this account can already read (ciphertext); the app decrypts it and packs the download. Since that's
+  // nothing the session couldn't fetch anyway, a two-factor sign-in in the last 10 minutes counts (grace, auth-6).
   const exportsByToken = new Map();
   setInterval(() => { const t = now(); for (const [k, e] of exportsByToken) if (e.expires < t) exportsByToken.delete(k); }, 60000).unref();
   function requireExport(req) {
@@ -683,7 +684,7 @@ module.exports = function setupUsability(ctx) {
   }
   api.post('/me/export', auth, wrap(async (req, res) => {
     rateLimit('export:' + req.userId, 5, 3600000);
-    await stepUp(req, req.body);
+    await stepUp(req, req.body, 'authKey', { grace: true });
     const token = crypto.randomBytes(32).toString('hex');
     const expires = now() + EXPORT_TTL;
     // Only a hash is kept, like session tokens.
