@@ -119,7 +119,12 @@ export function asShown(text) {
   const s = String(text == null ? '' : text).slice(0, LIMITS.text);
   if (!FORMAT.test(s)) return s;
   try {
-    return render(s).replace(/<br>|<\/?pre\b[^>]*>/g, '\n').replace(/<[^>]*>/g, '').replace(/&(amp|lt|gt|quot|#39);/g, (_, e) => ENTITY[e]);
+    // Only ever compared with the list, never put on the page. Tags are taken out until none are left, so a tag
+    // split around another one can't come back together.
+    let out = render(s).replace(/<br>|<\/?pre\b[^>]*>/g, '\n');
+    let before;
+    do { before = out; out = out.replace(/<[^>]*>/g, ''); } while (out !== before);
+    return out.replace(/&(amp|lt|gt|quot|#39);/g, (_, e) => ENTITY[e]);
   } catch { return s; }
 }
 // What's compared for a text: the text as typed and, when its formatting changes it, as shown.
