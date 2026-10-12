@@ -39,8 +39,8 @@ import { webhooksPanel, onWebhooksUpdate } from './webhooks.js';
 import { initServerAudit, auditTab, reportsTab } from './serveraudit.js';
 import { openDiscordImport } from './discord-import.js';
 import { loadAppearance, saveAppearance, setServerTheme, BACKGROUNDS } from './appearance.js';
-import { createDrafts, clearAllDrafts, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
-import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineText, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer, stricter as stricterTimer } from './disappear.js';
+import { createDrafts, clearAllDrafts, clearLocalCopies, expireLocalCopies, claimOnce, rememberNotification, closeNotifications, closeNotificationFor, alsoCloseNotifications, quietNow } from './usability.js';
+import { label as disLabel, deadline, expired as isExpired, disappears, serverKept, nextDeadline, waitFor, sysLineParts, remaining, TIMERS, setChoices as setTimerChoices, weaker as weakerTimer, stricter as stricterTimer } from './disappear.js';
 import { createScheduled } from './scheduled.js';
 import { trackViewport } from './viewport.js';
 import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel, onlyPresenceChanged } from './presence.js';
@@ -186,6 +186,9 @@ export const app = {
 init();
 
 async function init() {
+  // Copies of messages' words kept in this browser (inbox, reminders) whose message's deadline has passed go now,
+  // whichever account they belong to and whether or not anyone signs in (usability.js).
+  expireLocalCopies(Date.now());
   applyAppearance();
   setupServiceWorker();
   trackViewport();
@@ -439,9 +442,15 @@ async function signOutHere() {
   localStorage.removeItem('hearth.userId');
   fileUrls.release(); // decrypted files in memory
   clearAllDrafts(); // unsent words stay with the account, not the next person on this browser
+  // So do the inbox and reminders, which keep copies of messages' words (disappearing ones too): nothing here would
+  // drop them at their deadline once no one is signed in. (addInbox writes nothing more while signing out; this
+  // runs again last, in case anything else did.)
+  clearLocalCopies();
   SCHED.reset();
   sec.reset();
   await E2EE.clearKeys();
+  clearLocalCopies();
+  lsCache.clear();
   location.href = '/';
 }
 
@@ -462,9 +471,13 @@ function startApp() {
     canManage: (server) => isAdmin(server) || can(server, PERMS.MANAGE_SERVER),
     openChannelOrVoice: (c, server) => (c.type === 'voice' ? joinVoice(c, server) : openChannel(c.id, server.id)),
     onEventsChanged: (serverId) => { if (S.view.serverId === serverId) later(renderSidebar); if (S.view.type === 'home') later(renderMain); },
-    notify: ({ title, body }) => {
+    // tag and msgId: one with a message's words (a reminder) closes when that message disappears (forgetCopies).
+    notify: ({ title, body, tag = null, msgId = null }) => {
       if (!('Notification' in window) || Notification.permission !== 'granted' || (!document.hidden && document.hasFocus())) return;
-      try { new Notification(title, { body, icon: '/icons/icon-192.png' }); } catch { /* ignore */ }
+      try {
+        const n = new Notification(title, { body, icon: '/icons/icon-192.png', ...(tag ? { tag } : {}) });
+        if (tag) rememberNotification(tag, n, msgId);
+      } catch { /* ignore */ }
     },
   });
   $('#auth').hidden = true;
@@ -1257,9 +1270,16 @@ function shownDay(sc, before = null) {
 // "Alice turned on disappearing messages: 1 week · 3:04 PM"
 function sysLineEl(e) {
   // Drawn in the conversation on screen: in a server channel (a voice channel's chat too), whoever changed it goes by
-  // their nickname there; in DMs and group chats, their display name.
-  const text = sysLineText(e, S.me.id, (id) => nameInServer(currentServer(), getUser(id)));
-  return h('div', { class: 'sys-line', role: 'note' }, icon('timer'), h('span', null, text),
+  // their nickname there; in DMs and group chats, their display name. "You" only for a change made with your own
+  // account (the entry's user id); anyone else's name is drawn apart from it, and their @username follows any name
+  // that isn't simply that username (sysLineParts), so no display name or nickname, look-alike letters or not, can
+  // pass for your own change.
+  const p = sysLineParts(e, S.me.id, (id) => nameInServer(currentServer(), getUser(id)), (id) => (S.users[id] ? S.users[id].username : null));
+  const handle = !p.self && e.by && S.users[e.by] ? '@' + S.users[e.by].username : null;
+  const who = p.self ? h('span', { class: 'sys-you' }, 'You')
+    : h('bdi', { class: 'sys-who', ...(handle ? { title: handle } : {}) }, p.who);
+  return h('div', { class: 'sys-line', role: 'note' }, icon('timer'),
+    h('span', null, who, p.handle ? h('span', { class: 'sys-handle' }, ` (@${p.handle})`) : null, ` ${p.action}`),
     h('time', { datetime: new Date(e.at).toISOString(), title: new Date(e.at).toLocaleString() }, fmtStamp(e.at)));
 }
 // In the header while the timer is on: opens the choices, or says what it is to people who can't change it.
@@ -1852,6 +1872,7 @@ function updateTitle() {
 
 // ======================================================================= notification center (kept on this device)
 function addInbox(entry) {
+  if (!S.me || loggingOut) return; // signing out clears the inbox from this browser
   const list = P.inbox;
   list.unshift({ id: Math.random().toString(36).slice(2), at: Date.now(), read: false, ...entry });
   P.inbox = list;
@@ -5927,12 +5948,13 @@ async function stillSend(key, wrote) {
 // for a channel (with its current key), { ciphertext, ttl } for a DM. Sending, scheduling and re-encrypting a
 // scheduled message all use it, so a scheduled message is exactly what sending it now would have sent: the text,
 // files, poll and link preview card, and the conversation's disappearing timer as it is now (x inside, ttl beside).
-// keep: { ref, threadId, x? } for a scheduled message: then `draft` comes too, your own copy of what was encrypted
-// (the version that fitted), which only your keys open (sealDraft). keep.x is the timer it was written for, when it's
-// being re-encrypted: x inside is then the stricter of that and the conversation's timer now (ttl still says the
-// conversation's, which the server checks; it keeps the same stricter one), so a timer turned off or made longer
-// since never makes it last longer than its sender wrote it for. Never anything readable: all of this goes to the
-// server.
+// keep: { ref, threadId, x?, sid? } for a scheduled message: then `draft` comes too, your own copy of what was
+// encrypted (the version that fitted), which only your keys open (sealDraft). keep.x is the timer it was written for,
+// when it's being re-encrypted: x inside is then the stricter of that and the conversation's timer now (ttl still says
+// the conversation's, which the server checks; it keeps the same stricter one), so a timer turned off or made longer
+// since never makes it last longer than its sender wrote it for. keep.sid: the scheduled message's id, put inside
+// your copy only (never inside the message), so your apps know the copy belongs to that one (scheduled.js). Never
+// anything readable: all of this goes to the server.
 async function sealFor(key, payload0, keep = null) {
   const ttl = convSecs(key);
   const secs = keep && Number.isInteger(keep.x) && keep.x > 0 ? stricterTimer(keep.x, ttl) : ttl;
@@ -5950,7 +5972,7 @@ async function sealFor(key, payload0, keep = null) {
     const everyone = !isGroup(server) && /(^|\s)@(everyone|channel|here)\b/i.test(String(payload.t || ''));
     Object.assign(out, { ciphertext, epoch, mentions: mentionedIds(server, payload.t), everyone });
   } else out.ciphertext = await encryptFitting(payload, (p) => { fitted = p; return sec.encryptDm(key.slice(2), p); });
-  if (keep) out.draft = await sealDraft(keep.ref, key, keep.threadId, fitted);
+  if (keep) out.draft = await sealDraft(keep.ref, key, keep.threadId, keep.sid ? { ...fitted, sid: keep.sid } : fitted);
   return out;
 }
 // A scheduled message's own copy for its sender (server/scheduled.js): sealed with your personal vault key, which only
@@ -5969,12 +5991,26 @@ async function sendOnce(key, threadId, payload, replyTo, nonce, sendAt = null) {
     if (!server) throw new Error('Channel not found.');
     return withKeyRetry(server.id, async () => {
       const sealed = await sealFor(key, payload, sendAt ? { ref, threadId } : null);
-      return sendAt ? api('POST', `${where}/scheduled-messages`, { ...sealed, ref, replyTo, threadId, files, sendAt })
+      return sendAt ? bindScheduled(await api('POST', `${where}/scheduled-messages`, { ...sealed, ref, replyTo, threadId, files, sendAt }), sealed, key, ref, threadId)
         : api('POST', `${where}/messages`, { ...sealed, replyTo, threadId, files, nonce });
     });
   }
   const sealed = await sealFor(key, payload, sendAt ? { ref, threadId: null } : null);
-  return sendAt ? api('POST', `${where}/scheduled-messages`, { ...sealed, ref, replyTo, files, sendAt }) : api('POST', `${where}/messages`, { ...sealed, replyTo, files, nonce });
+  return sendAt ? bindScheduled(await api('POST', `${where}/scheduled-messages`, { ...sealed, ref, replyTo, files, sendAt }), sealed, key, ref, null)
+    : api('POST', `${where}/messages`, { ...sealed, replyTo, files, nonce });
+}
+// A scheduled message's own copy can't name it when it's made (the server picks its id), so as soon as the server
+// answers, the copy is sealed again naming it (sid) and goes back with the very same ciphertext. From then on any of
+// your apps re-encrypts it by itself after a key change, while a copy a stolen session puts back in another scheduled
+// message (after you sent or cancelled this one) never is (scheduled.js). If this doesn't go through, this device
+// still re-encrypts it by itself: it knows it made it.
+async function bindScheduled(item, sealed, key, ref, threadId) {
+  if (!item || !item.id) return item;
+  try {
+    const copy = await openDraft(ref, key, threadId, sealed.draft);
+    const draft = await sealDraft(ref, key, threadId, { ...copy, sid: item.id });
+    return await api('PATCH', `/scheduled-messages/${item.id}`, { ...sealed, draft });
+  } catch { return item; }
 }
 // "Sending…" copies of your own messages, shown until the real one arrives.
 const pendingSends = new Map(); // nonce -> { key, text, files, replyTo, el }

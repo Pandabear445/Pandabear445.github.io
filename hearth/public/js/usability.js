@@ -40,6 +40,39 @@ export const clearAllDrafts = () => {
   try { Object.keys(localStorage).filter((k) => k.startsWith('hearth.drafts.')).forEach((k) => localStorage.removeItem(k)); } catch { /* ignore */ }
 };
 
+// ---------------------------------------------------------------- inbox and reminders (this device only)
+// The inbox (hearth.inbox.<account>: mentions, replies and fired reminders) and reminders (hearth.reminders.<account>)
+// keep a copy of a message's words in this browser, with exp when the message disappears. The signed-in app drops
+// those as their time comes, but only for its own account while it runs. So signing out (or deleting the account)
+// removes every account's from this browser, like drafts: the next person here doesn't get them, and no deadline is
+// left that nobody would keep. And each time Hearth opens, any copy past its deadline goes, whoever it belongs to.
+const COPIES = ['hearth.inbox.', 'hearth.reminders.'];
+function copyKeys() {
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && COPIES.some((p) => k.startsWith(p))) out.push(k); }
+  } catch { /* storage off */ }
+  return out;
+}
+export function clearLocalCopies() {
+  for (const k of copyKeys()) { try { localStorage.removeItem(k); } catch { /* ignore */ } }
+}
+// now: this device's clock (no server time before signing in). Returns how many copies went.
+export function expireLocalCopies(now = Date.now()) {
+  let dropped = 0;
+  for (const k of copyKeys()) {
+    try {
+      const list = JSON.parse(localStorage.getItem(k) || '[]');
+      if (!Array.isArray(list)) { localStorage.removeItem(k); continue; }
+      const keep = list.filter((x) => !(x && Number(x.exp) > 0 && Number(x.exp) <= now));
+      if (keep.length === list.length) continue;
+      dropped += list.length - keep.length;
+      if (keep.length) localStorage.setItem(k, JSON.stringify(keep)); else localStorage.removeItem(k);
+    } catch { try { localStorage.removeItem(k); } catch { /* ignore */ } }
+  }
+  return dropped;
+}
+
 // ---------------------------------------------------------------- one notification per message
 // With Hearth open in several tabs, each gets every message. Only the first to claim a message shows its
 // notification and plays its sound. A Web Lock makes the claim atomic between tabs; a short list in

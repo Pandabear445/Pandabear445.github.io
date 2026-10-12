@@ -344,6 +344,8 @@ async function clientScheduled() {
 }
 // Re-encrypting passes the timer from the sender's own copy on to sealFor (which puts the stricter of it and the
 // conversation's timer inside the message), so a message re-encrypted by itself after a key change keeps it.
+// (The copies name their scheduled message, sid, as the composer's do once the server has answered: only those, or
+// ones this device made, are re-encrypted by themselves; see the replay test below.)
 test('the app re-encrypts a held message with the timer its own copy was written for', async () => {
   const { createScheduled } = await clientScheduled();
   const patches = []; const sealed = [];
@@ -356,7 +358,7 @@ test('the app re-encrypts a held message with the timer its own copy was written
       return { ...items[id], status: 'pending', reason: null, ciphertext: body.ciphertext, draft: body.draft };
     },
   };
-  const copies = { a: { t: 'see you at 9', f: [], x: 3600 }, b: { t: 'no timer', f: [] } };
+  const copies = { a: { t: 'see you at 9', f: [], x: 3600, sid: 'a' }, b: { t: 'no timer', f: [], sid: 'b' } };
   const base = { serverId: 's1', channelId: 'c1', dmId: null, threadId: null, status: 'held', reason: 'key', sendAt: Date.now() + HOUR, ciphertext: 'old', files: 0 };
   const items = {
     a: { ...base, id: 'a', ref: 'a'.repeat(16), draft: 'x1:copy-a', ttl: 3600 },
@@ -379,7 +381,7 @@ test('the app re-encrypts a held message with the timer its own copy was written
   await until(() => patches.length === 2, 'the second one too');
   const of = (ref) => sealed.find((x) => x.keep.ref === ref);
   assert.equal(of(items.a.ref).key, 'c:c1');
-  assert.deepEqual(of(items.a.ref).keep, { ref: items.a.ref, threadId: null, x: 3600 }, 'the timer from its own copy goes to sealFor');
+  assert.deepEqual(of(items.a.ref).keep, { ref: items.a.ref, threadId: null, x: 3600, sid: 'a' }, 'the timer from its own copy goes to sealFor, and the new copy names it');
   assert.equal(of(items.a.ref).payload.t, 'see you at 9');
   assert.equal(of(items.b.ref).keep.x, 0, 'one written without a timer has none to keep');
   assert.ok(patches.every(([, body]) => body.sendNow === true && body.epoch === 2));
@@ -411,7 +413,7 @@ test('the app re-encrypts by itself what a new sign-in token held, only from its
   };
   const sched = createScheduled({
     me: () => ({ id: 'u1' }),
-    openDraft: async (it) => { if (it.id !== 'mine') throw new Error('doesn\u2019t open'); return { t: 'see you at 9', f: [] }; },
+    openDraft: async (it) => { if (it.id !== 'mine') throw new Error('doesn\u2019t open'); return { t: 'see you at 9', f: [], sid: 'mine' }; },
     sealFor: async (key, payload, keep) => ({ ciphertext: 'new-' + keep.ref, epoch: 1, ttl: 0, draft: 'x1:again' }),
     withKeyRetry: (serverId, fn) => fn(),
     refreshTimer: async () => {},
@@ -431,6 +433,109 @@ test('the app re-encrypts by itself what a new sign-in token held, only from its
   await sleep(100);
   assert.equal(patches.length, 1, 'never the one whose copy doesn\u2019t open');
   assert.deepEqual(globalThis.__sched.toasts, []);
+});
+
+// A stolen session (the sender's token, no identity key) keeps the sender's own copy of a scheduled message from the
+// list, and after the sender cancels it puts it back as new scheduled messages (junk ciphertext, a reply target of its
+// choosing), then gets the key changed (a throwaway member joins and leaves). The sender's app, with its real vault,
+// must not re-encrypt and re-sign those words by itself: neither the copy as the composer first made it, nor the one
+// naming the cancelled message. Its own waiting ones still are: one whose copy names it, and one this device made.
+test('a copy of a cancelled scheduled message put back by a stolen session is never re-encrypted by itself; the app\u2019s own still are', async () => {
+  globalThis.window = globalThis.window || globalThis; // e2ee.js asks window.crypto for WebCrypto
+  const E2EE = await import(require('node:url').pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'e2ee.js')).href);
+  const { createScheduled } = await clientScheduled();
+  const { s, inv, ch } = await newServer('Replay');
+  const ann = await user('rpann', inv);
+  const tmp = await user('rptmp', inv); // leaves later, so the key has to change
+  freshEpoch(s.id);
+  const key = 'c:' + ch.id;
+  // Ann's vault key, derived from her identity key exactly as the app does (E2EE.vaultKey).
+  const priv = await crypto.webcrypto.subtle.importKey('pkcs8', ann.privateKey.export({ type: 'pkcs8', format: 'der' }), { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const vk = await E2EE.vaultKey(priv, ann.publicKey);
+  const draftId = (ref, k, threadId) => `${ref}|${k}|${threadId || ''}`; // app.js draftId
+  const seal = (ref, payload) => E2EE.sealVault(vk, 'scheduled', draftId(ref, key, null), payload);
+  const target = (await as(boss, 'POST', `/channels/${ch.id}/messages`, { ciphertext: cipher(), epoch: 1 })).json;
+  const targetId = (target.message || target).id;
+  // What the composer does (app.js sendOnce + bindScheduled): schedule with a copy, then seal it again naming the
+  // scheduled message and hand the server the same ciphertext with it.
+  async function scheduleLikeTheApp(words, { bind = true } = {}) {
+    const ref = crypto.randomBytes(16).toString('hex');
+    const first = await seal(ref, { t: words, f: [] });
+    const body = { ciphertext: cipher(), epoch: 1 };
+    const r = await as(ann, 'POST', `/channels/${ch.id}/scheduled-messages`, { ...body, ref, draft: first, sendAt: soon(HOUR) });
+    assert.equal(r.status, 200, r.text);
+    if (!bind) return { item: r.json, first };
+    const p = await as(ann, 'PATCH', `/scheduled-messages/${r.json.id}`, { ...body, draft: await seal(ref, { t: words, f: [], sid: r.json.id }) });
+    assert.equal(p.status, 200, p.text);
+    return { item: p.json, first };
+  }
+  const WORDS = 'I am resigning, effective immediately. (withdrawn)';
+  const orig = await scheduleLikeTheApp(WORDS);
+  const mine = await scheduleLikeTheApp('still on: lunch at 1'); // made on another of her devices
+  const here = await scheduleLikeTheApp('still on: the 3 pm call', { bind: false }); // made on this one (not bound)
+
+  // The attacker keeps both copies (the list has the bound one; the live scheduled:update for the POST had the first).
+  const stolen = (await list(ann)).find((x) => x.id === orig.item.id);
+  assert.notEqual(stolen.draft, orig.first, 'the copy on the server names its scheduled message');
+  assert.equal((await as(ann, 'DELETE', `/scheduled-messages/${orig.item.id}`)).status, 200);
+  const replays = [];
+  for (const copy of [orig.first, stolen.draft]) {
+    const r = await as(ann, 'POST', `/channels/${ch.id}/scheduled-messages`, { ref: stolen.ref, draft: copy, ciphertext: cipher(), epoch: 1, sendAt: soon(4000), replyTo: targetId });
+    assert.equal(r.status, 200, r.text);
+    replays.push(r.json.id);
+  }
+  // The key has to change: someone leaves; a member's app makes the new one.
+  assert.equal((await as(tmp, 'POST', `/servers/${s.id}/leave`)).status, 200);
+  const all = [...replays, mine.item.id, here.item.id];
+  await until(() => all.every((id) => rowOf(id).status === 'held'), 'held for the new key');
+  freshEpoch(s.id, 2);
+
+  // Ann's app opens (the real scheduled.js, her real vault). sealFor stands in for app.js: what it would encrypt and
+  // sign under epoch 2, with the copy it would seal (naming keep.sid).
+  const patches = []; const resealed = [];
+  globalThis.__sched = {
+    toasts: [],
+    api: async (method, p, body) => {
+      if (method === 'PATCH') patches.push(p.split('/').pop());
+      const r = await as(ann, method, p, body);
+      if (r.status >= 400) throw Object.assign(new Error(r.json && r.json.error), { status: r.status, code: r.json && r.json.code });
+      return r.json;
+    },
+  };
+  const sched = createScheduled({
+    me: () => ({ id: ann.id }),
+    openDraft: (it) => E2EE.openVault(vk, 'scheduled', draftId(it.ref, it.dmId ? 'd:' + it.dmId : 'c:' + it.channelId, it.threadId), it.draft),
+    sealFor: async (k, payload, keep) => {
+      resealed.push({ t: payload.t, sid: keep.sid });
+      return { ciphertext: cipher().replace('c2:1:', 'c2:2:'), epoch: 2, ttl: 0, draft: await seal(keep.ref, keep.sid ? { ...payload, sid: keep.sid } : payload) };
+    },
+    withKeyRetry: (serverId, fn) => fn(), refreshTimer: async () => {}, placeOf: () => ({ label: '#x', dm: false }), onChange: () => {}, openKey: () => {},
+  });
+  sched.added(here.item); // the composer on this device scheduled it
+  await sched.load();
+  await until(() => patches.length >= 2, 'her own two re-encrypted by themselves');
+  // Past the replays' time: nothing more happens.
+  await sleep(Math.max(0, rowOf(replays[0]).send_at - Date.now()) + 1500);
+  assert.deepEqual(patches.sort(), [mine.item.id, here.item.id].sort(), 'only her own waiting ones were re-encrypted');
+  assert.deepEqual(resealed.map((x) => x.t).sort(), ['still on: lunch at 1', 'still on: the 3 pm call'], 'the withdrawn words were never re-encrypted');
+  assert.ok(resealed.every((x) => x.sid), 'each new copy names its scheduled message');
+  for (const id of replays) assert.equal(rowOf(id).status, 'held', 'the replays wait, as they were');
+  assert.equal(srv.sql('SELECT COUNT(*) n FROM messages WHERE channel_id = ? AND author_id = ?', ch.id, ann.id)[0].n, 0, 'nothing was posted as her');
+  assert.deepEqual(globalThis.__sched.toasts, []);
+  // Bound to it now: another key change, and any of her apps re-encrypts it by itself (this one forgets it made it).
+  const again = createScheduled({
+    me: () => ({ id: ann.id }),
+    openDraft: (it) => E2EE.openVault(vk, 'scheduled', draftId(it.ref, 'c:' + it.channelId, it.threadId), it.draft),
+    sealFor: async (k, payload, keep) => ({ ciphertext: cipher().replace('c2:1:', 'c2:3:'), epoch: 3, ttl: 0, draft: await seal(keep.ref, { ...payload, sid: keep.sid }) }),
+    withKeyRetry: (serverId, fn) => fn(), refreshTimer: async () => {}, placeOf: () => ({ label: '#x', dm: false }), onChange: () => {}, openKey: () => {},
+  });
+  freshEpoch(s.id, 3);
+  patches.length = 0;
+  await again.load(); // (the list holds what still has epoch 2)
+  await until(() => patches.includes(here.item.id) && patches.includes(mine.item.id), 'both re-encrypted by another app once their copies name them');
+  await sleep(300);
+  assert.ok(!patches.some((id) => replays.includes(id)), 'never the replays');
+  for (const id of [...replays, mine.item.id, here.item.id]) await as(ann, 'DELETE', `/scheduled-messages/${id}`);
 });
 
 test('voice channels: their chats take scheduled messages like a text channel; threads stay in text channels; a group call has no chat', async () => {

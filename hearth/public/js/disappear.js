@@ -69,12 +69,49 @@ export function nextDeadline(items, now) {
 // a computer that went to sleep are checked again then; setTimeout can't wait past 24.8 days anyway).
 export const waitFor = (at, now) => Math.max(250, Math.min(HOUR, at - now));
 
-// The line shown in the conversation when someone changes its timer. entry: { by, secs, prev }.
-export function sysLineText(entry, meId, nameOf) {
-  const who = entry.by && entry.by === meId ? 'You' : (entry.by && nameOf(entry.by)) || 'Someone';
-  if (!entry.secs) return `${who} turned off disappearing messages`;
-  if (!entry.prev) return `${who} turned on disappearing messages: ${label(entry.secs)}`;
-  return `${who} changed disappearing messages to ${label(entry.secs)}`;
+// A name that reads as "You": in any case, with accents, spaces, dots or invisible characters in it (Hangul fillers
+// and every other character Unicode calls default-ignorable too), look-alike letters from other alphabets, or as its
+// first word ("You (admin)"). On the timer line it could pass for your own change. Look-alikes are matched before
+// anything is lower-cased, as capital and small letters can look like different ones: a capital Greek upsilon "Υ"
+// reads as Y, its small letter "υ" as u. (No list of look-alikes is complete, so the line doesn't rest on this alone:
+// see sysLineParts.)
+const LOOKALIKE = new Map(Object.entries({
+  y: 'уУүҮʏỿΥγɣᎩꭹⲨⲩყƴɏ',
+  o: 'оОοΟօՕөӨ0σᴏⲟⲞøØɵᴑ〇ⵔ',
+  u: 'υսՍцЦμʊᴜᑌᥙʋʉ',
+}).flatMap(([to, from]) => [...from].map((c) => [c, to])));
+const INVISIBLE = /[\p{M}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+export function readsAsYou(name) {
+  const s = String(name || '').normalize('NFKD').replace(INVISIBLE, '').replace(/./gsu, (c) => LOOKALIKE.get(c) || c.toLowerCase());
+  if (s.replace(/[^\p{L}]/gu, '') === 'you') return true;
+  return s.split(/[^\p{L}]+/u).find(Boolean) === 'you';
+}
+// The line shown in the conversation when someone changes its timer, in parts. entry: { by, secs, prev }.
+//   self    true only when the change is yours (its user id is yours): then who is "You"
+//   who     otherwise their name (nameOf: a nickname in a server, else the display name), or "Someone"
+//   handle  their @username (handleOf, always letters, digits, _ and . only), after any name that isn't simply that
+//           username, and after one that reads as "You" even when it is: whatever look-alike a name uses, someone
+//           else's change never reads as your own. Without a known @username, a name that reads as "You" is "Someone"
+//   action  "turned off disappearing messages", "turned on disappearing messages: 1 week", "changed …"
+// The app draws a name apart from the built-in "You" as well (sysLineEl in app.js).
+export function sysLineParts(entry, meId, nameOf, handleOf = () => null) {
+  const self = !!entry.by && entry.by === meId;
+  let who = self ? 'You' : (entry.by && nameOf(entry.by)) || 'Someone';
+  let handle = null;
+  if (!self) {
+    const at = (entry.by && handleOf(entry.by)) || null;
+    const justTheUsername = !!at && /^[A-Za-z0-9_.]+$/.test(who) && who.toLowerCase() === String(at).toLowerCase();
+    if (at && (!justTheUsername || readsAsYou(who))) handle = at;
+    else if (!at && readsAsYou(who)) who = 'Someone';
+  }
+  const action = !entry.secs ? 'turned off disappearing messages'
+    : !entry.prev ? `turned on disappearing messages: ${label(entry.secs)}`
+      : `changed disappearing messages to ${label(entry.secs)}`;
+  return { self, who, handle, action };
+}
+export function sysLineText(entry, meId, nameOf, handleOf) {
+  const p = sysLineParts(entry, meId, nameOf, handleOf);
+  return `${p.who}${p.handle ? ` (@${p.handle})` : ''} ${p.action}`;
 }
 
 // "in 3 days", "in 5 hours", "in 20 minutes", "in less than a minute".

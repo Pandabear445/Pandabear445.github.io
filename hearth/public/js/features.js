@@ -436,13 +436,16 @@ export function remindItems(m, key, preview) {
     before(tomorrow9()) ? { label: 'Remind me tomorrow (9 am)', icon: 'bell', action: at(tomorrow9()) } : null,
   ];
 }
-// Reminders for messages that disappeared (gone: their ids; or past their exp) are dropped without a word.
+// Reminders for messages that disappeared (gone: their ids; or past their exp) are dropped without a word, and so
+// is the bar a fired one put on screen with their words.
+const shownReminders = new Map(); // the bar on screen -> { msgId, exp }
 export function purgeReminders(gone = new Set()) {
   if (!X || !X.S || !X.S.me) return;
   const all = getR();
   const t = serverNow();
   const keep = all.filter((r) => !(r.exp && r.exp <= t) && !gone.has(r.msgId));
   if (keep.length !== all.length) setR(keep);
+  for (const [bar, r] of shownReminders) if ((r.exp && r.exp <= t) || gone.has(r.msgId)) { shownReminders.delete(bar); bar.remove(); }
 }
 export const reminderDeadlines = () => (X && X.S && X.S.me ? getR().map((r) => r.exp).filter(Boolean) : []);
 export function startReminders() {
@@ -455,12 +458,17 @@ export function startReminders() {
     setR(all.filter((r) => r.at > Date.now()));
     due.forEach((r) => {
       const who = X.displayName(X.getUser(r.authorId));
+      // A disappearing message's words go with it: the inbox entry keeps its deadline (exp), and the notification is
+      // tied to the message, so it closes when the message goes (as a message's own notification does).
+      const exp = Number.isFinite(r.exp) && r.exp > 0 ? { exp: r.exp } : {};
       X.playSound('mention');
-      X.notify({ title: 'Reminder', body: `${who}: ${r.text}` });
-      X.addInbox({ type: 'reminder', userId: r.authorId, msgId: r.msgId, title: `Reminder: message from ${who}`, text: r.text });
+      X.notify({ title: 'Reminder', body: `${who}: ${r.text}`, tag: `reminder:${r.msgId}`, msgId: r.msgId });
+      X.addInbox({ type: 'reminder', userId: r.authorId, msgId: r.msgId, title: `Reminder: message from ${who}`, text: r.text, ...exp });
+      const close = () => { shownReminders.delete(t); t.remove(); };
       const t = h('div', { class: 'update-bar ev-toast', role: 'status' }, icon('bell'), h('span', null, `Reminder: ${who} — “${r.text.slice(0, 60)}”`),
-        h('button', { class: 'btn primary sm', onclick: () => { X.jump(r.key, r.msgId); t.remove(); } }, 'Show'),
-        h('button', { class: 'icon-btn sm', 'aria-label': 'Dismiss', onclick: () => t.remove() }, icon('close')));
+        h('button', { class: 'btn primary sm', onclick: () => { X.jump(r.key, r.msgId); close(); } }, 'Show'),
+        h('button', { class: 'icon-btn sm', 'aria-label': 'Dismiss', onclick: close }, icon('close')));
+      shownReminders.set(t, { msgId: r.msgId, ...exp });
       document.body.append(t);
     });
   };

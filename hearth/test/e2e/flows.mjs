@@ -1095,6 +1095,13 @@ async function deleteAccount(t) {
   await bob.railButton(SERVER);
   await bob.openChannel('general');
   await bob.message('Carl was here: plum').waitFor();
+  // Bob mentions carl: carl's app keeps the words in its inbox, in this browser, and a reminder on it keeps them too.
+  await bob.send('@carl the gate code is 4417');
+  const copies = () => carl.page.evaluate(() => Object.keys(localStorage).filter((k) => /^hearth\.(inbox|reminders)\./.test(k)).map((k) => `${k}=${localStorage.getItem(k)}`));
+  await carl.message('the gate code is 4417').waitFor();
+  await carl.messageAction('the gate code is 4417', 'Remind me in 1 hour');
+  await carl.toast('remind you');
+  for (const until = Date.now() + 15000; (await copies()).filter((x) => x.includes('4417')).length < 2; await carl.page.waitForTimeout(100)) check(Date.now() < until, `Bob’s mention should be in carl’s inbox and reminders (has: ${(await copies()).join(' | ')}).`);
 
   await carl.openSettings('Security');
   await carl.$('.set-content button', { hasText: 'Delete my account' }).click();
@@ -1105,6 +1112,15 @@ async function deleteAccount(t) {
   await carl.page.waitForSelector('#login-form:not([hidden])');
   // (Said by Settings, or by the server's notice if that arrives first: either way, it says so.)
   await carl.$('#login-form .form-error', { hasText: /(Your|This) account was deleted\./ }).waitFor();
+  // Nothing of the words carl's app kept is left in this browser: no inbox, no reminders.
+  for (const until = Date.now() + 10000; (await copies()).length; await carl.page.waitForTimeout(100)) check(Date.now() < until, `Deleting the account should leave no inbox or reminder copies here (left: ${(await copies()).join(' | ')}).`);
+  // And each time Hearth opens, any copy past its deadline goes, whoever it belongs to.
+  await carl.page.evaluate(() => localStorage.setItem('hearth.inbox.someone', JSON.stringify([{ type: 'mention', msgId: 'a', text: 'gone already: 9921', exp: Date.now() - 1000 }, { type: 'mention', msgId: 'b', text: 'still waiting', exp: Date.now() + 3600000 }])));
+  await carl.page.reload();
+  await carl.page.waitForSelector('#login-form:not([hidden])');
+  const kept = await carl.page.evaluate(() => localStorage.getItem('hearth.inbox.someone') || '');
+  check(!kept.includes('9921') && kept.includes('still waiting'), `Opening Hearth should drop copies past their deadline and keep the rest (left: ${kept}).`);
+  await carl.page.evaluate(() => localStorage.removeItem('hearth.inbox.someone'));
   // The others see it go; what carl wrote stays, from a "Deleted user".
   await bob.showMembers();
   await bob.member('carl').waitFor({ state: 'detached' });
@@ -1900,6 +1916,27 @@ async function disappearing(t) {
   await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).waitFor();
   const days = await alice.page.$$eval('#messages .day-div', (els) => els.map((e) => e.dataset.day));
   check(days.length && new Set(days).size === days.length, `Each day should have one divider, timer lines or not (got ${days.join(' | ')}).`);
+  // Who changed it goes by their account: "You" only for alice's own change, anyone else's name drawn apart from it.
+  // Nor can a display name of "You" pass for her own change: his @username follows it, and follows one in look-alike
+  // letters too (a capital Greek upsilon, then "ou").
+  await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).locator('.sys-who', { hasText: 'bob' }).waitFor();
+  await alice.$('#messages .sys-line', { hasText: 'You turned on disappearing messages: 5 seconds' }).locator('.sys-you').waitFor();
+  const bobId = await bob.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  const bobProfile = t.server.rows('SELECT profile FROM users WHERE id = ?', bobId)[0].profile;
+  for (const name of ['You', 'Υou', 'bob']) {
+    if (name === 'bob') t.server.sql('UPDATE users SET profile = ? WHERE id = ?', bobProfile, bobId);
+    else t.server.sql("UPDATE users SET profile = json_set(profile, '$.displayName', ?) WHERE id = ?", name, bobId);
+    await alice.page.reload();
+    await alice.waitApp();
+    await alice.railButton('Direct messages');
+    await alice.dmRow(name).click();
+    await alice.page.waitForSelector(`#composer-input[placeholder="Message ${name}"]`);
+    if (name === 'bob') break;
+    const offLine = alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' });
+    await offLine.waitFor();
+    const said = await offLine.innerText();
+    check(said.includes(`${name} (@bob) turned off disappearing messages`), `Bob named “${name}” should show with his @username on the line (it says “${said}”).`);
+  }
   // Turned off while bob's message is on its way: he wrote it expecting it to disappear, so it isn't sent unasked.
   await alice.$('#main-head button[aria-label="More"]').click();
   await alice.menuItem('1 hour').click();
@@ -2476,6 +2513,55 @@ async function sendLater(t) {
   }
   await fake.locator('.sched-list .panel-empty').waitFor();
   await fake.locator('.modal-x').click();
+
+  // Someone with Bob's session token (no keys) keeps his own copy of a scheduled message, and after he cancels it puts
+  // it back as new scheduled messages held for a key change. Those copies open with his keys, but his app must not
+  // re-encrypt and re-sign the withdrawn words by itself: the copy naming the cancelled one shows as unconfirmed
+  // (Cancel only), and the one as the composer first sealed it (before the server answered) waits for him (Keep).
+  const firstPost = bob.page.waitForRequest((r) => r.method() === 'POST' && /\/api\/channels\/\w+\/scheduled-messages$/.test(r.url()));
+  await bob.$('#composer-input').fill('Scheduled, then withdrawn: guava');
+  await bob.$('.cw-main button[aria-label="Send later"]').click();
+  await bob.menuItem('In 3 hours').click();
+  const firstCopy = (await firstPost).postDataJSON();
+  await bob.toast('Scheduled for');
+  const guava = t.server.rows("SELECT id, ref, draft FROM scheduled_messages WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", bobId)[0];
+  check(guava && guava.ref === firstCopy.ref && guava.draft !== firstCopy.draft, 'Bob’s app should seal its copy again, naming the scheduled message, once the server has answered.');
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const gl = await bob.dialog('Scheduled messages');
+  await gl.locator('.sched-item .sched-text', { hasText: 'withdrawn: guava' }).waitFor();
+  await gl.locator('.sched-item button', { hasText: exact('Cancel') }).click();
+  await (await bob.dialog('Cancel this scheduled message?')).locator('.modal-foot .btn.danger').click();
+  await gl.locator('.sched-list .panel-empty').waitFor();
+  await gl.locator('.modal-x').click();
+  const putBack = (id, draft) => t.server.sql(`INSERT INTO scheduled_messages (id, user_id, server_id, channel_id, ciphertext, epoch, ref, draft, own_key, send_at, status, reason, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', 'key', ?, ?)`, id, bobId, hall.id, general.id, old.ciphertext, old.epoch, guava.ref, draft, ownKey, Date.now() + 2 * 3600000, Date.now(), Date.now());
+  putBack('replaybound' + crypto.randomBytes(4).toString('hex'), guava.draft);
+  putBack('replayfirst' + crypto.randomBytes(4).toString('hex'), firstCopy.draft);
+  const patchesBefore = patches.length;
+  await bob.page.reload();
+  await bob.waitApp();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.$('.cw-main .sched-bar', { hasText: '1 scheduled message is waiting for you' }).waitFor();
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const rl = await bob.dialog('Scheduled messages');
+  const waits = rl.locator('.sched-item', { hasText: 'withdrawn: guava' });
+  await waits.locator('.sched-note', { hasText: 'this one waits for you' }).waitFor();
+  const wl = (await waits.locator('.sched-actions button').allInnerTexts()).map((x) => x.trim());
+  check(wl[0] === 'Keep' && wl.includes('Cancel'), `A copy Bob’s app can’t tell he still wants sent should wait for him, Keep first (it offers ${wl.join(', ')}).`);
+  check((await waits.locator('.sched-when').innerText()).startsWith('Waiting for you'), 'The card should say it waits for Bob.');
+  await rl.locator('.sched-item .sched-text', { hasText: 'can’t confirm you wrote this one' }).waitFor();
+  await new Promise((r) => setTimeout(r, 1500));
+  check(patches.length === patchesBefore, `Bob’s app should never re-encrypt a copy put back after he cancelled it (it sent ${patches.length - patchesBefore} PATCH requests).`);
+  const back = t.server.rows("SELECT status, ciphertext FROM scheduled_messages WHERE id LIKE 'replay%'");
+  check(back.length === 2 && back.every((x) => x.status === 'held' && x.ciphertext === old.ciphertext), 'Both should still be waiting, exactly as they were.');
+  for (const left of [1, 0]) {
+    await rl.locator('.sched-item button', { hasText: exact('Cancel') }).first().click();
+    await (await bob.dialog('Cancel this scheduled message?')).locator('.modal-foot .btn.danger').click();
+    await rl.locator('.sched-item').nth(left).waitFor({ state: 'detached' });
+  }
+  await rl.locator('.sched-list .panel-empty').waitFor();
+  await rl.locator('.modal-x').click();
 
   // One scheduled from a session that has been signed out since waits for its owner, and one whose time has passed
   // isn't sent by saving an edit without asking. (The server holds it when the session ends; here that's done in

@@ -184,6 +184,10 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
   survives switching conversations and reloads, and is written right away when the page is hidden.
 - It never leaves the device. Sending clears it, and signing out removes all drafts. Drafts older than 30 days
   are dropped, and at most 200 are kept.
+- The inbox (`hearth.inbox.<userId>`) and reminders (`hearth.reminders.<userId>`) also copy messages' words into the
+  browser. Signing out (Log out, being signed out, Delete account) removes them for every account, like drafts
+  (`clearLocalCopies` in `usability.js`), and each time Hearth opens it drops any entry past its deadline
+  (`expireLocalCopies`), whoever it belongs to.
 
 ### Export my data
 - Settings → Privacy & safety → **Export my data**.
@@ -589,11 +593,17 @@ What this pass built, and where it differs from that design:
   messages disappearing by themselves aren't logged.
 - **Shown.** `disappear_log` keeps who changed what and when (50 per conversation); history pages carry the changes
   that fall inside them (`timerEvents`) and the apps draw them between the messages, each under its own day's
-  divider. Pages meet without gaps: a `?before=` page ends at its anchor's id time, an `?after=` page starts at its
-  anchor's `created_at`. Channels carry `disappear` in
-  `serializeChannel`, DMs in `serializeDm`. The app adds a timer button to the header, a note above the composer, a
-  line in the welcome block, a badge on each disappearing message, and the choices in the DM, group and channel ⋯
-  menus and in Edit channel. Turning it on asks first and says what it can't do.
+  divider. A line says "You" only when the change's user id is the viewer's own (`sysLineParts` in `disappear.js`);
+  anyone else's name is drawn in its own element, followed by the person's @username unless the name is simply that
+  username (usernames are plain letters, digits, `_` and `.`), so nobody can make their change look like the
+  viewer's, whatever look-alike letters their name uses. A name that reads as "You" (any case, spacing, accents,
+  invisible characters, Hangul fillers included, or look-alike letters, capitals matched before lower-casing, or as
+  its first word: `readsAsYou`) always gets it, and shows as "Someone" when the @username isn't known. Pages meet
+  without gaps: a `?before=` page ends at its anchor's id time, an `?after=` page starts at its anchor's
+  `created_at`. Channels carry `disappear` in `serializeChannel`, DMs in `serializeDm`. The app adds a timer button
+  to the header, a note above the composer, a line in the welcome block, a badge on each disappearing message, and
+  the choices in the DM, group and channel ⋯ menus and in Edit channel. Turning it on asks first and says what it
+  can't do.
 - **Stamped.** Each send stamps `expires_at = created_at + timer` (`DISAPPEAR.stamp`), capped by the thread's first
   message for replies. Bot posts, webhook posts (`BOTS.botPost`) and the news bot are stamped too; a test checks that
   every `INSERT INTO messages / dm_messages` in `server/` sets `expires_at`. The app sends `ttl` (the timer it
@@ -638,7 +648,12 @@ What this pass built, and where it differs from that design:
   at their deadline with one timer (re-checked at most hourly, and on focus and visibility), and when one goes drops
   its decrypted files (`fileUrls.drop(…, true)`), stops a voice message playing, closes the image viewer, cancels a
   reply or edit on it, closes its notification (`closeNotificationFor`), purges inbox entries and reminders that copy
-  its words (`exp` on each), removes it from open search results, and redraws pins and saved. Unread and mention
+  its words (`exp` on each: a reminder that fires passes its `exp` on to the inbox entry it makes, its notification
+  is tagged with the message so it closes too, and its bar on screen goes), removes it from open search results, and
+  redraws pins and saved. Those copies go at their `exp` even when the app wasn't running then: the signed-in app
+  purges its own at start-up, and every time Hearth opens (signed in or not) `expireLocalCopies` drops any account's
+  copies past their deadline. Signing out (and deleting the account) removes every inbox and reminder list from the
+  browser. Unread and mention
   counts are asked for again (`/me/unread`, debounced to at most every 30 seconds) when a conversation with unread
   messages lost some. A message that arrives live is in the expiry timer as soon as it's in the conversation.
 
@@ -1032,6 +1047,18 @@ old words for people who joined since. A copy only opens with the account's own 
 and thread, so it can't be made, moved or swapped by anyone else. The list shows what a scheduled message says from
 that copy too. One whose copy is missing or doesn't open shows as "This device can't confirm you wrote this one",
 is never re-encrypted, and offers only **Cancel**.
+
+**A copy put back isn't re-encrypted by itself.** A stolen session can read the sender's copies from the list and,
+after the sender sent or cancelled the message, put one back as a new scheduled message (the server only checks a
+copy's shape), then get the key changed so it's held. So each copy names the scheduled message it belongs to (`sid`
+inside it): the composer seals it again with the id as soon as the server answers and hands it back with the very same
+ciphertext (`bindScheduled` in `app.js`), and every re-encrypt keeps it. The app re-encrypts a held one by itself
+only if its copy names it, or if this device scheduled it (its ids are kept in `hearth.schedHere.<userId>`, for when
+that second step didn't go through; dropped as they're sent or cancelled, and at sign-out). A copy that names another
+scheduled message shows as can't-confirm (Cancel only). One that names none waits for the person ("Waiting for you",
+with **Keep** first), and confirming it binds it. Not covered: a copy names its scheduled message, not which version
+of it, so a stolen session can put an earlier copy of the same scheduled message back (its words before an edit),
+and that one is re-encrypted by itself after a key change.
 
 **Sessions.** Each scheduled message records the session that last wrote it (`session_id`: the one that scheduled,
 edited or re-encrypted it). When that session ends through the server (`revokeSessions`: logged out, signed out in

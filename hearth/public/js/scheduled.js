@@ -7,7 +7,7 @@
 // got a new token since (a password change, two-factor turned on, other devices signed out: a copy of the old token
 // could have scheduled it, and only one you wrote has a copy that opens here):
 //   - by itself, as soon as it can, when its time is still ahead or passed less than 10 minutes ago (it then goes
-//     out at once);
+//     out at once), and only when it's sure this is that scheduled message (see below);
 //   - later than that, only when you say so (Send now or a new time): a message sent days late might not be one
 //     you still want to send. Saving an edit of one like that asks too;
 //   - never one scheduled from a session that has been signed out since: that waits for you (Keep, Send now…).
@@ -15,6 +15,18 @@
 // someone with a stolen session, who has no identity key) can't make one that opens, so it can't get this app to
 // re-sign a forged message, or one of your old messages under a newer key. One whose copy doesn't open here shows
 // as "can't confirm you wrote this" and can only be cancelled.
+// A copy that opens isn't enough to do it by itself, though: a stolen session can read your copies from the list and
+// put one back as a new scheduled message after you sent or cancelled it, to have your app re-encrypt and re-sign
+// those words under a new key (readable by people who joined since, and as often as it likes). So each copy is bound
+// to the scheduled message it belongs to: sid inside it is that message's id (the server picks it, so the composer
+// seals the copy again with it as soon as the server answers, and every re-encrypt keeps it). This app re-encrypts by
+// itself only one whose copy names it, or one this device scheduled itself (its ids are kept here, for when that
+// second step didn't happen). Any other copy that opens is one you confirm: it waits for you (Keep, Send now, Edit,
+// Reschedule), and confirming it binds it. A copy that names another scheduled message is a copy of that one, put
+// here: it shows as "can't confirm" and can only be cancelled.
+// What this doesn't stop (SECURITY.md): a copy names its scheduled message, not which version of it, so a stolen
+// session can put an earlier copy of the same one back (its words before you edited it), and that one is
+// re-encrypted by itself after a key change.
 // Everything you wrote is put on screen as text nodes, never as HTML.
 import { h, clear, icon, toast, fmtTime, copyText } from './util.js';
 import { api } from './api.js';
@@ -25,6 +37,8 @@ import { label as timerLabel } from './disappear.js';
 const LATE_OK = 10 * 60 * 1000; // re-encrypted by itself (and sent at once) up to this long after its time
 const MAX_DAYS = 30;
 const MIN = 60 * 1000;
+
+const HERE_MAX = 100; // ids of scheduled messages this device made, kept per account (at most 25 are waiting at once)
 
 const keyOf = (it) => (it.dmId ? 'd:' + it.dmId : 'c:' + it.channelId);
 const readable = (dec) => !!dec && !dec.error;
@@ -78,7 +92,8 @@ const localInput = (t) => { const d = new Date(t - new Date(t).getTimezoneOffset
 //   sealFor(key, payload, keep) { ciphertext, epoch?, mentions?, everyone?, ttl, draft } for a message to that
 //                              conversation now (ttl beside it: its disappearing timer as it is now; x inside: the
 //                              stricter of that and keep.x, the timer the message was written for), with your own copy
-//                              bound to keep = { ref, threadId }
+//                              bound to keep = { ref, threadId }, and naming keep.sid inside it (the scheduled
+//                              message's id)
 //   withKeyRetry(serverId, fn) runs fn again once if the server says the key is out of date
 //   refreshTimer(key)          fetches the conversation's disappearing timer (the server said it changed)
 //   placeOf(item)              where it goes: { label, dm } ("#general · Hearth HQ", "Ana", a group's name)
@@ -96,6 +111,41 @@ export function createScheduled(deps) {
   let view = null; // the open list: { key, draw }
   let loaded = false;
 
+  // Ids of the scheduled messages this device made (the server's answer to the composer), kept in this browser for
+  // this account: one of those whose copy doesn't name it yet (the composer couldn't seal it again) is still
+  // re-encrypted by itself here. Only ever ids the server gave this device for something it scheduled: a new
+  // scheduled message gets a new id, so a copy put back in one never matches.
+  // Read afresh each time (another tab may have scheduled one); `here` is this tab's own, for when storage is off.
+  let here = new Set();
+  const hereKey = () => { const u = deps.me && deps.me(); return u && u.id ? `hearth.schedHere.${u.id}` : null; };
+  function madeHere() {
+    const all = new Set(here);
+    try {
+      const k = hereKey();
+      const v = k ? JSON.parse(localStorage.getItem(k) || '[]') : [];
+      if (Array.isArray(v)) v.forEach((x) => { if (typeof x === 'string') all.add(x); });
+    } catch { /* storage off: this tab's own only */ }
+    return all;
+  }
+  function keepHere(ids) {
+    here = new Set([...ids].slice(-HERE_MAX));
+    try {
+      const k = hereKey();
+      if (!k) return;
+      if (here.size) localStorage.setItem(k, JSON.stringify([...here])); else localStorage.removeItem(k);
+    } catch { /* full or blocked */ }
+  }
+  function forgetHere(ids) {
+    const all = madeHere();
+    if (ids.some((id) => all.has(id))) keepHere([...all].filter((id) => !ids.includes(id)));
+  }
+  // Re-encrypted by itself: one whose copy names this scheduled message, or one this device made.
+  const trusted = (it, dec) => readable(dec) && (dec.sid === it.id || (!dec.sid && madeHere().has(it.id)));
+  // Held, and waiting for you: one from a session signed out since, or one whose copy opens but that this app can't
+  // tell is still one you want sent (dec: what it says, or null while it's being opened).
+  const waitsForYou = (it, dec) => it.status === 'held' && (it.reason === 'session_ended' || (!!dec && readable(dec) && !trusted(it, dec)));
+  const shownDec = (it) => { const o = opened.get(it.id); return o && o.draft === it.draft ? o.dec : null; };
+
   const changed = (key) => { deps.onChange(key); if (view && (!view.key || view.key === key)) view.draw(); };
   function apply(it) {
     if (gone.has(it.id)) return;
@@ -107,7 +157,7 @@ export function createScheduled(deps) {
     if (it.status === 'held') fixHeld();
   }
   function drop(id) {
-    if (id) gone.add(id);
+    if (id) { gone.add(id); forgetHere([id]); }
     const it = items.get(id);
     if (!it) return;
     items.delete(id);
@@ -116,18 +166,19 @@ export function createScheduled(deps) {
   }
 
   // ------------------------------------------------------------------ opening and re-encrypting
-  // What it says, from your own copy (never from the ciphertext the server holds): { t, f, p?, l?, x? }, or
-  // { error: true } when the copy is missing or doesn't open with your keys. x is the disappearing timer it was
-  // written for (seconds), which every re-encrypt keeps (see reseal).
+  // What it says, from your own copy (never from the ciphertext the server holds): { t, f, p?, l?, x?, sid? }, or
+  // { error: true } when the copy is missing, doesn't open with your keys, or names another scheduled message (a
+  // copy of that one, put here). x is the disappearing timer it was written for (seconds), which every re-encrypt
+  // keeps (see reseal); sid, the scheduled message it was sealed for (see the top of this file).
   async function open(it) {
     const o = opened.get(it.id);
     if (o && o.draft === it.draft) return o.dec;
     let dec = { error: true };
     try {
       const p = it.draft && it.ref ? await deps.openDraft(it) : null;
-      if (p && typeof p === 'object' && !Array.isArray(p)) {
+      if (p && typeof p === 'object' && !Array.isArray(p) && (p.sid === undefined || p.sid === it.id)) {
         dec = { t: typeof p.t === 'string' ? p.t : '', f: Array.isArray(p.f) ? p.f : [], ...(p.p && typeof p.p === 'object' ? { p: p.p } : {}), l: Array.isArray(p.l) ? p.l : [],
-          ...(Number.isInteger(p.x) && p.x > 0 ? { x: p.x } : {}) };
+          ...(Number.isInteger(p.x) && p.x > 0 ? { x: p.x } : {}), ...(p.sid === it.id ? { sid: it.id } : {}) };
       }
     } catch { /* doesn't open: can't confirm it's yours */ }
     opened.set(it.id, { draft: it.draft, dec });
@@ -139,6 +190,7 @@ export function createScheduled(deps) {
   // conversation's timer now inside it, and the server keeps the same one. A timer turned off or made longer since
   // never makes it last longer than you wrote it for, so re-encrypting it (by itself after a key change, or for an
   // edit, Keep or Send now) never needs asking about the timer the way sending a message you wrote earlier does.
+  // The new copy names this scheduled message (sid), so your apps re-encrypt it by themselves from then on.
   // now: if its time has passed, it may go at once (the server refuses otherwise, 409 overdue).
   async function reseal(it, { text, sendAt, now = false } = {}) {
     const dec = await open(it);
@@ -148,7 +200,7 @@ export function createScheduled(deps) {
     const links = (dec.l || []).filter((x) => x && still.includes(x.url));
     const payload = { t, f: dec.f || [], ...(dec.p ? { p: dec.p } : {}), ...(links.length ? { l: links } : {}) };
     const patch = async () => api('PATCH', `/scheduled-messages/${it.id}`, {
-      ...(await deps.sealFor(keyOf(it), payload, { ref: it.ref, threadId: it.threadId, x: dec.x || 0 })), ...(sendAt ? { sendAt } : {}), ...(now ? { sendNow: true } : {}),
+      ...(await deps.sealFor(keyOf(it), payload, { ref: it.ref, threadId: it.threadId, x: dec.x || 0, sid: it.id })), ...(sendAt ? { sendAt } : {}), ...(now ? { sendNow: true } : {}),
     });
     // Checked against the conversation's disappearing timer as it is now (ttl). Changed meanwhile (409
     // disappear_changed): fetch it and encrypt again, once.
@@ -164,8 +216,10 @@ export function createScheduled(deps) {
     return fresh;
   }
   // Held ones whose time is ahead (or just passed) because a key changed or the sign-in got a new token: re-encrypted
-  // without asking. One that can't be (no key yet, a safety number to check, a copy that doesn't open) waits for the
-  // next change of keys, or for you. Never one from a session that was signed out since: you confirm those yourself.
+  // without asking, if this app can tell it's that very scheduled message (trusted: its copy names it, or this device
+  // made it). One that can't be (no key yet, a safety number to check, a copy that doesn't open) waits for the next
+  // change of keys, or for you. Never one from a session that was signed out since, nor one whose copy opens but
+  // doesn't name it (it could be a copy of one you already sent or cancelled, put back): you confirm those yourself.
   // A try turned away as signed out (401) isn't held against it: the news that it's held can arrive just before this
   // tab has the new token, and it's tried again when the app reconnects with it (load).
   async function fixHeld({ force = false } = {}) {
@@ -173,7 +227,17 @@ export function createScheduled(deps) {
       if (it.status !== 'held' || it.reason === 'session_ended' || busy.has(it.id) || it.sendAt < Date.now() - LATE_OK) continue;
       if (!force && tried.get(it.id) === it.ciphertext) continue;
       busy.add(it.id);
-      try { await reseal(it, { now: true }); tried.delete(it.id); } catch (e) { if (!e || e.status !== 401) tried.set(it.id, it.ciphertext); } finally { busy.delete(it.id); }
+      try {
+        const dec = await open(it);
+        if (readable(dec) && !trusted(it, dec)) {
+          // Waiting for you: the composer bar and the list say so.
+          tried.set(it.id, it.ciphertext);
+          changed(keyOf(it));
+          continue;
+        }
+        await reseal(it, { now: true });
+        tried.delete(it.id);
+      } catch (e) { if (!e || e.status !== 401) tried.set(it.id, it.ciphertext); } finally { busy.delete(it.id); }
     }
   }
 
@@ -267,7 +331,7 @@ export function createScheduled(deps) {
     const list = mineIn(key);
     if (!list.length) return null;
     const failed = list.filter((x) => x.status === 'failed').length;
-    const stuck = list.filter((x) => x.status === 'held' && (x.reason === 'session_ended' || x.sendAt < Date.now() - LATE_OK)).length;
+    const stuck = list.filter((x) => x.status === 'held' && (waitsForYou(x, shownDec(x)) || x.sendAt < Date.now() - LATE_OK)).length;
     const waiting = list.length - failed;
     const next = list.find((x) => x.status === 'pending');
     const text = failed ? `${plural(failed, 'scheduled message', 'scheduled messages')} here ${failed === 1 ? 'wasn’t' : 'weren’t'} sent.`
@@ -314,11 +378,12 @@ export function createScheduled(deps) {
     if (loaded) fixHeld({ force: true }).then(draw);
   }
   function card(it, { all, editing, redraw, close }) {
-    const o = opened.get(it.id);
-    const dec = o && o.draft === it.draft ? o.dec : null;
+    const dec = shownDec(it);
     if (!dec) open(it).then(() => { if (view) view.draw(); });
     const late = it.sendAt < Date.now();
-    const needsYou = it.status === 'held' && it.reason === 'session_ended';
+    const needsYou = waitsForYou(it, dec);
+    // Its copy opens but doesn't say it's this scheduled message, and this device didn't make it.
+    const unbound = needsYou && it.reason !== 'session_ended';
     const when = it.status === 'failed' ? `Not sent · was due ${whenPhrase(it.sendAt)}`
       : it.status === 'held' ? `${late ? 'Waiting · was due' : needsYou ? 'Waiting for you · sends' : 'Waiting to be re-encrypted · sends'} ${whenPhrase(it.sendAt)}`
         : `Sends ${whenPhrase(it.sendAt)}`;
@@ -366,7 +431,9 @@ export function createScheduled(deps) {
     // Why this device can't confirm it: every message your apps schedule carries a copy only your keys open.
     const doubt = dec && !readable(dec) && it.status !== 'failed'
       ? h('p', { class: 'sched-note bad' }, 'Each message your apps schedule carries a copy that only your own keys open, and this one’s doesn’t open here, so it isn’t re-encrypted or changed from here. If you didn’t schedule it, cancel it and sign out the sessions you don’t recognize (Settings → Signed-in devices).')
-      : null;
+      // Why it waits: your words, but this device can't tell they're still meant to go (see the top of this file).
+      : unbound ? h('p', { class: 'sched-note' }, 'Your app re-encrypts a scheduled message by itself only on the device that scheduled it, or once you’ve confirmed it, so this one waits for you. Keep it if you still want it sent. If you already sent or cancelled these words, cancel it and sign out the sessions you don’t recognize (Settings → Signed-in devices).')
+        : null;
     const where = all ? deps.placeOf(it) : null;
     return h('li', { class: `sched-item ${it.status}`, dataset: { sid: it.id } },
       h('div', { class: 'sched-head' }, icon(it.status === 'failed' ? 'ban' : 'clock'), h('strong', { class: 'sched-when' }, when),
@@ -385,10 +452,13 @@ export function createScheduled(deps) {
     // re-encrypting says so), then what can be re-encrypted now is.
     async load() {
       try {
+        const before = madeHere(); // (one scheduled while the list was on its way isn't in it yet)
         const r = await api('GET', '/scheduled-messages');
         const keys = new Set([...items.values()].map(keyOf));
         items.clear();
         for (const it of r.items || []) if (!gone.has(it.id)) { items.set(it.id, it); keys.add(keyOf(it)); }
+        // What this device made and is gone since (sent or cancelled) needn't be kept.
+        forgetHere([...before].filter((id) => !items.has(id)));
         loaded = true;
         keys.forEach((k) => changed(k));
         fixHeld();
@@ -398,10 +468,18 @@ export function createScheduled(deps) {
     onRemove: ({ id } = {}) => drop(id),
     // New keys arrived (a server key, a checked safety number): what was waiting for them can go.
     onKeys: () => fixHeld({ force: true }),
-    // After the composer scheduled one (the live event may come first or not at all).
-    added: (it) => { if (it && it.id) apply(it); },
+    // After the composer scheduled one (the live event may come first or not at all): this device made it.
+    added: (it) => {
+      if (!it || !it.id) return;
+      if (!gone.has(it.id)) keepHere([...madeHere(), it.id]);
+      apply(it);
+    },
     forKey: mineIn,
     bar, openList, pickTime, whenLabel, whenPhrase,
-    reset() { items.clear(); opened.clear(); tried.clear(); gone.clear(); loaded = false; },
+    // Signing out: nothing of this account's is kept in this browser.
+    reset() {
+      try { const k = hereKey(); if (k) localStorage.removeItem(k); } catch { /* storage off */ }
+      items.clear(); opened.clear(); tried.clear(); gone.clear(); loaded = false; here = new Set();
+    },
   };
 }

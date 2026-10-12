@@ -840,3 +840,188 @@ test('app: a scheduled message re-encrypted later keeps the stricter of the time
   assert.equal(D.stricter(undefined, 0), 0);
   assert.equal(D.stricter(undefined, HOUR), HOUR);
 });
+
+// ------------------------------------------------------------------ who changed the timer (the line in the conversation)
+// Someone whose display name or nickname is "You" (or reads as it) mustn't make the line look like your own change:
+// "You" is only ever for the entry's user id being yours; such a name gets their @username after it.
+test('app: the timer line says "You" only for your own change; a name that reads as "You" gets its @username', () => {
+  const names = { p1: 'You', p2: 'Alice', p3: 'y o u', p4: 'You (admin)', p5: 'Yоu', p6: 'Youssef' };
+  const nameOf = (id) => names[id] || null;
+  const handleOf = (id) => ({ p1: 'mallory', p3: 'eve', p4: 'trent', p5: 'oscar', p6: 'youssef' })[id] || null;
+  for (const [secs, prev] of [[0, HOUR], [HOUR, 0], [DAY, HOUR]]) {
+    const own = D.sysLineText({ by: 'me', secs, prev }, 'me', nameOf, handleOf);
+    const theirs = D.sysLineText({ by: 'p1', secs, prev }, 'me', nameOf, handleOf);
+    assert.match(own, /^You (turned|changed)/);
+    assert.notEqual(theirs, own, 'a partner named "You" doesn’t read like your own change');
+    assert.equal(theirs, own.replace(/^You /, 'You (@mallory) '));
+  }
+  assert.equal(D.sysLineText({ by: 'p3', secs: 0, prev: HOUR }, 'me', nameOf, handleOf), 'y o u (@eve) turned off disappearing messages');
+  assert.equal(D.sysLineText({ by: 'p4', secs: 0, prev: HOUR }, 'me', nameOf, handleOf), 'You (admin) (@trent) turned off disappearing messages');
+  assert.equal(D.sysLineText({ by: 'p5', secs: 0, prev: HOUR }, 'me', nameOf, handleOf), 'Yоu (@oscar) turned off disappearing messages', 'look-alike letters');
+  assert.equal(D.sysLineText({ by: 'p1', secs: 0, prev: HOUR }, 'me', nameOf), 'Someone turned off disappearing messages', 'no @username known: not the name');
+  assert.equal(D.sysLineText({ by: 'p2', secs: 0, prev: HOUR }, 'me', nameOf, handleOf), 'Alice turned off disappearing messages', 'other names as they are');
+  assert.equal(D.sysLineText({ by: 'p6', secs: 0, prev: HOUR }, 'me', nameOf, handleOf), 'Youssef turned off disappearing messages');
+  const parts = D.sysLineParts({ by: 'p1', secs: 0, prev: HOUR }, 'me', nameOf, handleOf);
+  assert.deepEqual(parts, { self: false, who: 'You', handle: 'mallory', action: 'turned off disappearing messages' });
+  assert.equal(D.sysLineParts({ by: 'me', secs: 0, prev: HOUR }, 'me', nameOf, handleOf).self, true);
+  for (const n of ['You', 'YOU', ' you ', 'Y.o.u', 'Y​ou', 'Yóu', 'Ｙｏｕ', 'Y0U', 'You!']) assert.equal(D.readsAsYou(n), true, n);
+  for (const n of ['Young', 'Yousef', 'Your friend', 'Alice', '', null]) assert.equal(D.readsAsYou(n), false, String(n));
+  // The app draws the line from those parts: the built-in "You" for yours, anyone else's name in its own element.
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  const el = app.slice(app.indexOf('function sysLineEl('), app.indexOf('\n}\n', app.indexOf('function sysLineEl(')));
+  assert.match(el, /sysLineParts\(e, S\.me\.id,/);
+  assert.match(el, /p\.self \? h\('span', \{ class: 'sys-you' \}, 'You'\)/);
+  assert.match(el, /h\('bdi', \{ class: 'sys-who'/);
+});
+
+// Look-alikes are matched before lower-casing (a capital Greek upsilon reads as Y, its small letter as u) and every
+// default-ignorable character goes, Hangul fillers included (letters to Unicode, but they draw nothing). And as no list
+// of look-alikes is complete, anyone else's @username follows any name that isn't simply that username.
+test('app: a name made of a capital upsilon, a Hangul filler or a look-alike no list has still never reads as your own change', () => {
+  for (const n of ['Υou', 'ΥΟU', 'Υοu', 'Υоս', 'Youㅤ', 'ㅤYou', 'Yᅟou', 'Youﾠ', 'Yᅠou', 'ϒou', 'Үou', 'Ꭹou', 'ʏᴏᴜ', 'You⠀']) {
+    assert.equal(D.readsAsYou(n), true, JSON.stringify(n));
+  }
+  for (const n of ['Υoung', 'Youssef', 'bob']) assert.equal(D.readsAsYou(n), false, n);
+  const names = { p1: 'Υou', p2: 'Youㅤ', p3: 'ꓬou', p4: 'Alice', p5: 'bob', p6: 'You', p7: 'Bob' };
+  const handles = { p1: 'mallory', p2: 'eve', p3: 'trudy', p4: 'alice_w', p5: 'bob', p6: 'You', p7: 'bob' };
+  const line = (by, handleOf = (id) => handles[id]) => D.sysLineText({ by, secs: 0, prev: HOUR }, 'me', (id) => names[id], handleOf);
+  const own = line('me');
+  assert.equal(own, 'You turned off disappearing messages');
+  for (const by of ['p1', 'p2', 'p3', 'p4', 'p6']) {
+    const theirs = line(by);
+    assert.notEqual(theirs, own);
+    assert.equal(theirs, `${names[by]} (@${handles[by]}) turned off disappearing messages`, by);
+  }
+  assert.equal(line('p5'), 'bob turned off disappearing messages', 'a name that is just the username needs no @username');
+  assert.equal(line('p7'), 'Bob turned off disappearing messages', 'nor one that differs from it only in case');
+  assert.equal(line('p1', () => null), 'Someone turned off disappearing messages', 'no @username known: not a name that reads as "You"');
+  assert.equal(line('p2', () => null), 'Someone turned off disappearing messages');
+});
+
+// ------------------------------------------------------------------ copies of a message's words kept on the device
+// The app's inbox (app.js addInbox / purgeInbox, run here from its own source) and reminders (features.js), with a
+// localStorage and a page small enough for Node.
+function fakePage() {
+  const ls = new Map();
+  const saved = { localStorage: globalThis.localStorage, document: globalThis.document, window: globalThis.window, Node: globalThis.Node };
+  globalThis.localStorage = {
+    getItem: (k) => (ls.has(k) ? ls.get(k) : null), setItem: (k, v) => ls.set(k, String(v)), removeItem: (k) => ls.delete(k),
+    key: (i) => [...ls.keys()][i] ?? null, get length() { return ls.size; },
+  };
+  class N {
+    constructor(t) { this.tag = t; this.children = []; this.attrs = {}; this.style = { setProperty() {} }; this.dataset = {}; this.classList = { add() {}, remove() {}, toggle() {}, contains: () => false }; this.removed = false; }
+    append(...k) { this.children.push(...k); }
+    appendChild(k) { this.children.push(k); return k; }
+    setAttribute(k, v) { this.attrs[k] = v; }
+    hasAttribute(k) { return k in this.attrs; }
+    addEventListener() {}
+    removeEventListener() {}
+    remove() { this.removed = true; }
+    get firstChild() { return this.children[0] || null; }
+    set innerHTML(v) { this.html = v; }
+  }
+  globalThis.Node = N;
+  const body = new N('body');
+  globalThis.document = { createElement: (t) => new N(t), createTextNode: (s) => ({ s }), body, getElementById: () => new N('div'), querySelector: () => null, addEventListener() {} };
+  globalThis.window = { addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }) };
+  const restore = () => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete globalThis[k]; else globalThis[k] = v; } };
+  return { ls, body, restore };
+}
+const appSrc = () => fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+const fnSrc = (src, name) => { const i = src.search(new RegExp(`\\n(async )?function ${name}\\(`)); assert.ok(i > 0, name); return src.slice(i, src.indexOf('\n}\n', i) + 2); };
+// addInbox and purgeInbox as app.js has them, over the same storage key (hearth.inbox.<account>).
+function inboxOf(S, now) {
+  const src = appSrc();
+  const mine = (k) => `hearth.${k}.${S.me.id}`;
+  const P = {
+    get inbox() { try { return JSON.parse(localStorage.getItem(mine('inbox')) || '[]'); } catch { return []; } },
+    set inbox(v) { localStorage.setItem(mine('inbox'), JSON.stringify(v.slice(0, 200))); },
+  };
+  return new Function('P', 'S', 'nowServer', 'updateTitle', 'armClientExpiry', 'loggingOut', `${fnSrc(src, 'addInbox')}\n${fnSrc(src, 'purgeInbox')}\nreturn { addInbox, purgeInbox };`)(P, S, now, () => {}, () => {}, null);
+}
+// The text inside a fake element and its children.
+const textIn = (n) => (n == null ? '' : typeof n === 'string' ? n : n.s != null ? String(n.s) : (n.children || []).map(textIn).join(''));
+
+test('app: a reminder on a disappearing message copies its words with the message’s deadline, and they go with it (app closed at the deadline)', async () => {
+  const page = fakePage();
+  const realNow = Date.now; const realInterval = globalThis.setInterval;
+  let clock = realNow.call(Date);
+  Date.now = () => clock;
+  globalThis.setInterval = () => 0;
+  try {
+    const F = await import(pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'features.js')).href);
+    const S = { me: { id: 'alice' } };
+    const app = inboxOf(S, () => clock);
+    const notes = [];
+    F.initFeatures({ S, nowServer: () => clock, addInbox: app.addInbox, notify: (n) => notes.push(n), playSound() {}, displayName: () => 'Bob', getUser: () => ({ id: 'bob' }), jump() {} });
+    // Bob's message in a DM with a 1-day timer; Alice asks to be reminded in an hour.
+    const words = 'the safe combination is 31-07-44';
+    const m = { id: 'm1', authorId: 'bob', dmId: 'd1', createdAt: clock, expiresAt: clock + DAY * 1000, dec: { t: words, x: DAY } };
+    F.remindItems(m, 'd:d1', words).filter(Boolean).find((x) => /1 hour/.test(x.label)).action();
+    assert.equal(JSON.parse(page.ls.get('hearth.reminders.alice'))[0].exp, m.expiresAt);
+    // It fires an hour later, with the app open.
+    clock += HOUR * 1000 + 1000;
+    F.startReminders();
+    const entry = JSON.parse(page.ls.get('hearth.inbox.alice'))[0];
+    assert.equal(entry.type, 'reminder');
+    assert.equal(entry.exp, m.expiresAt, 'the inbox copy carries the message’s deadline');
+    assert.deepEqual(notes[0], { title: 'Reminder', body: `Bob: ${words}`, tag: 'reminder:m1', msgId: 'm1' }, 'its notification is tied to the message, so it closes when the message goes');
+    const bar = page.body.children.find((x) => textIn(x).includes('31-07-44'));
+    assert.ok(bar && !bar.removed, 'the reminder’s bar is on screen');
+    // Alice closes the browser; the deadline passes with no delete event for her. Three days later the app opens:
+    // its start-up purge drops the copy (and the start-up sweep in usability.js would, for any account).
+    clock = m.expiresAt + 3 * DAY * 1000;
+    app.purgeInbox();
+    F.purgeReminders();
+    assert.ok(!(page.ls.get('hearth.inbox.alice') || '').includes('31-07-44'), 'the words are gone from the inbox');
+    assert.ok(bar.removed, 'and from the screen');
+    // While the app is open, the message's own delete takes the copy with it.
+    app.addInbox({ type: 'reminder', msgId: 'm2', text: 'other words', exp: clock + HOUR * 1000 });
+    app.purgeInbox(new Set(['m2']));
+    assert.ok(!(page.ls.get('hearth.inbox.alice') || '').includes('other words'));
+    // A reminder on a message with no timer has no deadline, and stays.
+    const plainMsg = { id: 'm3', authorId: 'bob', dmId: 'd1', createdAt: clock, dec: { t: 'no timer here' } };
+    F.remindItems(plainMsg, 'd:d1', 'no timer here').filter(Boolean).find((x) => /1 hour/.test(x.label)).action();
+    clock += HOUR * 1000 + 1000;
+    F.startReminders();
+    const plain = JSON.parse(page.ls.get('hearth.inbox.alice')).find((x) => x.msgId === 'm3');
+    assert.equal(plain.exp, undefined);
+    clock += 30 * DAY * 1000;
+    app.purgeInbox();
+    assert.ok(page.ls.get('hearth.inbox.alice').includes('no timer here'));
+  } finally { Date.now = realNow; globalThis.setInterval = realInterval; page.restore(); }
+});
+
+test('app: signing out or deleting the account clears every inbox and reminder copy from this browser; start-up drops any past its deadline', async () => {
+  const page = fakePage();
+  try {
+    const U = await import(pathToFileURL(path.join(__dirname, '..', 'public', 'js', 'usability.js')).href);
+    const now = Date.now();
+    const S = { me: { id: 'alice' } };
+    const app = inboxOf(S, () => now);
+    app.addInbox({ type: 'mention', msgId: 'm9', title: 'Bob mentioned you', text: 'the door code is 7741', exp: now + HOUR * 1000 });
+    page.ls.set('hearth.reminders.alice', JSON.stringify([{ at: now + 60000, key: 'd:x', msgId: 'm8', text: 'bring the 7741 key', exp: now + HOUR * 1000 }]));
+    page.ls.set('hearth.inbox.olduser', JSON.stringify([{ type: 'reply', msgId: 'm7', text: 'left by an earlier sign-out: 7741' }]));
+    page.ls.set('hearth.favs.alice', '[]');
+    // Log out and Settings → Delete account both end in signOutHere, which clears them (after the keys).
+    const src = appSrc();
+    assert.match(fnSrc(src, 'signOutHere'), /clearAllDrafts\(\)[\s\S]*clearLocalCopies\(\);[\s\S]*location\.href = '\/'/);
+    U.clearLocalCopies();
+    assert.deepEqual([...page.ls.keys()].filter((k) => /^hearth\.(inbox|reminders)\./.test(k)), [], 'no copies left, any account');
+    assert.equal(page.ls.get('hearth.favs.alice'), '[]', 'other settings stay');
+    // While signing out nothing new is written to the inbox.
+    assert.match(fnSrc(src, 'addInbox'), /if \(!S\.me \|\| loggingOut\) return;/);
+    // Start-up (before anyone signs in): whatever is past its deadline goes, whoever it belongs to.
+    assert.match(fnSrc(src, 'init'), /^\nasync function init\(\) \{\n(\s*\/\/.*\n)*\s*expireLocalCopies\(Date\.now\(\)\);/);
+    page.ls.set('hearth.inbox.alice', JSON.stringify([{ type: 'mention', msgId: 'a', text: 'gone already: 9921', exp: now - 1000 }, { type: 'mention', msgId: 'b', text: 'still here', exp: now + 60000 }, { type: 'reply', msgId: 'c', text: 'no timer' }]));
+    page.ls.set('hearth.reminders.bob', JSON.stringify([{ at: now + 60000, msgId: 'd', text: 'past: 5512', exp: now - 5 }]));
+    page.ls.set('hearth.inbox.carol', 'not json');
+    assert.equal(U.expireLocalCopies(now), 2);
+    const left = page.ls.get('hearth.inbox.alice');
+    assert.ok(!left.includes('9921') && left.includes('still here') && left.includes('no timer'));
+    assert.equal(page.ls.has('hearth.reminders.bob'), false, 'a list left empty goes');
+    assert.equal(page.ls.has('hearth.inbox.carol'), false, 'and an unreadable one');
+    // The ids of scheduled messages this device made go with the rest of the account's (SCHED.reset, in signOutHere).
+    assert.match(fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'scheduled.js'), 'utf8'), /reset\(\) \{\n\s*try \{ const k = hereKey\(\); if \(k\) localStorage\.removeItem\(k\);/);
+  } finally { page.restore(); }
+});

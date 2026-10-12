@@ -694,6 +694,9 @@ html.has-bg #sidebar, html.has-bg #main, html.has-bg #members { backdrop-filter:
 .sys-line { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; margin: 10px 20px; color: var(--muted); font-size: 12.5px; text-align: center; }
 .sys-line .ic { width: 14px; height: 14px; flex: none; }
 .sys-line time { font-size: 11.5px; }
+/* Someone else's name stands apart from the built-in "You" (your own change), so a name can't pass for it. */
+.sys-line .sys-who { color: var(--text-2); font-weight: 600; unicode-bidi: isolate; }
+.sys-line .sys-handle { color: var(--text-2); }
 .sys-line time::before { content: '\00b7'; margin-right: 6px; }
 .new-div span { position: absolute; right: 0; top: -9px; padding: 1px 7px; border-radius: 5px; background: var(--danger-fill); color: #fff; font-size: 11px; font-weight: 700; }
 .jump-latest {

@@ -757,7 +757,8 @@ The server never receives the words, phrases or `has:`/`is:` filters. It sees th
 ## Never lose your place
 
 - **Unread badges and a "New messages" line** that follow you across devices, **Jump to first unread**, Mark as
-  read/unread, and **drafts** that survive reloads (kept only on your device).
+  read/unread, and **drafts** that survive reloads (kept only on your device). Signing out removes drafts, the inbox
+  and reminders from the browser.
 - **Threads you won't miss:** a message that starts a thread shows how many replies are new to you ("3 replies · 2
   new", red with @ when one pings you), and a "New replies" line marks where you stopped. The **Threads** button in
   a channel's header lists its threads, the most recent reply first, with what's new in each; it carries a count when
@@ -867,8 +868,9 @@ they're sent: **off, 1 hour, 1 day, 1 week or 4 weeks**.
 - **Who can set it:** either person in a DM (not after one of you blocked the other), anyone in a group chat, and in
   a server people with **Manage Channels** in that channel. It's in the conversation's ⋯ menu, and for server
   channels also under Edit channel → Disappearing messages. Every change shows in the conversation ("Alice turned on
-  disappearing messages: 1 week"), and while it's on there's a timer in the header, a note above the message box and
-  a small timer on each disappearing message (hover it to see when it goes).
+  disappearing messages: 1 week"; "You" only for your own, and anyone else's @username follows a name that isn't
+  simply their username, so no name can pass for "You"), and while it's on there's a timer in the header, a note
+  above the message box and a small timer on each disappearing message (hover it to see when it goes).
 - **Never retroactive:** each message keeps the timer it was sent with. Changing the timer or turning it off doesn't
   change messages already sent, and editing a message doesn't move its time. A thread reply never outlives the
   message that started the thread.
