@@ -22,6 +22,7 @@ export const CHANGES = [
     'If someone resets their password without their recovery key, members see a Not verified shield on them, and nobody\u2019s app shares a server\u2019s or group\u2019s keys with them until someone there who knew them before compares safety numbers and presses \u201cNumbers match \u2014 verify and share keys\u201d. Until then they can\u2019t make invites or add people to group chats, so someone who only got into their email can\u2019t read along.',
     'Profile songs and GIFs lose hidden tags and comments (names, cover art, editing software) when uploaded. Webhook posts show their own picture only when it comes from Discord, GitHub, Gravatar or a site your server owner allows.',
     'For server owners: update zips can now be signed with your own key, and servers that pinned it refuse anything else (docs/SIGNING.md).',
+    'Security fixes from a review of this release: roles members pick themselves can’t sit above moderators who mute, move or clean up messages; categories of channels you can’t see stay out of reach; and reminders and inbox copies of disappearing messages now disappear too.',
   ] },
   { version: '1.28.2', items: [
     'Privacy: call relays (including other regions\u2019 relays) no longer get your account id, just a stand-in name that stays the same for you. They still see your IP address, as before.',
