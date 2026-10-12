@@ -1302,7 +1302,10 @@ with **Show**) or **Blur** (the words, link previews, pictures, polls and files 
 `inert` until shown, so nothing in it can be clicked, focused or read out). Hiding wins when both lists match. Your
 own messages are never filtered. **Show** lasts until the page reloads. A hidden row names its author unless the row
 above already does, and the next message never groups under a hidden one, so nothing reads as someone else's;
-after **Show** the next one is drawn again (it may group now). Hidden rows are out of the Tab order like any message
+after **Show** the next one is drawn again (it may group now). A hidden row keeps the message's warnings: a key or
+signature that doesn't check out, and the ⚠ flag (with its details) when the server may have moved, repeated or
+rolled it back (crypto-7, `binding.js`); only the words are hidden, so a server can't keep its tampering out of sight
+by putting a word from the message on its suggested list. Hidden rows are out of the Tab order like any message
 that isn't the current one. Everywhere else a message appears, a match says "Hidden by … word filter" instead of
 quoting it: reply quotes, the reply bar, reminders, search results, conversation previews, the notifications the app
 shows, the inbox, pins, saved messages and the Threads panel; **Copy text** isn't offered until Show. When a list
@@ -1357,7 +1360,9 @@ Every member's copy of a server carries `wordFilter` (`{ words, action, updatedA
   replying to it from its menu quotes the filter's note in the reply bar, search says it's hidden instead of quoting
   it, and Show reveals it (and the next message groups under it again); Bob sets a blurring list for the server while
   Alice has an edit open, the audit log has it, his next match is blurred (inert) on her screen at once, and her edit
-  is as she typed it; she reads the server's list and turns it off for herself, and the blur goes.
+  is as she typed it; she reads the server's list and turns it off for herself, and the blur goes. Added in review:
+  Bob's own list hides the reply the message binding flow tampered with, and its row still carries the ⚠ flag, whose
+  details open.
 
 **Known limitations**
 
@@ -1409,8 +1414,11 @@ newcomers wait a moment for theirs, and many communities want newcomers to read 
    newcomer's own `keys/rotate` counts as a voluntary one (10 minutes, 12 an hour), so nobody can join just to put in
    a key the others can't open. A newcomer alone in the server makes it themselves. A member held back until someone
    verifies them (a reset without the recovery key, `crypto-2`) gets no key either way: the key a join asks for is
-   wrapped for everyone else, `keys/share` skips them, they don't count as an older member who could make it, and
-   once verified they're handed keys from their own `key_from` on, like any newcomer.
+   wrapped for everyone else, `keys/share` skips them, and they don't count as an older member who could make it.
+   Once verified, they're handed the current key like any member missing it (`keys/share` only ever hands on the
+   current key). Keys made while they were held, the one their join asked for included unless it's still the
+   current one, stay out of their reach, as for any member held back: messages written under those after they
+   joined are served to them but stay locked.
 4. Nothing from before is served to them. "Before" means written before `joined_at`, or locked with an epoch below
    `key_from` (the few messages sent while their key was on its way, which they could never open):
    - channel and voice-chat pages (`GET /channels/:id/messages`, every paging mode), with `hidden: true` on the page

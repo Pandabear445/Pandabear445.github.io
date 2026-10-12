@@ -521,7 +521,9 @@ test('crypto-2: someone held back until verified gets no key either way, and isn
   assert.equal(copies(N, e), 1);
   assert.equal(copies(B, e), 0, 'no copy of the new key for the member held back');
   // A newcomer held back: the key their join asked for isn't theirs, nothing is shared to them, they aren't listed as
-  // missing it or waiting for a newer one. Once verified, they're handed keys from their own start like anyone.
+  // missing it or waiting for a newer one. Once verified, they're handed the current key like any member missing it
+  // (here still the one their join asked for). A key made while they were held and replaced since would stay out of
+  // reach, as for anyone held back: keys/share only ever hands on the current key.
   srv.sql('UPDATE users SET keys_reset_at = ? WHERE id = ?', Date.now(), V.id);
   ageKeys(sid);
   const joined = await joinWith(V, code);

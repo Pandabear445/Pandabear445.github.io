@@ -2845,7 +2845,8 @@ async function resetVerify(t) {
 // on his, it's his own): his next message still shows his name, replying to the hidden one quotes the filter's note,
 // and search finds it without quoting it. Bob, the owner, suggests a list for the server (Server settings → Word
 // filter): her app blurs a match live, the edit she has open is left alone, and the audit log has the change. She
-// looks at that list and turns it off for herself, and the blur goes.
+// looks at that list and turns it off for herself, and the blur goes. A message the server tampered with (flow 27)
+// keeps its warning flag when a list hides it.
 async function wordFilter(t) {
   const { alice, bob } = t.people;
   await alice.railButton(SERVER);
@@ -2933,6 +2934,29 @@ async function wordFilter(t) {
   await alice.closeSettings();
   await alice.page.waitForFunction(() => !document.querySelector('#messages .wf-blur'));
   await alice.message('The rambutan season is here').waitFor();
+
+  // Only the words are hidden, never a warning: Bob's own list hides the reply the server moved in flow 27, and its
+  // row still carries the ⚠ flag, whose details open. (Else a server could keep its tampering out of sight by adding
+  // a word from the message to its suggested list.) He clears his list again afterwards.
+  const ownList = async (text, said) => {
+    await bob.openSettings('Privacy & safety');
+    await bob.$('#word-filter textarea.wf-list').fill(text);
+    await bob.$('#word-filter .btn.primary', { hasText: 'Save word filter' }).click();
+    await bob.toast(said);
+    await bob.closeSettings();
+  };
+  await ownList('pecan', 'Word filter saved.');
+  const moved = bob.$('#messages .msg.filtered', { hasText: 'Hidden by your word filter' });
+  await moved.waitFor();
+  check(!(await bob.message('Binding reply: pecan').count()), 'Bob’s list should hide the reply’s words.');
+  check(await moved.locator('.msg-flag.warn').count() === 1, 'A hidden message the server tampered with should still be flagged.');
+  await moved.locator('.msg-flag.warn').click();
+  const why = await bob.dialog('This message may have been tampered with');
+  await why.locator('li', { hasText: 'reply to a different message than the one shown' }).waitFor();
+  await why.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  await ownList('', 'Word filter cleared.');
+  await bob.message('Binding reply: pecan').locator('.msg-flag.warn').waitFor();
 }
 
 // ------------------------------------------------------------------ 30. new members can't read messages from before they joined
@@ -3108,7 +3132,7 @@ export const FLOWS = [
   ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
   ['message binding: nothing earlier flagged; a reply moved, a message re-dated, replayed and rolled back in the database are each flagged after a reload, with details; deleting a copy clears the other', messageBinding],
   ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
-  ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off', wordFilter],
+  ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off; a hidden message keeps its tampering flag', wordFilter],
   ['join history: new members can’t read back (setting, audit log); someone joining again sees one line instead of locked rows, in a channel and a voice chat; later messages both ways', joinHistory],
   ['alert channels: add a signed webhook, its secret shown once, Test reaches it, masked address; off and remove need the password; the page stays put', alertChannels],
 ];

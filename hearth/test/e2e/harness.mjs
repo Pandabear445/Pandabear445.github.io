@@ -305,7 +305,7 @@ export class Person {
   }
   // Everything this person's app has open, for a failure report.
   async capture(dir) {
-    const safe = this.name.replace(/\W+/g, '_');
+    const safe = (this.tag || this.name).replace(/\W+/g, '_');
     for (const [i, p] of this.context.pages().entries()) {
       const tag = i ? `${safe}-${i}` : safe;
       await p.screenshot({ path: path.join(dir, `${tag}.png`) }).catch(() => {});

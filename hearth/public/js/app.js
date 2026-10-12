@@ -3710,8 +3710,12 @@ function filteredEl(el, m, prev, ctx, wf, o) {
   el.classList.add('filtered');
   // Who wrote it, unless the row above already says (the words are what's hidden, not the person).
   const who = o.isGrouped ? null : h('strong', { class: 'filtered-who' }, nameInMsg(m, o.author));
+  // Its warnings stay on the row: a key or signature that doesn't check out, and the server having moved, repeated or
+  // rolled it back (bindingFlag, a button that still opens its details). The words are what's hidden, never those:
+  // else a server could keep its tampering out of sight by putting a word from the message on its suggested list.
+  const flags = shadow.querySelectorAll(':scope > .msg-body > .msg-flag.bad, :scope > .msg-body > .msg-flag.warn');
   el.append(h('div', { class: 'msg-gutter' }), h('div', { class: 'msg-body' }, h('div', { class: 'filtered-note' }, icon('eyeOff'), who, who ? ' · ' : null, `${filterLabel(wf)}. `,
-    h('button', { class: 'link-btn', type: 'button', onclick: () => revealFiltered(m) }, 'Show'))));
+    h('button', { class: 'link-btn', type: 'button', onclick: () => revealFiltered(m) }, 'Show')), ...flags));
   if (loads.length) whenVisible(el, () => loads.forEach((f) => f()));
   // One message at a time is in the Tab order (roveMessage): this row's Show button too.
   roveMessage(el, false);

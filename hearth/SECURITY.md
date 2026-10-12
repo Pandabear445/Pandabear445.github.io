@@ -211,7 +211,10 @@ Found a problem? Please tell the server owner privately (not in a public channel
   - add a hidden listener to a call: apps accept any correctly signed call offer and draw the call only from what
     the server says is in it;
   - replay a message, change what it replies to or which thread it's in, change its time, or serve a version from
-    before an edit. It can't change a message's content or author;
+    before an edit. Apps from 1.29.0 bind each of these into the encrypted message and flag one that doesn't match
+    (`public/js/binding.js`), so it's detected, not prevented, and only for messages from 1.29.0 apps (not older
+    apps', bots' or webhooks'); a rollback is caught only by a device that saw the newer edit, and a replay only while
+    both copies are loaded. It can't change a message's content or author;
   - read which GIFs people pick (the app reports picks to build the server's GIF library) and, with the GIF proxy
     on, which ones each person loads.
 - **Metadata is visible to the server**: who is in which server, who messages whom and when, reactions, server and

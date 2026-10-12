@@ -979,6 +979,8 @@ them: **your app does, on your device**, and never tells the server what it hid.
 - **Hide or blur:** a hidden message leaves a row "*name* · Hidden by your word filter · Show"; a blurred one shows
   like a spoiler, once you click it. Previews, notifications, search results, replies quoting it, the reply bar,
   reminders, pins and saved messages say it's hidden instead of quoting it. Your own messages are never filtered.
+  Only the words are hidden: a warning about the message (a sender that couldn't be verified, or a server that may
+  have moved, repeated or rolled it back) stays on its row.
 - **A server's suggested list:** people with **Manage Server** can suggest one in Server settings → **Word filter**,
   hiding or blurring. It isn't secret: every member can read it (Privacy & safety → Word filter shows each server's
   list behind a click), and every member's app applies it in that server's channels and threads, unless they turn

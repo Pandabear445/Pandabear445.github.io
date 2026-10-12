@@ -765,3 +765,23 @@ test('static: both openers hand the binding over, every send and edit carries it
   assert.match(read('server', 'scheduled.js'), /const LATE_LIMIT_MS = 24 \* 3600 \* 1000;/);
   assert.match(read('public', 'js', 'binding.js'), /export const SCHEDULED_LATE = 24 \* 3600 \* 1000;/);
 });
+
+// A message the word filter hides is one row with Show (app.js filteredEl), drawn from a full copy kept out of sight.
+// Its warnings must reach that row: else a server could put a word from a message it tampered with on its suggested
+// list (plain text it serves, applied by default) and every member would see only "Hidden by this server's word
+// filter" until they pressed Show. The browser flow ("word filter") checks the same on screen.
+test('static: a message the word filter hides keeps its tampering flag and its key and signature warnings', () => {
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
+  const fn = (name) => app.slice(app.indexOf(`function ${name}(`), app.indexOf('\n}\n', app.indexOf(`function ${name}(`)));
+  const fill = fn('fillMessage');
+  // In the copy, every warning is a .msg-flag.bad or .msg-flag.warn straight on the message's body, outside any blur.
+  assert.match(fill, /body\.append\(bindingFlag\(m, bind\)\)/);
+  assert.match(fn('bindingFlag'), /class: 'msg-flag warn'/);
+  for (const what of ['Older key', 'New key', 'Sender could not be verified']) {
+    assert.match(fill, new RegExp(`body\\.append\\(h\\('div', \\{ class: 'msg-flag bad'[^\\n]*${what}`), what);
+  }
+  // The folded row takes them over from the copy, as they are (the flag's button keeps its details dialog).
+  const folded = fn('filteredEl');
+  assert.match(folded, /const flags = shadow\.querySelectorAll\(':scope > \.msg-body > \.msg-flag\.bad, :scope > \.msg-body > \.msg-flag\.warn'\);/);
+  assert.match(folded, /h\('div', \{ class: 'msg-body' \}, h\('div', \{ class: 'filtered-note' \}[^\n]*\n[^\n]*'Show'\)\), \.\.\.flags\)\)/);
+});
