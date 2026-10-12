@@ -896,7 +896,9 @@ test('review-3 (files-5/xss-3): the app only loads, shows or downloads attachmen
   assert.match(el, /voiceEl\(f, \(\) => \(\(f\.k \|\| m\.dmId\) \? decryptedUrl\(m, f\) : direct\(\)\)\)/);
   assert.match(el, /const full = \(\) => \(enc \? decryptedUrl\(m, f\) : direct\(\)\);/);
   assert.equal((el.match(/\.src = f\.url/g) || []).length, 1);
-  assert.match(el, /if \(enc \|\| f\.th \|\| !isUploadUrl\(f\.url\)\) whenVisible\(holder, load\); else el\.src = f\.url;/);
+  // (loadWhenVisible: whenVisible, or, for a message the word filter hides, the same load run when its row is seen.)
+  assert.match(el, /if \(enc \|\| f\.th \|\| !isUploadUrl\(f\.url\)\) loadWhenVisible\(holder, load\); else el\.src = f\.url;/);
+  assert.match(app, /^const loadWhenVisible = \(el, fn\) => \(lazyLoads \? lazyLoads\.push\(fn\) : whenVisible\(el, fn\)\);$/m);
 });
 
 // ------------------------------------------------------------------ files-10 / ssrf-3: proxies
