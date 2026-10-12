@@ -344,7 +344,10 @@ test('app: your list is sealed with your vault key, padded, and opens again on a
   await wf.save({ words: ['kumquat*', 'durian'], action: 'blur' });
   const sealed = stored.data;
   assert.match(sealed, /^x1:/);
-  assert.ok(!/kumquat|durian|blur/i.test(sealed) && !/kumquat|durian/i.test(Buffer.from(sealed.split(':')[2], 'base64').toString('latin1')), 'nothing readable in what the server stores');
+  // Look for the words where a leak would show them: verbatim in the short fields, and in the ciphertext's bytes.
+  // (Searching the ciphertext's base64 text itself matched 'blur' by chance about once in a hundred runs.)
+  const parts = sealed.split(':');
+  assert.ok(parts.every((part, i) => (i === 2 ? !/kumquat|durian|blur/.test(Buffer.from(part, 'base64').toString('latin1')) : !/kumquat|durian|blur/i.test(part))), 'nothing readable in what the server stores');
   // Bound to this account and this kind of item: opened as anything else, it fails.
   const open = await E.openVault(await vk, 'wordfilter', 'me1', sealed);
   assert.deepEqual([open.words, open.action, open.off], [['kumquat*', 'durian'], 'blur', []]);
