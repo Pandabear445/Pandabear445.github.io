@@ -191,9 +191,13 @@ a channel that gives @everyone Manage messages, Move members, Manage channel, Ma
 - The template is at most 2 MB (every JSON request is), and the app refuses anything over 1.5 MB before sending.
   The server reads at most 300 roles, 600 channels, 300 overrides per channel and 10,000 overrides in all, and
   nothing but the fields it knows.
-- Previews and imports also have a ceiling for the whole instance (300 per 10 minutes): working out the plan of a
-  very large template takes the server a moment. The preview the app gets back leaves out each channel's
-  overrides (it counts them), so ticking boxes on a big template stays quick.
+- Previews and imports also have a ceiling for the whole instance: working out the plan of a very large template
+  takes the server a moment (tens of milliseconds for the largest it reads), so at most 1,000 plans per 10 minutes
+  are worked out, however many accounts ask. Every request with a template counts (one with none is refused before
+  anything is read). It's shared: once 500 were made in a window, only accounts that have had fewer than 20 this
+  window get more, so a few accounts can't use it up and lock everyone else out (that takes dozens of accounts on
+  many networks every 10 minutes). The preview the app gets back leaves out each channel's overrides (it counts
+  them), so ticking boxes on a big template stays quick.
 
 ## For admins
 

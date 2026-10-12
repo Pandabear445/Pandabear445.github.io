@@ -298,7 +298,9 @@ in group chats. Up to 10 per channel and 50 per server.
   until the timeout ends (owners and Administrators have every permission, so this changes nothing for them).
 - A webhook belongs to whoever made its **current address** (`created_by`; re-keying moves it to the person who
   re-keyed). Anyone else can rename, re-key, delete it or change its pings only if their highest role is above that
-  person's, or that person has left the server. Hearth has no separate Manage Webhooks permission.
+  person's, or that person has left the server. Roles members pick themselves don't count here, on either side, so
+  picking one neither protects your webhook nor gets you past someone else's. Hearth has no separate Manage
+  Webhooks permission.
 
 **The address is the password.** Its secret (256 random bits) is shown once; only `SHA-256(id.secret)` is kept.
 "New address" replaces it at once (the old one stops working). Making, changing, re-keying and deleting are in the
@@ -343,7 +345,8 @@ can see the channel) get a push for each post, as for anyone's message. Role nam
 mention lose `<`, `>`, `@` and `&`, so a role named like a mention can't bring one back.
 
 **Limits:** 5 posts per 2 seconds and 1000 per hour per webhook, 30 per minute per channel (from all its webhooks),
-300 requests per minute per address, and 30 wrong addresses per minute per address. Managing them: 60 requests per
+300 requests per minute per network, and 30 wrong addresses per minute per network (an IPv4 address, or an IPv6
+/64). Managing them: 60 requests per
 minute per person, 20 new webhooks per hour and 60 per day (each one is an account), 20 new addresses per hour.
 
 **Pauses.** A paused webhook answers `403 { code: 50001 }` and the list says why. It pauses while the person who

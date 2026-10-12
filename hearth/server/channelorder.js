@@ -24,6 +24,29 @@
 //     (someone else moved something in the meantime), the list is refused as stale instead of quietly undoing that.
 const catOf = (c) => c.category || (c.type === 'voice' ? 'Voice' : 'Text');
 const STALE = 'The channel list changed in the meantime. Try again.';
+const UNKNOWN = 'Pick one of the categories in the list.';
+// Where a category name is typed (Edit channel's and Create channel's category field, Rename category's new name), a
+// made-up name is accepted (it makes a new category), so naming a category of channels the person can't see can't
+// get the same answer as a made-up one. It gets this instead, which says no more than the refusal itself does.
+const CLOSED = 'You can’t add channels to that category. Pick one from the list or type a different name.';
+const CLOSED_RENAME = 'You can’t add channels to that category, so you can’t rename this one to it. Type a different name.';
+
+// Whether `name` is a category of channels the person can't see: it has channels, and they see none of them. Such a
+// category belongs to the people who can see its channels, so this person can't put anything in it, merge into it or
+// rename it. Where the name comes from a list (a drag, Rename category's `from`) it's refused like a name that isn't
+// in it; where it's typed it gets CLOSED. A name with no channels is a new category; one with a channel they see is
+// theirs. What still shows: that a category by a guessed name exists (categories are names shared by the whole
+// server), never its place in the order or its channels.
+// except: a channel not to count (the one being moved, which is wherever it is now).
+function hiddenCategory(channels, seen, name, except = null) {
+  let any = false;
+  for (const c of channels) {
+    if (c.id === except || catOf(c) !== name) continue;
+    if (seen.has(c.id)) return false;
+    any = true;
+  }
+  return any;
+}
 
 // Every category that has a channel, top to bottom, the way the apps show them (orderedCategories in app.js).
 // channels: the server's channels by position (then age).
@@ -85,7 +108,7 @@ function planChannels({ channels, stored, ids, moves, seen, managed, from, fail 
   for (const [id, name] of moves) {
     const c = byId.get(id);
     if (!c) fail(400, STALE);
-    if (!theirs.has(name)) fail(400, 'Pick one of the categories in the list.');
+    if (!theirs.has(name)) fail(400, UNKNOWN);
     if (name === catOf(c)) continue;
     if (!managed.has(c.id)) fail(403, `You can’t move #${c.name}: you don’t have Manage Channels there.`);
     target.set(id, name);
@@ -165,10 +188,12 @@ function planCategories({ channels, stored, requested, seen, managed, from, fail
 // category, so it needs what dragging the category does: Manage Channels in every channel of it the person sees. A
 // category they see no channel of is answered like one that doesn't exist. Naming it like another category merges
 // the two, which moves its channels, so then they also have to see every one of them (a hidden channel keeps its
-// category, as in planChannels). Returns { relabel: the channels to relabel, merge }.
+// category, as in planChannels), and the one merged into has to be one they see: a merge into a category of
+// channels they can't see is refused (see hiddenCategory). Returns { relabel: the channels to relabel, merge }.
 function planRename({ channels, seen, managed, from, to, fail }) {
   const inIt = channels.filter((c) => catOf(c) === from);
-  if (!inIt.some((c) => seen.has(c.id))) fail(400, 'Pick one of the categories in the list.');
+  if (!inIt.some((c) => seen.has(c.id))) fail(400, UNKNOWN);
+  if (hiddenCategory(channels, seen, to)) fail(400, CLOSED_RENAME);
   const merge = to !== from && channels.some((c) => catOf(c) === to);
   const locked = `You can’t rename the category “${from}”: you don’t have Manage Channels in all of its channels.`;
   if (!inIt.every((c) => !seen.has(c.id) || managed.has(c.id))) fail(403, locked);
@@ -176,4 +201,4 @@ function planRename({ channels, seen, managed, from, to, fail }) {
   return { relabel: inIt, merge };
 }
 
-module.exports = { catOf, categoriesInOrder, visibleCategories, parseOrder, movedItems, sameLayout, planChannels, planCategories, planRename, STALE };
+module.exports = { catOf, categoriesInOrder, visibleCategories, parseOrder, movedItems, sameLayout, planChannels, planCategories, planRename, hiddenCategory, STALE, UNKNOWN, CLOSED };

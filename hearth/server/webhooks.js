@@ -410,8 +410,8 @@ function defuse(text, allow, roleName) {
 }
 
 module.exports = function setupWebhooks(ctx) {
-  const { api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
-    getIo, maintenance, ipBanned, bannedMsg, stillSuspended, botPost, notifyChannelMessage, cleanIp } = ctx;
+  const { api, express, db, fail, HttpError, rateLimit, limitNet, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
+    getIo, maintenance, ipBanned, bannedMsg, stillSuspended, botPost, notifyChannelMessage } = ctx;
   const now = () => Date.now();
   const io = () => getIo() || { to: () => ({ emit() {} }) };
   const live = 'SELECT * FROM channel_webhooks WHERE id = ? AND deleted_at IS NULL';
@@ -449,8 +449,11 @@ module.exports = function setupWebhooks(ctx) {
     if (!canPost(s, c, uid)) fail(403, 'You need to be able to send messages in this channel to set up its webhooks.');
   }
   // A webhook belongs to whoever made its current address (they hold it). Anyone else changes it only from above
-  // that person's highest role, as with everything else, unless they've left the server.
-  const holderOk = (s, w, uid) => !w.created_by || w.created_by === uid || !isMember(s.id, w.created_by) || perms.top(s, uid) > perms.top(s, w.created_by);
+  // that person's highest role, as with everything else, unless they've left the server. Roles members pick
+  // themselves don't count on either side (perms.topAssigned): they can sit above Manage Channels moderators, so a
+  // holder could otherwise pick one to put their webhook out of a moderator's reach, or a moderator pick one to get
+  // above a holder they're below.
+  const holderOk = (s, w, uid) => !w.created_by || w.created_by === uid || !isMember(s.id, w.created_by) || perms.topAssigned(s, uid) > perms.topAssigned(s, w.created_by);
   function mayChange(s, w, uid) {
     if (!holderOk(s, w, uid)) fail(403, 'Its address was made by someone at or above your highest role, so only they (or someone above them) can change it.');
   }
@@ -536,10 +539,11 @@ module.exports = function setupWebhooks(ctx) {
     try {
       if (ipBanned(req.ip)) throw new HookError(403, { message: bannedMsg, code: 0 });
       if (maintenance()) throw new HookError(503, { message: 'This Hearth is under maintenance. Try again later.', code: 0 });
-      rateLimit('hookip:' + cleanIp(req.ip), 300, 60000);
+      // Per network (limitNet: an IPv4 address, or an IPv6 /64, so rotating addresses inside one changes nothing).
+      limitNet(req, 'hookip', 300, 60000);
       const w = hookFor(req.params.id, req.params.token);
       if (!w) {
-        rateLimit('hookbad:' + cleanIp(req.ip), 30, 60000);
+        limitNet(req, 'hookbad', 30, 60000);
         throw unknownHook();
       }
       usable(w);

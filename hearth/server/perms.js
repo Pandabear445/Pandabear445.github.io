@@ -153,6 +153,14 @@ function makePerms(db) {
     if (server.owner_id === userId) return Infinity;
     return Math.max(0, ...rolesOf(server.id, userId).map((r) => r.position));
   }
+  // The same, leaving out roles members can pick themselves (roles.self_assign): for role-order checks that
+  // pickable roles aren't kept below (server/selfroles.js keeps them below the powers in its REACH list), so a role
+  // anyone can give themselves never puts anyone above anyone there. Changing a webhook someone else made
+  // (server/webhooks.js) is one; a moderator whose power comes from a member override is another (selfroles.js).
+  function topAssigned(server, userId) {
+    if (server.owner_id === userId) return Infinity;
+    return Math.max(0, ...rolesOf(server.id, userId).filter((r) => !r.self_assign).map((r) => r.position));
+  }
 
   // Is any member possibly blocked from seeing this channel? (Then events go to individuals, not the room.)
   function restricted(server, ch) {
@@ -161,7 +169,7 @@ function makePerms(db) {
     return !!db.prepare('SELECT 1 FROM channel_overrides WHERE channel_id = ? AND (deny & ?) != 0').get(ch.id, P.VIEW_CHANNEL);
   }
 
-  return { base, channel, forServer, top, restricted, rolesOf, timedOut };
+  return { base, channel, forServer, top, topAssigned, restricted, rolesOf, timedOut };
 }
 
 module.exports = { PERMS, ALL, DEFAULT_EVERYONE, CHANNEL_SCOPED, GROUP_MEMBER, TALK, makePerms };

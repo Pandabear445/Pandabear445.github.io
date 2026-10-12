@@ -310,7 +310,10 @@ Before this, a thread reply counted nowhere: not as unread, not as a mention, an
     retention removes them, but nobody reads them through the app. A member report made inside a server records
     the nickname they had there for staff (`targetNickname`).
   - Manage Nicknames reaches by role order, so self-assignable roles have to sit below every role with it, as with
-    Kick, Ban and Manage Roles (`server/selfroles.js` REACH).
+    Kick, Ban, Manage Roles, Manage Messages, Mute Members and Move Members (`server/selfroles.js` REACH; Manage
+    Messages and Move Members count in a channel override too, for a role or for one member, whose highest role
+    then counts). Changing a webhook someone else made also goes by role order, but there roles members pick
+    themselves don't count on either side (`perms.topAssigned`), so those can still sit above Manage Channels.
 - **Reports**:
   - Reporters can see the status of their own reports (`GET /me/reports`, without staff notes).
   - Reporting the same message again while the first report is still open returns the existing report
@@ -689,7 +692,17 @@ the server bar's (`public/js/folders.js` `dragDrop`), shared with the channel li
    person sees (the menu item isn't offered otherwise), and a category they see no channel of gets the same 400 as
    a made-up name. Renaming onto another category's name merges the two, which moves the channels, so that also
    needs seeing every channel in it (a hidden one keeps its category); the merged category takes the other one's
-   place. A plain rename takes hidden channels along, since they stay in the same (renamed) category.
+   place. A plain rename takes hidden channels along, since they stay in the same (renamed) category. Merging into
+   a category the person sees no channel of is refused (400, "You can't add channels to that category…"), and so
+   is Create channel's or Edit channel's category field naming one (`hiddenCategory`, `claimCategory` in
+   `index.js`): nothing goes into, merges into or renames a category of private channels from someone who can't see
+   them, and its place never shows in their sidebar. Create channel with no category uses Text or Voice as ever,
+   unless that's such a category: then the first of the person's categories with a channel of that type (or their
+   first), and the app's dialog starts with one of their categories for the same reason. The refusal does tell
+   them that a category by that name exists (a new name would be accepted): categories are names shared by the
+   whole server, so a Manage Channels holder can still confirm a guessed name, but not its place or its channels.
+   A new name (no channels) starts outside the stored `category_order`, so one left there by a deleted category
+   doesn't bring back that category's place.
 7. The server's audit log gets a `channel_update` (`changes.category { from, to }`) for each channel that changed
    category, and one `channel_reorder { count }` for the channels that changed place inside their category
    (counted as everything outside the longest run that kept its order, so dragging one channel is one move),

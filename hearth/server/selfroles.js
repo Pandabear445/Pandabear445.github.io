@@ -9,10 +9,15 @@
 // Nothing here hands out power:
 //   - a role with moderator powers or Mention @everyone (itself or through a channel override) can't be marked
 //     or picked, and a marked role can't be given them later (the role editor and channel permissions refuse);
-//   - a role that sits at or above a role that can kick, ban, manage roles or manage nicknames (or is an
-//     Administrator) can't be picked: everyone who did would be out of that role's reach (kicks, bans, timeouts,
-//     role changes and other people's nicknames only work on people below you). Other powers (Manage Messages,
-//     Emojis, Channels, Server) don't look at role order, so roles that only have those don't count here;
+//   - a role that sits at or above a moderator role whose powers only reach people below it can't be picked:
+//     everyone who did would be out of that role's reach. Those powers are Kick (kicks and timeouts), Ban, Manage
+//     Roles, Manage Nicknames, Manage Messages (bulk delete, a ban's message cleanup and the report inbox only take
+//     in people below you), Mute Members and Move Members (voice moderation), and Administrator. Manage Messages
+//     and Move Members count given in a single channel too (a channel override, for a role or for one member, whose
+//     highest role then counts), since that's where they're checked. Other powers (Manage Emojis, Channels, Server)
+//     aren't counted: the one place they go by role order, changing a webhook someone else made, leaves roles
+//     members pick themselves out of it instead (perms.topAssigned in server/webhooks.js), so roles that only have
+//     those can sit below pickable ones;
 //   - marking a role takes what giving it to anyone would take (PUT /servers/:id/members/:uid/roles): Manage
 //     Roles, the role below your highest one, and every permission it has, server-wide and in each channel;
 //   - a role sold as a membership can't be marked (it would be free), and a marked role can't be sold;
@@ -44,13 +49,37 @@ module.exports = function setupSelfRoles(ctx) {
 
   // The powers that only reach people below you (perms.top): kick, ban and timeouts (Kick), role changes and
   // channel overrides (Manage Roles, which the overrides route needs server-wide, so a channel override can't
-  // give this reach), and other people's nicknames (Manage Nicknames, server-wide only: a nickname moderator's one
-  // tool against an abusive name, which a picked role would otherwise put out of reach). Administrator has them all.
-  const REACH = PM.ADMINISTRATOR | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MANAGE_ROLES | PM.MANAGE_NICKNAMES;
-  // The lowest role with that reach, or null. @everyone doesn't count: it sits at the bottom and holding it puts
-  // nobody above anyone.
-  const lowestModRole = (s) => db.prepare('SELECT id, name, position FROM roles WHERE server_id = ? AND id != ? AND (permissions & ?) != 0 ORDER BY position LIMIT 1')
-    .get(s.id, s.id, REACH) || null;
+  // give this reach), other people's nicknames (Manage Nicknames, server-wide only: a nickname moderator's one
+  // tool against an abusive name, which a picked role would otherwise put out of reach), other people's messages in
+  // bulk and the reports about them (Manage Messages: bulk delete, a ban's cleanup and the report inbox keep to
+  // people below you), and voice moderation (Mute Members, server-wide only, and Move Members). Administrator has
+  // them all.
+  const REACH = PM.ADMINISTRATOR | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MANAGE_ROLES | PM.MANAGE_NICKNAMES
+    | PM.MANAGE_MESSAGES | PM.MUTE_MEMBERS | PM.MOVE_MEMBERS;
+  // Of those, the ones a channel override can give, checked in that channel: Manage Messages (bulk delete, and the
+  // report inbox for that channel's messages) and Move Members (disconnect and move from that voice channel).
+  const REACH_IN_CHANNEL = PM.MANAGE_MESSAGES | PM.MOVE_MEMBERS;
+  // The lowest role with that reach, server-wide or in some channel of this server, or null. @everyone doesn't
+  // count: it sits at the bottom and holding it puts nobody above anyone. A member given that reach by an override of
+  // their own reaches people below their highest role, so that role counts too ({ member: true }), leaving out roles
+  // members pick themselves (perms.topAssigned: a pick doesn't raise anyone's reach); one whose highest is @everyone
+  // reaches nobody, and the owner reaches everyone, so neither keeps anything below them.
+  function lowestModRole(s) {
+    let low = db.prepare(`SELECT id, name, position FROM roles WHERE server_id = ? AND id != ? AND ((permissions & ?) != 0 OR id IN (
+        SELECT o.target_id FROM channel_overrides o JOIN channels c ON c.id = o.channel_id
+        WHERE c.server_id = ? AND o.target_type = 'role' AND (o.allow & ?) != 0)) ORDER BY position LIMIT 1`)
+      .get(s.id, s.id, REACH, s.id, REACH_IN_CHANNEL) || null;
+    const mods = db.prepare(`SELECT DISTINCT o.target_id AS id FROM channel_overrides o JOIN channels c ON c.id = o.channel_id
+        JOIN members m ON m.server_id = c.server_id AND m.user_id = o.target_id
+        WHERE c.server_id = ? AND o.target_type = 'member' AND (o.allow & ?) != 0 AND o.target_id != ?`).all(s.id, REACH_IN_CHANNEL, s.owner_id || '');
+    const topOf = db.prepare(`SELECT r.id, r.name, r.position FROM member_roles mr JOIN roles r ON r.id = mr.role_id
+        WHERE mr.server_id = ? AND mr.user_id = ? AND r.server_id = ? AND r.id != ? AND r.self_assign = 0 ORDER BY r.position DESC LIMIT 1`);
+    for (const m of mods) {
+      const r = topOf.get(s.id, m.id, s.id, s.id);
+      if (r && r.position > 0 && (!low || r.position < low.position)) low = { ...r, member: true };
+    }
+    return low;
+  }
 
   // Why members can't pick this role right now, as a short clause, or null when they can.
   //   permissions: the role's permissions after a change being checked (default: as stored)
@@ -60,7 +89,13 @@ module.exports = function setupSelfRoles(ctx) {
     const tier = MEMB.tierForRole(r.id);
     if (tier) return `it’s sold as the "${tier.name}" membership`;
     if (MEMB.powerful({ ...r, permissions }, BLOCKED)) return 'it has moderator powers or Mention @everyone (itself or in a channel)';
-    if (low && low.id !== r.id && r.position >= low.position) return `it sits above "${low.name}", a role that can kick, ban, manage roles or manage nicknames`;
+    // (A moderator role is never the one marked: it has the powers, which the line above refuses, unless this edit
+    // takes them away. A member moderator's highest role can be, and picking it would put people level with them.)
+    if (low && low.member && low.id === r.id) return 'it’s the highest role of someone who moderates a channel, who only reaches people below it';
+    if (low && low.id !== r.id && r.position >= low.position) {
+      return low.member ? `it sits above "${low.name}", the highest role of someone who moderates a channel and only reaches people below it`
+        : `it sits above "${low.name}", a moderator role that only reaches people below it`;
+    }
     return null;
   }
 

@@ -7505,10 +7505,19 @@ function categoryField(server, value) {
   const input = h('input', { class: 'input', maxlength: '32', value: value || '', list: 'cat-options', placeholder: 'Text' });
   return { input, el: h('div', null, input, h('datalist', { id: 'cat-options' }, cats.map((c) => h('option', { value: c })))) };
 }
+// The category Create channel starts with when none was picked: Text or Voice, as on the server, when that's in this
+// person's list (or they have none). Otherwise the first of theirs with a channel of that type, or their first: a
+// Text they don't see may be a category of channels they can't see, which the server won't add channels to.
+function defaultCategory(server, type) {
+  const def = type === 'voice' ? 'Voice' : 'Text';
+  const cats = orderedCategories(server);
+  if (!cats.length || cats.includes(def)) return def;
+  return cats.find((k) => server.channels.some((c) => c.type === type && catOf(c) === k)) || cats[0];
+}
 function openCreateChannel(server, type, category) {
   let t = type;
   const name = h('input', { class: 'input', maxlength: '48', placeholder: type === 'text' ? 'new-channel' : 'Hangout' });
-  const cat = categoryField(server, category || (type === 'voice' ? 'Voice' : 'Text'));
+  const cat = categoryField(server, category || defaultCategory(server, type));
   const opt = (val, label, desc) => h('label', { class: 'radio-card' },
     h('input', { type: 'radio', name: 'ctype', value: val, checked: t === val, onchange: () => { t = val; } }),
     icon(val === 'text' ? 'hash' : 'speaker'), h('span', null, h('strong', null, label), h('span', null, desc)));

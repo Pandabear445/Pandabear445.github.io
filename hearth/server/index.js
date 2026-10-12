@@ -3181,6 +3181,33 @@ function channelAccess(s, userId) {
   }
   return { channels, seen, managed };
 }
+// The category a channel is made in or moved to from Create channel or Edit channel (POST /servers/:id/channels,
+// PATCH /channels/:id): one the person has a channel in, or a new name. A category of channels they can't see is
+// refused (channelorder.js hiddenCategory, ORDER.CLOSED): nothing of theirs goes into it, so it never shows up in
+// their sidebar with its place. (The refusal does say a category has that name: categories are names shared by the
+// whole server, and a new name is accepted.) A new name starts outside the stored category order, so a name left
+// there by a category that's gone (maybe one they couldn't see) doesn't bring back that one's place.
+//   name:   the category asked for; none (Create channel without one) is the default, Text or Voice by `type`, as
+//           ever, unless that's a category of channels they can't see: then the first category in their list with a
+//           channel of that type, or else the first in their list (with no list at all, the default is refused)
+//   except: the channel being moved (it doesn't count for the category it's leaving or going to)
+// Returns the category to use.
+function claimCategory(s, userId, name, { except = null, type = 'text' } = {}) {
+  const { channels, seen } = channelAccess(s, userId);
+  let k = name;
+  if (!k) {
+    k = type === 'voice' ? 'Voice' : 'Text';
+    if (ORDER.hiddenCategory(channels, seen, k)) {
+      const mine = ORDER.visibleCategories(channels, ORDER.parseOrder(s.category_order), seen);
+      k = mine.find((x) => channels.some((c) => seen.has(c.id) && c.type === type && ORDER.catOf(c) === x)) || mine[0] || k;
+    }
+  }
+  if (ORDER.hiddenCategory(channels, seen, k, except)) fail(400, ORDER.CLOSED);
+  if (channels.some((c) => c.id !== except && ORDER.catOf(c) === k)) return k;
+  const order = ORDER.parseOrder(s.category_order);
+  if (order.includes(k)) db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify(order.filter((x) => x !== k)), s.id);
+  return k;
+}
 
 // Reorder channels, and move them into other categories (drag and drop, or Move up / Move down in the channel menu).
 //   { ids: every channel you can see, top to bottom; categories?: { channelId: category } for the ones changing category;
@@ -3227,7 +3254,8 @@ api.post('/servers/:id/channel-order', auth, (req, res) => {
 });
 // Rename a category { from, to } (its menu → Rename category). Naming it like another category merges the two.
 // Needs what moving its channels would (server/channelorder.js planRename): Manage Channels in each channel of it you
-// see, and for a merge, seeing every one of them. A category you see no channel of is answered like a made-up name.
+// see, and for a merge, seeing every one of them. A category you see no channel of is answered like a made-up name
+// as `from`, and refused as `to` (nothing is merged into it; ORDER.hiddenCategory).
 api.post('/servers/:id/categories/rename', auth, (req, res) => {
   const s = requireAdmin(req.params.id, req.userId);
   const body = req.body || {};
@@ -3241,10 +3269,10 @@ api.post('/servers/:id/categories/rename', auth, (req, res) => {
   if (from === to) return res.json({ ok: true });
   const set = db.prepare('UPDATE channels SET category = ? WHERE id = ?');
   db.transaction(() => { for (const c of relabel) set.run(to, c.id); })();
-  // The renamed category keeps its place; merged into another one, it takes that one's place (which may be a
-  // category this person can't see: theirs mustn't move it).
+  // The renamed category keeps its place (a new name left in the order by a category that's gone doesn't give it
+  // that one's place); merged into another one, it takes that one's place.
   const order = ORDER.parseOrder(s.category_order).filter((k) => typeof k === 'string');
-  const next = merge ? order.filter((k) => k !== from) : order.map((k) => (k === from ? to : k));
+  const next = merge ? order.filter((k) => k !== from) : order.filter((k) => k !== to).map((k) => (k === from ? to : k));
   db.prepare('UPDATE servers SET category_order = ? WHERE id = ?').run(JSON.stringify([...new Set(next)]), s.id);
   serverAudit(s, req.userId, 'category_rename', null, { from, to });
   emitServer(s.id);
@@ -3262,7 +3290,7 @@ api.post('/servers/:id/channels', auth, (req, res) => {
   const type = (req.body || {}).type === 'voice' ? 'voice' : 'text';
   const name = cleanChannelName((req.body || {}).name, type);
   if (!name) fail(400, 'Give the channel a name.');
-  const category = cleanCategory((req.body || {}).category) || (type === 'voice' ? 'Voice' : 'Text');
+  const category = claimCategory(s, req.userId, cleanCategory((req.body || {}).category), { type });
   const pos = (db.prepare('SELECT MAX(position) AS p FROM channels WHERE server_id = ?').get(s.id).p ?? -1) + 1;
   const id = newId();
   db.prepare('INSERT INTO channels (id, server_id, name, type, position, created_at, category) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, s.id, name, type, pos, now(), category);
@@ -3289,6 +3317,7 @@ api.patch('/channels/:id', auth, (req, res) => {
   const category = req.body.category !== undefined ? (cleanCategory(req.body.category) || c.category) : c.category;
   const slowmode = req.body.slowmode !== undefined ? Math.max(0, Math.min(21600, parseInt(req.body.slowmode, 10) || 0)) : c.slowmode || 0;
   if (!name) fail(400, 'Channel name cannot be empty.');
+  if (category && category !== ORDER.catOf(c)) claimCategory(serverOf(c), req.userId, category, { except: c.id });
   db.prepare('UPDATE channels SET name = ?, topic = ?, category = ?, slowmode = ? WHERE id = ?').run(name, topic, category, slowmode, c.id);
   // The server's audit log says what changed; a topic's new text isn't repeated there.
   const changes = {};
@@ -5930,7 +5959,40 @@ function rollRepeating() {
   })();
   changed.forEach((sid) => emitEvents(sid));
 }
-const emitEvents = (serverId) => io.to(`server:${serverId}`).emit('events:update', { serverId });
+// events:update goes to everyone in the server, and each open app then fetches the server's events again. Changes to
+// events themselves have their own limits (posting 20 an hour, editing 60) and go out at once. An answer (RSVP) is
+// something any member can send, so answers have limits of their own (POST /events/:id/rsvp) and their updates are
+// coalesced per server: one goes out at once, and any more within the wait go out together at its end. The wait is
+// 500 ms, doubling (up to 5 s) while answers keep coming and starting short again once it's quiet, so however many
+// people answer at once, each open app fetches at most every few seconds because of it. A change that goes out at
+// once takes any answers still waiting with it.
+const EVENTS_WAIT_MIN = 500; const EVENTS_WAIT_MAX = 5000;
+const eventsBatches = new Map(); // server id -> { timer, last, wait }
+function emitEvents(serverId, { batch = false } = {}) {
+  const t = Date.now();
+  let b = eventsBatches.get(serverId);
+  const send = () => { if (b) b.last = Date.now(); io.to(`server:${serverId}`).emit('events:update', { serverId }); };
+  if (!batch) {
+    if (b && b.timer) { clearTimeout(b.timer); b.timer = null; }
+    send();
+    return;
+  }
+  if (!b) {
+    // Only servers with recent answers need remembering.
+    if (eventsBatches.size >= 1000) for (const [id, x] of eventsBatches) if (!x.timer && t - x.last > 2 * EVENTS_WAIT_MAX) eventsBatches.delete(id);
+    b = { timer: null, last: 0, wait: EVENTS_WAIT_MIN };
+    eventsBatches.set(serverId, b);
+  }
+  if (b.timer) return; // already going out at the end of the wait
+  const since = t - b.last;
+  if (since >= b.wait) {
+    if (since > b.wait + EVENTS_WAIT_MAX) b.wait = EVENTS_WAIT_MIN;
+    send();
+    return;
+  }
+  b.timer = setTimeout(() => { b.timer = null; b.wait = Math.min(EVENTS_WAIT_MAX, b.wait * 2); send(); }, b.wait - since);
+  b.timer.unref?.();
+}
 api.get('/servers/:id/events', auth, (req, res) => {
   const srv = requireServer(req.params.id, req.userId);
   rollRepeating(); // so a repeating event shows its next time right away, not up to a minute later
@@ -5996,15 +6058,24 @@ api.delete('/events/:id', auth, (req, res) => {
   emitEvents(srv.id);
   res.json({ ok: true });
 });
+// An answer makes every open app in the server fetch the events again (emitEvents), so answering has limits of its
+// own, per account (bursts and per hour) and per network, and an answer that changes nothing tells nobody.
 api.post('/events/:id/rsvp', auth, (req, res) => {
+  rateLimit('rsvp:' + req.userId, 15, 60000);
+  rateLimit('rsvph:' + req.userId, 120, 3600000);
+  limitNet(req, 'rsvp', 60, 60000);
   rollRepeating(); // an answer is for the time that's coming
   const e = db.prepare('SELECT * FROM server_events WHERE id = ?').get(req.params.id);
   if (!e) fail(404, 'That event no longer exists.');
   requireServer(e.server_id, req.userId);
   const st = (req.body || {}).status;
-  if (['going', 'maybe', 'no'].includes(st)) db.prepare('INSERT OR REPLACE INTO event_rsvps (event_id, user_id, status) VALUES (?, ?, ?)').run(e.id, req.userId, st);
-  else db.prepare('DELETE FROM event_rsvps WHERE event_id = ? AND user_id = ?').run(e.id, req.userId);
-  emitEvents(e.server_id);
+  const was = (db.prepare('SELECT status FROM event_rsvps WHERE event_id = ? AND user_id = ?').get(e.id, req.userId) || {}).status || null;
+  const answer = ['going', 'maybe', 'no'].includes(st) ? st : null;
+  if (answer !== was) {
+    if (answer) db.prepare('INSERT OR REPLACE INTO event_rsvps (event_id, user_id, status) VALUES (?, ?, ?)').run(e.id, req.userId, answer);
+    else db.prepare('DELETE FROM event_rsvps WHERE event_id = ? AND user_id = ?').run(e.id, req.userId);
+    emitEvents(e.server_id, { batch: true });
+  }
   res.json(eventOut(e, req.userId));
 });
 // Reminders: 15 minutes before, everyone going (or maybe) gets a nudge — in the app and as a push notification.
@@ -6155,8 +6226,8 @@ BOTS = require('./bots')({ api, express, db, fail, HttpError, wrap, rateLimit, n
 require('./linkpreview')({ api, auth, fail, wrap, rateLimit, countHit, limitNet, features, version: require('../package.json').version,
   publicUrl: () => { let v = {}; try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ } return String(v.publicUrl || ''); } });
 // Incoming webhooks (server/webhooks.js): Discord- and Slack-style addresses per channel, posting as a bot.
-require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
-  getIo: () => io, maintenance, ipBanned, bannedMsg: BANNED_MSG, stillSuspended, botPost: BOTS.botPost, notifyChannelMessage, cleanIp });
+require('./webhooks')({ api, express, db, fail, HttpError, rateLimit, limitNet, newId, auth, auditLog, serverAudit, chanRef, checkWords, perms, PM, getUserRow, publicUser, requireChannel, toChannel,
+  getIo: () => io, maintenance, ipBanned, bannedMsg: BANNED_MSG, stillSuspended, botPost: BOTS.botPost, notifyChannelMessage });
 // Saved messages, read state, notification preferences, pin history, timeouts, data export (server/usability.js).
 USE = require('./usability')({ api, auth, db, fail, wrap, rateLimit, stepUp, auditLog, serverAudit, perms, PM, ALL: ALL_PERMS, newId, now, brandName: () => brand().name,
   emitTo: (uid, ev, data) => io && io.to(`user:${uid}`).emit(ev, data), emitServer: (sid) => io && emitServer(sid),
@@ -6176,7 +6247,7 @@ SELF = require('./selfroles')({ api, auth, db, fail, rateLimit, limitNet, requir
 // Each server's own audit log and its moderators' report inbox (server/serveraudit.js).
 SA = require('./serveraudit')({ api, auth, db, fail, rateLimit, perms, PM, ALL: ALL_PERMS, requireServer, isMember, getIo: () => io, keptSql: serverAuditKeptSql });
 // Start a server from a Discord server template the person pastes (server/imports.js, server/discordmap.js).
-require('./imports')({ api, auth, db, fail, rateLimit, limitNet, newId, now, features, isStaff, ALL: ALL_PERMS, CHANNEL_SCOPED, PM,
+require('./imports')({ api, auth, db, fail, rateLimit, limitNet, countHit, hitsSoFar, newId, now, features, isStaff, ALL: ALL_PERMS, CHANNEL_SCOPED, PM,
   serializeServer, keyState, getIo: () => io, auditLog, requirePerm });
 // Scheduled messages, "Send later" (server/scheduled.js): ciphertext held until its time, then posted as if sent then.
 SCHED = require('./scheduled')({ api, auth, db, fail, rateLimit, limitMessages, newId, now, perms, PM, requireChannel, requireDm, isMember, serverOf,

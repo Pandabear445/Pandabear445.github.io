@@ -12,15 +12,37 @@ const POWERFUL = P.ADMINISTRATOR | P.MANAGE_SERVER | P.MANAGE_ROLES | P.MANAGE_C
   | P.MANAGE_EMOJIS | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MUTE_MEMBERS | P.MOVE_MEMBERS | P.VIEW_AUDIT_LOG | P.MANAGE_NICKNAMES;
 export const SELF_BLOCKED = POWERFUL | P.MENTION_EVERYONE;
 const BLOCKED = SELF_BLOCKED;
-// The powers that only reach people below you (kick, ban, timeouts, role changes, other people's nicknames), as on
-// the server: a marked role has to sit below every role with one of them.
-const REACH = P.ADMINISTRATOR | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_ROLES | P.MANAGE_NICKNAMES;
+// The powers that only reach people below you (kick, ban, timeouts, role changes, other people's nicknames,
+// bulk delete and the report inbox, voice mute and move), as on the server: a marked role has to sit below every
+// role with one of them. Manage Messages and Move Members count in a single channel too (REACH_IN_CHANNEL), given to
+// a role or to one member (whose highest role, leaving out pickable ones, then counts).
+const REACH = P.ADMINISTRATOR | P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_ROLES | P.MANAGE_NICKNAMES
+  | P.MANAGE_MESSAGES | P.MUTE_MEMBERS | P.MOVE_MEMBERS;
+const REACH_IN_CHANNEL = P.MANAGE_MESSAGES | P.MOVE_MEMBERS;
 // Channel permissions, as the server checks them for overrides.
 const CHANNEL_SCOPED = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
-  | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES;
+  | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES
+  | P.MOVE_MEMBERS;
 
 // Overrides are only sent to people who manage roles or channels; for everyone else this finds none.
 const allowsIn = (server, roleId, bits) => (server.channels || []).find((c) => (c.overrides || []).some((o) => o.type === 'role' && o.id === roleId && (o.allow & bits)));
+// The highest role (leaving out pickable ones) of each member given REACH_IN_CHANNEL by an override of their own, as
+// server/selfroles.js lowestModRole counts them: not the owner, nor anyone whose highest is @everyone.
+function memberModRoles(server) {
+  const defs = new Map((server.roleDefs || []).map((r) => [r.id, r]));
+  const out = [];
+  const seen = new Set();
+  for (const c of server.channels || []) {
+    for (const o of c.overrides || []) {
+      if (o.type !== 'member' || !(o.allow & REACH_IN_CHANNEL) || o.id === server.ownerId || seen.has(o.id)) continue;
+      seen.add(o.id);
+      const top = ((server.memberRoles || {})[o.id] || []).map((id) => defs.get(id)).filter((r) => r && !r.everyone && !r.selfAssign)
+        .sort((a, b) => b.position - a.position)[0];
+      if (top && top.position > 0) out.push(top);
+    }
+  }
+  return out;
+}
 
 // Roles a member can see in "Pick your roles": the marked ones, highest first. A role that can't be picked right
 // now is only listed for people who have it (so they can still drop it).
@@ -41,9 +63,14 @@ export function selfAssignProblem(server, role, permissions, mine = ALL) {
   // Only sent to people who manage roles, who are the ones who see this.
   const sold = (server.soldRoles || {})[role.id];
   if (sold && !role.selfAssign) return `It’s sold as the "${sold}" membership, so members can’t pick it for free.`;
-  const low = (server.roleDefs || []).filter((r) => !r.everyone && r.id !== role.id && (r.permissions & REACH))
+  const low = (server.roleDefs || []).filter((r) => !r.everyone && r.id !== role.id && ((r.permissions & REACH) || allowsIn(server, r.id, REACH_IN_CHANNEL)))
     .sort((a, b) => a.position - b.position)[0];
-  if (low && role.position >= low.position) return `It sits above "${low.name}", a role that can kick, ban, manage roles or manage nicknames: anyone who picked it would be out of that role’s reach. Move it below "${low.name}" first.`;
+  const lowMember = memberModRoles(server).sort((a, b) => a.position - b.position)[0];
+  if (lowMember && (!low || lowMember.position < low.position)) {
+    if (lowMember.id === role.id) return 'It’s the highest role of someone who moderates a channel: anyone who picked it would be level with them, out of their reach.';
+    if (role.position >= lowMember.position) return `It sits above "${lowMember.name}", the highest role of someone who moderates a channel: anyone who picked it would be out of their reach. Move it below "${lowMember.name}" first.`;
+  }
+  if (low && role.position >= low.position) return `It sits above "${low.name}", a moderator role that only reaches people below it: anyone who picked it would be out of that role’s reach. Move it below "${low.name}" first.`;
   if (!role.selfAssign) {
     if (permissions & ALL & ~mine) return 'It has permissions you don’t have, so you can’t let members pick it (that would give it to anyone).';
     // Channels this app knows about (ones you can see); the server also checks the rest.

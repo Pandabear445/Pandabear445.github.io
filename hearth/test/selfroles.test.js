@@ -5,7 +5,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { startServer, hex } = require('./helpers');
 
-const P = { VIEW: 1, SEND: 2, MENTION_EVERYONE: 16, MANAGE_MESSAGES: 32, CONNECT: 64, SPEAK: 128, KICK: 1 << 9, BAN: 1 << 10, MANAGE_CHANNELS: 1 << 11, MANAGE_ROLES: 1 << 12, MANAGE_NICKNAMES: 1 << 21, ADMIN: 1 << 30 };
+const P = { VIEW: 1, SEND: 2, MENTION_EVERYONE: 16, MANAGE_MESSAGES: 32, CONNECT: 64, SPEAK: 128, KICK: 1 << 9, BAN: 1 << 10, MANAGE_CHANNELS: 1 << 11, MANAGE_ROLES: 1 << 12, MUTE: 1 << 17, MOVE: 1 << 18, MANAGE_NICKNAMES: 1 << 21, ADMIN: 1 << 30 };
 let srv;
 const socks = [];
 const as = (u, method, p, body) => srv.api(method, p, { token: u.token, ip: u.ip, body });
@@ -327,26 +327,52 @@ test('selfroles: a moderator’s change touches only the role it names, so it ca
   assert.deepEqual(rolesOf(server.id, member.id), [regular.id]);
 });
 
-test('selfroles: only roles that can kick, ban, manage roles or manage nicknames keep marked roles below them', async () => {
-  const { owner, member, server, modRole, game, text } = await club();
-  // Bottom of the list: a role that only manages emoji, and one that only manages messages in one channel.
+test('selfroles: only roles whose powers go by role order keep marked roles below them, server-wide or in a channel', async () => {
+  const { owner, member, server, modRole, game, text, voice } = await club();
+  // Bottom of the list: a role that only manages emoji.
   const emoji = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name: 'Emoji artist', permissions: 1 << 14 })).json;
-  const helper = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name: 'helper', permissions: 0 })).json;
-  await as(owner, 'PUT', `/channels/${text.id}/overrides`, { overrides: [{ type: 'role', id: server.id, allow: 0, deny: P.VIEW }, { type: 'role', id: helper.id, allow: P.VIEW | P.MANAGE_MESSAGES, deny: 0 }, { type: 'role', id: game.id, allow: P.VIEW, deny: 0 }] });
-  await as(owner, 'POST', `/servers/${server.id}/roles/order`, { ids: [modRole.id, game.id, emoji.id, helper.id] });
+  await as(owner, 'POST', `/servers/${server.id}/roles/order`, { ids: [modRole.id, game.id, emoji.id] });
   let r = await mark(owner, game);
   assert.equal(r.status, 200, r.text);
   assert.equal((await pick(member, server.id, game.id)).status, 200);
-  // Neither of them reaches anyone (no kick, ban, timeout or role changes), so being above them changes nothing.
+  // It doesn't reach anyone (emoji don't look at role order), so being above it changes nothing.
   assert.equal((await view(member, server.id)).roleDefs.find((x) => x.id === game.id).selfAssignIssue, undefined);
-  // Each power that does check role order keeps marked roles below it.
-  for (const [name, bits] of [['kicker', P.KICK], ['banner', P.BAN], ['role-manager', P.MANAGE_ROLES], ['nickname-manager', P.MANAGE_NICKNAMES], ['admin', P.ADMIN]]) {
-    const low = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name, permissions: bits })).json;
+  const toBottom = async (low) => {
     const ids = (await view(owner, server.id)).roleDefs.filter((x) => !x.everyone && x.id !== low.id).map((x) => x.id);
     await as(owner, 'POST', `/servers/${server.id}/roles/order`, { ids: [...ids, low.id] });
-    const def = (await view(member, server.id)).roleDefs.find((x) => x.id === game.id);
-    assert.match(def.selfAssignIssue || '', new RegExp(`sits above "${name}"`), name);
+  };
+  const issueOf = async () => (await view(member, server.id)).roleDefs.find((x) => x.id === game.id).selfAssignIssue || '';
+  // Each power that does check role order keeps marked roles below it: kicks and timeouts, bans, role changes,
+  // other people's nicknames, bulk delete and the report inbox (Manage Messages), and voice mute and move.
+  for (const [name, bits] of [['kicker', P.KICK], ['banner', P.BAN], ['role-manager', P.MANAGE_ROLES], ['nickname-manager', P.MANAGE_NICKNAMES],
+    ['message-manager', P.MANAGE_MESSAGES], ['voice-muter', P.MUTE], ['voice-mover', P.MOVE], ['admin', P.ADMIN]]) {
+    const low = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name, permissions: bits })).json;
+    await toBottom(low);
+    assert.match(await issueOf(), new RegExp(`sits above "${name}"`), name);
     srv.sql('DELETE FROM roles WHERE id = ?', low.id);
+    assert.equal(await issueOf(), '', `${name} gone`);
+  }
+  // Manage Messages and Move Members given in a single channel count as well: that's where they're checked.
+  for (const [name, ch, bits] of [['helper', text, P.MANAGE_MESSAGES], ['usher', voice, P.MOVE]]) {
+    const low = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name, permissions: 0 })).json;
+    await toBottom(low);
+    assert.equal(await issueOf(), '', `${name} has no powers yet`);
+    const base = [{ type: 'role', id: server.id, allow: 0, deny: P.VIEW }, { type: 'role', id: game.id, allow: P.VIEW | P.CONNECT | P.SPEAK, deny: 0 }];
+    r = await as(owner, 'PUT', `/channels/${ch.id}/overrides`, { overrides: [...base, { type: 'role', id: low.id, allow: P.VIEW | bits, deny: 0 }] });
+    assert.equal(r.status, 200, r.text);
+    assert.match(await issueOf(), new RegExp(`sits above "${name}"`), name);
+    // Marking another role above it is refused, and so is picking.
+    const other = (await as(owner, 'POST', `/servers/${server.id}/roles`, { name: 'other-' + name, permissions: 0 })).json;
+    r = await mark(owner, other);
+    assert.equal(r.status, 400, r.text);
+    assert.match(r.json.error, new RegExp(`sits above "${name}"`));
+    assert.equal((await drop(member, server.id, game.id)).status, 200, 'dropping always works');
+    r = await pick(member, server.id, game.id);
+    assert.equal(r.status, 403, r.text);
+    assert.equal(r.json.code, 'self_assign');
+    assert.equal((await as(owner, 'PUT', `/channels/${ch.id}/overrides`, { overrides: base })).status, 200);
+    srv.sql('DELETE FROM roles WHERE id IN (?, ?)', low.id, other.id);
+    assert.equal((await pick(member, server.id, game.id)).status, 200, 'with the channel power gone, it can be picked again');
   }
 });
 

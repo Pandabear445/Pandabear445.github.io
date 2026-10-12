@@ -17,7 +17,9 @@
 //     server (no key yet; the first app to open it makes one), so the import changes nothing about encryption;
 //   - 60 previews per 10 minutes and 5 imported servers an hour per account, 30 create attempts an hour, a
 //     per-network ceiling across accounts and one for the whole instance (a plan of a big template takes a moment
-//     of the server's time, so many at once would hold everyone else up);
+//     of the server's time, so many at once would hold everyone else up). The instance ceiling bounds the server's
+//     time (every template read counts) and is shared fairly: past half of it, only accounts that have had few plans
+//     this window get more, so a handful of accounts can't use it up and lock everyone else out;
 //   - Hearth's own limits for one server: 99 roles besides @everyone, 50 categories, 100 overrides per channel, at
 //     most 500 channels and 5,000 overrides per import. Requests are capped at 2 MB like every JSON request.
 const { ImportError, parseTemplate, planFromTemplate } = require('./discordmap');
@@ -36,7 +38,7 @@ const PROBLEM = {
 };
 
 module.exports = function setupImports(ctx) {
-  const { api, auth, db, fail, rateLimit, limitNet, newId, now, features, isStaff, ALL, CHANNEL_SCOPED, PM,
+  const { api, auth, db, fail, rateLimit, limitNet, countHit, hitsSoFar, newId, now, features, isStaff, ALL, CHANNEL_SCOPED, PM,
     serializeServer, keyState, getIo, auditLog, requirePerm } = ctx;
 
   // The same rule and words as POST /servers.
@@ -48,10 +50,12 @@ module.exports = function setupImports(ctx) {
     if (!Array.isArray(v) || v.length > max) fail(400, 'That list of things to leave out is too long.', 'bad_request');
     return new Set(v.filter((k) => typeof k === 'string' && KEY.test(k)));
   }
-  function planOf(body) {
+  // req: whose plan it is (counted toward the instance ceiling once the template is going to be read).
+  function planOf(body, req) {
     const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
     if (b.template === undefined || b.template === null) fail(400, 'Paste the server template first.', 'bad_template');
     if (b.name !== undefined && typeof b.name !== 'string') fail(400, 'Give your server a name.', 'bad_request');
+    countAll(req);
     let parsed;
     try { parsed = parseTemplate(b.template); } catch (e) {
       if (e instanceof ImportError) fail(400, e.message, e.code);
@@ -61,8 +65,20 @@ module.exports = function setupImports(ctx) {
     return { meta: parsed.meta, plan };
   }
   const sourceOf = (meta) => ({ kind: 'paste', template: meta.template, code: meta.code, name: meta.name, usageCount: meta.usageCount, updatedAt: meta.updatedAt, isDirty: meta.isDirty });
-  // Previews and creates together, for everyone on this instance.
-  const limitAll = () => rateLimit('dimp:all', 300, 600000);
+  // Previews and creates together, for everyone on this instance: a safety valve for the server's time. Every request
+  // that has a template to read counts (a large one that turns out unreadable can cost as much as a plan), and past
+  // ALL_MAX in a window nobody gets more: at most ALL_MAX plans per 10 minutes, however many accounts ask.
+  // So that a few accounts can't use that up and lock everyone else out, it's shared: once BUSY plans were made in
+  // the window, only accounts that have had fewer than SHARE this window (their own count, 'dimp:share:') get more.
+  // Using it all up then takes BUSY plans from anyone (60 an account and 120 a network: at least 9 accounts on 5
+  // networks) and then (ALL_MAX - BUSY) / SHARE more accounts that haven't had their share, at least 34 accounts on
+  // 9 networks every 10 minutes, while someone importing for real gets up to SHARE plans even then.
+  const ALL_WINDOW = 600000; const ALL_MAX = 1000; const BUSY = 500; const SHARE = 20;
+  function checkAll(req) {
+    rateLimit('dimp:all', ALL_MAX - 1, ALL_WINDOW, 0); // a cost of 0 only checks: refused once ALL_MAX were made
+    if (hitsSoFar('dimp:all') >= BUSY) rateLimit('dimp:share:' + req.userId, SHARE - 1, ALL_WINDOW, 0);
+  }
+  const countAll = (req) => { countHit('dimp:all', ALL_WINDOW); countHit('dimp:share:' + req.userId, ALL_WINDOW); };
   // What the app shows: everything but each channel's overrides (counted instead) and the per-permission notes,
   // which the report already gathers. A big template's preview stays small, every time a box is ticked.
   const slim = (plan) => ({
@@ -74,8 +90,8 @@ module.exports = function setupImports(ctx) {
     mayCreate(req);
     rateLimit('dimp:' + req.userId, 60, 600000);
     limitNet(req, 'dimp', 120, 600000);
-    limitAll();
-    const { meta, plan } = planOf(req.body);
+    checkAll(req);
+    const { meta, plan } = planOf(req.body, req);
     res.json({ source: sourceOf(meta), plan: slim(plan) });
   });
 
@@ -83,13 +99,13 @@ module.exports = function setupImports(ctx) {
     mayCreate(req);
     rateLimit('dimpa:' + req.userId, 30, 3600000);
     limitNet(req, 'dimp', 120, 600000);
-    limitAll();
+    checkAll(req);
     // Five servers an hour: refused here once five were made (a cost of 0 only checks), counted once one exists, so
     // a refused attempt doesn't use one up.
     rateLimit('dimpc:' + req.userId, CREATIONS_PER_HOUR - 1, 3600000, 0);
     const b = req.body && typeof req.body === 'object' ? req.body : {};
     if (b.name !== undefined && (typeof b.name !== 'string' || !b.name.trim())) fail(400, 'Give your server a name.', 'bad_request');
-    const { meta, plan } = planOf(b);
+    const { meta, plan } = planOf(b, req);
     const tooMany = plan.problems[0];
     if (tooMany) fail(400, PROBLEM[tooMany.code](tooMany), tooMany.code);
     if (plan.everyone.dangerous && b.allowEveryoneAdmin !== true) {
