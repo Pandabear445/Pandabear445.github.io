@@ -67,6 +67,14 @@ Hearth combines the familiar experience of a modern community chat application w
 - Privacy-conscious handling of remote images and uploaded media
 - Automated security scanning and regression testing
 
+### 💜 We Believe Customization Shouldn't Be a Luxury
+
+Some platforms reserve profile enhancements and personalization options for paid subscriptions.
+We want Hearth to take a different approach.
+Your profile is how you present yourself to the world. Being able to personalize it should be fun, accessible, and open to everyone—not another recurring expense.
+We want you to spend your time creating, connecting, and enjoying your community, not deciding whether changing your profile is worth another subscription.
+Make it weird. Make it beautiful. Make it yours. Have fun.
+
 Security is an ongoing process. Features and protections are subject to continued review, testing, and improvement. Encryption guarantees, deployment security, and individual features should be evaluated against the current implementation and documentation.
 
 ### ⚙️ Self-Hosted Infrastructure
