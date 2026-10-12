@@ -1063,9 +1063,15 @@ server/presence.js  Automatic Away, status changes, custom statuses that clear t
 public/js/presence.js Tells the server when this app goes idle; "Clear after" times
 server/nicknames.js Per-server nicknames: who may change whose, the name rules, live updates
 server/joinhistory.js "New members can't read messages from before they joined": key changes on join, what's served
+server/wordfilter.js Word filters: your sealed list, a server's suggested list and the rules for entries
+server/alertchannels.js Where else owner alerts go: ntfy, a signed webhook, Discord, Slack
+server/metrics.js   GET /metrics for Prometheus (off unless METRICS_TOKEN is set)
 public/             The web app (plain JavaScript modules, no build)
 public/js/e2ee.js   Encryption primitives (WebCrypto + Argon2id)
 public/js/secure.js Key management: group keys, rotation, verification
+public/js/binding.js Each message's own id, reply, thread, time and edit count, and the flag when they don't match
+public/js/wordfilter.js Word filter matching: folding, wildcards, a bounded amount of work per message
+public/js/wordfilter-app.js The word filter in the app: your sealed list, servers' lists, hiding and blurring
 public/js/features.js Polls, voice messages, events, reminders
 public/js/ics.js    Calendar files for events (repeat rule, time zone)
 server/recurrence.js Repeating events: the next time, on the event's own clock

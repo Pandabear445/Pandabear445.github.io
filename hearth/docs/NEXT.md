@@ -148,3 +148,17 @@ The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-
   GIF proxy links aren't signed; OGG songs and earlier uploads keep their metadata; pre-upgrade copies aren't
   encrypted; a reset account's DMs and calls still rely on first-use trust, resets before 1.29.0 aren't marked, and
   an admin whose every server holds an attacker's second account can still be cleared by those accounts.
+
+- The batch-6 items are in (1.29.0; SECURITY.md rows 139–151). Partly fixed: crypto-7 (each new message carries its
+  own id, reply, thread, send time and edit count inside its encryption, and readers' apps flag one the server
+  moved, re-dated, showed twice or rolled back; Send now and Reschedule re-encrypt so the time inside is the real
+  one) and crypto-13 (a server setting, off by default, "New members can't read messages from before they joined":
+  every join replaces the key and nothing from before is served to the newcomer). Also built: a word filter that
+  only ever runs in each reader's app (your own list end-to-end encrypted, plus a server's suggested list members can
+  turn off), and alert channels for owners (ntfy, a signed webhook, Discord, Slack) with a Prometheus `/metrics`
+  behind `METRICS_TOKEN`. Left ([ENGINEERING-REPORT.md](ENGINEERING-REPORT.md) §5, §14): the binding is detection,
+  not prevention, and messages from older apps, bots and webhooks carry none of it; a rollback is caught only on a
+  device that saw the newer edit, and the server's clock can shift message times by up to a day; the history
+  setting is the server's to enforce, deletions still name older messages' ids to newcomers, and file blobs aren't
+  padded; the word filter can't stop anything being posted and can be spelled around; alerts aren't retried, and a
+  webhook channel keeps its signing secret when its address changes.
