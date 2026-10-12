@@ -106,7 +106,7 @@ if ! [[ " ${ID:-} ${ID_LIKE:-} " =~ \ (debian|ubuntu)\  ]]; then
   warn "This isn't Debian/Ubuntu (${PRETTY_NAME:-unknown}); the dry run continues, but a real run would stop here."
 fi
 
-# Find Hearth: the folder this script is in, the update tool's saved location, or a search.
+# Find Hearth: the folder this script is in, hearth-update's saved location, or a search.
 find_hearth() {
   local here d; here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
   for d in "${HEARTH_DIR:-}" "$here" "$(cat /etc/hearth-update.conf 2>/dev/null || true)"; do
@@ -123,7 +123,7 @@ envval() { # one setting from Hearth's .env (empty if not set)
 }
 PORT="$(envval PORT)"; PORT="${PORT:-3000}"
 
-# How does Hearth run? (same detection as the update tool)
+# How does Hearth run? (same detection as hearth-update)
 DC=""
 if docker compose version >/dev/null 2>&1; then DC="docker compose"; elif has docker-compose; then DC="docker-compose"; fi
 find_unit() {
@@ -523,7 +523,7 @@ harden_docker() {
     say "Hearth's container runs as root."
   elif [ -n "$uid" ]; then ok "Hearth's container already runs as an unprivileged user (uid $uid)."; fi
   if ! grep -qE '^\s*user:\s*"?1000' "$DIR/docker-compose.yml" 2>/dev/null; then
-    say "Your docker-compose.yml is from before the security update (the update tool never replaces it, so your own changes are kept). The new one in this download runs Hearth as an unprivileged user on a read-only filesystem without any root powers, keeps port $PORT private behind Caddy, and fixes the data folder's owner by itself. To switch:"
+    say "Your docker-compose.yml is from before the security update (hearth-update never replaces it, so your own changes are kept). The new one in this download runs Hearth as an unprivileged user on a read-only filesystem without any root powers, keeps port $PORT private behind Caddy, and fixes the data folder's owner by itself. To switch:"
     say "  cd '$DIR' && cp docker-compose.yml docker-compose.yml.old"
     say "  copy docker-compose.yml from the new Hearth download over it (re-add any changes you made)"
     say "  docker compose up -d --build        (with a domain: docker compose --profile domain up -d --build)"

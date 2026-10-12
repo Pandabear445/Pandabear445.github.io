@@ -27,9 +27,9 @@ encryption").
   unchanged since the baseline, and `npm audit` on today's tree still reports **0 vulnerabilities** (observed while
   writing this report, both the full audit and `--omit=dev --audit-level=high`).
 - **Syntax:** the baseline syntax checks passed (audit notes). Re-run on today's tree: `node --check` on all 98
-  JavaScript files in `server/`, `public/`, `desktop/`, `scripts/`, `tools/`, `mobile/www/` and `test/` passes,
-  and `bash -n` passes on `hearth-update.sh`, `make-update-zip.sh`, `setup-turn.sh`, `harden-vps.sh` and
-  `tools/update-hearth.sh`.
+  JavaScript files in `server/`, `public/`, `desktop/`, `scripts/`, `mobile/www/` and `test/` passes, and
+  `bash -n` passes on `hearth-update.sh`, `make-update-zip.sh`, `setup-turn.sh` and `harden-vps.sh` (and on the
+  update tools in `tools/`, since removed from the repository).
 - **Routes:** 242 HTTP routes and 13 Socket.IO events at the baseline; 248 and 13 now (see [ROUTES.md](ROUTES.md)).
 
 ## 2. Method
@@ -324,7 +324,7 @@ where the docs now state the behaviour.
 | voice-4 | No per-session socket cap and no per-network handshake limit. | Tabs share one session; a NAT full of users reconnecting after a restart would be locked out. The per-user cap of 30 sockets and shared event budget cover it. |
 | voice-9 | Anyone who can sign up gets relay logins; no default total bandwidth cap; existing installs need `setup-turn.sh` again. | Product decision; the right total depends on each VPS plan. |
 | crypto-2 | Done since (1.29.0): a reset without the recovery key marks the account (`users.keys_reset_at`) when it shares a server or group with anyone, and holds it back in each of them. In a server or group where it's held, the server keeps no key for it (shares and rotations skip it; an older app's copy is dropped), it can't make a key for others, hand on a key it made alone (a newcomer then gets a fresh key instead), create or list invites, see invite codes in that server's audit log, or add people to the group; the apps skip it and show why. A member who was in a server or group with the person before the reset (and isn't marked) compares safety numbers and vouches for the key they compared: that lifts the hold only in the servers and groups the voucher is in now (`key_vouches`), keys they hold anyway, so a second account an attacker put in a public server beforehand opens only that server. Once every server and group the person was in before the reset (including any left since) has a vouch, or an instance admin verifies them from Admin → Users, the mark goes everywhere. While marked anywhere they can't start group chats, give out staff roles or hand over ownership. Everything is in the audit log. What stays: invite links made before the reset keep working; resets before 1.29.0 aren't marked; a member of a server or group who is fooled into vouching opens that one; once the mark has gone, servers joined afterwards aren't held; a device that never saw someone's old key still writes new direct messages to the new key (first-use trust, as for any contact), and calls aren't held back; if every server an instance admin was in before their reset holds a second account of the attacker's, those can lift the admin's mark, and the admin can then verify other taken-over accounts from Admin → Users. | Old links were made by the real owner and may be in use, and a held-back account can't list them. Marking old resets now would cut people off from keys they were given long ago and may have been verified for on each device. A vouch is a member's own judgement, like inviting someone. DMs and calls follow the safety-number model; holding them too is a separate change. Admin verification is the way out for someone nobody can vouch for; tying it to more than the admin's own mark needs a record of when roles were given. |
-| admin-11 | Done since: zips are signed (Ed25519, `scripts/update-key.js`) and each server pins one key in `/etc/hearth-update.pub`. What stays: the first key is trusted on first use, a server that never ran `hearth-update` has no trusted updater to check the tools' upload, and a server with neither OpenSSL 3.0+ nor Node stays on checksums. | The owner makes the key (none is committed); see docs/SIGNING.md, "Signing server updates". |
+| admin-11 | Done since: zips are signed (Ed25519, `scripts/update-key.js`) and each server pins one key in `/etc/hearth-update.pub`. What stays: the first key is trusted on first use, a server that never ran `hearth-update` has no trusted updater installed until its operator installs one from the current Hearth (README, "Upgrading"), and a server with neither OpenSSL 3.0+ nor Node stays on checksums. | The owner makes the key (none is committed); see docs/SIGNING.md, "Signing server updates". |
 | xss-7 | Done since: the CSP comment says what the policy really does, and the policy no longer names Google Fonts or allows blob: frames (both unused). What stays: `img-src` and `media-src` still allow any https: site (an image link someone clicks open, a watch-together video file), so injected markup could still send data out in a picture address; the YouTube, Vimeo and Twitch frames and navigation stay too. | Narrowing them needs every outside picture and video to go through a proxy on the server, which would then fetch (and see) every link people open: a product decision. Image links now wait for a click by default (`xss-8`), so the everyday leak is gone. |
 | infra-1 | Updates come from whatever server the app is connected to; `data/downloads` is writable by Hearth; the SignPath certificate thumbprint isn't pinned. | Signed updates make the feed's origin irrelevant for builds with a key; the rest are deploy changes or need external information. Apps released before signing install the hop to the first signed build the old way. |
 | infra-2 | No always-visible native "sharing your screen" indicator; an old-style capture request gets the whole screen for about 3 s after a pick. | UX work; Electron can't tell the two request kinds apart, so the window is shortened, not closed. |
@@ -394,7 +394,7 @@ and in CI (`client-hardening.test.js` › infra-1…).
 | Desktop builds (Windows, macOS, Linux) | tested in CI (build only); not run here (no Wine) |
 | Android bridge policy | implemented; tested locally (`javac`) and in CI |
 | Android build | tested in CI (build only); not run here (no Android SDK) |
-| Update tools and `hearth-update.sh` | tested locally with stubbed system commands; not verified on a real VPS |
+| `hearth-update.sh` | tested locally with stubbed system commands; not verified on a real VPS (the update tools tested here were later removed from the repository) |
 | CI workflow rules (permissions, pinning, host-key pinning, release-only publishing) | static checks tested locally and in CI; the publish step itself not verified (it only runs for release builds) |
 | TURN bandwidth caps | config generation tested locally; not verified against a running coturn |
 | Watch-together sandboxed players | implemented; not verified against the live YouTube, Vimeo and Twitch players |
@@ -480,8 +480,12 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 
 1. Done: the gitleaks false positive is listed in `.gitleaksignore` at the repository root, and the CSP comment is
    corrected. New tests should use values that don't look like keys.
-2. Set the `UPDATE_SIGNING_KEY` secret (if it isn't set) and `VPS_HOST_FINGERPRINT`, and publish one signed
-   release so installed apps move to signed updates.
+2. Set the `UPDATE_SIGNING_KEY` secret and `UPDATE_PUBLIC_KEY` variable (if they aren't set; with an existing
+   secret the variable is its public half, `sign-update.js pubkey`, never a new pair) and `VPS_HOST_FINGERPRINT`,
+   with the secrets in the `production` environment (since the sign and publish jobs moved there) and the
+   repository secrets of the same names deleted, and publish one signed release so installed apps move to signed
+   updates. If Android builds used the key the old workflow cached, follow "Moving off the old built-in key" in
+   `mobile/README.md`.
 3. Done: server update zips are signed (`admin-11`) and `hearth-update` pins the trust anchor. Make the key
    (`node scripts/update-key.js keygen`), commit `update-signing.pub` and publish one signed release.
 4. Done: step-up always asks for a fresh code (`auth-6`; only starting a data export and clearing unused files keep

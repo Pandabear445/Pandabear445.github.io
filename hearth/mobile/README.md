@@ -42,24 +42,43 @@ Actions → Variables), e.g. `https://chat.example.com`, or type it when running
 
 ## Signing (so updates install over the top)
 
-Android only installs an update if it's signed with the same key as the installed app. The workflow makes a
-key on its first run and keeps it in the GitHub Actions cache. GitHub drops caches that aren't used for 7
-days; if that happens the next build gets a new key and people have to uninstall the old app once.
+Android only installs signed apps, and only installs an update if it's signed with the same key as the
+installed app. The workflow signs with **your own key** only, from the secrets below; it never makes a key or
+keeps one anywhere. Without the secrets the APK is built **unsigned** (`Hearth-<version>-UNSIGNED.apk`, artifact
+`hearth-android-UNSIGNED`): it only shows that the build works, Android won't install it, and it is never
+attached to a release or copied to your server.
 
-To use a key that never changes, make one (needs Java):
+Make your key once (needs Java), with a strong password of its own:
 
 ```bash
 keytool -genkeypair -v -keystore hearth.jks -alias hearth -keyalg RSA -keysize 2048 -validity 10000
 base64 -w0 hearth.jks > hearth.jks.txt      # macOS: base64 -i hearth.jks -o hearth.jks.txt
 ```
 
-…and add the repository secrets `ANDROID_KEYSTORE_BASE64` (contents of `hearth.jks.txt`),
-`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`hearth`) and `ANDROID_KEY_PASSWORD`. Keep `hearth.jks` safe:
-lose it and you can never update the app again without everyone reinstalling.
+…and add the repository secrets `ANDROID_KEYSTORE_BASE64` (contents of `hearth.jks.txt`, which you then
+delete), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`hearth`) and `ANDROID_KEY_PASSWORD`. Keep
+`hearth.jks` safe and offline: lose it and you can never update the app again without everyone reinstalling.
+
+**Moving off the old built-in key.** Older versions of this workflow, when these secrets were missing, made a
+key themselves, kept it in the Actions cache (`hearth-android-key-v1`) and protected it with a password written in
+the workflow. A cache entry outlives the workflow change, and pull request runs, even from forks, can restore it:
+treat that key as exposed, since whoever has it can sign an update that Android installs over Hearth. If your APKs
+came from such builds:
+
+1. Delete the cache entry: repository → *Actions → Caches* → every `hearth-android-key-v1` (or
+   `gh cache delete hearth-android-key-v1`).
+2. Delete or update old branches that still have the old `.github/workflows/hearth-apps.yml`: a push to one, or a
+   manual run of it, makes or restores the cached key again.
+3. Make your own key and add the secrets (above).
+4. Remove the APKs signed with the old key from your server's `data/downloads/` and from old GitHub releases.
+5. Set `ANDROID_CERT_SHA256` on the server to the new key's fingerprint (invite links, see
+   [`../docs/SIGNING.md`](../docs/SIGNING.md)).
+6. Tell people to **uninstall the app and install the new APK once**: Android refuses an update signed with a
+   different key, so it can't install over the old one.
 
 With these secrets the workflow also builds a Google Play bundle (`.aab`, artifact
-`hearth-android-play-bundle`), and with a `PLAY_SERVICE_ACCOUNT_JSON` secret it uploads it to Google Play's
-internal testing track. Step by step: [`../docs/SIGNING.md`](../docs/SIGNING.md).
+`hearth-android-play-bundle`), and with a `PLAY_SERVICE_ACCOUNT_JSON` secret (in the `production` environment)
+it uploads it to Google Play's internal testing track. Step by step: [`../docs/SIGNING.md`](../docs/SIGNING.md).
 
 The app's *versionCode* (which must go up with every update) is `(major × 100 + minor) × 100000 + the
 workflow's run number`.

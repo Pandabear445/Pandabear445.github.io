@@ -102,7 +102,8 @@ need unzip; need rsync; need curl
 
 # Puts $1 in place as the installed updater: a new file renamed over the old one, never written into it, because a
 # running hearth-update (often this very one) keeps reading its script as it goes and would run pieces of the new
-# file. Always 755, whatever the umask: the update tools read it as the login user before using sudo.
+# file. Always 755, whatever the umask: a program any account may read (copies of the old update tools, no longer
+# part of Hearth, read it as the login user before using sudo).
 install_updater() {
   local t; t="$(mktemp "$BIN.XXXXXX" 2>/dev/null)" || return 1
   if cp -- "$1" "$t" && chmod 755 "$t" && mv -fT "$t" "$BIN"; then return 0; fi
@@ -277,7 +278,7 @@ zip_version() { local pj; pj="$(unzip -p "$1" hearth/package.json 2>/dev/null)" 
 # only from an update that passed the check against the key before it: changing the key takes an update signed by
 # the old one (or --allow-unsigned). Nothing is pinned on a server that can't check signatures: it stays on
 # checksums, as before signing. Everything here reads a private copy of the zip, before anything in it is unpacked
-# or run. (The update tools run this check with the updater already on the server, before the zip's own updater.)
+# or run. (sudo hearth-update <zip> runs this check with the updater already on the server, never the zip's own.)
 SIG_CONTEXT=hearth-server-update-v1 # what's signed: "<this>\n<the zip's SHA-256 in hex>\n" (scripts/update-key.js)
 UNVERIFIED=0 # 1 once --allow-unsigned let a zip through that didn't pass
 CANT_VERIFY="this server can't check Ed25519 signatures (that takes OpenSSL 3.0 or newer, as on Debian 12 and Ubuntu 22.04, or Node.js)"
@@ -362,8 +363,8 @@ ver_older() {
 check_update() { # $1 = the zip as given (its .sha256 and .sig are next to it), $2 = the private copy
   local name key="" from="" bad="" sig=""; name="$(basename "$1")"
   # Compare the update with its SHA-256 when there's one to compare with: update.zip.sha256 next to it (made with
-  # each release by scripts/make-update-zip.sh; the update tools write it from the file you confirmed on your
-  # computer). A mismatch stops here, before anything is unpacked or run.
+  # each release by scripts/make-update-zip.sh and uploaded with the zip). A mismatch stops here, before anything
+  # is unpacked or run.
   SUM="$(sha256sum "$2" | cut -d' ' -f1)"
   if [ -f "$1.sha256" ]; then
     WANT="$(tr -d '\r' < "$1.sha256" | awk 'NR == 1 { print tolower($1) }')"
@@ -423,7 +424,7 @@ check_update() { # $1 = the zip as given (its .sha256 and .sig are next to it), 
       if [ "$ALLOW_DOWNGRADE" = 1 ]; then warn "Installing $new over the newer $(version), because of --allow-downgrade."
       else
         warn "To undo an update, use hearth-update --rollback (it puts back your own backup). To install this older one anyway,"
-        warn "  put it and its .sig on the server and run there: sudo hearth-update --allow-downgrade /path/to/the.zip (the update tools don't do that)."
+        warn "  put it and its .sig on the server and run there: sudo hearth-update --allow-downgrade /path/to/the.zip."
         die "$name is Hearth $new, older than the installed $(version). Nothing was changed."
       fi
     fi
@@ -566,8 +567,8 @@ restore() { # $1 = backup folder
 
 # ---------------------------------------------------------------- other modes
 if [ "$ACTION" = verify ]; then
-  # The same checks an update starts with (the update tools run this with the updater already on the server,
-  # before the zip's own one). Changes nothing; doesn't even pin a key.
+  # The same checks an update starts with, to check a zip before installing it. Changes nothing; doesn't even
+  # pin a key.
   [ -n "$ARG" ] || die "Which update? Usage: hearth-update --verify path/to/update.zip"
   [ -f "$ARG" ] || die "Update file not found: $ARG"
   WORK="$(mktemp -d)"

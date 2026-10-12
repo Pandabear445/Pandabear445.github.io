@@ -26,6 +26,7 @@ export const CHANGES = [
     'New server setting (Server settings \u2192 Overview \u2192 Privacy): \u201cNew members can\u2019t read messages from before they joined.\u201d With it on, everyone\u2019s apps switch to a fresh key whenever someone joins, so newcomers only see what\u2019s said after they arrive. It\u2019s off by default.',
     'For server owners: alerts can now also reach you on ntfy, a signed webhook, Discord or Slack (Admin \u2192 Health \u2192 Where alerts go), each with a Test button, and Prometheus can scrape /metrics once you set METRICS_TOKEN.',
     'For server owners: update zips can now be signed with your own key, and servers that pinned it refuse anything else (docs/SIGNING.md).',
+    'For server owners: a region’s install command (Admin → Regions) now checks the download before running it and needs Hearth opened over https, and the relay setup never shows the relay secret on screen.',
     'Security fixes from a review of this release: roles members pick themselves can’t sit above moderators who mute, move or clean up messages; categories of channels you can’t see stay out of reach; and reminders and inbox copies of disappearing messages now disappear too.',
   ] },
   { version: '1.28.2', items: [

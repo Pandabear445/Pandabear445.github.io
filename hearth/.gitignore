@@ -30,6 +30,10 @@ data-backup*/
 hearth-update-*.zip
 hearth-update-*.zip.sha256
 hearth-update-*.zip.sig
+# What copies of the old update tools (no longer part of Hearth) wrote next to themselves: a server's address and
+# its update log. Never commit them.
+hearth-update.json
+last-update-log.txt
 
 # Visual regression screenshots: made on the machine that checks them (see docs/ACCESSIBILITY.md).
 /test/visual/baseline/

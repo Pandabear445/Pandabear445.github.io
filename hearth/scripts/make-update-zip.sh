@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Makes a server update: the zip that tools/Update-Hearth.bat, tools/update-hearth.sh and hearth-update install,
-# plus its checksum file and signature, from the last commit (so nothing private or unfinished gets in).
+# Makes a server update: the zip that hearth-update installs (operators upload it with its checksum file and
+# signature, then run sudo hearth-update <zip> on the server), from the last commit (so nothing private or
+# unfinished gets in).
 #
 #   bash scripts/make-update-zip.sh [--unsigned] [--new-key FILE] [output folder]   (default: hearth/dist, ignored by git)
 #     -> hearth-update-<version>.zip, hearth-update-<version>.zip.sha256 and hearth-update-<version>.zip.sig
 #
-# Hand out all three files. The update tools refuse a zip that doesn't match the .sha256 next to it, and print the
-# SHA-256 they're installing: also post it somewhere people see apart from the download (release notes, your
+# Hand out all three files. hearth-update refuses a zip that doesn't match the .sha256 next to it, and prints the
+# SHA-256 it's installing: also post it somewhere people see apart from the download (release notes, your
 # announcement), so a swapped zip and checksum pair can still be spotted.
 #
 # Signing (docs/SIGNING.md, "Signing server updates"): with an update signing key (made once with
@@ -49,7 +50,7 @@ prefix="$(git rev-parse --show-prefix)"
 for f in hearth/server/index.js hearth/scripts/hearth-update.sh; do
   unzip -Z1 "$OUT/$name" "$f" >/dev/null 2>&1 || { echo "The zip is missing $f." >&2; exit 1; }
 done
-# The same format as sha256sum (Linux) / shasum -a 256 (macOS) / the update tools read: "<hash>  <file name>".
+# The same format as sha256sum (Linux) / shasum -a 256 (macOS) / hearth-update read: "<hash>  <file name>".
 if command -v sha256sum >/dev/null 2>&1; then sum="$(sha256sum "$OUT/$name" | cut -d' ' -f1)"
 else sum="$(shasum -a 256 "$OUT/$name" | cut -d' ' -f1)"; fi
 printf '%s  %s\n' "$sum" "$name" > "$OUT/$name.sha256"

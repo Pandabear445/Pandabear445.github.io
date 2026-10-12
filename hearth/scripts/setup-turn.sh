@@ -2,9 +2,15 @@
 # Sets up a TURN relay (coturn) so calls connect on every network: mobile data, CGNAT home internet,
 # school/office Wi-Fi.
 #
-#   On the Hearth server:              bash scripts/setup-turn.sh
-#   Extra relay in another region      bash setup-turn.sh --relay-only --secret <secret>
-#   (a small, cheap VPS near people):  (get the secret with:  node server/cli.js get-turn-secret)
+#   On the Hearth server:              sudo bash scripts/setup-turn.sh
+#   Extra relay in another region      sudo bash setup-turn.sh --relay-only
+#   (a small, cheap VPS near people):  it asks for the main server's relay secret (on the Hearth server:
+#                                      node server/cli.js get-turn-secret), or reads it from a file only root
+#                                      can read: --secret-file <file>. (Admin → Regions does all this for you.)
+#
+# The relay secret never goes on a command line (other accounts on the machine can see those, and shell history
+# keeps them) and is never printed: it's in /etc/turnserver.conf (static-auth-secret=), readable by root and
+# coturn only.
 #
 # Calls try every relay and use whichever works best, so people far from the main server get a
 # nearby relay. Safe to run again: it keeps the existing secret, so other relays keep working.
@@ -18,11 +24,12 @@ step() { printf '%s▸%s %s\n' "$c_y" "$c_0" "$*"; }
 ok()   { printf '%s✓%s %s\n' "$c_g" "$c_0" "$*"; }
 die()  { printf '%s✗ %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Run this as root (or with sudo)."
-RELAY_ONLY=no; SECRET=""; NEW_SECRET=no; MANAGED=no
+RELAY_ONLY=no; SECRET=""; SECRET_FILE=""; NEW_SECRET=no; MANAGED=no
 while [ $# -gt 0 ]; do
   case "$1" in
     --relay-only) RELAY_ONLY=yes ;;
-    --secret) SECRET="${2:-}"; shift ;;
+    --secret|--secret=*) die "--secret would put the relay secret on the command line, where other accounts on this machine can see it (ps) and your shell history keeps it. Leave it out and paste the secret when asked, or put it in a file only root can read and use --secret-file <file>." ;;
+    --secret-file) SECRET_FILE="${2:-}"; [ -n "$SECRET_FILE" ] || die "--secret-file needs a file name."; shift ;;
     --new-secret) NEW_SECRET=yes ;;
     --managed) MANAGED=yes ;; # installed from Admin → Regions: that install links the relay by itself
     *) die "Unknown option: $1" ;;
@@ -31,7 +38,21 @@ while [ $# -gt 0 ]; do
 done
 MAX_MBIT="${TURN_MAX_MBIT:-6}"; CAPACITY_MBIT="${TURN_CAPACITY_MBIT:-0}"
 [[ "$MAX_MBIT" =~ ^[0-9]+$ ]] && [[ "$CAPACITY_MBIT" =~ ^[0-9]+$ ]] || die "TURN_MAX_MBIT and TURN_CAPACITY_MBIT are whole numbers (megabits a second)."
-[ "$RELAY_ONLY" = yes ] && [ -z "$SECRET" ] && die "An extra relay needs the main server's secret: --secret <secret> (on the Hearth server: node server/cli.js get-turn-secret)"
+# The relay secret, from a file (read by the shell itself, so it's never another program's argument) or typed in.
+if [ -n "$SECRET_FILE" ]; then
+  { [ -f "$SECRET_FILE" ] && [ -r "$SECRET_FILE" ]; } || die "Can't read $SECRET_FILE."
+  IFS= read -r SECRET < "$SECRET_FILE" || true
+  SECRET="${SECRET%$'\r'}"
+  [ -n "$SECRET" ] || die "$SECRET_FILE is empty: put the relay secret on its first line."
+fi
+if [ "$RELAY_ONLY" = yes ] && [ -z "$SECRET" ] && [ -t 0 ]; then
+  printf "Paste the main server's relay secret (on the Hearth server: node server/cli.js get-turn-secret), then press Enter: "
+  IFS= read -rs SECRET || true
+  echo
+fi
+[ "$RELAY_ONLY" = yes ] && [ -z "$SECRET" ] && die "An extra relay needs the main server's relay secret: paste it when asked, or use --secret-file <file> (on the Hearth server: node server/cli.js get-turn-secret)."
+# One line of visible characters: it goes into /etc/turnserver.conf as it is.
+[[ "$SECRET" != *[[:cntrl:]]* ]] || die "The relay secret has a line break or another control character in it."
 
 # Find Hearth on this machine (not needed for --relay-only).
 find_hearth() {
@@ -42,7 +63,8 @@ find_hearth() {
   echo "$d"
 }
 hearth_cli() { # run server/cli.js inside Hearth (Docker or plain), as the user that owns Hearth's data (e.g. "hearth")
-  ( cd "$DIR" && if docker compose ps -q hearth 2>/dev/null | grep -q .; then docker compose exec -T hearth node server/cli.js "$@"
+  # (Standard input goes through to cli.js: that's how the relay secret reaches it, never as an argument.)
+  ( cd "$DIR" && if docker compose ps -q hearth 2>/dev/null </dev/null | grep -q .; then docker compose exec -T hearth node server/cli.js "$@"
     else
       owner="$(stat -c %U data 2>/dev/null || echo root)"
       if [ "$owner" != root ] && [ "$owner" != UNKNOWN ] && command -v runuser >/dev/null 2>&1; then runuser -u "$owner" -- "$(command -v node)" server/cli.js "$@"
@@ -67,8 +89,13 @@ EXTERNAL="$PUBLIC_IP"
 [ -n "$SECRET" ] || SECRET="$(openssl rand -hex 32)"
 
 step "Writing /etc/turnserver.conf…"
+# It holds the relay secret, so it's written private from the start (the backup of the old one too), handed to
+# coturn's group, and only then put in place: no other account can read it, not even for a moment.
+umask 077
 [ -f /etc/turnserver.conf ] && cp /etc/turnserver.conf "/etc/turnserver.conf.bak-$(date +%s)"
-cat > /etc/turnserver.conf <<CONF
+CONF_NEW="$(mktemp /etc/turnserver.conf.XXXXXX)"
+trap 'rm -f "$CONF_NEW"' EXIT
+cat > "$CONF_NEW" <<CONF
 # TURN relay for Hearth calls (written by scripts/setup-turn.sh)
 listening-port=3478
 external-ip=$EXTERNAL
@@ -108,13 +135,17 @@ denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 simple-log
 CONF
-chmod 640 /etc/turnserver.conf
+# coturn reads it as its own user (Debian and Ubuntu: turnserver): root and that group only.
+if getent group turnserver >/dev/null 2>&1; then chgrp turnserver "$CONF_NEW"; fi
+chmod 640 "$CONF_NEW"
+mv -f "$CONF_NEW" /etc/turnserver.conf
 [ -f /etc/default/coturn ] && sed -i 's/^#\?TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/' /etc/default/coturn
 systemctl enable coturn >/dev/null 2>&1 || true
 systemctl restart coturn
 sleep 1
 systemctl is-active --quiet coturn || die "coturn didn't start. Check: journalctl -u coturn -n 30"
 ok "Relay running on $PUBLIC_IP (port 3478, relay ports 49160–49400)."
+ok "The relay secret is in /etc/turnserver.conf (the static-auth-secret= line; only root and coturn can read it)."
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   step "Opening firewall ports…"
@@ -132,12 +163,12 @@ fi
 step "Connecting Hearth to the relay…"
 saved=no
 if [ -n "$DIR" ] && [ -f "$DIR/server/cli.js" ]; then
-  hearth_cli add-turn "$URLS" "$SECRET" && saved=yes
+  printf '%s\n' "$SECRET" | hearth_cli add-turn "$URLS" --secret-stdin && saved=yes
 fi
 if [ "$saved" = yes ]; then
   ok "Done. Calls now fall back to the relay automatically when a direct connection isn't possible."
-  printf 'To add a relay in another region later, run this on a small VPS there:\n  bash setup-turn.sh --relay-only --secret %s\n' "$SECRET"
+  printf 'To add a relay in another region later: Admin \u2192 Regions in Hearth, or on a small VPS there\n  sudo bash setup-turn.sh --relay-only\n(it asks for the relay secret: node server/cli.js get-turn-secret shows it here).\n'
 else
-  printf '\nCouldn'"'"'t save it into Hearth automatically. In Hearth go to Settings \u2192 Instance \u2192 Calls and enter:\n  Relay addresses: %s\n  Shared secret:   %s\n' "$URLS" "$SECRET"
+  printf '\nCouldn'"'"'t save it into Hearth automatically. In Hearth go to Settings \u2192 Instance \u2192 Calls and enter:\n  Relay addresses: %s\n  Shared secret:   the static-auth-secret= value in /etc/turnserver.conf (only root can read it:\n                   sudo grep '"'"'^static-auth-secret='"'"' /etc/turnserver.conf)\n' "$URLS"
 fi
 printf '\nIf your VPS provider has its own firewall (in their control panel), open UDP+TCP 3478 and UDP 49160-49400 there too.\n'

@@ -703,6 +703,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         ),
         h('div', { class: 'cmd-box' }, h('code', null, command), h('button', { class: 'btn sm', onclick: () => { copyText(command); toast('Copied.'); } }, icon('copy'), 'Copy')),
         h('p', { class: 'field-hint' }, 'The link works for 24 hours. It installs the call relay with this server\u2019s secret and a tiny check-in that reports here every minute. Within a minute of finishing, the region shows as online and calls start using it.'),
+        h('p', { class: 'field-hint' }, 'The line checks the download against the SHA-256 it carries before running anything. If that says FAILED, nothing ran: make a new command here.'),
         h('p', { class: 'field-hint' }, 'If the VPS provider has a firewall in its control panel, open UDP + TCP 3478 and UDP 49160\u201349400 there.')),
     });
     // An install command carries this server's relay secret, so making one asks for your password again.
@@ -758,7 +759,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         ...[
           ['Oracle Cloud Always Free', '$0', 'Arm VM (2 CPU / 12 GB since mid-2026) with 10 TB traffic a month. Many regions. Needs a card to sign up; free VMs can be hard to get in busy regions.'],
           ['Hetzner Cloud', '\u2248 \u20ac5.50/mo', 'Germany and Finland with 20 TB traffic: best value for Europe. Their US (1 TB) and Singapore (0.5 TB) plans include little traffic. The cheapest plans sell out at times.'],
-          ['Contabo (your current host)', '\u2248 $5\u20137/mo', 'EU, US, UK, Asia, Australia. Lots of traffic included. Same account you already have.'],
+          ['Contabo', '\u2248 $5\u20137/mo', 'EU, US, UK, Asia, Australia. Lots of traffic included.'],
           ['Vultr / DigitalOcean / Linode', '$4\u20136/mo', '30+ cities worldwide, 0.5\u20132 TB traffic. Good for places the others don\u2019t cover (South America, India, Japan, Australia).'],
         ].map(([n, p2, t]) => h('div', { class: 'adm-row three' }, h('b', null, n), h('span', null, p2), h('span', { class: 'stat-sub' }, t)))),
       h('p', { class: 'field-hint' }, 'Start with the region where most people who can\u2019t connect live (Europe and US East cover most friend groups). Two or three regions is plenty for thousands of people.'));

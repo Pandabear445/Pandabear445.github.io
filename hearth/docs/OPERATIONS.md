@@ -439,8 +439,7 @@ token for a user with write access to the topic (`ntfy token add <user>`, `ntfy 
 
 ## 6. Updates: checksums and signatures
 
-`hearth-update` (and the update tools, which run it) checks a private copy of each update zip before anything in
-it is unpacked or run:
+`hearth-update` checks a private copy of each update zip before anything in it is unpacked or run:
 
 1. **Checksum:** `<zip>.sha256` next to it must match. Without one it prints the SHA-256 for you to compare.
 2. **Signature**, once this server has an update signing key pinned in `/etc/hearth-update.pub`: `<zip>.sig` must
@@ -471,13 +470,14 @@ What the update log says, and what to do:
 | `can't be checked: this server can't check Ed25519 signatures` | A key is pinned, but neither OpenSSL 3.0 or newer nor Node.js is installed (OpenSSL 1.1.1, as on Ubuntu 20.04 and Debian 11, can't check them). Install Node.js (Hearth's own, outside Docker) or a newer OpenSSL. |
 | `… but this server can't check Ed25519 signatures …, so it isn't pinned` | No key is pinned yet and this server couldn't check one, so updates stay on checksums. Install Node.js or OpenSSL 3.0+ and the next key-carrying update pins its key. |
 | `update-signing.pub (or a folder it's in) can be changed by an account other than root, so it isn't trusted` | The installed Hearth's own key isn't pinned (its folder belongs to Hearth's account, as in plain installs); the first update that brings a key pins that one. Compare it with the release notes. |
-| `is Hearth X, older than the installed Y` | Use `hearth-update --rollback` to go back, or, if you really mean it, put the zip and its `.sig` on the server and run `sudo hearth-update --allow-downgrade <zip>` there (the update tools don't do downgrades). |
+| `is Hearth X, older than the installed Y` | Use `hearth-update --rollback` to go back, or, if you really mean it, put the zip and its `.sig` on the server and run `sudo hearth-update --allow-downgrade <zip>` there. |
 | `Going ahead anyway because of --allow-unsigned` / `installed WITHOUT a valid signature` | Someone overrode the check for this update. The full log stays in `/root/hearth-backups/last-update.log`. |
 
-The update tools stop with exit code **93** when the updater already on the server refuses the zip (the lines
-above it say why), or when the server pins a key but its installed updater can't check signatures (an older one
-was put back, or it's gone; `--allow-unsigned` goes ahead anyway, with a warning); 90–92 still mean the upload or
-the zip itself was wrong. In all four cases nothing ran.
+Run the updater that's already installed (`sudo hearth-update <zip>`), not the copy inside a new zip: then the
+copy you already trust does the checking. On a server that has never run it, install it once from the current
+Hearth folder: `sudo install -m 755 scripts/hearth-update.sh /usr/local/bin/hearth-update`. An updater from before
+signed updates doesn't check signatures; `hearth-update --status` without an "update key" line means it's one of
+those, so install the current one the same way.
 
 ### Database copies made before upgrades
 
