@@ -138,7 +138,7 @@ jobs:
       - name: Hand the app to SignPath
         id: unsigned-app
         if: steps.signing.outputs.method == 'signpath'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hearth-windows-unsigned-app
           path: hearth/desktop/dist/win-unpacked/Hearth.exe
@@ -168,7 +168,7 @@ jobs:
       - name: Hand the installer to SignPath
         id: unsigned-setup
         if: steps.signing.outputs.method == 'signpath'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hearth-windows-unsigned-setup
           path: hearth/desktop/dist/Hearth-Setup-*.exe
@@ -212,7 +212,7 @@ jobs:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
           if [ -n "$UPDATE_SIGNING_KEY" ]; then node build/sign-update.js sign dist; fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hearth-desktop-${{ runner.os }}
           path: |
@@ -341,12 +341,12 @@ jobs:
           mkdir -p ../dist ../play
           cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-$VERSION_NAME.apk"
           if [ -n "$BUNDLE" ]; then cp app/build/outputs/bundle/release/app-release.aab "../play/Hearth-$VERSION_NAME-$VERSION_CODE.aab"; fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hearth-android
           path: hearth/mobile/dist/*.apk
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.secretkey.outputs.found == '1'
         with:
           name: hearth-android-play-bundle
