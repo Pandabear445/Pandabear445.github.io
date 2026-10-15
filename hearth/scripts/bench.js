@@ -122,7 +122,7 @@ if (process.env.HEARTH_BENCH_WORKER === '1') {
 // ------------------------------------------------------------------ the server process
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-bench-'));
 let PORT; let BASE; let child = null; let log = '';
-const env = () => ({ ...process.env, DATA_DIR: DIR, PORT: String(PORT), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test', MAIL_OUTBOX_DIR: path.join(DIR, 'outbox'), PUBLIC_URL: 'https://chat.example.test' });
+const env = () => ({ ...process.env, DATA_DIR: DIR, PORT: String(PORT), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test', PUBLIC_URL: 'https://chat.example.test' });
 async function start() {
   log = '';
   const t0 = performance.now();

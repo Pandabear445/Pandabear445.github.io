@@ -50,7 +50,7 @@ start() {
   local port; port="$(free_port)"
   BASE="http://127.0.0.1:$port"
   (cd "$code" && exec env DATA_DIR="$data" PORT="$port" HOST=127.0.0.1 HTTPS=false NODE_ENV=test \
-      MAIL_OUTBOX_DIR="$data/outbox" PUBLIC_URL=https://chat.example.test "$@" node server/index.js) >"$WORK/server.log" 2>&1 &
+      PUBLIC_URL=https://chat.example.test "$@" node server/index.js) >"$WORK/server.log" 2>&1 &
   PID=$!
   PIDS+=("$PID")
 }
@@ -93,7 +93,6 @@ for ref in "${REFS[@]}"; do
     drill pack "$data" "$state" "$HEARTH/test/fixtures/upgrade-v$old_schema-$short.hfx.gz" | sed 's/^/   /'
   fi
   cp -a "$data" "$data-crash"
-  rm -rf "$data-crash/outbox"
 
   # The upgrade itself, then two restarts.
   for round in 0 1 2; do

@@ -34,7 +34,7 @@ function oldData() {
 function run(dir, env = {}) {
   return new Promise((resolve) => {
     const port = 30000 + Math.floor(Math.random() * 20000);
-    const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test', MAIL_OUTBOX_DIR: path.join(dir, 'outbox'), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
     let log = '';
     child.stdout.on('data', (x) => { log += x; }); child.stderr.on('data', (x) => { log += x; });
     const base = `http://127.0.0.1:${port}`;

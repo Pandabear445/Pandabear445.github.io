@@ -394,7 +394,7 @@ q_unit() { printf '"%s"' "$(esc_unit "$1")"; }        # quoted, for lists that m
 abs_in() { case "$2" in /*) printf '%s' "$2" ;; *) printf '%s/%s' "$1" "${2#./}" ;; esac; }
 
 harden_systemd() {
-  local unit_file cur_user wd node exec_line data dl mail rw tmpl new reason="" envkeep
+  local unit_file cur_user wd node exec_line data dl rw tmpl new reason="" envkeep
   unit_file="$(systemctl show -p FragmentPath --value "$UNIT" 2>/dev/null || true)"
   [ -n "$unit_file" ] || unit_file="/etc/systemd/system/$UNIT"
   [ -f "$unit_file" ] || { warn "Couldn't find the file for $UNIT."; return 0; }
@@ -420,7 +420,6 @@ harden_systemd() {
   node="$(readlink -f "$node" 2>/dev/null || echo "$node")"
   data="$(abs_in "$wd" "$(envval DATA_DIR)")"; [ -n "$(envval DATA_DIR)" ] || data="$wd/data"
   dl="$(envval DOWNLOADS_DIR)"; [ -n "$dl" ] && dl="$(abs_in "$wd" "$dl")"
-  mail="$(envval MAIL_OUTBOX_DIR)"; [ -n "$mail" ] && mail="$(abs_in "$wd" "$mail")"
 
   # Things that would stop a non-root Hearth from working: say so instead of breaking the site.
   if [ -z "$node" ] || [ ! -x "$node" ]; then reason="Node.js wasn't found"
@@ -451,7 +450,6 @@ harden_systemd() {
   [ -f "$tmpl" ] || { warn "deploy/hearth.service not found; left alone."; return 0; }
   rw="$(q_unit "$data")"
   [ -n "$dl" ] && [[ "$dl" != "$data"/* ]] && rw="$rw $(q_unit "$dl")"
-  [ -n "$mail" ] && [[ "$mail" != "$data"/* ]] && rw="$rw $(q_unit "$mail")"
   envkeep="$(sed -nE '/^\s*\[Service\]/,/^\s*\[/{/^\s*(Environment|EnvironmentFile)\s*=/p}' "$unit_file" | grep -v 'NODE_ENV=production' || true)"
   new="$(awk -v wd="$(esc_unit "$wd")" -v ex="$(esc_unit "$node") server/index.js" -v rw="$rw" -v env="$envkeep" \
              -v home="$( [[ "$wd" == /home/* ]] && echo read-only || echo yes)" -v low="$low_port" '
@@ -491,7 +489,6 @@ harden_systemd() {
     install -d -o hearth -g hearth -m 0700 "$data"
     chown -R hearth:hearth "$data"
     if [ -n "$dl" ]; then mkdir -p "$dl"; chown -R hearth:hearth "$dl"; fi
-    if [ -n "$mail" ]; then mkdir -p "$mail"; chown -R hearth:hearth "$mail"; fi
     if [ -f "$env_file" ]; then
       env_mode="$(stat -c %a "$env_file")"; env_group="$(stat -c %g "$env_file")"
       chgrp hearth "$env_file"; chmod 640 "$env_file"   # Hearth can read its settings; other users can't

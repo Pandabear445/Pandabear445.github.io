@@ -16,6 +16,8 @@
 //                                                  it after a break-in; see docs/RECOVERY.md).
 //   node server/cli.js check-files                 compare the database with data/uploads: files it needs that
 //                                                  are missing, and files nothing refers to
+//   node server/cli.js who PSEUDONYM               the account behind a pseudonym in the logs: the access log's
+//                                                  uid, or a relay login (<expiry>:<pseudonym>) from a relay's log
 // Exit codes: 0 done; 1 failed; 2 restore refused (backup from a newer Hearth); 3 done, but files are missing.
 // Checking an install (server/doctor.js; read-only unless a --fix flag is given):
 //   node server/cli.js doctor [--relays] [--integrity] [--json] [--fix-permissions]
@@ -113,6 +115,15 @@ const settings = () => {
     const f = BK.uploadReport(path.join(DATA_DIR, 'hearth.db'), path.join(DATA_DIR, 'uploads'));
     console.log(`Files: ${f.referenced} the database refers to, ${f.present} in uploads/, ${f.unreferencedCount} not referred to by anything.`);
     if (f.missingCount) { console.error(missingNote(f.missingCount, f.missing, 'are missing from uploads/')); process.exitCode = 3; }
+  } else if (cmd === 'who' && a) {
+    // Pseudonyms are keyed hashes of user ids (log.userHash), so the only way back is to hash every account's id.
+    const { db, atRestKey } = require('./db');
+    const log = require('./log');
+    log.setUserHashKey(atRestKey);
+    const want = a.trim().toLowerCase().replace(/^\d+:/, '');
+    const hits = db.prepare('SELECT id, username, deleted_at FROM users').all().filter((u) => log.userHash(u.id) === want);
+    if (!hits.length) { console.log('No account has that pseudonym on this server.'); process.exitCode = 1; }
+    hits.forEach((u) => console.log(`${u.username} (id ${u.id})${u.deleted_at ? ', deleted' : ''}`));
   } else if (cmd === 'doctor') {
     // Same .env as the server reads, so the checks see the configuration Hearth runs with.
     require('dotenv').config({ quiet: true });
@@ -121,7 +132,7 @@ const settings = () => {
     if (flags.has('--json')) console.log(JSON.stringify(r, null, 2)); else printReport(r);
     process.exitCode = r.exitCode;
   } else {
-    console.log('Usage: node server/cli.js doctor [--relays] [--integrity] [--json] [--fix-permissions] | set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key] [--sign-out-everyone] | check-files');
+    console.log('Usage: node server/cli.js doctor [--relays] [--integrity] [--json] [--fix-permissions] | set-turn <urls> <secret> | add-turn <urls> [secret] | get-turn | get-turn-secret | set-owner <username> | backup | verify-backup <file> [key] | restore <file> <new-data-dir> [key] [--sign-out-everyone] | check-files | who <pseudonym>');
     process.exitCode = 1;
   }
 })().catch((e) => { console.error(e.message); process.exitCode = 1; });

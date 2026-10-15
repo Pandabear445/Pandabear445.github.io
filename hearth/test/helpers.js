@@ -9,6 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const { startSmtpSink } = require('./smtp-sink');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -65,9 +66,13 @@ async function solveCaptchas(list) {
 async function startServer(extraEnv = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-test-'));
   const port = await freePort();
+  // Emails go out over SMTP as on a real server, to a mail sink in this process (read them with mails()). No
+  // SMTP login: the sink offers none, and a developer's own SMTP_USER/SMTP_PASS mustn't be tried against it.
+  const sink = await startSmtpSink();
   const env = {
     ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test',
-    MAIL_OUTBOX_DIR: path.join(dir, 'outbox'), PUBLIC_URL: 'https://chat.example.test', FEED_ALLOW_PRIVATE: '',
+    SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), SMTP_USER: '', SMTP_PASS: '', MAIL_FROM: 'hearth@chat.example.test',
+    PUBLIC_URL: 'https://chat.example.test', FEED_ALLOW_PRIVATE: '',
     // The readable log format prints stack traces on their own lines, which the attack suite counts as crashes
     // (JSON lines would hide them inside a string). Tests that parse the log ask for LOG_FORMAT=json.
     LOG_FORMAT: 'pretty', ...extraEnv,
@@ -88,7 +93,7 @@ async function startServer(extraEnv = {}) {
   const halt = async () => {
     if (child.exitCode === null) { child.kill('SIGTERM'); for (let i = 0; i < 50 && child.exitCode === null; i++) await sleep(50); if (child.exitCode === null) child.kill('SIGKILL'); }
   };
-  await launch();
+  try { await launch(); } catch (e) { await sink.close(); throw e; }
   const config = await (await fetch(base + '/api/config')).json();
 
   const srv = {
@@ -142,12 +147,10 @@ async function startServer(extraEnv = {}) {
       return d;
     },
     sql(q, ...args) { const d = srv.db(); try { return /^\s*select/i.test(q) ? d.prepare(q).all(...args) : d.prepare(q).run(...args); } finally { d.close(); } },
-    mails() {
-      const out = path.join(dir, 'outbox');
-      if (!fs.existsSync(out)) return [];
-      return fs.readdirSync(out).sort().map((f) => JSON.parse(fs.readFileSync(path.join(out, f), 'utf8')));
-    },
-    async stop() { await halt(); fs.rmSync(dir, { recursive: true, force: true }); },
+    // Every email the server has sent so far, oldest first: { to, subject, text }. Waits until mail has stopped
+    // arriving first, since some are sent after the HTTP answer (security notices, reset links).
+    async mails() { await sink.idle(); return sink.messages.map((m) => ({ ...m })); },
+    async stop() { await halt(); await sink.close(); fs.rmSync(dir, { recursive: true, force: true }); },
     // A live connection like an open app window. Resolves once connected (or rejects with the server's reason).
     async socket(token) {
       const { io } = require('socket.io-client');
@@ -165,10 +168,10 @@ async function startServer(extraEnv = {}) {
 
 // Adds an email to an account (through the real confirmation code).
 async function confirmEmail(srv, user, email) {
-  const before = srv.mails().length;
+  const before = (await srv.mails()).length;
   const r = await srv.api('POST', '/me/email', { token: user.token, body: { email, authKey: user.authKey }, ip: user.ip });
   if (r.status !== 200) throw new Error('email: ' + r.text);
-  const mail = srv.mails().slice(before).find((m) => m.to === email);
+  const mail = (await srv.mails()).slice(before).find((m) => m.to === email);
   const code = /is (\d{6})/.exec(mail.subject)[1];
   const v = await srv.api('POST', '/me/email/verify', { token: user.token, body: { code }, ip: user.ip });
   if (v.status !== 200) throw new Error('verify: ' + v.text);

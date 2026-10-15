@@ -1,6 +1,9 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
 // Newest first. Keep each item short and about what people can do.
 export const CHANGES = [
+  { version: '1.28.2', items: [
+    'Privacy: call relays (including other regions\u2019 relays) no longer get your account id, just a stand-in name that stays the same for you. They still see your IP address, as before.',
+  ] },
   { version: '1.28.1', items: [
     'Security fixes from an automated code scan: a generous per-account limit on requests, so one account can\u2019t flood the server; stricter checks on file names, profile CSS and links you open; and the server\u2019s own keys are created safely even if two copies start at once.',
   ] },

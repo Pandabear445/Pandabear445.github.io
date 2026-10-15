@@ -120,14 +120,14 @@ test('admin-2: deleting a backup needs the password again', async () => {
 test('admin-2: handing over ownership needs the password, and the old owner gets an email', async () => {
   await confirmEmail(srv, owner, 'owner@example.test');
   const heir = await srv.register('heir' + hex(3));
-  const before = srv.mails().length;
+  const before = (await srv.mails()).length;
   const noKey = await as(owner, 'POST', '/admin/owner', { userId: heir.id });
   assert.equal(noKey.status, 401); assert.equal(noKey.json.code, 'bad_password');
   assert.equal((await as(owner, 'POST', '/admin/owner', { userId: heir.id, authKey: hex(32) })).status, 401);
   assert.equal((await as(heir, 'GET', '/admin/staff')).status, 403, 'a stolen session alone changes nothing');
   assert.equal((await as(owner, 'POST', '/admin/owner', { userId: heir.id, authKey: owner.authKey })).status, 200);
   assert.equal((await as(heir, 'GET', '/admin/staff')).json.me, 'owner');
-  const mail = srv.mails().slice(before).find((m) => m.to === 'owner@example.test');
+  const mail = (await srv.mails()).slice(before).find((m) => m.to === 'owner@example.test');
   assert.ok(mail, 'the old owner is told by email');
   assert.match(mail.subject, /handed over ownership/);
   assert.match(mail.text, new RegExp(heir.username));

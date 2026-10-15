@@ -104,7 +104,7 @@ const channelMsgs = async (u, ch) => (await as(u, 'GET', `/channels/${ch}/messag
 async function resetWithoutRecovery(user) {
   await H.confirmEmail(srv, user, `${user.username}@example.test`);
   await srv.api('POST', '/auth/forgot', { ip: H.newIp(), body: { login: user.username } });
-  const tok = H.resetTokenFrom(srv.mails().filter((m) => m.to === `${user.username}@example.test` && /reset your password/.test(m.subject)).pop());
+  const tok = H.resetTokenFrom((await srv.mails()).filter((m) => m.to === `${user.username}@example.test` && /reset your password/.test(m.subject)).pop());
   const kdfSalt = E.newKdfSalt();
   const k = await E.deriveKeys(user.username, 'new-pw', { kdf: 'argon2id', salt: kdfSalt });
   const ident = await E.createIdentity(k.wrapKey);

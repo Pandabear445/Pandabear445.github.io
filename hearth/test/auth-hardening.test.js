@@ -366,17 +366,17 @@ read(); setInterval(read, 25).unref(); Date.now = () => real() + off;\n`);
     const u = resetter;
     const forgot = (ip, login, extra = {}) => srv.api('POST', '/auth/forgot', { ip, body: { login, ...extra } });
     // Without a solved check: turned away, nothing counted, no email.
-    const before = srv.mails().length;
+    const before = (await srv.mails()).length;
     const st = [];
     for (let n = 0; n < 61; n++) { const ip = newIp(); for (let i = 0; i < 5; i++) st.push((await forgot(ip, i ? 'nobody' + hex(3) : u.username)).status); }
     assert.ok(st.every((x) => x === 400), JSON.stringify(st));
-    assert.equal(srv.mails().length, before);
+    assert.equal((await srv.mails()).length, before);
     // Made-up names with solved checks: answered like real ones, and still nothing counted.
     for (let i = 0; i < 3; i++) { const ip = newIp(); assert.equal((await forgot(ip, 'nobody' + hex(3), { captcha: await solved(ip) })).status, 200); }
     const ip = newIp();
     const r = await forgot(ip, u.username, { captcha: await solved(ip) });
     assert.equal(r.status, 200, r.text);
-    assert.ok(srv.mails().slice(before).some((m) => m.to === `${u.username}@example.test` && /reset your password/.test(m.subject)), 'the real reset email went out');
+    assert.ok((await srv.mails()).slice(before).some((m) => m.to === `${u.username}@example.test` && /reset your password/.test(m.subject)), 'the real reset email went out');
   });
 });
 
@@ -427,9 +427,9 @@ describe('reset links, IP bans and sessions', () => {
   const rs = (u, method, p, body) => as(srv, u, method, p, body);
 
   async function linkFor(u, email) {
-    const before = srv.mails().length;
+    const before = (await srv.mails()).length;
     assert.equal((await srv.api('POST', '/auth/forgot', { ip: newIp(), body: { login: u.username } })).status, 200);
-    const m = srv.mails().slice(before).find((x) => x.to === email && /reset your password/.test(x.subject));
+    const m = (await srv.mails()).slice(before).find((x) => x.to === email && /reset your password/.test(x.subject));
     assert.ok(m, 'reset mail sent to ' + email);
     return resetTokenFrom(m);
   }
@@ -524,12 +524,12 @@ describe('reset links, IP bans and sessions', () => {
     u.authKey = k1;
     const second = (await srv.login(u)).json.token;
     const fresh = (await srv.login(u)).json.token;
-    const before = srv.mails().length;
+    const before = (await srv.mails()).length;
     const r2 = await srv.api('POST', '/me/password', { token: fresh, ip: u.ip, body: { oldAuthKey: k1, newAuthKey: hex(32), encPrivateKey: b64(60), salt: b64(16), keepSessions: true } });
     assert.equal(r2.status, 200, r2.text);
     assert.equal((await srv.api('GET', '/bootstrap', { token: second, ip: u.ip })).status, 200, 'the upgrade keeps other devices signed in');
     assert.equal(audit('password_upgraded'), 1);
-    assert.ok(srv.mails().slice(before).some((m) => m.to === `${u.username}@x.test` && /re-saved/.test(m.subject)), 'the owner is told');
+    assert.ok((await srv.mails()).slice(before).some((m) => m.to === `${u.username}@x.test` && /re-saved/.test(m.subject)), 'the owner is told');
   });
 
   test('adding an email another account has gives the same answer as a free one', async () => {
@@ -541,7 +541,7 @@ describe('reset links, IP bans and sessions', () => {
     assert.equal(free.status, 200, free.text);
     assert.deepEqual(Object.keys(taken.json).sort(), Object.keys(free.json).sort());
     // The address's owner is told why no code came; guessing a code at verify fails like any wrong code.
-    const toA = srv.mails().filter((m) => m.to === `${a.username}@x.test`);
+    const toA = (await srv.mails()).filter((m) => m.to === `${a.username}@x.test`);
     assert.ok(toA.some((m) => /already has an account/.test(m.subject)));
     assert.ok(!toA.some((m) => /confirmation code/.test(m.subject) && m.text.includes(b.username)), 'no code for b went to a’s inbox');
     await rs(b, 'POST', '/me/email', { email: `${a.username}@x.test`, authKey: b.authKey });

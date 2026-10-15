@@ -7,8 +7,6 @@
 // the reset makes you new keys: friends' apps automatically re-share every server's key with you, but old
 // direct messages can't be read any more. The app explains this before anyone confirms.
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 function b32encode(buf) {
@@ -59,16 +57,10 @@ module.exports = function setupAccounts(ctx) {
       from: v.from || process.env.MAIL_FROM || '', publicUrl: (v.publicUrl || process.env.PUBLIC_URL || '').replace(/\/+$/, ''),
     };
   }
-  const mailReady = () => { const c = mailCfg(); return !!((c.host && c.from) || process.env.MAIL_OUTBOX_DIR) && !!c.publicUrl; };
+  const mailReady = () => { const c = mailCfg(); return !!(c.host && c.from && c.publicUrl); };
   let transport = null; let transportKey = '';
   async function sendMail({ to, subject, text }) {
     const c = mailCfg();
-    // For testing: write emails to a folder instead of sending them.
-    if (process.env.MAIL_OUTBOX_DIR) {
-      fs.mkdirSync(process.env.MAIL_OUTBOX_DIR, { recursive: true });
-      fs.writeFileSync(path.join(process.env.MAIL_OUTBOX_DIR, `${now()}-${crypto.randomBytes(3).toString('hex')}.json`), JSON.stringify({ to, subject, text }, null, 2));
-      return;
-    }
     if (!c.host || !c.from) fail(503, 'Email isn’t set up on this server yet.');
     const key = JSON.stringify([c.host, c.port, c.user, c.pass]);
     if (!transport || key !== transportKey) {

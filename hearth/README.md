@@ -272,7 +272,7 @@ GIPHY needs a free API key (GIPHY no longer offers a shared public key):
 
 Good to know:
 - New keys are "beta" keys limited to roughly **100 searches per hour** for the whole server. If your community outgrows that, apply for a free production key in the GIPHY dashboard and paste it in.
-- **Privacy proxy (on by default):** GIFs are fetched by your server and passed on, so GIPHY sees your server, not your members. Only GIPHY's media hosts are allowed, and links carry a token tied to the viewer's sign-in, so it can't be used as a general proxy. It uses some bandwidth; turn it off in Settings → Instance if you'd rather not.
+- **Privacy proxy (on by default):** GIFs are fetched by your server and passed on, so GIPHY sees your server, not your members. Only GIPHY's and KLIPY's media hosts are allowed (the server rebuilds every address it fetches from that list), and links carry a token tied to the viewer's sign-in, so it can't be used as a general proxy. It uses some bandwidth; turn it off in Settings → Instance if you'd rather not.
 - GIF searches go from your server to GIPHY, which sees the search words (not who searched). Sent GIFs are links inside your encrypted messages, but **your server learns which GIFs people pick and load**: the app reports each pick (that's how the server's own GIF library learns), and proxied GIFs are fetched with the viewer's token.
 - Content rating defaults to PG-13 and can be changed in Settings → Instance.
 - People with **Manage emoji** can turn any GIPHY GIF or sticker into a server emoji (Server settings → Emoji → Add from GIPHY).
@@ -608,6 +608,8 @@ are never logged, and IP addresses are cut to their network (`LOG_FULL_IP=true` 
   alerts to the owner by email.
 - `node server/cli.js doctor`: read-only checks of your install, exit 0/1/2. Add `--relays` to test relays, or
   `--fix-permissions` to tighten key file permissions.
+- `node server/cli.js who <pseudonym>`: logs name people by a pseudonym, not their user id (the access log's `uid`, and
+  the part after the colon in a relay login). This finds the account behind one.
 
 See `docs/OPERATIONS.md`.
 
