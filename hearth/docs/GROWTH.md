@@ -113,7 +113,7 @@ rules require.
 > What's in it:
 > - Servers with text and voice channels, roles and permissions, threads, DMs and group chats (up to 25)
 > - Voice, video and screen sharing with sound; watch YouTube, Twitch or a video file together in a call
-> - Messages, files and calls are end-to-end encrypted in the app; the server stores ciphertext
+> - Messages and files are end-to-end encrypted in the app (the server stores ciphertext); calls are encrypted between the people in them (DTLS-SRTP, no media server)
 > - Desktop app (Windows/Mac/Linux), Android app, installable web app
 > - Import a Discord server's roles and channels from a server template (not message history)
 >
@@ -165,8 +165,9 @@ encryption, screen sharing.
 
 > Hearth is a chat app for friend groups and small communities that you can host yourself. It has servers with
 > text and voice channels, roles, threads, direct messages and group chats, voice and video calls with screen
-> sharing, and a player for watching videos together. Messages, files and calls are end-to-end encrypted in the
-> app, so the server stores only encrypted data (it still sees who talks to whom and when). It runs as one
+> sharing, and a player for watching videos together. Messages and files are end-to-end encrypted in the
+> app, so the server stores only encrypted data (it still sees who talks to whom and when), and calls are
+> encrypted between the people in them. It runs as one
 > Node.js process with SQLite, installs with Docker, and has desktop apps for Windows, Mac and Linux, an Android
 > app and an installable web app. Free and MIT licensed, with no ads, and every feature works for everyone (each
 > server's owner decides whether supporters get extra storage and bigger files).
