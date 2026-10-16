@@ -197,12 +197,14 @@ export function sentence(e, users) {
     case 'voice_mute': return [[who, ' server-muted ', them, d.channel ? ` (in ${ch})` : '']];
     case 'voice_unmute': return [[who, ' lifted the server mute of ', them]];
     case 'server_update': {
-      const ch2 = (d.changes || []).filter((k) => k !== 'name' && k !== 'hideHistory').map((k) => SETTING[k] || k);
+      const ch2 = (d.changes || []).filter((k) => k !== 'name' && k !== 'hideHistory' && k !== 'invitePreview').map((k) => SETTING[k] || k);
       const out = [who];
       if (d.name) out.push(` renamed the server from ${quoted(d.name.from)} to ${quoted(d.name.to)}`);
       if (ch2.length) out.push(`${d.name ? ' and' : ''} ${d.removed ? 'removed' : 'changed'} ${list(ch2)}`);
       // "New members can't read messages from before they joined" (the entry says which way it went).
       if ((d.changes || []).includes('hideHistory')) out.push(`${d.name || ch2.length ? ' and' : ''} turned ${d.hideHistory ? 'on' : 'off'} ${quoted('New members can’t read messages from before they joined')}`);
+      // Invite link previews showing the server's name (server/invitepreview.js), the same way.
+      if ((d.changes || []).includes('invitePreview')) out.push(`${d.name || ch2.length || (d.changes || []).includes('hideHistory') ? ' and' : ''} turned ${d.invitePreview ? 'on' : 'off'} ${quoted('Show this server’s name and member count in invite link previews')}`);
       return [out];
     }
     case 'server_transfer': return [[who, ' made ', them, ' the owner', d.from ? ` (it was ${nameOf(users, d.from)})` : '']];

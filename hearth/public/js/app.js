@@ -46,6 +46,7 @@ import { bindNew, bindEdit, describe as describeBinding, createVersions, createC
 import { trackViewport } from './viewport.js';
 import { initAway, CLEAR_AFTER, clearAfterMs, clearsLabel, onlyPresenceChanged } from './presence.js';
 import { createWordFilter, filterLabel, previewLabel } from './wordfilter-app.js';
+import { inviteMessage, movingMessage, joinNote, signUpMode, canShare, nudgeWanted, nudgeDismissed, dismissNudge } from './invite-share.js';
 
 // ======================================================================= state
 const S = {
@@ -245,6 +246,26 @@ function saveDeviceNote(username, note) {
     localStorage.setItem(DEVICE_NOTES, JSON.stringify(all));
   } catch { /* storage blocked: the limit for this network still applies */ }
 }
+// Signed out with an invite link (kept from start-up until after signing in, when the join dialog opens): say what
+// it's for. The server's name only when it chose to show it in invite previews (server/invitepreview.js); otherwise,
+// or if the server can't be asked, "a server".
+function inviteBanner() {
+  const box = $('#auth-invite');
+  const code = sessionStorage.getItem('hearth.pendingInvite');
+  box.hidden = !code;
+  if (!code) return;
+  const open = S.config.registrationOpen && !S.config.registrationRequiresCode;
+  const draw = (serverName) => {
+    clear(box).append(h('span', null, 'You’re invited to ', h('strong', null, serverName || 'a server'), ` on ${S.config.name}. `,
+      open ? 'Create an account or sign in to join.' : S.config.registrationRequiresCode ? 'Sign in to join, or create an account with a sign-up code from whoever invited you.' : 'Sign in to join.'),
+    open ? h('button', { type: 'button', class: 'link-btn auth-invite-new', onclick: () => { $('#login-form').hidden = true; $('#register-form').hidden = false; const u = $('#register-form [name=username]'); if (u) u.focus(); } }, 'Create an account') : null);
+  };
+  draw(null);
+  api('GET', `/invites/${encodeURIComponent(code)}/preview`)
+    .then((p) => { if (p && p.server && sessionStorage.getItem('hearth.pendingInvite') === code) draw(p.server.name); })
+    .catch(() => { /* the generic line stays */ });
+}
+
 // While lots of people are signing in (or this network keeps getting passwords wrong), the server can ask for a
 // harder robot check: solve a new one and try once more.
 const harderOnce = (attempt) => attempt().catch((ex) => (ex.code === 'captcha_harder' ? attempt() : Promise.reject(ex)));
@@ -258,6 +279,7 @@ function showSignIn() {
   $('#insecure-warning').hidden = secure;
   $('#reg-code-field').hidden = !S.config.registrationRequiresCode;
   if (!S.config.registrationOpen) $('#to-register').parentElement.hidden = true;
+  inviteBanner();
 
   // "I'm not a robot" checks. They start solving as soon as someone starts filling in the form.
   const loginCap = captchaWidget('login');
@@ -785,6 +807,7 @@ function startApp() {
       renderSidebar(); renderHeader(); renderPanel();
       if (composers.main) composers.main.renderExtras();
       refreshWelcomeRoles(server);
+      refreshInviteNudge(server);
     }
     else if (server.kind === 'group' && !S.view.serverId) renderSidebar();
   });
@@ -810,7 +833,7 @@ function startApp() {
     if (s && !s.memberIds.includes(user.id)) s.memberIds.push(user.id);
     // Someone joining (or coming back) has no roles yet: any the server hands out follow in a server update.
     if (s && s.memberRoles) s.memberRoles[user.id] = [];
-    if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
+    if (S.view.serverId === serverId) { renderPanel(); renderHeader(); refreshInviteNudge(s); }
   });
   socket.on('member:remove', ({ serverId, userId }) => {
     const s = S.servers.find((x) => x.id === serverId);
@@ -823,7 +846,7 @@ function startApp() {
       if (s.nicknames) delete s.nicknames[userId];
       s.channels.forEach((c) => { if (c.overrides) c.overrides = c.overrides.filter((o) => !(o.type === 'member' && o.id === userId)); });
     }
-    if (S.view.serverId === serverId) { renderPanel(); renderHeader(); }
+    if (S.view.serverId === serverId) { renderPanel(); renderHeader(); refreshInviteNudge(s); }
   });
   // A nickname set, changed or removed in one of your servers (server/nicknames.js).
   socket.on('member:nick', ({ serverId, userId, nickname } = {}) => applyNick(serverId, userId, typeof nickname === 'string' ? nickname : null));
@@ -3638,6 +3661,7 @@ function welcomeBlock() {
   const th = server.theme || {};
   return h('div', { class: 'welcome' }, h('div', { class: 'welcome-ic' }, icon(channelIcon(c))), h('h2', null, `Welcome to #${c.name}`),
     h('p', null, c.topic || 'This is the start of the channel.'),
+    h('div', { class: 'welcome-invite-slot' }, inviteNudge(server, c)),
     th.welcome ? h('div', { class: 'server-welcome', html: md(th.welcome, { mentionName: S.me.username }) }) : null,
     h('div', { class: 'welcome-roles-slot' }, welcomeRoles(server)),
     h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only members of this server can read it.'),
@@ -3647,6 +3671,29 @@ function welcomeBlock() {
 // marked or unmarked (server:update), since the message list itself isn't.
 function welcomeRoles(server) {
   return pickableRoles(server, S.me.id).length ? h('button', { class: 'btn ghost sm welcome-roles', onclick: () => pickRoles(currentServer() || server) }, icon('at'), 'Pick your roles') : null;
+}
+// "It's just you here. Invite people": at the top of a server's first text channel while you're its only member and
+// may invite people (invite-share.js), until you dismiss it in this browser. Goes by itself once someone joins.
+function inviteNudge(server, c) {
+  const first = server.channels.find((x) => x.type === 'text');
+  if (!c || !first || first.id !== c.id) return null;
+  if (!nudgeWanted(server, { canInvite: can(server, PERMS.CREATE_INVITE), dismissed: nudgeDismissed(server.id) })) return null;
+  return h('div', { class: 'invite-nudge', role: 'note' }, icon('userPlus'),
+    h('span', { class: 'invite-nudge-text' }, 'It’s just you here.'),
+    h('button', { class: 'btn primary sm', onclick: () => openInvite(currentServer() || server) }, 'Invite people'),
+    h('button', { class: 'icon-btn sm invite-nudge-x', 'aria-label': 'Dismiss', onclick: () => {
+      dismissNudge(server.id);
+      refreshInviteNudge(currentServer() || server);
+      const box = $('#composer-input'); if (box) box.focus({ preventScroll: true });
+    } }, icon('close')));
+}
+function refreshInviteNudge(server) {
+  if (!server || S.view.serverId !== server.id) return;
+  const c = server.channels.find((x) => x.id === S.view.channelId);
+  for (const slot of document.querySelectorAll('#messages .welcome-invite-slot')) {
+    const card = inviteNudge(server, c);
+    if (!!card !== !!slot.firstChild) { clear(slot); if (card) slot.append(card); }
+  }
 }
 function refreshWelcomeRoles(server) {
   for (const slot of document.querySelectorAll('#messages .welcome-roles-slot')) {
@@ -7244,7 +7291,7 @@ function openAddServer() {
     body: h('div', { class: 'stack' },
       h('button', { class: 'choice', onclick: () => { m.close(); openCreateServer(); } }, icon('plus', 'ic choice-ic'), h('span', null, h('strong', null, 'Create my own'), h('span', null, 'Start a space for you and your friends.'))),
       h('button', { class: 'choice', onclick: () => { m.close(); openJoinModal(''); } }, icon('link', 'ic choice-ic'), h('span', null, h('strong', null, 'Join with an invite'), h('span', null, 'Paste an invite link or code from a friend.'))),
-      h('button', { class: 'choice', onclick: () => { m.close(); openDiscordImport({ S, sec, openServer, back: openAddServer }); } }, icon('download', 'ic choice-ic'),
+      h('button', { class: 'choice', onclick: () => { m.close(); openDiscordImport({ S, sec, openServer, back: openAddServer, invite: (srv) => openInvite(srv, { welcome: 'imported' }) }); } }, icon('download', 'ic choice-ic'),
         h('span', null, h('strong', null, 'Import from Discord'), h('span', null, 'Start with a Discord server’s roles and channels.')))),
   });
 }
@@ -7271,6 +7318,8 @@ function openCreateServer() {
         if (!S.servers.find((x) => x.id === s.id)) S.servers.push(s);
         if (s.keyState) await sec.applyState(s.keyState);
         openServer(s.id);
+        // The moment people most want to bring their friends: hand them the link and a message to send.
+        if (can(s, PERMS.CREATE_INVITE)) openInvite(s, { welcome: 'created' });
       } },
     ],
   });
@@ -7316,27 +7365,65 @@ function openJoinModal(code) {
   });
   if (code) look();
 }
-function openInvite(server) {
+// The invite dialog. welcome: 'created' or 'imported' right after making a server ("Your server is ready. Invite
+// your people."), with a ready-to-send message, and for an import an announcement to post on Discord. Share opens
+// the device's own share sheet where there is one (invite-share.js); nothing is sent by Hearth itself.
+function openInvite(server, { welcome } = {}) {
+  server = S.servers.find((x) => x.id === server.id) || server;
   const out = h('input', { class: 'input mono', readonly: true, value: 'Creating\u2026', 'aria-label': 'Invite link' });
-  // Links expire after 7 days unless you choose otherwise, so one that leaks or gets forgotten stops working.
+  // Links expire after 7 days unless you choose otherwise, so one that leaks or gets forgotten stops working. An
+  // announcement for a moving server stays up for a while, so that one starts at 30 days.
   const expires = h('select', { class: 'input' }, [['1', '1 hour'], ['24', '1 day'], ['168', '7 days'], ['720', '30 days'], ['0', 'Never']].map(([v, l]) => h('option', { value: v }, l)));
-  expires.value = '168';
+  expires.value = welcome === 'imported' ? '720' : '168';
   const uses = h('select', { class: 'input' }, [['0', 'No limit'], ['1', '1 use'], ['5', '5 uses'], ['10', '10 uses'], ['25', '25 uses']].map(([v, l]) => h('option', { value: v }, l)));
+  let link = ''; // the link once made (not an error message shown in its place)
+  const extras = [];
   const make = async () => {
+    link = '';
+    extras.forEach((b) => { b.disabled = true; });
     try {
       // reuse: the same kind of link made in the last few minutes comes back, so reopening this doesn't make another.
       const { code } = await api('POST', `/servers/${server.id}/invites`, { expiresHours: expires.value, maxUses: uses.value, reuse: true });
-      out.value = `${location.origin}/invite/${code}`;
+      link = `${location.origin}/invite/${code}`;
+      out.value = link;
+      extras.forEach((b) => { b.disabled = false; });
     } catch (e) { out.value = e.message; }
   };
   expires.onchange = make; uses.onchange = make;
+  const copied = async (btn, text, note) => {
+    if (!link) return;
+    await copyText(text());
+    toast(note);
+    const was = btn.textContent;
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = was; }, 1500);
+  };
+  // What the words promise follows how this instance lets new people in (open, sign-up code, or closed).
+  const mode = signUpMode(S.config);
+  const message = () => inviteMessage({ serverName: server.name, link, instance: S.config.name, mode });
+  const shareBtn = canShare({ desktop: !!window.hearthDesktop, android: androidApp.on }) ? h('button', { class: 'btn ghost sm invite-share', disabled: true, onclick: async () => {
+    if (!link) return;
+    try { await navigator.share({ title: server.name, text: inviteMessage({ serverName: server.name, link: null, instance: S.config.name, mode }), url: link }); } catch (e) { if (e && e.name !== 'AbortError') toast('Couldn’t open the share sheet. Copy the message instead.'); }
+  } }, 'Share…') : null;
+  const msgBtn = h('button', { class: 'btn ghost sm invite-copy-msg', disabled: true, onclick: (e) => copied(e.currentTarget, message, 'Invite message copied.') }, 'Copy invite message');
+  const movingBtn = welcome === 'imported' ? h('button', { class: 'btn ghost sm invite-copy-moving', disabled: true,
+    onclick: (e) => copied(e.currentTarget, () => movingMessage({ link, hours: +expires.value, mode, instance: S.config.name }), 'Announcement copied. Paste it in your Discord server.') }, 'Copy a moving announcement for Discord') : null;
+  extras.push(...[shareBtn, msgBtn, movingBtn].filter(Boolean));
   modal({
-    title: `Invite people to ${server.name}`, size: 'sm',
+    title: welcome ? 'Your server is ready. Invite your people.' : `Invite people to ${server.name}`, size: 'sm', className: welcome ? 'invite-welcome' : '',
+    // A new server's welcome: back to the channel once it closes (the dialog that opened it is gone by then).
+    onClose: welcome ? () => setTimeout(() => { if (document.activeElement === document.body) { const c = $('#composer-input'); if (c) c.focus({ preventScroll: true }); } }, 160) : undefined,
     body: h('div', { class: 'stack' },
       h('p', { class: 'muted-p' }, 'Send this link to people. They need to be able to reach this computer or VPS.'),
+      // Always when new people need a sign-up code or can't sign up at all; otherwise only in the welcome.
+      welcome || mode !== 'open' ? h('p', { class: `muted-p invite-signup invite-signup-${mode}` },
+        joinNote({ serverName: server.name, instance: S.config.name, mode, manages: ['owner', 'admin'].includes(S.me.staffRole) })) : null,
       h('div', { class: 'row gap' }, out, h('button', { class: 'btn primary', onclick: async (e) => { await copyText(out.value); e.target.textContent = 'Copied'; setTimeout(() => { e.target.textContent = 'Copy'; }, 1500); } }, 'Copy')),
+      h('div', { class: 'row gap invite-extras' }, ...extras),
+      welcome === 'imported' ? h('p', { class: 'field-hint' }, 'The announcement says when the link expires. Choose Never below if you’ll pin it there.') : null,
       h('div', { class: 'row gap' }, field('Expires after', expires), field('Max uses', uses)),
       can(server, PERMS.MANAGE_SERVER) ? h('p', { class: 'field-hint' }, 'See or revoke invite links in Server settings \u2192 Invites.') : null),
+    actions: welcome ? [{ label: 'Done', kind: 'primary' }] : [],
   });
   make();
 }
@@ -7528,6 +7615,14 @@ function openServerSettings(server, startTab = 'overview') {
         // Refused (say, changed too often): the switch goes back to what the server has.
         run(() => api('PATCH', `/servers/${s.id}`, { hideHistory: box.checked }), box.checked ? 'New members will only see messages from after they join.' : 'New members can read earlier messages again.')
           .then(() => { box.checked = !!live().hideHistory; });
+      } }), h('span', { class: 'switch-track' }))),
+      // Invite link previews (server/invitepreview.js): off, a link's preview only says it's an invite to a server here.
+      h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Show this server’s name and member count in invite link previews'),
+        h('span', { class: 'field-hint' }, `Anyone who has one of this server’s invite links sees “Join ${s.name} on ${S.config.name}” and how many members it has before signing in, and so do the preview bots of apps the link is pasted into, like Discord’s, Reddit’s and X’s. Never its icon, channels, members or messages. Off, previews only say it’s an invite to a server on ${S.config.name}.`)),
+      h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: !!s.invitePreview, onchange: (e) => {
+        const box = e.target;
+        run(() => api('PATCH', `/servers/${s.id}`, { invitePreview: box.checked }), box.checked ? 'Invite link previews now show this server’s name.' : 'Invite link previews no longer show this server’s name.')
+          .then(() => { box.checked = !!live().invitePreview; });
       } }), h('span', { class: 'switch-track' }))));
   }
 

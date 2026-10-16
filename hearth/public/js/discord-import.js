@@ -385,7 +385,7 @@ function openPreview(ctx, state) {
         if (!ctx.S.servers.find((x) => x.id === server.id)) ctx.S.servers.push(server);
         if (server.keyState) await ctx.sec.applyState(server.keyState);
         ctx.openServer(server.id);
-        showReport(server, { ...plan, report });
+        showReport(server, { ...plan, report }, ctx);
       } },
     ],
   });
@@ -395,7 +395,9 @@ function openPreview(ctx, state) {
 }
 
 // ------------------------------------------------------------------ step 3: what happened
-function showReport(server, plan) {
+// Then straight on to inviting people (app.js openInvite in its 'imported' welcome, with an announcement to post on
+// Discord), when the app passed that in.
+function showReport(server, plan, ctx = {}) {
   const c = plan.report.counts;
   const groups = leftBehind(plan.report);
   const lines = widenedLines(plan);
@@ -403,12 +405,13 @@ function showReport(server, plan) {
     title: `Imported ${server.name}`, size: 'md',
     body: h('div', { class: 'stack' },
       h('p', { class: 'muted-p' }, `Made ${plural(c.roles, 'role')}, ${plural(c.categories, 'category', 'categories')} and ${plural(c.channels, 'channel')}. You own it.`),
-      h('p', { class: 'muted-p' }, 'Next: invite people (server menu → Invite people), then give out roles in Server settings → Roles or from the member list.'),
+      h('p', { class: 'muted-p' }, ctx.invite ? 'Next: invite your people, then give out roles in Server settings → Roles or from the member list.'
+        : 'Next: invite people (server menu → Invite people), then give out roles in Server settings → Roles or from the member list.'),
       lines.length ? h('div', { class: 'warn-box stack tight' }, h('strong', null, 'Hearth allows more than Discord did'), h('ul', { class: 'perk-list' }, lines.map((t) => h('li', null, t)))) : null,
       groups.length ? h('section', { class: 'di-section' }, h('h3', { class: 'set-h' }, 'Skipped'), groupsEl(groups)) : null),
     actions: [
       { label: 'Copy report', action: async () => { await copyText(reportText(server.name, plan)); toast('Report copied.'); return false; } },
-      { label: 'Done', kind: 'primary' },
+      ...(ctx.invite ? [{ label: 'Done' }, { label: 'Invite people', kind: 'primary', action: () => { setTimeout(() => ctx.invite(server)); } }] : [{ label: 'Done', kind: 'primary' }]),
     ],
   });
 }

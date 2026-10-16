@@ -433,6 +433,8 @@ function serializeServer(s, uid, common = serverCommon(s), ev = null) {
   if (myBase & PM.MANAGE_ROLES) out.soldRoles = common.soldRoles;
   // "New members can't read messages from before they joined" (server/joinhistory.js): the same for every member.
   if (out.kind !== 'group') out.hideHistory = !!s.hide_history;
+  // Whether invite link previews show this server's name and member count (server/invitepreview.js).
+  if (out.kind !== 'group') out.invitePreview = !!s.invite_preview;
   if (out.kind === 'group') { out.last = common.last; out.lastMessageAt = common.lastMessageAt; }
   const to = USE && out.kind !== 'group' ? USE.timeoutOf(s.id, uid) : null;
   if (to) out.timeout = { until: to.until, reason: to.reason };
@@ -1293,6 +1295,10 @@ app.get('/sw.js', (req, res) => {
   res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
   res.send(SW_TEMPLATE.replace('__VERSION__', BUILD).replace("'__ASSETS__'", JSON.stringify(APP_ASSETS)));
 });
+// The app's page carries the instance's name and tagline for link previews (server/invitepreview.js, set up below
+// with the other routes); it's answered here, before the static files.
+let appPage = null;
+app.get(['/', '/index.html'], (req, res, next) => (appPage ? appPage(req, res) : next()));
 app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
 // Android App Links: with this file, a phone that has a Hearth app built for this server (HEARTH_SERVER in the
@@ -2590,6 +2596,13 @@ api.patch('/servers/:id', auth, (req, res) => {
     if (typeof body.hideHistory !== 'boolean') fail(400, 'hideHistory is true or false.');
     if (historyChange) rateLimit(`hidehistory:${srv.id}:${req.userId}`, 10, HOUR_MS);
   }
+  // Invite link previews show the server's name and member count (server/invitepreview.js): Manage Server, like the
+  // rest of these settings; not in group chats, which have no invite links.
+  const previewChange = body.invitePreview !== undefined && body.invitePreview !== !!srv.invite_preview;
+  if (body.invitePreview !== undefined) {
+    if (srv.kind === 'group') fail(400, 'Group chats don’t have invite links.');
+    if (typeof body.invitePreview !== 'boolean') fail(400, 'invitePreview is true or false.');
+  }
   // The category order is about channels: it needs Manage Channels however it comes (with other changes, or in a
   // group chat), and is worked out before anything is written, since it can be refused (server/channelorder.js).
   let categoryPlan = null;
@@ -2641,7 +2654,13 @@ api.patch('/servers/:id', auth, (req, res) => {
     rekey = HIST.set(srv.id, hideHistory);
     changes.push('hideHistory');
   }
-  if (changes.length) serverAudit(srv, req.userId, 'server_update', null, { changes, name: renamed || undefined, hideHistory });
+  let invitePreview;
+  if (previewChange) {
+    invitePreview = body.invitePreview;
+    db.prepare('UPDATE servers SET invite_preview = ? WHERE id = ?').run(invitePreview ? 1 : 0, srv.id);
+    changes.push('invitePreview');
+  }
+  if (changes.length) serverAudit(srv, req.userId, 'server_update', null, { changes, name: renamed || undefined, hideHistory, invitePreview });
   if (reordered) serverAudit(srv, req.userId, 'category_reorder');
   if (rekey) emitKeyState(srv.id);
   emitServer(srv.id);
@@ -6701,6 +6720,22 @@ require('./health').setupHealth({ api, auth, adminOnly, wrap, fail, rateLimit, l
   sockets: () => (io ? io.engine.clientsCount : 0), listEncBackups, listBackups, autoBackup, NEWS_BOT_ID, isAlive: REG.isAlive,
   app, getSetting, setSetting, sealSecret, openSecret, brandName: () => brand().name, emitAdmins, countHit, hitsSoFar, netOf });
 
+// The address people use for this server, for what leaves it (the invite card's picture): Admin → Email's public
+// address, PUBLIC_URL, or the first PUBLIC_HOSTS name when Hearth serves https itself. Never the request's Host header.
+function publicOrigin() {
+  let v = {};
+  try { v = JSON.parse(getSetting('mail') || '{}') || {}; } catch { /* none */ }
+  const set = String(v.publicUrl || process.env.PUBLIC_URL || '').trim();
+  if (set) return set;
+  const host = (process.env.PUBLIC_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean)[0];
+  if (!host || !USE_HTTPS) return '';
+  return `https://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}${PORT === 443 ? '' : `:${PORT}`}`;
+}
+// Invite links that unfurl (server/invitepreview.js): /invite/<code> and /api/invites/:code/preview, before anyone
+// signs in. Nothing about a server unless it opted in, and never for a link that no longer works.
+const INVITE_CARDS = require('./invitepreview')({ app, api, db, now, brand, publicOrigin, countHit, limitNet, netOf, PUBLIC_DIR });
+appPage = INVITE_CARDS.appPage;
+
 // ---------------------------------------------------------------- errors + SPA fallback
 api.use((req, res) => res.status(404).json({ error: 'Not found.' }));
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
@@ -6720,7 +6755,7 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   // asks for a new one instead of sending the spent one again (see stepUp).
   res.status(status).json({ error: expected ? err.message : 'Something broke on the server.', code: err.code, ...(req.stepUpSpent ? { codeUsed: true } : {}) });
 });
-app.get(/^\/(?!api|uploads|socket\.io).*/, (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
+app.get(/^\/(?!api|uploads|socket\.io).*/, (req, res) => INVITE_CARDS.appPage(req, res));
 
 // ---------------------------------------------------------------- HTTP(S) + sockets
 async function loadTls() {

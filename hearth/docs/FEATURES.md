@@ -1499,3 +1499,104 @@ The server's copy of a server carries `hideHistory`; the key state carries `sinc
 - Deletions are announced to everyone who can see the channel (`message:delete`, `message:delete-bulk`), older
   messages included: the event carries ids only, nothing the newcomer could open, and their app has nothing to
   remove.
+
+## Invite links that unfurl, and inviting your people
+
+Every invite link someone shares is a small advertisement for their server. Before this, `/invite/<code>` was the app's
+bare page: pasted into Discord, Reddit, X or a text message it previewed as nothing, and a signed-out visitor saw a plain
+sign-in form with no word about why they were there. Server owners also got no nudge to invite anyone after making a
+server. This adds both, with no tracking and nothing public by default (`server/invitepreview.js`,
+`public/js/invite-share.js`).
+
+**Link previews** (`GET /invite/:code`): the app's page, with Open Graph and Twitter card tags in place of its title.
+
+- By default the card says "You're invited to a server on *instance*" and "Hearth is free, private chat. Messages are
+  end-to-end encrypted." It is byte for byte the same for every code (unknown, expired, used up and revoked ones too),
+  so the page can't be used to check whether a code works.
+- A server can opt in: **Server settings → Overview → Privacy → "Show this server's name and member count in invite
+  link previews"** (Manage Server, off by default, in the server's audit log, `servers.invite_preview` in v19). Then a
+  link that still works shows "Join *server* on *instance*" and "*n* members". Never the icon, the description,
+  channels, members' names or anything anyone wrote. Group chats have no invite links, so no setting.
+- The picture is the instance's own app icon (`/icons/icon-512.png`) at the configured public address: Admin → Email's
+  public address, `PUBLIC_URL`, or the first `PUBLIC_HOSTS` name when Hearth serves https itself. It is never built from
+  the request's Host header, so a forged one can't put another site into a card that a bot or cache keeps. Without a
+  configured address the card has no picture. Server icons stay out (`/uploads` is for signed-in members); a signed
+  link like the news pictures' could add them later.
+- Invite pages say `noindex` (a meta tag and `X-Robots-Tag`) and are never cached (`no-store`). Every value is
+  HTML-escaped, quotes included, with control and direction-changing characters dropped and lengths capped (titles 120
+  characters, descriptions 300, never half an emoji).
+- The app's own page (`/`, `/index.html` and every other app address) carries the instance's name and tagline the same
+  way, so the bare address unfurls too. It is still sent compressed. The page keeps its own `theme-color`, which some
+  apps use for the card's accent.
+
+**The sign-in screen** (`GET /api/invites/:code/preview`, no sign-in): `{ instance, server: { name, memberCount } | null }`,
+`server` only when the server opted in and the link works. Signed out with an invite link, the sign-in screen shows
+"You're invited to *the server, or "a server"* on *instance*. Create an account or sign in to join." with a **Create an
+account** button (on an instance that wants a sign-up code: "create an account with a sign-up code from whoever invited
+you"; closed: "Sign in to join"). The join dialog opens after signing in, as before.
+
+**Limits**: the page and the JSON share one allowance of 60 look-ups a minute per network. The JSON answers 429 past
+it; the page never refuses (someone following a link still gets the app) and shows the generic card without looking the
+code up.
+
+**Inviting your people** (client only):
+
+- Creating a server opens the invite dialog in a welcome mode: "Your server is ready. Invite your people." with the
+  link already made. **Import from Discord** ends with **Invite people** on its report, which opens the same welcome
+  with a 30-day link and **Copy a moving announcement for Discord** ("We're trying Hearth… Our channels and roles are
+  already set up: *link* (link expires in 30 days)", with the link's real expiry; nothing about expiry for Never).
+- Every invite dialog has **Copy invite message** ("Join me in *server* on Hearth: *link*", then what Hearth is and
+  where they'll make an account), and **Share…** where the device has a share sheet (`navigator.share`: phones and
+  some desktop browsers; not the desktop app or the Android app's web view). Share hands over the link and a message
+  without it.
+- The words follow how the instance lets new people in (`registrationOpen` and `registrationRequiresCode` in
+  `/api/config`). Open: "You'll make an account on *instance* first." Sign-up code: the message says making an account
+  needs a sign-up code and to ask the sender for it (never the code itself), and the dialog says to send the code
+  separately (an instance owner or admin is told it's in Admin → Registration & Terms; anyone else that whoever runs
+  the instance has it). Closed: the message says it only works with an account they already have there, and the
+  dialog says only people with an account can join. Outside the welcome, the dialog shows that line only for a code
+  or a closed instance. The moving announcement says the same before the link.
+- Alone in a server where you may invite people, its first text channel starts with "It's just you here." and an
+  **Invite people** button; it goes by itself once someone joins, or when you dismiss it (remembered per server in this
+  browser, `hearth.inviteNudgeDismissed`).
+- Nothing is sent by Hearth: no contacts, no automatic messages, no referral counts.
+
+**API**
+
+| Route | Who | What |
+|---|---|---|
+| `GET /invite/:code` | anyone | the app's page with the card's tags; generic unless opted in and working |
+| `GET /api/invites/:code/preview` | anyone | `{ instance, server }`; 60 a minute per network, shared with the page |
+| `PATCH /api/servers/:id` `{ invitePreview }` | Manage Server | the server's name in previews on or off (audited) |
+
+**Tests**
+
+- `test/invite-preview.test.js` (8 tests): off by default, an unknown, expired and working code (and a hostile one)
+  get the byte-identical generic card, noindex and `no-store`, and the JSON names no server; only Manage Server can
+  turn it on (members, outsiders, group chats and non-booleans refused), members see it, and it's audited; opted in, a
+  working link names the server and its member count and nothing else, while expired, used-up and revoked links and
+  turning it off again give the generic card; a name with quotes, `<script>`, `&`, `$&` and control characters is
+  escaped (one title, only the app's own scripts) and long text is cut whole; the per-network limit (JSON 429 on the
+  61st, the page quietly generic, other networks unaffected, a page flood counting against the JSON); the app's page
+  with the instance's name and tagline escaped on `/`, `/index.html` and app addresses, a forged Host header changing
+  nothing, still compressed; and `invite-share.js` (the messages carry the link and the real expiry, an open, a
+  sign-up code and a closed instance each get their own words with no false promise, Share only with a share sheet,
+  the card's rules, and dismissals when storage fails).
+- `test/attack.test.js`: the preview JSON is in the list of routes that answer without a sign-in, and gets the
+  every-route sweep like the rest.
+- Browser flows (`npm run test:e2e`): "servers" (creating the server opens the welcome with a link, no Share button
+  without a share sheet, the copied message carries the link, the card in #general opens the dialog and Share hands
+  the link to a share sheet, a signed-out visitor's banner says "a server" and the page doesn't name it, the card goes
+  when Bob joins, Alice turns previews on (audited) and the visitor's banner and the page then name the server with
+  its member count, and **Create an account** goes to the sign-up form); "step-up" (the card dismissed in a new server
+  stays away); "discord import" (Invite people on the report, a 30-day link and the moving announcement with it).
+
+**Known limitations**
+
+- Whoever holds a link to an opted-in server, and every preview bot it passes through, learns the server's name and
+  member count: that's the point, and the setting's hint says so. A link stays a key to the server for as long as it
+  works (expiry and use limits as before).
+- Preview bots keep the cards they made: turning the setting off or revoking a link changes what Hearth serves at once,
+  not a card a bot already stored.
+- On an instance whose sign-ups need a code, a server invite still doesn't let someone sign up. An admin option for
+  that would help invites on closed instances, but needs its own security review.

@@ -87,6 +87,11 @@ export async function createServer(page, name) {
   await page.click('.modal button.choice >> nth=0');
   await page.fill('.modal input.input', name);
   await page.click('.modal .modal-foot .btn.primary');
+  // Then "Invite your people" opens with a link (app.js openInvite's welcome): Done closes it.
+  await page.waitForSelector('.modal.invite-welcome', { timeout: 15000 });
+  await page.waitForFunction(() => /\/invite\/\w+/.test((document.querySelector('.modal.invite-welcome input[aria-label="Invite link"]') || {}).value || ''), null, { timeout: 15000 });
+  await page.click('.modal.invite-welcome .modal-foot .btn.primary');
+  await page.waitForSelector('.modal-backdrop', { state: 'detached', timeout: 15000 });
   await page.waitForSelector('#composer-input', { timeout: 15000 });
   await settle(page);
 }

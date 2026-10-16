@@ -29,8 +29,10 @@ template before anything is made.
      why.
 5. Untick any role or channel you don't want (a category's box takes all its channels). The preview is worked out
    again on the server each time.
-6. **Create server.** It opens straight away, followed by a report you can copy. Then invite people and give out
-   the roles (Server settings → Roles, or from the member list).
+6. **Create server.** It opens straight away, followed by a report you can copy. **Invite people** on the report
+   opens a 30-day invite link with **Copy a moving announcement for Discord**, a ready-made post with the link and
+   when it expires (FEATURES.md, "Invite links that unfurl"). Then give out the roles (Server settings → Roles, or
+   from the member list).
 
 Hearth never contacts Discord for this. The template link only builds the address you open yourself. Hearth
 doesn't ask for, keep or pass on any Discord login or token.

@@ -2907,6 +2907,16 @@ html.lite { --island-shadow: 0 1px 0 rgb(255 255 255 / .03) inset; }
 .field-hint.warn { color: color-mix(in oklab, var(--idle) 80%, var(--text)); }
 .welcome .welcome-roles { margin-top: 2px; }
 .welcome-roles-slot:empty { display: none; }
+/* Sharing invites (public/js/invite-share.js): the sign-in banner, the dialog's extra buttons, "It's just you here" */
+.auth-invite { background: rgb(var(--accent-rgb) / .1); border: 1px solid rgb(var(--accent-rgb) / .35); border-radius: 12px; padding: 10px 12px; font-size: 13.5px; margin: 0 0 16px; text-align: center; }
+.auth-invite .link-btn { margin-left: 4px; }
+.invite-extras { flex-wrap: wrap; }
+.invite-extras:empty { display: none; }
+.welcome-invite-slot { align-self: stretch; }
+.welcome-invite-slot:empty { display: none; }
+.invite-nudge { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 12px; border-radius: 12px; background: rgb(var(--accent-rgb) / .1); border: 1px solid rgb(var(--accent-rgb) / .3); max-width: 520px; }
+.invite-nudge > .ic { width: 18px; height: 18px; color: var(--accent-ink); flex: none; }
+.invite-nudge-text { flex: 1; min-width: 120px; font-weight: 600; }
 /* Import from Discord (public/js/discord-import.js) */
 .di-json { min-height: 120px; max-height: 260px; }
 .di-section { display: flex; flex-direction: column; gap: 6px; }

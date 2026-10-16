@@ -20,6 +20,9 @@ const PUBLIC = new Set([
   'GET /captcha', 'GET /terms', 'GET /push/key', 'POST /pay/kofi', 'POST /pay/stripe', 'POST /pay/memberships', 'POST /regions/:id/heartbeat',
   // Health probes for proxies, Docker and uptime monitors: only ok/degraded/fail and short codes (observability.test.js).
   'GET /health/live', 'GET /health/ready',
+  // What an invite link is for, before signing in: the instance's name, and a server's name and member count only if
+  // it opted in and the link works (invite-preview.test.js).
+  'GET /invites/:code/preview',
 ]);
 function routes() {
   const out = [];

@@ -1581,6 +1581,11 @@ CREATE INDEX IF NOT EXISTS idx_members_history_joined ON members(server_id, join
 CREATE INDEX IF NOT EXISTS idx_servers_join_rotate ON servers(join_rotate_at) WHERE join_rotate_at IS NOT NULL;
 `);
 
+// v19 (invite link previews): whether a link to /invite/<code> shows this server's name and member count to people
+// who aren't signed in and to link-preview bots (server/invitepreview.js). Off by default: the card then only says
+// "You're invited to a server on <instance>".
+addColumn('servers', 'invite_preview', 'INTEGER NOT NULL DEFAULT 0');
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;

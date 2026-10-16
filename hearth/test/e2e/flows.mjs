@@ -39,17 +39,84 @@ async function accounts(t) {
 }
 
 // ------------------------------------------------------------------ 2. a server, an invite, a second member
+// Creating the server opens "Invite your people" with the link and a message to copy (no Share button without a share
+// sheet); alone in it, #general says "It's just you here" until bob joins. A signed-out visitor with the link sees
+// what it's for on the sign-in screen: "a server" until alice lets invite previews show the server's name.
+const lastCopy = (p) => p.page.evaluate(() => (window.__copied || []).at(-1) || '');
+// What the app copies is kept in the page instead of the system clipboard (the same in every browser).
+const catchCopies = (p) => p.page.evaluate(() => { window.__copied = []; navigator.clipboard.writeText = async (x) => { window.__copied.push(String(x)); }; });
 async function servers(t) {
   const { alice, bob } = t.people;
-  await alice.createServer(SERVER);
+  await catchCopies(alice);
+  await alice.page.evaluate(() => { delete Navigator.prototype.share; });
+  const welcome = await alice.createServer(SERVER, { keepInvite: true });
+  const link = await welcome.locator('input[aria-label="Invite link"]').inputValue();
+  check(!(await welcome.locator('.invite-share').count()), 'Without a share sheet the invite dialog should have no Share button.');
+  await welcome.locator('.invite-copy-msg').click();
+  await alice.toast('Invite message copied.');
+  const msg = await lastCopy(alice);
+  check(msg.includes(link) && msg.includes(SERVER) && /end-to-end encrypted/.test(msg), `The copied invite message should carry the link and the server’s name (got “${msg}”).`);
+  await welcome.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  await alice.noModals();
   await alice.channelRow('general').waitFor();
   await alice.channelRow('Lounge').waitFor();
+  // Alone in it: the card at the top of #general opens the invite dialog. With a share sheet (as on phones), Share
+  // hands it the link.
+  const nudge = alice.$('#messages .invite-nudge', { hasText: 'It’s just you here.' });
+  await nudge.waitFor();
+  await alice.page.evaluate(() => { window.__shared = null; Navigator.prototype.share = async function share(d) { window.__shared = d; }; });
+  await nudge.locator('button', { hasText: 'Invite people' }).click();
+  const inv = await alice.dialog(`Invite people to ${SERVER}`);
+  await inv.locator('.invite-share:not([disabled])').click();
+  const shared = await (await alice.page.waitForFunction(() => window.__shared)).jsonValue();
+  check(shared.url === link && shared.title === SERVER && !shared.text.includes('http'), `Share should hand the link to the share sheet (got ${JSON.stringify(shared)}).`);
+  await alice.page.evaluate(() => { delete Navigator.prototype.share; });
+  await inv.locator('.modal-x').click();
+  await alice.noModals();
   t.state.invite = await alice.inviteLink();
+  check(t.state.invite === link, 'Reopening the invite dialog should hand back the same link.');
+
+  // Signed out, with the link: the sign-in screen says what it's for, without the server's name for now.
+  const visitor = await t.open('visitor');
+  await visitor.page.goto(link);
+  await visitor.$('#login-form').waitFor();
+  const banner = visitor.$('#auth-invite');
+  await banner.filter({ hasText: 'You’re invited to a server on' }).waitFor();
+  check(!(await banner.innerText()).includes(SERVER), 'The banner should not name a server that didn’t opt in.');
+  const card = async () => (await fetch(link)).text();
+  check(!(await card()).includes(SERVER), 'The invite page should not name a server that didn’t opt in.');
+
   await bob.join(t.state.invite, SERVER);
   await alice.showMembers();
   await alice.member('bob').waitFor();
   await bob.showMembers();
   await bob.member('alice').waitFor();
+  // Someone joined: the card goes by itself.
+  await alice.$('#messages .invite-nudge').waitFor({ state: 'detached' });
+
+  // Alice lets invite previews show the server's name (in the audit log); the visitor's banner and the page a preview
+  // bot reads now name it, with the member count.
+  const setting = 'Show this server’s name and member count in invite link previews';
+  await alice.serverMenu('Server settings');
+  const ss = alice.page.locator('.modal.server-settings');
+  const row = ss.locator('.toggle-row', { hasText: setting });
+  check(!(await row.locator('input[type=checkbox]').isChecked()), 'Invite previews should be off to start with.');
+  await row.locator('.switch').click();
+  await alice.toast('Invite link previews now show this server’s name.');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: `alice turned on “${setting}”` }).waitFor();
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+  await visitor.page.goto(link);
+  await visitor.$('#auth-invite strong', { hasText: exact(SERVER) }).waitFor();
+  const html = await card();
+  check(html.includes(`<meta property="og:title" content="Join ${SERVER} on `) && html.includes('2 members') && html.includes('<meta name="robots" content="noindex">'),
+    'Once it opted in, the invite page should name the server and its member count, and stay out of search engines.');
+  // "Create an account" in the banner goes to the sign-up form.
+  await banner.locator('.auth-invite-new').click();
+  await visitor.$('#register-form:not([hidden])').waitFor();
+  await visitor.close();
+  delete t.people.visitor;
 }
 
 // ------------------------------------------------------------------ 3. channel messages
@@ -976,6 +1043,16 @@ async function stepUp(t) {
   const { alice, bob } = t.people;
   // Deleting a server: the app asks for the password; a wrong one is refused in place, the right one deletes.
   await alice.createServer('Doomed Den');
+  // "It's just you here" can be dismissed, and stays away for this server.
+  const nudge = alice.$('#messages .invite-nudge');
+  await nudge.waitFor();
+  await nudge.locator('button[aria-label="Dismiss"]').click();
+  await nudge.waitFor({ state: 'detached' });
+  await alice.channelRow('Lounge').click({ button: 'right' });
+  await alice.menuItem('Open chat').click();
+  await alice.openChannel('general');
+  await alice.$('#messages .welcome').waitFor();
+  check(!(await alice.$('#messages .invite-nudge').count()), 'A dismissed “just you here” card should stay away.');
   await alice.serverMenu('Server settings');
   await alice.$('.modal.server-settings .ss-tab', { hasText: 'Danger zone' }).click();
   await alice.$('.modal.server-settings .danger-zone button', { hasText: 'Delete server' }).click();
@@ -2043,7 +2120,18 @@ async function discordImport(t) {
   await bob.page.locator('#sidebar-head .server-head-name', { hasText: exact('Pinecone Import') }).waitFor();
   const done = await bob.dialog('Imported Pinecone Import');
   await done.locator('li', { hasText: 'Muted: you left it out' }).waitFor();
-  await done.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  // Next, straight on to inviting people: a 30-day link and an announcement to post on Discord, with its expiry.
+  await done.locator('.modal-foot .btn.primary', { hasText: 'Invite people' }).click();
+  const welcome = await bob.dialog('Your server is ready. Invite your people.');
+  await bob.page.waitForFunction(() => /\/invite\/\w+/.test((document.querySelector('.modal.invite-welcome input[aria-label="Invite link"]') || {}).value || ''));
+  const link = await welcome.locator('input[aria-label="Invite link"]').inputValue();
+  check(await welcome.locator('select').first().inputValue() === '720', 'A moving announcement’s link should start at 30 days.');
+  await catchCopies(bob);
+  await welcome.locator('.invite-copy-moving').click();
+  await bob.toast('Announcement copied.');
+  const said = await lastCopy(bob);
+  check(said.includes(link) && said.endsWith('(link expires in 30 days)') && /end-to-end encrypted/.test(said), `The moving announcement should carry the link and its real expiry (got “${said}”).`);
+  await welcome.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
   await bob.noModals();
   // 公告 has no letters Hearth keeps, so it's named by its place: 7th, now that trail-photos stayed behind.
   for (const name of ['welcome', 'announcements', 'mod-chat', 'channel-7', 'Town Hall']) await bob.channelRow(name).waitFor();

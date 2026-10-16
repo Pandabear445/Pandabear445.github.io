@@ -162,3 +162,10 @@ The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-
   setting is the server's to enforce, deletions still name older messages' ids to newcomers, and file blobs aren't
   padded; the word filter can't stop anything being posted and can be spelled around; alerts aren't retried, and a
   webhook channel keeps its signing secret when its address changes.
+
+- Growth, without discovery or tracking (1.29.0; FEATURES.md "Invite links that unfurl", SECURITY.md row 153): invite
+  links unfurl in Discord, Reddit, X and texts, and the sign-in screen says what a link is for. Both say only "a
+  server on *instance*" unless the server opts in to its name and member count. A new or imported server opens its
+  invite link straight away, with a message to copy, Share on phones, a moving announcement for Discord imports, and
+  an "It's just you here" card. Left: server icons in cards (through a short signed link, like files-10's), and an
+  admin option letting a valid server invite also allow sign-up on code-only instances (needs its own security review).

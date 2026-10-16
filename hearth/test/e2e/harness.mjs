@@ -294,14 +294,21 @@ export class Person {
     await this.page.locator('#sidebar-head .server-head-name', { hasText: exact(serverName) }).waitFor();
     await this.noModals();
   }
-  async createServer(name) {
+  // Creating a server opens "Your server is ready. Invite your people." with a link made (app.js openInvite's
+  // welcome): closed with Done, or handed back open with keepInvite.
+  async createServer(name, { keepInvite = false } = {}) {
     await this.railButton('Add a server');
     await this.page.locator('.modal .choice', { hasText: 'Create my own' }).click();
     const m = await this.dialog('Create a server');
     await m.locator('input.input').fill(name);
     await m.locator('.modal-foot .btn.primary').click();
     await this.page.locator('#sidebar-head .server-head-name', { hasText: exact(name) }).waitFor();
+    const welcome = await this.dialog('Your server is ready. Invite your people.');
+    await this.page.waitForFunction(() => /\/invite\/\w+/.test((document.querySelector('.modal.invite-welcome input[aria-label="Invite link"]') || {}).value || ''));
+    if (keepInvite) return welcome;
+    await welcome.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
     await this.noModals();
+    return null;
   }
   // Everything this person's app has open, for a failure report.
   async capture(dir) {
