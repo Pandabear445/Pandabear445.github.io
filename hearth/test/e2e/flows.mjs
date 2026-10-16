@@ -3180,6 +3180,109 @@ async function alertChannels(t) {
   check(!(await bob.$('.admin-body').innerText()).includes(secret), 'The secret is never shown again.');
 }
 
+// ------------------------------------------------------------------ Discord habits: #channels, line formatting, attachment options, shortcuts
+async function discordHabits(t) {
+  const { alice, bob } = t.people;
+  await bob.railButton(SERVER);
+  await bob.serverMenu('Create channel');
+  const cc = await bob.dialog('Create channel');
+  await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('house-rules');
+  await cc.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  await bob.openChannel('general');
+  await alice.railButton(SERVER);
+  await alice.channelRow('house-rules').waitFor();
+  await alice.openChannel('general');
+
+  // "#" lists this server's channels; Enter puts the picked one's link in the box. "# " (a heading) closes the list.
+  const box = alice.$('#composer-input');
+  await box.fill('Read #house');
+  await alice.$('.cw-main .suggest .suggest-item', { hasText: 'house-rules' }).waitFor();
+  await box.press('Enter');
+  const picked = await box.inputValue();
+  check(/^Read <#[a-z0-9]{6,40}> $/.test(picked), `Picking a channel should put its link in the box (got “${picked}”).`);
+  await box.fill(`${picked}\n#`);
+  await alice.$('.cw-main .suggest .suggest-item').first().waitFor();
+  await box.fill(`${picked}\n# `);
+  await alice.$('.cw-main .suggest').waitFor({ state: 'hidden' });
+  const text = `${picked}first\n# Quokka rules\n-# updated today\n- be kind\n- no spam\n1. say hi\n1. pick roles\n>>> quoted line\nstill quoted\nand <#0zzzzzzzzzzzzzzzzz>`;
+  await box.fill(text);
+  await box.press('Enter');
+  const m = bob.message('Quokka rules').first();
+  await m.waitFor();
+  const shape = await m.locator('.msg-text').evaluate((el) => ({
+    h1: [...el.querySelectorAll('.md-h1')].map((x) => x.textContent),
+    sub: [...el.querySelectorAll('.md-sub')].map((x) => x.textContent),
+    li: [...el.querySelectorAll('.md-li:not(.md-ol)')].map((x) => x.textContent),
+    ol: [...el.querySelectorAll('.md-ol')].map((x) => `${x.dataset.n}:${x.textContent}`),
+    quote: [...el.querySelectorAll('.md-quote')].map((x) => x.textContent),
+    links: [...el.querySelectorAll('.channel-mention')].map((x) => x.textContent),
+    unknown: [...el.querySelectorAll('.channel-unknown')].map((x) => x.textContent),
+    raw: el.textContent,
+  }));
+  check(shape.h1.join() === 'Quokka rules' && shape.sub.join() === 'updated today', `Headings and small print should be formatted (got ${JSON.stringify(shape)}).`);
+  check(shape.li.join('|') === 'be kind|no spam' && shape.ol.join('|') === '1:say hi|2:pick roles', `Lists should be formatted and counted (got ${JSON.stringify(shape)}).`);
+  check(shape.quote.join('|') === 'quoted line|still quoted|and #unknown-channel', `>>> should quote the rest (got ${JSON.stringify(shape)}).`);
+  check(shape.links.join() === '#house-rules' && shape.unknown.join() === '#unknown-channel', `Channel mentions: a link for one Bob can see, plain text for any other (got ${JSON.stringify(shape)}).`);
+  check(!/<#|>>>|^# /m.test(shape.raw), `No raw markers should show (got “${shape.raw}”).`);
+  // The link opens the channel.
+  await m.locator('.channel-mention').click();
+  await bob.page.waitForSelector('#composer-input[placeholder="Message #house-rules"]');
+
+  // Attachment options: a description and a spoiler, set from the file's Edit button, inside the encrypted message.
+  await alice.$('.cw-main input[type=file]').setInputFiles([{ name: 'quokka.png', mimeType: 'image/png', buffer: makePng(48, 32) }]);
+  await alice.$('.cw-main .pending-edit').click();
+  const opts = await alice.dialog('Attachment options');
+  await opts.locator('textarea').fill('A quokka smiling at the camera');
+  await opts.locator('.toggle-row', { hasText: 'Mark as spoiler' }).locator('.switch').click();
+  await opts.locator('.modal-foot .btn.primary').click();
+  await alice.noModals();
+  check(await alice.page.evaluate(() => document.activeElement && document.activeElement.classList.contains('pending-edit')), 'Focus should go back to the file’s Edit button.');
+  const tags = await alice.$('.cw-main .pending .pending-tag').allInnerTexts();
+  check(tags.join() === 'SPOILER,ALT', `The file in the box should say what was set (got ${tags.join()}).`);
+  await alice.send('Spoiler picture of a quokka');
+  await bob.openChannel('general');
+  const pm = bob.message('Spoiler picture of a quokka').first();
+  await pm.waitFor();
+  const media = pm.locator('.att-media');
+  await media.locator('.att-spoiler-btn').waitFor();
+  check(await media.evaluate((el) => el.classList.contains('att-spoiler') && !el.classList.contains('revealed')), 'The picture should arrive covered.');
+  check((await pm.locator('.att-img').getAttribute('alt')) === 'A quokka smiling at the camera', 'The picture’s alt text should be the description.');
+  // The first press only uncovers it (no viewer); the next opens the viewer.
+  await media.locator('.att-spoiler-btn').focus();
+  await bob.page.keyboard.press('Enter');
+  await media.locator('.att-spoiler-btn').waitFor({ state: 'detached' });
+  check(await media.evaluate((el) => el.classList.contains('revealed')), 'Enter should uncover it.');
+  check(!(await bob.$('.viewer').count()), 'Uncovering should not open the viewer.');
+  check(await bob.page.evaluate(() => document.activeElement && document.activeElement.classList.contains('att-img')), 'Focus should move to the picture.');
+  await bob.page.keyboard.press('Enter');
+  await bob.$('.viewer').waitFor();
+  await bob.page.keyboard.press('Escape');
+  await bob.$('.viewer').waitFor({ state: 'detached' });
+  await media.locator('.att-alt').click();
+  await bob.$('.popover .alt-pop', { hasText: 'A quokka smiling at the camera' }).waitFor();
+  await bob.page.keyboard.press('Escape');
+
+  // Ctrl+/ shows every shortcut; pressed again it closes.
+  await alice.$('#composer-input').focus();
+  await alice.page.keyboard.press('Control+/');
+  const sheet = await alice.dialog('Keyboard shortcuts');
+  await sheet.locator('.sc-row', { hasText: 'Mark the server you’re in as read' }).waitFor();
+  await sheet.locator('.sc-group', { hasText: 'Calls' }).locator('kbd', { hasText: 'M' }).first().waitFor();
+  await alice.page.keyboard.press('Control+/');
+  await alice.noModals();
+
+  // Shift+Esc marks the whole server read.
+  await bob.openChannel('house-rules');
+  await bob.send('New rule: quokkas first');
+  const unread = alice.$('#sidebar-body .ch-row.unread').filter({ has: alice.$('.ch-name', { hasText: exact('house-rules') }) });
+  await unread.waitFor();
+  await alice.$('#composer-input').focus();
+  await alice.page.keyboard.press('Shift+Escape');
+  await alice.toast(`Marked ${SERVER} as read.`);
+  await unread.waitFor({ state: 'detached' });
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
@@ -3223,4 +3326,5 @@ export const FLOWS = [
   ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off; a hidden message keeps its tampering flag', wordFilter],
   ['join history: new members can’t read back (setting, audit log); someone joining again sees one line instead of locked rows, in a channel and a voice chat; later messages both ways', joinHistory],
   ['alert channels: add a signed webhook, its secret shown once, Test reaches it, masked address; off and remove need the password; the page stays put', alertChannels],
+  ['discord habits: # picks a channel and the link opens it (unknown ones stay plain); headings, lists and >>> quotes; a spoiler picture with a description; Ctrl+/ and Shift+Esc', discordHabits],
 ];

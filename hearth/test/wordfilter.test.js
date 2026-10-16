@@ -163,7 +163,7 @@ test('hostile lists and texts: regex syntax is just text, nothing hangs, long te
   for (const junk of [null, undefined, 42, {}, [], 'x'.repeat(10)]) { W.compile(junk); W.parseList(junk); W.compile(['cat']).find(junk); }
 });
 
-test('what a message shows is checked: words, link previews, polls, bot cards and file names', () => {
+test('what a message shows is checked: words, link previews, polls, bot cards, file names and descriptions', () => {
   const m = W.compile(['spoiler']);
   const t = (dec) => m.test(W.textOfMessage(dec));
   assert.equal(t({ t: 'nothing to see' }), false);
@@ -174,6 +174,8 @@ test('what a message shows is checked: words, link previews, polls, bot cards an
   assert.equal(t({ t: '', p: { q: 'Who wins?', o: ['me', 'spoiler'] } }), true, 'a poll option');
   assert.equal(t({ t: '', embed: { title: 'Feed', summary: 'big spoiler' } }), true, 'a bot’s card');
   assert.equal(t({ t: '', f: [{ name: 'spoiler.png' }] }), true, 'a file name');
+  assert.equal(t({ t: 'hello', f: [{ name: 'cat.png', alt: 'a spoiler, sorry' }] }), true, 'a picture’s description (alt text)');
+  assert.equal(t({ t: 'hello', f: [{ name: 'cat.png', alt: 'a cat on a rug' }] }), false);
   assert.equal(W.textOfMessage(null), '');
 });
 
@@ -225,6 +227,15 @@ test('formatting: the text is also read as it’s shown, so bold, italics, strik
   assert.equal(m.find(W.readings('```\nc\n```at')), null);
   assert.equal(m.find(W.readings('ca t **bold**')), null);
   assert.deepEqual(W.readings('plain text'), ['plain text'], 'plain text is read once');
+  // Headings, small print, list items and quotes are lines of their own (no <br> around them): a word split by
+  // formatting at the end of one is still caught, and two of them don't join into a word nobody sees.
+  const n = W.compile(['idiot', 'shit']);
+  for (const t of ['- i__d__iot\n- loser', '1. i__d__iot\n2. go', '* i**d**iot\n* fine', '# i__d__iot\nloser', '-# i*d*iot\nok',
+    '> i__d__iot\nloser', '>>> a\ni__d__iot\nb', 'well\n- i__d__iot', '- i__d__iot\nloser'])
+    assert.equal(n.find(W.readings(t)), 'idiot', `“${t}”`);
+  for (const t of ['- *s*\n- hit', '- *s*\nhit', '*s*\n- hit', '# *s*\nhit', '> *s*\nhit', '1. *s*\n2. hit', '-# *s*\n# hit', '- ||s||\n- hit'])
+    assert.equal(n.find(W.readings(t)), null, `“${t}”`);
+  assert.equal(n.find(W.readings('- a *s*hit b\n- c')), 'shit', 'inside one list item, formatting still joins');
 });
 
 test('a doubled letter is another word (the trade-off for not catching good with god): stretched ones still match', () => {

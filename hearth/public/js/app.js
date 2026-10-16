@@ -4,14 +4,14 @@ import { androidApp } from './android.js';
 import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playSound, copyText, debounce } from './util.js';
 import { api, upload, getToken, setToken, setTokenOwner, onTokenChange, tokenMovedFrom } from './api.js';
 import * as E2EE from './e2ee.js';
-import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers, linkedUrls } from './markdown.js';
+import { render as md, renderDoc, extractImageUrls, isOnlyImageUrl, isJumbo, setResolvers, linkedUrls, readableText, linkChannelNames } from './markdown.js';
 import { findPreviewUrl, looksPrivate, payloadVariants, hostLabel, cleanText as cleanPreviewText, KINDS as PREVIEW_KINDS, TITLE_MAX, DESC_MAX, SITE_MAX } from './linkpreview.js';
 import { PERMS, PERM_GROUPS, ALL as ALL_PERMS, has, memberRoles, basePerms, topColor, mayMentionRole, mayEmbed } from './perms.js';
 import { openCropper } from './cropper.js';
 import { adminView, CATEGORY_LABEL } from './admin.js';
 import { captchaWidget } from './captcha.js';
 import { prepareImage, makeQueue, whenVisible, previewThumb } from './media.js';
-import { isUploadUrl, safeDownloadHref } from './attachments.js';
+import { isUploadUrl, safeDownloadHref, ALT_MAX } from './attachments.js';
 import { outsideMode, outsideHost, imageDecision, openedLinks } from './outside.js';
 import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, mediaKind, typeLabel } from './files.js';
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
@@ -25,7 +25,7 @@ import { initFeatures, pollEl, onPollUpdate, openPollCreator, voiceButton, voice
 import { rankRelays, chooseIce, relayTime, iceStale } from './relays.js';
 import { watchConnection } from './conn.js';
 import { unseenChanges } from './whatsnew.js';
-import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate } from './keybinds.js';
+import { initKeybinds, getKeybinds, comboLabel, reportCall, flashTaskbar, installUpdate, shortcutGroups, comboParts, keyName } from './keybinds.js';
 import { initActivity, activityLine, openActivityPicker, startDesktopDetection } from './activity.js';
 import { modal, popover, closePopover, menu, contextMenu, confirmDialog, field, ibtn, markInvalid, clearInvalid, trapTab } from './ui.js';
 import { openSettings, applyAppearance, confirmedCall, displayNameDialog } from './settings.js';
@@ -186,6 +186,7 @@ export const app = {
   setNotifySettings: (body) => setNotifySettings(body),
   decryptMessage: (m) => decryptMessage(m),
   wordFilter: WF,
+  openShortcuts: () => openShortcuts(),
 };
 
 // ======================================================================= boot
@@ -1192,7 +1193,7 @@ function previewText(m, group = false) {
   // The word filter covers previews and notifications too: they say it's hidden instead of what it says.
   const wf = WF.check(m);
   if (wf) return who + previewLabel(wf);
-  const t = (m.dec.t || '').replace(/\s+/g, ' ').trim();
+  const t = readableText(m.dec.t).replace(/\s+/g, ' ').trim();
   return who + (t || ((m.dec.f || []).length ? 'Sent an attachment' : ''));
 }
 
@@ -1495,6 +1496,15 @@ setResolvers({
     for (const s of S.servers) {
       const r = (s.roleDefs || []).find((x) => x.id === id);
       if (r) return { name: r.name, color: r.color, mine: !!S.me && ((s.memberRoles || {})[S.me.id] || []).includes(id) };
+    }
+    return null;
+  },
+  // #channel mentions: only channels this person can see are in S.servers, so anything else stays #unknown-channel.
+  channel: (id) => {
+    for (const s of S.servers) {
+      if (isGroup(s)) continue;
+      const c = s.channels.find((x) => x.id === id);
+      if (c) return { name: c.name, type: c.type, serverId: s.id };
     }
     return null;
   },
@@ -1993,10 +2003,22 @@ function relTime(ts) {
 }
 
 // ======================================================================= keyboard
+// Every key here is in the shortcuts sheet (keybinds.js SHORTCUTS; test/shortcuts-client.test.js checks).
 function globalKeys(e) {
   const k = e.key.toLowerCase();
   if ((e.ctrlKey || e.metaKey) && k === 'k') { e.preventDefault(); openSearch(); return; }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key === '/') { e.preventDefault(); openShortcuts(); return; }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); stepChannel(e.key === 'ArrowUp' ? -1 : 1); }
+  // Shift+Esc: mark the whole server you're in as read (not a group chat, and not while a dialog or menu is open).
+  if (e.shiftKey && e.key === 'Escape') {
+    const server = currentServer();
+    if (server && !isGroup(server) && !document.querySelector('.modal-backdrop, .popover')) {
+      e.preventDefault();
+      markServerRead(server);
+      toast(`Marked ${server.name} as read.`);
+      return;
+    }
+  }
   if (e.key === 'Escape' && !document.querySelector('.modal-backdrop, .popover')) {
     // Phones: the navigation drawer closes first, and focus goes back to the button that opened it.
     if (document.body.classList.contains('nav-open')) { document.body.classList.remove('nav-open'); const t = $('.nav-toggle'); if (t) t.focus(); }
@@ -2006,6 +2028,22 @@ function globalKeys(e) {
     else if (composers.main && composers.main.state.replyTo) composers.main.setReply(null);
     else if (S.panel === 'thread') closeThread();
   }
+}
+// Ctrl+/ (⌘+/ on a Mac), Settings → Keybinds or the user menu: every shortcut, with this person's own call keys.
+// Pressed again while it's open, it closes.
+function openShortcuts() {
+  const open = document.querySelector('.modal-backdrop:not(.closing) .shortcuts-modal');
+  if (open) { open.closest('.modal-backdrop')._close(); return; }
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || '');
+  const combo = (c) => h('span', { class: 'sc-combo' }, comboParts(c).map((key, i) => [i ? h('span', { class: 'sc-plus', 'aria-hidden': 'true' }, '+') : null, h('kbd', null, keyName(key, mac))]));
+  const keys = (list) => (list.length ? list.map((c, i) => [i ? h('span', { class: 'sc-or' }, i === list.length - 1 ? ' or ' : ', ') : null, combo(c)]) : h('span', { class: 'sc-none' }, '\u2014'));
+  modal({
+    title: 'Keyboard shortcuts', size: 'md', className: 'shortcuts-modal',
+    body: h('div', { class: 'sc-groups' }, shortcutGroups({ enterSends: P.chat.enterToSend !== false }).map(([group, rows]) => h('section', { class: 'sc-group' },
+      h('h3', { class: 'set-h' }, group),
+      h('dl', { class: 'sc-list' }, rows.map(([list, what]) => h('div', { class: 'sc-row' }, h('dt', null, keys(list)), h('dd', null, what))))))),
+    actions: [{ label: 'Close', kind: 'primary' }],
+  });
 }
 // Alt+↑/↓ moves through the channels of the current sidebar.
 function stepChannel(dir) {
@@ -2726,6 +2764,7 @@ function statusMenu(anchor) {
     h('button', { class: 'menu-item', onclick: () => { closePopover(); displayNameDialog(app); } }, icon('user', 'ic menu-ic'), 'Change display name'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'profile'); } }, icon('edit', 'ic menu-ic'), 'Edit profile'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'appearance'); } }, icon('palette', 'ic menu-ic'), 'Theme and appearance'),
+    h('button', { class: 'menu-item', onclick: () => { closePopover(); openShortcuts(); } }, icon('info', 'ic menu-ic'), h('span', { class: 'menu-col' }, 'Keyboard shortcuts', h('span', { class: 'menu-desc' }, /Mac|iPhone|iPad/.test(navigator.platform || '') ? '\u2318 + /' : 'Ctrl + /'))),
   );
   popover(anchor, el, { side: 'top' });
 }
@@ -3239,9 +3278,21 @@ function chatView() {
 }
 function onMessageAreaClick(e) {
   const sp = e.target.closest('.md-spoiler');
+  const veiledNow = !!sp && !sp.classList.contains('revealed');
   if (sp) sp.classList.add('revealed');
   const mention = e.target.closest('.mention[data-user]');
   if (mention) openProfilePop(mention, mention.dataset.user, 'right');
+  // A #channel mention (markdown.js) opens that channel here, without going through the address bar. Inside a spoiler
+  // that isn't shown yet, the first click only reveals it.
+  const chan = e.target.closest('.channel-mention[data-channel]');
+  if (chan) { e.preventDefault(); if (!veiledNow) openChannelMention(chan); }
+}
+// The channel is looked up again in this person's own list (the link's server attribute is only a hint).
+function openChannelMention(el) {
+  const s = serverOfChannel(el.dataset.channel);
+  if (!s || isGroup(s)) return toast('You don’t have access to that channel.');
+  closePopover();
+  openChannel(el.dataset.channel, s.id);
 }
 
 const msgUrl = (key) => (key.startsWith('c:') ? `/channels/${encodeURIComponent(key.slice(2))}/messages` : `/dms/${encodeURIComponent(key.slice(2))}/messages`);
@@ -3662,7 +3713,7 @@ function welcomeBlock() {
   return h('div', { class: 'welcome' }, h('div', { class: 'welcome-ic' }, icon(channelIcon(c))), h('h2', null, `Welcome to #${c.name}`),
     h('p', null, c.topic || 'This is the start of the channel.'),
     h('div', { class: 'welcome-invite-slot' }, inviteNudge(server, c)),
-    th.welcome ? h('div', { class: 'server-welcome', html: md(th.welcome, { mentionName: S.me.username }) }) : null,
+    th.welcome ? h('div', { class: 'server-welcome', html: md(linkChannelNames(th.welcome, server.channels), { mentionName: S.me.username }) }) : null,
     h('div', { class: 'welcome-roles-slot' }, welcomeRoles(server)),
     h('p', { class: 'welcome-note' }, icon('lock'), 'End-to-end encrypted. Only members of this server can read it.'),
     timerWelcome('c:' + c.id));
@@ -3740,7 +3791,7 @@ const veiledQuote = (m) => (m.reply && !WF.isShown(m.reply.id) ? WF.check({ auth
 // the rows where this changed, so nothing else on screen (an edit being typed, an open poll) is touched.
 const filterState = (m, prev) => { const a = veiled(m); const q = veiledQuote(m); return `${a ? a.action : ''}|${q ? q.action : ''}|${grouped(m, prev) && hiddenByFilter(prev) ? 1 : 0}`; };
 // What a reply bar or reminder quotes from a message: the filter's note instead of words it hides or blurs.
-const quoteOf = (m, fallback = 'Attachment') => { const wf = veiled(m); return wf ? previewLabel(wf) : textOf(m) || fallback; };
+const quoteOf = (m, fallback = 'Attachment') => { const wf = veiled(m); return wf ? previewLabel(wf) : readableText(textOf(m)) || fallback; };
 // "Show" on a hidden or blurred message: drawn in full, and the message after it drawn again (it may now group).
 function revealFiltered(m) {
   WF.reveal(m.id);
@@ -4541,10 +4592,13 @@ function attachmentEl(f, m) {
   const type = f.type || '';
   const media = mediaKind(type, f.name);
   if (media) {
+    // The sender's description (alt text) is what screen readers say; the file name stands in without one.
     const el = media === 'img'
-      ? h('img', { class: 'att-img', alt: f.name || 'Image', tabindex: '0', role: 'button', 'aria-label': `Open ${f.name || 'image'}` })
-      : h(media, { class: `att-${media}`, controls: true, preload: 'metadata' });
+      ? h('img', { class: 'att-img', alt: f.alt || f.name || 'Image', tabindex: '0', role: 'button', 'aria-label': `Open ${f.alt || f.name || 'image'}` })
+      : h(media, { class: `att-${media}`, controls: true, preload: 'metadata', 'aria-label': f.alt || null });
     const holder = h('div', { class: `att-media${enc ? ' locked' : ''}`, dataset: { name: f.name || '' } }, el);
+    if (f.alt && media !== 'audio') { holder.classList.add('has-alt'); holder.append(altChip(f.alt)); }
+    if (f.sp) spoilerCover(holder, el, media);
     // Reserve the right space up front so the chat doesn't jump while images load.
     if (media === 'img' && f.w && f.h) {
       const w = Math.min(440, f.w, Math.round(340 * f.w / f.h));
@@ -4598,18 +4652,43 @@ function attachmentEl(f, m) {
   // address leads to scrambled bytes, and its key is only in the message.
   const link = !enc && isUploadUrl(f.url)
     ? h('button', { class: 'btn ghost sm', type: 'button', onclick: (e) => { e.stopPropagation(); copyText(new URL(f.url, location.origin).href); toast('Link copied.'); } }, icon('link'), 'Copy link') : null;
-  return h('div', { class: 'att-file', title: `Download ${f.name || 'file'}`, onclick: () => downloadAttachment(m, f, btn) },
+  return h('div', { class: `att-file${f.sp ? ' spoiler' : ''}`, title: `Download ${f.name || 'file'}`, onclick: () => downloadAttachment(m, f, btn) },
     h('span', { class: 'att-file-badge' }, icon(fileIcon(type, f.name || ''), 'ic'), h('span', null, ((f.name || '').split('.').pop() || 'file').slice(0, 4).toUpperCase())),
-    h('div', { class: 'att-file-text' }, h('span', { class: 'att-name', title: f.name }, f.name || 'file'),
+    h('div', { class: 'att-file-text' }, f.sp ? h('span', { class: 'att-spoiler-tag' }, icon('eyeOff', 'ic'), 'Spoiler') : null, h('span', { class: 'att-name', title: f.name }, f.name || 'file'),
       h('span', { class: 'att-size' }, fmtSize(f.size || 0), h('span', { class: 'att-kind' }, typeLabel(type, f.name || '')), enc ? h('span', { class: 'att-enc' }, icon('lock', 'ic'), 'Encrypted') : null)),
     link, btn);
+}
+
+// The ALT button in a picture's corner: the sender's description, for anyone (screen readers read it anyway).
+function altChip(text) {
+  const b = h('button', { class: 'att-alt', type: 'button', 'aria-label': 'Show description', 'data-pop-anchor': '',
+    onclick: (e) => { e.stopPropagation(); popover(b, h('div', { class: 'alt-pop' }, h('div', { class: 'alt-pop-head' }, 'Description'), h('p', null, text)), { side: 'top', label: 'Image description' }); } }, 'ALT');
+  return b;
+}
+// A spoiler attachment is blurred under a Spoiler button. The first click (or Enter) only shows it; after that the
+// picture opens in the viewer as usual. Videos and songs stay paused until then.
+function spoilerCover(holder, el, media) {
+  holder.classList.add('att-spoiler');
+  if (media === 'img') el.tabIndex = -1;
+  const what = media === 'img' ? 'picture' : media === 'video' ? 'video' : 'audio';
+  const cover = h('button', { class: 'att-spoiler-btn', type: 'button', 'aria-label': `Spoiler ${what}, select to show` },
+    h('span', { class: 'att-spoiler-pill' }, icon('eyeOff'), h('span', null, 'Spoiler')));
+  cover.addEventListener('click', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    holder.classList.add('revealed');
+    cover.remove();
+    if (media === 'img') el.tabIndex = 0;
+    const next = el.hidden ? holder.querySelector('.att-play') : el; // a big video waits behind its Play button
+    if (next) next.focus({ preventScroll: true });
+  });
+  holder.append(cover);
 }
 
 function openViewer(fromImg, { name, download } = {}) {
   const opener = document.activeElement;
   // Every picture in the conversation loaded so far, including those not scrolled into view yet (they load as
-  // you reach them here).
-  const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => i.src || i._full);
+  // you reach them here). Spoilers nobody has opened yet are left out.
+  const imgs = $$('#messages .att-img, #messages .embed-img, .thread-list .att-img').filter((i) => (i.src || i._full) && !i.closest('.att-spoiler:not(.revealed)'));
   let idx = Math.max(0, imgs.indexOf(fromImg));
   let scale = 1; let tx = 0; let ty = 0;
   const img = h('img', { class: 'viewer-img', alt: '' });
@@ -5714,13 +5793,15 @@ function createComposer({ id, key, threadId, placeholder }) {
       onmousedown: (e) => { e.preventDefault(); pick(i); },
     },
     c.cmd ? h('span', { class: 'suggest-at' }, icon('bot'))
+      : c.chan ? h('span', { class: 'suggest-at' }, icon(channelIcon(c.chan)))
       : c.emoji ? h('span', { class: 'suggest-emoji' }, c.custom ? h('img', { class: 'cemoji', src: c.custom.url, alt: '' }) : c.emoji)
       : c.special ? h('span', { class: 'suggest-at' }, icon('at'))
         : c.role ? h('span', { class: 'suggest-at role', style: c.role.color ? { color: c.role.color } : null }, c.role.icon || icon('shield'))
           : avatarEl(c, 24),
     h('span', { class: 'suggest-name', style: c.role && c.role.color ? { color: c.role.color } : null },
-      c.cmd ? SLASH.usage(c.cmd) : c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : nameInServer(suggServer(), c)),
-    h('span', { class: 'suggest-hint' }, c.cmd ? `${c.cmd.botName} \u00b7 ${c.cmd.description}` : c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
+      c.cmd ? SLASH.usage(c.cmd) : c.chan ? c.chan.name : c.emoji ? `:${c.name}:` : c.special ? `@${c.special}` : c.role ? `@${c.role.name}` : nameInServer(suggServer(), c)),
+    h('span', { class: 'suggest-hint' }, c.cmd ? `${c.cmd.botName} \u00b7 ${c.cmd.description}` : c.chan ? (c.chan.type === 'voice' ? 'Voice channel' : catOf(c.chan))
+      : c.emoji ? (c.custom ? c.custom.serverName : '') : c.special ? c.hint : c.role ? 'Role' : c.username))));
     suggest.hidden = !sugg.items.length;
   };
   const checkSuggest = () => {
@@ -5743,6 +5824,17 @@ function createComposer({ id, key, threadId, placeholder }) {
       sugg = { items: [...custom, ...std], i: 0, start: pos - em[2].length - 1, kind: 'emoji' };
       return drawSuggest();
     }
+    // #channel: this server's text and voice channels (in a server only; a space after a lone # is a heading).
+    const cm = before.match(/(^|\s)#([\w-]{0,32})$/);
+    const csv = cm && suggServer();
+    if (csv && !isGroup(csv)) {
+      const q = cm[2].toLowerCase();
+      const all = orderedChannels(csv).filter((c) => c.type === 'text' || c.type === 'voice');
+      const items = [...all.filter((c) => c.name.toLowerCase().startsWith(q)), ...all.filter((c) => !c.name.toLowerCase().startsWith(q) && c.name.toLowerCase().includes(q))]
+        .slice(0, 8).map((c) => ({ chan: c }));
+      sugg = { items, i: 0, start: pos - cm[2].length - 1, kind: 'channel' };
+      return drawSuggest();
+    }
     const m = before.match(/(^|\s)@([\w.]{0,24})$/);
     if (!m) return closeSuggest();
     const q = m[2].toLowerCase();
@@ -5762,7 +5854,7 @@ function createComposer({ id, key, threadId, placeholder }) {
       closeSuggest(); update(); renderCmdBar(); ta.focus();
       return;
     }
-    const insert = c.emoji ? (c.custom ? emojiToken(c.custom) : c.emoji) : c.role ? `<@&${c.role.id}>` : '@' + (c.special || c.username);
+    const insert = c.chan ? `<#${c.chan.id}>` : c.emoji ? (c.custom ? emojiToken(c.custom) : c.emoji) : c.role ? `<@&${c.role.id}>` : '@' + (c.special || c.username);
     if (c.emoji) pushRecentEmoji(c.custom ? emojiToken(c.custom) : c.emoji);
     ta.value = ta.value.slice(0, sugg.start) + insert + ' ' + ta.value.slice(ta.selectionStart);
     const at = sugg.start + insert.length + 1;
@@ -5927,6 +6019,37 @@ function createComposer({ id, key, threadId, placeholder }) {
     }
     renderExtras(); update(); ta.focus();
   }
+  // A file's Edit button: a description (alt text) for pictures and videos, and "Mark as spoiler" for any file.
+  // Both go inside the encrypted message with the file (uploadEncryptedFiles), so the server never sees them.
+  function editPending(p) {
+    const kind = mediaKind(p.file.type || '', p.file.name);
+    const describe = kind === 'img' || kind === 'video';
+    const alt = h('textarea', { class: 'input', rows: '3', maxlength: String(ALT_MAX), value: p.alt || '',
+      placeholder: kind === 'video' ? 'What happens in the video' : 'What’s in the picture' });
+    const spoiler = h('input', { type: 'checkbox', checked: !!p.spoiler, 'aria-describedby': 'att-spoiler-hint' });
+    // Focus goes back to this file's Edit button, which the tray draws again when something changes.
+    const refocus = () => {
+      const i = state.pending.indexOf(p);
+      const b = i >= 0 && extras.querySelector(`.pending-edit[data-pending="${i}"]`);
+      (b || ta).focus({ preventScroll: true });
+    };
+    modal({
+      title: 'Attachment options', size: 'sm', className: 'att-options',
+      onClose: () => setTimeout(refocus, 0),
+      body: h('div', { class: 'stack' },
+        h('p', { class: 'muted-p att-options-name' }, icon('file', 'ic'), p.file.name),
+        describe ? field('Description (alt text)', alt, 'Screen readers read it out, and anyone can open it from the ALT button. It’s end-to-end encrypted with the message.') : null,
+        h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Mark as spoiler'),
+          h('span', { class: 'field-hint', id: 'att-spoiler-hint' }, kind === 'img' || kind === 'video' ? 'People see it blurred until they click it.' : 'People see a spoiler warning on the file.')),
+        h('span', { class: 'switch' }, spoiler, h('span', { class: 'switch-track' })))),
+      actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', action: () => {
+        if (!state.pending.includes(p)) return;
+        p.alt = describe ? alt.value.replace(/\s+/g, ' ').trim().slice(0, ALT_MAX) : '';
+        p.spoiler = spoiler.checked;
+        renderExtras();
+      } }],
+    });
+  }
   function setReply(m) {
     const old = state.replyTo;
     state.replyTo = m;
@@ -5953,10 +6076,12 @@ function createComposer({ id, key, threadId, placeholder }) {
     extras.append(linkBox);
     if (chipFocus !== null) ((chipFocus && linkBox.querySelector(`[data-act="${chipFocus}"]`)) || ta).focus();
     if (state.pending.length) {
-      extras.append(h('div', { class: 'pending-files' }, state.pending.map((p, i) => h('div', { class: 'pending' },
+      extras.append(h('div', { class: 'pending-files' }, state.pending.map((p, i) => h('div', { class: `pending${p.spoiler ? ' is-spoiler' : ''}` },
         p.url ? h('img', { src: p.url, alt: '' }) : h('div', { class: 'pending-ic' }, icon('file')),
+        p.spoiler || p.alt ? h('span', { class: 'pending-tags' }, p.spoiler ? h('span', { class: 'pending-tag' }, 'SPOILER') : null, p.alt ? h('span', { class: 'pending-tag' }, 'ALT') : null) : null,
         h('span', { class: 'pending-name', title: p.file.name }, p.file.name),
         h('span', { class: 'pending-size' }, fmtSize(p.file.size)),
+        h('button', { class: 'pending-edit', type: 'button', 'aria-label': `Edit ${p.file.name} (description, spoiler)`, 'data-tip': 'Edit', 'data-pending': String(i), onclick: () => editPending(p) }, icon('edit')),
         h('button', { class: 'pending-x', 'aria-label': `Remove ${p.file.name}`, 'data-tip': 'Remove', onclick: () => { if (p.url) URL.revokeObjectURL(p.url); state.pending.splice(i, 1); renderExtras(); update(); } }, icon('close'))))));
     }
     extras.append(upStatus);
@@ -6151,7 +6276,7 @@ async function uploadEncryptedFiles(key, files, onProgress, { signal, onStatus }
   const compress = P.chat.compressImages !== false;
   // Optimize images first (resize big photos, make thumbnails), then encrypt and upload.
   const prepared = [];
-  for (const p of files) prepared.push({ ...(p.voice ? { file: p.file } : await prepareImage(p.file, { compress })), orig: p.file, voice: p.voice, dur: p.dur });
+  for (const p of files) prepared.push({ ...(p.voice ? { file: p.file } : await prepareImage(p.file, { compress })), orig: p.file, voice: p.voice, dur: p.dur, alt: p.alt, spoiler: p.spoiler });
   const total = prepared.reduce((a, p) => a + p.file.size + (p.thumb ? p.thumb.size : 0), 0) || 1;
   let done = 0;
   onProgress(0);
@@ -6168,7 +6293,9 @@ async function uploadEncryptedFiles(key, files, onProgress, { signal, onStatus }
     const th = p.thumb ? await send(p.thumb, p.thumb.size) : null;
     const main = await send(p.file, p.file.size);
     out.push({ url: main.url, name: p.file.name, type: p.file.type, size: p.file.size, k: main.k, ...(p.w ? { w: p.w, h: p.h } : {}), ...(th ? { th: { url: th.url, k: th.k } } : {}),
-      ...(p.voice ? { voice: true, dur: p.dur } : {}) });
+      ...(p.voice ? { voice: true, dur: p.dur } : {}),
+      // Set from the file's Edit button in the box; like the rest, it's inside the encrypted message.
+      ...(p.spoiler ? { sp: 1 } : {}), ...(p.alt ? { alt: String(p.alt).slice(0, ALT_MAX) } : {}) });
   }
   return out;
 }
@@ -6190,7 +6317,13 @@ const CIPHER_MAX = 64000;
 // x among them) stays in every variant.
 async function encryptFitting(payload, encrypt) {
   let out;
-  for (const p of payloadVariants(payload)) {
+  const variants = payloadVariants(payload);
+  // Ten long image descriptions on top of a long message can be too much as well: then they're cut short.
+  const last = variants[variants.length - 1];
+  if (Array.isArray(last.f) && last.f.some((f) => f && typeof f.alt === 'string' && f.alt.length > 200)) {
+    variants.push({ ...last, f: last.f.map((f) => (f && typeof f.alt === 'string' ? { ...f, alt: f.alt.slice(0, 200) } : f)) });
+  }
+  for (const p of variants) {
     out = await encrypt(p);
     if ((typeof out === 'string' ? out : out.ciphertext).length <= CIPHER_MAX) return out;
   }

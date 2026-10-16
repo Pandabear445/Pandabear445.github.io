@@ -5,7 +5,7 @@ A self-hosted place to hang out with your friends: servers with text and voice c
 - **Servers** with categories you can collapse, channels and categories you drag into order (or move from their menus), text and voice channels, invites, bans and per-server notification levels.
 - **Roles and permissions:** unlimited custom roles with colors, emoji badges, hierarchy, "show separately" in the member list and @mentions; roles members pick themselves (ping roles, pronouns, colors, opt-in channels); 17 permissions; per-channel overrides for any role or person (private channels, read-only announcements, listen-only voice); slowmode per channel.
 - **Make your server yours:** banner (positionable, GIFs animate), description, accent color, a server-wide background (presets, custom gradients or an image), welcome message, icon shape, role-colored names, and up to 200 custom emoji — animated GIF, WebP and APNG included, uploaded in bulk or grabbed straight from GIPHY — that members can use in any server or DM.
-- **Conversations** with replies, threads (with what's new in each, and a Threads list per channel), reactions, pins, edits, forwarding, saved messages, @mentions (including @everyone and @channel), Markdown, spoilers, code blocks, GIFs, emoji search, and image/video/file attachments with a full-screen image viewer.
+- **Conversations** with replies, threads (with what's new in each, and a Threads list per channel), reactions, pins, edits, forwarding, saved messages, @mentions (including @everyone and @channel), #channel links, Markdown with Discord's headings, lists and >>> quotes, spoilers, timestamps (`<t:…>`), code blocks, GIFs, emoji search, and image/video/file attachments (with spoilers and image descriptions) with a full-screen image viewer.
 - **GIFs, stickers and emoji in one picker, laid out like Discord's:** GIFs / Stickers / Emoji tabs, big Favorites, Trending and category tiles, a back arrow out of any category or search, results in two steady columns that keep loading as you scroll, and a star on every GIF. Through KLIPY or GIPHY, with a privacy proxy so they never see your members' IP addresses.
 - **Direct messages and group DMs** (up to 25 people, with group voice calls).
 - **Home screen** with recent and pinned conversations, online friends, your servers and recent activity.
@@ -653,12 +653,14 @@ Also back up `.env`. `cert.pem` and `key.pem` (the self-signed certificate) are 
 
 ## Keyboard shortcuts
 
+- **Ctrl/⌘ + /** shows all of these in the app (also Settings → Keybinds → See all shortcuts, or the menu on your name)
 - **Ctrl/⌘ + K** search anything
 - **Enter** send, **Shift+Enter** new line (switchable to Ctrl+Enter in Settings → Chat)
-- **@** then a name to mention someone; **↑/↓** and **Enter** to pick
+- **@** then a name to mention someone, **#** then a name to link a channel, **:** then a name for an emoji; **↑/↓** and **Enter** to pick
 - **↑** in an empty message box edits your last message, **Esc** cancels editing, a reply, or closes a thread
 - **Alt + ↑/↓** move between channels or conversations in the sidebar
-- **Ctrl/⌘ + Shift + M** mute, **Ctrl/⌘ + Shift + D** deafen
+- **Shift + Esc** marks the server you're in as read
+- **Ctrl + Shift + M** mute, **Ctrl + Shift + D** deafen (change them in Settings → Keybinds)
 - In the image viewer: **←/→** previous/next, **+/−** zoom, **Esc** close
 - Right-click messages, channels, servers and people for more actions
 

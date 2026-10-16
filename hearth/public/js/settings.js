@@ -1049,13 +1049,14 @@ function keybindsEditor() {
     h('div', null, h('button', { class: 'btn ghost sm', type: 'button', onclick: async () => { await saveKeybinds({ ...DEFAULT_KEYBINDS }); root.replaceWith(keybindsEditor()); toast('Keybinds reset.'); } }, 'Reset to defaults')));
   return root;
 }
-function keybindsTab() {
+function keybindsTab(app) {
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Keybinds'),
     section('Voice', keybindsEditor()),
     section('Everywhere in Hearth',
-      ...[['Search everything', 'Ctrl + K'], ['Previous / next channel', 'Alt + \u2191 / \u2193'], ['Close menus, cancel a reply or an edit', 'Esc'], ['New line in a message', 'Shift + Enter'], ['Edit your last message', '\u2191 in an empty box']]
-        .map(([a, k]) => h('div', { class: 'kv' }, h('span', null, a), h('kbd', null, k)))));
+      ...[['Search everything', 'Ctrl + K'], ['Previous / next channel', 'Alt + \u2191 / \u2193'], ['Mark the server you\u2019re in as read', 'Shift + Esc'], ['Close menus, cancel a reply or an edit', 'Esc'], ['New line in a message', 'Shift + Enter'], ['Edit your last message', '\u2191 in an empty box']]
+        .map(([a, k]) => h('div', { class: 'kv' }, h('span', null, a), h('kbd', null, k))),
+      app && app.openShortcuts ? h('div', null, h('button', { class: 'btn ghost sm', type: 'button', onclick: () => app.openShortcuts() }, icon('info'), 'See all shortcuts (Ctrl + /)')) : null));
 }
 
 // ------------------------------------------------------------------ appearance tab
@@ -1424,7 +1425,7 @@ function chatTab(app) {
     section('Display',
       toggle('Optimize photos before sending', c.compressImages !== false, (v) => set('compressImages', v), 'Big photos are resized to 2560 px and made much smaller (also removing hidden location data). Turn off to always send the original file.'),
       toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'By default a picture from another site waits for a click, since that site sees your IP address (Privacy & safety \u2192 Outside images).'),
-      toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers|| and > quotes.'),
+      toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers||, # headings, - lists, > and >>> quotes, and #channel links.'),
       toggle('Large emoji when a message is only emoji', c.jumbo, (v) => set('jumbo', v))),
     linkPreviewSection(app, c, set),
     section('Screen sharing',

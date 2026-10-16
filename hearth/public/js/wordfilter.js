@@ -111,17 +111,26 @@ const clampRuns = (w) => w.replace(/(.)\1{3,}/gu, '$1$1$1');
 // One letter per run: the key a word is looked up by.
 const squash = (w) => w.replace(/(.)\1+/gu, '$1');
 
-// The text as it's shown, with its formatting applied (markdown.js): "c**at**" is shown as "cat". Line breaks and
-// code blocks stay apart; everything else that formatting adds or takes away goes.
+// The text as it's shown, with its formatting applied (markdown.js): "c**at**" is shown as "cat". Line breaks, code
+// blocks and line blocks (headings, small print, list items, quotes) stay apart; everything else that formatting adds
+// or takes away goes.
 const FORMAT = /[*_~|`]/;
 const ENTITY = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
+const BLOCK_SPAN = /^<span class="md-(?:h[123]|sub|li|quote)\b/;
 export function asShown(text) {
   const s = String(text == null ? '' : text).slice(0, LIMITS.text);
   if (!FORMAT.test(s)) return s;
   try {
-    // Only ever compared with the list, never put on the page. Tags are taken out until none are left, so a tag
-    // split around another one can't come back together.
-    let out = render(s).replace(/<br>|<\/?pre\b[^>]*>/g, '\n');
+    // Only ever compared with the list, never put on the page. A line block is shown on lines of its own, with no
+    // <br> around it, so both its start and its end (the </span> that closes it, told from an inline span's by
+    // keeping count of the open ones) are line breaks. Tags are taken out until none are left, so a tag split around
+    // another one can't come back together.
+    const open = [];
+    let out = render(s).replace(/<br>|<\/?pre\b[^>]*>|<span\b[^>]*>|<\/span>/g, (tag) => {
+      if (tag === '</span>') return open.pop() ? '\n' : '';
+      if (tag.startsWith('<span')) { const block = BLOCK_SPAN.test(tag); open.push(block); return block ? '\n' : ''; }
+      return '\n';
+    });
     let before;
     do { before = out; out = out.replace(/<[^>]*>/g, ''); } while (out !== before);
     return out.replace(/&(amp|lt|gt|quot|#39);/g, (_, e) => ENTITY[e]);
@@ -414,7 +423,8 @@ export function compile(list) {
 }
 
 // Everything a message shows as text: its words, its link previews' title, description and site name, a poll's
-// question and options, a bot post's card, and its files' names. (dec: the decrypted message.)
+// question and options, a bot post's card, and its files' names and descriptions (alt text). (dec: the decrypted
+// message.)
 export function textOfMessage(dec) {
   if (!dec || typeof dec !== 'object') return '';
   const out = [];
@@ -423,6 +433,6 @@ export function textOfMessage(dec) {
   for (const l of Array.isArray(dec.l) ? dec.l.slice(0, 5) : []) if (l && typeof l === 'object') { add(l.title); add(l.desc); add(l.site); }
   if (dec.p && typeof dec.p === 'object') { add(dec.p.q); for (const o of Array.isArray(dec.p.o) ? dec.p.o.slice(0, 20) : []) add(typeof o === 'string' ? o : o && o.t); }
   if (dec.embed && typeof dec.embed === 'object') { add(dec.embed.title); add(dec.embed.summary); add(dec.embed.source); }
-  for (const f of Array.isArray(dec.f) ? dec.f.slice(0, 20) : []) if (f && typeof f === 'object') add(f.name);
+  for (const f of Array.isArray(dec.f) ? dec.f.slice(0, 20) : []) if (f && typeof f === 'object') { add(f.name); add(f.alt); }
   return out.join('\n');
 }

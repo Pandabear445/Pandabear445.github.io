@@ -122,6 +122,59 @@ export function recordCombo({ allowMods = true } = {}) {
   });
 }
 
+// ---- the keyboard shortcuts sheet (Ctrl+/ or Settings → Keybinds → See all shortcuts)
+// [group, [[combos, what it does]]]: each combo is keys joined by "+", and "Mod" is Ctrl (⌘ on a Mac). The calls
+// group is filled in from this person's own keybinds (shortcutGroups). README.md "Keyboard shortcuts" lists the same.
+export const SHORTCUTS = [
+  ['Navigation', [
+    [['Mod+K'], 'Search messages, people and channels'],
+    [['Alt+↑', 'Alt+↓'], 'Previous or next channel or conversation'],
+    [['Shift+Esc'], 'Mark the server you’re in as read'],
+    [['Mod+/'], 'Show this list of shortcuts'],
+    [['Esc'], 'Close a dialog, menu or thread'],
+  ]],
+  ['Messages', [
+    [['Enter'], 'Send'],
+    [['Shift+Enter'], 'New line'],
+    [['↑'], 'Edit your last message (in an empty message box)'],
+    [['Esc'], 'Cancel an edit or a reply'],
+    [['@', '#', ':'], 'Mention someone or a role, link a channel, or pick an emoji by name'],
+    [['↑', '↓', 'Enter'], 'Choose from the suggestions (Tab works too)'],
+    [['↑', '↓'], 'Move between messages once one has focus (Home and End: first and last)'],
+  ]],
+  ['Calls', []],
+  ['Picture viewer', [
+    [['←', '→'], 'Previous or next picture'],
+    [['+', '−'], 'Zoom in or out'],
+    [['Esc'], 'Close the viewer'],
+  ]],
+];
+// The sheet as this person has it: the calls keys they chose, and Ctrl+Enter to send if that's their setting.
+export function shortcutGroups({ enterSends = true } = {}) {
+  const b = getKeybinds();
+  const label = (x) => (x && x.code ? [comboLabel(x).replace(/ \+ /g, '+')] : []);
+  const calls = [
+    [label(b.mute), b.mute && b.mute.code ? 'Mute or unmute your microphone' : 'Mute or unmute: no key set (Settings → Keybinds)'],
+    [label(b.deafen), b.deafen && b.deafen.code ? 'Deafen or undeafen' : 'Deafen: no key set (Settings → Keybinds)'],
+    [label(b.ptt), b.ptt && b.ptt.code ? 'Push to talk (hold)' : 'Push to talk: no key set (Settings → Keybinds)'],
+  ];
+  return SHORTCUTS.map(([group, rows]) => {
+    if (group === 'Calls') return [group, calls];
+    if (group === 'Messages' && !enterSends) {
+      return [group, rows.map(([keys, what]) => (keys[0] === 'Enter' && keys.length === 1 ? [['Mod+Enter'], 'Send'] : keys[0] === 'Shift+Enter' ? [['Enter'], 'New line'] : [keys, what]))];
+    }
+    return [group, rows];
+  });
+}
+// The keys of one combo ("Mod+K" → Mod, K; a lone "+" is the plus key).
+export const comboParts = (combo) => String(combo).split(/\+(?=.)/);
+// One key's name as shown: Ctrl or ⌘ for "Mod", Option on a Mac for Alt.
+export function keyName(k, mac = /Mac|iPhone|iPad/.test((typeof navigator !== 'undefined' && navigator.platform) || '')) {
+  if (k === 'Mod') return mac ? '⌘' : 'Ctrl';
+  if (k === 'Alt' && mac) return '⌥';
+  return k;
+}
+
 // ---- small desktop helpers used by the app
 export function reportCall(state) { const d = desktop(); if (d && d.setCallState) d.setCallState(state); }
 export function flashTaskbar() { const d = desktop(); if (d && d.flash) d.flash(); }

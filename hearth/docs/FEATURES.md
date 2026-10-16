@@ -1273,7 +1273,8 @@ count as Latin when the message has no other Cyrillic or Greek letters (`сат`
 `как`, `не`, `рот` in Russian sentences aren't `ho`, `kak`, `he`, `pot`), and a Latin word counts for a Cyrillic or
 Greek entry when the message is otherwise written in that script (`Закрой pot` is `рот`; `I like pot` isn't). The
 text is read twice when its formatting changes it: as typed and as shown (`markdown.js` applied, tags removed), so
-`c**at**`, `c*at*`, `ca~~t~~`, `` c`at` `` and `c||at||` are `cat` too. Digits or symbols standing for letters
+`c**at**`, `c*at*`, `ca~~t~~`, `` c`at` `` and `c||at||` are `cat` too. Line breaks, code blocks and line blocks
+(headings, small print, list items, quotes) stay apart as shown, so two list items never join into one word. Digits or symbols standing for letters
 (`c4t`) aren't guessed at.
 
 **Cost.** Each different word in a message is prepared once and compared with each entry's word at most once. An
@@ -1312,7 +1313,7 @@ shows, the inbox, pins, saved messages and the Threads panel; **Copy text** isn'
 changes, only the message rows whose filtering changed are drawn again (each row keeps what it was drawn with in
 `data-wf`), never one being edited, so an open edit and anything else on screen stay as they are. What's checked is everything a
 message shows as text: its words, link previews' title, description and site name, a poll's question and options, a
-bot's card, and file names.
+bot's card, and file names and descriptions (alt text).
 
 **What the server learns.** Nothing about matches: the lists are fetched whole, matching and Show stay on the device,
 and a hidden message is still drawn out of sight so it loads what it would have shown (its pictures, a poll's votes)
@@ -1600,3 +1601,40 @@ code up.
   not a card a bot already stored.
 - On an instance whose sign-ups need a code, a server invite still doesn't let someone sign up. An admin option for
   that would help invites on closed instances, but needs its own security review.
+
+## Discord habits: #channel links, line formatting, attachment options, shortcuts
+
+Small additions in the app for communities moving over from Discord. None needs a server or schema change: the
+tokens and options travel inside the encrypted message, and the server never sees them.
+
+**#channel links** (`public/js/markdown.js` `CHANNEL_MENTION`; the composer's `checkSuggest` and
+`onMessageAreaClick` in `public/js/app.js`). Typing `#` in a server channel lists that server's text and voice
+channels (not in DMs or group chats); picking one puts `<#id>` in the box. Readers' apps look the id up in their own
+list of servers, which only holds channels they can see, so a link shows `#name` and opens the channel in place
+(`#c/<id>` is the same link from anywhere), and any other id shows as plain `#unknown-channel`, with no link and no
+name. Previews, notifications and the reply bar show `#name` as text (`readableText`). A server's welcome message
+(Server settings) has no picker, so `#rules` there links to the channel called rules (`linkChannelNames`).
+
+**Line formatting** (`render`). `# `, `## ` and `### ` headings, `-# ` small print, `- ` or `* ` bullets and `1. `
+numbered items (indent to nest; counted on from the first number), `> ` for one quoted line and `>>> ` for the rest
+of the message. Each needs a space after the marker, so `#general` and `#1` stay text; code blocks are left alone;
+everything is escaped first, as before. On one line (replies, thread cards, previews) the markers are dropped and
+bullets become dots. `<t:seconds>` and `<t:seconds:style>` (t, T, d, D, f, F, R) show in the reader's time zone, the
+same syntax `server/webhooks.js` already turns into dates for webhook posts.
+
+**Attachment options** (the pencil on a file in the box: `editPending`; `uploadEncryptedFiles`; `attachmentEl`,
+`altChip` and `spoilerCover`; `public/js/attachments.js` `cleanFiles`). A description (alt text, up to 1,000
+characters) for pictures and videos, and "Mark as spoiler" for any file, sent as `alt` and `sp: 1` on the file's
+entry. Readers keep `alt` only as a trimmed string and `sp` only as 1. Pictures use the description as their alt
+text and show an ALT button that opens it; spoilers are blurred under a Spoiler button, and the first click or Enter
+only uncovers them (videos and songs stay paused, file cards say Spoiler). The picture viewer's arrows skip spoilers
+nobody has opened yet.
+
+**Keyboard shortcuts** (`public/js/keybinds.js` `SHORTCUTS` and `shortcutGroups`; `openShortcuts` in app.js).
+Ctrl+/ (⌘+/) opens a sheet of every shortcut, in navigation, messages, calls (this person's own keybinds) and the
+picture viewer; pressed again, it closes. Also from Settings → Keybinds → See all shortcuts and the menu on your
+name. Shift+Esc marks the server you're in as read (not in a group chat, nor while a dialog or menu is open).
+
+**Tests**: `test/markdown-client.test.js`, `test/attachments-client.test.js`, `test/shortcuts-client.test.js` (every
+key `globalKeys` handles is in the sheet), the e2e flow "discord habits", and the shortcuts sheet and the attachment
+dialog in `npm run test:a11y`.
