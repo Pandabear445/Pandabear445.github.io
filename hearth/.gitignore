@@ -38,3 +38,8 @@ last-update-log.txt
 # Visual regression screenshots: made on the machine that checks them (see docs/ACCESSIBILITY.md).
 /test/visual/baseline/
 /test/visual/output/
+
+# The Umbrel app package has to ship its empty data folder (deploy/catalogs/README.md). Nothing else goes in it.
+!/deploy/catalogs/umbrel/hearth/data/
+/deploy/catalogs/umbrel/hearth/data/*
+!/deploy/catalogs/umbrel/hearth/data/.gitkeep

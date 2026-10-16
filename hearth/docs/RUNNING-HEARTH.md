@@ -251,7 +251,8 @@ Avoid: ads, tracking pixels, selling data, paywalling safety or privacy features
 * **Where:** short videos of profile customization (MySpace nostalgia travels well), invite links passed
   between friend groups (each server owner becomes a recruiter), privacy and self-hosting communities
   (r/privacy, r/selfhosted), and a "Show HN"/Product Hunt launch when you're ready for a spike — the
-  capacity numbers above say one server can take it.
+  capacity numbers above say one server can take it. Dated steps that follow each place's rules, and texts to
+  start from, are in [GROWTH.md](GROWTH.md).
 * **Be careful with:** claims you can't back up. "End-to-end encrypted" is true for messages, files and calls;
   who-talks-to-whom (metadata) is visible to the server — say so. Don't promise that even a hostile host can't
   read chats: the apps load their code from the server, so people are trusting whoever runs it (see SECURITY.md

@@ -114,6 +114,11 @@ Build-ready designs for the larger picks, each grounded in the current code (wit
 
 The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-REPORT.md) as they land.
 
+- Getting it to people ([GROWTH.md](GROWTH.md)): the server is published as a multi-arch image
+  (`.github/workflows/hearth-image.yml`, `deploy/compose.image.yml`), with app store templates in
+  `deploy/catalogs/` and a "Hearth vs Discord" page on arc32.me (SECURITY.md rows 154–155). Left: publishing the
+  first image and submitting to each store after a test install there.
+
 - Pick 9, phase 1 (structure) is in: **Add a server → Import from Discord** takes a pasted server template and
   shows everything that won't come over before creating ([IMPORT.md](IMPORT.md)). Hearth doesn't fetch template
   links itself yet: whether Discord serves them without a login is still unconfirmed. Left: that server-side

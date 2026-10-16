@@ -222,6 +222,32 @@ docker compose up -d --build   # rebuild after updating the files
 
 Everything is stored in `./data`. Requires Docker Compose 2.24 or newer.
 
+**Without building: the ready-made image.** Each release (a `hearth-v<version>` tag) is published as
+`ghcr.io/pandabear445/hearth:<version>` for 64-bit Intel/AMD and ARM (Raspberry Pi 4 and 5 included), scanned before
+it's pushed and with a build provenance attestation and an SBOM attached (`.github/workflows/hearth-image.yml`).
+[`deploy/compose.image.yml`](deploy/compose.image.yml) is the same hardened setup as `docker-compose.yml` with that
+image in place of the build, and works on its own in an empty folder (the domain setup is in its header):
+
+```bash
+curl -fsSLo compose.yaml https://raw.githubusercontent.com/Pandabear445/Hearth-chat/main/hearth/deploy/compose.image.yml
+docker compose up -d          # https://<host>:3000; then sign up first: the first account is the owner
+```
+
+Without Compose (it starts as root only to hand `./data` to uid 1000, then drops to it with no capabilities):
+
+```bash
+docker run -d --name hearth --restart unless-stopped -p 3000:3000 -v "$PWD/data:/data" \
+  --read-only --tmpfs /tmp:size=64m,mode=1777 --security-opt no-new-privileges:true --pids-limit 512 \
+  --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH --cap-add SETUID --cap-add SETGID \
+  ghcr.io/pandabear445/hearth:1.29.0
+```
+
+To update, change the version and run `docker compose pull && docker compose up -d` (or start a new container
+from the new tag). If the registry says the image isn't there, that release hasn't been published yet: use the
+steps above. Templates for the Unraid, CasaOS, Umbrel, Dokploy and Coolify app stores are in
+[`deploy/catalogs/`](deploy/catalogs/README.md), with what each needs (https, a way in for friends, who signs up
+first).
+
 **Hardened by default.**
 
 - **Runs unprivileged**: Hearth's container runs as an unprivileged user (uid 1000) on a read-only filesystem, with no Linux capabilities and no way to gain any. Only `./data` and a small `/tmp` are writable, and logs are rotated.
@@ -1095,7 +1121,8 @@ scripts/            hearth-update.sh — safe server-side updater with automatic
 desktop/            Electron desktop app + build config
 mobile/             Android app (Capacitor) + its native code
 .github/workflows/  Builds the desktop installers on GitHub (when Hearth is its own repository)
-deploy/             Caddy, coturn and systemd examples
+deploy/             Caddy, coturn and systemd examples; compose.image.yml (the published image)
+deploy/catalogs/    App store templates: Unraid, CasaOS, Umbrel, Dokploy, Coolify
 ```
 
-MIT licensed.
+MIT licensed ([LICENSE](LICENSE)).

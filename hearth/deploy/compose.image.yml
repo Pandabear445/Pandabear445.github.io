@@ -1,0 +1,152 @@
+# Hearth from the ready-made image (ghcr.io/pandabear445/hearth, linux/amd64 and linux/arm64), so nothing is built
+# on your server. The same hardened setup as docker-compose.yml, which builds the image from this folder instead.
+#
+# Quick start, in an empty folder (needs Docker Compose 2.24 or newer):
+#   curl -fsSLo compose.yaml https://raw.githubusercontent.com/Pandabear445/Hearth-chat/main/hearth/deploy/compose.image.yml
+#   docker compose up -d                  -> https://<this-machine>:3000 (self-signed: click through the warning once)
+# The first account to sign up becomes this Hearth's owner, so sign up yourself before sharing the address. On a
+# machine others can reach (a VPS), first put REGISTRATION_CODE=<a code only you know> in a .env file next to this
+# one: until you've signed up, nobody else can (change it later in Admin -> Registration & Terms).
+# Hearth needs https (a secure page) for its encryption and for microphones: plain http://<lan-ip>:3000 won't work.
+#
+# With a domain (a real certificate from Caddy, no warning): point the domain's A record at this server, then put
+# these three lines in a file called .env next to this one and run `docker compose --profile domain up -d`:
+#   HEARTH_DOMAIN=chat.example.com
+#   HTTPS=false
+#   HEARTH_BIND=127.0.0.1     <- port 3000 then only answers on this machine itself
+# Other settings (registration code, email, relay for calls...) go in the same .env: see .env.example and the
+# README's settings table.
+#
+# Updating: change the version in both `image:` lines below (releases: the repository's tags named hearth-v*), then
+#   docker compose pull && docker compose up -d
+# Hearth backs up its database before upgrading it (data/backups). hearth-update is for installs made from the
+# source folder; it doesn't touch this one.
+#
+# How it's locked down (the same as docker-compose.yml):
+#  - Hearth runs as uid 1000 (not root), on a read-only filesystem: it can only write ./data and a small /tmp.
+#    It has no Linux capabilities, can't gain any (no-new-privileges), and its process count is capped.
+#  - No Docker socket is mounted anywhere.
+#  - Port 3000: Docker publishes ports straight past the server's firewall, so with a domain set
+#    HEARTH_BIND=127.0.0.1. Caddy reaches Hearth over a private network ("proxy") that has no route to the internet.
+#  - Visitors' addresses: Hearth only believes X-Forwarded-For when it comes from that private network, where only
+#    Caddy and Hearth live. A proxy of your own instead (nginx, Traefik, a tunnel): TRUST_PROXY=<its address or
+#    subnet> in .env. Never a number or Docker's gateway (x.x.x.1) while port 3000 is reachable from other machines.
+#  - hearth-perms runs once at start-up and hands ./data to uid 1000 (only what isn't already), then exits.
+#  - Logs are rotated (3 x 10 MB per container).
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  hearth-perms:
+    image: ghcr.io/pandabear445/hearth:1.29.0
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'find /data -xdev \( ! -user 1000 -o ! -group 1000 \) -exec chown -h 1000:1000 {} +'
+    volumes:
+      - ./data:/data
+    network_mode: none
+    read_only: true
+    # CHOWN to change owners; DAC_READ_SEARCH so it can look inside folders that already belong to uid 1000.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    logging: *logging
+
+  hearth:
+    image: ghcr.io/pandabear445/hearth:1.29.0
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      hearth-perms:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /data
+      # Who may tell Hearth a visitor's address: by default only Caddy, on the "proxy" network below (keep the
+      # default equal to that network's subnet). TRUST_PROXY in .env replaces it.
+      TRUST_PROXY: "${TRUST_PROXY:-10.231.47.0/28}"
+    ports:
+      # Quick start: reachable on every interface. Behind Caddy: HEARTH_BIND=127.0.0.1 in .env.
+      - "${HEARTH_BIND:+${HEARTH_BIND}:}3000:3000"
+    volumes:
+      - ./data:/data
+    networks: [hearth_net, proxy]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    # mem_limit: 1g
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    logging: *logging
+
+  caddy:
+    image: caddy:2.11
+    profiles: ["domain"]
+    restart: unless-stopped
+    depends_on: [hearth]
+    environment:
+      HEARTH_DOMAIN: "${HEARTH_DOMAIN:-}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge, proxy]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    logging: *logging
+
+# The same Caddyfile as deploy/Caddyfile, with the domain taken from HEARTH_DOMAIN ("$$" is a literal "$" here).
+configs:
+  caddyfile:
+    content: |
+      {$$HEARTH_DOMAIN} {
+      	encode gzip
+      	# Hearth sends its own security headers; these two are backstops for error pages while it restarts.
+      	header {
+      		-Server
+      		-Via
+      	}
+      	header ?Strict-Transport-Security "max-age=31536000; includeSubDomains"
+      	header ?X-Content-Type-Options "nosniff"
+      	# No request size limit: Hearth enforces the limits set in Admin -> Storage & limits.
+      	reverse_proxy hearth:3000 {
+      		lb_try_duration 30s
+      		lb_try_interval 250ms
+      	}
+      }
+
+networks:
+  hearth_net: {}
+  edge: {}
+  # Private link between Caddy and Hearth, with no route in or out. If Docker says it overlaps another network,
+  # pick another private /28 and change it here and in TRUST_PROXY's default above.
+  proxy:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.231.47.0/28
+
+volumes:
+  caddy_data:
+  caddy_config:

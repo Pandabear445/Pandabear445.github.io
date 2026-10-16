@@ -30,7 +30,8 @@ RUN apt-get update \
 # Program files stay owned by root, so the app (which runs as the unprivileged "node" user, uid 1000)
 # can read them but never change them. Only /data is writable for it.
 COPY --from=deps /app/node_modules ./node_modules
-COPY package.json ./
+# The MIT license travels with every copy of the image.
+COPY package.json LICENSE ./
 COPY server ./server
 COPY public ./public
 # Admin → Regions serves this script to new relay servers.

@@ -1,0 +1,91 @@
+# CasaOS / ZimaOS app store entry for Hearth (v2 store format: a standard compose file plus a top-level x-casaos
+# block). Staging copy: it goes to Apps/Hearth/docker-compose.yml in IceWhaleTech/CasaOS-AppStore, see ../README.md.
+# Hearth keeps its own self-signed HTTPS on: browsers only allow its encryption and microphones on https pages, and
+# CasaOS opens apps on http://<device>:<port> otherwise. The first account to sign up becomes the owner.
+name: hearth
+services:
+  # Runs once at start: CasaOS creates /DATA/AppData/hearth as root, Hearth runs as uid 1000.
+  hearth-perms:
+    image: ghcr.io/pandabear445/hearth:1.29.0
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'find /data -xdev \( ! -user 1000 -o ! -group 1000 \) -exec chown -h 1000:1000 {} +'
+    volumes:
+      - /DATA/AppData/hearth/data:/data
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  hearth:
+    image: ghcr.io/pandabear445/hearth:1.29.0
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      hearth-perms:
+        condition: service_completed_successfully
+    environment:
+      DATA_DIR: /data
+      # This device's address or name, so Hearth's own certificate names it (comma-separated; optional).
+      PUBLIC_HOSTS: ""
+    ports:
+      - target: 3000
+        published: "3000"
+        protocol: tcp
+    volumes:
+      - /DATA/AppData/hearth/data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+x-casaos:
+  id: me.arc32.hearth
+  main: hearth
+  index: /
+  port_map: "3000"
+  scheme: https
+  icon: https://raw.githubusercontent.com/Pandabear445/Hearth-chat/main/hearth/public/icons/icon-512.png
+  title:
+    en_US: Hearth
+  tagline:
+    en_US: Self-hosted, end-to-end encrypted chat for friend groups
+  description:
+    en_US: >-
+      Hearth is a chat app for friend groups and small communities that you host yourself: servers with text and
+      voice channels, roles, threads, direct messages and group chats, voice and video calls with screen sharing,
+      and watching videos together. Messages, files and calls are end-to-end encrypted in the app, so the server
+      stores only encrypted data (it still sees who talks to whom, and when). Desktop apps for Windows, Mac and
+      Linux, an Android app and an installable web app connect to your server. Free, MIT licensed, no ads.
+  tips:
+    before_install:
+      en_US: >-
+        Hearth opens on https with a certificate it makes itself, so your browser warns once: choose Advanced and
+        continue. Plain http won't work (encryption and microphones need https). The first account to sign up
+        becomes the owner, so sign up before sharing the address. Friends outside your home network need a domain
+        or a tunnel (Cloudflare Tunnel, Tailscale Funnel); see the README.
+  author: Pandabear445
+  developer: Pandabear445
+  category: Social
+  architectures:
+    - amd64
+    - arm64
+  version: "1.29.0"
+  update_at: "2026-10-16"
+  release_notes:
+    en_US: First release in the CasaOS store.
+  website: https://arc32.me
+  repo: https://github.com/Pandabear445/Hearth-chat
+  support: https://github.com/Pandabear445/Hearth-chat/issues
+  docs: https://github.com/Pandabear445/Hearth-chat/tree/main/hearth#readme

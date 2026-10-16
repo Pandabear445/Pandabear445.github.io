@@ -1,0 +1,33 @@
+# Dokploy template for Hearth (blueprints/hearth in Dokploy/templates). Staging copy: see ../../README.md.
+# Dokploy's Traefik serves the https: give the domain a Let's Encrypt certificate (Domains tab, HTTPS on), because
+# Hearth's encryption and microphones only work on https pages. The first account to sign up becomes the owner, so
+# sign-up needs the random REGISTRATION_CODE made at install (Environment tab) until you change it in Admin.
+services:
+  hearth:
+    image: ghcr.io/pandabear445/hearth:1.29.0
+    restart: unless-stopped
+    user: "1000:1000"
+    expose:
+      - 3000
+    environment:
+      DATA_DIR: /data
+      HTTPS: "false"
+      # The port is reachable only through Dokploy's proxy (nothing is published), which passes each visitor's
+      # address on.
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      REGISTRATION_CODE: ${REGISTRATION_CODE:?a registration code, so strangers cannot sign up first}
+      INSTANCE_NAME: ${INSTANCE_NAME:-Hearth}
+    volumes:
+      # A new named volume starts out as the image's /data, which belongs to uid 1000.
+      - hearth-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+
+volumes:
+  hearth-data: {}

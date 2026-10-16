@@ -1,5 +1,7 @@
-# GitHub Pages (arc32.me): only the landing page and its images are published.
+# GitHub Pages (arc32.me): only the landing pages (index.html, discord-alternative.html, code-signing.html), their
+# images, robots.txt and sitemap.xml are published.
 # The app itself (hearth/) is code to download and run, not part of the website.
 exclude:
   - hearth
   - README.md
+  - LICENSE
