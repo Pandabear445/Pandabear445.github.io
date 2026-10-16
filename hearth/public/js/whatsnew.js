@@ -28,6 +28,7 @@ export const CHANGES = [
     'For server owners: update zips can now be signed with your own key, and servers that pinned it refuse anything else (docs/SIGNING.md).',
     'For server owners: a region’s install command (Admin → Regions) now checks the download before running it and needs Hearth opened over https, and the relay setup never shows the relay secret on screen.',
     'Security fixes from a review of this release: roles members pick themselves can’t sit above moderators who mute, move or clean up messages; categories of channels you can’t see stay out of reach; and reminders and inbox copies of disappearing messages now disappear too.',
+    'Calls are always checked against the security keys your device saw for each person, even if the server leaves a key out. When someone’s key changed, a blocked call now says so and asks you to compare safety numbers, instead of a generic “signature didn’t check out”.',
   ] },
   { version: '1.28.2', items: [
     'Privacy: call relays (including other regions\u2019 relays) no longer get your account id, just a stand-in name that stays the same for you. They still see your IP address, as before.',

@@ -474,7 +474,9 @@ export class Voice {
     if (gap > 15000) { this.log(`Woke up after ${Math.round(gap / 1000)} s asleep`); this.healthCheck(); }
     if (this.socket.connected && LIVE.has(this.state)) {
       for (const p of [...this.peers.values()]) {
-        if (p.unlistedSince && t - p.unlistedSince > UNLISTED_GRACE && this.listed.size) this.closePeer(p.socketId, 'no longer in the call');
+        // Whatever the list holds, an empty one included: a server that sent no one at all would otherwise keep
+        // every connection open for good.
+        if (p.unlistedSince && t - p.unlistedSince > UNLISTED_GRACE) this.closePeer(p.socketId, 'no longer in the call');
       }
     }
     this.recompute();
@@ -668,6 +670,9 @@ export class Voice {
   }
 
   async createPeer(socketId, userId, initiator) {
+    // Never a connection to ourselves (see handleSignal): a server that lists us among the others gets nowhere.
+    const me = this.myId();
+    if (me && userId === me) throw new Error('Not connecting to this account itself.');
     // One connection per person: an older one (from before they reconnected) makes way.
     const dupe = this.peerByUser(userId);
     if (dupe) this.closePeer(dupe.socketId, null);
@@ -878,6 +883,15 @@ export class Voice {
 
   async handleSignal({ from, userId, data }) {
     if (!this.channelId || !data) return;
+    // Nobody is in a call twice (joining from another device takes the first one out), so a signal that says it comes
+    // from this account is forged. It's refused before anything else: everything below trusts that label, and a
+    // connection under our own name would never count as "not listed" (the server always lists us).
+    const me = this.myId();
+    if (me && userId === me) {
+      console.warn('Rejected a voice signal that claims to come from this account');
+      if (data.sdp) this.onSecurityWarning(userId, 'self');
+      return;
+    }
     let peer = this.peers.get(from);
     // Same person on a new socket (they reconnected and the news hasn't reached us yet): move the connection over.
     if (!peer && userId) { const known = this.peerByUser(userId); if (known) { this.rekey(known, from); peer = known; } }
@@ -895,10 +909,16 @@ export class Voice {
     // From one of their connections that has since been replaced (candidates, answers): ignore it.
     if (peer && !data.sdp && data.pc && peer.remotePc && data.pc !== peer.remotePc) return;
     if (data.sdp) {
-      const ok = data.sdp && typeof data.sdp.sdp === 'string' && await this.verifySdp(userId, data.sdp, data.sig);
+      // verifySdp answers true, or { ok, why } (secure.js checkSdp; why says what was wrong, for the warning). A check
+      // that fails outright (their keys didn't load) refuses the handshake too: no connection is made unless it passed.
+      let verdict = false;
+      if (typeof data.sdp.sdp === 'string') {
+        try { verdict = await this.verifySdp(userId, data.sdp, data.sig); } catch { verdict = { ok: false, why: 'lookup-failed' }; }
+      }
+      const ok = verdict === true || (!!verdict && typeof verdict === 'object' && verdict.ok === true);
       if (!ok) {
         console.warn('Rejected unsigned or tampered voice handshake from', userId);
-        this.onSecurityWarning(userId);
+        this.onSecurityWarning(userId, (verdict && verdict.why) || 'bad-signature');
         return;
       }
       if (!this.channelId) return;

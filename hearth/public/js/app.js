@@ -17,7 +17,7 @@ import { CHUNKED_ABOVE, uploadResumable, uploadSimple, download, makeUrlCache, m
 import { EMOJI, EMOJI_NAMES, CATEGORY_ICONS, recentEmoji, pushRecentEmoji, searchEmoji } from './emoji.js';
 import { Voice } from './voice.js';
 import { openCallDiagnostics } from './call-diagnostics.js';
-import { createSecure, mergeUser } from './secure.js';
+import { createSecure, mergeUser, callRefusedText, noSafetyNumbersText } from './secure.js';
 import { avatarEl, nameEl, displayName, displayNameIn, nicknameIn, profileCard, presenceOf, STATUS_LABEL, cropStyle, stopSong } from './profile-ui.js';
 import { renderPage } from './page.js';
 import { watchPlayer, dropWatchPlayer } from './watch.js';
@@ -545,8 +545,8 @@ function startApp() {
     },
     ensureIce: () => freshIce(),
     signSdp: (toUserId, desc) => sec.signSdp(voice.channelId, toUserId, desc),
-    verifySdp: (fromUserId, desc, sig) => sec.verifySdp(voice.channelId, fromUserId, desc, sig),
-    onSecurityWarning: (userId) => toast(`Blocked a voice connection from ${displayName(getUser(userId))}: its security signature didn't check out.`, 'error'),
+    verifySdp: (fromUserId, desc, sig) => sec.checkSdp(voice.channelId, fromUserId, desc, sig),
+    onSecurityWarning: (userId, why) => callWarning(userId, why),
     onChange: () => {
       if (!voice.channelId) S.regionWarned.clear();
       shareChanged(); renderVoicePanel(); renderUserPanel(); renderCallStages(); syncWatchDock(); renderSidebarVoiceUsers();
@@ -3495,6 +3495,15 @@ async function onKeysChanged(serverId, added, heldChanged) {
   }
   if (S.view.serverId === serverId && composers.main) { composers.main.renderExtras(); renderHeader(); }
   if (added) SCHED.onKeys(); // scheduled messages waiting for this key can be re-encrypted now
+}
+// A call connection the app refused (voice.js handleSignal; why from secure.js checkSdp). The other app keeps trying,
+// so the same warning about the same person is shown once a minute at most.
+const callWarned = new Map(); // `${userId}|${why}` -> when it was last shown
+function callWarning(userId, why) {
+  const key = `${userId}|${why}`;
+  if (Date.now() - (callWarned.get(key) || 0) < 60000) return;
+  callWarned.set(key, Date.now());
+  toast(callRefusedText(why, displayName(getUser(userId))), 'error');
 }
 function onKeyWarning(user) {
   toast(`${displayName(user)}'s security key changed. Compare safety numbers before trusting it.`, 'error');
@@ -7078,6 +7087,10 @@ function keyWarn(u, label, tip) {
 async function openSafetyNumber(u) {
   try {
     const user = await sec.userWithKeys(u.id);
+    // No identity key listed for them (a server that blanked it, or an account deleted long ago): no numbers to
+    // compare, and nothing to accept.
+    const none = user.id !== S.me.id && noSafetyNumbersText(user, displayName(user));
+    if (none) return toast(none, 'error');
     const groupsN = await E2EE.safetyNumber(S.me, user);
     const changed = sec.keyChanged(user);
     // They're waiting to be verified, and you may be the one to do it (the server checks you knew them before).

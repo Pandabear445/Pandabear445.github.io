@@ -21,12 +21,33 @@ function cleanPoll(p) {
   return { q: String(p.q || '').slice(0, 300), o, m: !!p.m };
 }
 
-// A user object from the server on top of what the app had. A whole one (it always has publicKey) that doesn't say
-// keysReset means they're verified now: the field is only sent while it's set, so it mustn't linger from before.
+// Marks the server sends only while they're set (server/index.js publicUser: keysReset, deleted, bot).
+const ONLY_WHILE_SET = ['keysReset', 'deleted', 'bot'];
+// A user object from the server on top of what the app had. A whole one (it always has publicKey) that leaves one of
+// those marks out means it's off now (keysReset: they're verified; deleted: the account isn't), so it mustn't linger
+// from before: a single record that said "deleted" would otherwise refuse that person's calls until a reload.
 export function mergeUser(old, x) {
   const u = { ...(old || {}), ...x };
-  if (x && 'publicKey' in x && !('keysReset' in x)) delete u.keysReset;
+  if (x && 'publicKey' in x) for (const k of ONLY_WHILE_SET) if (!(k in x)) delete u[k];
   return u;
+}
+
+// What the app says when it refused a call connection (app.js callWarning; why from checkSdp, or 'self' from
+// voice.js handleSignal).
+export function callRefusedText(why, name) {
+  if (why === 'key-changed') return `${name}’s security key changed, so their call connection was blocked. Compare safety numbers with them (their profile → Verify encryption) before you talk.`;
+  if (why === 'deleted') return `Blocked a call connection in the name of ${name}: that account was deleted, so it can’t be in a call.`;
+  if (why === 'no-key') return `Blocked a call connection from ${name}: the server lists no usable security key for them, so it can’t be checked.`;
+  if (why === 'lookup-failed') return `Blocked a call connection from ${name}: their security key couldn’t be loaded to check it.`;
+  if (why === 'self') return 'Blocked a call connection that claimed to come from your own account. Only the server could have sent it.';
+  return `Blocked a voice connection from ${name}: its security signature didn't check out.`;
+}
+// Why there are no safety numbers to compare with someone (app.js openSafetyNumber), or null when there are: the
+// server lists no identity key for them (one that blanked or left it out, a bot, or an account deleted long ago).
+export function noSafetyNumbersText(user, name) {
+  if (!user || (typeof user.publicKey === 'string' && user.publicKey)) return null;
+  return user.deleted ? 'This account was deleted, so there are no safety numbers to compare.'
+    : `The server lists no security key for ${name}, so there are no safety numbers to compare. Calls with them stay blocked until it lists their key again.`;
 }
 
 export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () => {} }) {
@@ -86,7 +107,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   const keyChanged = (user) => !!user && user.id !== S.me.id && E2EE.checkPin(S.me.id, user) === 'changed';
   // keyChanged for a whole list at once (the member list): a Set of the ids whose keys changed.
   const keysChanged = (users) => E2EE.checkPins(S.me.id, users);
-  function acceptKeys(user) { E2EE.acceptPin(S.me.id, user); warned.delete(user.id); }
+  // false (and nothing trusted) for a record with no identity key: there's nothing to verify.
+  function acceptKeys(user) { const ok = E2EE.acceptPin(S.me.id, user); if (ok) warned.delete(user.id); return ok; }
   // Someone's keys to open (which: 'e', identity keys) or check (which: 's', signing keys) what they wrote at
   // `at` (ms; 0 if unknown), best first, each with how far it's trusted:
   //   'now'     their current key, or the one this device pinned for them (the same one unless it changed)
@@ -104,7 +126,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (user.id === S.me.id) { if (proven) add(proven[which], 'now'); return out; }
     const changed = keyChanged(user);
     const p = E2EE.pinnedKeys(S.me.id, user, at);
-    if (!changed) add(user[field], 'now');
+    // A key the server lists counts as theirs only next to the identity key this device pinned for them (pinned on
+    // first sight, so that's everyone with keys): never from a record that leaves the identity key out, whatever
+    // the pin check made of it.
+    if (!changed && p.e && user.publicKey === p.e) add(user[field], 'now');
     if (p[which]) {
       if (!changed) add(p[which], 'now');
       else {
@@ -583,11 +608,31 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   // ---------------------------------------------------------------- voice handshakes
   const sdpText = (channelId, from, to, desc) => `hearth-voice|${channelId}|${from}|${to}|${desc.type}|${desc.sdp}`;
   const signSdp = (channelId, toUserId, desc) => E2EE.sign(S.signKey, sdpText(channelId, S.me.id, toUserId, desc));
-  async function verifySdp(channelId, fromUserId, desc, sig) {
-    const u = await userWithKeys(fromUserId);
-    if (!u || !u.signPublicKey || keyChanged(u)) return false;
-    return E2EE.verify(u.signPublicKey, sdpText(channelId, fromUserId, S.me.id, desc), sig);
+  // Whether an offer or answer really comes from that person: { ok: true }, or { ok: false, why } with why one of
+  //   'no-key'         the server lists no identity key for them (a bot has none), or no signing key at all
+  //   'deleted'        the server says the account was deleted (it can't sign in, so it's never in a call)
+  //   'key-changed'    their keys aren't the ones this device pinned for them (e2ee.js judgePin), until you compare
+  //                    safety numbers and accept the new ones
+  //   'lookup-failed'  their keys couldn't be loaded
+  //   'bad-signature'  no signature, a wrong one, or one claiming to come from your own account
+  // The signature is checked with the signing key this device pinned for them (pinned on first sight, trust on first
+  // use), never just the one the server lists now: the DTLS fingerprint inside the SDP is what the encrypted
+  // connection is checked against, so a server that could get its own key accepted could sit in the middle.
+  async function checkSdp(channelId, fromUserId, desc, sig) {
+    if (!fromUserId || fromUserId === S.me.id || !desc || typeof desc.sdp !== 'string' || !sig) return { ok: false, why: 'bad-signature' };
+    let u;
+    try { u = await userWithKeys(fromUserId); } catch { u = null; }
+    if (!u) return { ok: false, why: 'lookup-failed' };
+    // (An account deleted by an older version has no keys at all; one that lists a signing key without an identity
+    // key is no real deletion, e2ee.js judgePin.)
+    if (!u.publicKey) return { ok: false, why: u.deleted && !keyChanged(u) ? 'deleted' : 'no-key' };
+    if (keyChanged(u)) return { ok: false, why: 'key-changed' };
+    if (u.deleted) return { ok: false, why: 'deleted' };
+    const signKey = E2EE.pinnedKeys(S.me.id, u).s;
+    if (!signKey) return { ok: false, why: 'no-key' };
+    return (await E2EE.verify(signKey, sdpText(channelId, fromUserId, S.me.id, desc), sig)) ? { ok: true } : { ok: false, why: 'bad-signature' };
   }
+  const verifySdp = async (channelId, fromUserId, desc, sig) => (await checkSdp(channelId, fromUserId, desc, sig)).ok;
 
   function reset() {
     groupKeys.clear(); states.clear(); busy.clear(); warned.clear(); rewrapped.clear(); keeping.clear(); unverified.clear(); holds.clear();
@@ -597,7 +642,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   return {
     ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain, awaitingVerify, heldBack, isHeld,
     encryptChannel, decryptChannelMessage, encryptDm, decryptDmMessage, decryptAttachment,
-    signSdp, verifySdp, keyChanged, keysChanged, acceptKeys, trust, userWithKeys, reset,
+    signSdp, verifySdp, checkSdp, keyChanged, keysChanged, acceptKeys, trust, userWithKeys, reset,
     heldEpochs: (serverId) => [...keysFor(serverId).keys()],
     keysSaved: (serverId) => keeping.get(serverId) || Promise.resolve(), // our own copies are stored back
     signKeysFor,

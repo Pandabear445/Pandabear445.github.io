@@ -225,20 +225,56 @@ panel and the raw output for IP-address patterns).
 
 This section is about calls. The general threat model is in `SECURITY.md`.
 
-**Media encryption ends at the peers.** Each `RTCPeerConnection` runs DTLS-SRTP between the two browsers. A TURN
-relay forwards packets it can't decrypt: it sees ciphertext, packet sizes and timing (so roughly when someone
-talks), both ends' IP addresses, and the TURN username: an expiry and a keyed pseudonym of the person (the one the
-access log records), never their user id. Hearth has no media server, so
-there is no point where media is decrypted.
+**Media encryption ends at the peers.** Each `RTCPeerConnection` runs DTLS-SRTP between the two browsers, with a
+fresh certificate per connection (in Chromium: DTLS 1.2 and SRTP `AES_CM_128_HMAC_SHA1_80`). Hearth has no media
+server, so there is no point where media is decrypted. SRTP encrypts and authenticates the audio and video, not the
+RTP headers, and the DTLS 1.2 handshake (with both certificates) is in the clear too. So a TURN relay, or anyone on
+the network path, can't read or change the media, but it sees:
+
+- both ends' IP addresses, packet sizes and timing;
+- **a loudness level on every audio packet** (the `ssrc-audio-level` RTP header extension, about every 20 ms), so
+  exactly when, and roughly how loudly, each person talks;
+- each packet's lane id (`mid`), so which stream is the camera and which is a screen share;
+- the DTLS certificates;
+- for a relay, the TURN username: an expiry and a keyed pseudonym of the person (the one the access log records),
+  never their user id.
 
 **Offers and answers are signed; ICE candidates are not.** An SDP is signed (ECDSA P-256) over
-`hearth-voice|room|fromUserId|toUserId|type|sdp` with the sender's signing key and checked against the key this
-device pinned for that user (trust on first use, `secure.js`). The SDP contains the DTLS certificate fingerprint,
-so the server can't splice itself into an existing participant's connection: a swapped fingerprint fails the
-signature, and a changed signing key pauses the check until the user accepts it. ICE candidates, the restart/reset
-requests and the connection ids (`pc`/`topc`) are not signed. A malicious server can drop, add or alter them:
-route media through a relay it controls (seeing what any relay sees), or break or force rebuilds of connections
-(denial of service). It can't decrypt media that way, because DTLS still checks the signed fingerprint.
+`hearth-voice|room|fromUserId|toUserId|type|sdp` with the sender's signing key, and checked (`secure.js`
+`checkSdp`) against the signing key this device **pinned** for that person, never just the one the server lists
+now. The SDP contains the DTLS certificate fingerprint, so once this device has pinned someone, the server can't
+splice itself into a connection with them: a swapped fingerprint fails the signature, and a record that lists
+another identity or signing key for them, or none (null, empty, or the field left out), counts as a key change. The
+handshake is then refused before any connection is made, and the app says that person's security key changed and to
+compare safety numbers; after "Numbers match", their new keys are pinned. (Before 1.29.0 a record with no identity
+key skipped the pin check and the server's signing key was used; `test/call-handshake.test.js` covers that case and
+the others.) The same pin check decides which signing keys vouch for someone's server-key shares and messages, so
+such a record can't make the server's key theirs there either. A deleted account (the app says so), keys that can't
+be loaded, and a signal that claims to come from your own account are refused too: nobody is in a call twice, since
+joining from another device takes the first one out. The limits:
+
+- **First contact is trust on first use.** Someone this device has never seen (a new contact, or anyone on a new
+  device or browser) is pinned with whatever keys the server lists then, so a malicious server could sit in the
+  middle of that first call. Comparing safety numbers catches it.
+- **Someone pinned before they had a signing key** (an account that hadn't finished setting up, or someone right
+  after a password reset) gets the first signing key the server lists for them, like a new contact. If you had
+  verified them by safety number, a signing key appearing is a key change to verify again instead.
+- **Signed offers can be replayed.** The signature covers no nonce or connection id, so the server can send an old
+  offer or answer from the same room and pair again. That breaks or stalls a connection (in one variant the audio
+  stops while both apps still show "connected", until someone rejoins), but can't be used to listen in: DTLS still
+  needs the private key behind the old fingerprint, which only the original browser had.
+
+ICE candidates, the restart/reset/relayDown requests and the connection ids (`pc`/`topc`) are not signed. A
+malicious server can drop, add or alter them: route media through a relay it controls (seeing what any relay
+sees), break or force rebuilds of connections (denial of service), or, timed right behind an offer, make a call
+pinned to a region fall back to automatic relays. It can't decrypt media that way, because DTLS still checks the
+signed fingerprint.
+
+**Who sees your IP address.** The server sees every ICE candidate, so every participant's local and public
+addresses. In a call without a region (automatic), the candidates aren't filtered: everyone in the call gets
+everyone else's local (host) and public (server-reflexive) addresses, and anyone allowed to join (Connect, which
+`@everyone` has by default) can collect them. A call pinned to a region goes through that region's relay only, so
+the others see the relay's address instead of yours (unless the call falls back to automatic relays).
 
 **The server decides who is in the call, and could add an invisible listener.** Who a client connects to comes
 from server state (the `voice:join` peers and the offers it relays), and signing keys are trust-on-first-use. A
@@ -249,10 +285,12 @@ sees. Now:
 - The app compares its actual `RTCPeerConnection`s with the list the server sends. A live connection to someone
   the server has **never listed** in the call shows a warning on the call stage ("you're connected to X, who the
   server doesn't list in this call") and in diagnostics.
-- A connection to someone the server **stops** listing is closed after 20 s.
+- A connection to someone the server doesn't list (never, or **no longer**) is closed after 20 s of not being
+  listed, whatever the list holds. Before 1.29.0 an empty list stopped the close.
 - Not covered: a server that lists the listener openly (it's then visible, under whatever name it gave the
-  account); a server that lists different people to different viewers (each viewer still sees everyone they're
-  connected to); a server that injects the listener into the list only for the listener. The warning relies on
+  account); a server that lists the listener again, even for a moment, at least every 20 s (each listing restarts
+  the 20 s, and someone who has been listed once gets no warning); a server that lists different people to
+  different viewers; a server that injects the listener into the list only for the listener. The warning relies on
   the app's JavaScript, which the server serves (see `SECURITY.md`).
 
 **How removed participants lose access.** When someone is kicked, banned, loses Connect, or their channel or DM
@@ -261,8 +299,8 @@ goes away, the server removes them (`leaveVoice`, `recheckVoice` on every permis
 which ends the DTLS session: no further media reaches them. During a grace window, the same rechecks apply to the
 kept place, signing the session out ends it immediately, and a resume runs every access check again. This relies
 on the server: a malicious server can keep someone connected by not sending `voice:peer-left` (but it then has to
-keep listing them, or the 20 s unlisted rule closes the connection). There is no call key to rotate: each
-connection's keys come from its own DTLS handshake and die with it.
+keep listing them, at least for a moment every 20 s, or the unlisted rule closes the connection). There is no call
+key to rotate: each connection's keys come from its own DTLS handshake and die with it.
 
 **Moderators: disconnect, move and server mute.** People with Move Members can disconnect someone from a voice
 channel or move them to another one. It's checked in the channel the person is in (and, for a move, in the one they
@@ -282,10 +320,11 @@ Speak there). Only the people in the call get that list. A modified app can stil
 play it. A malicious server could of course mute or unmute anyone it likes; that is no different from it
 controlling who is in the call.
 
-**What a compromised relay can do.** Everything any relay can (above): see metadata, drop or delay packets, end
-calls through it. It can't decrypt or inject media (SRTP is authenticated). A compromised **region** VPS also holds
-the instance-wide TURN secret: it can mint relay logins under any name on every relay (abuse relay bandwidth;
-TURN usernames are not proof of identity), and it stores encrypted backups. It has no signaling access.
+**What a compromised relay can do.** Everything any relay can (above): see metadata, including who talks when and
+how loudly, drop or delay packets, end calls through it. It can't decrypt or inject media (SRTP is authenticated).
+A compromised **region** VPS also holds the instance-wide TURN secret: it can mint relay logins under any name on
+every relay (abuse relay bandwidth; TURN usernames are not proof of identity), and it stores encrypted backups. It
+has no signaling access.
 
 **Diagnostics** show only the viewer's own connections and never addresses or device ids.
 
@@ -317,6 +356,11 @@ and protection that would survive adding a media server (SFU) for bigger calls.
   conflicts (versions, last write wins, late joiners), and the engine on a fake WebRTC (state machine, stale
   attempts, rejoin and back-off, connection ids and glare, unlisted peers, devices and permissions, relay
   fallback, region switching state, diagnostics privacy).
+- `npm test` also includes `test/call-handshake.test.js`: the handshake check with the real `e2ee.js` and
+  `secure.js` (pinned, emptied, left-out, deleted, swapped and foreign keys, stripped or misdirected signatures,
+  someone pinned before they had a signing key, a forged server-key share from a pinned member, and the warning each
+  refusal shows), and the real call engine wired to it the way `app.js` does, on a fake WebRTC that counts
+  connections: a forged offer or answer makes no `RTCPeerConnection`, sends nothing, and says why.
 - `npm run test:voice` runs `test/e2e-voice/run.mjs`: a real server and two (or three) Chromium instances with
   fake media (`--use-fake-device-for-media-stream`). It needs Playwright (`PLAYWRIGHT_MODULE`, or the copy in the
   dev container) and Chromium (`CHROMIUM_PATH`). `ONLY=<regex>` runs a subset. The page-level hook
