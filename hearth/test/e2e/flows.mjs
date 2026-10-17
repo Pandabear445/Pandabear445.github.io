@@ -1047,8 +1047,9 @@ function fakeIPhone() {
   Object.defineProperty(Notification, 'permission', { get: () => 'default' });
 }
 async function iPhoneNotifications(t) {
+  // Bob, signed in on a new device (a new account would go over the server's sign-ups-per-hour limit for one address).
   const phone = await t.open('iphone');
-  await phone.register('iphone', newPassword());
+  await phone.login('bob', t.pw.bob);
   await phone.context.addInitScript(fakeIPhone);
   const restart = async () => { await phone.page.reload(); await phone.waitApp(); await phone.page.waitForTimeout(400); };
   await restart();
