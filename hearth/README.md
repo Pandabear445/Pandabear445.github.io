@@ -239,7 +239,7 @@ Without Compose (it starts as root only to hand `./data` to uid 1000, then drops
 docker run -d --name hearth --restart unless-stopped -p 3000:3000 -v "$PWD/data:/data" \
   --read-only --tmpfs /tmp:size=64m,mode=1777 --security-opt no-new-privileges:true --pids-limit 512 \
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH --cap-add SETUID --cap-add SETGID \
-  ghcr.io/pandabear445/hearth:1.29.0
+  ghcr.io/pandabear445/hearth:1.29.1
 ```
 
 To update, change the version and run `docker compose pull && docker compose up -d` (or start a new container

@@ -83,7 +83,7 @@ everything is still there.
 
 1. Tag `hearth-v<version>` (the version in `package.json`). The image workflow checks they match, scans the image
    and publishes `<version>`, `<major.minor>` and `latest`.
-2. Change `1.29.0` to the new version in every file in this folder, in `deploy/compose.image.yml`, and in
+2. Change `1.29.1` to the new version in every file in this folder, in `deploy/compose.image.yml`, and in
    Umbrel's digest. `test/catalogs.test.js` fails until they all agree with `package.json`.
 3. Update each store: CasaOS `version` and `update_at`, Umbrel `version` and `releaseNotes`, Dokploy `version`.
    Unraid reads the template from this repository, so pushing it is enough. Open the update pull requests.

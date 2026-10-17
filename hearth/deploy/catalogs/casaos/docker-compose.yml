@@ -6,7 +6,7 @@ name: hearth
 services:
   # Runs once at start: CasaOS creates /DATA/AppData/hearth as root, Hearth runs as uid 1000.
   hearth-perms:
-    image: ghcr.io/pandabear445/hearth:1.29.0
+    image: ghcr.io/pandabear445/hearth:1.29.1
     user: "0:0"
     entrypoint:
       - /bin/sh
@@ -22,7 +22,7 @@ services:
     restart: "no"
 
   hearth:
-    image: ghcr.io/pandabear445/hearth:1.29.0
+    image: ghcr.io/pandabear445/hearth:1.29.1
     restart: unless-stopped
     user: "1000:1000"
     depends_on:
@@ -81,8 +81,8 @@ x-casaos:
   architectures:
     - amd64
     - arm64
-  version: "1.29.0"
-  update_at: "2026-10-16"
+  version: "1.29.1"
+  update_at: "2026-10-17"
   release_notes:
     en_US: First release in the CasaOS store.
   website: https://pandabear445.github.io/Hearth-chat

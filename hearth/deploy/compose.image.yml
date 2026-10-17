@@ -40,7 +40,7 @@ x-logging: &logging
 
 services:
   hearth-perms:
-    image: ghcr.io/pandabear445/hearth:1.29.0
+    image: ghcr.io/pandabear445/hearth:1.29.1
     user: "0:0"
     entrypoint:
       - /bin/sh
@@ -58,7 +58,7 @@ services:
     logging: *logging
 
   hearth:
-    image: ghcr.io/pandabear445/hearth:1.29.0
+    image: ghcr.io/pandabear445/hearth:1.29.1
     restart: unless-stopped
     user: "1000:1000"
     depends_on:

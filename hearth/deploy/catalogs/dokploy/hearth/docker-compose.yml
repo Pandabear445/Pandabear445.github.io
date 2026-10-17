@@ -4,7 +4,7 @@
 # sign-up needs the random REGISTRATION_CODE made at install (Environment tab) until you change it in Admin.
 services:
   hearth:
-    image: ghcr.io/pandabear445/hearth:1.29.0
+    image: ghcr.io/pandabear445/hearth:1.29.1
     restart: unless-stopped
     user: "1000:1000"
     expose:

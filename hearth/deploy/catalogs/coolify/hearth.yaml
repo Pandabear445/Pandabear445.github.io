@@ -12,7 +12,7 @@
 # until you change it in Admin -> Registration & Terms.
 services:
   hearth:
-    image: ghcr.io/pandabear445/hearth:1.29.0
+    image: ghcr.io/pandabear445/hearth:1.29.1
     user: "1000:1000"
     environment:
       - SERVICE_URL_HEARTH_3000

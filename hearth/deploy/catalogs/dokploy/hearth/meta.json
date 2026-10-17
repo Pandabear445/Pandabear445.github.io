@@ -1,7 +1,7 @@
 {
   "id": "hearth",
   "name": "Hearth",
-  "version": "1.29.0",
+  "version": "1.29.1",
   "description": "Self-hosted chat for friend groups and small communities: servers, voice, video and screen sharing, with messages, files and calls end-to-end encrypted in the app. Needs an https domain.",
   "logo": "hearth.svg",
   "links": {

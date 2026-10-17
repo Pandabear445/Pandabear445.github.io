@@ -4,7 +4,7 @@ storage:
   dataRoot: data
 category: social
 name: Hearth
-version: "1.29.0"
+version: "1.29.1"
 tagline: Self-hosted, end-to-end encrypted chat for friend groups
 description: >-
   First run: the first account to sign up becomes this Hearth's owner, so create yours right after installing.

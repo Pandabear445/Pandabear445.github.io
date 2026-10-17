@@ -125,7 +125,9 @@ test('play-2: What’s new leaves out the items about paying in the Android app,
     assert.ok(!text(app).some((t) => /Stripe|supporter|memberships|pay /i.test(t)), 'the app has none of them');
     assert.equal(text(app).length, text(web).length - 2, 'only those two are left out');
     assert.ok(app.every((c) => c.items.length), 'no empty versions');
-    assert.deepEqual(web.map((c) => c.version), W.CHANGES.filter((c) => c.version !== '1.17.0').map((c) => c.version));
+    // Every version after 1.17.0 up to 1.29.0 (CHANGES is newest first; later releases are newer than 1.29.0).
+    const upTo = W.CHANGES.slice(W.CHANGES.findIndex((c) => c.version === '1.29.0'));
+    assert.deepEqual(web.map((c) => c.version), upTo.filter((c) => c.version !== '1.17.0').map((c) => c.version));
     // Seen everything already, or a first visit: nothing, as before.
     store.set('hearth.seenVersion', '1.29.0');
     assert.deepEqual(W.unseenChanges('1.29.0', { payments: false }), []);

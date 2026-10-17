@@ -3,6 +3,11 @@
 // the Android app leaves them out, as it offers no way to pay (noPayments in android.js).
 const pay = (text) => ({ text, pay: true });
 export const CHANGES = [
+  { version: '1.29.1', items: [
+    'Privacy policy: if your server’s owner publishes one (PRIVACY_URL), it’s linked at sign-up, in Settings → Security and in Settings → Apps & devices. The Android app’s connect screen links to Hearth’s own privacy policy.',
+    pay('The Android app no longer shows ways to pay (Support, the funding card on Home, creator memberships) or the download page for the APK. A browser and the desktop app still do.'),
+    'Android app: the APK no longer carries Google’s encrypted list of the app’s libraries, so app stores like IzzyOnDroid can check it.',
+  ] },
   { version: '1.29.0', items: [
     'Webhooks: give a channel a webhook address (channel settings \u2192 Webhooks) and paste it into Uptime Kuma, Home Assistant, Grafana, GitHub or anything that posts to Discord or Slack. Posts show as the webhook, marked as not end-to-end encrypted, and can\u2019t ping anyone unless you allow it.',
     'Pick your roles: moderators can let members choose roles themselves (ping roles like @game-night, pronouns, colors, opt-in channels) from the server menu or the start of any channel.',

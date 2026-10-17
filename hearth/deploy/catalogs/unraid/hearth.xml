@@ -4,7 +4,7 @@
      capabilities left (deploy/docker-entrypoint.sh). The four capabilities below are all that takes. -->
 <Container version="2">
   <Name>Hearth</Name>
-  <Repository>ghcr.io/pandabear445/hearth:1.29.0</Repository>
+  <Repository>ghcr.io/pandabear445/hearth:1.29.1</Repository>
   <Registry>https://github.com/Pandabear445/Hearth-chat/pkgs/container/hearth</Registry>
   <Network>bridge</Network>
   <MyIP/>
