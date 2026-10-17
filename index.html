@@ -138,6 +138,12 @@
   .steps .card::before { content: counter(s); display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: var(--ink); font: 800 16px var(--display); margin-bottom: 14px; }
   pre { margin: 14px 0 0; padding: 14px 16px; background: #0b0a10; border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; font: 13.5px/1.6 ui-monospace, 'SF Mono', Menlo, Consolas, monospace; color: #e8e2f0; }
   .note { margin-top: 20px; color: var(--muted); font-size: 15px; }
+  .dl-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .dl-grid a.card { display: block; color: inherit; text-decoration: none; transition: border-color .15s, transform .15s; }
+  .dl-grid a.card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .dl-grid code { font-size: 13.5px; color: var(--text); }
+  @media (max-width: 900px) { .dl-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 480px) { .dl-grid { grid-template-columns: 1fr; } }
 
   /* faq */
   details { border-bottom: 1px solid var(--line); padding: 18px 0; }
@@ -169,6 +175,7 @@
       <a href="#features">Features</a>
       <a href="discord-alternative.html">vs Discord</a>
       <a href="#free">Free, really</a>
+      <a href="#download">Download</a>
       <a href="#host">Host your own</a>
       <a href="#faq">FAQ</a>
       <a href="https://github.com/Pandabear445/Hearth-chat/tree/main/hearth">GitHub</a>
@@ -287,6 +294,27 @@
   </div>
 </section>
 
+<section id="download">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="eyebrow">Download</div>
+      <h2>Get the apps.</h2>
+      <p>Free for Windows, Mac, Linux and Android. Each card opens the latest release; pick the file it names. Or skip the download and use Hearth in your browser.</p>
+    </div>
+    <div class="dl-grid">
+      <a class="card" href="https://github.com/Pandabear445/Hearth-chat/releases/latest"><h3>Windows</h3><p>The installer: <code>Hearth-Setup-&lt;version&gt;.exe</code></p></a>
+      <a class="card" href="https://github.com/Pandabear445/Hearth-chat/releases/latest"><h3>Mac</h3><p>Apple silicon (M1 and newer): <code>Hearth-&lt;version&gt;-arm64.dmg</code></p></a>
+      <a class="card" href="https://github.com/Pandabear445/Hearth-chat/releases/latest"><h3>Linux</h3><p><code>.AppImage</code> for any distro, or <code>.deb</code> for Debian and Ubuntu</p></a>
+      <a class="card" href="https://github.com/Pandabear445/Hearth-chat/releases/latest"><h3>Android</h3><p>The app: <code>Hearth-&lt;version&gt;.apk</code></p></a>
+    </div>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/Pandabear445/Hearth-chat/releases/latest">Download the latest release</a>
+      <a class="btn ghost" href="https://kappachat.duckdns.org">Use it in your browser</a>
+    </div>
+    <p class="note">Windows apps: free code signing provided by <a href="https://signpath.io/">SignPath.io</a>, certificate by <a href="https://signpath.org/">SignPath Foundation</a> (<a href="code-signing.html">code signing policy</a>). iPhone and iPad: open Hearth in Safari and choose Add to Home Screen.</p>
+  </div>
+</section>
+
 <section class="free" id="free">
   <div class="wrap">
     <div class="sec-head center" style="text-align:center">
@@ -370,16 +398,15 @@ docker compose up -d</pre>
   </div>
 </section>
 
-<section class="final" id="download">
+<section class="final">
   <div class="wrap">
     <div class="card">
       <h2>Bring your friends over.</h2>
       <p>It takes a minute to sign up, and it's free forever.</p>
       <div class="cta">
         <a class="btn primary" href="https://kappachat.duckdns.org">Join the community</a>
-        <a class="btn ghost" href="https://kappachat.duckdns.org/download">Get the apps</a>
+        <a class="btn ghost" href="#download">Get the apps</a>
       </div>
-      <p class="note">Windows apps: free code signing provided by <a href="https://signpath.io/">SignPath.io</a>, certificate by <a href="https://signpath.org/">SignPath Foundation</a> (<a href="code-signing.html">code signing policy</a>).</p>
     </div>
   </div>
 </section>
@@ -389,7 +416,7 @@ docker compose up -d</pre>
     <span>Hearth · MIT licensed · made for friend groups</span>
     <nav aria-label="Footer">
       <a href="https://kappachat.duckdns.org">Open Hearth</a>
-      <a href="https://kappachat.duckdns.org/download">Download</a>
+      <a href="#download">Download</a>
       <a href="https://kappachat.duckdns.org/terms">Terms</a>
       <a href="code-signing.html">Code signing</a>
       <a href="https://github.com/Pandabear445/Hearth-chat/tree/main/hearth">GitHub</a>
