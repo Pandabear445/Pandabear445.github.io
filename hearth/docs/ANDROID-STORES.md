@@ -25,13 +25,19 @@ What's already done in this repository:
 - **An APK IzzyOnDroid accepts.** From `app-v1.29.1` on, the APK no longer carries Google's "dependency
   information" block (an encrypted list of the app's libraries that only Google can read). IzzyOnDroid's scanner
   flags that block. The Play bundle (`.aab`) still has it, for Play Console's library checks.
+- **No Android backup.** From `app-v1.29.1` on, Android doesn't back the app's data up or move it to a new phone
+  (the session and the unlocked keys stay on the phone; the privacy policy says so).
+- **No way to pay in the app**, once kappachat runs Hearth 1.29.1 (step 4.4). The app itself also refuses to open
+  Stripe and Ko-fi payment pages.
 
 **Marked *(unverified)*:** a rule or label taken from Google's or a store's help pages that couldn't be opened
 while writing this. Check it on the real page when you get there. Store rules change; this was written in
 October 2026.
 
 **The contact email** isn't decided yet. Wherever this page says `{{CONTACT_EMAIL}}`, use the address you pick
-for Hearth (a separate free address is a good idea: Google Play shows it publicly).
+for Hearth (a separate free address is a good idea: Google Play shows it publicly). The privacy policy, the account
+deletion page and the child safety page on the website have the same placeholder: step 4.6 says how to replace it
+there before Google gets their addresses.
 
 ---
 
@@ -145,9 +151,10 @@ GitHub Actions builds everything and makes the release (follow it in the reposit
 <https://github.com/Pandabear445/Hearth-chat/releases>: the release should have `Hearth-1.29.1.apk` and
 `Hearth.apk` (the same file under a fixed name, for the website's download button).
 
-**Before every release**, update `changelogs/default.txt` (at most 500 characters): it's the "what's new" text the
-stores show. F-Droid's tools use `default.txt` when there's no changelog for that exact build; IzzyOnDroid runs on
-the same tools *(unverified)*. A changelog for one build is named after its **versionCode**: the workflow sets it to
+**Before every release**, update `changelogs/default.txt` (at most 500 characters): it's the "what's new" text
+IzzyOnDroid (and later F-Droid) shows. Google Play's release notes are typed in Play Console instead (step 4.4).
+F-Droid's tools use `default.txt` when there's no changelog for that exact build; IzzyOnDroid runs on the same tools
+*(unverified)*. A changelog for one build is named after its **versionCode**: the workflow sets it to
 `(major × 100 + minor) × 100000 + the workflow's run number`, so you only learn it once the build ran (the
 *Version* step's log says `Hearth 1.29.1, Android versionCode 12900042`, and the Play bundle is named
 `Hearth-1.29.1-12900042.aab`). That's why `default.txt` is the practical choice for now. To add one for a build
@@ -183,7 +190,11 @@ Contact: {{CONTACT_EMAIL}}
    Google's STUN servers may earn a *NonFreeNet* label. That's a label on the listing, not a refusal.
 5. Once listed, new GitHub releases are picked up by themselves *(unverified: within about a day)*. Keep the APK's
    name pattern, keep signing with `hearth.jks`, and keep the repository public: IzzyOnDroid (and GitHub
-   downloads) stop working if it goes private.
+   downloads) stop working if it goes private. So do the privacy policy, account deletion and child safety pages
+   you give Google Play (section 4): they're part of the website, which GitHub Pages publishes from this repository, and on
+   a free GitHub plan Pages only publishes public repositories *(unverified)*. If the repository has to go private
+   while Hearth is on Play, first put copies of the three pages somewhere public (kappachat, say), give Play
+   Console those addresses, and set `PRIVACY_URL` on kappachat (step 4.4) to the new privacy policy address.
 
 ## 4. Google Play internal testing
 
@@ -198,6 +209,10 @@ app" warnings, and get updates automatically. It isn't public: nobody else can f
 4. Verify your identity: your legal name and address, and a photo of a government ID if asked.
 5. Fill in the developer details. **Play shows the developer name, and for a personal account also your legal name
    and country, publicly** on Hearth's page, plus the developer email. Use `{{CONTACT_EMAIL}}`.
+   For the **developer name**, use `Pandabear445`. The privacy policy, the deletion page and the child safety page
+   name the developer that way, and Google wants the privacy policy and the deletion page to name the developer or
+   app the way the listing does *(unverified)*. If you pick another name, change it in those three pages too (search
+   `privacy.html`, `delete-account.html` and `child-safety.html` for `Pandabear445`), so they match.
 6. **Device verification:** install the **Play Console** app on your Android phone (Android 10 or newer, not
    rooted), sign in, and follow what it asks (it may show a code to scan). Then verify your phone number.
 7. Keep an eye on email from Play Console and answer it. Google closes personal accounts that haven't published an
@@ -257,16 +272,54 @@ How (the labels may differ a little *(unverified)*):
 5. Check: *App integrity* now shows an **App signing key certificate** whose SHA-256 is the one from section 2
    (`5F:65:14:3B:…:8D:8F`).
 
-### 4.4 First upload, by hand
+### 4.4 Update kappachat, then the first upload
 
-Play takes the first bundle only by hand.
+**Update kappachat.duckdns.org first.** The Android app shows the pages kappachat sends, so a Play reviewer sees
+what kappachat runs, not only what's in the APK. Two things Play checks come from the server:
+
+- **No way to pay.** From Hearth 1.29.1 the Android app shows no *Support* window, funding card or memberships. A
+  server on an older version still shows them, with links to Stripe and Ko-fi. (The 1.29.1 app also refuses to
+  open Stripe and Ko-fi pages, but the buttons would still be there.)
+- **A privacy policy link in the app.** The app opens the saved server, or kappachat, straight away, so the connect
+  screen and its privacy policy link only show when a connection fails or someone taps *Switch server*. The links
+  people do see, at sign-up and in *Settings → Security* and *Settings → Apps & devices*, show only when the server
+  has `PRIVACY_URL` set.
+
+So, before the first upload and before any review:
+
+1. Update kappachat to Hearth 1.29.1 or newer, the way you always do (see
+   [the README](../README.md#upgrading-a-server-that-already-has-users)).
+2. In kappachat's `.env` file (in the Hearth folder on the server), add this line:
+
+   ```
+   PRIVACY_URL=https://pandabear445.github.io/Hearth-chat/privacy.html
+   ```
+
+   Then restart Hearth: `docker compose up -d --force-recreate` in the Hearth folder if it runs in Docker, or
+   `sudo systemctl restart hearth` if it doesn't. The address must start with `https://`; anything else is ignored
+   (the server's log then says `privacy_url_ignored`).
+3. Check on your phone, in the Android app signed in to kappachat: *Settings → Security* (at the bottom, in the
+   *Delete account* part) and *Settings → Apps & devices* show a **Privacy policy** link that opens the policy;
+   Home has no funding card; the menu on your name has no *Support* item.
+
+Then the first upload. Play takes the first bundle only by hand.
 
 1. Get the bundle: GitHub → *Actions → Hearth apps* → the run for the `app-v1.29.1` tag (or the newest run on `main`)
    → *Artifacts* → **hearth-android-play-bundle**. It downloads as a zip; inside is `Hearth-1.29.1-<versionCode>.aab`.
    (The artifact is only there when the `ANDROID_KEYSTORE_*` secrets are set.)
 2. Play Console → *Test and release → Testing → Internal testing → Create new release*.
-3. Upload the `.aab`. For the release notes, paste `changelogs/default.txt` between Play's `<en-US>` and `</en-US>`
-   lines.
+3. Upload the `.aab`. For the release notes, paste this (Play shows the lines between `<en-US>` and `</en-US>`):
+
+   ```
+   <en-US>
+   The connect screen links to Hearth's privacy policy.
+   Android's backup of the app is off, so your sign-in and keys stay on this phone.
+   </en-US>
+   ```
+
+   Don't paste `changelogs/default.txt`: that's for IzzyOnDroid, and it names other app stores and the APK, which
+   Play's listing rules don't want *(unverified)*. For later releases, write a line or two about what changed in
+   the app, without naming other stores, download pages or ways to pay.
 4. *Next → Save and publish* (or *Start rollout to Internal testing*).
 
 If the rollout button is greyed out, Play wants parts of *App content* (step 4.6) first. Fill those in and come
@@ -283,6 +336,23 @@ back *(unverified for internal testing)*.
 
 Play Console → your app → *App content* (in the left menu; Google moves it around now and then). Fill in every
 item before the first rollout.
+
+**First, put your contact email in the three pages.** The privacy policy, the account deletion page and the child
+safety page (`privacy.html`, `delete-account.html` and `child-safety.html` at the top of this repository) still
+say `{{CONTACT_EMAIL}}` where the address goes. Google wants a working contact on them, and the deletion page's
+*Can't sign in?* steps depend on it.
+
+1. In each of the three files, replace every `{{CONTACT_EMAIL}}` with your address. In the links it comes right
+   after `mailto:`; keep that.
+2. Check nothing's left. In PowerShell in the repository folder, this should print nothing:
+
+   ```powershell
+   Select-String -Path privacy.html, delete-account.html, child-safety.html -Pattern 'CONTACT_EMAIL'
+   ```
+
+3. Commit, and merge the change into `main`. GitHub Pages publishes it within a few minutes.
+4. Open the three pages (their addresses are in this step and in 4.8) and click the email links: they should open your mail app
+   with your address.
 
 **Privacy policy:** `https://pandabear445.github.io/Hearth-chat/privacy.html` (open it first to check it loads).
 
@@ -390,7 +460,8 @@ First page:
 | Delete account URL | `https://pandabear445.github.io/Hearth-chat/delete-account.html` (open it first to check it loads) |
 | If asked: can people delete some data without deleting the account? | Yes: in the app they can delete their own messages, remove their profile pictures and remove their email address. |
 
-Data types to tick. For each: **collected yes, shared no**, and processed on the server (not only on the phone):
+Data types to tick. For each: **collected yes**, **shared no** (but see the two things to decide below), and
+processed on the server (not only on the phone):
 
 | Play's data type | What it is in Hearth | Required or optional | Purposes |
 |---|---|---|---|
@@ -399,34 +470,64 @@ Data types to tick. For each: **collected yes, shared no**, and processed on the
 | Personal info → User IDs | username and account id | required | App functionality, Account management |
 | Photos and videos → Photos | profile pictures, banners and backgrounds, server icons, custom emoji, GIFs uploaded to the server's library (public on purpose, not encrypted) | optional | App functionality |
 | Audio → Music files | profile songs (public on purpose) | optional | App functionality |
-| Messages → Other in-app messages | only the messages someone chooses to include when they report a message or a person: their app sends them readable, for the moderators | optional | Fraud prevention, security, and compliance |
+| Messages → Other in-app messages | the messages someone chooses to include when they report a message or a person (their app sends them readable, for the moderators); and what someone types after a bot's slash command, if a server on kappachat has a bot with commands (it goes to the bot unencrypted, after a warning) | optional | App functionality, Fraud prevention, security, and compliance |
 | App activity → App interactions | who is in which server, who messages whom and when, reactions, poll votes, read markers, online status, the game or music someone chooses to show, GIF picks | required | App functionality |
-| App activity → Other user-generated content | profile text and profile page, server, channel and category names, events, server folders and tracked feeds; links someone presses *Preview* on (fetched by the server and kept in memory for a few minutes; tick "processed ephemerally") | optional | App functionality |
+| App activity → In-app search history | GIF search words: the server sends them to KLIPY or GIPHY (whichever kappachat uses) without saying who searched. The server keeps them only in memory (never on disk), until newer searches push them out or it restarts. Message search runs on the phone and isn't included | optional | App functionality |
+| App activity → Other user-generated content | profile text and profile page, server, channel and category names, events, server folders and tracked feeds; links someone presses *Preview* on (fetched by the server and kept in memory for a few minutes) | optional | App functionality |
 | Device or other IDs | the push address of the phone's push app, the browser or app name (user agent) of each signed-in session, IP addresses (with sign-ins, sessions and reports; never turned into a location) | required | App functionality, Fraud prevention, security, and compliance, Account management |
-| Financial info → Purchase history | **not needed from 1.29.1 on:** the Android app shows no way to pay (`noPayments` in `../public/js/android.js`). Tick it only if a build you upload still offers supporter payments or memberships (Stripe, Ko-fi): what was paid, when, by whom | optional | App functionality |
+| Financial info → Purchase history | **not needed while kappachat runs Hearth 1.29.1 or newer:** the Android app then shows no way to pay (`noPayments` in `../public/js/android.js`, which the server sends). The APK doesn't decide this, the server does: tick it if kappachat is ever on an older version, where the app still offers supporter payments or memberships (Stripe, Ko-fi): what was paid, when, by whom | optional | App functionality |
 
 Play's form has no separate item for IP addresses. Listing them under *Device or other IDs* is our reading
 *(unverified)*.
 
-Not collected: location, contacts, calendar, health, web browsing history, search terms (message search runs on the
-phone), crash logs and diagnostics (the app sends none), and the camera and microphone (they go only into calls,
-encrypted between the people in them).
+**Processed ephemerally:** Play asks this once per data type. Answer **No** for every type above: each one holds
+something the server stores (the link previews kept only in memory share their type with profile text, events and
+feeds, which are stored). GIF searches are only in memory, but they stay there after the search is answered, so No
+is the careful answer there too.
 
-**Shared: no** for every type. The server does pass things to other services, but in ways Google's form doesn't
-count as sharing *(our reading, unverified)*: notifications go through the push app the phone picked (ntfy.sh by
-default) encrypted so only the phone can read them; emails go out through the server's mail provider; payment
-pages, videos and outside pictures are opened by the person themselves; reports of child abuse go to the
-authorities as the law requires.
+Not collected: location, contacts, calendar, health, web browsing history, message search terms (message search runs
+on the phone), crash logs and diagnostics (the app sends none), and the camera and microphone (they go only into
+calls, encrypted between the people in them).
+
+**Shared: no** for every type, with two things to decide first. The server does pass things to other services, but
+in ways Google's form doesn't count as sharing *(our reading, unverified)*: notifications go through the push app the
+phone picked (ntfy.sh by default) encrypted so only the phone can read them; emails go out through the server's mail
+provider; payment pages, videos and outside pictures are opened by the person themselves; reports of child abuse go
+to the authorities as the law requires. The two to decide:
+
+- **GIF searches.** KLIPY or GIPHY get the search words from the server, not tied to an account or an IP address,
+  but under their own terms. Whether that's a service working for you or sharing is your call. The careful answer
+  is **shared: yes** for *In-app search history*, purpose App functionality.
+- **Bots.** A bot is run by whoever made it, and it gets events from the servers that add it: who joins and leaves,
+  who posted or reacted and when (never what messages say), and what people type after its commands. Keep
+  *Admin → Owner → Features → Who can make bots* on **Admins** (the default), and make bots only yourself. Then no
+  one else runs a bot on kappachat, and "shared: no" holds. If you let other people make bots, tick **shared** for
+  *Messages → Other in-app messages* and *App activity → App interactions*, purpose App functionality. (The
+  privacy policy already lists bots under who else gets data.)
 
 What deleting an account erases and keeps, in short (the deletion page,
 `https://pandabear445.github.io/Hearth-chat/delete-account.html`, has the full list): erased at once are the
-account's private keys, email, two-factor, recovery key, profile and pictures, friends, blocks, push addresses and
-IP address history. Its sign-ins end at once; their records (with the IP address and device name) are deleted 30
-days later. Kept, among other things: messages the person sent (still end-to-end encrypted, shown as "Deleted
-user"), their public keys (others need them for old messages), reports made by or about them, payment records, and
-an entry in the audit log. Encrypted
-backups keep deleted data until they rotate out. Someone who owns a server has to hand it over or delete it first.
-(Code: `DELETE /api/me` in `../server/index.js`, and the `sessions.purge` job.)
+account's private keys, email, two-factor, recovery key, profile and pictures (and the comments on its profile
+page), friends, blocks, push addresses, IP address history, saved messages, read positions and settings. Its
+sign-ins end at once; their records (with the IP address and device name) are deleted 30 days later. Kept, among
+other things: messages the person sent (still end-to-end encrypted, shown as "Deleted user"), their public keys
+(others need them for old messages), bots they made (turned off), reports made by or about them, payment records,
+and an entry in the audit log. Encrypted backups keep deleted data until they rotate out. Someone who owns a server
+has to hand it over or delete it first. (Code: `eraseAccount` in `../server/index.js`, run by `DELETE /api/me` and
+by staff's `DELETE /api/admin/users/:id`, and the `sessions.purge` job.)
+
+**When someone asks by email to delete their account** (the deletion page's *Can't sign in?*), or you learn an
+account belongs to a child under 13 (the privacy policy and the child safety page promise to delete those):
+
+1. For a request, make sure it's really theirs, as the deletion page says: it comes from the account's email
+   address, or they tell you things only they would know.
+2. If it's a child under 13, suspend the account at once (*Admin → Users* → the account → *Suspend…*).
+3. If the account owns servers, delete them or give them to someone else in *Admin → Servers*.
+4. *Admin → Users* → the account → **Delete account…**. Type its username and a reason ("asked by email", "under
+   13"), press *Delete forever*, and enter your password (and two-factor code). It erases exactly what deleting the
+   account in the app does, and goes in the audit log with your name and the reason. Only admins and the owner can
+   do it.
+5. Write back to say it's done.
 
 ## 5. Optional: automatic uploads to Google Play
 

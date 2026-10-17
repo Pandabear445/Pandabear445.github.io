@@ -1243,6 +1243,47 @@ async function deleteAccount(t) {
   void alice;
 }
 
+// Staff delete an account for someone who can't sign in (delete-account.html's "Can't sign in?"), or a child under 13:
+// Admin → Users → Delete account…, with the username typed out and the owner's own password. It ends like deleting
+// it yourself: signed out with the reason, an email, messages left as "Deleted user", no signing in again. Dana
+// (from "away and status", with the email she confirmed in "reset without a recovery key") is the account: this is
+// the last flow, and a new sign-up would hit the limit of five an hour from one network.
+async function staffDelete(t) {
+  const { bob } = t.people; // the owner since "instance: new owner…"
+  const dana = await t.open('dana');
+  await dana.login('dana', t.pw.dana);
+  await bob.noModals();
+  await bob.railButton('Admin');
+  await bob.$('.admin-tabs .admin-tab', { hasText: exact('Users') }).click();
+  await bob.$('.admin-body input.search-input').fill('dana');
+  await bob.$('.admin-body .adm-row .adm-user', { hasText: '@dana' }).click();
+  const m = await bob.dialog('(@dana)');
+  await m.locator('.modal-foot button', { hasText: 'Delete account' }).click();
+  const d = await bob.dialog('account?');
+  await d.locator('.field', { hasText: 'Reason' }).locator('input').fill('asked by email');
+  // Not until the username is typed out.
+  await d.locator('.modal-foot .btn.danger', { hasText: 'Delete forever' }).click();
+  await d.locator('.form-error', { hasText: 'Type dana to confirm.' }).waitFor();
+  await d.locator('.field', { hasText: 'Type dana to confirm' }).locator('input').fill('dana');
+  await d.locator('.modal-foot .btn.danger', { hasText: 'Delete forever' }).click();
+  await bob.confirmPassword('Confirm deleting the account', t.pw.bob);
+  await bob.toast('dana\u2019s account is deleted.');
+  await bob.noModals();
+  await dana.page.waitForSelector('#login-form:not([hidden])');
+  await dana.$('#login-form .form-error', { hasText: 'This account was deleted.' }).waitFor();
+  await t.server.mail('dana@example.test', /deleted by the server's staff/);
+  // In the audit log, with the reason.
+  await bob.$('.admin-tabs .admin-tab', { hasText: 'Audit log' }).click();
+  await bob.$('.admin-body', { hasText: 'asked by email' }).waitFor();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.message('Hello again from dana: date').locator('.msg-name', { hasText: 'Deleted user' }).waitFor();
+  await dana.$('#login-form [name=username]').fill('dana');
+  await dana.$('#login-form [name=password]').fill(t.pw.dana);
+  await dana.$('#login-form button[type=submit]').click();
+  await dana.$('#login-form .form-error', { hasText: 'Wrong username or password' }).waitFor({ timeout: 30000 });
+}
+
 // ------------------------------------------------------------------ 13. recovery key, email, password change and reset
 // Across the auth and crypto changes: the password-locked key, step-up, sessions, reset links and key proofs.
 async function recovery(t) {
@@ -3361,4 +3402,5 @@ export const FLOWS = [
   ['join history: new members can’t read back (setting, audit log); someone joining again sees one line instead of locked rows, in a channel and a voice chat; later messages both ways', joinHistory],
   ['alert channels: add a signed webhook, its secret shown once, Test reaches it, masked address; off and remove need the password; the page stays put', alertChannels],
   ['discord habits: # picks a channel and the link opens it (unknown ones stay plain); headings, lists and >>> quotes; a spoiler picture with a description; Ctrl+/ and Shift+Esc', discordHabits],
+  ['staff deletion: the owner deletes an account for someone who can’t sign in, from Admin → Users', staffDelete],
 ];

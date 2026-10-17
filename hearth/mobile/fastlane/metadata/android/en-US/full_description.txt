@@ -15,7 +15,7 @@ WHAT THE ANDROID APP ADDS
 IN HEARTH
 • Servers with categories, roles and permissions, threads, replies, reactions, pins, polls and events.
 • Direct messages, and group chats with up to 25 people.
-• Voice and video calls, voice messages, and watch together: a YouTube or Vimeo video, a Twitch stream or a video file, in sync for everyone in the call.
+• Voice and video calls, voice messages, and watch together: a video link, a live stream or a video file, in sync for everyone in the call.
 • Profiles you can make your own: pictures, colors, fonts, effects and a full profile page.
 • Disappearing messages, scheduled messages and reminders.
 • Message search runs on your phone, so the server never sees the words you search for.
@@ -27,9 +27,9 @@ NOT IN THE ANDROID APP YET
 • A full-screen incoming call screen. Calls ring as a notification.
 
 PRIVACY
-No ads and no tracking. The app has no analytics or advertising code and no Google Play Services.
+No ads and no tracking. The app has no analytics or ad libraries. Android's backup is off, so your sign-in and keys stay on your phone.
 The server you use can see who is in which server, who messages whom and when, profiles, online status and IP addresses, but not what your messages and files say.
-Some features contact other sites, which then see your IP address: the YouTube, Vimeo and Twitch players, pictures from other sites that you choose to load, and the STUN servers that help calls connect (Google's, unless the server's owner sets others).
+Some features contact other sites, which then see your IP address: the video players of the sites a watched video comes from, pictures from other sites that you choose to load, and the public STUN servers that help calls connect (the server's owner can change them).
 Details: https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md
 
 Source code: https://github.com/Pandabear445/Hearth-chat

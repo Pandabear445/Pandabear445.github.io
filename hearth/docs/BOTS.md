@@ -76,7 +76,7 @@ Base URL: `https://<your hearth>/api/bot/v1`. JSON in and out. Every error looks
 |---|---|---|
 | `bad_token` | 401 | Missing, malformed, wrong, rotated or revoked token. |
 | `token_in_url` | 400 | The token was in the address. |
-| `bot_disabled` | 403 | The bot was switched off. |
+| `bot_disabled` | 403 | The bot was switched off: by an admin, or because the account that made it was deleted (an admin can switch it back on in Admin → Bots). |
 | `not_installed` | 404 | The bot isn't in that server (or the token is for another installation). |
 | `installation_paused` | 403 | The server paused it. |
 | `missing_scope` | 403 | The installation didn't grant the scope. |

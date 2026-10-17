@@ -77,19 +77,25 @@ test('play-1: noPayments is androidApp.on (or the app’s user agent), and every
   // A payment that didn't go through isn't a reason to send someone to their card from the app.
   assert.match(js, /else if \(m\.status === 'past_due' && !noPayments\) toast\(/);
 
-  // Any other place that opens one of them (a new button, say), or reads the donation link, has to check
-  // noPayments itself.
-  const opens = /openSupport\(\)|openMemberships\(|openServerSettings\([^)]*'memberships'\)|config\.funding/g;
+  // Any other place that opens one of them (a new button, say), or reads the donation link or the supporter
+  // settings (config.funding, config.support, however they're reached), has to check noPayments itself: in every
+  // client file but Admin → Money, where the owner sets them up.
+  const opens = /openSupport\(\)|openMemberships\(|openServerSettings\([^)]*'memberships'\)|\.funding\b|\.support\b|\[\s*['"`]funding['"`]\s*\]|['"`]funding['"`]\s+in\b|\{[^{}\n]*\bfunding\b[^{}\n]*\}\s*=(?!=)/g;
+  const guarded = { 'app.js': ['fundingCard', 'openSupport', 'backFromStripe'], 'memberships.js': ['openMemberships', 'membershipsTab'] };
   let m; let n = 0;
-  while ((m = opens.exec(js))) {
-    const lineStart = js.lastIndexOf('\n', m.index) + 1;
-    const line = js.slice(lineStart, js.indexOf('\n', m.index));
-    if (/^(async )?function /.test(line) || /^import /.test(line)) continue;
-    n++;
-    const inside = enclosing(js, m.index);
-    assert.ok(/noPayments/.test(line) || ['fundingCard', 'openSupport', 'backFromStripe'].includes(inside), `app.js: ${line.trim().slice(0, 140)}`);
+  for (const file of fs.readdirSync(path.join(ROOT, 'public', 'js')).filter((f) => f.endsWith('.js') && f !== 'admin.js')) {
+    const src = read('public', 'js', file);
+    while ((m = opens.exec(src))) {
+      const lineStart = src.lastIndexOf('\n', m.index) + 1;
+      const line = src.slice(lineStart, src.indexOf('\n', m.index));
+      if (/^(export )?(async )?function /.test(line) || /^import /.test(line)) continue;
+      if (/(^|\s)\/\/|^\s*\*/.test(src.slice(lineStart, m.index))) continue; // in a comment
+      n++;
+      const inside = enclosing(src, m.index);
+      assert.ok(/noPayments/.test(line) || (guarded[file] || []).includes(inside), `${file}: ${line.trim().slice(0, 140)}`);
+    }
   }
-  assert.ok(n >= 8, `found the places that open payments (${n})`);
+  assert.ok(n >= 9, `found the places that open payments (${n})`);
 
   // Memberships: joining (Stripe's checkout) and the owner's tab both stop in the app.
   const mb = read('public', 'js', 'memberships.js');
@@ -210,6 +216,39 @@ public class LinkCheck {
 });
 function hasJava() { return spawnSync('javac', ['-version'], { stdio: 'ignore' }).status === 0; }
 
+// The app's own backstop, for a server that still shows a way to pay (older than 1.29.1) and for links people post:
+// payment pages never open, in the app or in the browser.
+test('play-8: the app refuses Stripe and Ko-fi payment pages (javac), before anything else gets the link', () => {
+  const main = read('mobile', 'native', 'MainActivity.java');
+  const nav = main.slice(main.indexOf('public boolean shouldOverrideUrlLoading('), main.indexOf('public void onPageStarted('));
+  assert.match(nav, /if \(BridgePolicy\.isPaymentPage\(url\)\) \{\n\s*Toast\.makeText\(MainActivity\.this, "Payments aren't available in the Android app", Toast\.LENGTH_SHORT\)\.show\(\);\n\s*return true;\n\s*\}/);
+  const at = nav.indexOf('BridgePolicy.isPaymentPage(url)');
+  assert.ok(at > nav.indexOf('if (isOurs(url)) return false;'), 'after the server’s own pages');
+  assert.ok(at < nav.indexOf('setServerOrigin(') && at < nav.indexOf('startActivity('), 'before the connect screen and the browser');
+  assert.match(read('mobile', 'native', 'test', 'PushPolicyTest.java'), /public void paymentPagesDontOpenFromTheApp\(\)/);
+  if (!hasJava()) return;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-pay-'));
+  try {
+    const pay = ['https://checkout.stripe.com/c/pay/cs_test_a1', 'https://buy.stripe.com/test_123', 'https://donate.stripe.com/x', 'https://billing.stripe.com/p/session/x',
+      FUNDING, 'https://www.ko-fi.com/hearth', 'https://KO-FI.COM/hearth', 'http://ko-fi.com/hearth', 'https://ko-fi.com./hearth', 'https://ko-fi.com:443/hearth',
+      'https://someone@ko-fi.com/hearth', 'https://ko-fi.com', 'https://ko-fi.com?x=1', 'https://ko-fi.com#top'];
+    const other = ['https://kappachat.duckdns.org/', 'https://stripe.com/docs', 'https://connect.stripe.com/express/x', 'https://notko-fi.com/x', 'https://ko-fi.com.evil.example/x',
+      'https://evil.example/ko-fi.com', 'https://evil.example/?u=https://ko-fi.com', 'https://ko-fi.com@evil.example/', 'https://[::1]:3000/', 'ftp://ko-fi.com/', 'ko-fi.com', '',
+      'https://pandabear445.github.io/Hearth-chat/privacy.html'];
+    fs.writeFileSync(path.join(tmp, 'PayCheck.java'), `package app.hearth.mobile;
+public class PayCheck {
+  public static void main(String[] a) {
+    String[] urls = { ${[...pay, ...other].map((u) => JSON.stringify(u)).join(', ')}, null };
+    StringBuilder sb = new StringBuilder();
+    for (String u : urls) sb.append(BridgePolicy.isPaymentPage(u) ? '1' : '0');
+    System.out.println(sb);
+  }
+}`);
+    execFileSync('javac', ['-d', tmp, path.join(ROOT, 'mobile', 'native', 'BridgePolicy.java'), path.join(tmp, 'PayCheck.java')], { stdio: 'pipe' });
+    assert.equal(execFileSync('java', ['-cp', tmp, 'app.hearth.mobile.PayCheck'], { encoding: 'utf8' }).trim(), '1'.repeat(pay.length) + '0'.repeat(other.length + 1));
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
 test('play-6: the connect screen links to Hearth’s privacy policy, and MainActivity sends that link to the browser', () => {
   const site = /static final String SITE = "([^"]+)";/.exec(read('mobile', 'native', 'BridgePolicy.java'))[1];
   assert.equal(site, 'https://pandabear445.github.io/Hearth-chat/');
@@ -224,6 +263,46 @@ test('play-6: the connect screen links to Hearth’s privacy policy, and MainAct
   assert.match(nav, /if \(from\.equals\(localOrigin\(\)\) && \(url\.startsWith\("https:\/\/"\) \|\| url\.startsWith\("http:\/\/"\)\) && !BridgePolicy\.opensInBrowser\(url\)\) \{\n\s*setServerOrigin\(originOf\(url\)\);\n\s*return false;/);
   assert.ok(nav.indexOf('BridgePolicy.opensInBrowser(url)') < nav.indexOf('startActivity(new Intent(Intent.ACTION_VIEW, request.getUrl())'), 'then on to the browser');
   assert.match(read('mobile', 'native', 'test', 'PushPolicyTest.java'), /public void theConnectScreensPrivacyLinkOpensInTheBrowser\(\)/);
+});
+
+// ================================================================== 4. nothing copied off the phone
+// The web view's storage holds the session token and the unlocked keys, so Android's backup (to the person's Google
+// account) and phone-to-phone transfer are off. The privacy policy says so.
+test('play-9: the build turns off Android backup and phone-to-phone transfer, and the merged manifest check insists on it', () => {
+  const P = require('../mobile/scripts/patch-android.js');
+  const manifest = (app) => `<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application ${app} android:label="@string/app_name">
+        <activity android:name=".MainActivity" android:launchMode="singleTask" android:exported="true">
+        </activity>
+    </application>
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>
+`;
+  for (const app of ['android:allowBackup="true"', '']) {
+    const out = P.patchManifest(manifest(app), { server: '' });
+    const tag = /<application\b[^>]*>/.exec(out)[0];
+    assert.match(tag, /^<application android:allowBackup="false" android:dataExtractionRules="@xml\/data_extraction_rules" tools:replace="android:allowBackup,android:dataExtractionRules" /, app || 'no allowBackup in the template');
+    assert.equal((tag.match(/allowBackup/g) || []).length, 2, 'set once (and named in tools:replace)');
+    assert.match(out, /<manifest xmlns:tools="http:\/\/schemas\.android\.com\/tools" xmlns:android=/);
+    assert.ok(!P.checkMerged(out).some((x) => /allowBackup|data_extraction/.test(x)));
+  }
+  assert.throws(() => P.patchManifest(manifest('android:dataExtractionRules="@xml/other"')), /backup rules/);
+  assert.throws(() => P.patchManifest(manifest('android:fullBackupContent="@xml/other"')), /backup rules/);
+  const merged = P.patchManifest(manifest('android:allowBackup="true"'));
+  assert.ok(P.checkMerged(merged.replace('android:allowBackup="false"', 'android:allowBackup="true"')).includes('<application> must have android:allowBackup="false"'));
+  assert.ok(P.checkMerged(merged.replace(/ android:dataExtractionRules="[^"]*"/, '')).includes('<application> must use @xml/data_extraction_rules'));
+  // The rules leave out every place the app keeps data, for the backup and for a transfer. They're copied in with
+  // the status bar icon (native/res).
+  const rules = read('mobile', 'native', 'res', 'xml', 'data_extraction_rules.xml');
+  for (const part of ['cloud-backup', 'device-transfer']) {
+    const body = new RegExp(`<${part}>([\\s\\S]*?)</${part}>`).exec(rules)[1];
+    assert.doesNotMatch(body, /<include\b/, part);
+    for (const d of ['root', 'file', 'database', 'sharedpref', 'external']) assert.match(body, new RegExp(`<exclude domain="${d}" path="\\." />`), `${part}: ${d}`);
+  }
+  assert.match(read('mobile', 'scripts', 'patch-android.js'), /copyDir\(path\.join\(native, 'res'\), path\.join\(dir, 'app', 'src', 'main', 'res'\)\)/);
+  const privacy = path.join(ROOT, '..', 'privacy.html');
+  if (fs.existsSync(privacy)) assert.match(fs.readFileSync(privacy, 'utf8'), /turns off Android's own backup and phone-to-phone transfer/);
 });
 
 // ================================================================== the real client, as a browser and as the app
@@ -311,6 +390,31 @@ test('play-7: in Chromium, a browser shows the ways to pay and downloads as befo
     assert.equal(await app.locator('.home-view').count(), 1, 'Home is showing');
     const appMenu = await menuItems(app);
     assert.ok(appMenu.length > 3 && !appMenu.some((t) => /Support/.test(t)), `no Support item (${appMenu.join(' | ')})`);
+    // And no link to the donation page anywhere: Home, the menu on your name, every Settings tab.
+    const noFunding = async (where) => assert.equal(await app.locator(`a[href="${FUNDING}"]`).count(), 0, `a donation link in ${where}`);
+    await noFunding('Home');
+    await app.click('#user-panel .me-btn');
+    await app.waitForSelector('.menu.status-menu');
+    await noFunding('the menu on your name');
+    await app.keyboard.press('Escape');
+    await app.waitForSelector('.menu.status-menu', { state: 'detached', timeout: 5000 }).catch(() => {});
+    await app.click('#user-panel button[aria-label="Settings"]');
+    await app.waitForSelector('.settings-modal .set-nav');
+    const navBtn = '.set-nav .set-nav-btn:not(.danger)'; // not Log out
+    const tabs = await app.locator(navBtn).allInnerTexts();
+    assert.ok(tabs.length >= 8, `Settings tabs (${tabs.join(' | ')})`);
+    let seen = 0;
+    for (let i = 0; i < tabs.length; i++) {
+      await app.locator(navBtn).nth(i).click();
+      await settle(app, 200);
+      const subs = await app.locator('.set-subtabs .set-subtab').count();
+      for (let j = 0; j < Math.max(1, subs); j++) {
+        if (subs) { await app.locator('.set-subtabs .set-subtab').nth(j).click(); await settle(app, 200); }
+        await noFunding(`Settings \u2192 ${tabs[i].trim()}${subs ? ` \u2192 ${(await app.locator('.set-subtabs .set-subtab').nth(j).innerText()).trim()}` : ''}`);
+        seen++;
+      }
+    }
+    assert.ok(seen > tabs.length, `looked at the sub-tabs too (${seen})`);
     await openSettingsTab(app, 'Apps & devices');
     const appsText = await app.locator('.set-content').innerText();
     assert.match(appsText, /You’re using the Hearth Android app/);

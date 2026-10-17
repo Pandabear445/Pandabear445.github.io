@@ -1141,7 +1141,29 @@ async function userModal(id, refresh, myRank = 2) {
       u.suspendedAt
         ? { label: 'Unsuspend', kind: 'primary', action: async () => { await api('POST', `/admin/users/${id}/unsuspend`); toast('Unsuspended.'); refresh(); } }
         : { label: 'Suspend\u2026', kind: 'danger', action: () => { m.close(); suspendDialog(u, refresh); return false; } },
+      myRank >= 2 && !u.deletedAt && !u.bot ? { label: 'Delete account\u2026', kind: 'danger', action: () => { m.close(); deleteAccountDialog(u, refresh); return false; } } : null,
     ].filter(Boolean),
+  });
+}
+// Deleting someone's account for them: a child under 13, or a person who asked by email because they can't sign in.
+// The server does what Settings → Delete account does (eraseAccount in server/index.js), without their password.
+function deleteAccountDialog(u, after) {
+  const confirmIn = h('input', { class: 'input', maxlength: '40', autocomplete: 'off', spellcheck: 'false' });
+  const reason = h('input', { class: 'input', maxlength: '300', placeholder: 'For the audit log, e.g. \u201casked by email\u201d or \u201cunder 13\u201d' });
+  modal({
+    title: `Delete ${u.displayName}\u2019s account?`, size: 'sm',
+    body: h('div', { class: 'stack' },
+      h('p', { class: 'muted-p' }, 'The same as when they delete it themselves in Settings: they\u2019re signed out everywhere, and their keys, email, profile, pictures, friends and settings are erased. Their messages stay, as \u201cDeleted user\u201d. It can\u2019t be undone. If they own servers, delete those or give them to someone first.'),
+      h('p', { class: 'muted-p' }, 'Only for an account that belongs to a child under 13, or for someone who asked you and showed it\u2019s theirs. Reports and staff notes about them stay. This goes in the audit log.'),
+      field(`Type ${u.username} to confirm`, confirmIn), field('Reason', reason)),
+    actions: [{ label: 'Cancel' }, { label: 'Delete forever', kind: 'danger', action: async () => {
+      if (confirmIn.value.trim() !== u.username) throw new Error(`Type ${u.username} to confirm.`);
+      const r = await withPassword((x) => api('DELETE', `/admin/users/${u.id}`, { confirm: confirmIn.value.trim(), reason: reason.value, ...x }),
+        { title: 'Confirm deleting the account', text: `Deleting ${u.username}\u2019s account needs your password.`, button: 'Delete forever' });
+      if (!r) return false;
+      toast(`${u.username}\u2019s account is deleted.`);
+      if (after) await after();
+    } }],
   });
 }
 // Private staff notes on an account.

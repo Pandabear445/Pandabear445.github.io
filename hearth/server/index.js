@@ -2212,7 +2212,7 @@ api.post('/me/password', auth, wrap(async (req, res) => {
   res.json({ ok: true, token: rotateToken(req) });
 }));
 
-// Deleting your account. Needs your password (and a two-factor code when it's on). What happens:
+// Deleting your account. Needs your password (and a two-factor code when it's on). What happens (eraseAccount):
 //   - you're signed out everywhere, and the account can never sign in again; the username is freed
 //   - your private keys, email, two-factor, recovery key, profile, pictures, friends, blocks and push devices are
 //     erased. Your PUBLIC keys stay: the people you talked to need them to keep reading your old direct
@@ -2220,18 +2220,30 @@ api.post('/me/password', auth, wrap(async (req, res) => {
 //   - you leave every server and group (the others switch to a new server key, as when anyone leaves)
 //   - messages you sent stay where they are (still end-to-end encrypted) and show "Deleted user"
 // Owners first hand over or delete their servers; the instance owner first hands over ownership.
+// Staff can do the same to someone else's account (DELETE /admin/users/:id, below).
 api.delete('/me', auth, wrap(async (req, res) => {
   rateLimit('deleteme:' + req.userId, 5, 60 * 60 * 1000);
   const mayGo = (row) => {
     if ((req.body || {}).confirm !== row.username) fail(400, 'Type your username to confirm.', 'confirm');
     if (ownerId() === row.id) fail(400, 'You own this Hearth server. Hand ownership to someone else first (Admin → Team & roles).', 'is_owner');
-    const owned = db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(row.id);
+    const owned = ownedServers(row.id);
     if (owned.length) fail(400, `First delete or hand over the servers you own: ${owned.map((x) => x.name).join(', ')}.`, 'owns_servers');
   };
   // Before the password and code too (a server still owned mustn't use up a two-factor code), and again after.
   mayGo(getUserRow(req.userId));
   const row = await stepUp(req, req.body, 'authKey', { ticket: 'delete-account' });
   mayGo(row);
+  eraseAccount(row);
+  auditLog(req, 'account_deleted', row.id, row.username);
+  ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
+  res.json({ ok: true });
+}));
+// The servers an account owns (group chats aren't: they pass to the next person in them).
+const ownedServers = (uid) => db.prepare("SELECT id, name FROM servers WHERE owner_id = ? AND COALESCE(kind, 'server') != 'group'").all(uid);
+// What deleting an account does, whoever asked (the account itself, or staff). `row` is the users row from before.
+// The account row stays, emptied, so the messages it sent keep an author. delete-account.html on the website lists
+// what goes and what stays: change it when this changes.
+function eraseAccount(row) {
   // Who has them on screen, worked out before their servers and friendships go: they all see "Deleted user".
   const audience = userAudience(row.id);
   revokeSessions(row.id, { reason: 'account_deleted' });
@@ -2249,27 +2261,35 @@ api.delete('/me', auth, wrap(async (req, res) => {
   }
   const files = [row.avatar, row.banner, row.background, row.song, row.page_bg];
   const friends = db.prepare('SELECT requester_id, addressee_id FROM friendships WHERE requester_id = ? OR addressee_id = ?').all(row.id, row.id);
+  // Bots they made stop: nobody can look after them any more, and their events would keep going to the maker's
+  // own server. An admin can turn one back on (Admin → Bots) or remove it.
+  const bots = db.prepare('SELECT id FROM bots WHERE owner_id = ? AND disabled = 0').all(row.id).map((b) => b.id);
+  const botServers = bots.length ? db.prepare(`SELECT DISTINCT server_id FROM bot_installations WHERE bot_id IN (${bots.map(() => '?').join(',')})`).all(...bots).map((r) => r.server_id) : [];
   db.transaction(() => {
     db.prepare(`UPDATE users SET username = ?, auth_hash = '!', enc_private_key = '', enc_sign_private_key = NULL,
       enc_private_key_recovery = NULL, recovery_salt = NULL, email = NULL, email_verified = 0, totp_enabled = 0, totp_secret = NULL, backup_codes = '[]',
       avatar = NULL, banner = NULL, background = NULL, song = NULL, page = NULL, page_bg = NULL, profile = ?, status = 'offline', activity_cfg = '{}',
-      last_ip = NULL, support_code = NULL, deleted_at = ? WHERE id = ?`)
+      last_ip = NULL, support_code = NULL, stripe_customer = NULL, deleted_at = ? WHERE id = ?`)
       .run(`deleted-${crypto.randomBytes(5).toString('hex')}`, JSON.stringify(sanitizeProfile({ displayName: 'Deleted user' })), now(), row.id);
     for (const t of ['friendships WHERE requester_id = ? OR addressee_id = ?', 'blocks WHERE blocker_id = ? OR blocked_id = ?']) db.prepare(`DELETE FROM ${t}`).run(row.id, row.id);
-    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps', 'word_filters']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    // Their settings and bookmarks (saved messages with their notes, read positions, mention counts, notification
+    // choices, folders and other preferences), and which servers they were in (former_members only matters to
+    // someone who could come back).
+    for (const t of ['push_subs', 'user_ips', 'auth_tokens', 'server_keys', 'user_feeds', 'study_items', 'event_rsvps', 'word_filters',
+      'saved_messages', 'read_states', 'mention_marks', 'notify_prefs', 'user_prefs', 'former_members']) db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).run(row.id);
+    db.prepare('DELETE FROM profile_comments WHERE profile_id = ?').run(row.id); // the comments on their profile page go with it
     db.prepare("UPDATE users SET rail_layout = '', study_enabled = 0, status_expires_at = NULL WHERE id = ?").run(row.id);
+    if (bots.length) db.prepare('UPDATE bots SET disabled = 1 WHERE owner_id = ?').run(row.id);
     const roles = staffRoles();
     if (roles[row.id]) { delete roles[row.id]; saveStaffRoles(roles); }
   })();
   files.forEach((f) => removeUpload(f));
   SCHED.forgetUser(row.id); // messages they scheduled never go out
   friends.forEach((f) => emitRelationship(null, f.requester_id, f.addressee_id));
+  botServers.forEach((s) => emitServer(s));
   broadcastUser(row.id, audience);
   closeWindows(row.id, 'account_deleted');
-  auditLog(req, 'account_deleted', row.id, row.username);
-  ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted. This can't be undone.`);
-  res.json({ ok: true });
-}));
+}
 
 // One-time upload of the user's message-signing key. Its private half is encrypted by the
 // browser with a key only the account's own identity key can derive.
@@ -5578,6 +5598,7 @@ api.get('/admin/users/:id', auth, staffOnly, (req, res) => {
     storage: quotaOf(r.id), quotaOverride: r.upload_quota_mb, profileLocked: !!r.profile_locked, supporter: !!r.supporter,
     emailMasked: ACCT ? ACCT.mask(r.email) : '', totpEnabled: !!r.totp_enabled, hasRecovery: !!r.enc_private_key_recovery,
     keysResetAt: r.keys_reset_at || null, keysWaiting: r.keys_reset_at ? stillWaiting(r).length : 0, keysVouched: r.keys_vouched_at ? { at: r.keys_vouched_at, by: brief(r.keys_vouched_by) } : null, self: r.id === req.userId,
+    deletedAt: r.deleted_at || null,
     commentsWritten: db.prepare('SELECT COUNT(*) n FROM profile_comments WHERE author_id = ?').get(r.id).n,
     notes: db.prepare('SELECT id, author_id, text, created_at FROM staff_notes WHERE user_id = ? ORDER BY created_at DESC LIMIT 100').all(r.id)
       .map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, author: brief(n.author_id), mine: n.author_id === req.userId })),
@@ -5654,6 +5675,32 @@ api.post('/admin/users/:id/logout', auth, staffOnly, (req, res) => {
   adminLog(req, 'sign_out_everywhere', req.params.id);
   res.json({ ok: true });
 });
+// Deleting someone else's account, the same way Settings → Delete account does (eraseAccount), without their
+// password: for an account that belongs to a child under 13, or for someone who asked by email and can't sign in
+// (delete-account.html and child-safety.html on the website promise both). Admins and the owner only, on accounts
+// ranked below them; it takes the staff member's own password (and two-factor code), and the account's username
+// typed out. Like the account itself, staff first deal with servers it owns (Admin → Servers).
+api.delete('/admin/users/:id', auth, adminOnly, wrap(async (req, res) => {
+  const b = req.body || {};
+  const mayGo = () => {
+    const r = requireOutranks(req, req.params.id);
+    if (r.deleted_at) fail(400, 'That account is already deleted.', 'deleted');
+    if (r.is_bot) fail(400, 'That’s a bot or webhook account, not a person’s. Remove the bot or the webhook instead.', 'bot');
+    if (b.confirm !== r.username) fail(400, `Type ${r.username} to confirm.`, 'confirm');
+    const owned = ownedServers(r.id);
+    if (owned.length) fail(400, `${r.username} owns ${owned.map((x) => x.name).join(', ')}. Delete those servers or give them to someone else first (Admin → Servers).`, 'owns_servers');
+    return r;
+  };
+  mayGo(); // before the password and code too, so a refusal doesn't use up a two-factor code
+  await stepUp(req, b);
+  const row = mayGo();
+  const reason = String(b.reason || '').trim().slice(0, 300);
+  eraseAccount(row);
+  adminLog(req, 'account_deleted_by_staff', row.id, `${row.username}${reason ? ` — ${reason}` : ''}`);
+  // No "reset your password" advice: there's no account left to sign in to.
+  ACCT.notify(row, 'your account was deleted', `The account ${row.username} was deleted by the server's staff. This can't be undone.`, { footer: '' });
+  res.json({ ok: true });
+}));
 api.get('/admin/reports', auth, staffOnly, (req, res) => {
   const st = ['open', 'reviewing', 'resolved', 'dismissed', 'all'].includes(req.query.status) ? req.query.status : 'open';
   const rows = st === 'all' ? db.prepare('SELECT * FROM reports ORDER BY created_at DESC LIMIT 200').all()

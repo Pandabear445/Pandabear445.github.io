@@ -7,6 +7,9 @@ export const CHANGES = [
     'Privacy policy: if your server’s owner publishes one (PRIVACY_URL), it’s linked at sign-up, in Settings → Security and in Settings → Apps & devices. The Android app’s connect screen links to Hearth’s own privacy policy.',
     pay('The Android app no longer shows ways to pay (Support, the funding card on Home, creator memberships) or the download page for the APK. A browser and the desktop app still do.'),
     'Android app: the APK no longer carries Google’s encrypted list of the app’s libraries, so app stores like IzzyOnDroid can check it.',
+    'Android app: Android’s own backup and phone-to-phone transfer are off, so your sign-in and unlocked keys stay on your phone. On a new phone you sign in again.',
+    'Deleting your account now also erases your saved messages, read positions, notification and app settings, and the comments on your profile page. Bots you made are turned off.',
+    'Admins can delete an account for someone in Admin → Users (for a person who can’t sign in and asks, or a child under 13). It does the same as Settings → Delete account, needs the admin’s password and goes in the audit log.',
   ] },
   { version: '1.29.0', items: [
     'Webhooks: give a channel a webhook address (channel settings \u2192 Webhooks) and paste it into Uptime Kuma, Home Assistant, Grafana, GitHub or anything that posts to Discord or Slack. Posts show as the webhook, marked as not end-to-end encrypted, and can\u2019t ping anyone unless you allow it.',

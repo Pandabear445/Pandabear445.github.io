@@ -7,7 +7,8 @@
 //     Android needs for the latter;
 //   - invite links: hearth://invite/CODE, and https://SERVER/invite/CODE when the app is built for one server
 //     (HEARTH_SERVER), as a verified App Link (the server publishes /.well-known/assetlinks.json);
-//   - the status bar icon (native/res) and the app's unit tests (native/test, run by testReleaseUnitTest).
+//   - the status bar icon (native/res) and the app's unit tests (native/test, run by testReleaseUnitTest);
+//   - no Android backup and no phone-to-phone transfer of the app's data (BACKUP below).
 //
 // Usage (from hearth/mobile, after `npx cap add android` and copying native/*.java):
 //   node scripts/patch-android.js android                       patch android/ (SERVER: the baked-in server)
@@ -37,6 +38,15 @@ const SERVICES = `
         </service>
         <service android:name=".CallService" android:exported="false" android:foregroundServiceType="microphone" android:stopWithTask="true" />
 `;
+
+// The web view's storage holds the session token and the unlocked encryption keys, which must stay on this phone
+// (the privacy policy says so). Capacitor's template has android:allowBackup="true", which lets Android copy the app's
+// data to the person's Google account and to a new phone. allowBackup="false" stops the backup; from Android 12 on, a
+// phone-to-phone transfer only stops with data extraction rules that leave everything out (native/res/xml/
+// data_extraction_rules.xml). https://developer.android.com/about/versions/12/behavior-changes-12#backup-restore
+// tools:replace lets these win over a library that sets the same attributes, instead of failing the merge.
+const BACKUP = 'android:allowBackup="false" android:dataExtractionRules="@xml/data_extraction_rules"';
+const TOOLS_NS = 'xmlns:tools="http://schemas.android.com/tools"';
 
 // https://SERVER for an App Link: a plain https origin, nothing else ('' when there's none to add).
 function appLinkHost(server) {
@@ -79,7 +89,14 @@ function patchManifest(xml, { server = '' } = {}) {
   const act = /<activity\b[^>]*android:name="\.MainActivity"[^>]*>[\s\S]*?<\/activity>/.exec(xml);
   if (!act) throw new Error('AndroidManifest.xml has no .MainActivity');
   if (!/android:launchMode="singleTask"/.test(act[0])) throw new Error('.MainActivity must be singleTask (links reach the running app)');
-  let out = xml.replace(act[0], act[0].replace(/\s*<\/activity>$/, `${inviteFilters(server)}\n\n        </activity>`));
+  const app = /<application\b[^>]*>/.exec(xml);
+  if (!app) throw new Error('AndroidManifest.xml has no <application>');
+  if (/android:(dataExtractionRules|fullBackupContent)=|tools:replace=/.test(app[0])) throw new Error('<application> already has backup rules or tools:replace: check the template');
+  const root = /<manifest\b[^>]*>/.exec(xml);
+  if (!root) throw new Error('AndroidManifest.xml has no <manifest>');
+  let out = xml.replace(app[0], app[0].replace(/\s+android:allowBackup="[^"]*"/, '').replace(/^<application\b/, `<application ${BACKUP} tools:replace="android:allowBackup,android:dataExtractionRules"`));
+  if (!root[0].includes(TOOLS_NS)) out = out.replace(root[0], root[0].replace(/^<manifest\b/, `<manifest ${TOOLS_NS}`));
+  out = out.replace(act[0], act[0].replace(/\s*<\/activity>$/, `${inviteFilters(server)}\n\n        </activity>`));
   out = out.replace('</application>', `${SERVICES}    </application>`);
   out = out.replace(internet, (m) => `${m}\n    ${PERMISSIONS.map((p) => `<uses-permission android:name="${p}" />`).join('\n    ')}`);
   return out;
@@ -137,6 +154,9 @@ function checkMerged(xml) {
   }
   for (const p of PERMISSIONS) if (!xml.includes(`android:name="${p}"`)) problems.push(`permission ${p} is missing`);
   if (!/android:scheme="hearth"/.test(xml)) problems.push('the hearth://invite link filter is missing');
+  const app = /<application\b[^>]*>/.exec(xml);
+  if (!app || !/android:allowBackup="false"/.test(app[0])) problems.push('<application> must have android:allowBackup="false"');
+  if (!app || !/android:dataExtractionRules="@xml\/data_extraction_rules"/.test(app[0])) problems.push('<application> must use @xml/data_extraction_rules');
   return problems;
 }
 
@@ -163,5 +183,5 @@ function main(argv) {
   return 0;
 }
 
-module.exports = { patchManifest, gradleAdditions, checkMerged, appLinkHost, CONNECTOR, PERMISSIONS };
+module.exports = { patchManifest, gradleAdditions, checkMerged, appLinkHost, CONNECTOR, PERMISSIONS, BACKUP };
 if (require.main === module) process.exitCode = main(process.argv.slice(2));

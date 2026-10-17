@@ -1,4 +1,4 @@
 • The connect screen links to Hearth's privacy policy, which opens in your browser.
 • The APK no longer carries Google's encrypted list of the app's libraries, so app stores such as IzzyOnDroid can check it.
+• Android's backup and phone-to-phone transfer are off: your sign-in and keys stay on this phone.
 • With a server on Hearth 1.29.1 or newer, the app shows no ways to pay and no APK download page, and links to the server's privacy policy if it has one.
-• A store listing (text, icon and screenshots).

@@ -745,7 +745,7 @@ function startApp() {
   socket.on('config:update', (c) => {
     Object.assign(S.config, c);
     if ('name' in c || 'tagline' in c) { document.title = S.config.name; $$('[data-instance-name]').forEach((el) => { el.textContent = S.config.name; }); }
-    if ('funding' in c && S.view.type === 'home') later(renderMain);
+    if (!noPayments && 'funding' in c && S.view.type === 'home') later(renderMain); // the funding card on Home (none in the app)
     if ('announcement' in c) renderAnnouncement();
     if (c.termsVersion) askToAcceptTerms();
     if (composers.main) composers.main.renderExtras();

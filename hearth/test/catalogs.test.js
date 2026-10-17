@@ -459,6 +459,23 @@ test('landing site: the privacy policy, account deletion and child safety pages'
   for (const s of ['<strong>Security</strong>', 'Security &amp; storage', '<strong>Delete account</strong>', '<strong>Delete my account</strong>', '<strong>Delete forever</strong>', 'Export my data']) {
     assert.ok(del.includes(s), `delete-account.html: ${s}`);
   }
+  // Deleting an account for someone who can't sign in (the page's "Can't sign in?"), or one that belongs to a child under
+  // 13 (privacy.html, child-safety.html): staff do it in Admin → Users, with the same erasure as Settings → Delete
+  // account. What the page says goes and stays matches that erasure.
+  const index = read('server/index.js');
+  assert.match(index, /^api\.delete\('\/admin\/users\/:id', auth, adminOnly, wrap\(async/m);
+  assert.match(index, /eraseAccount\(row\);\n {2}adminLog\(req, 'account_deleted_by_staff'/);
+  assert.match(read('public/js/admin.js'), /label: 'Delete account\\u2026'/);
+  assert.match(del, /we delete the account from the server's admin tools\. That erases and keeps exactly what deleting it in the app does/);
+  for (const [f, html] of [['privacy.html', privacy], ['child-safety.html', kids]]) assert.match(html, /If we learn that an account belongs to someone under 13, we (suspend it and )?delete it\./, f);
+  const erase = index.slice(index.indexOf('function eraseAccount('), index.indexOf('\n}\n', index.indexOf('function eraseAccount(')));
+  for (const t of ['saved_messages', 'read_states', 'mention_marks', 'notify_prefs', 'user_prefs', 'former_members']) assert.ok(erase.includes(`'${t}'`), `eraseAccount deletes ${t}`);
+  assert.match(erase, /DELETE FROM profile_comments WHERE profile_id = \?/);
+  assert.match(erase, /UPDATE bots SET disabled = 1 WHERE owner_id = \?/);
+  for (const s of ['Your saved messages and their notes', 'and the comments people left on it', '<strong>Bots you made</strong> stay, but they\'re turned off',
+    '<strong>GIFs you added to the server\'s GIF library</strong>', 'and for Ko-fi the name and message you typed there']) assert.ok(del.includes(s), `delete-account.html: ${s}`);
+  // Bots are on the list of who else gets data.
+  assert.match(privacy, /<tr><td><strong>Bots in a server<\/strong><\/td>/);
   // Reporting: the message menu item, the category, and child-safety reports staying with the instance's staff.
   assert.match(read('public/js/app.js'), /label: 'Report message'/);
   assert.match(read('public/js/app.js'), /label: 'Send report'/);

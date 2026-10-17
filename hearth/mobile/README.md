@@ -17,7 +17,10 @@ What the app adds on top of the web page (in `native/MainActivity.java`):
   built for your server (see *Invite links* below).
 * **Saving files** (attachments, exports) to *Downloads/Hearth*.
 * **Links to other sites** open in your browser; only your server loads inside the app. The connect screen
-  links to Hearth's privacy policy, which opens in the browser too.
+  links to Hearth's privacy policy, which opens in the browser too. Payment pages (Stripe's checkout, payment
+  links and billing pages, and Ko-fi) don't open at all, wherever the link comes from.
+* **Nothing copied off the phone:** Android's backup and phone-to-phone transfer are off for the app, so your
+  sign-in and unlocked keys stay on the phone. On a new phone you sign in again.
 * **Back button** goes back; on the first screen it sends the app to the background (so messages keep
   arriving) instead of closing it.
 * **Switch server:** Settings → Apps & devices → *Switch server*.
@@ -192,7 +195,9 @@ still need a real phone (checklist: `docs/design/ANDROID-PUSH.md` §17) before a
 
 * **Paying:** the supporter window (*Support* in the menu on your name), the funding card on Home and creator
   memberships (joining one, and Server settings → Memberships) don't show in the app. Google Play doesn't allow
-  an app to send people to pay outside Play's own billing. A browser and the desktop app still show them.
+  an app to send people to pay outside Play's own billing. A browser and the desktop app still show them. That
+  part comes from the server (1.29.1 or newer); the app itself also refuses to open Stripe and Ko-fi payment pages
+  (`BridgePolicy.isPaymentPage`), for a server on an older version and for links people post.
 * **Downloads:** Settings → Apps & devices has no download page or share link, and `/download` lists no
   downloads when it's opened in the app. An app installed from Google Play updates only through Play.
 
@@ -210,7 +215,10 @@ and the `androidx.webkit` dependency, keep Google's dependency-info block out of
 * `HearthPushService` (unexported, reachable only by the library) and `CallService` (a `microphone` foreground
   service) with the `FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_MICROPHONE` permissions;
 * the invite link filters (`SERVER` set: also the verified https one);
-* the status bar icon (`native/res`) and the unit tests (`native/test`).
+* the status bar icon (`native/res`) and the unit tests (`native/test`);
+* `android:allowBackup="false"` and data extraction rules that leave everything out
+  (`native/res/xml/data_extraction_rules.xml`), so Android neither backs the app's data up nor moves it to a new
+  phone.
 
 It refuses to patch a manifest that doesn't look like Capacitor's template, so a template change fails the build
 instead of shipping an app without push. Then `./gradlew assembleRelease testReleaseUnitTest` (and

@@ -885,6 +885,8 @@ test('android store listing (fastlane): text within the stores\' limits and hone
   // No other company's trademark; screen sharing only where it says the Android app lacks it (mobile/README.md);
   // closed-app notifications need a push app; the default server is the one the app opens.
   assert.doesNotMatch(`${title}\n${short}\n${full}`, /discord/i);
+  // Nor other services' names (Google Play's listing rules): generic words for the video sites, GIF search and STUN.
+  assert.doesNotMatch(`${title}\n${short}\n${full}`, /\b(youtube|vimeo|twitch|google|giphy|klipy|whatsapp|telegram|slack)\b/i);
   const [does, lacks] = full.split('NOT IN THE ANDROID APP YET');
   assert.ok(lacks, 'says what the Android app lacks');
   assert.doesNotMatch(does, /screen.?shar/i);

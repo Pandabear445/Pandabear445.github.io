@@ -62,16 +62,17 @@
   <h2 id="by-email">Can't sign in?</h2>
   <p>If you forgot your password and your account has a confirmed email, use <strong>Forgot your password?</strong> on the sign-in screen. Then delete the account in the app.</p>
   <p>Otherwise, email <a href="mailto:{{CONTACT_EMAIL}}">{{CONTACT_EMAIL}}</a> with "Delete my account" as the subject. Include your username, and say that the account is on kappachat.duckdns.org.</p>
-  <p>Send it from the email address on the account, if it has one. If it doesn't, we'll ask for details that show the account is yours, such as when you made it, the servers you're in or people you talk to. We check so that nobody can delete someone else's account. Once we're sure, we delete the account and the data listed below, and write back to tell you.</p>
+  <p>Send it from the email address on the account, if it has one. If it doesn't, we'll ask for details that show the account is yours, such as when you made it, the servers you're in or people you talk to. We check so that nobody can delete someone else's account. Once we're sure, we delete the account from the server's admin tools. That erases and keeps exactly what deleting it in the app does (the lists below). Then we write back to tell you.</p>
 
   <h2 id="deleted">What's deleted</h2>
   <ul>
     <li>Your username (other people can then take it), your password check and your email address.</li>
     <li>Your private encryption keys and your recovery key.</li>
     <li>Two-factor sign-in and its backup codes.</li>
-    <li>Your profile: display name, bio, pronouns, status, pictures, banner, background, profile song and profile page. You show as "Deleted user".</li>
+    <li>Your profile: display name, bio, pronouns, status, pictures, banner, background, profile song and profile page, and the comments people left on it. You show as "Deleted user".</li>
     <li>Your friends and blocks.</li>
-    <li>Your place in every server and group chat, with your roles and nicknames there. A group chat with nobody left in it is deleted with everything in it.</li>
+    <li>Your place in every server and group chat, with your roles and nicknames there, and the server's record of which servers you were in. A group chat with nobody left in it is deleted with everything in it.</li>
+    <li>Your saved messages and their notes, where you'd read up to, mention counts, notification settings, server folders and other app settings.</li>
     <li>Your signed-in devices (all signed out at once), push notification registrations, the list of IP addresses your account used, and your last IP address.</li>
     <li>Unfinished uploads, scheduled messages that haven't gone out yet, tracked feeds, study tools data, your word filter, your event replies, password-reset links and any staff role.</li>
   </ul>
@@ -81,11 +82,13 @@
     <li><strong>Messages and files you sent</strong> stay in their conversations, still end-to-end encrypted, under "Deleted user". The people who could read them before still can. Reactions and poll votes you left, and comments you wrote on other people's profile pages, stay too. They're deleted only when someone deletes them, by a disappearing-message timer, or with their conversation or server.</li>
     <li><strong>Your public keys</strong> stay, so people can still read your old direct messages and check your old posts. Public keys can't unlock anything.</li>
     <li><strong>An empty account record</strong> with a random name stays, so old messages keep an author. It can never sign in again. It keeps the dates the account was made and last used, and its supporter status.</li>
+    <li><strong>Bots you made</strong> stay, but they're turned off: they stop getting events and can't post. The server's admins can remove them or turn them back on.</li>
+    <li><strong>GIFs you added to the server's GIF library</strong> stay there for everyone, until staff remove them.</li>
     <li><strong>Signed-out device records</strong> (with their IP addresses) are deleted 30 days later.</li>
     <li><strong>Reports</strong> you sent or that were made about you, with the messages and IP addresses in them, and notes staff wrote about the account. These aren't deleted automatically.</li>
     <li><strong>The audit log</strong> keeps a line saying the account was deleted, with its old username and the IP address the deletion came from, and the earlier security events on the account. The audit log can't be edited or deleted.</li>
     <li><strong>Moderation logs</strong> of the servers you were in can name you for up to a year.</li>
-    <li><strong>Payment records</strong> (amount, date and the payment service's reference), if you paid to support the server or bought a membership.</li>
+    <li><strong>Payment records</strong> (amount, date and the payment service's reference, and for Ko-fi the name and message you typed there), if you paid to support the server or bought a membership.</li>
     <li><strong>Backups</strong> made before the deletion still hold the deleted data until they're removed. With Hearth's default settings that's about a week for the server's daily backups, the newest 14 on each linked relay server, and the newest few copies made before software updates. Copies sent to off-site storage stay until the server's operator deletes them by hand. Every backup that leaves the server is encrypted.</li>
   </ul>
 
