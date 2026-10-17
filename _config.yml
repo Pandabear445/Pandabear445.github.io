@@ -1,5 +1,5 @@
-# GitHub Pages (pandabear445.github.io/Hearth-chat): only the landing pages (index.html, discord-alternative.html, code-signing.html), their
-# images, robots.txt and sitemap.xml are published.
+# GitHub Pages (pandabear445.github.io/Hearth-chat): only the landing pages (index.html, discord-alternative.html, code-signing.html,
+# privacy.html, delete-account.html, child-safety.html), their images, robots.txt and sitemap.xml are published.
 # The app itself (hearth/) is code to download and run, not part of the website.
 exclude:
   - hearth

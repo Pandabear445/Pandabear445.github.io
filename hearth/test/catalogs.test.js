@@ -368,7 +368,7 @@ test('nothing secret can reach the image: the Dockerfile copies only program fil
 const siteFile = (p) => fs.readFileSync(path.join(SITE, p), 'utf8');
 test('landing site: sitemap, robots.txt, canonical links, structured data, the comparison page, no scripts', { skip: !fs.existsSync(path.join(SITE, 'index.html')) && 'no landing site in this checkout' }, () => {
   const pages = fs.readdirSync(SITE).filter((f) => /\.html$/.test(f)).sort();
-  assert.deepEqual(pages, ['code-signing.html', 'discord-alternative.html', 'index.html']);
+  assert.deepEqual(pages, ['child-safety.html', 'code-signing.html', 'delete-account.html', 'discord-alternative.html', 'index.html', 'privacy.html']);
   const url = (f) => (f === 'index.html' ? 'https://pandabear445.github.io/Hearth-chat/' : `https://pandabear445.github.io/Hearth-chat/${f}`);
   const locs = [...siteFile('sitemap.xml').matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]).sort();
   assert.deepEqual(locs, pages.map(url).sort(), 'the sitemap lists every page');
@@ -421,4 +421,60 @@ test('landing site: sitemap, robots.txt, canonical links, structured data, the c
   assert.match(cmp, /@media \(max-width: 720px\) \{\s*\.compare-table, \.compare-table tbody, \.compare-table tr, \.compare-table th, \.compare-table td \{ display: block;/);
   const cells = [...cmp.matchAll(/<td\b([^>]*)>/g)].map((m) => m[1]);
   assert.ok(cells.length >= 20 && cells.every((a) => /data-label="(Hearth|Discord)"/.test(a)), 'every cell is labelled');
+});
+
+// The pages Google Play's reviewers read. They name menus, buttons and numbers from the app, so those are checked
+// against the code too: renaming one there means fixing the page.
+test('landing site: the privacy policy, account deletion and child safety pages', { skip: !fs.existsSync(path.join(SITE, 'privacy.html')) && 'no landing site in this checkout' }, () => {
+  const pages = fs.readdirSync(SITE).filter((f) => /\.html$/.test(f));
+  for (const f of pages) assert.match(siteFile(f), /<a href="privacy\.html">Privacy<\/a>/, `${f}: links the privacy policy`);
+  for (const f of ['index.html', 'discord-alternative.html', 'code-signing.html']) {
+    assert.match(siteFile(f), /<a href="delete-account\.html">Delete account<\/a>/, `${f}: links account deletion`);
+    assert.match(siteFile(f), /<a href="child-safety\.html">Child safety<\/a>/, `${f}: links the child safety standards`);
+  }
+  const titleOf = (html) => (/<title>([^<]+)<\/title>/.exec(html) || [])[1];
+  const privacy = siteFile('privacy.html');
+  const del = siteFile('delete-account.html');
+  const kids = siteFile('child-safety.html');
+  assert.equal(titleOf(privacy), 'Hearth Privacy Policy');
+  assert.equal(titleOf(del), 'Delete your Hearth account');
+  assert.equal(titleOf(kids), 'Hearth child safety standards');
+  for (const [f, html] of [['privacy.html', privacy], ['delete-account.html', del], ['child-safety.html', kids]]) {
+    assert.match(html, /<a href="mailto:[^"]+">/, `${f}: an address to write to`);
+    assert.match(html, /kappachat\.duckdns\.org/, `${f}: says which server it covers`);
+    assert.match(html, /Pandabear445/, `${f}: names the developer`);
+  }
+  assert.match(privacy, /<a href="delete-account\.html">/);
+  assert.match(privacy, /<a href="child-safety\.html">/);
+  assert.match(privacy, /hearth\/SECURITY\.md/);
+  assert.match(kids, /<a href="privacy\.html">/);
+  assert.match(kids, /NCMEC/);
+  // The minimum age matches the default terms.
+  assert.match(read('server/index.js'), /You must be old enough to use online services where you live \(at least 13\)/);
+  for (const [f, html] of [['privacy.html', privacy], ['child-safety.html', kids]]) assert.match(html, /You must be 13 or older to use Hearth/, f);
+  // The way to delete an account in the app (Settings → Security → Security & storage → Delete account).
+  const settings = read('public/js/settings.js');
+  assert.ok(settings.includes("['account', 'Security', 'lock']") && settings.includes("['account', 'Security & storage']"), 'Settings → Security');
+  for (const s of ["section('Delete account'", "'Delete my account'", "label: 'Delete forever'", "'Export my data'"]) assert.ok(settings.includes(s), s);
+  for (const s of ['<strong>Security</strong>', 'Security &amp; storage', '<strong>Delete account</strong>', '<strong>Delete my account</strong>', '<strong>Delete forever</strong>', 'Export my data']) {
+    assert.ok(del.includes(s), `delete-account.html: ${s}`);
+  }
+  // Reporting: the message menu item, the category, and child-safety reports staying with the instance's staff.
+  assert.match(read('public/js/app.js'), /label: 'Report message'/);
+  assert.match(read('public/js/app.js'), /label: 'Send report'/);
+  assert.match(read('public/js/admin.js'), /child_safety: 'Child safety'/);
+  assert.match(read('server/index.js'), /const REPORT_CATEGORIES = \[[^\]]*'child_safety'/);
+  assert.match(read('server/serveraudit.js'), /const STAFF_ONLY = \['child_safety'\];/);
+  for (const s of ['<strong>Report message</strong>', '<strong>Child safety</strong>', '<strong>Send report</strong>']) assert.ok(kids.includes(s), `child-safety.html: ${s}`);
+  // Retention numbers the pages give, from the code's defaults: 30 days for signed-out devices, a week of daily
+  // backups, 14 on each region.
+  assert.match(read('server/index.js'), /DELETE FROM sessions WHERE \(revoked_at IS NOT NULL AND revoked_at < \?\)/);
+  assert.match(read('server/index.js'), /\.run\(t - 30 \* 86400000, t - 30 \* 86400000, /);
+  assert.match(read('server/index.js'), /return \{ enabled: true, keep: 7, /);
+  assert.match(read('server/regions.js'), /REGION_BACKUP_KEEP \|\| 14\)/);
+  for (const [f, html] of [['privacy.html', privacy], ['delete-account.html', del]]) {
+    assert.match(html, /30 days/, `${f}: signed-out devices`);
+    assert.match(html, /newest 14/, `${f}: region backups`);
+    assert.match(html, /off-site storage/, `${f}: off-site copies`);
+  }
 });

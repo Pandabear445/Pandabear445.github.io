@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hearth Privacy Policy</title>
+<meta name="description" content="What the Hearth apps and the community server kappachat.duckdns.org collect, who else gets it, how long it's kept and how to delete it.">
+<link rel="canonical" href="https://pandabear445.github.io/Hearth-chat/privacy.html">
+<meta name="theme-color" content="#100e16">
+<link rel="icon" href="site/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="site/icon-192.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,800&family=Figtree:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { color-scheme: dark; --bg: #100e16; --s1: #18151f; --line: #2e2939; --text: #f3eff8; --text-2: #b9b1c7; --muted: #8a8299; --accent: #f2a541; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.65 'Figtree', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  main { width: min(760px, 100% - 32px); margin: 0 auto; padding: 40px 0 72px; }
+  a { color: var(--accent); }
+  .back { display: inline-flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; font-weight: 700; margin-bottom: 36px; }
+  .back img { width: 28px; height: 28px; border-radius: 8px; }
+  h1 { font: 800 clamp(32px, 5vw, 44px)/1.1 'Bricolage Grotesque', 'Figtree', sans-serif; letter-spacing: -.02em; margin: 0 0 12px; }
+  h2 { font-size: 20px; margin: 36px 0 8px; }
+  p, li { color: var(--text-2); }
+  p, li, td { overflow-wrap: break-word; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 6px 0; }
+  li strong, td strong { color: var(--text); }
+  .updated { color: var(--muted); font-size: 14px; margin: 0 0 8px; }
+  .card { background: var(--s1); border: 1px solid var(--line); border-radius: 16px; padding: 18px 20px; margin-top: 20px; }
+  .card p { margin: 0; color: var(--text); }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-size: 14px; font-weight: 600; }
+  td { color: var(--text-2); }
+  td:first-child { width: 30%; }
+  @media (max-width: 520px) { th, td { padding: 8px 6px; } td:first-child { width: 34%; } }
+  footer { margin-top: 48px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="./"><img src="site/icon-192.png" alt="" width="28" height="28">Hearth</a>
+  <h1>Hearth Privacy Policy</h1>
+  <p class="updated">Last updated 17 October 2026</p>
+  <p>This policy covers the Hearth apps (Android, Windows, Mac and Linux) and kappachat.duckdns.org, the community Hearth server. It says what we collect, why, who else gets it, how long we keep it and how to delete it.</p>
+
+  <div class="card"><p>The short version: your messages, DMs and files are end-to-end encrypted, so we can't read them. The server still stores your account, and it sees who talks to whom, when, and from which IP address. There are no ads and no analytics, and we don't sell your data.</p></div>
+
+  <h2 id="who">Who we are</h2>
+  <p>Hearth is free, open-source chat software (MIT license). Its developer, <a href="https://github.com/Pandabear445">Pandabear445</a> on GitHub, makes the apps and runs the community server at kappachat.duckdns.org. In this policy, "we" means the Hearth developer.</p>
+  <p>The Android and desktop apps open kappachat.duckdns.org the first time you start them. You can switch to another Hearth server at any time (in the Android app: Settings → Apps &amp; devices → Switch server).</p>
+  <p>Questions about this policy or your data: <a href="mailto:{{CONTACT_EMAIL}}">{{CONTACT_EMAIL}}</a>.</p>
+
+  <h2 id="other-servers">Other Hearth servers</h2>
+  <p>Anyone can run their own Hearth server. Those servers are run by other people, under their own rules and privacy policies. This policy doesn't cover them, and we can't see or change their data. If you use another server, ask its admins how they handle your data. The apps work the same way on every server: they connect to the server you picked, plus the outside services listed below.</p>
+
+  <h2 id="collect">What the server stores</h2>
+  <p>To make an account you pick a username and a password, accept the terms and pass a robot check that runs on your device. You don't need an email address, phone number or real name.</p>
+  <table>
+    <tr><th>What</th><th>Details</th></tr>
+    <tr><td><strong>Account</strong></td><td>Your username, when you joined, and that you accepted the terms. Your password never leaves your device: the app turns it into two keys. One signs you in, and the server keeps only a hash of it. The other unlocks your encryption keys and stays on your device.</td></tr>
+    <tr><td><strong>Encryption keys</strong></td><td>Your public keys, and your private keys locked with your password. The server can't unlock them. If you save a recovery key, the server keeps a second locked copy.</td></tr>
+    <tr><td><strong>Email (optional)</strong></td><td>Only if you add one (Settings → Security). It's used only for password resets and security notices, such as "your password was changed". It's never shown to other people.</td></tr>
+    <tr><td><strong>Two-factor sign-in (optional)</strong></td><td>The secret for your authenticator app, encrypted with the server's key, and your backup codes, stored as keyed hashes.</td></tr>
+    <tr><td><strong>Profile</strong></td><td>Display name, pronouns, bio, custom status, links, colours, pictures (avatar, banner, background), profile song, profile page and the comments people leave on it. Profiles aren't encrypted: everyone signed in to the server can see them. Hidden data in pictures, such as a GPS location, is removed when you upload them (since Hearth 1.29.0).</td></tr>
+    <tr><td><strong>Servers and friends</strong></td><td>The servers and group chats you're in, your roles and nicknames there, friends, blocks, the events you reply to, and your settings (notifications, server folders, read positions, saved messages).</td></tr>
+    <tr><td><strong>Messages and files</strong></td><td>DMs, channel messages, group chats, attachments, voice messages, polls, notes on saved messages, scheduled messages and study decks are encrypted on your device before they're sent. The server stores them as data it can't read.</td></tr>
+    <tr><td><strong>What the server can see</strong></td><td>Who is in which server, who messages whom and when, how big messages and files are (message text is padded, file sizes aren't hidden), reactions and poll votes, your online status, games and music you choose to share, who was mentioned, which GIFs you pick, when and where you search (not what), and links you ask it to preview. Server names, channel names, topics and events aren't encrypted. Neither are posts by bots, webhooks and the news bot, or what you type after a bot's command (the app warns you first).</td></tr>
+    <tr><td><strong>Devices and IP addresses</strong></td><td>For each signed-in device: its IP address, what kind of device and browser it is, when it signed in and when it was last used. You can see them in Settings → Security → Signed-in devices. The server also keeps a list of the IP addresses your account has used, with when each was first and last seen. We use these to keep accounts safe and to stop abuse.</td></tr>
+    <tr><td><strong>Push notifications</strong></td><td>If you turn them on: each device's push address and the keys used to encrypt notifications for it.</td></tr>
+    <tr><td><strong>Reports</strong></td><td>If you report someone: the reason, your note, the messages you chose to share (your app decrypts them and sends them to staff) and your IP address. The reported account's recent IP addresses are added to the report.</td></tr>
+    <tr><td><strong>Logs</strong></td><td>An audit log of security events on accounts (sign-outs, password, email and two-factor changes, account deletions) and of staff actions, each with the IP address it came from. Each server also logs moderation actions in it, such as kicks, bans and deleted messages, but never message text. By default, the server's own log records requests with IP addresses cut short to their network.</td></tr>
+    <tr><td><strong>Payments (web only)</strong></td><td>If you chip in or buy a membership on the web, Stripe or Ko-fi handle the payment and your card details. We never see your card. The server keeps the amount, currency, date and the payment service's reference, and for Ko-fi the name and message you typed there.</td></tr>
+  </table>
+
+  <h2 id="device">What stays on your device</h2>
+  <ul>
+    <li>While you're signed in, the app keeps your unlocked keys, drafts, your inbox and reminders on your device. Signing out removes them.</li>
+    <li>The Android app also remembers which server you use, and any self-signed certificates you chose to trust. Files you save go to Downloads/Hearth.</li>
+  </ul>
+
+  <h2 id="not">What we don't do</h2>
+  <ul>
+    <li><strong>No ads</strong>, in the apps, on the server or on this website.</li>
+    <li><strong>No analytics or tracking.</strong> The apps and this website have no analytics, crash-reporting or advertising code.</li>
+    <li><strong>No advertising ID.</strong> The Android app doesn't use one, and it doesn't include Firebase.</li>
+    <li><strong>No selling.</strong> We don't sell or rent your data, and we don't share it with advertisers or data brokers.</li>
+    <li><strong>No reading your messages.</strong> We can't: they're end-to-end encrypted.</li>
+  </ul>
+
+  <h2 id="third-parties">Who else gets data</h2>
+  <p>Some features need outside services. Here is each one, when it's used and what it gets.</p>
+  <table>
+    <tr><th>Service</th><th>When, and what it gets</th></tr>
+    <tr><td><strong>Push services</strong></td><td>When you turn on notifications. Browsers use their maker's push service (Google, Mozilla, Apple or Microsoft). The Android app uses a push app you install, usually ntfy, which uses ntfy.sh unless you point it at another ntfy server. The push service learns that your device got a notification, when, and how big it was. Notifications are encrypted for your device and never contain message text. By default they say only the server's name and "New message".</td></tr>
+    <tr><td><strong>Call setup (STUN) servers</strong></td><td>When you join a call. By default these are Google's (stun.l.google.com). They see your IP address, so your device can find its public address.</td></tr>
+    <tr><td><strong>People in your calls</strong></td><td>Calls connect directly between devices when they can, so the people in a call can see each other's IP addresses. When a direct connection doesn't work, the call goes through a relay run by the server's operator. Calls are encrypted between the people in them.</td></tr>
+    <tr><td><strong>KLIPY or GIPHY</strong></td><td>When you search for GIFs. The server sends the search for you, so they get the search words from the server, not from you. By default, GIFs then load through the server too.</td></tr>
+    <tr><td><strong>Websites you link to</strong></td><td>When you add a preview to a link you send. The server fetches the page, so the site sees the server, not you. The server sees the link and that you asked for it.</td></tr>
+    <tr><td><strong>Steam, Wikipedia, RAWG, Last.fm, iTunes and music sites</strong></td><td>When you share a game or song on your profile, link your Last.fm account or paste a song link. The server looks up the game or song (or asks Last.fm what you're playing). Pictures load through the server.</td></tr>
+    <tr><td><strong>YouTube, Vimeo and Twitch</strong></td><td>When you watch a video together in a call. Their players load from their own sites, which see your IP address. YouTube videos play from youtube-nocookie.com.</td></tr>
+    <tr><td><strong>Other websites</strong></td><td>When you load a picture or video from another site, or open a link. That site sees your IP address, like any visit. Pictures from other sites wait for your click by default (Settings → Privacy &amp; safety → Outside images).</td></tr>
+    <tr><td><strong>Email service</strong></td><td>When the server sends you a password-reset link or a security notice. It goes through the mail service the server is set up with, which sees your email address and the message.</td></tr>
+    <tr><td><strong>Stripe and Ko-fi</strong></td><td>When you pay on the web. They get what you give them when you pay, under their own privacy policies.</td></tr>
+    <tr><td><strong>News sources</strong></td><td>When a server's news bot or your Updates page checks a feed (Google News, Reddit, Steam, GitHub, YouTube). The request and its search words come from the server, not from you.</td></tr>
+    <tr><td><strong>GitHub and Google Fonts</strong></td><td>When you visit this website. It's hosted on GitHub Pages and loads its fonts from Google Fonts, so both see your IP address. The website runs no scripts. The app itself loads its fonts from your Hearth server.</td></tr>
+  </table>
+  <p>We also share data when the law requires it, for example because of a valid court order. We can only hand over what we have, and we don't have the keys to your messages.</p>
+
+  <h2 id="android">Android app permissions</h2>
+  <table>
+    <tr><th>Permission</th><th>Why</th></tr>
+    <tr><td><strong>Internet</strong></td><td>To connect to your Hearth server.</td></tr>
+    <tr><td><strong>Microphone</strong> (record audio, change audio settings)</td><td>For calls and voice messages. Android asks you first.</td></tr>
+    <tr><td><strong>Camera</strong></td><td>For video calls. Android asks you first.</td></tr>
+    <tr><td><strong>Notifications</strong></td><td>To show new messages and incoming calls. Android 13 and newer ask you first.</td></tr>
+    <tr><td><strong>Foreground service (microphone)</strong></td><td>Keeps a call going with the screen locked. It runs only while you're in a call, with an "In a call" notification that has a Hang up button.</td></tr>
+    <tr><td><strong>Keep awake (wake lock)</strong></td><td>Added by the UnifiedPush library, which delivers notifications while the app is closed.</td></tr>
+  </table>
+  <p>The app doesn't ask for your contacts, location, phone, text messages or files. Files you save go to Downloads/Hearth without a storage permission. The desktop app asks before it uses your microphone, camera or clipboard; see the <a href="code-signing.html#privacy">code signing policy</a>.</p>
+
+  <h2 id="security">Security</h2>
+  <ul>
+    <li>Messages and files are encrypted on your device (AES-256-GCM, with keys exchanged using ECDH P-256 and messages signed with ECDSA P-256). Only the people in the conversation have the keys.</li>
+    <li>Your password is hashed on your device with Argon2id. The server never sees it.</li>
+    <li>The apps talk to the server over HTTPS (TLS). The Android app refuses plain http:// addresses, except on your own local network.</li>
+    <li>Backups are encrypted with a separate key.</li>
+    <li>There are limits. The server sees the metadata listed above. The app's code comes from the server, so you're trusting whoever runs it. The details, including what an attacker could still do, are in Hearth's <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md">security model</a> (see <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md#4-what-each-adversary-can-still-do-honest-limits">its honest limits</a>).</li>
+  </ul>
+
+  <h2 id="retention">How long we keep data</h2>
+  <p>These are the times built into Hearth's code, with its default settings.</p>
+  <table>
+    <tr><th>Data</th><th>Kept</th></tr>
+    <tr><td><strong>Account, profile, email, IP address list</strong></td><td>Until you delete your account.</td></tr>
+    <tr><td><strong>Messages and files</strong></td><td>Until they're deleted: by you, by moderators, by a disappearing-message timer, or with their conversation or server. They stay if you delete your account (see <a href="delete-account.html">what stays</a>).</td></tr>
+    <tr><td><strong>Signed-in devices</strong></td><td>Until you sign out, the device goes unused for 60 days, or 365 days after it signed in. The record, with its IP address, is deleted 30 days after that.</td></tr>
+    <tr><td><strong>Push registrations</strong></td><td>Until that device is signed out or turns notifications off, or its push service stops answering.</td></tr>
+    <tr><td><strong>Password-reset links</strong></td><td>30 minutes, and they work once.</td></tr>
+    <tr><td><strong>Reports and staff notes</strong></td><td>Not deleted automatically.</td></tr>
+    <tr><td><strong>Account audit log</strong></td><td>Kept for good. The log can't be edited or deleted, so tampering shows.</td></tr>
+    <tr><td><strong>Server moderation logs</strong></td><td>Up to a year.</td></tr>
+    <tr><td><strong>Server request log</strong></td><td>Depends on how the machine stores its logs. Hearth doesn't delete them itself.</td></tr>
+    <tr><td><strong>Rate limits and recent failed sign-ins</strong></td><td>In memory only. They're gone when the server restarts.</td></tr>
+    <tr><td><strong>Payment records</strong></td><td>Not deleted automatically.</td></tr>
+  </table>
+  <p><strong>Backups.</strong> The server makes a full backup every day. A backup holds everything above, including things deleted since it was made, so deleted data can stay in backups for a while. With Hearth's default settings:</p>
+  <ul>
+    <li>the server keeps about a week of encrypted daily backups, and about a week of plain copies of the database for undoing problems on the same machine;</li>
+    <li>each linked relay server keeps the newest 14 encrypted backups;</li>
+    <li>the newest few copies made before software updates are kept (3 to 5, depending on how the update was installed);</li>
+    <li>copies sent to off-site storage are never deleted by Hearth. They stay until the server's operator deletes them by hand.</li>
+  </ul>
+  <p>Backups are encrypted with a key kept apart from them. The plain database copies never leave the server.</p>
+
+  <h2 id="deletion">Deleting your data</h2>
+  <p>You can delete your account in the app: Settings → Security → Delete account. It's permanent. The <a href="delete-account.html">account deletion page</a> has the steps, what's erased, what stays, and how to ask by email if you can't sign in.</p>
+  <p>You can also delete single messages, change or clear your profile, and download a copy of your data (Settings → Privacy &amp; safety → Export my data).</p>
+
+  <h2 id="children">Children</h2>
+  <p>You must be 13 or older to use Hearth, or older if the law where you live says so. Hearth isn't made for children under 13, and we don't knowingly collect their data. If we learn that an account belongs to someone under 13, we delete it. If you think a child under 13 has an account, email us. Our <a href="child-safety.html">child safety standards</a> explain how we deal with abuse.</p>
+
+  <h2 id="rights">Your rights</h2>
+  <p>You can see and change most of your data in the app, export it, and delete your account at any time. Depending on where you live, the law may give you more rights, such as getting a copy of your data, having it corrected or deleted, or objecting to how it's used. Email us to use them. If you're unhappy with our answer, you can complain to your local data protection authority.</p>
+
+  <h2 id="changes">Changes</h2>
+  <p>If we change this policy, we'll update the date at the top. If a change matters, we'll also tell people on the community server before it applies.</p>
+
+  <h2 id="contact">Contact</h2>
+  <p>The Hearth developer: <a href="mailto:{{CONTACT_EMAIL}}">{{CONTACT_EMAIL}}</a>. For a security problem, please email us rather than posting it in public.</p>
+
+  <footer>Hearth · MIT licensed · <a href="privacy.html">Privacy</a> · <a href="delete-account.html">Delete account</a> · <a href="child-safety.html">Child safety</a> · <a href="./">pandabear445.github.io/Hearth-chat</a></footer>
+</main>
+</body>
+</html>
