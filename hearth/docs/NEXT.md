@@ -116,7 +116,7 @@ The work log for the picks above is kept in [ENGINEERING-REPORT.md](ENGINEERING-
 
 - Getting it to people ([GROWTH.md](GROWTH.md)): the server is published as a multi-arch image
   (`.github/workflows/hearth-image.yml`, `deploy/compose.image.yml`), with app store templates in
-  `deploy/catalogs/` and a "Hearth vs Discord" page on arc32.me (SECURITY.md rows 154–155). Left: publishing the
+  `deploy/catalogs/` and a "Hearth vs Discord" page on the landing site (SECURITY.md rows 154–155). Left: publishing the
   first image and submitting to each store after a test install there.
 
 - Pick 9, phase 1 (structure) is in: **Add a server → Import from Discord** takes a pasted server template and

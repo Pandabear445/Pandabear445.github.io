@@ -74,8 +74,8 @@ built from your repository.
 
 What to know first:
 - **You apply, they decide.** They want an actively maintained project that's already released (the `/download`
-  page and arc32.me count), with no malware or adware, and a **code signing policy** page. That page is ready:
-  [arc32.me/code-signing.html](https://arc32.me/code-signing.html) (the file `code-signing.html` in this repo).
+  page and the landing site count), with no malware or adware, and a **code signing policy** page. That page is ready:
+  [pandabear445.github.io/Hearth-chat/code-signing.html](https://pandabear445.github.io/Hearth-chat/code-signing.html) (the file `code-signing.html` in this repo).
   Keep it accurate if more people join the project.
 - **You approve every release.** Each signing request waits until you (the approver) click *Approve* on
   signpath.io. Each Windows release makes two requests: the app, then the installer. The build waits up to an
@@ -89,7 +89,7 @@ What to know first:
 **Step by step:**
 
 1. **Apply** at [signpath.org](https://signpath.org/) (the *Apply* link). Give the GitHub repository, the
-   website (`https://arc32.me`) and the code signing policy page above. Use a GitHub account with two-factor
+   website (`https://pandabear445.github.io/Hearth-chat`) and the code signing policy page above. Use a GitHub account with two-factor
    authentication on: SignPath requires it for everyone with commit rights.
 2. **When you're accepted**, sign in at [app.signpath.io](https://app.signpath.io). The Foundation sets up your
    project there. Check (or create) these, and note their *slugs* (short ids):
