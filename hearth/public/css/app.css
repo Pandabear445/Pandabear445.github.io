@@ -1875,6 +1875,9 @@ body.resizing, body.resizing * { cursor: col-resize !important; user-select: non
   animation: rise .2s var(--ease);
 }
 .update-bar > .ic, .push-offer > .ic { width: 16px; height: 16px; color: var(--accent); }
+.push-offer { max-width: calc(100vw - 24px); }
+.push-offer > span { flex: 1; min-width: 0; }
+.push-offer > .ic, .push-offer > .btn { flex: none; }
 
 /* ------------------------------------------------------------------ roles, server customization, custom emoji */
 #sidebar-head.has-banner { height: auto; flex-direction: column; align-items: stretch; padding: 0; border-bottom: 0; position: relative; }

@@ -54,13 +54,29 @@ self.addEventListener('fetch', (e) => {
   })());
 });
 
+// Apple's push service (iPhone, iPad, Safari on Mac) cancels a push subscription when its pushes show no
+// notification, after about three of them, and notifications then stop for good on that device.
+const SEEN_TAG = 'hearth-seen';
+const fromApple = async () => {
+  try {
+    const s = await self.registration.pushManager.getSubscription();
+    return !!s && /(^|\.)push\.apple\.com$/i.test(new URL(s.endpoint).hostname);
+  } catch { return false; }
+};
+
 self.addEventListener('push', (e) => {
   let data = {};
   try { data = e.data ? e.data.json() : {}; } catch { data = { title: 'Hearth', body: e.data ? e.data.text() : '' }; }
   e.waitUntil((async () => {
-    // If a Hearth window is already focused, the app shows its own notification.
+    // If a Hearth window is already focused, the app shows its own notification. Apple still needs one shown
+    // for this push (see above), so there it's shown and closed at once.
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    if (wins.some((w) => w.focused)) return;
+    if (wins.some((w) => w.focused)) {
+      if (!(await fromApple())) return;
+      await self.registration.showNotification(data.title || 'Hearth', { body: data.body || 'New activity', tag: SEEN_TAG, icon: '/icons/icon-192.png' });
+      for (const n of await self.registration.getNotifications({ tag: SEEN_TAG })) n.close();
+      return;
+    }
     // A call push that arrives late (the device was offline) is a missed call, not a ring. (`at` is when the
     // server sent it; something must still be shown, browsers require it.)
     const tag = typeof data.tag === 'string' ? data.tag : '';

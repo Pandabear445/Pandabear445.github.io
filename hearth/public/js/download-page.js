@@ -16,7 +16,7 @@ const files = cfg.downloads || [];
 const mine = files.filter((f) => f.platform === os);
 const installBtn = () => prompt ? el('button', { class: 'btn primary', onclick: async () => { prompt.prompt(); await prompt.userChoice; prompt = null; render(); } }, 'Install the app') : null;
 const steps = {
-  ios: ['Open this page in Safari', 'Tap the Share button', 'Choose "Add to Home Screen"', 'Open Hearth from your Home Screen and log in'],
+  ios: ['Open this page in Safari', 'Tap the Share button', 'Choose "Add to Home Screen"', 'Open Hearth from your Home Screen and log in', 'Tap "Turn on" when Hearth offers notifications (iOS 16.4 or newer)'],
   android: ['Open this page in Chrome', 'Tap the menu (⋮)', 'Choose "Install app"', 'Open Hearth from your home screen'],
 };
 function render() {

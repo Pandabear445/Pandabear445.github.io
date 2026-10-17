@@ -1061,7 +1061,7 @@ async function loadBootstrap() {
   const open = new URLSearchParams(location.search).get('open');
   if (open) { history.replaceState(null, '', '/' + location.hash); if (open === 'messages') openMessages(); if (open === 'friends') goFriends(); }
   if (localStorage.getItem('hearth.push') === 'on') enablePush({ quiet: true }).catch(() => {});
-  if (androidApp.on) androidPushAtStart();
+  if (androidApp.on) androidPushAtStart(); else applePushAtStart();
   const invite = sessionStorage.getItem('hearth.pendingInvite');
   if (invite) { sessionStorage.removeItem('hearth.pendingInvite'); openJoinModal(invite); }
   else {
@@ -8428,6 +8428,10 @@ async function androidPushAtStart() {
   });
   // (Not over an update offer, which shares its place on screen: it's offered again next start.)
   if (localStorage.getItem('hearth.push') !== null || androidApp.notify === 'denied' || document.querySelector('.push-offer, .update-bar')) return;
+  offerPush();
+}
+// The one-time "Get notifications?" bar (Android app, and Hearth on an iPhone or iPad Home Screen).
+function offerPush() {
   const no = () => { localStorage.setItem('hearth.push', 'off'); bar.remove(); };
   const bar = h('div', { class: 'push-offer', role: 'status' }, icon('bell'),
     h('span', null, 'Get notifications when Hearth is closed?'),
@@ -8437,6 +8441,26 @@ async function androidPushAtStart() {
     } }, 'Turn on'),
     h('button', { class: 'btn ghost sm', onclick: no }, 'Not now'));
   document.body.append(bar);
+}
+// iPhone and iPad: web push works only for Hearth opened from the Home Screen, on iOS 16.4 and newer. In Safari,
+// say so once; once it's on the Home Screen, offer notifications once, as the Android app does.
+const appleMobile = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const iosVersion = () => { const m = /OS (\d+)[_.](\d+)/.exec(navigator.userAgent); return m ? Number(m[1]) + Number(m[2]) / 100 : 0; };
+function applePushAtStart() {
+  if (!appleMobile() || !(S.config && S.config.pushEnabled) || document.querySelector('.push-offer, .update-bar')) return;
+  if (!isStandalone()) {
+    // An iPad asking for the desktop site says "Macintosh" without an iOS version: assume it's new enough.
+    const v = iosVersion();
+    if (localStorage.getItem('hearth.ios.homeTip') || (v && v < 16.04)) return;
+    const done = () => { localStorage.setItem('hearth.ios.homeTip', 'seen'); bar.remove(); };
+    const bar = h('div', { class: 'push-offer', role: 'status' }, icon('bell'),
+      h('span', null, 'To get notifications on this ' + (/iPad|Macintosh/.test(navigator.userAgent) ? 'iPad' : 'iPhone') + ', add Hearth to your Home Screen: tap Share, then \u201cAdd to Home Screen\u201d, and open Hearth from there.'),
+      h('button', { class: 'btn ghost sm', onclick: done }, 'Got it'));
+    document.body.append(bar);
+    return;
+  }
+  if (!app.push.supported() || localStorage.getItem('hearth.push') !== null || Notification.permission !== 'default') return;
+  offerPush();
 }
 
 // ======================================================================= Terms of Service

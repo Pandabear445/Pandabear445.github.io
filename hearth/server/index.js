@@ -1575,7 +1575,9 @@ try {
   const VAPID_FILE = path.join(DATA_DIR, 'vapid.json');
   if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) vapid = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
   else vapid = JSON.parse(readOrCreate(VAPID_FILE, () => JSON.stringify(webpush.generateVAPIDKeys())));
-  webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
+  const vs = require('./vapid').vapidSubject();
+  if (vs.placeholder) log.warn('push', 'vapid_subject', { msg: 'Set VAPID_SUBJECT=mailto:you@yourdomain (a real address) or PUBLIC_URL=https://your.domain in .env: Apple\u2019s push service can refuse notifications for iPhone, iPad and Mac without one.' });
+  webpush.setVapidDetails(vs.subject, vapid.publicKey, vapid.privateKey);
 } catch (e) { log.warn('push', 'disabled', { err: e, msg: 'Push notifications are off.' }); vapid = null; }
 
 const nameOf = (uid) => { const r = getUserRow(uid); return r ? (parseProfile(r).displayName || r.username) : 'Someone'; };
