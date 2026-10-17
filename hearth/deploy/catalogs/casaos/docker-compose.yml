@@ -51,7 +51,7 @@ services:
       options: { max-size: "10m", max-file: "3" }
 
 x-casaos:
-  id: me.arc32.hearth
+  id: io.github.pandabear445.hearth
   main: hearth
   index: /
   port_map: "3000"
@@ -85,7 +85,7 @@ x-casaos:
   update_at: "2026-10-16"
   release_notes:
     en_US: First release in the CasaOS store.
-  website: https://arc32.me
+  website: https://pandabear445.github.io/Hearth-chat
   repo: https://github.com/Pandabear445/Hearth-chat
   support: https://github.com/Pandabear445/Hearth-chat/issues
   docs: https://github.com/Pandabear445/Hearth-chat/tree/main/hearth#readme

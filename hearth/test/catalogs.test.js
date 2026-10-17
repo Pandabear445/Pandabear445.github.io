@@ -9,7 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
-const SITE = path.join(ROOT, '..'); // the landing site (arc32.me) and .github/, when this is the whole repository
+const SITE = path.join(ROOT, '..'); // the landing site (pandabear445.github.io/Hearth-chat) and .github/, when this is the whole repository
 const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
 const VERSION = JSON.parse(read('package.json')).version;
 const IMAGE = 'ghcr.io/pandabear445/hearth';
@@ -364,15 +364,15 @@ test('nothing secret can reach the image: the Dockerfile copies only program fil
   for (const p of ['data', 'data-backup*', '.env', '.env.*', '*.key', '*.pem', '*.db', '*.hbk', '.git']) assert.ok(ignored.includes(p), p);
 });
 
-// ------------------------------------------------------------------ the landing site (arc32.me)
+// ------------------------------------------------------------------ the landing site (pandabear445.github.io/Hearth-chat)
 const siteFile = (p) => fs.readFileSync(path.join(SITE, p), 'utf8');
 test('landing site: sitemap, robots.txt, canonical links, structured data, the comparison page, no scripts', { skip: !fs.existsSync(path.join(SITE, 'index.html')) && 'no landing site in this checkout' }, () => {
   const pages = fs.readdirSync(SITE).filter((f) => /\.html$/.test(f)).sort();
   assert.deepEqual(pages, ['code-signing.html', 'discord-alternative.html', 'index.html']);
-  const url = (f) => (f === 'index.html' ? 'https://arc32.me/' : `https://arc32.me/${f}`);
+  const url = (f) => (f === 'index.html' ? 'https://pandabear445.github.io/Hearth-chat/' : `https://pandabear445.github.io/Hearth-chat/${f}`);
   const locs = [...siteFile('sitemap.xml').matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]).sort();
   assert.deepEqual(locs, pages.map(url).sort(), 'the sitemap lists every page');
-  assert.match(siteFile('robots.txt'), /^Sitemap: https:\/\/arc32\.me\/sitemap\.xml$/m);
+  assert.match(siteFile('robots.txt'), /^Sitemap: https:\/\/pandabear445\.github\.io\/Hearth-chat\/sitemap\.xml$/m);
   assert.doesNotMatch(siteFile('robots.txt'), /^Disallow: \/\s*$/m);
   const config = siteFile('_config.yml');
   for (const f of [...pages, 'robots.txt', 'sitemap.xml']) assert.doesNotMatch(config, new RegExp(`^\\s+- ${f.replace(/\./g, '\\.')}$`, 'm'), `${f} is published`);

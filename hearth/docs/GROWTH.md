@@ -8,7 +8,7 @@ named before relying on it, since these rules change.
 **Status (16 October 2026, 1.29.0):** built with this note: the `LICENSE` files, the image workflow
 (`.github/workflows/hearth-image.yml`) and `deploy/compose.image.yml`, the app store templates
 (`deploy/catalogs/`), and the "Hearth vs Discord" page with `sitemap.xml`, `robots.txt`, canonical links and
-JSON-LD on arc32.me. Still to do by hand: the rest of step 0, publishing the first image (a `hearth-v1.29.0` tag),
+JSON-LD on the GitHub Pages site. Still to do by hand: the rest of step 0, publishing the first image (a `hearth-v1.29.0` tag),
 the store submissions and the posts.
 
 ## The short version
@@ -41,10 +41,10 @@ the store submissions and the posts.
 |---|---|---|
 | Add `LICENSE` (MIT) at the repo root and in `hearth/` | `package.json` and the landing page say MIT, but there's no license file. GitHub then shows "no license", and Unraid Community Apps requires an OSI-approved license in the repo. The first Hearth commit reads "Add Hearth 1.11.0 source as received", so confirm you hold the rights and put the right name in the file. | 10 min |
 | Keep the repo public: drop the pending "make repo private" task | Every directory, catalog and Show HN below needs public source. The landing page promises "open source". | 0 |
-| One clearly named public repo | The landing page told people to `git clone .../Pandabear445.github.io`. A repo named after a GitHub Pages site looks odd to self-hosters, and its name never appears in "discord alternative" searches. The repository is already `Pandabear445/Hearth-chat` (the old `Pandabear445.github.io` address redirects there), and arc32.me's clone command and links now use that name. Give it a one-line description, topics (`discord-alternative`, `self-hosted`, `chat`, `voice-chat`, `end-to-end-encryption`, `webrtc`) and a social preview image (reuse `site/og.png`). | 30 min |
+| One clearly named public repo | The landing page told people to `git clone .../Pandabear445.github.io`. A repo named after a GitHub Pages site looks odd to self-hosters, and its name never appears in "discord alternative" searches. The repository is already `Pandabear445/Hearth-chat` (the old `Pandabear445.github.io` address redirects there), and the landing page's clone command and links now use that name. Give it a one-line description, topics (`discord-alternative`, `self-hosted`, `chat`, `voice-chat`, `end-to-end-encryption`, `webrtc`) and a social preview image (reuse `site/og.png`). | 30 min |
 | Say how it was built | 165 commits on the 1.29.0 branch carry an AI co-author line. r/selfhosted and Lemmy's c/selfhosted both ask for AI-involvement labels, and HN readers will check the commit log. Add a short "How Hearth is built" paragraph to the README: what was AI-written, how you review and test, that the security reviews and the attacker test suite were automated, and that no independent human audit has happened yet. Saying it first costs little; being "caught" sinks the thread. | 20 min |
 | Make the root README concrete | The repo-root `README.md` uses vague lines ("Encrypted messaging features", "Privacy-conscious by design"). The detailed one is `hearth/README.md`. Self-hosters skim the first screen: one sentence, a screenshot, the install command, an honest limits list and links. | 30 min |
-| Move the public instance off DuckDNS | `kappachat.duckdns.org` is a free dynamic-DNS name. School and work filters often block that category, and some link scanners treat it with suspicion (*unverified for Discord and Reddit specifically*). You already own `arc32.me`: point `chat.arc32.me` at the VPS and add it to the Caddyfile. Keep the old name as a redirect. | 30 min |
+| Move the public instance off DuckDNS | `kappachat.duckdns.org` is a free dynamic-DNS name. School and work filters often block that category, and some link scanners treat it with suspicion (*unverified for Discord and Reddit specifically*). A custom domain avoids this. The old `arc32.me` has lapsed, so this needs a domain registered first; until then the public instance stays on DuckDNS. Once you have one, point a subdomain (e.g. `chat.<domain>`) at the VPS, add it to the Caddyfile, and keep the old name as a redirect. | 30 min |
 | Publish a Docker image (see "Build: site and listings", item 1) | Every app store and PikaPods expects a pullable image. Right now `docker-compose.yml` builds from source. | 1–2 h |
 | Get ready for a spike on the public instance | Check that the robot check (captcha) is on for sign-ups (Admin → Registration & Terms; it's on by default), check the Terms, and check that reports reach you. Watch Admin → Health on launch day. | 15 min |
 | Clean install by someone else | Ask one friend to follow the landing page's "about ten minutes" on a fresh VPS and time it. Fix whatever trips them before any launch post. | 1 h of theirs |
@@ -82,14 +82,14 @@ Ranked by expected users per hour of your time. None of it costs money.
 - sign-ups and active users in the public instance's Admin dashboard;
 - likes on AlternativeTo.
 
-Don't add analytics scripts to arc32.me. The privacy stance is part of the pitch.
+Don't add analytics scripts to the landing site. The privacy stance is part of the pitch.
 
 ## The week, day by day
 
-- **Fri 16 Oct – Sun 18 Oct:** step 0 (license, repo, README honesty, `chat.arc32.me`, image workflow). Start the
+- **Fri 16 Oct – Sun 18 Oct:** step 0 (license, repo, README honesty, image workflow). Start the
   two in-product items.
 - **Mon 19 Oct:** AlternativeTo submission and the selfh.st email. Mastodon post.
-- **Tue 20 – Thu 22 Oct:** a friend's clean install, fixes, and the comparison page on arc32.me.
+- **Tue 20 – Thu 22 Oct:** a friend's clean install, fixes, and the comparison page on the landing site.
 - **Fri 23 Oct:** r/selfhosted megathread comment. Stay in the replies all day.
 - **The week after:** Show HN (Tuesday to Thursday morning US Eastern is the usual advice, *unverified*). Then the
   Unraid and CasaOS submissions.
@@ -107,7 +107,7 @@ rules require.
 > **Hearth**: self-hosted chat for friend groups and small communities (Discord-style servers, voice, video,
 > screen share)
 >
-> Repo: <repo link> · Site: https://arc32.me · Public instance to try (needs an account): <chat.arc32.me>
+> Repo: <repo link> · Site: https://pandabear445.github.io/Hearth-chat · Public instance to try (needs an account): https://kappachat.duckdns.org
 > License: MIT · One Node.js process + SQLite, Docker Compose, no outside services required
 >
 > What's in it:
@@ -215,7 +215,7 @@ yet.
 **Site and listings**
 1. A multi-arch Docker image on GHCR, and a compose file that uses it.
 2. App store templates in `hearth/deploy/catalogs/`: Unraid, CasaOS, Umbrel, Dokploy and Coolify.
-3. A "Hearth vs Discord" page on arc32.me, plus SEO basics: sitemap, robots.txt, canonical links, JSON-LD.
+3. A "Hearth vs Discord" page on the landing site, plus SEO basics: sitemap, robots.txt, canonical links, JSON-LD.
 
 All five stay inside NEXT.md's "Not recommended" list:
 - no public directory of servers (an invite preview only reaches people who already have the link);

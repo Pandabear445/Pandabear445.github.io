@@ -11,7 +11,7 @@
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
   <Support>https://github.com/Pandabear445/Hearth-chat/issues</Support>
-  <Project>https://arc32.me</Project>
+  <Project>https://pandabear445.github.io/Hearth-chat</Project>
   <ReadMe>https://github.com/Pandabear445/Hearth-chat/tree/main/hearth#readme</ReadMe>
   <Overview>Hearth is a chat app for friend groups and small communities that you host yourself: servers with text and voice channels, roles, threads, direct messages and group chats, voice and video calls with screen sharing, and watching videos together. Messages, files and calls are end-to-end encrypted in the app, so the server stores only encrypted data (it still sees who talks to whom, and when). One process and a SQLite file; free and MIT licensed.[br][br]
 [b]First run:[/b] open the WebUI and click through the certificate warning once (Hearth makes its own certificate; browsers only allow encryption and microphones on https). The first account to sign up becomes the owner, so sign up before you share the address.[br][br]
