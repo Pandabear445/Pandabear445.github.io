@@ -4,6 +4,7 @@
 const pay = (text) => ({ text, pay: true });
 export const CHANGES = [
   { version: '1.29.1', items: [
+    'iPhone and iPad: notifications work for Hearth added to the Home Screen (iOS 16.4 and newer). Safari says how, once, and Hearth offers notifications once you open it from the Home Screen. Notifications no longer stop for good on Apple devices after a few arrive while Hearth is open.',
     'Privacy policy: if your server’s owner publishes one (PRIVACY_URL), it’s linked at sign-up, in Settings → Security and in Settings → Apps & devices. The Android app’s connect screen links to Hearth’s own privacy policy.',
     pay('The Android app no longer shows ways to pay (Support, the funding card on Home, creator memberships) or the download page for the APK. A browser and the desktop app still do.'),
     'Android app: the APK no longer carries Google’s encrypted list of the app’s libraries, so app stores like IzzyOnDroid can check it.',
