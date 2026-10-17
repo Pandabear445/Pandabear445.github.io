@@ -488,10 +488,34 @@ jobs:
           if [ ${#bad[@]} -gt 0 ]; then echo "::error::Not releasing unsigned or intermediate files: ${bad[*]}"; exit 1; fi
           apks=(dist/*.apk)
           if [ ${#apks[@]} -eq 0 ]; then echo "::warning title=Android::No signed APK in this release: add the ANDROID_KEYSTORE_* secrets (hearth/mobile/README.md)."; fi
+      # A copy of each installer without the version in its name, so the website can link straight to the newest
+      # one (https://github.com/<repo>/releases/latest/download/Hearth-Setup.exe starts the download). The versioned
+      # files stay as they are: latest*.yml names those, and the apps update themselves from them. The website
+      # links to every copy below, so a release missing one stops here instead of breaking a download button.
+      # A version with a pre-release part (app-v1.30.0-beta.1) is released as a pre-release, which GitHub never
+      # makes "latest", so the website keeps offering the last stable version.
+      - name: Add fixed-name copies for direct download links
+        id: copies
+        run: |
+          shopt -s nullglob
+          v="${GITHUB_REF_NAME#app-v}" # the APK's name has the whole version
+          dv="${v%%+*}"                # npm version drops +build metadata from the desktop apps' names
+          if [[ "$dv" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+          cd dist
+          for f in "Hearth-Setup-$dv.exe" Hearth-"$dv"-*.dmg Hearth-"$dv"-*.AppImage Hearth-"$dv"-*.deb; do
+            if [ -f "$f" ]; then cp -- "$f" "${f/-"$dv"/}"; echo "${f/-"$dv"/} = $f"; fi
+          done
+          if [ -f "Hearth-$v.apk" ]; then cp -- "Hearth-$v.apk" Hearth.apk; echo "Hearth.apk = Hearth-$v.apk"; fi
+          missing=0
+          for n in Hearth-Setup.exe Hearth-arm64.dmg Hearth-amd64.deb Hearth-x86_64.AppImage Hearth.apk; do
+            if [ ! -f "$n" ]; then echo "::error title=Website download::No $n in this release, so the website's link to it would be broken."; missing=1; fi
+          done
+          exit "$missing"
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ steps.copies.outputs.prerelease }}
 
   # Only release builds reach everyone's apps (the desktop app updates itself from this folder): tags and the
   # default branch, whether pushed or run by hand. Never another branch, not even by a manual run.
