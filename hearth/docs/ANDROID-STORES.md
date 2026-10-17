@@ -331,9 +331,10 @@ Hearth's terms (on kappachat: *Admin → Registration & Terms*) should say the s
 **Foreground service permissions:** see [4.7](#47-foreground-service-declaration).
 
 **Child safety standards:** Google's help says this applies to apps in the Social and Dating categories
-*(unverified)*; Hearth is in Communication. If Play Console asks for it anyway, it needs a public page with your
-standards against child abuse and a contact (`{{CONTACT_EMAIL}}`). People can already report a message or a person
-in the app under a child safety category.
+*(unverified)*; Hearth is in Communication. If Play Console asks for it anyway, give it
+`https://pandabear445.github.io/Hearth-chat/child-safety.html` (your standards against child abuse, with the
+contact `{{CONTACT_EMAIL}}`). People can already report a message or a person in the app under a child safety
+category.
 
 ### 4.7 Foreground service declaration
 
@@ -402,7 +403,7 @@ Data types to tick. For each: **collected yes, shared no**, and processed on the
 | App activity → App interactions | who is in which server, who messages whom and when, reactions, poll votes, read markers, online status, the game or music someone chooses to show, GIF picks | required | App functionality |
 | App activity → Other user-generated content | profile text and profile page, server, channel and category names, events, server folders and tracked feeds; links someone presses *Preview* on (fetched by the server and kept in memory for a few minutes; tick "processed ephemerally") | optional | App functionality |
 | Device or other IDs | the push address of the phone's push app, the browser or app name (user agent) of each signed-in session, IP addresses (with sign-ins, sessions and reports; never turned into a location) | required | App functionality, Fraud prevention, security, and compliance, Account management |
-| Financial info → Purchase history | **only if** supporter payments or memberships (Stripe, Ko-fi) are switched on for kappachat and reachable from the Android app: what was paid, when, by whom | optional | App functionality |
+| Financial info → Purchase history | **not needed from 1.29.1 on:** the Android app shows no way to pay (`noPayments` in `../public/js/android.js`). Tick it only if a build you upload still offers supporter payments or memberships (Stripe, Ko-fi): what was paid, when, by whom | optional | App functionality |
 
 Play's form has no separate item for IP addresses. Listing them under *Device or other IDs* is our reading
 *(unverified)*.
@@ -417,11 +418,13 @@ default) encrypted so only the phone can read them; emails go out through the se
 pages, videos and outside pictures are opened by the person themselves; reports of child abuse go to the
 authorities as the law requires.
 
-What deleting an account erases and keeps (the deletion page should say the same): erased at once are the
+What deleting an account erases and keeps, in short (the deletion page,
+`https://pandabear445.github.io/Hearth-chat/delete-account.html`, has the full list): erased at once are the
 account's private keys, email, two-factor, recovery key, profile and pictures, friends, blocks, push addresses and
 IP address history. Its sign-ins end at once; their records (with the IP address and device name) are deleted 30
-days later. Kept: messages the person sent (still end-to-end encrypted, shown as "Deleted user"), their public keys
-(others need them for old messages), reports made by or about them, and an entry in the audit log. Encrypted
+days later. Kept, among other things: messages the person sent (still end-to-end encrypted, shown as "Deleted
+user"), their public keys (others need them for old messages), reports made by or about them, payment records, and
+an entry in the audit log. Encrypted
 backups keep deleted data until they rotate out. Someone who owns a server has to hand it over or delete it first.
 (Code: `DELETE /api/me` in `../server/index.js`, and the `sessions.purge` job.)
 
