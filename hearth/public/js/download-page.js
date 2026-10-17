@@ -3,6 +3,10 @@ const ua = navigator.userAgent;
 const os = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? 'ios'
   : /Android/.test(ua) ? 'android' : /Windows/.test(ua) ? 'windows' : /Mac OS X/.test(ua) ? 'mac' : /Linux|X11/.test(ua) ? 'linux' : 'other';
 const label = { windows: 'Windows', mac: 'macOS', linux: 'Linux', android: 'Android', ios: 'iPhone & iPad', other: 'your device' };
+// Opened inside the Hearth Android app (its user agent says HearthAndroid, mobile/capacitor.config.json): no
+// downloads and no links to them, as the releases page has the Android app too. An app from Google Play updates
+// only through Play.
+const inApp = /\bHearthAndroid\b/.test(ua);
 const size = (n) => (n > 1048576 ? (n / 1048576).toFixed(0) + ' MB' : Math.round(n / 1024) + ' KB');
 const el = (tag, attrs = {}, ...kids) => { const e = document.createElement(tag); Object.entries(attrs).forEach(([k, v]) => (k === 'class' ? (e.className = v) : k.startsWith('on') ? e.addEventListener(k.slice(2), v) : e.setAttribute(k, v))); e.append(...kids.flat().filter((x) => x != null)); return e; };
 let prompt = null;
@@ -12,7 +16,7 @@ let cfg = { name: 'Hearth', downloads: [] };
 try { cfg = await (await fetch('/api/config')).json(); } catch {}
 document.title = `Get ${cfg.name}`;
 document.querySelectorAll('[data-name]').forEach((n) => { n.textContent = cfg.name; });
-const files = cfg.downloads || [];
+const files = inApp ? [] : cfg.downloads || [];
 const mine = files.filter((f) => f.platform === os);
 const installBtn = () => prompt ? el('button', { class: 'btn primary', onclick: async () => { prompt.prompt(); await prompt.userChoice; prompt = null; render(); } }, 'Install the app') : null;
 const steps = {
@@ -22,6 +26,11 @@ const steps = {
 function render() {
   const p = document.getElementById('primary');
   p.replaceChildren();
+  if (inApp) {
+    p.append(el('h2', {}, `You\u2019re using the ${cfg.name} Android app`),
+      el('p', { class: 'dl-note' }, `To get ${cfg.name} on a computer, open ${location.host}/download there.`));
+    return;
+  }
   p.append(el('h2', {}, `Get ${cfg.name} for ${label[os]}`));
   if ((os === 'windows' || os === 'mac' || os === 'linux') && (mine.length || cfg.desktopUrl)) {
     p.append(el('div', { class: 'row-btns' },

@@ -2039,6 +2039,7 @@ img.cemoji.big { width: 40px; height: 40px; }
 .pcard.pc-no-banner .pc-av { margin-top: 0; }
 .tos-check { display: flex; align-items: flex-start; gap: 8px; font-size: 13.5px; color: var(--text-2); margin: 4px 0 2px; cursor: pointer; }
 .tos-check input { margin-top: 3px; accent-color: var(--accent); }
+.tos-privacy { margin: -10px 0 0; }
 
 /* ------------------------------------------------------------------ admin */
 .admin { flex: 1; display: flex; flex-direction: column; min-height: 0; }

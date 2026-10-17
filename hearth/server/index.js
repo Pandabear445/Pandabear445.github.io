@@ -1301,6 +1301,15 @@ let appPage = null;
 app.get(['/', '/index.html'], (req, res, next) => (appPage ? appPage(req, res) : next()));
 app.get('/download', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'download.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'terms.html')));
+// This server's privacy policy, a page the operator publishes somewhere (https only). The app links to it at sign-up
+// and in Settings; it's given out as privacyUrl in /api/config.
+const PRIVACY_URL = (() => {
+  const v = String(process.env.PRIVACY_URL || '').trim();
+  if (!v) return null;
+  try { const u = new URL(v); if (u.protocol === 'https:' && !u.username && !u.password) return u.href; } catch { /* below */ }
+  log.warn('config', 'privacy_url_ignored', { msg: 'PRIVACY_URL must be an https:// address; it is ignored.' });
+  return null;
+})();
 // Android App Links: with this file, a phone that has a Hearth app built for this server (HEARTH_SERVER in the
 // apps workflow) opens https://this-server/invite/... links straight in the app instead of the browser. Android
 // only believes it for apps signed with a key listed here: ANDROID_CERT_SHA256 is that key's SHA-256
@@ -1890,6 +1899,7 @@ api.get('/config', (req, res) => {
     registrationOpen: regMode() !== 'closed',
     registrationRequiresCode: regMode() === 'code',
     termsVersion: termsInfo().version || 0,
+    privacyUrl: PRIVACY_URL,
     gifsEnabled: true, // the server's own library always works
     gifLibraryOnly: !gifKey(),
     gifProvider: gifProvider(),

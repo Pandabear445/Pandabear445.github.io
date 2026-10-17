@@ -20,6 +20,8 @@
     button:disabled { opacity: .6; }
     .err { color: #ff7b8c; font-size: 14px; min-height: 20px; margin-top: 10px; }
     .hint { font-size: 12.5px; color: #847c97; margin-top: 14px; }
+    .links { font-size: 12.5px; margin-top: 10px; }
+    .links a { color: #b6afc6; }
     .loading { display: none; text-align: center; color: #b6afc6; }
     body.auto .card { display: none; } body.auto .loading { display: block; }
   </style>
@@ -35,6 +37,8 @@
     <button id="go" type="submit">Connect</button>
     <div class="err" id="err" role="alert"></div>
     <div class="hint">Your messages stay end-to-end encrypted. The app only talks to the server you enter. If your server uses a self-signed certificate (an IP address like 1.2.3.4:3000), the app asks you to confirm it once.</div>
+    <!-- Opens in the browser (BridgePolicy.opensInBrowser); it never becomes the server. -->
+    <div class="links"><a href="https://pandabear445.github.io/Hearth-chat/privacy.html">Privacy policy</a></div>
   </form>
   <script>
     // First launch: type the server address. After that the app goes straight there. Comes back here

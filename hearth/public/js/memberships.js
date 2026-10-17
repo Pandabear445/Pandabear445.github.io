@@ -1,10 +1,12 @@
 // Creator memberships in the app: the owner's "Memberships" tab in Server settings (connect Stripe, make
 // tiers, see members) and the members' window (join a tier, see or cancel yours). Paying happens on Stripe's
-// own page: in a browser this tab goes there and comes back; the desktop and Android apps open the browser.
+// own page: in a browser this tab goes there and comes back; the desktop app opens the browser. The Android app
+// shows none of it (noPayments in android.js).
 import { h, clear, icon, toast } from './util.js';
 import { api } from './api.js';
 import { modal, field, confirmDialog } from './ui.js';
 import { PERMS } from './perms.js';
+import { noPayments } from './android.js';
 
 const money = (cents, cur) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur || 'USD' }).format(cents / 100); } catch { return `${(cents / 100).toFixed(2)} ${cur || ''}`; } };
 const day = (t) => (t ? new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '');
@@ -20,6 +22,7 @@ function statusLine(m) {
 
 // ------------------------------------------------------------------ members: join / manage
 export async function openMemberships(server) {
+  if (noPayments) return;
   let d;
   try { d = await api('GET', `/servers/${server.id}/memberships`); } catch (e) { toast(e.message, 'error'); return; }
   const body = h('div', { class: 'stack mb-join' });
@@ -57,6 +60,7 @@ export async function openMemberships(server) {
 
 // ------------------------------------------------------------------ owner: Server settings → Memberships
 export async function membershipsTab(s, body, { roles }) {
+  if (noPayments) { clear(body); return; }
   clear(body).append(h('div', { class: 'panel-loading' }, h('span', { class: 'spinner' })));
   let d;
   try { d = await api('GET', `/servers/${s.id}/memberships`); } catch (e) { clear(body).append(h('p', { class: 'form-error' }, e.message)); return; }

@@ -9,6 +9,11 @@ const A = window.HearthAndroid;
 // push: null until the app says it can (an older app can't). ready: settles once the app answered (or didn't
 // in time). onHangUp: set by app.js; the call notification's Hang up button calls it.
 export const androidApp = { on: !!A, version: '', notify: 'default', push: null, calls: false, ready: Promise.resolve(), onHangUp: null };
+// Inside the Android app there is no way to pay: no supporter window, funding card or memberships to join. Google
+// Play doesn't allow an app to send people to pay outside Play's own billing. The web and the desktop app are
+// unchanged. The app's user agent (HearthAndroid, mobile/capacitor.config.json) counts too, for a web view too
+// old to have window.HearthAndroid.
+export const noPayments = androidApp.on || /\bHearthAndroid\b/.test((typeof navigator !== 'undefined' && navigator.userAgent) || '');
 
 if (A) {
   const send = (msg) => { try { A.postMessage(JSON.stringify(msg)); } catch { /* app closing */ } };

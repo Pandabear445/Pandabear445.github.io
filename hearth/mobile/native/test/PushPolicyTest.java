@@ -140,4 +140,14 @@ public class PushPolicyTest {
         assertTrue(BridgePolicy.allowed("setServer", local, local, server));
         assertFalse(BridgePolicy.allowed("setServer", server, local, server));
     }
+
+    @Test
+    public void theConnectScreensPrivacyLinkOpensInTheBrowser() {
+        assertTrue(BridgePolicy.opensInBrowser("https://pandabear445.github.io/Hearth-chat/privacy.html"));
+        for (String other : new String[] { "https://kappachat.duckdns.org/", "https://pandabear445.github.io/", "https://pandabear445.github.io/Hearth-chat",
+                "https://pandabear445.github.io.evil.example/Hearth-chat/privacy.html", "https://pandabear445.github.io@evil.example/Hearth-chat/",
+                "http://pandabear445.github.io/Hearth-chat/privacy.html", "", null }) {
+            assertFalse(String.valueOf(other), BridgePolicy.opensInBrowser(other));
+        }
+    }
 }

@@ -16,7 +16,8 @@ What the app adds on top of the web page (in `native/MainActivity.java`):
 * **Invite links open in the app:** `hearth://invite/CODE`, and `https://your-server/invite/CODE` for an app
   built for your server (see *Invite links* below).
 * **Saving files** (attachments, exports) to *Downloads/Hearth*.
-* **Links to other sites** open in your browser; only your server loads inside the app.
+* **Links to other sites** open in your browser; only your server loads inside the app. The connect screen
+  links to Hearth's privacy policy, which opens in the browser too.
 * **Back button** goes back; on the first screen it sends the app to the background (so messages keep
   arriving) instead of closing it.
 * **Switch server:** Settings → Apps & devices → *Switch server*.
@@ -33,7 +34,7 @@ Install it: open the `.apk` on the phone and allow "Install unknown apps" for yo
 Those warnings (and Play Protect's "unrecognised app") come with installing outside Google Play; to avoid them,
 offer the app through Google Play's internal testing track, see [`../docs/SIGNING.md`](../docs/SIGNING.md).
 To offer it to everyone, put the `.apk` in your server's `data/downloads/` folder — the `/download` page shows
-it to Android visitors.
+it to Android visitors (in a browser; opened inside the app, it lists no downloads).
 
 **Server address:** people type it on first launch (e.g. `chat.example.com` or `1.2.3.4:3000`). To build an
 app for your server only, set the repository variable `HEARTH_SERVER` (Settings → Secrets and variables →
@@ -180,6 +181,14 @@ still need a real phone (checklist: `docs/design/ANDROID-PUSH.md` §17) before a
 * **Screen sharing** — Android's web view can't capture the screen. Camera, mic and watch together work.
 * **A full-screen incoming call screen** (like the phone app's) — calls ring as a notification.
 * **Google's push service built in** (for people without a push app) — planned as an optional build flag.
+
+## Left out on purpose
+
+* **Paying:** the supporter window (*Support* in the menu on your name), the funding card on Home and creator
+  memberships (joining one, and Server settings → Memberships) don't show in the app. Google Play doesn't allow
+  an app to send people to pay outside Play's own billing. A browser and the desktop app still show them.
+* **Downloads:** Settings → Apps & devices has no download page or share link, and `/download` lists no
+  downloads when it's opened in the app. An app installed from Google Play updates only through Play.
 
 ## Building it yourself
 

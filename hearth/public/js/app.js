@@ -1,6 +1,6 @@
 // Hearth web client.
 // Layout: server rail | sidebar (home or server) | conversation | contextual right panel (members, pins, thread).
-import { androidApp } from './android.js';
+import { androidApp, noPayments } from './android.js';
 import { h, $, $$, clear, icon, fmtTime, fmtStamp, fmtDay, fmtSize, toast, playSound, copyText, debounce } from './util.js';
 import { api, upload, getToken, setToken, setTokenOwner, onTokenChange, tokenMovedFrom } from './api.js';
 import * as E2EE from './e2ee.js';
@@ -280,6 +280,10 @@ function showSignIn() {
   $('#insecure-warning').hidden = secure;
   $('#reg-code-field').hidden = !S.config.registrationRequiresCode;
   if (!S.config.registrationOpen) $('#to-register').parentElement.hidden = true;
+  // The server's privacy policy (PRIVACY_URL) under the terms, when it has one.
+  const privacyUrl = typeof S.config.privacyUrl === 'string' && /^https:\/\//i.test(S.config.privacyUrl) ? S.config.privacyUrl : '';
+  $('#reg-privacy').hidden = !privacyUrl;
+  if (privacyUrl) $('#reg-privacy-link').href = privacyUrl;
   inviteBanner();
 
   // "I'm not a robot" checks. They start solving as soon as someone starts filling in the form.
@@ -700,7 +704,7 @@ function startApp() {
     const sv = S.servers.find((x) => x.id === serverId);
     const where = sv ? sv.name : 'the server';
     if (m.status === 'active' && !m.cancelAtEnd && Date.now() - m.since < 10 * 60000) { toast(`\u2B50 You\u2019re a member of ${where}. Thank you!`); playSound('mention'); }
-    else if (m.status === 'past_due') toast(`Your membership payment for ${where} didn\u2019t go through. Stripe will try again; check your card.`, 'error');
+    else if (m.status === 'past_due' && !noPayments) toast(`Your membership payment for ${where} didn\u2019t go through. Stripe will try again; check your card.`, 'error');
     else if (m.status === 'ended') toast(`Your membership of ${where} has ended.`);
   });
   socket.on('support:thanks', ({ until, forever }) => {
@@ -1067,7 +1071,7 @@ async function loadBootstrap() {
   else {
     if (!S.whatsNewShown) {
       S.whatsNewShown = true;
-      const news = unseenChanges(S.config.version);
+      const news = unseenChanges(S.config.version, { payments: !noPayments });
       if (news.length) {
         modal({ title: 'What\u2019s new', size: 'md', className: 'whatsnew',
           body: h('div', { class: 'stack' }, ...news.map((c) => h('section', null, h('h3', { class: 'set-h' }, `Version ${c.version}`), h('ul', { class: 'perk-list' }, c.items.map((t) => h('li', null, t)))))),
@@ -2388,7 +2392,7 @@ function renderServerSidebar(server, head, body) {
       next.repeat ? ` · ${repeatLabel(next).toLowerCase()}` : '')) : 'Events'),
     evs.length ? h('span', { class: 'badge inline' }, evs.length) : null));
   // Memberships this server sells (support the creator, get a role / private channels).
-  if (server.memberships) body.append(h('button', { class: 'ev-row mb-row', onclick: () => (isOwner(server) ? openServerSettings(server, 'memberships') : openMemberships(server)) }, icon('star'), h('span', { class: 'ev-row-text' }, 'Memberships')));
+  if (server.memberships && !noPayments) body.append(h('button', { class: 'ev-row mb-row', onclick: () => (isOwner(server) ? openServerSettings(server, 'memberships') : openMemberships(server)) }, icon('star'), h('span', { class: 'ev-row-text' }, 'Memberships')));
   const collapsed = P.collapsed[server.id] || [];
   const cats = orderedCategories(server);
   cats.forEach((cat, ci) => {
@@ -2759,7 +2763,7 @@ function statusMenu(anchor) {
     h('div', { class: 'menu-sep' }),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openCustomStatus(); } }, icon('smile', 'ic menu-ic'), 'Set a custom status'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openActivityPicker(S.me.activity); } }, icon('gamepad', 'ic menu-ic'), 'Set what I\u2019m playing or listening to'),
-    S.config.funding || S.config.support ? h('button', { class: 'menu-item', onclick: () => { closePopover(); openSupport(); } }, icon('coin', 'ic menu-ic'), `Support ${S.config.name}`) : null,
+    !noPayments && (S.config.funding || S.config.support) ? h('button', { class: 'menu-item', onclick: () => { closePopover(); openSupport(); } }, icon('coin', 'ic menu-ic'), `Support ${S.config.name}`) : null,
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openProfileModal(S.me.id); } }, icon('user', 'ic menu-ic'), 'View my profile'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); displayNameDialog(app); } }, icon('user', 'ic menu-ic'), 'Change display name'),
     h('button', { class: 'menu-item', onclick: () => { closePopover(); openSettings(app, 'profile'); } }, icon('edit', 'ic menu-ic'), 'Edit profile'),
@@ -2987,10 +2991,10 @@ function notifyMenu(key) {
 
 // ---- Home: a quick launchpad, not a wall of content
 // "Keep this server running": the owner's monthly cost, how much is covered, and where to chip in.
-// No ads, no tracking: just an honest number. It can be hidden for a month.
+// No ads, no tracking: just an honest number. It can be hidden for a month. Never in the Android app (no way to pay there).
 function fundingCard() {
   const f = S.config.funding;
-  if (!f || !f.enabled || !f.url) return null;
+  if (noPayments || !f || !f.enabled || !f.url) return null;
   const hidKey = `hearth.fundHidden.${S.me.id}`;
   if (+(localStorage.getItem(hidKey) || 0) > Date.now()) return null;
   const money = (n) => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: f.currency || 'USD', maximumFractionDigits: 0 }).format(n); } catch { return `${n} ${f.currency}`; } };
@@ -3007,8 +3011,9 @@ function fundingCard() {
   return card;
 }
 // The Support window: perks, the person's own support code, and the ways to pay (Stripe / Ko-fi / the
-// owner's own link). Payments with the code turn on the supporter badge by themselves.
+// owner's own link). Payments with the code turn on the supporter badge by themselves. Not in the Android app.
 async function openSupport() {
+  if (noPayments) return;
   let d;
   try { d = await api('GET', '/me/support'); } catch (e) { return toast(e.message, 'error'); }
   const f = S.config.funding || {};
@@ -7370,6 +7375,7 @@ function backFromStripe() {
   const what = q.get('membership');
   if (!what) return;
   history.replaceState(null, '', '/' + location.hash);
+  if (noPayments) return;
   const sv = S.servers.find((x) => x.id === q.get('server'));
   if (what === 'thanks') toast('\u2B50 Thanks! Your membership starts as soon as Stripe confirms the payment (a few seconds).');
   else if (what === 'cancelled') toast('No payment was made.');
@@ -7392,7 +7398,7 @@ function serverMenuItems(server) {
     { label: 'Members', icon: 'people', action: () => { if (S.view.serverId !== server.id) openServer(server.id); S.panel = 'members'; S.thread = null; delete composers.thread; P.showMembers = true; renderAll(); } },
     pickableRoles(server, S.me.id).length ? { label: 'Pick your roles', icon: 'at', action: () => pickRoles(server) } : null,
     mayNickname(server, S.me) ? { label: 'Change nickname', icon: 'edit', action: () => openNickname(server, S.me) } : null,
-    server.memberships && !isOwner(server) ? { label: 'Memberships', icon: 'star', action: () => openMemberships(server) } : null,
+    server.memberships && !isOwner(server) && !noPayments ? { label: 'Memberships', icon: 'star', action: () => openMemberships(server) } : null,
     { label: fav ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => toggleFavorite('s:' + server.id) },
     ...folders.serverMenuExtras(server),
     '-',
@@ -7688,7 +7694,7 @@ function openServerSettings(server, startTab = 'overview') {
     ['audit', 'Audit log', 'file', (s) => !isGroup(s) && can(s, PERMS.VIEW_AUDIT_LOG)],
     ['invites', 'Invites', 'link', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
     ['wordfilter', 'Word filter', 'eyeOff', (s) => !isGroup(s) && can(s, PERMS.MANAGE_SERVER)],
-    ['memberships', 'Memberships', 'star', (s) => !isGroup(s) && isOwner(s) && s.membershipsOn],
+    ['memberships', 'Memberships', 'star', (s) => !noPayments && !isGroup(s) && isOwner(s) && s.membershipsOn],
     ['danger', 'Danger zone', 'trash', (s) => isOwner(s)],
   ];
   const add = (el, ...kids) => el.append(...kids.filter((k) => k != null && k !== false));

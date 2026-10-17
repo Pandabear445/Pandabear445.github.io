@@ -67,6 +67,12 @@ function fold(title, hint, ...kids) {
     h('summary', null, h('span', { class: 'set-h' }, title), hint ? h('span', { class: 'set-fold-hint' }, hint) : null, icon('chevronRight')),
     h('div', { class: 'set-fold-body' }, kids));
 }
+// This server's privacy policy (PRIVACY_URL), when it has one. It opens like other links to other sites: a new tab,
+// or the browser from the desktop and Android apps.
+function privacyLink(cfg) {
+  const url = cfg && cfg.privacyUrl;
+  return typeof url === 'string' && /^https:\/\//i.test(url) ? h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, 'Privacy policy') : null;
+}
 
 // ------------------------------------------------------------------ the modal
 // Grouped like most chat apps so people can find things: [group label, [[key, label, icon], ...]]
@@ -518,7 +524,8 @@ function accountTab(app, setDirty, go) {
       h('p', { class: 'field-hint' }, 'To see or sign out your other devices, open Sessions.')),
     section('Delete account',
       h('p', { class: 'muted-p' }, 'Erases your private keys, email, profile, pictures and friends, takes you out of every server, and signs out every device. Messages you sent stay where they are (still encrypted, readable by the people who could read them before) and show “Deleted user”. This can’t be undone.'),
-      h('div', null, h('button', { class: 'btn danger', onclick: () => deleteAccount(app).catch(quiet) }, 'Delete my account'))),
+      h('div', null, h('button', { class: 'btn danger', onclick: () => deleteAccount(app).catch(quiet) }, 'Delete my account')),
+      privacyLink(S.config) ? h('p', { class: 'field-hint' }, 'How this server handles your data: ', privacyLink(S.config)) : null),
   );
 }
 async function deleteAccount(app) {
@@ -1954,7 +1961,9 @@ function appsTab(app) {
     h('h2', { class: 'set-title' }, 'Apps & devices'),
     section('Install on this device', installBox),
     window.hearthDesktop ? desktopSettingsSection({ h, section, toggle, field, toast }) : null,
-    window.hearthDesktop ? null : section('Desktop app',
+    // Not in the Android app: the download page offers the Android app itself, and an app from Google Play
+    // updates only through Play.
+    window.hearthDesktop || androidApp.on ? null : section('Desktop app',
       h('p', { class: 'muted-p' }, 'A Windows, Mac and Linux app with a tray icon, unread badge and launch-at-login.'),
       dl.length || cfg.desktopUrl
         ? h('div', null, h('a', { class: 'btn ghost', href: '/download', target: '_blank', rel: 'noopener' }, icon('download'), 'Download page'))
@@ -1963,9 +1972,10 @@ function appsTab(app) {
     androidApp.on && !androidApp.push ? section('Notifications', androidNotifyRow())
       : section('Notifications', ...pushRows(app),
         h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
-    section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
+    androidApp.on ? null : section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
       h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download`, 'aria-label': 'Download page link' }),
         h('button', { class: 'btn ghost', onclick: () => { navigator.clipboard.writeText(`${location.origin}/download`).then(() => toast('Link copied.')); } }, 'Copy'))),
+    privacyLink(cfg) ? section('Privacy', h('p', { class: 'muted-p' }, 'How this server handles your data: ', privacyLink(cfg))) : null,
   );
 }
 

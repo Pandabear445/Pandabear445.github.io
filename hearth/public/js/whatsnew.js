@@ -1,5 +1,7 @@
 // "What's new": shown once after this server is updated (not on someone's very first visit).
-// Newest first. Keep each item short and about what people can do.
+// Newest first. Keep each item short and about what people can do. Items about paying are wrapped in pay():
+// the Android app leaves them out, as it offers no way to pay (noPayments in android.js).
+const pay = (text) => ({ text, pay: true });
 export const CHANGES = [
   { version: '1.29.0', items: [
     'Webhooks: give a channel a webhook address (channel settings \u2192 Webhooks) and paste it into Uptime Kuma, Home Assistant, Grafana, GitHub or anything that posts to Discord or Slack. Posts show as the webhook, marked as not end-to-end encrypted, and can\u2019t ping anyone unless you allow it.',
@@ -70,7 +72,7 @@ export const CHANGES = [
     'Watch together has a full screen button (or press F, or double-click the video). The shared controls and Sync stay at the bottom and fade away while you watch; Esc goes back. On phones it fills the screen and turns sideways where it can.',
   ] },
   { version: '1.26.0', items: [
-    'Creator memberships: server owners can sell monthly memberships, like Patreon inside your server. Each one gives a role, and roles can open private channels. Members join from the server\u2019s Memberships row and pay on Stripe\u2019s page; the money goes to the creator. Everything that\u2019s free stays free.',
+    pay('Creator memberships: server owners can sell monthly memberships, like Patreon inside your server. Each one gives a role, and roles can open private channels. Members join from the server\u2019s Memberships row and pay on Stripe\u2019s page; the money goes to the creator. Everything that\u2019s free stays free.'),
     'Fixed: on phones and tablets the member list no longer covers the chat every time you open a channel (tap the people button when you want it).',
   ] },
   { version: '1.25.1', items: [
@@ -124,17 +126,20 @@ export const CHANGES = [
   { version: '1.18.1', items: ['A new GIF picker laid out like Discord’s: GIFs, Stickers and Emoji tabs, Favorites and Trending tiles, and smoother scrolling.'] },
   { version: '1.18.0', items: [
     'Show the game you’re playing and the music you’re listening to (Settings → Games & music). Add your favorite games to your profile.',
-    'Support the server: become a supporter from the 💜 card on Home.',
+    pay('Support the server: become a supporter from the 💜 card on Home.'),
   ] },
   { version: '1.17.0', items: ['Polls, voice messages, events with RSVPs, message reminders, and a People page. Profiles got a big new header.'] },
 ];
 
 const cmp = (a, b) => { const x = a.split('.').map(Number); const y = b.split('.').map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); } return 0; };
-// Returns the entries newer than what this device last saw, and remembers the current version.
-export function unseenChanges(current) {
+// Returns the entries newer than what this device last saw, and remembers the current version. Items are plain
+// text; with payments: false the ones about paying are left out (and an entry with nothing left).
+export function unseenChanges(current, { payments = true } = {}) {
   const KEY = 'hearth.seenVersion';
   let seen = null;
   try { seen = localStorage.getItem(KEY); localStorage.setItem(KEY, current); } catch { return []; }
   if (!seen || !current || cmp(current, seen) <= 0) return [];
-  return CHANGES.filter((c) => cmp(c.version, seen) > 0 && cmp(c.version, current) <= 0);
+  return CHANGES.filter((c) => cmp(c.version, seen) > 0 && cmp(c.version, current) <= 0)
+    .map((c) => ({ ...c, items: c.items.filter((t) => payments || !t.pay).map((t) => (typeof t === 'string' ? t : t.text)) }))
+    .filter((c) => c.items.length);
 }

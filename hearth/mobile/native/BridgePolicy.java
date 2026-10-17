@@ -10,6 +10,7 @@ package app.hearth.mobile;
  * "changeServer" only opens the connect screen, where the person decides, so the server's page may ask for it.
  * "push..." (notifications while the app is closed) and "call..." (keeping a call going with the screen off) are
  * only for the server's own page: they belong to the account signed in there, and the connect screen has none.
+ * Also which of the connect screen's links open in the browser instead (opensInBrowser).
  */
 final class BridgePolicy {
     private BridgePolicy() { }
@@ -21,5 +22,17 @@ final class BridgePolicy {
         if ("setServer".equals(type)) return local;
         if (type.startsWith("push") || type.startsWith("call")) return server;
         return local || server;
+    }
+
+    /** Hearth's own website, where the connect screen's privacy policy link goes. */
+    static final String SITE = "https://pandabear445.github.io/Hearth-chat/";
+
+    /**
+     * Whether a link the connect screen opens goes to the browser. Any other https:// address the connect screen
+     * goes to is the server the person chose (that's how an old web view without window.HearthAndroid says so),
+     * so a link to Hearth's website must not become the server.
+     */
+    static boolean opensInBrowser(String url) {
+        return url != null && url.startsWith(SITE);
     }
 }

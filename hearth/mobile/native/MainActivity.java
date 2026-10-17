@@ -223,9 +223,10 @@ public class MainActivity extends BridgeActivity {
             String url = request.getUrl().toString();
             if (isOurs(url)) return false;
             // Leaving the connect screen: that's the server the person just chose (covers old web views
-            // without window.HearthAndroid, which can't tell us directly).
+            // without window.HearthAndroid, which can't tell us directly). Its privacy policy link isn't: it goes
+            // to the browser below, like links from the server's pages.
             String from = view.getUrl() == null ? "" : originOf(view.getUrl());
-            if (from.equals(localOrigin()) && (url.startsWith("https://") || url.startsWith("http://"))) {
+            if (from.equals(localOrigin()) && (url.startsWith("https://") || url.startsWith("http://")) && !BridgePolicy.opensInBrowser(url)) {
                 setServerOrigin(originOf(url));
                 return false;
             }
