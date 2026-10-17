@@ -2,6 +2,8 @@
 import { h, clear, icon, toast, fmtStamp, fmtDay, fmtTime } from './util.js';
 import { api } from './api.js';
 import { modal, confirmDialog, field, menu } from './ui.js';
+import { icsText } from './ics.js';
+import { deadline } from './disappear.js';
 
 let X = null; // the app's helpers: S, getUser, displayName, avatarEl, socket(), notify, playSound, jump, addInbox, openChannel
 export function initFeatures(ctx) { X = ctx; }
@@ -151,6 +153,17 @@ export function voiceButton(getComposer, onSend) {
   return btn;
 }
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+// Voice messages loaded so far, by file: one from a disappearing message stops when the message goes (the player
+// isn't in the page, so taking the message off the screen alone wouldn't stop it).
+const voiceAudio = new Map(); // file url -> Audio
+export function stopVoice(urls) {
+  for (const u of urls) {
+    const a = voiceAudio.get(u);
+    if (!a) continue;
+    voiceAudio.delete(u);
+    try { a.pause(); a.removeAttribute('src'); a.load(); } catch { /* already stopped */ }
+  }
+}
 // A voice message in the chat: play button, progress and length. The file decrypts when played.
 export function voiceEl(f, getUrl) {
   const audio = new Audio();
@@ -168,7 +181,7 @@ export function voiceEl(f, getUrl) {
   btn.addEventListener('click', async () => {
     if (!loaded) {
       btn.disabled = true;
-      try { audio.src = await getUrl(); loaded = true; } catch { toast('Couldn’t load that voice message.', 'error'); return; } finally { btn.disabled = false; }
+      try { audio.src = await getUrl(); loaded = true; voiceAudio.set(f.url, audio); } catch { toast('Couldn’t load that voice message.', 'error'); return; } finally { btn.disabled = false; }
     }
     document.querySelectorAll('.vm audio').forEach(() => {});
     if (audio.paused) audio.play().catch(() => {}); else audio.pause();
@@ -196,6 +209,25 @@ const when = (e) => {
   const day = fmtDay(e.startsAt);
   return `${day} · ${d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
 };
+// Repeating events: the server moves one on to its next time when it ends. Only "this time and every later
+// one" can be changed or deleted (there are no one-off exceptions).
+const REPEATS = [['none', 'Does not repeat'], ['weekly', 'Every week'], ['biweekly', 'Every 2 weeks'], ['monthly', 'Every month']];
+export const repeatLabel = (e) => (e && e.repeat ? (REPEATS.find(([k]) => k === e.repeat) || [])[1] || 'Repeats' : '');
+// A zone this browser knows (an older one may not know a zone the server does), else undefined: this device's.
+const knownZone = (tz) => { try { return tz ? new Intl.DateTimeFormat('en-US', { timeZone: tz }).resolvedOptions().timeZone : undefined; } catch { return undefined; } };
+// A day on the event's own clock (the last date is the end of that day where the event is kept).
+const dayIn = (t, timeZone, opts) => new Date(t).toLocaleDateString(undefined, { timeZone: knownZone(timeZone), ...opts });
+function repeatText(e) {
+  const base = repeatLabel(e);
+  if (!base) return '';
+  if (e.repeatCount === 1) return `${base} · this is the last time`;
+  if (e.repeatCount) return `${base} · ${e.repeatCount} times left`;
+  if (e.repeatUntil) {
+    const sameYear = new Date(e.repeatUntil).getFullYear() === new Date().getFullYear();
+    return `${base} until ${dayIn(e.repeatUntil, e.timeZone, { month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) })}`;
+  }
+  return base;
+}
 const relative = (ts) => {
   const m = Math.round((ts - Date.now()) / 60000);
   if (m <= 0) return 'happening now';
@@ -205,10 +237,7 @@ const relative = (ts) => {
 };
 // Download an .ics file so it can go in any calendar app.
 function icsFor(e, serverName) {
-  const z = (t) => new Date(t).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
-  const esc = (s) => String(s || '').replace(/[\\;,]/g, (c) => '\\' + c).replace(/\n/g, '\\n');
-  const body = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Hearth//Events//EN', 'BEGIN:VEVENT', `UID:${e.id}@hearth`, `DTSTAMP:${z(Date.now())}`, `DTSTART:${z(e.startsAt)}`, `DTEND:${z(e.endsAt || e.startsAt + 3600000)}`,
-    `SUMMARY:${esc(e.title)}`, `DESCRIPTION:${esc(e.description)}`, `LOCATION:${esc(e.location || serverName)}`, 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+  const body = icsText(e, serverName);
   const url = URL.createObjectURL(new Blob([body], { type: 'text/calendar' }));
   h('a', { href: url, download: `${e.title.replace(/[^\w -]+/g, '').slice(0, 40) || 'event'}.ics` }).click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
@@ -220,7 +249,8 @@ export function eventCard(e, server, { onChange } = {}) {
   return h('div', { class: 'ev-card' },
     h('div', { class: 'ev-date' }, h('span', null, new Date(e.startsAt).toLocaleDateString(undefined, { month: 'short' })), h('strong', null, String(new Date(e.startsAt).getDate()))),
     h('div', { class: 'ev-body' },
-      h('div', { class: 'ev-when' }, when(e), h('span', { class: 'ev-rel' }, relative(e.startsAt))),
+      h('div', { class: 'ev-when' }, when(e), h('span', { class: 'ev-rel' }, relative(e.startsAt)),
+        e.repeat ? h('span', { class: 'ev-repeat' }, icon('repeat', 'ic'), repeatText(e)) : null),
       h('strong', { class: 'ev-title' }, e.title),
       e.location || channel ? h('span', { class: 'ev-where' }, channel ? `${channel.type === 'voice' ? '🔊' : '#'} ${channel.name}` : '', channel && e.location ? ' · ' : '', e.location || '') : null,
       e.description ? h('p', { class: 'ev-desc' }, e.description) : null,
@@ -234,7 +264,10 @@ export function eventCard(e, server, { onChange } = {}) {
           { label: 'Add to my calendar', icon: 'download', action: () => icsFor(e, server.name) },
           channel ? { label: channel.type === 'voice' ? 'Join the voice channel' : 'Open the channel', icon: 'hash', action: () => X.openChannelOrVoice(channel, server) } : null,
           canEdit ? { label: 'Edit', icon: 'edit', action: () => openEventEditor(server, e, onChange) } : null,
-          canEdit ? { label: 'Delete', icon: 'trash', danger: true, action: async () => { if (await confirmDialog({ title: `Delete ${e.title}?`, confirm: 'Delete', danger: true })) api('DELETE', `/events/${e.id}`).then(() => onChange && onChange()).catch((x) => toast(x.message, 'error')); } } : null,
+          canEdit ? { label: 'Delete', icon: 'trash', danger: true, action: async () => {
+            const text = e.repeat ? 'This deletes this time and every later one (single dates can’t be deleted on their own).' : undefined;
+            if (await confirmDialog({ title: `Delete ${e.title}?`, text, confirm: 'Delete', danger: true })) api('DELETE', `/events/${e.id}`).then(() => onChange && onChange()).catch((x) => toast(x.message, 'error'));
+          } } : null,
         ]) }, icon('more')))));
 }
 export function openEvents(server) {
@@ -249,7 +282,7 @@ export function openEvents(server) {
     title: `Events in ${server.name}`, size: 'md', className: 'events-modal',
     body: h('div', { class: 'stack' },
       h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => openEventEditor(server, null, draw) }, icon('plus'), 'Plan an event'),
-        h('span', { class: 'field-hint' }, 'Everyone going gets a reminder 15 minutes before. Events aren’t end-to-end encrypted.')),
+        h('span', { class: 'field-hint' }, 'Everyone going gets a reminder 15 minutes before. A repeating event moves on to its next time when one ends, and everyone answers again. Events aren’t end-to-end encrypted.')),
       list),
   });
   eventsModal = { serverId: server.id, draw, m };
@@ -279,13 +312,78 @@ function openEventEditor(server, e, onDone) {
   const where = h('input', { class: 'input', maxlength: '120', value: e ? e.location : '', placeholder: 'Optional: somewhere else, a link…' });
   const desc = h('textarea', { class: 'input', rows: '3', maxlength: '2000', placeholder: 'What’s happening? What to bring?' });
   desc.value = e ? e.description : '';
+  // Repeating: the times stay on the clock of the time zone it was planned in (a series keeps its zone when
+  // someone elsewhere edits it). The last date is a day there.
+  const tz = (e && e.repeat && knownZone(e.timeZone)) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const dayOn = (t) => { const p = {}; new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(t).forEach((x) => { p[x.type] = x.value; }); return `${p.year}-${p.month}-${p.day}`; };
+  const rep = h('select', { class: 'input' }, REPEATS.map(([v, l]) => h('option', { value: v }, l)));
+  rep.value = e && e.repeat ? e.repeat : 'none';
+  const ends = h('select', { class: 'input' }, h('option', { value: 'never' }, 'Never'), h('option', { value: 'date' }, 'On a date'), h('option', { value: 'count' }, 'After a number of times'));
+  ends.value = e && e.repeatUntil ? 'date' : e && e.repeatCount ? 'count' : 'never';
+  const until = h('input', { class: 'input', type: 'date', value: e && e.repeatUntil ? dayOn(e.repeatUntil) : '' });
+  const count = h('input', { class: 'input', type: 'number', min: '1', max: '500', step: '1', value: e && e.repeatCount ? String(e.repeatCount) : '4' });
+  const endsField = field('Ends', ends);
+  const untilField = field('Last date', until);
+  const countField = field('How many times', count, e ? 'Counting the next time.' : 'Counting the first time.');
+  const repHint = h('p', { class: 'field-hint', 'aria-live': 'polite' });
+  const describe = () => {
+    const t = new Date(starts.value).getTime();
+    if (!Number.isFinite(t)) return '';
+    const fmt = (o) => new Intl.DateTimeFormat(undefined, { timeZone: tz, ...o }).format(t);
+    // An unchanged monthly event keeps its day (the 31st, even in a month where it's on the 30th).
+    const day = e && e.repeatDay && t === e.startsAt && rep.value === e.repeat ? e.repeatDay : Number(new Intl.DateTimeFormat('en-US', { timeZone: tz, day: 'numeric' }).format(t));
+    const rule = rep.value === 'monthly' ? `On day ${day} of every month${day > 28 ? ' (the last day in shorter months)' : ''}`
+      : `${rep.value === 'biweekly' ? 'Every other' : 'Every'} ${fmt({ weekday: 'long' })}`;
+    return `${rule} at ${fmt({ hour: 'numeric', minute: '2-digit' })}, ${tz.replace(/_/g, ' ')} time, also after the clocks change. Everyone in the server sees this time zone (it’s also in the calendar file). Edits apply to the next time and every one after it; single dates can’t be changed on their own.`;
+  };
+  const sync = () => {
+    const on = rep.value !== 'none';
+    endsField.hidden = !on;
+    untilField.hidden = !on || ends.value !== 'date';
+    countField.hidden = !on || ends.value !== 'count';
+    if (on && ends.value === 'date' && !until.value && starts.value) until.value = dayOn(new Date(starts.value).getTime() + 90 * 86400000);
+    if (starts.value) until.min = dayOn(new Date(starts.value).getTime());
+    repHint.textContent = on ? describe() : '';
+  };
+  rep.addEventListener('change', sync);
+  ends.addEventListener('change', sync);
+  starts.addEventListener('input', sync);
+  sync();
+  // The time and the repeat rule as the dialog opened with them (see saving, below).
+  const timeShape = () => `${starts.value}|${hours.value}`;
+  const ruleShape = () => (rep.value === 'none' ? 'none' : `${rep.value}|${ends.value}|${ends.value === 'date' ? until.value : ''}|${ends.value === 'count' ? count.value : ''}`);
+  const time0 = timeShape(); const rule0 = ruleShape();
   modal({
-    title: e ? 'Edit event' : 'Plan an event', size: 'sm',
-    body: h('div', { class: 'stack' }, field('Name', title), h('div', { class: 'grid-2' }, field('Starts', starts), field('Lasts (hours)', hours)), field('Where', chan), field('Place or link', where), field('Details', desc)),
+    title: e ? (e.repeat ? 'Edit repeating event' : 'Edit event') : 'Plan an event', size: 'sm',
+    body: h('div', { class: 'stack' }, field('Name', title), h('div', { class: 'grid-2' }, field('Starts', starts), field('Lasts (hours)', hours)),
+      h('div', { class: 'grid-2' }, field('Repeats', rep), endsField), untilField, countField, repHint,
+      field('Where', chan), field('Place or link', where), field('Details', desc)),
     actions: [{ label: 'Cancel' }, { label: e ? 'Save' : 'Create event', kind: 'primary', action: async () => {
       const startsAt = new Date(starts.value).getTime();
       const len = Math.max(0, +hours.value || 0);
-      const body = { title: title.value, startsAt, endsAt: len ? startsAt + len * 3600000 : null, channelId: chan.value || null, location: where.value, description: desc.value };
+      const body = { title: title.value, channelId: chan.value || null, location: where.value, description: desc.value };
+      // An edit sends the time and the repeat rule only when they were changed, with the start this dialog
+      // showed. A repeating event may have moved on to its next time while the dialog was open: other edits
+      // then apply to that next time, and the server refuses a changed time or rule based on the old one
+      // (which would take the series back to a time that's over, or count a time that's already been).
+      const timeChanged = !e || timeShape() !== time0;
+      const ruleChanged = !e || ruleShape() !== rule0;
+      if (timeChanged) Object.assign(body, { startsAt, endsAt: len ? startsAt + len * 3600000 : null });
+      if (ruleChanged) {
+        body.repeat = null;
+        if (rep.value !== 'none') {
+          Object.assign(body, { repeat: rep.value, timeZone: tz, repeatUntil: null, repeatCount: null });
+          if (ends.value === 'date') {
+            if (!until.value) throw new Error('Pick the last date.');
+            body.repeatUntil = until.value; // a day: the server counts it until midnight in the event's time zone
+          } else if (ends.value === 'count') {
+            const n = Math.round(+count.value);
+            if (!(n >= 1 && n <= 500)) throw new Error('Pick between 1 and 500 times.');
+            body.repeatCount = n;
+          }
+        }
+      }
+      if (e && (timeChanged || ruleChanged)) body.from = e.startsAt;
       // Leave the channel out unless it was changed, so saving other edits never moves or drops the link.
       if (e && chan.value === chan0) delete body.channelId;
       await api(e ? 'PATCH' : 'POST', e ? `/events/${e.id}` : `/servers/${server.id}/events`, body);
@@ -320,32 +418,57 @@ export function onEventStarting(e) {
 const RKEY = () => `hearth.reminders.${X.S.me.id}`;
 const getR = () => { try { return JSON.parse(localStorage.getItem(RKEY()) || '[]'); } catch { return []; } };
 const setR = (v) => { try { localStorage.setItem(RKEY(), JSON.stringify(v.slice(0, 200))); } catch { /* full */ } };
+// Disappearing messages: deadlines are in the server's time (see app.js nowServer).
+const serverNow = () => (X && X.nowServer ? X.nowServer() : Date.now());
 export function remindItems(m, key, preview) {
-  const at = (ms) => () => { setR([...getR(), { at: Date.now() + ms, key, msgId: m.id, text: preview.slice(0, 140), authorId: m.authorId }]); toast(`Okay — I’ll remind you ${relative(Date.now() + ms)}.`); };
+  // A reminder keeps a copy of the message's words on this device, so it goes when a disappearing message does (exp),
+  // and isn't offered for after that.
+  const exp = deadline(m);
+  const offset = serverNow() - Date.now();
+  const at = (ms) => () => { setR([...getR(), { at: Date.now() + ms, key, msgId: m.id, text: preview.slice(0, 140), authorId: m.authorId, ...(Number.isFinite(exp) ? { exp } : {}) }]); toast(`Okay — I’ll remind you ${relative(Date.now() + ms)}.`); };
+  const before = (ms) => Date.now() + offset + ms < exp;
   const tomorrow9 = () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); };
   const tonight = () => { const d = new Date(); d.setHours(20, 0, 0, 0); return d.getTime() - Date.now(); };
   return [
-    { label: 'Remind me in 20 minutes', icon: 'bell', action: at(20 * 60000) },
-    { label: 'Remind me in 1 hour', icon: 'bell', action: at(3600000) },
-    tonight() > 30 * 60000 ? { label: 'Remind me tonight (8 pm)', icon: 'bell', action: at(tonight()) } : null,
-    { label: 'Remind me tomorrow (9 am)', icon: 'bell', action: at(tomorrow9()) },
+    before(20 * 60000) ? { label: 'Remind me in 20 minutes', icon: 'bell', action: at(20 * 60000) } : null,
+    before(3600000) ? { label: 'Remind me in 1 hour', icon: 'bell', action: at(3600000) } : null,
+    tonight() > 30 * 60000 && before(tonight()) ? { label: 'Remind me tonight (8 pm)', icon: 'bell', action: at(tonight()) } : null,
+    before(tomorrow9()) ? { label: 'Remind me tomorrow (9 am)', icon: 'bell', action: at(tomorrow9()) } : null,
   ];
 }
+// Reminders for messages that disappeared (gone: their ids; or past their exp) are dropped without a word, and so
+// is the bar a fired one put on screen with their words.
+const shownReminders = new Map(); // the bar on screen -> { msgId, exp }
+export function purgeReminders(gone = new Set()) {
+  if (!X || !X.S || !X.S.me) return;
+  const all = getR();
+  const t = serverNow();
+  const keep = all.filter((r) => !(r.exp && r.exp <= t) && !gone.has(r.msgId));
+  if (keep.length !== all.length) setR(keep);
+  for (const [bar, r] of shownReminders) if ((r.exp && r.exp <= t) || gone.has(r.msgId)) { shownReminders.delete(bar); bar.remove(); }
+}
+export const reminderDeadlines = () => (X && X.S && X.S.me ? getR().map((r) => r.exp).filter(Boolean) : []);
 export function startReminders() {
   const check = () => {
     if (!X.S.me) return;
+    purgeReminders();
     const all = getR();
     const due = all.filter((r) => r.at <= Date.now());
     if (!due.length) return;
     setR(all.filter((r) => r.at > Date.now()));
     due.forEach((r) => {
       const who = X.displayName(X.getUser(r.authorId));
+      // A disappearing message's words go with it: the inbox entry keeps its deadline (exp), and the notification is
+      // tied to the message, so it closes when the message goes (as a message's own notification does).
+      const exp = Number.isFinite(r.exp) && r.exp > 0 ? { exp: r.exp } : {};
       X.playSound('mention');
-      X.notify({ title: 'Reminder', body: `${who}: ${r.text}` });
-      X.addInbox({ type: 'reminder', userId: r.authorId, msgId: r.msgId, title: `Reminder: message from ${who}`, text: r.text });
+      X.notify({ title: 'Reminder', body: `${who}: ${r.text}`, tag: `reminder:${r.msgId}`, msgId: r.msgId });
+      X.addInbox({ type: 'reminder', userId: r.authorId, msgId: r.msgId, title: `Reminder: message from ${who}`, text: r.text, ...exp });
+      const close = () => { shownReminders.delete(t); t.remove(); };
       const t = h('div', { class: 'update-bar ev-toast', role: 'status' }, icon('bell'), h('span', null, `Reminder: ${who} — “${r.text.slice(0, 60)}”`),
-        h('button', { class: 'btn primary sm', onclick: () => { X.jump(r.key, r.msgId); t.remove(); } }, 'Show'),
-        h('button', { class: 'icon-btn sm', 'aria-label': 'Dismiss', onclick: () => t.remove() }, icon('close')));
+        h('button', { class: 'btn primary sm', onclick: () => { X.jump(r.key, r.msgId); close(); } }, 'Show'),
+        h('button', { class: 'icon-btn sm', 'aria-label': 'Dismiss', onclick: close }, icon('close')));
+      shownReminders.set(t, { msgId: r.msgId, ...exp });
       document.body.append(t);
     });
   };

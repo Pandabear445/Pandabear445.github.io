@@ -3,7 +3,8 @@
 This page explains, in plain language, why Windows and Android warn people before they install the Hearth
 apps, what you can buy or set up to make those warnings go away (or get smaller), what it costs, and exactly
 which GitHub settings to fill in. It also covers signing the desktop app's updates, which protects people's apps
-from a server that's been broken into. The build (`.github/workflows/hearth-apps.yml`) already knows how to sign:
+from a server that's been broken into, and signing server updates, which protects servers from a swapped update
+zip. The build (`.github/workflows/hearth-apps.yml`) already knows how to sign:
 it signs automatically as soon as the secrets below exist, and builds unsigned apps (like today) when they
 don't.
 
@@ -23,6 +24,7 @@ Prices and rules below were checked in October 2026. They change, so check the l
 | Android: "Install unknown apps", Play Protect "unrecognised app" | Install from **Google Play** (internal testing for friends) | **$25 once** | an evening, plus Google's ID check |
 | Browser padlock / "Not secure" on your website | Already done: Caddy gets a real TLS certificate | free | none |
 | Desktop apps installing an update someone else put on your server | Your own **update signing key** (`UPDATE_SIGNING_KEY`, see [Signing desktop updates](#signing-desktop-updates)) | **free** | ten minutes |
+| Servers installing a swapped update zip (it carries the code that does the encryption) | Your own **server update signing key** (`update-signing.pub`, see [Signing server updates](#signing-server-updates)) | **free** | ten minutes |
 
 ## First: the website certificate is a different thing
 
@@ -272,16 +274,35 @@ installs on quit. macOS builds don't update themselves (people download new vers
 
 1. Make a key pair on your own computer: `node hearth/desktop/build/sign-update.js keygen`. It prints a private key
    (PEM) and its public half.
-2. Put the **whole** private key (with the BEGIN/END lines, or its base64) in the repository **secret**
-   `UPDATE_SIGNING_KEY`. Keep an offline copy (a password manager). Never commit it.
-3. Build a release (an `app-v*` tag or *Run workflow*). The workflow bakes the public key into the app
-   (`sign-update.js bake`), and after any step that rewrites `latest*.yml` (SignPath's re-signing included) writes
-   `latest*.yml.sig` next to each one (`sign-update.js sign dist`). The release and the server copy include the
-   `.sig` files. Without the secret the build prints a warning and the apps can't verify updates.
+2. Put the **whole** private key (with the BEGIN/END lines, or its base64) in the **secret** `UPDATE_SIGNING_KEY`
+   of the `production` environment (*Settings → Environments → production*; see
+   [Where each secret and variable goes](#where-each-secret-and-variable-goes)), and the public half in the
+   repository **variable** `UPDATE_PUBLIC_KEY`. Keep an offline copy of the private key (a password manager).
+   Never commit it.
+3. Build a release (an `app-v*` tag, a push to the default branch, or *Run workflow* there). The build bakes the
+   public key into the app (`sign-update.js bake`, from `UPDATE_PUBLIC_KEY`: the build job, which runs npm
+   packages' code, never sees the private key). Then a job of its own, `sign-updates`, which installs nothing
+   from npm, writes `latest*.yml.sig` next to each `latest*.yml` (`sign-update.js sign dist`, after anything that
+   rewrites them, SignPath's re-signing included), and refuses a private key that isn't `UPDATE_PUBLIC_KEY`'s
+   other half. The release and the server copy include the `.sig` files. Without the variable the build prints a
+   warning and the apps can't verify updates; with the variable but without the secret, or with the secret but
+   without the variable, `sign-updates` fails and nothing from the desktop build is published. Branch builds aren't
+   signed (they're never published).
 
-**Uploading by hand:** copy each `latest*.yml.sig` next to its `latest*.yml` in `data/downloads`, or the signed apps
-refuse the update. To sign files you built yourself:
-`UPDATE_SIGNING_KEY="$(cat update-key.pem)" node build/sign-update.js sign dist` (run in `hearth/desktop`).
+**Already have `UPDATE_SIGNING_KEY`** (set up before the `UPDATE_PUBLIC_KEY` variable existed): **don't make a new
+key pair**, since the apps people have installed only accept updates signed with the key you have. Set the variable
+`UPDATE_PUBLIC_KEY` to that key's public half. The next release build's `sign-updates` job prints it when the
+variable is missing (and signs nothing until it's set), or work it out yourself:
+`UPDATE_SIGNING_KEY="$(cat update-key.pem)" node build/sign-update.js pubkey` (run in `hearth/desktop`). Then move
+the secret into the `production` environment and delete the repository secret (see
+[Where each secret and variable goes](#where-each-secret-and-variable-goes)).
+
+**Uploading by hand:** the signatures are in the run's **`hearth-desktop-update-signatures`** artifact (made only
+for `app-v*` tags and the default branch; branch runs have none), not in the `hearth-desktop-<OS>` ones. Copy each
+`latest*.yml.sig` next to its `latest*.yml` in `data/downloads`, or the signed apps refuse the update. To sign
+files you built yourself:
+`UPDATE_SIGNING_KEY="$(cat update-key.pem)" UPDATE_PUBLIC_KEY='<the public key your apps were built with>' node build/sign-update.js sign dist`
+(run in `hearth/desktop`; it refuses without `UPDATE_PUBLIC_KEY`, so you can't sign apps built without the key).
 
 **Good to know:**
 
@@ -290,6 +311,113 @@ refuse the update. To sign files you built yourself:
 - Apps built before this feature, and fork builds without the secret, can't verify signatures. The first update
   from such an app to a signed build is installed the old way (after asking).
 - Forks should make their own key; they can't sign with yours.
+
+---
+
+## Signing server updates
+
+Also free, and separate from the desktop key: an **update signing key for server updates** (Ed25519). A Hearth
+server sends every browser and app the code that does the encryption, so whoever gets a server to install their
+update zip can quietly take that encryption apart for everyone on it. The `.sha256` next to each zip only catches
+a damaged download: someone who can swap the zip (on the download page, in a chat, on the way) can swap the
+`.sha256` too. With a key of your own, servers only install update zips you signed.
+
+**How it works:**
+
+- `scripts/make-update-zip.sh` signs each zip with your private key and writes `hearth-update-<version>.zip.sig`
+  next to it: an Ed25519 signature over `hearth-server-update-v1`, a newline, the zip's SHA-256 (hex) and a
+  newline. The label keeps a signature made for anything else (a desktop update, say) from passing as one.
+- The public half is committed as `hearth/update-signing.pub`, so it's inside every update and every install.
+- Each server trusts one key, pinned in **`/etc/hearth-update.pub`**: root's, outside the Hearth folder, so once
+  it's pinned neither Hearth itself nor an npm install script can replace it. It's the key the installed Hearth
+  came with (pinned at its first update, and only when that `update-signing.pub` and every folder above it can
+  be changed by root alone: in a plain install the Hearth folder is Hearth's own account's, and that account
+  mustn't choose the key), or else the key the first update that brings one carries.
+- From then on `hearth-update` refuses a zip without a valid signature by that key, before anything in it is
+  unpacked or run: it says why and "Nothing was changed". The operator runs the updater that's already on the
+  server (`sudo hearth-update <zip>`, the copy in `/usr/local/bin`), so the one inside the zip never checks itself.
+  Everything is checked on a private copy of the zip, so it can't change between the check and the install.
+- A server that checks signatures also never installs an older version by itself (an old, signed update could
+  bring back problems fixed since). `hearth-update --rollback` puts back your own backup as before;
+  `sudo hearth-update --allow-downgrade <zip>` on the server installs an older signed zip on purpose.
+- Servers check with **OpenSSL 3.0 or newer** (Debian 12, Ubuntu 22.04 and later), so Docker hosts don't need
+  Node. OpenSSL 1.1.1 (Debian 11, Ubuntu 20.04) can't check Ed25519 signatures at all; there the updater uses
+  Node instead, which Hearth needs outside Docker anyway. A server with neither pins no key and stays on
+  checksums only (it says so in the update log and in `hearth-update --status`); one that already pinned a key
+  refuses updates until one of them is installed. `hearth-update --status` shows the pinned key, and
+  `hearth-update --verify <zip>` checks a zip without installing anything.
+
+**Set it up once:**
+
+1. Make a key pair on your own computer: `node hearth/scripts/update-key.js keygen`. The private key goes to
+   `~/.config/hearth/update-signing.key`, readable only by you (`--key <file>` puts it elsewhere); the public
+   half goes to `hearth/update-signing.pub`. Nothing secret is printed.
+2. **Back up the private key** offline (a password manager, an encrypted USB stick). Never commit it (`*.key` is
+   ignored by git anyway) and never put it on a server.
+3. Commit `hearth/update-signing.pub`.
+4. Make releases as before: `bash scripts/make-update-zip.sh` finds the key in its usual place (or in
+   `HEARTH_UPDATE_KEY_FILE=/path/to/key`, or the key itself in `HEARTH_UPDATE_KEY`, for a CI job) and writes the
+   `.sig`. Once `update-signing.pub` is committed it refuses to make an unsigned zip, because servers that pinned
+   the key would refuse it (`--unsigned` makes one anyway).
+5. Hand out the zip, its `.sha256` and its `.sig`, and put the SHA-256 and your public key in the release notes.
+   To check a zip yourself: `node scripts/update-key.js verify hearth-update-<version>.zip`.
+
+Servers move to signed updates by themselves: the first update that carries `update-signing.pub` is installed the
+old way (checksum only) and pins its key; every later one has to be signed. The updater prints the key it pinned:
+operators who want to be sure compare it with the one in your release notes.
+
+**Changing the key:** a new key is only accepted from an update the old key signed (a key that comes inside a zip
+can't vouch for that zip, or anyone could ship their own key with their own zip).
+
+1. `node scripts/update-key.js keygen --key ~/.config/hearth/update-signing-new.key` (this replaces
+   `update-signing.pub` with the new public half). Commit it.
+2. Make the next release **signed with the old key** (still the default one), naming the new one:
+   `bash scripts/make-update-zip.sh --new-key ~/.config/hearth/update-signing-new.key`. Servers check it against
+   the old key, install it and switch to the new key; `make-update-zip.sh` says `KEY CHANGE` and from which key to
+   which. Without `--new-key` (or with a key that isn't the committed one) it makes nothing: a key change has to
+   come from whoever holds the new key, never from a commit alone. If it ever stops with "update-signing.pub in the
+   last commit is …, but you sign with …" and you didn't change the key, someone else did: look at
+   `git log -p -- hearth/update-signing.pub` before anything else.
+3. Then sign with the new key: move it to `~/.config/hearth/update-signing.key` (keep the old one backed up for a
+   while).
+
+Servers have to install that release before any later one: a server that skips it refuses the later ones
+("doesn't match this server's update key"). Say so in its release notes.
+
+**Lost or leaked key:** make a new one (`keygen` as in step 1, moving the old key file away first if you still have
+it, so the new one becomes the default), commit it and sign the next release with it. Every server
+then refuses that release, so each operator checks the zip another way (its SHA-256 from a place they trust) and
+installs it once with `sudo hearth-update --allow-unsigned <zip>`, which pins the key it brings. With a leaked key, tell operators straight
+away: until they move to the new key, a zip signed with the leaked one would be accepted.
+
+**Switching it off:** removing `update-signing.pub` from the repository unpins nothing (a release can't switch the
+check off). On each server: `sudo rm /etc/hearth-update.pub`, and delete `update-signing.pub` from the Hearth folder,
+or the next update pins it again.
+
+**Checking a signature by hand** (what the server does, with OpenSSL 3.0 or newer; with Node anywhere:
+`node scripts/update-key.js verify hearth-update-1.2.3.zip --pub update-signing.pub`):
+
+```bash
+printf 'hearth-server-update-v1\n%s\n' "$(sha256sum hearth-update-1.2.3.zip | cut -d' ' -f1)" > msg
+base64 -d hearth-update-1.2.3.zip.sig > sig.bin
+{ echo '-----BEGIN PUBLIC KEY-----'; grep -v '^#' update-signing.pub; echo '-----END PUBLIC KEY-----'; } > key.pem
+openssl pkeyutl -verify -pubin -inkey key.pem -rawin -in msg -sigfile sig.bin
+```
+
+**Good to know:**
+
+- The first key a server pins is trusted the first time it's seen. Before that, only the checksum protects the
+  update that brings it, so compare the pinned key (in the update log and `hearth-update --status`) with yours.
+- Updates rely on the updater already installed on the server. On a server that has never run `hearth-update`,
+  install it from your current Hearth once (in the Hearth folder:
+  `sudo install -m 755 scripts/hearth-update.sh /usr/local/bin/hearth-update`), rather than running the copy inside
+  a new zip, which would only be checking itself. An updater from before signed updates (put back by running an
+  old copy of the script) doesn't check signatures at all: if `hearth-update --status` shows no "update key" line,
+  install the current one the same way before updating.
+- `--allow-unsigned` switches the check off for that one update, by design, and says so loudly in the log.
+- Root on the server can change the pinned key. Signing protects the way updates reach a server, not a server
+  that's already been broken into.
+- Forks make their own key; servers that pinned yours then need one `--allow-unsigned` update to move to it.
 
 ---
 
@@ -328,10 +456,13 @@ Details change; see [developer.android.com/developer-verification](https://devel
 for new personal accounts an Android phone for verification). Internal testing has **no review wait and no
 "12 testers for 14 days" rule**; that rule only applies before publishing publicly (production).
 
-1. **Use a permanent signing key** (if you haven't yet), as described in `hearth/mobile/README.md` → *Signing*:
-   make `hearth.jks` and add the secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
-   `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`. With them, every build also makes a Google Play bundle (`.aab`,
-   in the run's artifacts as **hearth-android-play-bundle**). Back up `hearth.jks` somewhere safe.
+1. **Add your signing key**, as described in `hearth/mobile/README.md` → *Signing* (without it the workflow
+   only builds an unsigned APK): make `hearth.jks` and add the secrets `ANDROID_KEYSTORE_BASE64`,
+   `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`. With them, every build also makes a
+   Google Play bundle (`.aab`, in the run's artifacts as **hearth-android-play-bundle**). Back up `hearth.jks`
+   somewhere safe. If your APKs so far came from an older version of this workflow, which made a key itself and
+   kept it in the Actions cache, treat that key as exposed and follow *Moving off the old built-in key* in
+   `hearth/mobile/README.md` first.
 2. **Create the developer account** at [play.google.com/console](https://play.google.com/console) (*personal*
    account is fine), pay the $25 and finish identity verification.
 3. **Create the app:** *Create app →* name `Hearth`, *App*, *Free*. The package name is fixed by the first upload
@@ -356,28 +487,55 @@ for new personal accounts an Android phone for verification). Internal testing h
       (no roles needed). Open it → *Keys → Add key → JSON*: a `.json` file downloads.
    2. In Play Console → *Users and permissions → Invite new users*, enter the service account's email
       (`…@….iam.gserviceaccount.com`), and under *App permissions* add Hearth with **Release to testing tracks**.
-   3. In GitHub add the secret **`PLAY_SERVICE_ACCOUNT_JSON`** with the whole contents of that `.json` file,
-      then delete the file from your computer.
+   3. In GitHub add the secret **`PLAY_SERVICE_ACCOUNT_JSON`** to the `production` environment, with the whole
+      contents of that `.json` file, then delete the file from your computer.
    4. If Play still shows the app as a *draft* (it hasn't finished step 5), add the variable
       `PLAY_RELEASE_STATUS` = `draft` until it has; then remove it.
 
    From then on, every `app-v*` tag, every push to the default branch that changes the apps, and every manual
-   run uploads the new bundle to internal testing, and your testers' phones update by themselves.
+   run on the default branch uploads the new bundle to internal testing, and your testers' phones update by
+   themselves. (Manual runs on other branches never upload.)
 
 **Version numbers:** Android and Play only accept an update with a higher *versionCode*. The workflow sets it
 to `(major × 100 + minor) × 100000 + run number`, e.g. `12100457` for Hearth 1.21 in workflow run 457, so it
 always goes up.
 
+**Invite links that open in the app (Android App Links):** an app built for your server (`HEARTH_SERVER`) asks
+Android to open `https://your-server/invite/…` links itself. Android only agrees if your server vouches for the
+app's signing key: set `ANDROID_CERT_SHA256` in the server's `.env` to the key's SHA-256 fingerprint, which
+`keytool -list -v -keystore hearth.jks -alias hearth` prints (the `SHA256:` line, `AB:CD:…`). With Google Play,
+add Play's *app signing key* too (Play Console → your app → App integrity → App signing: the app signing key
+certificate's SHA-256), comma-separated: Play re-signs what it installs. The server then serves `/.well-known/assetlinks.json`.
+
 **Things Google's review might flag:** Hearth's Android app lets people trust a self-signed server certificate
 after showing its fingerprint. Google Play's automated checks sometimes flag apps that can accept certificate
 errors. If that happens, servers with a real domain (Caddy) don't need that feature, and it can be left out of
-the Play build.
+the Play build. Play also asks every app with a foreground service to say what it's for: Hearth's `CallService`
+(type `microphone`) keeps a call going while the screen is off; it runs only during a call the person joined.
 
 ---
 
 ## Where each secret and variable goes
 
-All in GitHub: your repository → *Settings → Secrets and variables → Actions*.
+All in GitHub: your repository → *Settings → Secrets and variables → Actions*, except the secrets that only sign or
+publish releases (`UPDATE_SIGNING_KEY`, `PLAY_SERVICE_ACCOUNT_JSON` and the `VPS_*` ones): put those in the
+**`production` environment** (*Settings → Environments → production → Environment secrets*; create it if the
+workflow hasn't yet). Only the jobs that sign update files or publish releases (`sign-updates`, `play-upload`,
+`release`, `publish-to-vps`) run there, only for `app-v*` tags and the default branch, and none of them installs
+npm packages or runs the build. Give the environment protection rules: **deployment branches and tags** limited to
+the default branch and `app-v*` (add `desktop-v*` if you use `hearth/.github/workflows/desktop.yml` in a
+repository of its own), and **required reviewers** (you) if you want to approve each release build: each of those
+jobs then waits for you on every tag and every default-branch push that changes the apps, even one with nothing to
+do (`play-upload` without a Play account, `publish-to-vps` without the `VPS_*` secrets).
+
+**Then delete the repository secrets with the same names** (*Settings → Secrets and variables → Actions*, the
+*Repository secrets* list), if you made them before. Jobs in the environment use its copy either way, so leaving
+them changes nothing you'd notice, but a repository secret can be read by any job on any branch: anyone who can push
+a branch could add a workflow that reads `VPS_SSH_KEY`, and the environment's rules would protect nothing.
+
+Environments and their secrets need a **public repository**, or a paid GitHub plan for a private one. On GitHub
+Free, a private repository's jobs don't get the environment's secrets: update signing then fails and the server
+copy copies nothing. Keep these as repository secrets in that case, knowing every branch's workflows can read them.
 
 | Name | Kind | For |
 |---|---|---|
@@ -389,11 +547,12 @@ All in GitHub: your repository → *Settings → Secrets and variables → Actio
 | `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` (+ optional `SIGNPATH_POLICY_SLUG`, `SIGNPATH_ARTIFACT_CONFIG_SLUG`, `SIGNPATH_PUBLISHER`) | Variable | Windows, option S |
 | `WINDOWS_REQUIRE_SIGNING` | Variable | `true` = fail instead of building unsigned |
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | Secret | Android signing key, Play bundle |
-| `PLAY_SERVICE_ACCOUNT_JSON` | Secret | upload to Play internal testing |
+| `PLAY_SERVICE_ACCOUNT_JSON` | Secret (`production` environment) | upload to Play internal testing |
 | `PLAY_RELEASE_STATUS` | Variable (optional) | `draft` while the Play app is still a draft |
-| `UPDATE_SIGNING_KEY` | Secret | Signs desktop updates; apps built with it only install updates you signed |
-| `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DOWNLOADS_DIR` | Secret | Copy release installers and update files to your server's `data/downloads` (use a user that can only write that folder, not root) |
-| `VPS_HOST_FINGERPRINT` | Secret | **Required with `VPS_HOST`:** the server's SSH host key fingerprint (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server, the `SHA256:…` part). Without it the copy fails and copies nothing |
+| `UPDATE_SIGNING_KEY` | Secret (`production` environment) | Signs desktop updates |
+| `UPDATE_PUBLIC_KEY` | Variable | Its public half, built into the apps: they only install updates signed with `UPDATE_SIGNING_KEY` |
+| `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DOWNLOADS_DIR` | Secret (`production` environment) | Copy release installers and update files to your server's `data/downloads` (use a user that can only write that folder, not root) |
+| `VPS_HOST_FINGERPRINT` | Secret (`production` environment) | **Required with `VPS_HOST`:** the server's SSH host key fingerprint (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server, the `SHA256:…` part). Without it the copy fails and copies nothing |
 
 Forks and Dependabot runs don't get your secrets; their builds are simply unsigned.
 

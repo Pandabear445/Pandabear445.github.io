@@ -8,7 +8,10 @@
 #   SHA256:... part), so the copy refuses any other machine.
 #   Security: read-only token except for the release job, actions pinned to exact commits, the exact library
 #   versions from package-lock.json, and the server copy uses the runner's own ssh/scp (no third-party code
-#   ever handles VPS_SSH_KEY).
+#   ever handles VPS_SSH_KEY). The release and server-copy jobs run in the GitHub environment "production": put
+#   the VPS_* secrets there (Settings > Environments), delete the repository secrets of the same names, and add its
+#   protection rules: deployment branches and tags limited to the default branch and desktop-v* tags (this
+#   workflow releases from desktop-v* tags; add app-v* too if hearth-apps.yml shares the environment).
 name: Desktop app
 
 on:
@@ -72,6 +75,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/desktop-v')
     runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: write # the only job that writes: it creates the GitHub release
     steps:
@@ -87,8 +91,9 @@ jobs:
   # Installers reach everyone's apps from there: tags and the default branch only.
   publish-to-vps:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/desktop-v') || github.ref_name == github.event.repository.default_branch
+    if: startsWith(github.ref, 'refs/tags/desktop-v') || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    environment: production
     env:
       HAS_VPS: ${{ secrets.VPS_HOST != '' }}
     steps:

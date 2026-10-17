@@ -8,7 +8,7 @@
 //            attachment rows.
 //   --out    also write the results as JSON to this file.
 //   --root   measure another Hearth checkout (an older release, say) with this script and the same dataset.
-//   --only   run only some sections: bootstrap, members, history, search, perms, fanout, roles, joinleave,
+//   --only   run only some sections: bootstrap, members, history, threads, search, perms, fanout, roles, joinleave,
 //            slowmode, admin, startup, migration (memory is always reported).
 //   --plans  print EXPLAIN QUERY PLAN for the hot statements.
 //   --keep   keep the temporary data folder (its path is printed).
@@ -286,6 +286,29 @@ function seed() {
     im.run(troot, tch, users[2].id, cipher, null, null, now - 3600000 - 1);
     S.threadRoot = troot; S.threadChannel = tch; S.threadReplies = sc(20000, 200);
     for (let i = 0; i < S.threadReplies; i++) { const at = now - 3600000 + Math.floor((i * 3600000) / S.threadReplies); im.run(idAt(at), tch, users[pick(S.big.members.slice(2, 50))].id, cipher, null, troot, at); }
+    // A channel with many threads (the Threads panel): one started every few minutes over the last 30 days, 1 to 4
+    // replies each, and some of the replies ping the heavy user (thread pings in /me/unread).
+    const mch = S.big.channels[4];
+    S.manyThreadsChannel = mch; S.manyThreads = sc(5000, 100);
+    const threadPings = d.prepare("SELECT 1 FROM pragma_table_info('mention_marks') WHERE name = 'thread_id'").get()
+      ? d.prepare('INSERT OR IGNORE INTO mention_marks (message_id, conv, user_id, thread_id) VALUES (?, ?, ?, ?)') : null;
+    const month = 30 * 86400000;
+    for (let i = 0; i < S.manyThreads; i++) {
+      const at = now - month - 3600000 + Math.floor((i * month) / S.manyThreads);
+      const root = idAt(at);
+      im.run(root, mch, users[pick(S.big.members.slice(2, 200))].id, cipher, null, null, at);
+      for (let k = 0, n = 1 + Math.floor(rand() * 4); k < n; k++) {
+        const rat = Math.min(now - 3600000, at + 1 + Math.floor(rand() * 2 * 86400000));
+        const rid = idAt(rat);
+        im.run(rid, mch, users[pick(S.big.members.slice(2, 200))].id, cipher, null, root, rat);
+        if (threadPings && rand() < 0.05) threadPings.run(rid, 'ct:' + mch, users[S.heavy].id, root);
+      }
+    }
+    // Replies are written straight into the table here, so their threads' latest replies too (thread_activity: the
+    // server keeps it as replies are posted). Not in older checkouts measured with --root.
+    if (d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_activity'").get()) {
+      d.prepare('INSERT OR REPLACE INTO thread_activity (root_id, channel_id, last_reply_id) SELECT thread_id, channel_id, MAX(id) FROM messages WHERE thread_id IS NOT NULL GROUP BY thread_id').run();
+    }
     // 20 pinned messages spread over #general's history.
     const pin = d.prepare('UPDATE messages SET pinned_at = ?, pinned_by = ? WHERE id = ?');
     S.depthIds.filter((_, i) => i % Math.max(1, Math.floor(S.depthIds.length / 20)) === 0).slice(0, 20).forEach((id, i) => pin.run(now - i * 1000, users[0].id, id));
@@ -367,6 +390,15 @@ function plans() {
     ['perms.forServer: all members\' roles', `SELECT mr.user_id, mr.role_id FROM member_roles mr JOIN members m ON m.server_id = mr.server_id AND m.user_id = mr.user_id
           WHERE mr.server_id = ?`, [big]],
     ['socket connect: my servers', 'SELECT server_id FROM members WHERE user_id = ?', [u]],
+    ['threads list: latest reply first', 'SELECT root_id, last_reply_id FROM thread_activity WHERE channel_id = ? AND last_reply_id < ? ORDER BY last_reply_id DESC LIMIT ?', [S.manyThreadsChannel, 'z', 26]],
+    ['thread: unread replies', 'SELECT COUNT(*) AS n FROM (SELECT 1 FROM messages WHERE thread_id = ? AND id > ? AND author_id != ? LIMIT 100)', [S.threadRoot, '0', u]],
+    ['thread: pings', "SELECT COUNT(*) AS n FROM (SELECT 1 FROM mention_marks WHERE thread_id = ? AND (user_id = ? OR (user_id = '*' AND ? = 1)) AND message_id > ? LIMIT 100)", [S.threadRoot, u, 1, '0']],
+    ['thread pings in a channel (badge)', `SELECT COUNT(*) AS n FROM (SELECT 1 FROM (
+        SELECT message_id, thread_id FROM mention_marks WHERE conv = ? AND user_id = ? AND message_id > ?
+        UNION ALL SELECT message_id, thread_id FROM mention_marks WHERE conv = ? AND user_id = '*' AND ? = 1 AND message_id > ?
+        ORDER BY message_id DESC LIMIT 500) mm
+      WHERE mm.message_id > COALESCE((SELECT last_read_id FROM read_states WHERE user_id = ? AND conv = 't:' || mm.thread_id), '') LIMIT 100)`,
+    ['ct:' + S.manyThreadsChannel, u, '0', 'ct:' + S.manyThreadsChannel, 1, '0', u]],
     ['search (all): my text channels', `SELECT c.* FROM channels c JOIN members m ON m.server_id = c.server_id WHERE m.user_id = ? AND c.type = 'text'`, [u]],
   ];
   try {
@@ -547,6 +579,30 @@ async function sendAndWait(channelId, sender, count) {
       const pins = [];
       for (let i = 0; i < 30; i++) pins.push((await timed('GET', `/channels/${ch}/pins`, asNext())).ms);
       record(`pinned messages of #general (20 pins, ${dataset.bigGeneralMessages} messages)`, pins);
+    }
+    if (want('threads')) {
+      console.log('\nThreads');
+      const ok = (await call('GET', `/channels/${S.manyThreadsChannel}/threads`, asNext())).status === 200;
+      if (!ok) console.log('  (this checkout has no Threads panel)');
+      else {
+        const first = [];
+        for (let i = 0; i < 30; i++) first.push((await timed('GET', `/channels/${S.manyThreadsChannel}/threads`, asNext())).ms);
+        record(`Threads panel: first page (25) of a channel with ${S.manyThreads} threads`, first);
+        const pages = [];
+        let next = null;
+        for (let i = 0; i < 20; i++) {
+          const { ms, r } = await timed('GET', `/channels/${S.manyThreadsChannel}/threads${next ? `?before=${next}` : ''}`, { token: heavy.token, ip: heavy.ip });
+          pages.push(ms); next = r.json.next;
+          if (!r.json.hasMore) break;
+        }
+        record('Threads panel: paging back 25 at a time (20 pages in a row)', pages);
+        const busy = [];
+        for (let i = 0; i < 30; i++) busy.push((await timed('GET', `/channels/${S.threadChannel}/threads`, asNext())).ms);
+        record(`Threads panel of the channel with the ${S.threadReplies}-reply thread`, busy);
+      }
+      const unread = [];
+      for (let i = 0; i < 20; i++) unread.push((await timed('GET', '/me/unread', { token: heavy.token, ip: heavy.ip })).ms);
+      record(`/api/me/unread, heavy user (${N.servers} servers, ${N.servers * TEXT_CHANNELS} channels)`, unread);
     }
     if (want('admin')) {
       console.log('\nAdmin');

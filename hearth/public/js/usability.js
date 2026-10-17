@@ -40,6 +40,39 @@ export const clearAllDrafts = () => {
   try { Object.keys(localStorage).filter((k) => k.startsWith('hearth.drafts.')).forEach((k) => localStorage.removeItem(k)); } catch { /* ignore */ }
 };
 
+// ---------------------------------------------------------------- inbox and reminders (this device only)
+// The inbox (hearth.inbox.<account>: mentions, replies and fired reminders) and reminders (hearth.reminders.<account>)
+// keep a copy of a message's words in this browser, with exp when the message disappears. The signed-in app drops
+// those as their time comes, but only for its own account while it runs. So signing out (or deleting the account)
+// removes every account's from this browser, like drafts: the next person here doesn't get them, and no deadline is
+// left that nobody would keep. And each time Hearth opens, any copy past its deadline goes, whoever it belongs to.
+const COPIES = ['hearth.inbox.', 'hearth.reminders.'];
+function copyKeys() {
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && COPIES.some((p) => k.startsWith(p))) out.push(k); }
+  } catch { /* storage off */ }
+  return out;
+}
+export function clearLocalCopies() {
+  for (const k of copyKeys()) { try { localStorage.removeItem(k); } catch { /* ignore */ } }
+}
+// now: this device's clock (no server time before signing in). Returns how many copies went.
+export function expireLocalCopies(now = Date.now()) {
+  let dropped = 0;
+  for (const k of copyKeys()) {
+    try {
+      const list = JSON.parse(localStorage.getItem(k) || '[]');
+      if (!Array.isArray(list)) { localStorage.removeItem(k); continue; }
+      const keep = list.filter((x) => !(x && Number(x.exp) > 0 && Number(x.exp) <= now));
+      if (keep.length === list.length) continue;
+      dropped += list.length - keep.length;
+      if (keep.length) localStorage.setItem(k, JSON.stringify(keep)); else localStorage.removeItem(k);
+    } catch { try { localStorage.removeItem(k); } catch { /* ignore */ } }
+  }
+  return dropped;
+}
+
 // ---------------------------------------------------------------- one notification per message
 // With Hearth open in several tabs, each gets every message. Only the first to claim a message shows its
 // notification and plays its sound. A Web Lock makes the claim atomic between tabs; a short list in
@@ -61,10 +94,27 @@ export async function claimOnce(id) {
 }
 // Read somewhere else (another tab or device): close what's still on screen for that conversation.
 const shown = new Map(); // tag -> Notification shown by this tab
-export function rememberNotification(tag, n) { if (tag && n) { shown.set(tag, n); n.addEventListener('close', () => { if (shown.get(tag) === n) shown.delete(tag); }); } }
+const shownFor = new Map(); // tag -> the message it shows (a disappearing one closes it when it goes)
+export function rememberNotification(tag, n, msgId = null) {
+  if (!tag || !n) return;
+  shown.set(tag, n);
+  if (msgId) shownFor.set(tag, msgId); else shownFor.delete(tag);
+  n.addEventListener('close', () => { if (shown.get(tag) === n) { shown.delete(tag); shownFor.delete(tag); } });
+}
+// Messages that disappeared: a notification still showing one of them (with its text) goes too.
+export function closeNotificationFor(ids) {
+  const gone = new Set(ids);
+  for (const [tag, id] of [...shownFor]) if (gone.has(id)) { shownFor.delete(tag); closeNotifications(tag); }
+}
+// The Android app's own notifications, including ones it posted while closed (set by app.js; this file has no
+// imports so it stays testable in Node). closeNotifications closes those too, for a read conversation and for a
+// disappearing message that went.
+let closeElsewhere = null;
+export function alsoCloseNotifications(fn) { closeElsewhere = typeof fn === 'function' ? fn : null; }
 export function closeNotifications(tag) {
   const n = shown.get(tag);
   if (n) { try { n.close(); } catch { /* gone */ } shown.delete(tag); }
+  if (closeElsewhere) { try { closeElsewhere(tag); } catch { /* app closing */ } }
   if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
     navigator.serviceWorker.ready.then((reg) => reg.getNotifications({ tag })).then((list) => list.forEach((x) => x.close())).catch(() => {});
   }
@@ -165,7 +215,8 @@ What's inside
                        reports you filed.
 - conversations/       One JSON file per channel, group chat or direct message you can read right now, with
                        every message the app could decrypt: who sent it, when, the text, replies, threads,
-                       reactions, polls and attachment details. Messages it couldn't decrypt are listed as such.
+                       reactions, polls, link previews and attachment details. Messages it couldn't decrypt
+                       are listed as such.
 - attachments/         The files attached to those messages, decrypted, up to the size limit below.
 - manifest.json        What was exported, what was skipped and why.
 
@@ -193,6 +244,8 @@ export async function runExport(ctx) {
   onProgress('Getting your account details…', 0);
   const account = await get('/me/export/account');
   zip.add('account.json', JSON.stringify(account, null, 2));
+  // Your word filter, as this device decrypted it (the server only has it sealed).
+  if (ctx.wordFilter) zip.add('word-filter.json', JSON.stringify(ctx.wordFilter, null, 2));
   const people = new Map();
   const nameOf = (id) => { const u = S.users[id]; return u ? { id, username: u.username, displayName: (u.profile && u.profile.displayName) || u.username } : { id }; };
   const convs = [];
@@ -222,6 +275,8 @@ export async function runExport(ctx) {
         if (m.legacy) { rec.text = m.content || ''; rec.note = 'sent before end-to-end encryption'; } else if (ok) {
           rec.text = m.dec.t || '';
           if (m.dec.p) rec.poll = { question: m.dec.p.q, options: m.dec.p.o };
+          const lp = m.dec.l && m.dec.l[0];
+          if (lp) rec.link = { url: lp.url, title: lp.title, description: lp.desc, site: lp.site }; // the preview's words, not its picture
           rec.attachments = [];
           for (const f of m.dec.f || []) {
             const a = { name: f.name || 'file', type: f.type || '', size: f.size || 0 };

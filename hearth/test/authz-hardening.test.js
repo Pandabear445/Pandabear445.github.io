@@ -600,7 +600,10 @@ test('authz-14: deleting or handing over a server needs the password (and two-fa
   const t = await as(owner, 'POST', `/servers/${s1.id}/transfer`, { userId: heir.id, authKey: owner.authKey, backupCode: tf.backupCodes[0] });
   assert.equal(t.status, 200, t.text);
   assert.equal(srv.sql('SELECT owner_id FROM servers WHERE id = ?', s1.id)[0].owner_id, heir.id);
-  assert.equal((await as(owner, 'DELETE', `/servers/${s2.id}`, { authKey: owner.authKey })).status, 200, 'two-factor was just used: the password is enough for a few minutes');
+  // Two-factor was just used, but deleting a server can't be undone: it takes a fresh code every time (auth-6).
+  const again = await as(owner, 'DELETE', `/servers/${s2.id}`, { authKey: owner.authKey });
+  assert.deepEqual([again.status, again.json.code], [401, 'need_2fa'], 'no 10-minute shortcut');
+  assert.equal((await as(owner, 'DELETE', `/servers/${s2.id}`, { authKey: owner.authKey, backupCode: tf.backupCodes[1] })).status, 200);
   assert.equal(srv.sql('SELECT COUNT(*) n FROM servers WHERE id = ?', s2.id)[0].n, 0);
   const logged = srv.sql("SELECT action FROM admin_log WHERE target IN (?, ?) ORDER BY id", s1.id, s2.id).map((r) => r.action);
   assert.deepEqual(logged, ['server_transferred', 'server_deleted']);

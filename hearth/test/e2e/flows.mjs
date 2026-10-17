@@ -1,7 +1,8 @@
 // The end-to-end flows, in order: each one builds on what the earlier ones set up (accounts, the server, roles…).
 // Everything goes through the real UI; the only shortcuts are reading state the UI already shows.
 import fs from 'node:fs';
-import { exact, makePng, totp } from './harness.mjs';
+import crypto from 'node:crypto';
+import { exact, makePng, totp, newPassword, Person } from './harness.mjs';
 
 export function check(ok, message) { if (!ok) throw new Error(message); }
 const SERVER = 'E2E Hall';
@@ -38,17 +39,84 @@ async function accounts(t) {
 }
 
 // ------------------------------------------------------------------ 2. a server, an invite, a second member
+// Creating the server opens "Invite your people" with the link and a message to copy (no Share button without a share
+// sheet); alone in it, #general says "It's just you here" until bob joins. A signed-out visitor with the link sees
+// what it's for on the sign-in screen: "a server" until alice lets invite previews show the server's name.
+const lastCopy = (p) => p.page.evaluate(() => (window.__copied || []).at(-1) || '');
+// What the app copies is kept in the page instead of the system clipboard (the same in every browser).
+const catchCopies = (p) => p.page.evaluate(() => { window.__copied = []; navigator.clipboard.writeText = async (x) => { window.__copied.push(String(x)); }; });
 async function servers(t) {
   const { alice, bob } = t.people;
-  await alice.createServer(SERVER);
+  await catchCopies(alice);
+  await alice.page.evaluate(() => { delete Navigator.prototype.share; });
+  const welcome = await alice.createServer(SERVER, { keepInvite: true });
+  const link = await welcome.locator('input[aria-label="Invite link"]').inputValue();
+  check(!(await welcome.locator('.invite-share').count()), 'Without a share sheet the invite dialog should have no Share button.');
+  await welcome.locator('.invite-copy-msg').click();
+  await alice.toast('Invite message copied.');
+  const msg = await lastCopy(alice);
+  check(msg.includes(link) && msg.includes(SERVER) && /end-to-end encrypted/.test(msg), `The copied invite message should carry the link and the server’s name (got “${msg}”).`);
+  await welcome.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  await alice.noModals();
   await alice.channelRow('general').waitFor();
   await alice.channelRow('Lounge').waitFor();
+  // Alone in it: the card at the top of #general opens the invite dialog. With a share sheet (as on phones), Share
+  // hands it the link.
+  const nudge = alice.$('#messages .invite-nudge', { hasText: 'It’s just you here.' });
+  await nudge.waitFor();
+  await alice.page.evaluate(() => { window.__shared = null; Navigator.prototype.share = async function share(d) { window.__shared = d; }; });
+  await nudge.locator('button', { hasText: 'Invite people' }).click();
+  const inv = await alice.dialog(`Invite people to ${SERVER}`);
+  await inv.locator('.invite-share:not([disabled])').click();
+  const shared = await (await alice.page.waitForFunction(() => window.__shared)).jsonValue();
+  check(shared.url === link && shared.title === SERVER && !shared.text.includes('http'), `Share should hand the link to the share sheet (got ${JSON.stringify(shared)}).`);
+  await alice.page.evaluate(() => { delete Navigator.prototype.share; });
+  await inv.locator('.modal-x').click();
+  await alice.noModals();
   t.state.invite = await alice.inviteLink();
+  check(t.state.invite === link, 'Reopening the invite dialog should hand back the same link.');
+
+  // Signed out, with the link: the sign-in screen says what it's for, without the server's name for now.
+  const visitor = await t.open('visitor');
+  await visitor.page.goto(link);
+  await visitor.$('#login-form').waitFor();
+  const banner = visitor.$('#auth-invite');
+  await banner.filter({ hasText: 'You’re invited to a server on' }).waitFor();
+  check(!(await banner.innerText()).includes(SERVER), 'The banner should not name a server that didn’t opt in.');
+  const card = async () => (await fetch(link)).text();
+  check(!(await card()).includes(SERVER), 'The invite page should not name a server that didn’t opt in.');
+
   await bob.join(t.state.invite, SERVER);
   await alice.showMembers();
   await alice.member('bob').waitFor();
   await bob.showMembers();
   await bob.member('alice').waitFor();
+  // Someone joined: the card goes by itself.
+  await alice.$('#messages .invite-nudge').waitFor({ state: 'detached' });
+
+  // Alice lets invite previews show the server's name (in the audit log); the visitor's banner and the page a preview
+  // bot reads now name it, with the member count.
+  const setting = 'Show this server’s name and member count in invite link previews';
+  await alice.serverMenu('Server settings');
+  const ss = alice.page.locator('.modal.server-settings');
+  const row = ss.locator('.toggle-row', { hasText: setting });
+  check(!(await row.locator('input[type=checkbox]').isChecked()), 'Invite previews should be off to start with.');
+  await row.locator('.switch').click();
+  await alice.toast('Invite link previews now show this server’s name.');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: `alice turned on “${setting}”` }).waitFor();
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+  await visitor.page.goto(link);
+  await visitor.$('#auth-invite strong', { hasText: exact(SERVER) }).waitFor();
+  const html = await card();
+  check(html.includes(`<meta property="og:title" content="Join ${SERVER} on `) && html.includes('2 members') && html.includes('<meta name="robots" content="noindex">'),
+    'Once it opted in, the invite page should name the server and its member count, and stay out of search engines.');
+  // "Create an account" in the banner goes to the sign-up form.
+  await banner.locator('.auth-invite-new').click();
+  await visitor.$('#register-form:not([hidden])').waitFor();
+  await visitor.close();
+  delete t.people.visitor;
 }
 
 // ------------------------------------------------------------------ 3. channel messages
@@ -117,6 +185,75 @@ async function messages(t) {
   await onBobPoll.locator('.poll-opt', { hasText: 'Salad' }).click();
   await alice.$('#messages .poll', { hasText: 'Lunch today?' }).locator('.poll-foot', { hasText: '1 vote' }).waitFor();
   await alice.$('#messages .poll', { hasText: 'Lunch today?' }).locator('.poll-opt', { hasText: 'Salad' }).locator('.poll-count', { hasText: '1 · 100%' }).waitFor();
+}
+
+// ------------------------------------------------------------------ 3b. a channel webhook (what Uptime Kuma posts)
+async function webhooks(t) {
+  const { alice, bob } = t.people;
+  await alice.channelRow('general').click({ button: 'right' });
+  await alice.menuItem('Webhooks').click();
+  const settings = await alice.dialog('general — settings');
+  // The tab saves as it goes, so the dialog's Save is hidden, and Enter in the name field makes the webhook only
+  // (it once also pressed the dialog's Save, closing it and saving the other tabs).
+  check(!(await settings.locator('.modal-foot .btn.primary', { hasText: 'Save' }).isVisible()), 'Save should be hidden on the Webhooks tab.');
+  const channelSaves = [];
+  const watch = (r) => { if (/\/api\/channels\/[^/]+(\/overrides)?$/.test(r.url()) && ['PATCH', 'PUT'].includes(r.method())) channelSaves.push(r.url()); };
+  alice.page.on('request', watch);
+  await settings.locator('input[aria-label="New webhook name"]').fill('Uptime Kuma');
+  await settings.locator('input[aria-label="New webhook name"]').press('Enter');
+  const shown = await alice.dialog('Webhook “Uptime Kuma” made');
+  const url = await shown.locator('input[aria-label="Webhook address"]').inputValue();
+  check(url.startsWith(`${t.server.base}/api/webhooks/`), `The webhook address should be on this server (got ${url}).`);
+  t.state.hookUrl = url; // the threads flow posts through it again
+  await shown.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  await settings.locator('.hook-row', { hasText: 'Uptime Kuma' }).waitFor();
+  alice.page.off('request', watch);
+  check(!channelSaves.length, `Enter in the webhook name field shouldn’t save the channel (sent ${channelSaves.join(', ')}).`);
+  await settings.locator('.modal-x').click();
+  await alice.noModals();
+  // The program's side: a Discord-style post, no session.
+  const post = (body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await post({ username: 'Uptime Kuma', embeds: [{ title: 'Your service My API went down.', color: 16711680, fields: [{ name: 'Error', value: 'timeout of 48000ms exceeded' }] }] });
+  check(r.status === 204, `Posting to the webhook should answer 204 (got ${r.status}).`);
+  const msg = bob.message('Your service My API went down.');
+  await msg.locator('.msg-flag', { hasText: 'Webhook · not end-to-end encrypted' }).waitFor();
+  await msg.locator('.msg-name', { hasText: 'Uptime Kuma' }).waitFor();
+  await msg.locator('.bot-tag').waitFor();
+  // Its @everyone doesn't ping anyone (webhooks may only when allowed).
+  check((await post({ content: '@everyone the deploy finished' })).status === 204, 'The second post should be accepted.');
+  const ping = bob.message('the deploy finished');
+  await ping.waitFor();
+  check(!(await ping.evaluate((el) => el.classList.contains('mentioned'))), 'A webhook’s @everyone should not ping (it wasn’t allowed to).');
+  // A post's own picture (Grafana sends avatar_url) loads through this server's avatar proxy, by the link the server
+  // signed for that picture (files-10): only for a known avatar host or one the admin listed (here the stand-in
+  // site, in WEBHOOK_AVATAR_HOSTS). The app only adds its media token, and the proxy fetches the picture.
+  const pic = `${t.server.site.base}/cover.png`;
+  check((await post({ content: 'Grafana alert firing', username: 'Grafana', avatar_url: pic })).status === 204, 'The post with a picture should be accepted.');
+  const graf = bob.message('Grafana alert firing').first();
+  await graf.locator('.msg-av img').waitFor();
+  const src = await graf.locator('.msg-av img').getAttribute('src');
+  check(/^\/media\/avatar\/[0-9a-f]{12}\?u=[^&]+&e=\d+&s=[\w-]{32}&t=[^&]+$/.test(src || ''), `The avatar should load through a signed proxy link (got ${src}).`);
+  check(decodeURIComponent(/[?&]u=([^&]+)/.exec(src)[1]) === pic, 'The signed link should name the picture the post asked for.');
+  const status = await bob.page.evaluate(async (s) => (await fetch(s)).status, src);
+  check(status === 200, `The avatar proxy should load the picture (got ${status}).`);
+  check(await graf.locator('.msg-av img').evaluate((img) => img.complete && img.naturalWidth > 0), 'The avatar picture should show.');
+  const forged = await bob.page.evaluate(async (s) => (await fetch(s.replace(/([?&]u=)[^&]+/, `$1${encodeURIComponent('https://example.com/x.png')}`))).status, src);
+  check(forged === 403, `The same signature for another address should be refused (got ${forged}).`);
+  // An avatar on any other host isn't signed: the post shows the webhook's own picture, which the server never fetches.
+  const elsewhere = `https://pictures.example.test/${'x'.repeat(8)}.png`;
+  check((await post({ content: 'Avatar from elsewhere', username: 'Elsewhere', avatar_url: elsewhere })).status === 204, 'The post with another host\u2019s picture should be accepted.');
+  await bob.message('Avatar from elsewhere').first().waitFor();
+  const loaded = await bob.page.evaluate(() => [...document.images].map((i) => i.getAttribute('src') || '').filter((x) => x.includes('pictures.example.test')));
+  check(!loaded.length, `A picture on another host should not be loaded (got ${loaded.join(', ')}).`);
+  // Alice (the owner) deletes that post, so later flows don't keep loading its picture.
+  const own = alice.message('Grafana alert firing').first();
+  await own.hover();
+  await own.locator('button[aria-label="More actions"]').click();
+  await alice.menuItem('Delete message').click();
+  await alice.modal('Delete message?').locator('.modal-foot .btn.danger').click();
+  await bob.message('Grafana alert firing').first().waitFor({ state: 'detached' });
+  // The stand-in site is shared with the link-preview flow, which counts every request it gets: forget these.
+  t.server.site.hits.splice(0);
 }
 
 // ------------------------------------------------------------------ 4. direct messages and blocking
@@ -385,6 +522,122 @@ async function roles(t) {
   await alice.channelRow('bob-made').waitFor();
 }
 
+// ------------------------------------------------------------------ 9. roles members pick themselves
+// Alice marks a role "Members can pick this role themselves" (the editor won't while it has a moderator power) and
+// lets it into a private channel; bob picks it from the server menu and the channel opens for him, then drops it
+// from the start of a channel and the channel goes again.
+async function selfRoles(t) {
+  const { alice, bob } = t.people;
+  // Nothing to pick yet: the start of bob's channel doesn't offer it.
+  await bob.openChannel('bob-made');
+  const welcomeBtn = () => bob.$('#messages .welcome button', { hasText: 'Pick your roles' });
+  check(!(await welcomeBtn().count()), 'Nothing to pick yet, so the channel start should not offer it.');
+  await alice.serverMenu('Roles');
+  const ss = alice.page.locator('.modal.server-settings');
+  await ss.locator('button', { hasText: 'Create role' }).click();
+  await ss.locator('.role-editor-head', { hasText: 'new role' }).waitFor();
+  await ss.locator('.role-editor .field', { hasText: 'Role name' }).locator('input').fill('game-night');
+  const selfRow = () => ss.locator('.role-editor .toggle-row', { hasText: 'Members can pick this role themselves' });
+  const permRow = (name) => ss.locator('.perm-groups .toggle-row').filter({ has: alice.page.locator('.toggle-label', { hasText: exact(name) }) });
+  // It sits above Keepers, but Keepers only manages channels, which doesn't reach anyone: it can be offered.
+  await selfRow().locator('.field-hint', { hasText: 'Pick your roles' }).waitFor();
+  // Ticking a moderator power turns the option off, and says why.
+  await permRow('Kick members').locator('.switch').click();
+  await selfRow().locator('.field-hint', { hasText: 'moderator powers' }).waitFor();
+  check(await selfRow().locator('input').isDisabled(), 'A role with Kick members should not be offered to members.');
+  await permRow('Kick members').locator('.switch').click();
+  await selfRow().locator('.field-hint', { hasText: 'Pick your roles' }).waitFor();
+  await selfRow().locator('.switch').click();
+  await ss.locator('.role-actions .btn.primary', { hasText: 'Save changes' }).click();
+  await alice.toast('Role saved.');
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+  // Bob's open channel offers it as soon as it's marked.
+  await welcomeBtn().waitFor();
+  // #game-night: only the role sees it.
+  await alice.serverMenu('Create channel');
+  const cc = await alice.dialog('Create channel');
+  await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('game-night');
+  await cc.locator('.modal-foot .btn.primary').click();
+  await alice.page.waitForSelector('#composer-input[placeholder="Message #game-night"]');
+  await alice.channelRow('game-night').locator('.ch-main').click({ button: 'right' });
+  await alice.menuItem('Make private').click();
+  const perms = await alice.dialog('game-night');
+  const add = perms.locator('select[aria-label="Add a role or member"]');
+  await add.selectOption(await add.locator('option', { hasText: 'game-night' }).getAttribute('value'));
+  await perms.locator('.ov-perms .ov-row', { hasText: 'View channels' }).locator('.tri-btn.allow').click();
+  await perms.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await alice.toast('Channel saved.');
+  await alice.noModals();
+  await alice.send('Board games on Friday: plum');
+  await bob.channelRow('game-night').waitFor({ state: 'detached' });
+
+  await bob.serverMenu('Pick your roles');
+  let picker = await bob.dialog('Pick your roles');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await bob.channelRow('game-night').waitFor();
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:checked').waitFor();
+  await picker.locator('.modal-x').click();
+  await bob.noModals();
+  await bob.openChannel('game-night');
+  await bob.message('Board games on Friday: plum').waitFor();
+  check(!(await bob.$('#messages .msg-text.undecryptable').count()), 'Bob should read #game-night with the server key he already has.');
+  // The start of a channel offers the same window.
+  await bob.$('#messages .welcome button', { hasText: 'Pick your roles' }).click();
+  picker = await bob.dialog('Pick your roles');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await bob.channelRow('game-night').waitFor({ state: 'detached' });
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:not(:checked)').waitFor();
+  await picker.locator('.modal-x').click();
+  await bob.noModals();
+}
+
+// ------------------------------------------------------------------ 9b. a weekly event
+async function events(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await alice.$('#sidebar-body .ev-row').click();
+  const list = await alice.dialog(`Events in ${SERVER}`);
+  await list.locator('button', { hasText: 'Plan an event' }).click();
+  const ed = await alice.dialog('Plan an event');
+  await ed.locator('.field', { hasText: 'Name' }).locator('input').fill('Board game night');
+  await ed.locator('.field', { hasText: 'Repeats' }).locator('select').selectOption('weekly');
+  // The editor says what that means: same weekday and time, on this person's clock, which everyone can see.
+  await ed.locator('.field-hint', { hasText: /^Every \w+day at .* time, also after the clocks change\. Everyone in the server sees this time zone/ }).waitFor();
+  await ed.locator('.field', { hasText: 'Ends' }).locator('select').selectOption('count');
+  await ed.locator('.field', { hasText: 'How many times' }).locator('input').fill('6');
+  await ed.locator('.modal-foot .btn.primary', { hasText: 'Create event' }).click();
+  await alice.toast('Event created.');
+  await list.locator('.ev-card', { hasText: 'Board game night' }).locator('.ev-repeat', { hasText: 'Every week · 6 times left' }).waitFor();
+  await list.locator('.modal-x').click();
+  await alice.noModals();
+  // Bob's sidebar shows it live, with how often it happens; he says he's going.
+  const row = bob.$('#sidebar-body .ev-row', { hasText: 'Board game night' });
+  await row.locator('small', { hasText: 'every week' }).waitFor();
+  await row.click();
+  const bl = await bob.dialog(`Events in ${SERVER}`);
+  const card = bl.locator('.ev-card', { hasText: 'Board game night' });
+  await card.locator('.chip', { hasText: exact('Going') }).click();
+  await card.locator('.ev-count', { hasText: '2 going' }).waitFor();
+  await bl.locator('.modal-x').click();
+  await bob.noModals();
+  // Alice stops it repeating (edits apply to this time and every later one); bob's copy updates.
+  await alice.$('#sidebar-body .ev-row').click();
+  const al = await alice.dialog(`Events in ${SERVER}`);
+  await al.locator('.ev-card', { hasText: 'Board game night' }).locator('button[aria-label="More"]').click();
+  await alice.menuItem('Edit').click();
+  const edit = await alice.dialog('Edit repeating event');
+  await edit.locator('.field', { hasText: 'Repeats' }).locator('select').selectOption('none');
+  await edit.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await alice.toast('Event updated.');
+  await al.locator('.ev-card', { hasText: 'Board game night' }).locator('.ev-repeat').waitFor({ state: 'detached' });
+  check(await al.locator('.ev-card', { hasText: 'Board game night' }).locator('.ev-count', { hasText: '2 going' }).count() === 1, 'Editing should keep the answers people gave.');
+  await al.locator('.modal-x').click();
+  await alice.noModals();
+  await bob.$('#sidebar-body .ev-row', { hasText: 'Board game night' }).locator('small', { hasText: 'every week' }).waitFor({ state: 'detached' });
+}
+
 // ------------------------------------------------------------------ 10 + 11. a voice call, and watching together in it
 async function voiceCall(t) {
   const { alice, bob } = t.people;
@@ -400,6 +653,45 @@ async function voiceCall(t) {
   }
 }
 
+// ------------------------------------------------------------------ moderator toolkit: server mute in and out of a call, bulk delete
+async function moderatorTools(t) {
+  const { alice, bob } = t.people;
+  const bobInCall = () => alice.$('#sidebar-body .vc-user', { hasText: 'bob' });
+  // Server mute from the voice channel's list: bob's app is told and keeps his mic off; alice sees him marked.
+  await bobInCall().click({ button: 'right' });
+  await alice.menuItem('Server mute').click();
+  await bob.toast('A moderator muted you in this server');
+  await bobInCall().locator('.server-muted').waitFor();
+  await bob.$('#voice-panel button[aria-label="Unmute"]').click();
+  await bob.toast('You can listen, but not talk');
+  // The mute outlasts the call, and a moderator can still see and lift it from the member list once he's gone.
+  await bob.$('#voice-panel button[aria-label="Leave call"]').click();
+  await bobInCall().waitFor({ state: 'detached' });
+  await alice.openChannel('general');
+  await bob.openChannel('general');
+  await alice.member('bob').click({ button: 'right' });
+  await alice.menuItem('Remove server mute').click();
+  await alice.toast('bob can talk again.');
+  // Bulk delete: pick two messages and delete them for everyone at once.
+  await alice.send('Spam number one');
+  await alice.send('Spam number two');
+  await bob.message('Spam number two').waitFor();
+  // Esc stops picking, even with focus on the bar's own buttons.
+  await alice.messageAction('Spam number one', 'Select messages to delete…');
+  await alice.$('#select-bar button', { hasText: 'Cancel' }).focus();
+  await alice.page.keyboard.press('Escape');
+  await alice.$('#select-bar').waitFor({ state: 'hidden' });
+  await alice.messageAction('Spam number one', 'Select messages to delete…');
+  await alice.message('Spam number two').locator('.msg-select').check();
+  await alice.$('#select-bar button', { hasText: 'Delete 2' }).click();
+  await alice.modal('Delete 2 messages?').locator('.modal-foot .btn.danger').click();
+  await alice.toast('Deleted 2 messages.');
+  for (const p of [alice, bob]) await p.message('Spam number').first().waitFor({ state: 'detached' });
+  check(!(await alice.$('#select-bar:not([hidden])').count()), 'Picking messages should end once they are deleted.');
+  // Back to the call for the next flow.
+  for (const p of [alice, bob]) { await p.channelRow('Lounge').locator('.ch-main').click(); await p.$('.voice-room .cs-controls').waitFor(); }
+}
+
 async function watchTogether(t) {
   const { alice, bob } = t.people;
   await alice.$('.voice-room .cs-controls button[aria-label="Watch together"]').click();
@@ -413,12 +705,121 @@ async function watchTogether(t) {
   await alice.$('.wt-actions button', { hasText: 'Stop' }).first().click();
   for (const p of [alice, bob]) await p.$('.wt-title').first().waitFor({ state: 'detached' });
 
+  // A video file on another site: each viewer is told that site will see their IP address, and it loads only
+  // when they choose to (the harness refuses outside requests, so here it then fails to play, which is fine).
+  const outsideHost = 'videos.outside-site.test';
+  const asked = [];
+  const onRequest = (r) => { if (r.url().includes(outsideHost)) asked.push(r.url()); };
+  bob.page.on('request', onRequest);
+  try {
+    await alice.$('.voice-room .cs-controls button[aria-label="Watch together"]').click();
+    const m2 = await alice.dialog('Watch together');
+    await m2.locator('input.input').fill(`https://${outsideHost}/trailer.webm`);
+    await m2.locator('.modal-foot .btn.primary').click();
+    for (const p of [alice, bob]) await p.$('.wt-outside', { hasText: `This video comes from ${outsideHost}, which will see your IP address.` }).first().waitFor();
+    check(!asked.length, `Nothing should be fetched from ${outsideHost} before Bob agrees (fetched ${asked.join(', ')}).`);
+    const req = bob.page.waitForRequest((r) => r.url().includes(outsideHost));
+    await bob.$('.wt-outside button', { hasText: 'Load video' }).first().click();
+    await req;
+    await bob.$('.wt-outside').first().waitFor({ state: 'detached' });
+    check(await bob.page.evaluate(() => !!document.activeElement && document.activeElement.matches('video.wt-frame')), 'After Load video, keyboard focus should be on the player, not lost to the page.');
+    check(await alice.$('.wt-outside').first().isVisible(), 'Alice\'s choice is her own: her notice stays until she clicks.');
+  } finally { bob.page.off('request', onRequest); }
+  await alice.$('.wt-actions button', { hasText: 'Stop' }).first().click();
+  for (const p of [alice, bob]) await p.$('.wt-title').first().waitFor({ state: 'detached' });
+
   // Leaving: bob first (alice sees him go), then alice from the call bar.
   await bob.$('.voice-room .cs-controls button[aria-label="Leave call"]').click();
   await alice.$('.voice-room .cs-tile', { hasText: 'bob' }).waitFor({ state: 'detached' });
   await alice.$('#voice-panel button[aria-label="Leave call"]').click();
   await alice.page.waitForSelector('#voice-panel', { state: 'hidden' });
   await bob.page.waitForSelector('#voice-panel', { state: 'hidden' });
+}
+
+// ------------------------------------------------------------------ the server's own audit log and report inbox
+async function auditAndReports(t) {
+  const { alice, bob } = t.people;
+  await alice.openChannel('general');
+  await bob.openChannel('general');
+  // Alice (the owner) reads what happened in her server, as sentences: the moderator toolkit's bulk delete and
+  // server mute, and bob picking a role himself.
+  await alice.serverMenu('Server settings');
+  const ss = alice.page.locator('.modal.server-settings');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  const row = (text) => ss.locator('.audit-row', { hasText: text });
+  await row('deleted 2 messages at once in #general').waitFor();
+  await row(/server-muted bob/).first().waitFor();
+  await row('bob picked the role “game-night”').first().waitFor();
+  // Filtered to voice, the message entries go.
+  await ss.locator('select[aria-label="Show"]').selectOption({ label: 'Voice' });
+  await row('deleted 2 messages').waitFor({ state: 'detached' });
+  await row(/server-muted bob/).first().waitFor();
+  await ss.locator('select[aria-label="Show"]').selectOption({ label: 'Everything' });
+  await row('deleted 2 messages at once in #general').waitFor();
+  // Filtered to one person (typed, as for someone who's no longer a member): only what they did or had done to them.
+  const person = ss.locator('input[aria-label="Done by or to"]');
+  await person.fill('bob');
+  await person.press('Enter');
+  await row('deleted 2 messages').waitFor({ state: 'detached' });
+  await row(/server-muted bob/).first().waitFor();
+  await person.fill('');
+  await row('deleted 2 messages at once in #general').waitFor();
+  // While it's open, a new entry appears by itself: bob picks the role again (and drops it, as it was).
+  const picks = () => alice.page.evaluate(() => [...document.querySelectorAll('.modal.server-settings .audit-row')].filter((r) => r.textContent.includes('bob picked the role')).length);
+  const before = await picks();
+  await bob.serverMenu('Pick your roles');
+  const picker = await bob.dialog('Pick your roles');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:checked').waitFor();
+  await alice.page.waitForFunction((n) => [...document.querySelectorAll('.modal.server-settings .audit-row')].filter((r) => r.textContent.includes('bob picked the role')).length > n, before, { timeout: 15000 });
+  check(await picks() === before + 1, 'The new entry should appear once.');
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('.switch').click();
+  await picker.locator('.pick-role', { hasText: 'game-night' }).locator('input:not(:checked)').waitFor();
+  await picker.locator('.modal-x').click();
+  await bob.noModals();
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+
+  // A reported message reaches the server's moderators too (here the owner), without saying who reported it.
+  await bob.send('Rude remark about kumquats');
+  await alice.message('Rude remark about kumquats').waitFor();
+  await alice.messageAction('Rude remark about kumquats', 'Report message');
+  const rep = await alice.dialog('Report message');
+  await rep.locator('.radio-card', { hasText: 'Harassment or bullying' }).click();
+  const share = rep.locator('.tos-check', { hasText: `Also show it to the moderators of ${SERVER}` }).locator('input');
+  check(await share.isChecked(), 'Sharing with the server’s moderators should be on by default.');
+  await rep.locator('.modal-foot .btn.danger', { hasText: 'Send report' }).click();
+  await alice.toast(`New report in ${SERVER}`);
+  // The app offers to block bob afterwards: not now.
+  const block = await alice.dialog('Block bob?');
+  await block.locator('.modal-foot button', { hasText: 'Cancel' }).click();
+  await alice.noModals();
+  await alice.serverMenu('Server settings');
+  await ss.locator('.ss-tab', { hasText: exact('Reports') }).click();
+  const card = ss.locator('.report-card', { hasText: 'Harassment or bullying' });
+  await card.locator('.ev.reported', { hasText: 'Rude remark about kumquats' }).waitFor();
+  await card.locator('button', { hasText: 'Mark handled' }).click();
+  const note = await alice.dialog('Mark as handled');
+  await note.locator('input').fill('Talked to bob');
+  await note.locator('.modal-foot .btn.primary').click();
+  await alice.toast('Marked as handled.');
+  await ss.locator('.panel-empty', { hasText: 'No open reports.' }).waitFor();
+  // Who handled it stays on the report (not in the audit log, where the person reported might read it).
+  await ss.locator('.seg-btn', { hasText: exact('Handled') }).click();
+  await ss.locator('.report-card .stat-sub', { hasText: /Note: Talked to bob — Handled by / }).waitFor();
+  await ss.locator('.modal-x').click();
+  await alice.noModals();
+  // Alice also runs this Hearth: staff still have the report open, see what the server's moderators did, and close
+  // their own copy.
+  await alice.railButton('Admin');
+  await alice.$('.admin-tabs .admin-tab', { hasText: 'Reports' }).click();
+  const staffCard = alice.$('.admin-body .report-card', { hasText: 'Rude remark about kumquats' });
+  await staffCard.locator('.stat-sub', { hasText: 'The server’s moderators have it too: handled' }).waitFor();
+  await staffCard.locator('button', { hasText: exact('Resolve') }).click();
+  await (await alice.dialog('Resolve report')).locator('.modal-foot .btn.primary').click();
+  await alice.toast('Resolved.');
+  await alice.$('.admin-body .panel-empty', { hasText: 'No open reports' }).waitFor();
+  await alice.railButton(SERVER);
 }
 
 // ------------------------------------------------------------------ a 1-to-1 call from a DM: ring, accept, hang up, decline
@@ -479,11 +880,179 @@ async function groupChat(t) {
   }
 }
 
-// ------------------------------------------------------------------ 9. changes that need the password again
+// ------------------------------------------------------------------ the Android app, with its native half simulated
+// The page as the Hearth Android app shows it. window.HearthAndroid stands in for the app (MainActivity and the
+// UnifiedPush push app): what the page sends it is recorded, and it answers the way the app does. The push
+// address it hands out isn't a real push service, so /api/push/subscribe is answered here and only what the
+// page sends is checked (the server's side has its own tests in test/android-push.test.js).
+function fakeAndroidBridge({ invite }) {
+  if (window.HearthAndroid) return;
+  // Kept across reloads (signing out reloads the page).
+  const log = () => JSON.parse(sessionStorage.getItem('e2e.sent') || '[]');
+  Object.defineProperty(window, '__androidSent', { get: log });
+  const b64u = (n) => { const a = new Uint8Array(n); crypto.getRandomValues(a); return btoa(String.fromCharCode(...a)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+  let n = 0;
+  let st = { type: 'pushState', state: 'none', reason: '', vapid: '', endpoint: '', distributor: '', distributorName: '', distributors: 1 };
+  const bridge = {
+    onmessage: null,
+    postMessage(raw) {
+      const m = JSON.parse(raw);
+      sessionStorage.setItem('e2e.sent', JSON.stringify([...log(), m]));
+      const reply = (o) => setTimeout(() => bridge.onmessage && bridge.onmessage({ data: JSON.stringify(o) }), 5);
+      if (m.type === 'hello') {
+        // An invite link the app was opened with, handed over once (as the app does).
+        const give = invite && !sessionStorage.getItem('e2e.invited');
+        if (give) sessionStorage.setItem('e2e.invited', '1');
+        reply({ type: 'info', version: '1.29.0', notify: 'granted', server: location.origin, call: true, push: { ...st }, ...(give ? { invite } : {}) });
+      } else if (m.type === 'pushState') reply({ ...st });
+      else if (m.type === 'pushRegister' || m.type === 'pushPick') {
+        st = { ...st, state: 'pending', reason: '', vapid: String(m.vapid || '').replace(/=+$/, '') };
+        reply({ ...st });
+        n++;
+        // The push app answers a moment later with a new address and this phone's public keys.
+        setTimeout(() => {
+          st = { ...st, state: 'registered', endpoint: `https://ntfy.example.test/upE2e${n}${b64u(6)}?up=1`, p256dh: 'B' + b64u(66).slice(0, 86), auth: b64u(16), distributor: 'io.heckel.ntfy', distributorName: 'ntfy' };
+          window.dispatchEvent(new CustomEvent('hearth-push', { detail: { ...st } }));
+        }, 60);
+      } else if (m.type === 'pushUnregister') {
+        // Like the UnifiedPush library: unregistering the last registration forgets the push app too.
+        st = { ...st, state: 'none', endpoint: '', p256dh: '', auth: '', distributor: '', distributorName: '' };
+        reply({ ...st });
+      }
+    },
+  };
+  window.HearthAndroid = bridge;
+}
+async function androidApp(t) {
+  const code = t.state.invite.split('/invite/')[1];
+  const droid = await t.open('droid');
+  await droid.register('droid', newPassword());
+  const subs = [];
+  await droid.page.route('**/api/push/subscribe', (route) => { subs.push(route.request().postDataJSON()); route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }); });
+  await droid.context.addInitScript(fakeAndroidBridge, { invite: code });
+  await droid.page.reload();
+  await droid.waitApp();
+  const sent = (type) => droid.page.evaluate((ty) => window.__androidSent.filter((m) => m.type === ty), type);
+  check((await sent('hello')).some((m) => m.v === 2), 'The page should tell the app it takes notification taps and invites in place.');
+
+  // The invite link the app was opened with: the "Join a server" box, without leaving the page.
+  const join = await droid.dialog('Join a server');
+  await join.locator('.invite-preview strong', { hasText: 'E2E Hall' }).waitFor();
+  await join.locator('.modal-foot .btn.primary').click();
+  await droid.page.locator('#sidebar-head .server-head-name', { hasText: exact('E2E Hall') }).waitFor();
+  await droid.noModals();
+
+  // Offered once: notifications when Hearth is closed. The app registers with the server's key; the page
+  // subscribes the address it hands back.
+  const { publicKey } = await droid.page.evaluate(() => fetch('/api/push/key').then((r) => r.json()));
+  await droid.$('.push-offer button', { hasText: 'Turn on' }).click();
+  await droid.toast('Notifications are on, even when Hearth is closed.');
+  const reg = await sent('pushRegister');
+  check(reg.length === 1 && reg[0].vapid === publicKey, 'The app should be asked to register with this server\u2019s VAPID key.');
+  check(subs.length === 1 && /^https:\/\/ntfy\.example\.test\/upE2e1/.test(subs[0].subscription.endpoint) && subs[0].subscription.keys.auth && !subs[0].replaces,
+    `The page should subscribe the app's push address (got ${JSON.stringify(subs[0])}).`);
+
+  // Settings: on, through ntfy; picking the push app again gives a new address, which replaces the old one.
+  await droid.openSettings('Apps & devices');
+  const row = droid.$('.set-content .toggle-row', { hasText: 'Notifications when Hearth is closed' });
+  await row.waitFor();
+  const pushIs = (on) => droid.page.waitForFunction((want) => { const r = [...document.querySelectorAll('.set-content .toggle-row')].find((x) => /when Hearth is closed/.test(x.textContent)); return r && !r.querySelector('input').disabled && r.querySelector('input').checked === want; }, on);
+  const change = () => droid.$('.set-content button', { hasText: exact('Change') });
+  await pushIs(true);
+  await droid.$('.set-content .muted-p', { hasText: 'Push app: ntfy' }).waitFor();
+  await change().click();
+  await droid.toast('Notifications now come through the push app you picked.');
+  check((await sent('pushPick')).length === 1, 'Change should ask the app to show the list of push apps.');
+  check(subs.length === 2 && subs[1].replaces === subs[0].subscription.endpoint && subs[1].subscription.endpoint !== subs[0].subscription.endpoint,
+    'The new push address should replace the old one on the server.');
+  // Turning it off takes the push app row (and Change, which would turn push back on) away at once; turning it
+  // on again brings them back, without reopening Settings.
+  await row.locator('.switch').click();
+  await droid.toast('Notifications when Hearth is closed are off.');
+  await pushIs(false);
+  await change().waitFor({ state: 'detached' });
+  check(!(await droid.$('.set-content .muted-p', { hasText: 'Push app:' }).count()), 'With push off, no push app should be shown.');
+  await row.locator('.switch').click();
+  await droid.toast('Notifications are on, even when Hearth is closed.');
+  await pushIs(true);
+  await change().waitFor();
+  check((await sent('pushPick')).length === 1 && subs.length === 3, 'Turning push on again registers once, without the list of push apps.');
+  await droid.closeSettings();
+
+  // A call starts the app's call notification (it keeps the call going with the screen off). Android shows it on
+  // the lock screen too, so it says only "In a call" until the person chooses to show who and where.
+  const callStarts = () => droid.page.evaluate(() => window.__androidSent.filter((m) => m.type === 'callStart'));
+  await droid.channelRow('Lounge').locator('.ch-main').click();
+  await droid.$('#voice-panel').waitFor();
+  await droid.page.waitForFunction(() => window.__androidSent.some((m) => m.type === 'callStart' && m.title === 'In a call'));
+  check(!(await callStarts()).some((m) => /Lounge/.test(m.title)), 'The call notification should not name the channel by default.');
+  await droid.openSettings('Notifications');
+  await droid.$('.set-content .toggle-row', { hasText: 'Show who and where on the lock screen' }).locator('.switch').click();
+  await droid.toast('Push notifications now show the sender and conversation.');
+  await droid.page.waitForFunction(() => window.__androidSent.some((m) => m.type === 'callStart' && /Lounge/.test(m.title)));
+  await droid.closeSettings();
+  // Its Hang up button leaves the call, which stops it again.
+  await droid.page.evaluate(() => window.dispatchEvent(new CustomEvent('hearth-hangup', { detail: true })));
+  await droid.page.waitForSelector('#voice-panel', { state: 'hidden' });
+  await droid.page.waitForFunction(() => window.__androidSent.some((m) => m.type === 'callEnd'));
+  // Reloading the page in a call (the "Reload now" after an update, say) ends the call, and the notification too.
+  const startsBefore = (await callStarts()).length;
+  const endsBefore = (await sent('callEnd')).length;
+  await droid.$('.cs-controls .btn.primary', { hasText: exact('Join call') }).click(); // still looking at the Lounge
+  await droid.$('#voice-panel').waitFor();
+  await droid.page.waitForFunction((n) => window.__androidSent.filter((m) => m.type === 'callStart').length > n, startsBefore);
+  await droid.page.reload();
+  await droid.waitApp();
+  check((await sent('callEnd')).length === endsBefore + 1, 'Leaving the page during a call should end the app\u2019s call notification.');
+
+  // A #call/ link to a server's voice channel (which anyone can post) opens the server but never shows an
+  // "incoming call" from whoever is sitting in it: only DM and group calls ring.
+  const { alice } = t.people;
+  await alice.railButton(SERVER);
+  await alice.channelRow('Lounge').locator('.ch-main').click();
+  await alice.$('#voice-panel').waitFor();
+  await droid.railButton(SERVER);
+  await droid.$('#sidebar-body .vc-user', { hasText: 'Alice Wonder' }).waitFor();
+  const lounge = await droid.page.evaluate(() => fetch('/api/bootstrap', { headers: { Authorization: 'Bearer ' + localStorage.getItem('hearth.token') } })
+    .then((r) => r.json()).then((b) => b.servers.flatMap((x) => x.channels).find((c) => c.type === 'voice' && c.name === 'Lounge').id));
+  await droid.railButton('Direct messages');
+  await droid.page.evaluate((id) => { location.hash = '#call/' + id; }, lounge);
+  await droid.page.waitForSelector('#composer-input[placeholder="Message #general"]');
+  await droid.page.waitForTimeout(800);
+  check(!(await droid.$('.ring-card').count()), 'A #call/ link to a server voice channel must not ring.');
+  await alice.$('#voice-panel button[aria-label="Leave call"]').click();
+  await alice.page.waitForSelector('#voice-panel', { state: 'hidden' });
+
+  // A tapped notification opens only places inside the app.
+  await droid.page.evaluate(() => window.dispatchEvent(new CustomEvent('hearth-open', { detail: 'https://evil.example/' })));
+  check(droid.page.url().startsWith(t.server.base), 'A notification must never take the app to another site.');
+  await droid.page.evaluate(() => window.dispatchEvent(new CustomEvent('hearth-open', { detail: '/#d/zzzzzz' })));
+  await droid.toast('That conversation isn\u2019t available.');
+
+  // Signing out removes the phone's push registration, and push isn't "off by choice" for the next person.
+  const unregBefore = (await sent('pushUnregister')).length;
+  await droid.logout();
+  check((await sent('pushUnregister')).length > unregBefore, 'Signing out should remove the app\u2019s push registration.');
+  check(await droid.page.evaluate(() => localStorage.getItem('hearth.push') === null && localStorage.getItem('hearth.push.endpoint') === null), 'Signing out should forget push on this device.');
+  await droid.close();
+  delete t.people.droid;
+}
+
+// ------------------------------------------------------------------ 11b. changes that need the password again
 async function stepUp(t) {
   const { alice, bob } = t.people;
   // Deleting a server: the app asks for the password; a wrong one is refused in place, the right one deletes.
   await alice.createServer('Doomed Den');
+  // "It's just you here" can be dismissed, and stays away for this server.
+  const nudge = alice.$('#messages .invite-nudge');
+  await nudge.waitFor();
+  await nudge.locator('button[aria-label="Dismiss"]').click();
+  await nudge.waitFor({ state: 'detached' });
+  await alice.channelRow('Lounge').click({ button: 'right' });
+  await alice.menuItem('Open chat').click();
+  await alice.openChannel('general');
+  await alice.$('#messages .welcome').waitFor();
+  check(!(await alice.$('#messages .invite-nudge').count()), 'A dismissed “just you here” card should stay away.');
   await alice.serverMenu('Server settings');
   await alice.$('.modal.server-settings .ss-tab', { hasText: 'Danger zone' }).click();
   await alice.$('.modal.server-settings .danger-zone button', { hasText: 'Delete server' }).click();
@@ -603,6 +1172,13 @@ async function deleteAccount(t) {
   await bob.railButton(SERVER);
   await bob.openChannel('general');
   await bob.message('Carl was here: plum').waitFor();
+  // Bob mentions carl: carl's app keeps the words in its inbox, in this browser, and a reminder on it keeps them too.
+  await bob.send('@carl the gate code is 4417');
+  const copies = () => carl.page.evaluate(() => Object.keys(localStorage).filter((k) => /^hearth\.(inbox|reminders)\./.test(k)).map((k) => `${k}=${localStorage.getItem(k)}`));
+  await carl.message('the gate code is 4417').waitFor();
+  await carl.messageAction('the gate code is 4417', 'Remind me in 1 hour');
+  await carl.toast('remind you');
+  for (const until = Date.now() + 15000; (await copies()).filter((x) => x.includes('4417')).length < 2; await carl.page.waitForTimeout(100)) check(Date.now() < until, `Bob’s mention should be in carl’s inbox and reminders (has: ${(await copies()).join(' | ')}).`);
 
   await carl.openSettings('Security');
   await carl.$('.set-content button', { hasText: 'Delete my account' }).click();
@@ -613,6 +1189,15 @@ async function deleteAccount(t) {
   await carl.page.waitForSelector('#login-form:not([hidden])');
   // (Said by Settings, or by the server's notice if that arrives first: either way, it says so.)
   await carl.$('#login-form .form-error', { hasText: /(Your|This) account was deleted\./ }).waitFor();
+  // Nothing of the words carl's app kept is left in this browser: no inbox, no reminders.
+  for (const until = Date.now() + 10000; (await copies()).length; await carl.page.waitForTimeout(100)) check(Date.now() < until, `Deleting the account should leave no inbox or reminder copies here (left: ${(await copies()).join(' | ')}).`);
+  // And each time Hearth opens, any copy past its deadline goes, whoever it belongs to.
+  await carl.page.evaluate(() => localStorage.setItem('hearth.inbox.someone', JSON.stringify([{ type: 'mention', msgId: 'a', text: 'gone already: 9921', exp: Date.now() - 1000 }, { type: 'mention', msgId: 'b', text: 'still waiting', exp: Date.now() + 3600000 }])));
+  await carl.page.reload();
+  await carl.page.waitForSelector('#login-form:not([hidden])');
+  const kept = await carl.page.evaluate(() => localStorage.getItem('hearth.inbox.someone') || '');
+  check(!kept.includes('9921') && kept.includes('still waiting'), `Opening Hearth should drop copies past their deadline and keep the rest (left: ${kept}).`);
+  await carl.page.evaluate(() => localStorage.removeItem('hearth.inbox.someone'));
   // The others see it go; what carl wrote stays, from a "Deleted user".
   await bob.showMembers();
   await bob.member('carl').waitFor({ state: 'detached' });
@@ -655,6 +1240,16 @@ async function recovery(t) {
   // A new password signs out her other devices.
   const phone = await t.open('alice-phone');
   await phone.login(name, t.pw.alice);
+  // …but not a second tab of this browser (the same storage): the sign-in gets a new token, which every tab here
+  // picks up, reconnecting with it (auth-11). Its errors count as alice's.
+  const tab2 = new Person('alice-tab2', alice.context, await alice.context.newPage(), alice.base);
+  tab2.pageErrors = alice.pageErrors; tab2.serverErrors = alice.serverErrors; tab2.log = alice.log; // (its log goes in alice's report)
+  tab2.page.setDefaultTimeout(20000);
+  await tab2.page.goto(alice.base);
+  await tab2.waitApp();
+  await tab2.railButton(SERVER);
+  await tab2.openChannel('general');
+  const oldToken = await alice.page.evaluate(() => localStorage.getItem('hearth.token'));
   const next = t.pw.alice + '-2';
   const box = alice.$('.set-content .set-section', { hasText: 'Change password' });
   await box.locator('.field', { hasText: 'Current password' }).locator('input').fill(t.pw.alice);
@@ -668,6 +1263,28 @@ async function recovery(t) {
   await phone.close();
   delete t.people['alice-phone'];
   await alice.closeSettings();
+  // Both tabs hold the new token and are live on it: bob's message shows up in each as it's sent, and the second
+  // tab's own message reaches him.
+  await alice.page.waitForFunction((old) => { const v = localStorage.getItem('hearth.token'); return v && v !== old; }, oldToken);
+  check(await tab2.page.evaluate((old) => !!localStorage.getItem('hearth.token') && localStorage.getItem('hearth.token') !== old, oldToken), 'The second tab should share the new token.');
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.send('After the password change: plum');
+  await alice.message('After the password change: plum').waitFor();
+  await tab2.message('After the password change: plum').waitFor();
+  await tab2.send('The second tab is still here: pear');
+  await bob.message('The second tab is still here: pear').waitFor();
+  check(!(await tab2.$('#auth:not([hidden])').count()), 'The second tab should never have been signed out.');
+  // Its keys weren't wiped either: after a reload it opens straight into the app, messages readable.
+  await tab2.page.reload();
+  await tab2.waitApp();
+  await tab2.railButton(SERVER);
+  await tab2.openChannel('general');
+  await tab2.message('After the password change: plum').waitFor();
+  check(!(await tab2.$('#messages .msg-text.undecryptable').count()), 'After a reload, the second tab should still read the channel.');
+  await tab2.page.close();
 
   // Forgot it: the email link plus the recovery key keep every old message readable.
   await alice.logout();
@@ -704,7 +1321,7 @@ async function recovery(t) {
 
 // ------------------------------------------------------------------ 14. two-factor sign-in
 async function twoFactor(t) {
-  const { alice } = t.people;
+  const { alice, bob } = t.people;
   await alice.openSettings('Security');
   await alice.$('.set-content button', { hasText: 'Set up two-factor sign-in' }).click();
   await alice.confirmPassword('Turn on two-factor sign-in', t.pw.alice);
@@ -731,6 +1348,49 @@ async function twoFactor(t) {
   await f.locator('[name=totp]').fill(backup[0]);
   await f.locator('button[type=submit]').click();
   await alice.waitApp();
+
+  // Even right after signing in with a code, a sensitive change asks for the password and a code, in one dialog
+  // (auth-6). A new recovery key takes two requests (the locked key, then the new copy) on that one code: the
+  // first answer's step-up ticket stands in for it on the second.
+  const steps = [];
+  const onStep = (r) => { const p = new URL(r.url()).pathname; if (p.startsWith('/api/me/')) steps.push(`${r.method()} ${p}`); };
+  alice.page.on('request', onStep);
+  await alice.openSettings('Security');
+  await alice.$('.set-content button', { hasText: /^(Create a recovery key|Make a new one)$/ }).click();
+  const rk = await alice.dialog('Create a recovery key');
+  await rk.locator('input[type=password]').fill(t.pw.alice);
+  await rk.locator('input[autocomplete="one-time-code"]').fill(backup[1]);
+  await rk.locator('.modal-foot .btn.primary').click();
+  const rkShown = alice.modal('recovery key for');
+  await rkShown.locator('.secret-box code').waitFor();
+  check(!(await alice.modal('Enter your two-factor code').count()), 'One code should be enough for a new recovery key.');
+  await rkShown.locator('input[type=checkbox]').check();
+  await rkShown.locator('button', { hasText: exact('Done') }).click();
+  alice.page.off('request', onStep);
+  check(steps.includes('POST /api/me/keys/wrapped') && steps.includes('PUT /api/me/recovery'), `The locked key, then the new copy (asked for: ${steps.join(', ')}).`);
+  await alice.closeSettings();
+
+  // "Log out all other devices" asks for the password and a code too: this device then gets a new sign-in token, so
+  // a copy of it taken earlier stops working (auth-11). The app carries on with the new one, live connection included.
+  const tokenBefore = await alice.page.evaluate(() => localStorage.getItem('hearth.token'));
+  await alice.openSettings('Security', 'Signed-in devices');
+  await alice.$('.set-content button', { hasText: 'Log out all other devices' }).click();
+  const others = await alice.dialog('Log out all other devices?');
+  await others.locator('input[type=password]').fill(t.pw.alice);
+  await others.locator('input[autocomplete="one-time-code"]').fill(backup[2]);
+  await others.locator('.modal-foot .btn.danger').click();
+  await alice.toast(/Signed out \d+ device|No other devices were signed in/);
+  await alice.page.waitForFunction((old) => { const v = localStorage.getItem('hearth.token'); return v && v !== old; }, tokenBefore);
+  await alice.closeSettings();
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.send('After alice’s new sign-in: quince');
+  await alice.message('After alice’s new sign-in: quince').waitFor();
+  await alice.send('Still here with the new sign-in: fig');
+  await bob.message('Still here with the new sign-in: fig').waitFor();
+  check(!(await alice.$('#auth:not([hidden])').count()), 'Alice should still be signed in.');
 
   // Turning it off takes the password and one code, in one dialog, also when the last code was a while ago (this
   // sign-in's is made 11 minutes old here). Asking for the password used to fetch the locked key first, which then
@@ -945,20 +1605,1705 @@ async function smoke(t) {
   check(!failed.length, `Pages that failed to load:\n  ${failed.join('\n  ')}`);
 }
 
+// ------------------------------------------------------------------ 19. threads: what's new in them, the Threads panel
+// A ping in a thread shows on the message that starts it, on the Threads button and in the channel's badge, survives
+// a reload, and goes once the thread is opened. The panel lists the thread (decrypted) and follows new replies live.
+async function threads(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await alice.send('Thread starter: who brings snacks?');
+  const onBob = bob.message('Thread starter: who brings snacks?').first();
+  await onBob.hover();
+  await onBob.locator('button[aria-label="Reply in thread"]').click();
+  await bob.send('@alice_w I bring the chips', '.cw-thread textarea.composer-input');
+
+  const chip = alice.message('Thread starter: who brings snacks?').locator('.thread-chip');
+  const threadsBtn = alice.$('#main-head button.with-badge');
+  await chip.locator('.thread-new.ping', { hasText: '1 new' }).waitFor();
+  await threadsBtn.locator('.badge', { hasText: '1' }).waitFor();
+  await alice.channelRow('general').locator('.badge', { hasText: '1' }).waitFor();
+  // It's kept on the server: still there after a reload.
+  await alice.page.reload();
+  await alice.waitApp();
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await chip.locator('.thread-new', { hasText: '1 new' }).waitFor();
+
+  // The Threads panel lists it, decrypted, with what's new.
+  await threadsBtn.click();
+  const card = alice.$('#members .thread-card', { hasText: 'who brings snacks?' });
+  await card.locator('.thread-new', { hasText: '1 new' }).waitFor();
+  await card.click();
+  await alice.message('I bring the chips', '.thread-list').waitFor();
+  await alice.$('.thread-list .new-div', { hasText: 'New replies' }).waitFor();
+  // Opening it read it: the badges go.
+  await threadsBtn.locator('.badge').waitFor({ state: 'detached' });
+  await chip.locator('.thread-new').waitFor({ state: 'detached' });
+  check(!(await alice.channelRow('general').locator('.badge').count()), 'Reading the thread should clear the channel’s badge.');
+
+  // Back to the list from the keyboard: it lands on that thread's card. The list follows new replies live.
+  await alice.$('#members button[aria-label="Back to threads"]').focus();
+  await alice.page.keyboard.press('Enter');
+  await card.waitFor();
+  check(await card.evaluate((el) => el === document.activeElement), 'Back to threads should put the keyboard on that thread’s card.');
+  check(!(await card.locator('.thread-new').count()), 'A thread just read should have nothing new.');
+  await bob.send('And a bowl of dip', '.cw-thread textarea.composer-input');
+  await card.locator('.thread-new', { hasText: '1 new' }).waitFor();
+  await chip.locator('.thread-new', { hasText: '1 new' }).waitFor();
+  // "Mark as read" on the channel takes its threads with it.
+  await alice.channelRow('general').locator('.ch-main').click({ button: 'right' });
+  await alice.menuItem('Mark as read').click();
+  await card.locator('.thread-new').waitFor({ state: 'detached' });
+  await chip.locator('.thread-new').waitFor({ state: 'detached' });
+
+  // A thread left chosen while the member list covers it (the server menu's Members) doesn't read new replies.
+  await card.click();
+  await alice.message('And a bowl of dip', '.thread-list').waitFor();
+  await alice.serverMenu('Members');
+  await alice.$('#members .member-list').waitFor();
+  await bob.send('Napkins too', '.cw-thread textarea.composer-input');
+  await chip.locator('.thread-new', { hasText: '1 new' }).waitFor();
+
+  // A ping that's deleted leaves nothing behind: not on the channel, the message or the page title.
+  const title = await alice.page.title();
+  await bob.send('@alice_w ping, wrong person', '.cw-thread textarea.composer-input');
+  await chip.locator('.thread-new.ping', { hasText: '2 new' }).waitFor();
+  await alice.channelRow('general').locator('.badge', { hasText: '1' }).waitFor();
+  const wrong = bob.message('wrong person', '.thread-list').first();
+  await wrong.hover();
+  await wrong.locator('button[aria-label="More actions"]').click();
+  await bob.menuItem('Delete message').click();
+  await bob.modal('Delete message?').locator('.modal-foot .btn.danger').click();
+  await alice.channelRow('general').locator('.badge').waitFor({ state: 'detached' });
+  await chip.locator('.thread-new:not(.ping)', { hasText: '1 new' }).waitFor();
+  await alice.page.waitForFunction((t) => document.title === t, title);
+  await bob.$('#members button[aria-label="Close panel"]').click();
+
+  // A webhook's post that starts a thread keeps its BOT tag and "not end-to-end encrypted" flag in the Threads
+  // panel, even under a member's name, and links in a card's preview are plain text.
+  const hook = await fetch(t.state.hookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'bob', content: 'HOOKROOT the server moved, sign in again at https://evil.example' }) });
+  check(hook.status === 204, `Posting to the webhook should answer 204 (got ${hook.status}).`);
+  const hookMsg = bob.message('HOOKROOT').first();
+  await hookMsg.hover();
+  await hookMsg.locator('button[aria-label="Reply in thread"]').click();
+  await bob.send('Is this really you?', '.cw-thread textarea.composer-input');
+  await threadsBtn.click();
+  const hookCard = alice.$('#members .thread-card', { hasText: 'HOOKROOT' });
+  await hookCard.locator('.bot-tag', { hasText: 'BOT' }).waitFor();
+  await hookCard.locator('.msg-flag', { hasText: 'Webhook · not end-to-end encrypted' }).waitFor();
+  check(!(await hookCard.locator('a').count()), 'A link in a card’s preview should be plain text.');
+  check(/webhook/.test(await hookCard.getAttribute('aria-label')), 'A webhook’s card should say so to screen readers.');
+  await bob.$('#members button[aria-label="Close panel"]').click();
+
+  // A thread started by someone you blocked is folded away in the panel, as their messages are in the channel.
+  await bob.send('Bob secret root words');
+  const bobRoot = bob.message('Bob secret root words').first();
+  await bobRoot.hover();
+  await bobRoot.locator('button[aria-label="Reply in thread"]').click();
+  await bob.send('My own first reply', '.cw-thread textarea.composer-input');
+  await alice.$('#members .thread-card', { hasText: 'Bob secret root words' }).waitFor();
+  await alice.message('Bob secret root words').locator('.msg-name').click();
+  await alice.page.locator('.pop-profile button[aria-label="More"]').click();
+  await alice.menuItem('Block').click();
+  await alice.modal('Block bob?').locator('.modal-foot .btn.danger').click();
+  await alice.toast('bob is blocked.');
+  const folded = alice.$('#members .thread-card.blocked', { hasText: 'Thread started by someone you blocked' });
+  await folded.waitFor();
+  check(!(await alice.$('#members .threads-list', { hasText: 'Bob secret root words' }).count()), 'A blocked person’s thread should be folded away in the Threads panel.');
+  await folded.locator('button', { hasText: 'Show' }).click();
+  await alice.$('#members .thread-card', { hasText: 'Bob secret root words' }).waitFor();
+  // Unblocked again for whatever comes next.
+  await alice.showMembers();
+  await alice.member('bob').click();
+  await alice.page.locator('.pop-profile button[aria-label="More"]').click();
+  await alice.menuItem('Unblock').click();
+  await alice.toast('bob is unblocked.');
+  await bob.$('#members button[aria-label="Close panel"]').click();
+}
+
+// ------------------------------------------------------------------ 20. link previews
+// The sender's app asks for a preview only when told to; the card goes inside the encrypted message, so the
+// reader's app shows it without contacting the site (or asking this server about the link).
+async function linkPreviews(t) {
+  const { alice, bob } = t.people;
+  const site = t.server.site;
+  const url = `${site.base}/story`;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const bobAsked = [];
+  const onRequest = (r) => { const u = r.url(); if (u.includes(site.host) || u.includes(`:${site.port}/`) || u.includes('/api/link-previews')) bobAsked.push(u); };
+  bob.page.on('request', onRequest);
+  try {
+    const box = alice.$('#composer-input');
+    const chip = alice.$('.cw-main .link-chip');
+    // "Ask each time" (the default): the chip only offers. Nothing has been fetched yet.
+    await box.fill(`Have you seen this? ${url} `);
+    await chip.filter({ hasText: 'Your Hearth server fetches the page, so it sees this link.' }).waitFor();
+    check(!site.hits.length, `Nothing should be fetched before Alice asks for a preview (fetched ${site.hits.join(', ')}).`);
+    // No thanks: the link goes out as a plain link.
+    await chip.locator('button[aria-label="No preview for this link"]').click();
+    await chip.waitFor({ state: 'detached' });
+    await box.press('Enter');
+    await bob.message('Have you seen this?').waitFor();
+    check(!(await bob.message('Have you seen this?').locator('.link-card').count()), 'A message sent without a preview should not show a card.');
+    check(!site.hits.length, 'Turning the preview down should not fetch the page.');
+
+    // Yes please: the server fetches it for Alice, her app shrinks the picture, and the card travels encrypted.
+    await box.fill(`Pineapple news: ${url} `);
+    await chip.locator('button', { hasText: exact('Preview') }).click();
+    await alice.$('.cw-main .link-chip.ready', { hasText: 'Pineapple harvest report' }).waitFor();
+    check(site.hits.includes('/story') && site.hits.includes('/cover.png'), `The server should have fetched the page and its picture (got ${site.hits.join(', ')}).`);
+    await box.press('Enter');
+    const card = bob.message('Pineapple news:').locator('a.link-card');
+    await card.locator('.news-title', { hasText: 'Pineapple harvest report' }).waitFor();
+    check((await card.getAttribute('href')) === url, 'The card should open the link from the message.');
+    check((await card.locator('.news-meta').innerText()).trim() === `${site.host}:${site.port}`, 'The domain line should come from the link itself.');
+    check(/^data:image\/(webp|jpeg);base64,/.test(await card.locator('img.link-img').getAttribute('src') || ''), 'The picture should come from inside the message.');
+    check(!(await card.locator('.news-summary').innerText()).includes('<'), 'Text from the page is shown as text.');
+    await alice.message('Pineapple news:').locator('a.link-card').waitFor();
+
+    // Keyboard only: Enter on Preview gets the card and leaves the focus in the box, so the next Enter sends.
+    await box.fill(`Keyboard pick: ${site.base}/keys `);
+    await chip.locator('button', { hasText: exact('Preview') }).focus();
+    await alice.page.keyboard.press('Enter');
+    await alice.$('.cw-main .link-chip.ready').waitFor();
+    const focused = await alice.page.evaluate(() => (document.activeElement ? document.activeElement.id || document.activeElement.tagName : ''));
+    check(focused === 'composer-input', `After Preview, the focus should be back in the message box (it is on ${focused}).`);
+    await alice.page.keyboard.press('Enter');
+    await bob.message('Keyboard pick:').locator('a.link-card').waitFor();
+
+    // "Always": a link is fetched once it's finished. Backspace inside "…/story-twelve please" makes a new link
+    // each time; none of them is sent anywhere until the typing pauses, and then only the one in the box.
+    await box.fill(`Third story: ${site.base}/story-twelve please`);
+    await chip.locator('button', { hasText: exact('Always') }).click();
+    await alice.$('.cw-main .link-chip.ready').waitFor();
+    const asked = [];
+    const onAsk = (r) => { if (r.url().endsWith('/api/link-previews')) asked.push(r.postDataJSON().url); };
+    alice.page.on('request', onAsk);
+    try {
+      await box.press('End');
+      for (let i = 0; i < ' please'.length; i++) await box.press('ArrowLeft');
+      for (let i = 0; i < 3; i++) await box.press('Backspace');
+      check(!asked.length, `Editing inside a link should not ask for a preview before the pause (asked for ${asked.join(', ')}).`);
+      check(!(await chip.count()), 'The card for the link as it was should go as soon as the link changes.');
+      await alice.$('.cw-main .link-chip.ready').waitFor();
+    } finally { alice.page.off('request', onAsk); }
+    check(asked.length === 1 && asked[0] === `${site.base}/story-twe`, `After the pause, only the link in the box should be previewed (asked for ${asked.join(', ')}).`);
+    check(!site.hits.includes('/story-twelv') && !site.hits.includes('/story-twel'), `Half-edited links should never be fetched (the site got ${site.hits.join(', ')}).`);
+    await box.fill('');
+    await chip.waitFor({ state: 'detached' });
+  } finally { bob.page.off('request', onRequest); }
+  // Back to the default for whatever runs next.
+  await alice.openSettings('Chat');
+  await alice.page.locator('select[aria-label="When I send a link"]').selectOption('ask');
+  await alice.closeSettings();
+  check(!bobAsked.length, `Bob's app should never contact the site or ask about the link (it asked for ${bobAsked.join(', ')}).`);
+}
+
+// ------------------------------------------------------------------ 20b. outside images and the app’s own fonts (xss-8)
+// An image link to another site would show that site every reader's IP address, so it waits behind a placeholder
+// until clicked (Settings → Privacy & safety → Outside images: Ask first, Always load, Never load). The other site
+// here is answered by Bob's browser itself, counting what it's asked for.
+async function outsideImages(t) {
+  const { alice, bob } = t.people;
+  const host = 'pics.outside-site.test';
+  const png = makePng(80, 60);
+  const hits = [];
+  await bob.page.route(`https://${host}/**`, (route) => { hits.push(route.request().url()); route.fulfill({ status: 200, contentType: 'image/png', body: png }); });
+  const choose = async (label) => {
+    await bob.openSettings('Privacy & safety');
+    await bob.page.locator('.chips[aria-label="Outside images"] .chip', { hasText: label }).click();
+    await bob.toast('Saved.');
+    await bob.closeSettings();
+  };
+  try {
+    await alice.railButton(SERVER);
+    await alice.openChannel('general');
+    await bob.railButton(SERVER);
+    await bob.openChannel('general');
+
+    // Ask first (the default): the host and a Load button, and nothing fetched until the click.
+    const first = `https://${host}/sunset.png`;
+    await alice.send(`Sunset from the trip ${first}`);
+    const msg = bob.message('Sunset from the trip');
+    const ask = msg.locator('.embed-ask');
+    await ask.waitFor();
+    check((await ask.innerText()).includes(host), 'The placeholder should name the site the picture would load from.');
+    check(!(await msg.locator('img.embed-img').count()), 'The picture should not be in the page before the click.');
+    check(!hits.length, `Nothing should be fetched from ${host} before the click (fetched ${hits.join(', ')}).`);
+    await ask.locator('button', { hasText: exact('Load image') }).click();
+    const img = msg.locator('img.embed-img');
+    await img.waitFor();
+    await bob.page.waitForFunction((el) => el.complete && el.naturalWidth === 80, await img.elementHandle());
+    check(hits.length === 1 && hits[0] === first, `After the click, the picture should load once (fetched ${hits.join(', ')}).`);
+    check(!(await msg.locator('.embed-ask').count()), 'The placeholder should be gone once the picture shows.');
+    // The click was for that message: the same link in a later one asks again (or its sender, serving the picture
+    // uncached, would learn when each later message is read without Bob being asked).
+    await alice.send(`Sunset again ${first}`);
+    const again = bob.message('Sunset again');
+    await again.locator('.embed-ask button', { hasText: exact('Load image') }).waitFor();
+    check(!(await again.locator('img.embed-img').count()), 'The same link in a later message should ask again, not load by itself.');
+    check(hits.length === 1, `Nothing more should be fetched for the later message (fetched ${hits.join(', ')}).`);
+    check(await msg.locator('img.embed-img').count() === 1, 'The message it was loaded in should keep its picture.');
+
+    // A message that's only the link, from the keyboard: the link text shows while it asks, then just the picture,
+    // and keyboard focus moves to the message (the button it was on is gone).
+    const only = `https://${host}/lighthouse.png`;
+    await alice.send(only);
+    const onlyMsg = bob.message(only).first();
+    await onlyMsg.locator('.embed-ask button').waitFor();
+    const onlyId = await onlyMsg.getAttribute('data-mid');
+    const onlyEl = bob.page.locator(`#messages .msg[data-mid="${onlyId}"]`);
+    await onlyEl.locator('.embed-ask button').focus();
+    await bob.page.keyboard.press('Enter');
+    await onlyEl.locator('img.embed-img').waitFor();
+    check(!(await onlyEl.locator('.msg-text').count()), 'Once its picture shows, a message that is only an image link should show just the picture.');
+    check(await bob.page.evaluate((id) => document.activeElement && document.activeElement.matches(`#messages .msg[data-mid="${id}"]`), onlyId),
+      'After Load image, keyboard focus should be on the message, not lost to the page.');
+
+    // Never load: no button, never fetched.
+    await choose('Never load');
+    const second = `https://${host}/harbour.png`;
+    await alice.send(`The harbour at dusk ${second}`);
+    const never = bob.message('The harbour at dusk').locator('.embed-ask.never');
+    await never.waitFor();
+    check(!(await never.locator('button').count()), 'Never load should offer no Load button.');
+    check(!(await bob.message('Sunset from the trip').locator('img.embed-img').count()), 'Never load should also hide a picture loaded earlier.');
+    check(!hits.includes(second), 'Never load should not fetch anything.');
+
+    // Changed on another device (here, the API with Bob's own sign-in): the pictures on screen follow at once,
+    // without throwing away an edit Bob is typing here.
+    await bob.send('A note I am still fixing');
+    await bob.messageAction('A note I am still fixing', 'Edit message');
+    const edit = bob.page.locator('#messages textarea.edit-input');
+    await edit.waitFor();
+    await edit.fill('A note I am still fixing, half-written');
+    const elsewhere = (mode) => bob.page.evaluate((v) => fetch('/api/me/privacy', { method: 'PATCH', headers: { Authorization: `Bearer ${localStorage.getItem('hearth.token')}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ outsideImages: v }) }).then((r) => r.status), mode);
+    check(await elsewhere('ask') === 200, 'Changing Outside images from another device should work.');
+    await bob.message('The harbour at dusk').locator('.embed-ask:not(.never) button').waitFor();
+    check(await edit.inputValue() === 'A note I am still fixing, half-written', 'An edit being typed should survive Outside images changing on another device.');
+    check(await edit.evaluate((el) => el === document.activeElement), 'The edit box should keep keyboard focus.');
+    check(!hits.includes(second), 'Ask first again: still nothing fetched.');
+    await edit.press('Escape');
+    await edit.waitFor({ state: 'detached' });
+
+    // Always load: pictures load straight away, as before.
+    await choose('Always load');
+    await bob.message('The harbour at dusk').locator('img.embed-img').waitFor();
+    await bob.page.waitForFunction(() => [...document.querySelectorAll('#messages img.embed-img')].some((i) => i.complete && i.naturalWidth === 80 && i.src.includes('harbour')));
+    check(hits.includes(second), 'Always load should fetch the picture.');
+
+    // Even then, a link to this server's own picture proxy (with the sender's token and the sender's choice of
+    // site) stays a plain link: showing it would have Hearth fetch that site for every reader.
+    const proxied = [];
+    const onProxy = (r) => { if (r.url().includes('/media/news')) proxied.push(r.url()); };
+    bob.page.on('request', onProxy);
+    try {
+      const sneaky = `${t.server.base}/media/news/x.png?u=${encodeURIComponent(`https://${host}/read-receipt.png`)}&t=alices-token`;
+      await alice.send(`Proxy trick ${sneaky}`);
+      const trick = bob.message('Proxy trick');
+      await trick.waitFor();
+      await bob.page.waitForTimeout(500);
+      check(!(await trick.locator('.msg-embeds, .embed-ask, img.embed-img').count()), 'A link to this server\'s picture proxy should not be shown as a picture.');
+      check(await trick.locator('.msg-text a').count() === 1, 'It should stay a plain link.');
+      check(!proxied.length && !hits.some((u) => u.includes('read-receipt')), `Nothing should be fetched for it (fetched ${[...proxied, ...hits.filter((u) => u.includes('read-receipt'))].join(', ')}).`);
+    } finally { bob.page.off('request', onProxy); }
+  } finally {
+    await bob.page.unroute(`https://${host}/**`);
+  }
+  // Back to the default for whatever runs next.
+  await choose('Ask first');
+
+  // The app's fonts come from Hearth itself: every face loads from this server (the harness refuses everything
+  // else), and the page asked no other site for a font.
+  const fonts = await bob.page.evaluate(async () => {
+    await document.fonts.ready;
+    const families = ['Figtree', 'Bricolage Grotesque', 'Pacifico', 'Orbitron', 'Press Start 2P', 'Caveat', 'Righteous', 'Bungee', 'Space Mono', 'Playfair Display', 'Creepster', 'Comfortaa', 'Monoton'];
+    const missing = [];
+    for (const f of families) {
+      try { const got = await document.fonts.load(`16px "${f}"`, 'Hearth'); if (!got.length || got.some((x) => x.status !== 'loaded')) missing.push(f); } catch { missing.push(f); }
+    }
+    const fontFiles = performance.getEntriesByType('resource').map((e) => e.name).filter((n) => /\.woff2(\?|$)|fonts\.(googleapis|gstatic)/.test(n));
+    return { missing, body: getComputedStyle(document.body).fontFamily, fontFiles };
+  });
+  check(!fonts.missing.length, `These fonts didn't load from Hearth: ${fonts.missing.join(', ')}`);
+  check(/^"?Figtree"?,/.test(fonts.body), `The interface font should be Figtree (it is ${fonts.body}).`);
+  const elsewhere = fonts.fontFiles.filter((u) => !u.startsWith(`${t.server.base}/fonts/`));
+  check(fonts.fontFiles.length && !elsewhere.length, `Fonts should only come from ${t.server.base}/fonts/ (also asked: ${elsewhere.join(', ') || 'none'}).`);
+}
+
+// ------------------------------------------------------------------ disappearing messages (a DM, 5 seconds: NODE_ENV=test)
+async function disappearing(t) {
+  const { alice, bob } = t.people;
+  for (const [p, other] of [[alice, 'bob'], [bob, 'alice']]) {
+    await p.railButton('Direct messages');
+    await p.dmRow(other).click();
+    await p.page.waitForSelector(`#composer-input[placeholder="Message ${other}"]`);
+  }
+  // Alice turns it on from the conversation's menu; turning it on asks first and says what it can't do.
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('5 seconds').click();
+  const ask = await alice.dialog('Turn on disappearing messages?');
+  check(/screenshot/.test(await ask.innerText()), 'Turning on disappearing messages should say people can still screenshot what they see.');
+  await ask.locator('.modal-foot .btn.primary').click();
+  // Both screens get the line in the conversation, the timer in the header and the note above the box.
+  await alice.$('#messages .sys-line', { hasText: 'You turned on disappearing messages: 5 seconds' }).waitFor();
+  await bob.$('#messages .sys-line', { hasText: 'turned on disappearing messages: 5 seconds' }).waitFor();
+  for (const p of [alice, bob]) {
+    await p.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').waitFor();
+    await p.$('.cw-main .dis-note', { hasText: 'New messages disappear after 5 seconds.' }).waitFor();
+  }
+  // A message with a picture, mentioning bob (so it lands in his inbox too).
+  await alice.$('.cw-main input[type=file]').setInputFiles([{ name: 'secret.png', mimeType: 'image/png', buffer: makePng(40, 30) }]);
+  const sent = alice.page.waitForRequest((r) => /\/api\/dms\/\w+\/messages$/.test(r.url()) && r.method() === 'POST');
+  await alice.send('@bob this one self-destructs: plum');
+  const body = (await sent).postDataJSON();
+  check(body.ttl === 5 && Array.isArray(body.files) && body.files.length, 'The app should send the timer it encrypted for, with the file.');
+  const onBob = bob.message('self-destructs: plum').first();
+  await onBob.locator('.msg-exp').waitFor();
+  await onBob.locator('img.att-img[src^="blob:"]').waitFor({ timeout: 15000 });
+  const inbox = () => bob.page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('hearth.inbox.')).map((k) => localStorage.getItem(k)).join('').includes('plum'));
+  check(await inbox(), 'The mention should be in bob’s inbox while the message is there.');
+  // Five seconds later it's gone from both screens, its file stops loading, and the inbox entry goes too.
+  await bob.message('self-destructs: plum').waitFor({ state: 'detached', timeout: 20000 });
+  await alice.message('self-destructs: plum').waitFor({ state: 'detached', timeout: 20000 });
+  // (Polled briefly: this app hides it by the server's clock, which it only knows to within a few milliseconds.)
+  let status = 0;
+  for (let i = 0; i < 20 && status !== 404; i++) { status = await bob.page.evaluate(async (u) => (await fetch(u)).status, body.files[0]); if (status !== 404) await bob.page.waitForTimeout(100); }
+  check(status === 404, `A disappeared message’s file should no longer load (got ${status}).`);
+  check(!(await inbox()), 'The inbox entry should go with the message.');
+  // Bob turns it off from the header; new messages stay.
+  await bob.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').click();
+  await bob.menuItem('Off').click();
+  await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).waitFor();
+  await alice.$('#main-head button[aria-label^="Disappearing messages"]').waitFor({ state: 'detached' });
+  await alice.send('This one stays: fig');
+  await bob.message('This one stays: fig').waitFor();
+  check(!(await bob.message('This one stays: fig').locator('.msg-exp').count()), 'A message sent with the timer off should not show a timer.');
+  // Drawn again from scratch (away and back): one divider per day, the timer lines included.
+  await alice.railButton('Home');
+  await alice.railButton('Direct messages');
+  await alice.dmRow('bob').click();
+  await alice.page.waitForSelector('#composer-input[placeholder="Message bob"]');
+  await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).waitFor();
+  const days = await alice.page.$$eval('#messages .day-div', (els) => els.map((e) => e.dataset.day));
+  check(days.length && new Set(days).size === days.length, `Each day should have one divider, timer lines or not (got ${days.join(' | ')}).`);
+  // Who changed it goes by their account: "You" only for alice's own change, anyone else's name drawn apart from it.
+  // Nor can a display name of "You" pass for her own change: his @username follows it, and follows one in look-alike
+  // letters too (a capital Greek upsilon, then "ou").
+  await alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' }).locator('.sys-who', { hasText: 'bob' }).waitFor();
+  await alice.$('#messages .sys-line', { hasText: 'You turned on disappearing messages: 5 seconds' }).locator('.sys-you').waitFor();
+  const bobId = await bob.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  const bobProfile = t.server.rows('SELECT profile FROM users WHERE id = ?', bobId)[0].profile;
+  for (const name of ['You', 'Υou', 'bob']) {
+    if (name === 'bob') t.server.sql('UPDATE users SET profile = ? WHERE id = ?', bobProfile, bobId);
+    else t.server.sql("UPDATE users SET profile = json_set(profile, '$.displayName', ?) WHERE id = ?", name, bobId);
+    await alice.page.reload();
+    await alice.waitApp();
+    await alice.railButton('Direct messages');
+    await alice.dmRow(name).click();
+    await alice.page.waitForSelector(`#composer-input[placeholder="Message ${name}"]`);
+    if (name === 'bob') break;
+    const offLine = alice.$('#messages .sys-line', { hasText: 'turned off disappearing messages' });
+    await offLine.waitFor();
+    const said = await offLine.innerText();
+    check(said.includes(`${name} (@bob) turned off disappearing messages`), `Bob named “${name}” should show with his @username on the line (it says “${said}”).`);
+  }
+  // Turned off while bob's message is on its way: he wrote it expecting it to disappear, so it isn't sent unasked.
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('1 hour').click();
+  await (await alice.dialog('Turn on disappearing messages?')).locator('.modal-foot .btn.primary').click();
+  await bob.$('.cw-main .dis-note', { hasText: 'New messages disappear after 1 hour.' }).waitFor();
+  const ttls = [];
+  let hold = true;
+  await bob.page.route('**/api/dms/*/messages', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    ttls.push(route.request().postDataJSON().ttl);
+    try {
+      if (hold) {
+        hold = false;
+        await alice.$('#main-head button[aria-label="Disappearing messages: 1 hour"]').click();
+        await alice.menuItem('Off').click();
+        await bob.$('.cw-main .dis-note').waitFor({ state: 'hidden' });
+      }
+    } finally { await route.continue(); }
+  });
+  const box = bob.$('#composer-input');
+  await box.fill('Written while it said 1 hour: kiwi');
+  await box.press('Enter');
+  const offAsk = await bob.dialog('Disappearing messages turned off');
+  check(/won’t disappear/.test(await offAsk.innerText()), 'Bob should be asked before his message goes out without a timer.');
+  await offAsk.locator('.modal-foot .btn', { hasText: 'Cancel' }).click();
+  await bob.noModals();
+  await bob.toast('Not sent');
+  check(await box.inputValue() === 'Written while it said 1 hour: kiwi', 'The words should be back in bob’s box.');
+  check(ttls.join() === '3600', `Only the first try should have gone out (got ${ttls.join()}).`);
+  check(!(await alice.message('said 1 hour: kiwi').count()), 'Alice should not have it.');
+  await bob.page.unroute('**/api/dms/*/messages');
+  // Sent again under the timer as it is now: no question.
+  await box.press('Enter');
+  await alice.message('said 1 hour: kiwi').first().waitFor();
+  check(!(await bob.$('.modal').count()), 'Sending under the current timer should not ask.');
+  // A server channel (alice owns the server, so she may set it): a message that arrives live goes at its time by the
+  // apps' own timer, even when the server hasn't deleted it (its copy is given an hour more here, so no delete event
+  // comes).
+  for (const p of [alice, bob]) { await p.railButton(SERVER); await p.openChannel('general'); }
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('5 seconds').click();
+  await (await alice.dialog('Turn on disappearing messages?')).locator('.modal-foot .btn.primary').click();
+  await bob.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').waitFor();
+  await alice.send('Gone by the app’s own timer: quince');
+  await bob.message('own timer: quince').first().waitFor();
+  check(t.server.sql('UPDATE messages SET expires_at = expires_at + 3600000 WHERE expires_at > ?', Date.now()).changes === 1, 'The message should be waiting on the server.');
+  await bob.message('own timer: quince').waitFor({ state: 'detached', timeout: 15000 });
+  await alice.message('own timer: quince').waitFor({ state: 'detached', timeout: 15000 });
+  check(t.server.sql('UPDATE messages SET expires_at = ? WHERE expires_at > ?', Date.now() - 1000, Date.now()).changes === 1, 'The server should still have had it: the apps hid it by themselves.');
+  // Off again for the flows after this one.
+  await alice.$('#main-head button[aria-label="Disappearing messages: 5 seconds"]').click();
+  await alice.menuItem('Off').click();
+  await bob.$('#main-head button[aria-label^="Disappearing messages"]').waitFor({ state: 'detached' });
+}
+
+// ------------------------------------------------------------------ 21. import a Discord server's structure
+// Bob pastes the sample template (test/fixtures/discord-template.json): the preview says what comes over and what
+// is skipped before anything exists, leaving a role and a channel out updates it, and Create opens the new server.
+async function discordImport(t) {
+  const { bob } = t.people;
+  const template = fs.readFileSync(new URL('../fixtures/discord-template.json', import.meta.url), 'utf8');
+  await bob.railButton('Add a server');
+  await bob.page.locator('.modal .choice', { hasText: 'Import from Discord' }).click();
+  const m = await bob.dialog('Import from Discord');
+  // A template link only gives the address to open in the browser; Hearth doesn't fetch it.
+  await m.locator('.field', { hasText: 'Template link' }).locator('input').fill('https://discord.new/hEaRtHtEsT01');
+  const href = await m.locator('a.di-api-link').getAttribute('href');
+  check(href === 'https://discord.com/api/v10/guilds/templates/hEaRtHtEsT01', `The template link should point at Discord's template address (got ${href}).`);
+  await m.locator('textarea.di-json').fill(template);
+  await m.locator('.modal-foot .btn.primary', { hasText: 'Preview' }).click();
+  const p = bob.modal('Import from Discord');
+  await p.locator('.di-list').first().waitFor();
+  await p.locator('.muted-p', { hasText: 'Creates 6 roles, 4 categories and 11 channels' }).waitFor();
+  // What doesn't come over is listed before creating.
+  const skipped = p.locator('.di-section', { hasText: 'These will be skipped' });
+  for (const text of ['Manage threads: Moderator', 'Category Archive: no channels left in it', 'Age-restricted (NSFW) flag: channel-8', 'Verification level']) {
+    await skipped.locator('li', { hasText: text }).waitFor();
+  }
+  await p.locator('.warn-box li', { hasText: 'Read message history (channel-8)' }).waitFor();
+  // Builder's Manage Channels also manages events in Hearth, which it couldn't in Discord: said before creating.
+  await p.locator('.warn-box li', { hasText: 'Manage events (Builder)' }).waitFor();
+  await p.locator('.di-row.di-chan', { hasText: 'Town Hall' }).locator('.di-sub', { hasText: 'Stage' }).waitFor();
+  await p.locator('.di-row.di-chan', { hasText: 'mod-chat' }).locator('.di-lock').waitFor();
+  // Leave a role and a channel out: the server works the plan out again.
+  await p.locator('.di-row', { hasText: 'Muted' }).locator('input[type=checkbox]').uncheck();
+  await p.locator('.di-row.di-chan', { hasText: 'trail-photos' }).locator('input[type=checkbox]').uncheck();
+  await p.locator('.muted-p', { hasText: 'Creates 5 roles, 4 categories and 10 channels' }).waitFor();
+  await p.locator('.field', { hasText: 'Server name' }).locator('input').fill('Pinecone Import');
+  // A slow Create, pressed while a change is still being worked out: nothing turns the button back on meanwhile
+  // (a second press would make a second server).
+  const create = p.locator('.modal-foot .btn.primary', { hasText: 'Create server' });
+  const muted = p.locator('.di-row', { hasText: 'Muted' }).locator('input[type=checkbox]');
+  const held = []; // each request held back, until it has gone on
+  await bob.page.route('**/api/imports/discord', (route) => { const go = new Promise((r) => setTimeout(r, 3000)).then(() => route.continue()); held.push(go); return go; });
+  await muted.check();
+  await muted.uncheck();
+  await create.click();
+  await new Promise((r) => setTimeout(r, 1200));
+  check(await create.isDisabled(), 'Create should stay off while the server is being made.');
+  // Let the held requests through before taking the hold away: unrouting one still waiting would fail it (and, with
+  // more flows after this one, bring the run down).
+  await Promise.all(held);
+  await bob.page.unroute('**/api/imports/discord');
+  await bob.page.locator('#sidebar-head .server-head-name', { hasText: exact('Pinecone Import') }).waitFor();
+  const done = await bob.dialog('Imported Pinecone Import');
+  await done.locator('li', { hasText: 'Muted: you left it out' }).waitFor();
+  // Next, straight on to inviting people: a 30-day link and an announcement to post on Discord, with its expiry.
+  await done.locator('.modal-foot .btn.primary', { hasText: 'Invite people' }).click();
+  const welcome = await bob.dialog('Your server is ready. Invite your people.');
+  await bob.page.waitForFunction(() => /\/invite\/\w+/.test((document.querySelector('.modal.invite-welcome input[aria-label="Invite link"]') || {}).value || ''));
+  const link = await welcome.locator('input[aria-label="Invite link"]').inputValue();
+  check(await welcome.locator('select').first().inputValue() === '720', 'A moving announcement’s link should start at 30 days.');
+  await catchCopies(bob);
+  await welcome.locator('.invite-copy-moving').click();
+  await bob.toast('Announcement copied.');
+  const said = await lastCopy(bob);
+  check(said.includes(link) && said.endsWith('(link expires in 30 days)') && /end-to-end encrypted/.test(said), `The moving announcement should carry the link and its real expiry (got “${said}”).`);
+  await welcome.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
+  await bob.noModals();
+  // 公告 has no letters Hearth keeps, so it's named by its place: 7th, now that trail-photos stayed behind.
+  for (const name of ['welcome', 'announcements', 'mod-chat', 'channel-7', 'Town Hall']) await bob.channelRow(name).waitFor();
+  check(!(await bob.channelRow('trail-photos').count()), 'A channel left out should not be created.');
+  await bob.openChannel('general');
+  await bob.send('First message after the import: pinecone');
+}
+
+// ------------------------------------------------------------------ 22. channel order: drag and drop, and the keyboard
+// Bob (who owns the server now) drags a new channel onto the Voice category's name and then the Voice category above
+// Text; alice, who doesn't manage channels, sees each change at once and has nothing to drag. Then Move down from the
+// channel menu, by keyboard: inside Voice, then on into the next category (collapsed: it opens), with the focus
+// staying on the channel. Last, a menu left open while another of bob's devices reorders doesn't undo that.
+async function channelOrder(t) {
+  const { alice, bob } = t.people;
+  await bob.railButton(SERVER);
+  await alice.railButton(SERVER);
+  await bob.serverMenu('Create channel');
+  const cc = await bob.dialog('Create channel');
+  await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('drag-me');
+  await cc.locator('.modal-foot .btn.primary').click();
+  await bob.page.waitForSelector('#composer-input[placeholder="Message #drag-me"]');
+  await alice.channelRow('drag-me').waitFor();
+  const group = (p, cat) => p.$(`#sidebar-body .cat-group[data-cat="${cat}"]`);
+  const namesIn = (p, cat) => group(p, cat).locator('.ch-row .ch-name').allInnerTexts();
+  const categories = (p) => p.page.locator('#sidebar-body .cat-group').evaluateAll((els) => els.map((e) => e.dataset.cat));
+  check(!(await alice.$('#sidebar-body [draggable="true"]').count()), 'Alice can’t manage channels, so nothing in her channel list should be draggable.');
+  await alice.channelRow('drag-me').locator('.ch-main').click({ button: 'right' });
+  await alice.menuItem('Copy channel link').waitFor();
+  check(!(await alice.menuItem('Move up').count()) && !(await alice.menuItem('Move down').count()), 'Alice’s channel menu should not offer to move channels.');
+  await alice.page.keyboard.press('Escape');
+
+  // Onto the Voice category's name: first in Voice, for alice too.
+  await bob.channelRow('drag-me').locator('.ch-main').dragTo(group(bob, 'Voice').locator('.cat-head'));
+  await group(alice, 'Voice').locator('.ch-row').filter({ has: alice.page.locator('.ch-name', { hasText: exact('drag-me') }) }).waitFor();
+  check((await namesIn(alice, 'Voice'))[0] === 'drag-me', `#drag-me should be first in Voice (alice sees ${(await namesIn(alice, 'Voice')).join(', ')}).`);
+  check(!(await namesIn(alice, 'Text')).includes('drag-me'), '#drag-me should have left Text.');
+
+  // The Voice category above Text, dragged by its name onto the top of Text.
+  await group(bob, 'Voice').locator('.cat-toggle').dragTo(group(bob, 'Text'), { targetPosition: { x: 30, y: 3 } });
+  await alice.page.waitForFunction(() => {
+    const cats = [...document.querySelectorAll('#sidebar-body .cat-group')].map((e) => e.dataset.cat);
+    return cats.indexOf('Voice') >= 0 && cats.indexOf('Voice') < cats.indexOf('Text');
+  });
+  const order = await categories(bob);
+  check(order.indexOf('Voice') === order.indexOf('Text') - 1, `Voice should sit right above Text for bob (${order.join(', ')}).`);
+
+  // The keyboard: Move down from the channel's menu, chosen with Enter. The focus stays on the channel as it moves.
+  const voiceNames = await namesIn(bob, 'Voice');
+  const main = bob.channelRow('drag-me').locator('.ch-main');
+  await main.focus();
+  await main.click({ button: 'right' });
+  await bob.menuItem('Move down').press('Enter');
+  await bob.toast('#drag-me moved down.');
+  await alice.page.waitForFunction((n) => {
+    const rows = [...document.querySelectorAll('#sidebar-body .cat-group[data-cat="Voice"] .ch-row .ch-name')].map((e) => e.textContent);
+    return rows.indexOf('drag-me') === 1 && rows.length === n;
+  }, voiceNames.length);
+  const focusedOn = () => bob.page.evaluate(() => { const r = document.activeElement && document.activeElement.closest('.ch-row'); return r ? r.querySelector('.ch-name').textContent : null; });
+  check(await focusedOn() === 'drag-me', `The focus should stay on #drag-me after moving it (it is on ${await focusedOn()}).`);
+  // At the bottom of Voice, Move down goes on into the category below (Text), first in it.
+  for (let i = 2; i < voiceNames.length; i++) {
+    await main.click({ button: 'right' });
+    await bob.menuItem('Move down').press('Enter');
+    await bob.toast('#drag-me moved down.');
+  }
+  // With Text collapsed and another channel open, so nothing else keeps #drag-me drawn there: Text opens.
+  await bob.openChannel('general');
+  await group(bob, 'Text').locator('.cat-toggle').click();
+  await group(bob, 'Text').locator('.cat-toggle[aria-expanded="false"]').waitFor();
+  await main.focus();
+  await main.click({ button: 'right' });
+  const last = bob.menuItem('Move down');
+  check((await last.innerText()).includes('to Text'), `At the bottom of Voice, Move down should say where it goes (it says “${(await last.innerText()).trim()}”).`);
+  await last.press('Enter');
+  await bob.toast('#drag-me moved to Text.');
+  check(await group(bob, 'Text').locator('.cat-toggle').getAttribute('aria-expanded') === 'true', 'Moving a channel into a collapsed category from its menu should open the category.');
+  check((await namesIn(bob, 'Text'))[0] === 'drag-me', `#drag-me should be first in Text for bob (${(await namesIn(bob, 'Text')).join(', ')}).`);
+  check(await focusedOn() === 'drag-me', `The focus should stay on #drag-me after moving it into a collapsed category (it is on ${await focusedOn()}).`);
+  await alice.page.waitForFunction(() => document.querySelector('#sidebar-body .cat-group[data-cat="Text"] .ch-row .ch-name')?.textContent === 'drag-me');
+
+  // The menu stays open while another of bob's devices moves the last channel of Text to the top. Move down then
+  // goes from the list as it is now (below the next channel), and that other move stands.
+  await main.click({ button: 'right' });
+  const down = bob.menuItem('Move down');
+  await down.waitFor();
+  const lastInText = await bob.page.evaluate(async (name) => {
+    const token = localStorage.getItem('hearth.token');
+    const call = async (method, path, body) => (await fetch('/api' + path, { method, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) })).json();
+    const s = (await call('GET', '/bootstrap')).servers.find((x) => x.name === name);
+    const catOf = (c) => c.category || (c.type === 'voice' ? 'Voice' : 'Text');
+    const chans = [...s.channels].sort((a, b) => a.position - b.position);
+    const seen = [...new Set(chans.map(catOf))];
+    const cats = [...s.categoryOrder.filter((k) => seen.includes(k)), ...seen.filter((k) => !s.categoryOrder.includes(k))];
+    const groups = cats.map((k) => chans.filter((c) => catOf(c) === k));
+    const text = groups[cats.indexOf('Text')];
+    const moved = text.pop();
+    text.unshift(moved);
+    await call('POST', `/servers/${s.id}/channel-order`, { ids: groups.flat().map((c) => c.id) });
+    return moved.name;
+  }, SERVER);
+  await bob.page.waitForFunction((n) => document.querySelector('#sidebar-body .cat-group[data-cat="Text"] .ch-row .ch-name')?.textContent === n, lastInText);
+  const was = await namesIn(bob, 'Text');
+  check(was[1] === 'drag-me' && was.length >= 3, `Text should read ${lastInText}, drag-me, … for bob (${was.join(', ')}).`);
+  await down.press('Enter');
+  await bob.toast('#drag-me moved down.');
+  await bob.page.waitForFunction((n) => [...document.querySelectorAll('#sidebar-body .cat-group[data-cat="Text"] .ch-row .ch-name')].map((e) => e.textContent).indexOf('drag-me') === n, 2);
+  const now = await namesIn(bob, 'Text');
+  check(now[0] === lastInText && now[1] === was[2], `The other device's move should stand, with #drag-me below ${was[2]} (Text reads ${now.join(', ')}).`);
+  check(await focusedOn() === 'drag-me', `The focus should be on #drag-me after the move (it is on ${await focusedOn()}).`);
+}
+
+// ------------------------------------------------------------------ 23. away after inactivity, a custom status that clears itself
+// Dana (new, in the server) sets "Away after" to 5 minutes. With her page's clock moved six minutes on and no input,
+// Alice sees her go Away by herself, and Online again the moment she moves the mouse; Dana's own panel changes in
+// place (its buttons aren't rebuilt under her pointer). Dana saves a custom status in Settings → Profile and clears
+// it again in the same tab. Alice sets a status that clears after 30 minutes: Bob sees it, and when it's due the
+// server clears it for both of them without a reload.
+async function awayAndStatus(t) {
+  const { alice, bob } = t.people;
+  await bob.railButton(SERVER);
+  const link = await bob.inviteLink();
+  t.pw.dana = newPassword();
+  const dana = await t.open('dana');
+  await dana.register('dana', t.pw.dana);
+  await dana.openSettings('Privacy & safety');
+  const after = dana.$('select[aria-label="Show me as Away after"]');
+  check((await after.inputValue()) === '10', 'Away after should start at 10 minutes.');
+  await after.selectOption('5');
+  await dana.toast('Saved.');
+  await dana.closeSettings();
+  // Joined after that, so nothing has sent the app a whole new copy of Dana since: what joining leaves differs from
+  // the server's copy without anything changing (her public copy has no keysReset, and the server bar put the new
+  // server in her folder order on this device only). Going Away must still be just the dots.
+  await dana.join(link, SERVER);
+
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await alice.showMembers();
+  const danaRow = alice.member('dana');
+  await danaRow.locator('.status-dot.st-online').waitFor();
+  const gearKept = () => dana.page.evaluate(() => !!(window.e2eGear && window.e2eGear.isConnected));
+  await dana.page.evaluate(() => { window.e2eGear = document.querySelector('#user-panel button[aria-label="Settings"]'); });
+  // Six minutes without input (only the page's clock moves; its timers keep running).
+  await dana.page.clock.setFixedTime(Date.now() + 6 * 60000);
+  await danaRow.locator('.status-dot.st-idle').waitFor({ timeout: 40000 });
+  await dana.$('#user-panel .me-sub', { hasText: 'Away (inactive)' }).waitFor();
+  await dana.$('#user-panel .status-dot.st-idle').waitFor();
+  check(await gearKept(), 'Going Away by herself should change Dana\u2019s panel in place, not rebuild its buttons.');
+  // Back: moving the mouse is enough, without waiting for the next check.
+  await dana.page.mouse.move(300, 300);
+  await dana.page.mouse.move(340, 320);
+  await danaRow.locator('.status-dot.st-online').waitFor({ timeout: 10000 });
+  await dana.$('#user-panel .me-sub', { hasText: 'Online' }).waitFor();
+  check(await gearKept(), 'Coming back should not rebuild Dana\u2019s panel either.');
+
+  // Settings → Profile: a custom status saved there, then cleared again in the same tab (which reloads after each
+  // save, so the second save sees the status changed).
+  await dana.openSettings('Profile');
+  const csText = dana.$('.settings-modal input[aria-label="Status text"]');
+  await csText.fill('Lunch');
+  await dana.$('.settings-modal .save-bar button', { hasText: 'Save changes' }).click();
+  await dana.toast('Profile saved.');
+  // (Settings covers the user panel, so these only need it to be in the page.)
+  await dana.$('#user-panel .me-sub', { hasText: 'Lunch' }).waitFor({ state: 'attached' });
+  check((await csText.inputValue()) === 'Lunch', 'The reloaded Profile tab should show the saved status.');
+  await csText.fill('');
+  await dana.$('.settings-modal .save-bar button', { hasText: 'Save changes' }).click();
+  await dana.$('#user-panel .me-sub', { hasText: 'Online' }).waitFor({ state: 'attached' });
+  check(!(await dana.$('#toasts .toast-error').count()), `Saving the profile should show no error (got ${JSON.stringify(await dana.$('#toasts .toast-error').allTextContents())}).`);
+  await dana.closeSettings();
+  await dana.close();
+
+  // A status that clears itself after 30 minutes.
+  await alice.$('#user-panel .me-btn').click();
+  await alice.$('.popover .menu-item', { hasText: 'Set a custom status' }).click();
+  let m = await alice.dialog('Set a custom status');
+  await m.locator('input[aria-label="Status text"]').fill('Out for lunch');
+  check((await m.locator('select[aria-label="Clear after"]').inputValue()) === 'never', 'A new status should stay until cleared unless told otherwise.');
+  await m.locator('select[aria-label="Clear after"]').selectOption('30m');
+  await m.locator('.field-hint', { hasText: /^Clears (at|tomorrow at) / }).waitFor();
+  await m.locator('.modal-foot .btn.primary', { hasText: 'Save' }).click();
+  await alice.noModals();
+  await alice.$('#user-panel .me-sub', { hasText: 'Out for lunch' }).waitFor();
+  await bob.openChannel('general');
+  await bob.showMembers();
+  const status = bob.member('Alice Wonder').locator('.member-status', { hasText: 'Out for lunch' });
+  await status.waitFor();
+  // Opening it again keeps the time it clears unless she picks another.
+  await alice.$('#user-panel .me-btn').click();
+  await alice.$('.popover .menu-item', { hasText: 'Set a custom status' }).click();
+  m = await alice.dialog('Set a custom status');
+  check((await m.locator('select[aria-label="Clear after"]').inputValue()) === 'keep', 'Reopening should offer to keep the time it clears.');
+  await m.locator('.modal-x').click();
+  await alice.noModals();
+  // Due (as if the half hour had passed): cleared by the server, live, for both.
+  const aliceId = await alice.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  t.server.sql('UPDATE users SET status_expires_at = ? WHERE id = ?', Date.now() - 1000, aliceId);
+  await status.waitFor({ state: 'detached', timeout: 30000 });
+  await alice.$('#user-panel .me-sub', { hasText: 'Out for lunch' }).waitFor({ state: 'detached', timeout: 10000 });
+}
+
+// ------------------------------------------------------------------ 24. text chat in a voice channel
+// The chat opens beside the call view (from the voice channel's menu, or the header's chat button), messages go both
+// ways end-to-end encrypted, and threads aren't offered there. A chat bob never opened doesn't light up for him (a
+// ping still does); once he has opened it, new messages count as unread like any channel's. Pinned messages open in
+// the chat's place and Jump goes back to it. "All messages" on a chat alice never opened makes it count (dot and
+// sound); in a call whose chat she never opened, "New messages" goes above what was said since she joined.
+async function voiceChat(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  // Alice opens the Lounge's chat from its menu: the call view with the chat beside it, without joining the call.
+  await alice.channelRow('Lounge').click({ button: 'right' });
+  await alice.menuItem('Open chat').click();
+  await alice.$('#members[data-mode="chat"] #composer-input[placeholder="Message \u{1F50A} Lounge"]').waitFor();
+  await alice.$('.voice-room .cs-controls button', { hasText: 'Join call' }).waitFor();
+  await alice.send('Anyone up for a round in the Lounge?');
+  // Bob never opened it: a plain message doesn't light it up for him, a ping does.
+  await alice.send('@bob come join us');
+  const lounge = bob.channelRow('Lounge');
+  await lounge.locator('.badge', { hasText: exact('1') }).waitFor();
+  check(!(await lounge.evaluate((el) => el.classList.contains('unread'))), 'A voice chat Bob never opened should show only his ping, not as unread.');
+  // He opens it from the menu too: both messages, decrypted, and the ping is read.
+  await lounge.click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.message('Anyone up for a round in the Lounge?').waitFor();
+  check(!(await bob.$('#messages .msg-text.undecryptable').count()), 'Bob should be able to decrypt the voice chat.');
+  await lounge.locator('.badge').waitFor({ state: 'detached' });
+  await bob.send('On my way');
+  await alice.message('On my way').waitFor();
+  // A picture link to another site waits for a click here too (Ask first, the default), as in any channel (xss-8).
+  const picHost = 'pics.outside-site.test';
+  const picHits = [];
+  await bob.page.route(`https://${picHost}/**`, (route) => { picHits.push(route.request().url()); route.fulfill({ status: 200, contentType: 'image/png', body: makePng(40, 30) }); });
+  try {
+    await alice.send(`Lounge snapshot https://${picHost}/lounge.png`);
+    const snap = bob.message('Lounge snapshot');
+    await snap.locator('.embed-ask').waitFor();
+    check(!(await snap.locator('img.embed-img').count()) && !picHits.length, `A picture link in a voice chat should wait for a click (fetched ${picHits.join(', ')}).`);
+    await snap.locator('.embed-ask button', { hasText: exact('Load image') }).click();
+    await bob.message('Lounge snapshot').locator('img.embed-img').waitFor();
+    check(picHits.length === 1, `After the click, the picture should load once (fetched ${picHits.join(', ')}).`);
+  } finally { await bob.page.unroute(`https://${picHost}/**`); }
+  // No threads in a voice channel's chat.
+  const onAlice = alice.message('On my way').first();
+  await onAlice.hover();
+  await onAlice.locator('button[aria-label="Add reaction"]').waitFor();
+  check(!(await onAlice.locator('button[aria-label="Reply in thread"]').count()), 'A voice chat message should not offer a thread.');
+  // The header's chat button hides and shows it.
+  await alice.$('#main-head button[aria-label="Hide chat"]').click();
+  await alice.page.waitForSelector('#members', { state: 'hidden' });
+  await alice.$('#main-head button[aria-label^="Show chat"]').click();
+  await alice.message('On my way').waitFor();
+  // Now that Bob has opened it, a new message counts as unread for him while he's elsewhere.
+  await bob.openChannel('general');
+  await alice.send('Bring snacks');
+  await bob.$('#sidebar-body .ch-row.unread').filter({ has: bob.$('.ch-name', { hasText: exact('Lounge') }) }).waitFor();
+
+  // Pinned messages show in the chat's place; Jump goes back to the chat, at the message (bob owns the server since
+  // the step-up flow, so he pins).
+  await bob.channelRow('Lounge').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.send('pin me please zebra');
+  await bob.messageAction('pin me please zebra', 'Pin message');
+  await bob.toast('Message pinned.');
+  await bob.$('#main-head button[aria-label="More"]').click();
+  await bob.menuItem('Pinned messages').click();
+  await bob.$('#members[data-mode="pins"] .pin-card', { hasText: 'pin me please zebra' }).locator('button', { hasText: 'Jump' }).click();
+  await bob.$('#members[data-mode="chat"] #messages .msg.flash', { hasText: 'pin me please zebra' }).waitFor();
+  check(!(await bob.$('#toasts .toast', { hasText: 'That message was deleted' }).count()), 'Jump from the pins of a voice chat should find the message.');
+
+  // Two new voice channels whose chats alice has never opened. (Her chat button is set to hide the chat from now on.)
+  await alice.$('#main-head button[aria-label="Hide chat"]').click();
+  await alice.page.waitForSelector('#members', { state: 'hidden' });
+  for (const name of ['Den', 'Nook']) {
+    await bob.serverMenu('Create channel');
+    const cc = await bob.dialog('Create channel');
+    await cc.locator('.radio-card', { hasText: 'Voice' }).click();
+    await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill(name);
+    await cc.locator('.modal-foot .btn.primary').click();
+    await bob.noModals();
+    await alice.channelRow(name).waitFor();
+  }
+  // Alice picks "All messages" for the Den's chat: from then on it counts for her (an unread dot and the sound).
+  await alice.channelRow('Den').click({ button: 'right' });
+  const saved = alice.page.waitForResponse((r) => r.url().includes('/api/me/notify/') && r.request().method() === 'PUT');
+  await alice.menuItem('All messages').click();
+  await saved;
+  await bob.channelRow('Den').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.$('#members[data-mode="chat"] #composer-input[placeholder="Message \u{1F50A} Den"]').waitFor();
+  await bob.send('den news');
+  const denId = await bob.message('den news').first().getAttribute('data-mid');
+  await alice.$('#sidebar-body .ch-row.unread').filter({ has: alice.$('.ch-name', { hasText: exact('Den') }) }).waitFor();
+  await alice.page.waitForFunction((id) => (localStorage.getItem('hearth.notified') || '').includes(id), denId);
+
+  // Alice joins the Nook's call (its chat hidden, never opened): what's said meanwhile counts, and opening the chat
+  // puts "New messages" right above it, not above everything said before she came.
+  await bob.channelRow('Nook').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.$('#members[data-mode="chat"] #composer-input[placeholder="Message \u{1F50A} Nook"]').waitFor();
+  await bob.send('before the call 1');
+  await bob.send('before the call 2');
+  await alice.channelRow('Nook').locator('.ch-main').click();
+  await alice.$('#sidebar-body .vc-user', { hasText: 'Alice Wonder' }).waitFor();
+  await alice.$('#main-head button[aria-label="Show chat"]').waitFor();
+  check(!(await alice.$('#main-head button[aria-label="Show chat"][aria-pressed]').count()), 'The chat button names what it does; it has no pressed state too.');
+  await bob.send('during the call');
+  await alice.$('#main-head button[aria-label="Show chat \u00b7 new messages"]').click();
+  await alice.message('during the call').waitFor();
+  await alice.$('#unread-bar', { hasText: '1 new message since' }).waitFor();
+  check(await alice.page.evaluate(() => { const d = document.querySelector('#new-div'); return !!(d && d.nextElementSibling && d.nextElementSibling.textContent.includes('during the call')); }),
+    '"New messages" should sit right above the message said during the call.');
+
+  // Back to a text channel for whatever runs next (the chat stays closed next time).
+  await alice.$('#main-head button[aria-label="Hide chat"]').click();
+  await alice.page.waitForSelector('#members', { state: 'hidden' });
+  await alice.$('#voice-panel button[aria-label="Leave call"]').click();
+  await alice.$('#sidebar-body .vc-user', { hasText: 'Alice Wonder' }).waitFor({ state: 'detached' });
+  await alice.openChannel('general');
+  await bob.openChannel('general');
+}
+
+// ------------------------------------------------------------------ 25. send later (scheduled messages)
+async function sendLater(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const box = alice.$('#composer-input');
+  // A right-click on the send button offers the same choices as the clock next to it.
+  await box.fill('Scheduled: the pineapple party starts at noon');
+  await alice.$('.cw-main .send-btn').click({ button: 'right' });
+  await alice.menuItem('Tomorrow morning').waitFor();
+  await alice.page.keyboard.press('Escape');
+  // The clock: pick "In 1 hour". The box empties and a bar above it says what's waiting.
+  await alice.$('.cw-main button[aria-label="Send later"]').click();
+  await alice.menuItem('In 1 hour').click();
+  await alice.toast('Scheduled for');
+  check(!(await box.inputValue()), 'The box should be empty once the message is scheduled.');
+  const bar = alice.$('.cw-main .sched-bar');
+  await bar.filter({ hasText: '1 message scheduled here' }).waitFor();
+  check(!(await bob.message('pineapple party').count()), 'Bob should not see a scheduled message before its time.');
+
+  // The list decrypts it on Alice's device. Edit the words, pick another time, then send it now.
+  await bar.locator('button', { hasText: exact('View') }).click();
+  const dlg = await alice.dialog('Scheduled messages');
+  const item = dlg.locator('.sched-item');
+  await item.locator('.sched-text', { hasText: 'the pineapple party starts at noon' }).waitFor();
+  check((await item.locator('.sched-when').innerText()).startsWith('Sends '), 'The list should say when it goes out.');
+  await item.locator('button', { hasText: exact('Edit') }).click();
+  const ed = dlg.locator('textarea.sched-edit');
+  await ed.fill('Scheduled: the pineapple party starts at one');
+  await ed.press('Enter');
+  await item.locator('.sched-text', { hasText: 'starts at one' }).waitFor();
+  await item.locator('button', { hasText: exact('Reschedule') }).click();
+  await alice.menuItem('Pick a date and time…').click();
+  const pick = await alice.dialog('Reschedule');
+  const d = new Date(Date.now() + 2 * 86400000);
+  d.setHours(15, 30, 0, 0);
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  await pick.locator('input[type="datetime-local"]').fill(local);
+  await pick.locator('.modal-foot .btn.primary').click();
+  await alice.toast('Rescheduled for');
+  await item.locator('.sched-when', { hasText: /3:30/ }).waitFor();
+  check(!(await bob.message('pineapple party').count()), 'Editing and rescheduling should not send anything.');
+  await item.locator('button', { hasText: exact('Send now') }).click();
+  await bob.message('the pineapple party starts at one').waitFor(); // decrypted on bob's device
+  check(!(await bob.message('starts at noon').count()), 'Bob should only ever get the edited words.');
+  await dlg.locator('.sched-list .panel-empty').waitFor();
+  await dlg.locator('.modal-x').click();
+  await bar.waitFor({ state: 'detached' });
+
+  // In a DM: schedule, find it from the conversation's ⋯ menu, cancel it. Bob never gets it.
+  await alice.railButton('Direct messages');
+  await alice.dmRow('bob').click();
+  await alice.page.waitForSelector('#composer-input[placeholder="Message bob"]');
+  await box.fill('A DM for later that never goes out');
+  await alice.$('.cw-main button[aria-label="Send later"]').click();
+  await alice.menuItem('In 3 hours').click();
+  await alice.toast('Scheduled for');
+  await alice.$('#main-head button[aria-label="More"]').click();
+  await alice.menuItem('Scheduled messages').click();
+  const dm = await alice.dialog('Scheduled messages');
+  await dm.locator('.sched-text', { hasText: 'never goes out' }).waitFor();
+  await dm.locator('.sched-item button', { hasText: exact('Cancel') }).click();
+  const sure = await alice.dialog('Cancel this scheduled message?');
+  await sure.locator('.modal-foot .btn.danger').click();
+  await dm.locator('.sched-list .panel-empty').waitFor();
+  await dm.locator('.modal-x').click();
+  await alice.$('.cw-main .sched-bar').waitFor({ state: 'detached' });
+
+  // The key changes while one waits: alice leaves and comes back. Bob's open app re-encrypts his scheduled message
+  // with each new key by itself (the server never posts it with the old one), and it still goes out readable.
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.$('#composer-input').fill('Scheduled before the key changed: kiwi');
+  await bob.$('.cw-main button[aria-label="Send later"]').click();
+  await bob.menuItem('In 3 hours').click();
+  await bob.toast('Scheduled for');
+  const held = () => t.server.rows("SELECT epoch, status FROM scheduled_messages WHERE status != 'failed' ORDER BY created_at DESC LIMIT 1")[0];
+  const first = held();
+  check(first && first.status === 'pending', 'The scheduled message should be waiting on the server.');
+  await alice.railButton(SERVER);
+  await alice.serverMenu('Leave server');
+  await alice.modal(`Leave ${SERVER}?`).locator('.modal-foot .btn.danger').click();
+  await alice.$(`#rail button[aria-label="${SERVER}"]`).waitFor({ state: 'detached' });
+  await alice.join(await bob.inviteLink(), SERVER);
+  const keyNow = () => t.server.rows('SELECT key_epoch, needs_rotation FROM servers WHERE name = ?', SERVER)[0];
+  for (const until = Date.now() + 30000; ; await new Promise((r) => setTimeout(r, 200))) {
+    const row = held(); const k = keyNow();
+    if (row && row.status === 'pending' && !k.needs_rotation && row.epoch === k.key_epoch && row.epoch > first.epoch) break;
+    check(Date.now() < until, `Bob's app should re-encrypt the held message with the new key (it has epoch ${row && row.epoch}, ${row && row.status}; the server is at ${k.key_epoch}).`);
+  }
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const kl = await bob.dialog('Scheduled messages');
+  await kl.locator('.sched-item .sched-text', { hasText: 'kiwi' }).waitFor();
+  await kl.locator('.sched-item button', { hasText: exact('Send now') }).click();
+  await kl.locator('.sched-list .panel-empty').waitFor();
+  await kl.locator('.modal-x').click();
+  // Decrypted on alice's device, with the key made after she came back (older messages from while she was away stay
+  // closed to her, as they should).
+  await alice.openChannel('general');
+  await alice.message('Scheduled before the key changed: kiwi').waitFor();
+
+  // The server (or someone with Bob's session token) slips "held" messages into Bob's list: one of his own old
+  // messages from an earlier key, and the same with a made-up copy. His app must never re-encrypt and re-sign them
+  // (that would hand the old words to people who joined since, under his name): it re-encrypts only from his own
+  // copy, which nobody without his keys can make. They show as unconfirmed, with Cancel only.
+  const bobId = await bob.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  const hall = t.server.rows('SELECT id, key_epoch FROM servers WHERE name = ?', SERVER)[0];
+  const general = t.server.rows("SELECT id FROM channels WHERE server_id = ? AND name = 'general'", hall.id)[0];
+  const old = t.server.rows('SELECT ciphertext, epoch FROM messages WHERE author_id = ? AND channel_id = ? AND thread_id IS NULL AND epoch < ? ORDER BY created_at DESC LIMIT 1', bobId, general.id, hall.key_epoch)[0];
+  check(old, 'Bob should have an older message in #general from before the key changed.');
+  const keys = t.server.rows('SELECT public_key, sign_public_key FROM users WHERE id = ?', bobId)[0];
+  const ownKey = crypto.createHash('sha256').update(['c', keys.public_key, keys.sign_public_key].join('|')).digest('base64').slice(0, 24);
+  const plant = (id, draft) => t.server.sql(`INSERT INTO scheduled_messages (id, user_id, server_id, channel_id, ciphertext, epoch, ref, draft, own_key, send_at, status, reason, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', 'key', ?, ?)`, id, bobId, hall.id, general.id, old.ciphertext, old.epoch, crypto.randomBytes(12).toString('hex'), draft, ownKey, Date.now() + 2 * 3600000, Date.now(), Date.now());
+  plant('plantedold' + crypto.randomBytes(4).toString('hex'), null);
+  plant('plantedfake' + crypto.randomBytes(4).toString('hex'), 'x1:' + crypto.randomBytes(120).toString('base64'));
+  const patches = [];
+  bob.page.on('request', (r) => { if (r.method() === 'PATCH' && r.url().includes('/api/scheduled-messages/')) patches.push(r.url()); });
+  await bob.page.reload();
+  await bob.waitApp();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.$('.cw-main .sched-bar', { hasText: '2 messages scheduled here' }).waitFor();
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const fake = await bob.dialog('Scheduled messages');
+  await fake.locator('.sched-item .sched-text', { hasText: 'can’t confirm you wrote this one' }).nth(1).waitFor();
+  for (const card of await fake.locator('.sched-item').all()) {
+    const labels = (await card.locator('.sched-actions button').allInnerTexts()).map((x) => x.trim());
+    check(labels.join() === 'Cancel', `An unconfirmed scheduled message should only offer Cancel (it offers ${labels.join(', ')}).`);
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+  const planted = t.server.rows("SELECT status, ciphertext, epoch FROM scheduled_messages WHERE id LIKE 'planted%'");
+  check(planted.length === 2 && planted.every((x) => x.status === 'held' && x.ciphertext === old.ciphertext && x.epoch === old.epoch),
+    'Bob’s app should leave scheduled messages it can’t confirm exactly as they were.');
+  check(!patches.length, `Bob’s app should never re-encrypt a scheduled message it can’t confirm (it sent ${patches.length} PATCH requests).`);
+  for (const left of [1, 0]) {
+    await fake.locator('.sched-item button', { hasText: exact('Cancel') }).first().click();
+    await (await bob.dialog('Cancel this scheduled message?')).locator('.modal-foot .btn.danger').click();
+    await fake.locator('.sched-item').nth(left).waitFor({ state: 'detached' });
+  }
+  await fake.locator('.sched-list .panel-empty').waitFor();
+  await fake.locator('.modal-x').click();
+
+  // Someone with Bob's session token (no keys) keeps his own copy of a scheduled message, and after he cancels it puts
+  // it back as new scheduled messages held for a key change. Those copies open with his keys, but his app must not
+  // re-encrypt and re-sign the withdrawn words by itself: the copy naming the cancelled one shows as unconfirmed
+  // (Cancel only), and the one as the composer first sealed it (before the server answered) waits for him (Keep).
+  const firstPost = bob.page.waitForRequest((r) => r.method() === 'POST' && /\/api\/channels\/\w+\/scheduled-messages$/.test(r.url()));
+  await bob.$('#composer-input').fill('Scheduled, then withdrawn: guava');
+  await bob.$('.cw-main button[aria-label="Send later"]').click();
+  await bob.menuItem('In 3 hours').click();
+  const firstCopy = (await firstPost).postDataJSON();
+  await bob.toast('Scheduled for');
+  const guava = t.server.rows("SELECT id, ref, draft FROM scheduled_messages WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", bobId)[0];
+  check(guava && guava.ref === firstCopy.ref && guava.draft !== firstCopy.draft, 'Bob’s app should seal its copy again, naming the scheduled message, once the server has answered.');
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const gl = await bob.dialog('Scheduled messages');
+  await gl.locator('.sched-item .sched-text', { hasText: 'withdrawn: guava' }).waitFor();
+  await gl.locator('.sched-item button', { hasText: exact('Cancel') }).click();
+  await (await bob.dialog('Cancel this scheduled message?')).locator('.modal-foot .btn.danger').click();
+  await gl.locator('.sched-list .panel-empty').waitFor();
+  await gl.locator('.modal-x').click();
+  const putBack = (id, draft) => t.server.sql(`INSERT INTO scheduled_messages (id, user_id, server_id, channel_id, ciphertext, epoch, ref, draft, own_key, send_at, status, reason, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'held', 'key', ?, ?)`, id, bobId, hall.id, general.id, old.ciphertext, old.epoch, guava.ref, draft, ownKey, Date.now() + 2 * 3600000, Date.now(), Date.now());
+  putBack('replaybound' + crypto.randomBytes(4).toString('hex'), guava.draft);
+  putBack('replayfirst' + crypto.randomBytes(4).toString('hex'), firstCopy.draft);
+  const patchesBefore = patches.length;
+  await bob.page.reload();
+  await bob.waitApp();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.$('.cw-main .sched-bar', { hasText: '1 scheduled message is waiting for you' }).waitFor();
+  await bob.$('.cw-main .sched-bar button', { hasText: exact('View') }).click();
+  const rl = await bob.dialog('Scheduled messages');
+  const waits = rl.locator('.sched-item', { hasText: 'withdrawn: guava' });
+  await waits.locator('.sched-note', { hasText: 'this one waits for you' }).waitFor();
+  const wl = (await waits.locator('.sched-actions button').allInnerTexts()).map((x) => x.trim());
+  check(wl[0] === 'Keep' && wl.includes('Cancel'), `A copy Bob’s app can’t tell he still wants sent should wait for him, Keep first (it offers ${wl.join(', ')}).`);
+  check((await waits.locator('.sched-when').innerText()).startsWith('Waiting for you'), 'The card should say it waits for Bob.');
+  await rl.locator('.sched-item .sched-text', { hasText: 'can’t confirm you wrote this one' }).waitFor();
+  await new Promise((r) => setTimeout(r, 1500));
+  check(patches.length === patchesBefore, `Bob’s app should never re-encrypt a copy put back after he cancelled it (it sent ${patches.length - patchesBefore} PATCH requests).`);
+  const back = t.server.rows("SELECT status, ciphertext FROM scheduled_messages WHERE id LIKE 'replay%'");
+  check(back.length === 2 && back.every((x) => x.status === 'held' && x.ciphertext === old.ciphertext), 'Both should still be waiting, exactly as they were.');
+  for (const left of [1, 0]) {
+    await rl.locator('.sched-item button', { hasText: exact('Cancel') }).first().click();
+    await (await bob.dialog('Cancel this scheduled message?')).locator('.modal-foot .btn.danger').click();
+    await rl.locator('.sched-item').nth(left).waitFor({ state: 'detached' });
+  }
+  await rl.locator('.sched-list .panel-empty').waitFor();
+  await rl.locator('.modal-x').click();
+
+  // One scheduled from a session that has been signed out since waits for its owner, and one whose time has passed
+  // isn't sent by saving an edit without asking. (The server holds it when the session ends; here that's done in
+  // the database, along with moving its time three hours back.)
+  await alice.$('#composer-input').fill('Scheduled from a laptop: tamarind');
+  await alice.$('.cw-main button[aria-label="Send later"]').click();
+  await alice.menuItem('In 3 hours').click();
+  await alice.toast('Scheduled for');
+  const aliceId = await alice.page.evaluate(() => localStorage.getItem('hearth.userId'));
+  const tama = t.server.rows("SELECT id FROM scheduled_messages WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", aliceId)[0];
+  t.server.sql("UPDATE scheduled_messages SET status = 'held', reason = 'session_ended', send_at = ? WHERE id = ?", Date.now() - 3 * 3600000, tama.id);
+  const alicePatches = [];
+  alice.page.on('request', (r) => { if (r.method() === 'PATCH' && r.url().includes('/api/scheduled-messages/')) alicePatches.push(r.url()); });
+  await alice.page.reload();
+  await alice.waitApp();
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  const abar = alice.$('.cw-main .sched-bar', { hasText: '1 scheduled message is waiting for you' });
+  await abar.waitFor();
+  await abar.locator('button', { hasText: exact('View') }).click();
+  const ad = await alice.dialog('Scheduled messages');
+  const mcard = ad.locator('.sched-item');
+  await mcard.locator('.sched-text', { hasText: 'tamarind' }).waitFor();
+  const mwhen = await mcard.locator('.sched-when').innerText();
+  check(/^Waiting · was due (today|yesterday) at /.test(mwhen), `The card should say when it was due, mid-sentence (it says “${mwhen}”).`);
+  check(!alicePatches.length, 'Alice’s app should not confirm a message from a signed-out session by itself.');
+  await mcard.locator('button', { hasText: exact('Edit') }).click();
+  const med = ad.locator('textarea.sched-edit');
+  await med.fill('Scheduled from a laptop: tamarind and lime');
+  await med.press('Enter');
+  const late = await alice.dialog('Its time has passed');
+  await late.locator('.modal-foot .btn', { hasText: exact('Cancel') }).click();
+  await new Promise((r) => setTimeout(r, 500));
+  check(t.server.rows('SELECT status FROM scheduled_messages WHERE id = ?', tama.id)[0].status === 'held', 'Saving an edit of an overdue message should ask before sending it.');
+  check(!(await bob.message('from a laptop: tamarind').count()), 'Bob should not get it before Alice says so.');
+  await med.press('Escape');
+  await mcard.locator('button', { hasText: exact('Keep') }).click();
+  await (await alice.dialog('Its time has passed')).locator('.modal-foot .btn.primary', { hasText: exact('Send now') }).click();
+  await alice.toast('Sent.');
+  await bob.message('Scheduled from a laptop: tamarind').waitFor();
+  await ad.locator('.sched-list .panel-empty').waitFor();
+  await ad.locator('.modal-x').click();
+}
+
+// ------------------------------------------------------------------ 26. nicknames
+// Alice picks a nickname in the server: bob sees it in the member list, on her messages and in @mention suggestions
+// (picking it still writes her username), while her profile card keeps her display name and says what she's called
+// here. Bob (the owner) changes it for her from the member menu, then removes it; her own app follows each time,
+// and the audit log has all three.
+async function nicknames(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await alice.serverMenu('Change nickname');
+  const mine = await alice.dialog('Change your nickname');
+  await mine.locator('input').fill('Hall Alice');
+  await mine.locator('.modal-foot .btn.primary').click();
+  await alice.toast('Your nickname in E2E Hall is now Hall Alice.');
+  await bob.showMembers();
+  await bob.member('Hall Alice').waitFor();
+  check(!(await bob.member('Alice Wonder').count()), 'Bob’s member list should show Alice’s nickname instead of her display name.');
+  // Bob speaks first, so her message starts a new group and shows her name.
+  await bob.send('Anyone here? pear');
+  await alice.message('Anyone here? pear').waitFor();
+  await alice.send('Nickname check: quince');
+  await bob.message('Nickname check: quince').locator('.msg-name', { hasText: 'Hall Alice' }).waitFor();
+
+  // Her profile card leads with her display name, and says what she goes by here.
+  await bob.member('Hall Alice').click();
+  const pop = bob.page.locator('.pop-profile');
+  await pop.locator('.pc-name', { hasText: 'Alice Wonder' }).waitFor();
+  await pop.locator('.pc-nick', { hasText: 'Hall Alice' }).waitFor();
+  await bob.page.keyboard.press('Escape');
+  await pop.waitFor({ state: 'detached' });
+
+  // @mention suggestions find her by the nickname and show it; picking her writes her username.
+  const box = bob.$('#composer-input');
+  await box.fill('@hall');
+  const suggestion = bob.page.locator('.suggest-item', { hasText: 'Hall Alice' });
+  await suggestion.waitFor();
+  await suggestion.click();
+  const written = await box.inputValue();
+  check(/^@alice\w* $/.test(written), `Picking the suggestion should write her username, not the nickname (wrote “${written}”).`);
+  await box.fill('');
+
+  // Bob is above her: he changes it from the member menu, and her own app follows.
+  await bob.member('Hall Alice').click({ button: 'right' });
+  await bob.menuItem('Change nickname…').click();
+  let theirs = await bob.dialog('Change Alice Wonder');
+  await theirs.locator('input').fill('Quince Queen');
+  await theirs.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  await alice.showMembers();
+  await alice.member('Quince Queen').waitFor();
+  // Removing it: back to her display name in the server, on her messages too.
+  await bob.member('Quince Queen').click({ button: 'right' });
+  await bob.menuItem('Change nickname…').click();
+  theirs = await bob.dialog('Change Alice Wonder');
+  await theirs.locator('.modal-foot .btn', { hasText: 'Remove nickname' }).click();
+  await bob.noModals();
+  await alice.member('Alice Wonder').waitFor();
+  await bob.message('Nickname check: quince').locator('.msg-name', { hasText: 'Alice Wonder' }).waitFor();
+
+  // The server's audit log has each change, the first marked as her own.
+  await bob.serverMenu('Server settings');
+  const ss = bob.page.locator('.modal.server-settings');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: 'Alice Wonder set their nickname to “Hall Alice”' }).waitFor();
+  await ss.locator('.audit-row', { hasText: 'bob changed the nickname of Alice Wonder from “Hall Alice” to “Quince Queen”' }).waitFor();
+  await ss.locator('.audit-row', { hasText: 'bob removed the nickname of Alice Wonder (“Quince Queen”)' }).waitFor();
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+}
+
+// ------------------------------------------------------------------ 27. a message the server moved, repeated or rolled back
+// Each message carries its own id, what it replies to, its thread, its time and its edit count inside the encryption
+// (public/js/binding.js). Nothing the earlier flows did in #general is flagged (edits, replies, threads, scheduled
+// messages sent now, late or re-encrypted after a key change). Then the test plays a malicious server in the
+// database: it moves a reply under another message, re-dates one, posts one again under a new id and serves another
+// from before its edit. After a reload, Bob's app shows one small yellow flag on each, whose details say which check
+// failed; everything else stays unflagged. Deleting one of the two copies clears the other's flag.
+async function messageBinding(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  await bob.message('Nickname check: quince').first().waitFor();
+  check(!(await bob.$('#messages .msg-flag.warn').count()), 'No message should be flagged before anything was tampered with.');
+  check(!(await alice.$('#messages .msg-flag.warn').count()), 'No message should be flagged on Alice’s side either.');
+
+  await bob.send('Binding: walnut');
+  await bob.send('Binding: hazel');
+  const walnut = alice.message('Binding: walnut').first();
+  await walnut.hover();
+  await walnut.locator('button[aria-label="Reply"]').click();
+  await alice.send('Binding reply: pecan');
+  await alice.send('Binding: chestnut');
+  const idOf = async (p, text) => p.message(text).first().getAttribute('data-mid');
+  const ids = { walnut: await idOf(alice, 'Binding: walnut'), hazel: await idOf(alice, 'Binding: hazel'), pecan: await idOf(alice, 'Binding reply: pecan'), chestnut: await idOf(alice, 'Binding: chestnut') };
+  const before = t.server.rows('SELECT ciphertext FROM messages WHERE id = ?', ids.chestnut)[0].ciphertext;
+  await alice.messageAction('Binding: chestnut', 'Edit message');
+  const box = alice.$('#messages textarea.edit-input');
+  await box.fill('Binding: chestnut, edited');
+  await box.press('Enter');
+  await bob.message('Binding: chestnut, edited').locator('.edited').waitFor(); // Bob's app has seen the edit
+  await bob.message('Binding reply: pecan').locator('.msg-reply .reply-text', { hasText: 'Binding: walnut' }).waitFor();
+  check(!(await bob.$('#messages .msg-flag.warn').count()), 'Sending, replying and editing should flag nothing.');
+
+  // The server's operator goes to work.
+  t.server.sql('UPDATE messages SET reply_to = ? WHERE id = ?', ids.hazel, ids.pecan);
+  t.server.sql('UPDATE messages SET created_at = created_at - ? WHERE id = ?', 3 * 3600000, ids.hazel);
+  const copy = Date.now().toString(36).padStart(9, '0') + crypto.randomBytes(5).toString('hex');
+  t.server.sql(`INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id)
+    SELECT ?, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id FROM messages WHERE id = ?`, copy, ids.walnut);
+  t.server.sql('UPDATE messages SET ciphertext = ? WHERE id = ?', before, ids.chestnut);
+  await bob.page.reload();
+  await bob.waitApp();
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const flagOf = (text) => bob.message(text).locator('.msg-flag.warn');
+  await flagOf('Binding reply: pecan').waitFor();
+  const tip = async (text, n = 0) => (await flagOf(text).nth(n).getAttribute('data-tip')) || '';
+  check(/reply to a different message/.test(await tip('Binding reply: pecan')), `The flag on the moved reply should say so (it says “${await tip('Binding reply: pecan')}”).`);
+  check(/time doesn.t match.*about 3 hours earlier/.test(await tip('Binding: hazel')), `The re-dated message should be flagged for its time (“${await tip('Binding: hazel')}”).`);
+  check((await bob.message('Binding: walnut').count()) === 2 && (await flagOf('Binding: walnut').count()) === 2, 'Both copies of the repeated message should be flagged.');
+  check(/appears here twice/.test(await tip('Binding: walnut', 1)), `The copies should be flagged as repeated (“${await tip('Binding: walnut', 1)}”).`);
+  check(/older version/.test(await tip('Binding: chestnut')), `The message served from before its edit should be flagged (“${await tip('Binding: chestnut')}”).`);
+  check(await bob.$('#messages .msg-flag.warn').count() === 5, `Only the five tampered messages should be flagged (${await bob.$('#messages .msg-flag.warn').count()} are).`);
+  // The flag is a button: its details open in a dialog (for keyboards and touch screens too).
+  await flagOf('Binding reply: pecan').click();
+  const why = await bob.dialog('This message may have been tampered with');
+  await why.locator('li', { hasText: 'reply to a different message than the one shown' }).waitFor();
+  await why.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  // One of the two copies is deleted (Bob wrote it, so he can): the one left behind is no longer flagged as repeated.
+  await bob.messageAction('Binding: walnut', 'Delete message');
+  await bob.modal('Delete message?').locator('.modal-foot .btn.danger').click();
+  for (const until = Date.now() + 10000; (await bob.message('Binding: walnut').count()) !== 1 || (await flagOf('Binding: walnut').count()); await new Promise((r) => setTimeout(r, 100))) {
+    check(Date.now() < until, `Once one copy is deleted, the other should no longer be flagged (${await bob.message('Binding: walnut').count()} left, ${await flagOf('Binding: walnut').count()} flagged).`);
+  }
+  check(await bob.$('#messages .msg-flag.warn').count() === 3, 'The other three tampered messages should still be flagged.');
+}
+
+// ------------------------------------------------------------------ 28. reset without a recovery key (crypto-2)
+// New keys from an email link alone are held back until someone who knew the person checks them: her app says why,
+// she can't invite anyone meanwhile, a member sees the badge, compares safety numbers and verifies her, and then she
+// reads and writes again.
+async function resetVerify(t) {
+  const { bob } = t.people;
+  // Dana (from the away flow, a member of the server since then) signs in on a new device. (A new account here would
+  // be one sign-up too many for this network's hourly limit: every person in these flows signs up from 127.0.0.1.)
+  const dana = await t.open('dana');
+  await dana.login('dana', t.pw.dana);
+  await bob.railButton(SERVER);
+  await dana.railButton(SERVER);
+  await dana.openChannel('general');
+  await dana.send('Dana before her reset: quince');
+  await bob.openChannel('general');
+  await bob.message('Dana before her reset: quince').waitFor();
+  await bob.showMembers();
+  await bob.member('dana').waitFor();
+
+  // An email for resets, then she forgets her password (she never made a recovery key).
+  await dana.openSettings('Security');
+  await dana.$('.set-content button', { hasText: 'Add an email' }).click();
+  const add = await dana.dialog('Add an email');
+  await add.locator('input[type=email]').fill('dana@example.test');
+  await dana.confirmPassword('Add an email', t.pw.dana);
+  const mail = await t.server.mail('dana@example.test', /confirmation code is \d{6}/);
+  const confirm = await dana.dialog('Check your email');
+  await confirm.locator('input').fill(/code is (\d{6})/.exec(mail.subject)[1]);
+  await confirm.locator('.modal-foot .btn.primary').click();
+  await dana.toast('Email confirmed.');
+  await dana.closeSettings();
+  await dana.logout();
+  await dana.$('#to-forgot').click();
+  const forgot = await dana.dialog('Reset your password');
+  await forgot.locator('input.input').fill('dana');
+  await forgot.locator('.modal-foot .btn.primary').click();
+  await dana.toast('a reset link is on its way');
+  const reset = await t.server.mail('dana@example.test', /#reset=/);
+  await dana.page.goto(/(http\S+#reset=[\w-]+)/.exec(reset.text)[1]);
+  const fresh = newPassword();
+  const form = await dana.dialog('Choose a new password for dana');
+  await form.locator('.warn-box', { hasText: 'has to verify you' }).waitFor();
+  await form.locator('.field', { hasText: exact('New password') }).locator('input').fill(fresh);
+  await form.locator('.field', { hasText: 'Confirm new password' }).locator('input').fill(fresh);
+  await form.locator('.modal-foot .btn.primary').click();
+  await dana.toast('Ask a member to verify you');
+  t.pw.dana = fresh;
+  await dana.waitApp();
+
+  // Her app says why it can't read or send here; making an invite is refused with the reason.
+  await dana.railButton(SERVER);
+  await dana.openChannel('general');
+  const bar = dana.$('.key-bar', { hasText: 'once someone who knew you before verifies you' });
+  await bar.waitFor();
+  // A voice channel's chat uses the server's key too: the same bar there.
+  await dana.channelRow('Lounge').click({ button: 'right' });
+  await dana.menuItem('Open chat').click();
+  await dana.$('#members[data-mode="chat"] .key-bar', { hasText: 'once someone who knew you before verifies you' }).waitFor();
+  await dana.$('#main-head button[aria-label="Hide chat"]').click();
+  await dana.page.waitForSelector('#members', { state: 'hidden' });
+  await dana.openChannel('general');
+  await bar.waitFor();
+  // Who can verify her: the server lists Bob (in this server with her since before the reset).
+  await bar.locator('button', { hasText: 'Ask a member to verify you' }).click();
+  const ask = await dana.dialog('Ask a member to verify you');
+  await ask.locator('.ss-row', { hasText: 'bob' }).locator('button', { hasText: 'Compare safety numbers' }).waitFor();
+  await ask.locator('.modal-foot .btn', { hasText: 'Close' }).click();
+  await dana.noModals();
+  await dana.serverMenu('Invite people');
+  await dana.page.waitForFunction(() => /recovery key/.test((document.querySelector('.modal input[aria-label="Invite link"]') || {}).value || ''));
+  await dana.$('.modal .modal-x').click();
+  await dana.noModals();
+
+  // Bob sees the badge on her (a control of its own: the keyboard opens it too), compares safety numbers, and
+  // verifies her for everyone.
+  await bob.showMembers();
+  await bob.member('dana').locator('.key-warn[data-tip^="Reset their password without their recovery key"]').focus();
+  await bob.page.keyboard.press('Enter');
+  const dlg = bob.modal(/Security key changed|Verify encryption/);
+  await dlg.locator('.key-bar', { hasText: 'reset their password without their recovery key' }).waitFor();
+  await dlg.locator('.modal-foot .btn.primary', { hasText: 'verify and share keys' }).click();
+  await bob.toast('is verified. Everyone');
+  await bob.member('dana').locator('.key-warn[data-tip^="Reset their password"]').waitFor({ state: 'detached' });
+
+  // Her app hears it, gets the key from Bob's, and she talks again.
+  await dana.toast('You’re verified');
+  await bar.waitFor({ state: 'detached' });
+  await dana.send('Dana, verified again: lychee');
+  await bob.message('Dana, verified again: lychee').waitFor();
+}
+
+// ------------------------------------------------------------------ 29. word filter
+// Alice keeps her own list (Privacy & safety), tried in its box before saving (formatting doesn't get around it); the
+// server only gets it sealed. Bob's message with a disguised word on it is hidden behind "Show" on her screen (never
+// on his, it's his own): his next message still shows his name, replying to the hidden one quotes the filter's note,
+// and search finds it without quoting it. Bob, the owner, suggests a list for the server (Server settings → Word
+// filter): her app blurs a match live, the edit she has open is left alone, and the audit log has the change. She
+// looks at that list and turns it off for herself, and the blur goes. A message the server tampered with (flow 27)
+// keeps its warning flag when a list hides it.
+async function wordFilter(t) {
+  const { alice, bob } = t.people;
+  await alice.railButton(SERVER);
+  await alice.openChannel('general');
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+
+  await alice.openSettings('Privacy & safety');
+  const mine = alice.$('#word-filter');
+  const box = mine.locator('textarea.wf-list');
+  await box.fill('tamarillo*\n*');
+  await mine.locator('.wf-errors li', { hasText: 'goes inside a word' }).waitFor();
+  await box.fill('tamarillo*');
+  await mine.locator('.wf-try input').fill('Fresh T A M A R I L L O S here');
+  await mine.locator('.wf-try-out', { hasText: 'Hidden: it matches “tamarillo*”' }).waitFor();
+  await mine.locator('.wf-try input').fill('Fresh ta**marillos** here');
+  await mine.locator('.wf-try-out', { hasText: 'Hidden: it matches “tamarillo*”' }).waitFor();
+  await mine.locator('.btn.primary', { hasText: 'Save word filter' }).click();
+  await alice.toast('Word filter saved.');
+  await alice.closeSettings();
+  const stored = await alice.page.evaluate(async () => (await fetch('/api/me/word-filter', { headers: { Authorization: 'Bearer ' + localStorage.getItem('hearth.token') } })).json());
+  check(/^x1:/.test(stored.data || '') && !/tamarillo/i.test(stored.data), 'The server should only have Alice’s word filter sealed.');
+
+  await bob.send('Have you tried tämarillos? Delicious');
+  const hidden = alice.$('#messages .msg.filtered', { hasText: 'Hidden by your word filter' });
+  await hidden.waitFor();
+  check(!(await alice.message('Delicious').count()), 'Alice should not see the words of a message her filter hides.');
+  check(!(await bob.$('#messages .msg.filtered, #messages .wf-blur').count()), 'Your own messages are never filtered.');
+  // Bob's next message isn't grouped under a hidden one: it shows his name, not whoever spoke before.
+  await bob.send('Just kidding');
+  const next = alice.message('Just kidding');
+  await next.waitFor();
+  check(await next.locator('.msg-head').count() === 1 && await hidden.locator('.filtered-who').count() === 1, 'Messages around a hidden one should show who wrote them.');
+  // Replying to it from its menu quotes the filter's note, not the words.
+  await hidden.click({ button: 'right' });
+  await alice.menuItem('Reply').click();
+  await alice.$('.reply-bar', { hasText: 'Hidden by your word filter' }).waitFor();
+  check(!(await alice.$('.reply-bar', { hasText: 'Delicious' }).count()), 'The reply bar should not quote a hidden message.');
+  await alice.$('#composer-input').press('Escape');
+  // Search finds it, but says it's hidden instead of quoting it.
+  await alice.page.keyboard.press('Control+k');
+  await alice.$('.search-modal input.search-main').fill('delicious');
+  await alice.$('.search-modal .search-msg', { hasText: 'Hidden by your word filter' }).waitFor();
+  check(!(await alice.$('.search-modal .search-msg', { hasText: 'tämarillos' }).count()), 'Search results should not quote a hidden message.');
+  await alice.page.keyboard.press('Escape');
+  await alice.page.waitForSelector('.search-modal', { state: 'detached' });
+  await hidden.locator('button', { hasText: 'Show' }).click();
+  await alice.message('Delicious').waitFor();
+  // Shown, it heads its group again: the next message joins it.
+  await alice.page.waitForFunction(() => [...document.querySelectorAll('#messages .msg[data-mid]')].some((e) => e.textContent.includes('Just kidding') && e.classList.contains('grouped')));
+
+  // An edit Alice has open is left as she typed it when a list changes (only rows whose filtering changes redraw).
+  await alice.send('Some words of mine');
+  await alice.messageAction('Some words of mine', 'Edit message');
+  const edit = alice.$('#messages textarea.edit-input');
+  await edit.fill('Some words of mine, not saved yet');
+
+  // Bob suggests a list for the server; it blurs on Alice's screen as soon as he saves it.
+  await bob.serverMenu('Server settings');
+  const ss = bob.page.locator('.modal.server-settings');
+  await ss.locator('.ss-tab', { hasText: exact('Word filter') }).click();
+  await ss.locator('.wf-note', { hasText: 'isn’t secret' }).waitFor();
+  await ss.locator('textarea.wf-list').fill('rambutan');
+  await ss.locator('.chips .chip', { hasText: 'Blur them' }).click();
+  await ss.locator('.btn.primary', { hasText: 'Save word filter' }).click();
+  await bob.toast('Word filter saved.');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: 'changed the server’s suggested word filter (1 entry)' }).waitFor();
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+  await bob.send('The rambutan season is here');
+  const blurred = alice.$('#messages .msg', { has: alice.page.locator('.wf-blur-show', { hasText: 'Blurred by this server’s word filter' }) });
+  await blurred.waitFor();
+  check(await blurred.locator('.wf-blur-inner[inert]').count() === 1, 'A blurred message should stay inert until shown.');
+  check(await edit.inputValue() === 'Some words of mine, not saved yet', 'A list change should leave an open edit alone.');
+  await edit.press('Escape');
+
+  // Alice reads the server's list and turns it off for herself: the blur goes.
+  await alice.openSettings('Privacy & safety');
+  const theirs = alice.$('#word-filter .wf-server', { hasText: `Use ${SERVER}’s list` });
+  await theirs.locator('details.wf-words summary').click();
+  await theirs.locator('.wf-word-list', { hasText: 'rambutan' }).waitFor();
+  await theirs.locator('.switch').click();
+  await alice.toast(`${SERVER}’s word filter is off for you.`);
+  await alice.closeSettings();
+  await alice.page.waitForFunction(() => !document.querySelector('#messages .wf-blur'));
+  await alice.message('The rambutan season is here').waitFor();
+
+  // Only the words are hidden, never a warning: Bob's own list hides the reply the server moved in flow 27, and its
+  // row still carries the ⚠ flag, whose details open. (Else a server could keep its tampering out of sight by adding
+  // a word from the message to its suggested list.) He clears his list again afterwards.
+  const ownList = async (text, said) => {
+    await bob.openSettings('Privacy & safety');
+    await bob.$('#word-filter textarea.wf-list').fill(text);
+    await bob.$('#word-filter .btn.primary', { hasText: 'Save word filter' }).click();
+    await bob.toast(said);
+    await bob.closeSettings();
+  };
+  await ownList('pecan', 'Word filter saved.');
+  const moved = bob.$('#messages .msg.filtered', { hasText: 'Hidden by your word filter' });
+  await moved.waitFor();
+  check(!(await bob.message('Binding reply: pecan').count()), 'Bob’s list should hide the reply’s words.');
+  check(await moved.locator('.msg-flag.warn').count() === 1, 'A hidden message the server tampered with should still be flagged.');
+  await moved.locator('.msg-flag.warn').click();
+  const why = await bob.dialog('This message may have been tampered with');
+  await why.locator('li', { hasText: 'reply to a different message than the one shown' }).waitFor();
+  await why.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  await ownList('', 'Word filter cleared.');
+  await bob.message('Binding reply: pecan').locator('.msg-flag.warn').waitFor();
+}
+
+// ------------------------------------------------------------------ 30. new members can't read messages from before they joined
+// Dana (from flow 23) leaves the server. Bob (the owner) turns the setting on in Server settings → Overview, and the
+// audit log says so; he writes in #general and in the Lounge's chat. Dana comes back with an invite: as a new member
+// her app gets only the key the apps switch to for her, and instead of the earlier messages (or rows of locked ones)
+// she sees one line where her history starts, in #general and in the voice channel's chat. What's said after she
+// joined goes both ways; Alice, there all along, sees everything. Bob turns it off again. (A first-time joiner goes the
+// same way and the waits for a key under a flood of joins are in test/join-history.test.js; this instance's sign-ups
+// from one network are used up by the earlier flows.)
+async function joinHistory(t) {
+  const { alice, bob } = t.people;
+  const dana = await t.open('dana');
+  await dana.login('dana', t.pw.dana);
+  await dana.railButton(SERVER);
+  await dana.serverMenu('Leave server');
+  await dana.modal(`Leave ${SERVER}?`).locator('.modal-foot .btn.danger').click();
+  await dana.$(`#rail button[aria-label="${SERVER}"]`).waitFor({ state: 'detached' });
+
+  await alice.railButton(SERVER);
+  await bob.railButton(SERVER);
+  await bob.openChannel('general');
+  const setting = 'New members can’t read messages from before they joined';
+  await bob.serverMenu('Server settings');
+  const ss = bob.page.locator('.modal.server-settings');
+  const row = ss.locator('.toggle-row', { hasText: setting });
+  check(!(await row.locator('input[type=checkbox]').isChecked()), 'The setting should be off to start with.');
+  await row.locator('.switch').click();
+  await bob.toast('New members will only see messages from after they join.');
+  check(await ss.locator('.toggle-row', { hasText: setting }).locator('input[type=checkbox]').isChecked(), 'The switch should stay on once saved.');
+  await ss.locator('.ss-tab', { hasText: exact('Audit log') }).click();
+  await ss.locator('.audit-row', { hasText: `bob turned on “${setting}”` }).waitFor();
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+  // (Turning it on switched keys once: Bob's message goes out under the new one.)
+  await bob.send('Before dana came back: quince jam');
+  await alice.openChannel('general');
+  await alice.message('Before dana came back: quince jam').waitFor();
+  await bob.channelRow('Lounge').click({ button: 'right' });
+  await bob.menuItem('Open chat').click();
+  await bob.send('Lounge before dana: medlar');
+  await bob.openChannel('general');
+
+  const link = await bob.inviteLink();
+  await dana.join(link, SERVER);
+  await dana.openChannel('general');
+  await dana.$('#messages .history-hidden', { hasText: 'Messages from before you joined are hidden in this server' }).waitFor();
+  check(!(await dana.message('quince jam').count()), 'Dana should not get a message from before she joined.');
+  check(!(await dana.$('#messages .msg-text.undecryptable').count()), 'Dana should see one line, not rows of messages she can’t open.');
+  // After she joined: both ways (her key arrives once the apps have switched).
+  await bob.send('After dana joined: fig');
+  await dana.message('After dana joined: fig').waitFor();
+  await dana.send('Hello again from dana: date');
+  await bob.message('Hello again from dana: date').waitFor();
+  await alice.message('Hello again from dana: date').waitFor();
+  check(!(await dana.$('#messages .msg-text.undecryptable').count()), 'Everything Dana is shown should open.');
+  // The Lounge's chat too.
+  await dana.channelRow('Lounge').click({ button: 'right' });
+  await dana.menuItem('Open chat').click();
+  await dana.$('#messages .history-hidden').waitFor();
+  check(!(await dana.message('medlar').count()), 'Dana should not get the Lounge chat from before she joined.');
+  check(!(await dana.$('#messages .msg-text.undecryptable').count()), 'No locked rows in the Lounge chat either.');
+  // Members who were there all along keep everything.
+  check(!(await alice.$('#messages .history-hidden').count()), 'Alice was in before: nothing is hidden for her.');
+  check(!!(await alice.message('Before dana came back: quince jam').count()), 'Alice still reads what came before.');
+  await dana.close();
+
+  // Off again, for whoever joins after this.
+  await bob.serverMenu('Server settings');
+  await ss.locator('.toggle-row', { hasText: setting }).locator('.switch').click();
+  await bob.toast('New members can read earlier messages again.');
+  await ss.locator('.modal-x').click();
+  await bob.noModals();
+}
+
+// ------------------------------------------------------------------ 31. where alerts go
+// Bob (the owner) adds a webhook alert channel pointing at the stand-in site (named in ALERT_PRIVATE_HOSTS by the
+// harness), gets its signing secret once, and Test makes the site get a POST. The row shows the delivery and only a
+// masked address. Turning it off and removing it ask for his password; turning it back on doesn't. Pressing Test or
+// Turn off down the page leaves it scrolled where it was, with focus on that button (the live update that follows
+// redraws only Health's own content).
+async function alertChannels(t) {
+  const { bob } = t.people;
+  const site = t.server.site;
+  await bob.railButton('Admin');
+  await bob.$('.admin-tabs .admin-tab', { hasText: 'Health' }).click();
+  await bob.$('.admin-body button', { hasText: 'Add a channel' }).click();
+  const add = await bob.dialog('Add an alert channel');
+  await add.locator('.chips .chip', { hasText: exact('Webhook') }).click();
+  const hookPath = `/alert-hook/${crypto.randomBytes(8).toString('hex')}`;
+  await add.locator('input[type=url]').fill(`${site.base}${hookPath}`);
+  await add.locator('input[placeholder="e.g. My phone"]').fill('Pager');
+  await add.locator('.modal-foot .btn.primary').click();
+  const shown = await bob.dialog('Webhook signing secret');
+  const secret = (await shown.locator('.secret-box code').innerText()).trim();
+  check(/^[A-Za-z0-9_-]{43}$/.test(secret), `The signing secret should be shown once (got “${secret}”).`);
+  await shown.locator('input[type=checkbox]').check();
+  await shown.locator('button', { hasText: exact('Done') }).click();
+  await bob.noModals();
+  const row = () => bob.$('.admin-body .chan-row', { hasText: 'Pager' });
+  await row().waitFor();
+  const text = await row().innerText();
+  check(!text.includes(hookPath.slice(-8)) && text.includes('news.preview-site.net'), `The address should only be shown masked (got “${text}”).`);
+  const page = bob.$('.admin-body');
+  await row().locator('button', { hasText: exact('Test') }).scrollIntoViewIfNeeded();
+  const scrolled = await page.evaluate((el) => el.scrollTop);
+  const stayed = async (label, what) => {
+    await bob.page.waitForTimeout(800); // the server's admin:alert-channels event redraws Health once more
+    const now = await page.evaluate((el) => el.scrollTop);
+    check(Math.abs(now - scrolled) < 120, `${what} should leave Health scrolled where it was (${scrolled}, now ${now}).`);
+    const focus = await bob.page.evaluate(() => { const a = document.activeElement; const r = a && a.closest('.chan-row'); return r ? `${r.querySelector('strong').textContent}: ${a.textContent}` : a && a.tagName; });
+    check(focus === `Pager: ${label}`, `${what} should leave focus on Pager’s “${label}” (it’s on ${focus}).`);
+  };
+  const before = site.hits.length;
+  await row().locator('button', { hasText: exact('Test') }).click();
+  await bob.toast('Delivered to Pager.');
+  check(site.hits.slice(before).includes(hookPath), 'The stand-in site should have received the test alert.');
+  await row().locator('.badge-tag', { hasText: 'Delivered' }).waitFor();
+  await stayed('Test', 'Test');
+
+  await row().locator('button', { hasText: exact('Turn off') }).click();
+  await bob.confirmPassword('Confirm turning off an alert channel', t.pw.bob);
+  await bob.toast('Pager is off.');
+  await row().locator('button', { hasText: exact('Turn on') }).waitFor();
+  await stayed('Turn on', 'Turning it off');
+  await row().locator('button', { hasText: exact('Turn on') }).click();
+  await bob.toast('Pager is on.');
+  await row().locator('button', { hasText: exact('Remove') }).click();
+  await bob.modal('Remove Pager?').locator('.modal-foot .btn.danger').click();
+  await bob.confirmPassword('Confirm removing an alert channel', t.pw.bob);
+  await bob.toast('Pager removed.');
+  await row().waitFor({ state: 'detached' });
+  check(!(await bob.$('.admin-body').innerText()).includes(secret), 'The secret is never shown again.');
+}
+
+// ------------------------------------------------------------------ Discord habits: #channels, line formatting, attachment options, shortcuts
+async function discordHabits(t) {
+  const { alice, bob } = t.people;
+  await bob.railButton(SERVER);
+  await bob.serverMenu('Create channel');
+  const cc = await bob.dialog('Create channel');
+  await cc.locator('.field', { hasText: 'Channel name' }).locator('input').fill('house-rules');
+  await cc.locator('.modal-foot .btn.primary').click();
+  await bob.noModals();
+  await bob.openChannel('general');
+  await alice.railButton(SERVER);
+  await alice.channelRow('house-rules').waitFor();
+  await alice.openChannel('general');
+
+  // "#" lists this server's channels; Enter puts the picked one's link in the box. "# " (a heading) closes the list.
+  const box = alice.$('#composer-input');
+  await box.fill('Read #house');
+  await alice.$('.cw-main .suggest .suggest-item', { hasText: 'house-rules' }).waitFor();
+  await box.press('Enter');
+  const picked = await box.inputValue();
+  check(/^Read <#[a-z0-9]{6,40}> $/.test(picked), `Picking a channel should put its link in the box (got “${picked}”).`);
+  await box.fill(`${picked}\n#`);
+  await alice.$('.cw-main .suggest .suggest-item').first().waitFor();
+  await box.fill(`${picked}\n# `);
+  await alice.$('.cw-main .suggest').waitFor({ state: 'hidden' });
+  const text = `${picked}first\n# Quokka rules\n-# updated today\n- be kind\n- no spam\n1. say hi\n1. pick roles\n>>> quoted line\nstill quoted\nand <#0zzzzzzzzzzzzzzzzz>`;
+  await box.fill(text);
+  await box.press('Enter');
+  const m = bob.message('Quokka rules').first();
+  await m.waitFor();
+  const shape = await m.locator('.msg-text').evaluate((el) => ({
+    h1: [...el.querySelectorAll('.md-h1')].map((x) => x.textContent),
+    sub: [...el.querySelectorAll('.md-sub')].map((x) => x.textContent),
+    li: [...el.querySelectorAll('.md-li:not(.md-ol)')].map((x) => x.textContent),
+    ol: [...el.querySelectorAll('.md-ol')].map((x) => `${x.dataset.n}:${x.textContent}`),
+    quote: [...el.querySelectorAll('.md-quote')].map((x) => x.textContent),
+    links: [...el.querySelectorAll('.channel-mention')].map((x) => x.textContent),
+    unknown: [...el.querySelectorAll('.channel-unknown')].map((x) => x.textContent),
+    raw: el.textContent,
+  }));
+  check(shape.h1.join() === 'Quokka rules' && shape.sub.join() === 'updated today', `Headings and small print should be formatted (got ${JSON.stringify(shape)}).`);
+  check(shape.li.join('|') === 'be kind|no spam' && shape.ol.join('|') === '1:say hi|2:pick roles', `Lists should be formatted and counted (got ${JSON.stringify(shape)}).`);
+  check(shape.quote.join('|') === 'quoted line|still quoted|and #unknown-channel', `>>> should quote the rest (got ${JSON.stringify(shape)}).`);
+  check(shape.links.join() === '#house-rules' && shape.unknown.join() === '#unknown-channel', `Channel mentions: a link for one Bob can see, plain text for any other (got ${JSON.stringify(shape)}).`);
+  check(!/<#|>>>|^# /m.test(shape.raw), `No raw markers should show (got “${shape.raw}”).`);
+  // The link opens the channel.
+  await m.locator('.channel-mention').click();
+  await bob.page.waitForSelector('#composer-input[placeholder="Message #house-rules"]');
+
+  // Attachment options: a description and a spoiler, set from the file's Edit button, inside the encrypted message.
+  await alice.$('.cw-main input[type=file]').setInputFiles([{ name: 'quokka.png', mimeType: 'image/png', buffer: makePng(48, 32) }]);
+  await alice.$('.cw-main .pending-edit').click();
+  const opts = await alice.dialog('Attachment options');
+  await opts.locator('textarea').fill('A quokka smiling at the camera');
+  await opts.locator('.toggle-row', { hasText: 'Mark as spoiler' }).locator('.switch').click();
+  await opts.locator('.modal-foot .btn.primary').click();
+  await alice.noModals();
+  check(await alice.page.evaluate(() => document.activeElement && document.activeElement.classList.contains('pending-edit')), 'Focus should go back to the file’s Edit button.');
+  const tags = await alice.$('.cw-main .pending .pending-tag').allInnerTexts();
+  check(tags.join() === 'SPOILER,ALT', `The file in the box should say what was set (got ${tags.join()}).`);
+  await alice.send('Spoiler picture of a quokka');
+  await bob.openChannel('general');
+  const pm = bob.message('Spoiler picture of a quokka').first();
+  await pm.waitFor();
+  const media = pm.locator('.att-media');
+  await media.locator('.att-spoiler-btn').waitFor();
+  check(await media.evaluate((el) => el.classList.contains('att-spoiler') && !el.classList.contains('revealed')), 'The picture should arrive covered.');
+  check((await pm.locator('.att-img').getAttribute('alt')) === 'A quokka smiling at the camera', 'The picture’s alt text should be the description.');
+  // The first press only uncovers it (no viewer); the next opens the viewer.
+  await media.locator('.att-spoiler-btn').focus();
+  await bob.page.keyboard.press('Enter');
+  await media.locator('.att-spoiler-btn').waitFor({ state: 'detached' });
+  check(await media.evaluate((el) => el.classList.contains('revealed')), 'Enter should uncover it.');
+  check(!(await bob.$('.viewer').count()), 'Uncovering should not open the viewer.');
+  check(await bob.page.evaluate(() => document.activeElement && document.activeElement.classList.contains('att-img')), 'Focus should move to the picture.');
+  await bob.page.keyboard.press('Enter');
+  await bob.$('.viewer').waitFor();
+  await bob.page.keyboard.press('Escape');
+  await bob.$('.viewer').waitFor({ state: 'detached' });
+  await media.locator('.att-alt').click();
+  await bob.$('.popover .alt-pop', { hasText: 'A quokka smiling at the camera' }).waitFor();
+  await bob.page.keyboard.press('Escape');
+
+  // Ctrl+/ shows every shortcut; pressed again it closes.
+  await alice.$('#composer-input').focus();
+  await alice.page.keyboard.press('Control+/');
+  const sheet = await alice.dialog('Keyboard shortcuts');
+  await sheet.locator('.sc-row', { hasText: 'Mark the server you’re in as read' }).waitFor();
+  await sheet.locator('.sc-group', { hasText: 'Calls' }).locator('kbd', { hasText: 'M' }).first().waitFor();
+  await alice.page.keyboard.press('Control+/');
+  await alice.noModals();
+
+  // Shift+Esc marks the whole server read.
+  await bob.openChannel('house-rules');
+  await bob.send('New rule: quokkas first');
+  const unread = alice.$('#sidebar-body .ch-row.unread').filter({ has: alice.$('.ch-name', { hasText: exact('house-rules') }) });
+  await unread.waitFor();
+  await alice.$('#composer-input').focus();
+  await alice.page.keyboard.press('Shift+Escape');
+  await alice.toast(`Marked ${SERVER} as read.`);
+  await unread.waitFor({ state: 'detached' });
+}
+
 export const FLOWS = [
   ['accounts: register two people, sign out and back in', accounts],
   ['servers: create a server, invite, join', servers],
   ['messages: send, decrypt, edit, react, thread, delete, reply, pin, poll', messages],
+  ['webhooks: make one in channel settings, post like Uptime Kuma, no pings', webhooks],
   ['direct messages: both ways, block and unblock, friends', directMessages],
+  ['disappearing messages: turn on in a DM, a picture vanishes on both screens with its file and inbox entry, turn off, day dividers, asked before sending under a weaker timer; a channel message goes by the apps’ own timer', disappearing],
   ['attachments: image preview, byte-exact download, storage', attachments],
   ['pictures: avatar, custom emoji, server icon, GIF library', pictures],
   ['search: Ctrl+K words, from:, jump to the message', search],
   ['settings: display name, username, signed-in devices', settings],
   ['roles: private channel, overrides, Manage channels role', roles],
+  ['self-assign roles: marked in the role editor, picked by a member, opens a private channel', selfRoles],
+  ['events: a weekly event, RSVP, stop it repeating', events],
   ['voice: two people connected in a call', voiceCall],
-  ['watch together: start, pause for everyone, stop; leave the call', watchTogether],
+  ['moderator toolkit: server mute in and out of a call, bulk delete', moderatorTools],
+  ['watch together: start, pause for everyone, stop; a video file from another site says so before it loads; leave the call', watchTogether],
+  ['audit log and reports: moderation as sentences, filters, live entries; a report reaches the server’s moderators', auditAndReports],
   ['dm call: ring, accept, hang up, decline', dmCall],
   ['group chat: create, talk both ways, call rings', groupChat],
+  ['android app: push through a push app, call notification and hang up, invite link (native side simulated)', androidApp],
   ['step-up: delete and hand over a server, staff, relay, region, backups, owner', stepUp],
   ['account deletion: a throwaway account deletes itself', deleteAccount],
   ['recovery: recovery key, email, password change, reset by email keeps messages', recovery],
@@ -967,4 +3312,19 @@ export const FLOWS = [
   ['instance: new owner removes staff, announces, maintenance on and off', broadcastAndMaintenance],
   ['moderation: staff sign-out and suspension say why; unsuspend', moderation],
   ['smoke: every settings, admin and server settings page loads', smoke],
+  ['threads: new replies and pings on the message and the Threads button, the Threads panel, read when opened', threads],
+  ['link previews: ask, turn down, preview, send; the reader sees the card and never contacts the site; keyboard; editing a link in Always mode', linkPreviews],
+  ['outside images: a picture link waits for a click and loads after it; Never and Always load; fonts come from Hearth', outsideImages],
+  ['discord import: paste a template, see what is skipped, leave some out, create', discordImport],
+  ['channel order: drag a channel into a category and a category above another, live for everyone; Move down by keyboard keeps focus (into a collapsed category too); a menu left open doesn’t undo another move', channelOrder],
+  ['away and status: Away after inactivity and back on input; a custom status that clears itself, live', awayAndStatus],
+  ['voice chat: open beside the call, both ways, a picture link from another site waits for a click, no threads, unread only once opened, pings always, pins, All messages, in a call', voiceChat],
+  ['send later: schedule from the send button, edit, reschedule and send now from the list; cancel one in a DM; re-encrypted by itself when the key changes, never from a copy it can’t confirm; a signed-out session’s message waits for Keep; overdue ones ask first', sendLater],
+  ['nicknames: set your own, seen in the member list, messages and @mention suggestions; a moderator changes and removes it; audit log', nicknames],
+  ['message binding: nothing earlier flagged; a reply moved, a message re-dated, replayed and rolled back in the database are each flagged after a reload, with details; deleting a copy clears the other', messageBinding],
+  ['reset without a recovery key: held back (in a voice channel’s chat too) and no invites until a member compares safety numbers and verifies her', resetVerify],
+  ['word filter: your own list hides a disguised word (sealed on the server, never your own messages, search doesn’t quote it); a server’s suggested list blurs live, is audited, and can be turned off; a hidden message keeps its tampering flag', wordFilter],
+  ['join history: new members can’t read back (setting, audit log); someone joining again sees one line instead of locked rows, in a channel and a voice chat; later messages both ways', joinHistory],
+  ['alert channels: add a signed webhook, its secret shown once, Test reaches it, masked address; off and remove need the password; the page stays put', alertChannels],
+  ['discord habits: # picks a channel and the link opens it (unknown ones stay plain); headings, lists and >>> quotes; a spoiler picture with a description; Ctrl+/ and Shift+Esc', discordHabits],
 ];

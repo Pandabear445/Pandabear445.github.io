@@ -248,6 +248,37 @@ try {
   check(!(await p.locator('.viewer').count()), 'Esc closes it');
   check(await p.evaluate(() => document.activeElement.classList.contains('att-img')), 'and focus returns to the picture', await active(p));
 
+  section('Keyboard shortcuts sheet (Ctrl+/)');
+  await p.focus('#composer-input');
+  await p.keyboard.press('Control+/'); await settle(p, 300);
+  const sc = await p.evaluate(() => {
+    const m = document.querySelector('.modal-backdrop:not(.closing) .modal.shortcuts-modal');
+    const by = m && m.getAttribute('aria-labelledby');
+    return m && { modal: m.getAttribute('aria-modal'), title: by && document.getElementById(by) ? document.getElementById(by).textContent : null, kbd: m.querySelectorAll('kbd').length, focusIn: m.contains(document.activeElement) };
+  });
+  check(sc && sc.modal === 'true' && sc.title === 'Keyboard shortcuts', 'Ctrl+/ opens a labelled dialog', sc);
+  check(sc && sc.focusIn && sc.kbd > 10, 'focus moves into it, and it lists the keys', sc);
+  await audit(p, 'keyboard shortcuts');
+  let scOut = false;
+  for (let i = 0; i < 4; i++) { await p.keyboard.press('Tab'); if (!(await active(p)).inModal) scOut = true; }
+  check(!scOut, 'Tab stays inside the shortcuts dialog');
+  await p.keyboard.press('Escape'); await settle(p, 300);
+  check(!(await p.locator('.modal-backdrop:not(.closing)').count()), 'Esc closes it');
+  check(await p.evaluate(() => document.activeElement.id === 'composer-input'), 'and focus returns to the message box', await active(p));
+
+  section('Attachment options');
+  await p.setInputFiles('.cw-main input[type=file]', { name: 'square.png', mimeType: 'image/png', buffer: png });
+  await settle(p, 300);
+  const edit = p.locator('.cw-main .pending-edit');
+  check(/Edit square\.png/.test(await edit.getAttribute('aria-label') || ''), 'the file’s Edit button has a name', await edit.getAttribute('aria-label'));
+  await edit.focus(); await p.keyboard.press('Enter'); await settle(p, 300);
+  const ao = await p.evaluate(() => { const m = document.querySelector('.modal-backdrop:not(.closing) .modal.att-options'); return m && { focusIn: m.contains(document.activeElement), tag: document.activeElement.tagName }; });
+  check(ao && ao.focusIn && ao.tag === 'TEXTAREA', 'Enter opens the options with focus in the description', ao);
+  await audit(p, 'attachment options');
+  await p.keyboard.press('Escape'); await settle(p, 300);
+  check(await p.evaluate(() => document.activeElement.classList.contains('pending-edit')), 'Esc goes back to the Edit button', await active(p));
+  await p.click('.cw-main .pending-x'); await settle(p, 200);
+
   section('Focus is visible');
   await p.focus('#composer-input');
   await p.keyboard.press('Shift+Tab');

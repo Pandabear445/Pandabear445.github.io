@@ -83,6 +83,8 @@ async function seed({ base, codeRoot = ROOT }) {
   const setup = ok(await as(bob, 'POST', '/me/2fa/setup', { authKey: bob.authKey }), '2fa setup');
   const en = ok(await as(bob, 'POST', '/me/2fa/enable', { code: H.totp(setup.secret.replace(/\s/g, '')) }), '2fa enable');
   bob.backupCodes = en.backupCodes;
+  // Since 1.29.0, turning on two-factor renews the session's token (auth-11); older versions return none.
+  if (en.token) bob.token = en.token;
   // Settings, with API keys that older versions kept in plain text.
   const secrets = { giphyKey: `giphy-${H.hex(8)}`, klipyKey: `klipy-${H.hex(8)}` };
   ok(await as(owner, 'PATCH', '/admin/settings', secrets), 'settings');

@@ -4,7 +4,8 @@ export const PERMS = {
   MENTION_EVERYONE: 1 << 4, MANAGE_MESSAGES: 1 << 5, CONNECT: 1 << 6, SPEAK: 1 << 7,
   CREATE_INVITE: 1 << 8, KICK_MEMBERS: 1 << 9, BAN_MEMBERS: 1 << 10, MANAGE_CHANNELS: 1 << 11,
   MANAGE_ROLES: 1 << 12, MANAGE_SERVER: 1 << 13, MANAGE_EMOJIS: 1 << 14, CREATE_THREADS: 1 << 15,
-  EMBED_LINKS: 1 << 16, ADMINISTRATOR: 1 << 30,
+  EMBED_LINKS: 1 << 16, MUTE_MEMBERS: 1 << 17, MOVE_MEMBERS: 1 << 18, VIEW_AUDIT_LOG: 1 << 19,
+  CHANGE_NICKNAME: 1 << 20, MANAGE_NICKNAMES: 1 << 21, ADMINISTRATOR: 1 << 30,
 };
 const P = PERMS;
 export const PERM_GROUPS = [
@@ -14,16 +15,19 @@ export const PERM_GROUPS = [
     ['MANAGE_ROLES', 'Manage roles', 'Create and edit roles below their own, and change channel permissions.', true],
     ['MANAGE_SERVER', 'Manage server', 'Change the name, icon, banner, theme and welcome message.', false],
     ['MANAGE_EMOJIS', 'Manage emoji', 'Upload, rename and delete custom emoji.', false],
+    ['VIEW_AUDIT_LOG', 'View audit log', 'See who kicked, banned or timed out whom, and who changed roles, channels, permissions and settings.', false],
     ['CREATE_INVITE', 'Create invites', 'Invite new people.', true],
   ]],
   ['Members', [
+    ['CHANGE_NICKNAME', 'Change nickname', 'Set their own nickname in this server. DMs and profiles still show their display name.', false],
+    ['MANAGE_NICKNAMES', 'Manage nicknames', 'Change or reset the nicknames of people below them.', false],
     ['KICK_MEMBERS', 'Kick members', 'Remove people below them. They can rejoin with an invite.', false],
     ['BAN_MEMBERS', 'Ban members', 'Remove people below them and stop them from rejoining.', false],
   ]],
   ['Text', [
     ['SEND_MESSAGES', 'Send messages', '', true],
     ['CREATE_THREADS', 'Reply in threads', '', true],
-    ['EMBED_LINKS', 'Show link previews', 'Image links in their messages show as pictures.', true],
+    ['EMBED_LINKS', 'Show link previews', 'Their links can carry a preview card. It counts as a role permission: a channel override can turn it off there, not on. Members’ apps enforce this, since the server can’t see inside messages.', true],
     ['ATTACH_FILES', 'Attach files', '', true],
     ['ADD_REACTIONS', 'Add reactions', 'Add new reactions (anyone can join existing ones).', true],
     ['MENTION_EVERYONE', 'Mention @everyone and @channel', 'Their @everyone notifies people.', true],
@@ -32,6 +36,8 @@ export const PERM_GROUPS = [
   ['Voice', [
     ['CONNECT', 'Connect', 'Join voice channels.', true],
     ['SPEAK', 'Speak', 'Talk in voice channels (otherwise listen only).', true],
+    ['MUTE_MEMBERS', 'Mute members', 'Server-mute people below them: nobody hears them in any voice channel here until it\u2019s lifted.', false],
+    ['MOVE_MEMBERS', 'Move members', 'Disconnect people below them from voice, or move them to another voice channel. Can be given per voice channel.', false],
   ]],
   ['Advanced', [
     ['ADMINISTRATOR', 'Administrator', 'Every permission, everywhere, and bypasses channel restrictions. Give this carefully.', false],
@@ -57,6 +63,11 @@ export function basePerms(server, userId) {
   for (const r of server.roleDefs || []) if (r.everyone || ((server.memberRoles || {})[userId] || []).includes(r.id)) p |= r.permissions;
   return p & P.ADMINISTRATOR ? ALL : p;
 }
+// Whether this person's link previews show: Show link previews as a server-wide (role) permission, since that
+// is what every member's app can work out (each app gets channel overrides worked out for its own person only).
+// Groups give it to everyone. The composer asks the same about you, so the server never fetches a page for a
+// card nobody would see.
+export const mayEmbed = (server, userId) => !!server && has(basePerms(server, userId), P.EMBED_LINKS);
 // Does a <@&role> in this person's message ping the role's members? Only if the role is mentionable or they may
 // mention everyone. The composer only offers those roles, but a hand-typed mention must not ping either.
 export function mayMentionRole(server, roleId, authorId) {

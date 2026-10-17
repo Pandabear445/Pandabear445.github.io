@@ -55,6 +55,7 @@ const ipChip = (ip) => h('button', { class: 'ip-chip', 'data-tip': 'IP options',
 ]) }, ip);
 const userCell = (b, onOpen) => h('button', { class: 'adm-user', onclick: () => b && onOpen && onOpen(b.id) }, avatarEl(asUser(b), 28),
   h('span', { class: 'adm-user-text' }, h('strong', null, b ? b.displayName : 'Deleted user'), h('span', null, b ? '@' + b.username : '')),
+  b && b.bot ? h('span', { class: 'bot-tag' }, 'BOT') : null,
   b && b.suspended ? h('span', { class: 'badge-tag bad' }, 'Suspended') : null, b ? roleTag(b.role) : null);
 
 export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, role = 'admin', confirm = null } = {}) {
@@ -69,6 +70,13 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   const nav = h('nav', { class: 'admin-tabs', role: 'tablist' });
   const body = h('div', { class: 'admin-body' });
   let timer = null;
+  // Health redraws replace every button. The one last pressed there gets focus back afterwards when a password dialog
+  // or a disabled button lost it meanwhile (see healthPage), so keyboard and screen-reader users stay where they were.
+  let pressed = null;
+  body.addEventListener('click', (e) => {
+    const b = e.target.closest && e.target.closest('[data-focus]');
+    pressed = tab === 'health' && b ? { key: b.dataset.focus, at: Date.now() } : null;
+  });
   const go = (t) => { clearInterval(timer); tab = t; setTab && setTab(t); draw(); };
   const openUser = (id) => userModal(id, () => draw(), myRank);
   const draw = () => {
@@ -161,6 +169,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('div', null, h('span', { class: 'field-label' }, 'Reported'), userCell(r.target, openUser), h('div', { class: 'ip-list' }, ...r.targetIps.map(ipChip))),
           h('div', null, h('span', { class: 'field-label' }, 'By'), userCell(r.reporter, openUser), r.reporterIp ? h('div', { class: 'ip-list' }, ipChip(r.reporterIp)) : null)),
         r.context.kind === 'message' ? h('p', { class: 'stat-sub' }, r.context.dmId ? 'In a direct message' : `In #${r.context.channelName} \u00b7 ${r.context.serverName}`) : h('p', { class: 'stat-sub' }, 'Report about the account'),
+        // The nickname they had in that server when reported (members saw it instead of their display name).
+        r.context.targetNickname ? h('p', { class: 'stat-sub' }, `Their nickname in ${r.context.serverName || 'that server'}: \u201C${r.context.targetNickname}\u201D`) : null,
         r.details ? h('blockquote', { class: 'report-details' }, r.details) : null,
         r.evidence.length ? h('div', { class: 'evidence' },
           h('p', { class: 'field-hint' }, 'Messages shared by the reporter from their device. Who sent them and when is checked by the server; the wording comes from the reporter.'),
@@ -172,6 +182,8 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
               if (await confirmDialog({ title: 'Delete this message for everyone?', text: 'It disappears from the conversation for all members.', confirm: 'Delete', danger: true })) { await api('DELETE', `/admin/messages/${e.id}`).then(() => toast('Message deleted.'), (x) => toast(x.message, 'error')); }
             } }, 'Delete message') : null))) : null,
         r.resolution ? h('p', { class: 'stat-sub' }, `Note: ${r.resolution}${r.handledBy ? ` \u2014 ${r.handledBy.displayName}` : ''}`) : null,
+        // Also sent to the server's own moderators (their status is theirs; closing it here doesn't change it).
+        r.serverInbox ? h('p', { class: 'stat-sub' }, `The server\u2019s moderators have it too: ${r.serverInbox.status}${r.serverInbox.handledBy && r.serverInbox.status !== 'open' ? ` by ${r.serverInbox.handledBy.displayName}` : ''}${r.serverInbox.note ? ` \u2014 \u201c${r.serverInbox.note}\u201d` : ''}`) : null,
         h('div', { class: 'report-actions' },
           r.status === 'open' ? h('button', { class: 'btn ghost sm', onclick: () => act(r, { status: 'reviewing' }, 'Marked as reviewing.') }, 'I\u2019m on it') : null,
           r.target && !r.target.suspended ? h('button', { class: 'btn danger sm', onclick: () => suspendDialog(r.target, () => act(r, { status: 'resolved', resolution: 'Account suspended' }, 'Suspended and resolved.')) }, 'Suspend account') : null,
@@ -336,7 +348,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       report,
       ...gifSection,
       h('div', { class: 'admin-head' }, h('h3', null, 'Word filter')),
-      h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so they can\u2019t be filtered.'),
+      h('p', { class: 'field-hint' }, 'Names, bios, profile pages and profile comments can\u2019t contain these (whole words, any capitalization). Chats are end-to-end encrypted, so the server can\u2019t filter them: each person, and each server as a suggestion, can set a word filter that their own apps apply (Privacy & safety, Server settings \u2192 Word filter).'),
       words,
       h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: async () => {
         try { const r = await api('PUT', '/admin/words', { words: words.value }); toast(`Word filter saved (${r.words.length}).`); } catch (e) { toast(e.message, 'error'); }
@@ -356,7 +368,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       clean.disabled = true;
       try {
         const x = await withPassword((y) => api('POST', '/admin/storage/cleanup', { graceHours: grace, ...y }),
-          { title: 'Clean up unused files', text: `Deletes ${o.count} files (${fmtSize(o.bytes)}) that nothing uses and that are older than ${grace} hours. This can\u2019t be undone.` });
+          { title: 'Clean up unused files', text: `Deletes ${o.count} files (${fmtSize(o.bytes)}) that nothing uses and that are older than ${grace} hours. This can\u2019t be undone.`, grace: true });
         if (x) { toast(`Removed ${x.files} files (${fmtSize(x.bytes)}).`); storageReport(box); }
       } catch (e) { if (!e.cancelled) toast(e.message, 'error'); } finally { clean.disabled = false; }
     };
@@ -369,6 +381,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Direct messages'), h('strong', null, fmtSize(r.dms.bytes)), h('span', { class: 'stat-sub' }, `${r.dms.files} files`)),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploads in progress'), h('strong', null, String(r.uploads.count)), h('span', { class: 'stat-sub' }, `${fmtSize(r.uploads.received)} of ${fmtSize(r.uploads.reserved)} received`)),
         h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Uploaded, not posted yet'), h('strong', null, fmtSize(r.pending.bytes)), h('span', { class: 'stat-sub' }, `${r.pending.files} files, removed after a day`)),
+        r.scheduled ? h('div', { class: 'stat' }, h('span', { class: 'stat-label' }, 'Waiting with scheduled messages'), h('strong', null, fmtSize(r.scheduled.bytes)), h('span', { class: 'stat-sub' }, `${r.scheduled.files} files, posted at their time`)) : null,
         h('div', { class: `stat${o.count ? ' warn' : ''}` }, h('span', { class: 'stat-label' }, 'Unused files'), h('strong', null, fmtSize(o.bytes)), h('span', { class: 'stat-sub' }, `${o.count} files`))),
       h('p', { class: 'field-hint' }, 'Files in messages are end-to-end encrypted: the server sees only their sizes and which conversation they were posted in, never their names or contents.'),
       h('div', { class: 'admin-head' }, h('h3', null, 'Servers using the most space')),
@@ -491,12 +504,24 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
     const saveAlerts = async (patch) => {
       try {
         const off = (patch.enabled === false && alerts.enabled) || (patch.email === false && alerts.email);
-        const r = off ? await withPassword((x) => api('PUT', '/admin/alerts', { ...patch, ...x }), { title: 'Confirm turning alerts off', text: 'Turning alerts off needs your password.' }) : await api('PUT', '/admin/alerts', patch);
+        // Holding alerts back for longer than an hour is close to turning them off: the server asks for it too.
+        const longer = patch.cooldownMin > alerts.cooldownMin && patch.cooldownMin > 60;
+        const ask = off ? { title: 'Confirm turning alerts off', text: 'Turning alerts off needs your password.' }
+          : longer ? { title: 'Confirm a longer cooldown', text: 'Sending the same alert less than once an hour needs your password.' } : null;
+        const r = ask ? await withPassword((x) => api('PUT', '/admin/alerts', { ...patch, ...x }), ask) : await api('PUT', '/admin/alerts', patch);
         if (r) toast('Saved.');
       } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
       healthPage();
     };
-    const cooldown = h('input', { class: 'input', type: 'number', min: '1', max: '10080', value: alerts.cooldownMin, style: { width: '90px' } });
+    const cooldown = h('input', { class: 'input', type: 'number', min: '1', max: '10080', value: alerts.cooldownMin, style: { width: '90px' }, 'data-focus': 'alerts-cooldown' });
+    const had = document.activeElement;
+    const recent = pressed && Date.now() - pressed.at < 60000 ? pressed.key : null;
+    // Focus is lost when it's nowhere, gone with a removed button, or in a dialog that's on its way out.
+    const lost = !had || had === document.body || !had.isConnected || !!had.closest('.modal-backdrop.closing');
+    const refocus = !lost && body.contains(had) ? had.dataset.focus : lost ? recent : null;
+    // Taking out a focused button can lay the page out while it's empty, which scrolls it back to the top: put the
+    // scroll position back after the redraw.
+    const scrolled = body.scrollTop;
     clear(body).append(
       h('div', { class: 'admin-head' }, h('h3', null, 'Health ', tag(d.status)), h('span', { class: 'field-hint' }, `Checked ${ago(d.checkedAt)} · refreshes every 15 seconds`)),
       h('div', { class: 'stats' },
@@ -517,20 +542,154 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
           h('span', { class: 'mono' }, j.name), h('span', null, tag(j.status), j.failures ? h('span', { class: 'stat-sub' }, ` ${j.failures} in a row`) : null),
           h('span', null, ago(j.lastRun)), h('span', null, ago(j.lastOk)),
           h('span', { class: 'stat-sub' }, j.lastError ? `${ago(j.lastErrorAt)}: ${j.lastError}` : '')))),
-      h('div', { class: 'admin-head' }, h('h3', null, 'Alerts'), h('span', { class: 'field-hint' }, 'Sent to the owner’s confirmed email and shown here live. Never includes messages or secrets.')),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Alerts'), h('span', { class: 'field-hint' }, 'Sent to the owner’s confirmed email and the channels below, and shown here live. Never includes messages or secrets.')),
       h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Alerts'), h('span', { class: 'field-hint' }, 'Failed backups and restore tests, jobs that keep failing, relay outages, low disk, repeated errors and sign-in floods.')),
-        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.enabled, onchange: (e) => saveAlerts({ enabled: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.enabled, 'data-focus': 'alerts-on', onchange: (e) => saveAlerts({ enabled: e.target.checked }) }), h('span', { class: 'switch-track' }))),
       h('label', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Email the owner'), h('span', { class: 'field-hint' }, 'Needs email set up in Owner → Email and a confirmed address on the owner’s account.')),
-        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.email, onchange: (e) => saveAlerts({ email: e.target.checked }) }), h('span', { class: 'switch-track' }))),
+        h('span', { class: 'switch' }, h('input', { type: 'checkbox', checked: alerts.email, 'data-focus': 'alerts-email', onchange: (e) => saveAlerts({ email: e.target.checked }) }), h('span', { class: 'switch-track' }))),
       h('div', { class: 'row gap' }, h('span', null, 'The same alert at most once every'), cooldown, h('span', null, 'minutes'),
-        h('button', { class: 'btn', onclick: () => saveAlerts({ cooldownMin: +cooldown.value }) }, 'Save'),
-        h('button', { class: 'btn ghost', onclick: async () => { try { const r = await api('POST', '/admin/alerts/test'); toast(r.result === 'sent' ? 'Test alert sent.' : r.result === 'off' ? 'Alerts are off.' : 'Held back: too many alerts lately.'); healthPage(); } catch (e) { toast(e.message, 'error'); } } }, 'Send a test alert')),
+        h('button', { class: 'btn', 'data-focus': 'alerts-save', onclick: () => saveAlerts({ cooldownMin: +cooldown.value }) }, 'Save'),
+        h('button', { class: 'btn ghost', 'data-focus': 'alerts-test', onclick: async () => { try { const r = await api('POST', '/admin/alerts/test'); toast(r.result === 'sent' ? 'Test alert sent.' : r.result === 'off' ? 'Alerts are off.' : 'Held back: too many alerts lately.'); healthPage(); } catch (e) { toast(e.message, 'error'); } } }, 'Send a test alert')),
+      ...alertChannels(alerts.channels || []),
+      h('div', { class: 'admin-head' }, h('h3', null, 'Recent alerts')),
       alerts.recent.length ? h('div', { class: 'adm-table' },
         h('div', { class: 'adm-row head' }, h('span', null, 'When'), h('span', null, 'Alert'), h('span', null, 'Details')),
         ...alerts.recent.map((a) => h('div', { class: 'adm-row' }, h('span', null, ago(a.at)), h('span', null, h('span', { class: `badge-tag ${a.severity === 'critical' ? 'bad' : 'warn'}` }, a.severity === 'critical' ? 'Urgent' : 'Warning'), ' ', a.title),
           h('span', { class: 'stat-sub' }, a.detail, a.held ? ` (${a.held} more held back)` : '')))) : h('p', { class: 'muted-p' }, 'No alerts yet.'));
+    if (body.scrollTop !== scrolled) body.scrollTop = scrolled;
+    const again = refocus && [...body.querySelectorAll('[data-focus]')].find((el) => el.dataset.focus === refocus);
+    if (again) {
+      // A number being typed into the cooldown box survives the 15-second refresh.
+      if (had && had !== again && had.tagName === 'INPUT' && had.type !== 'checkbox' && had.dataset.focus === refocus) again.value = had.value;
+      again.focus({ preventScroll: true });
+      if (refocus === recent) pressed = null;
+    }
     clearInterval(timer);
     timer = setInterval(() => { if (tab === 'health' && document.contains(body)) healthPage().catch(() => {}); else clearInterval(timer); }, 15000);
+  }
+
+  // Where else alerts go (server/alertchannels.js). The server only ever sends addresses, topics and tokens back
+  // masked, so editing one means typing the new value. Turning one off, changing where it points and removing it
+  // ask for the password again (the server insists too): that's how someone would hide alerts from the owner.
+  const CH_KIND = { ntfy: 'ntfy', webhook: 'Webhook', discord: 'Discord', slack: 'Slack' };
+  const CH_HINT = {
+    ntfy: 'Install the ntfy app and subscribe to the topic. On ntfy.sh anyone who knows a topic can read it, so pick one nobody can guess, or use your own ntfy with an access token.',
+    webhook: 'Hearth POSTs each alert as JSON, signed like bot webhooks: you get the signing secret once, next.',
+    discord: 'In Discord: Server settings → Integrations → Webhooks → Copy Webhook URL. Anything that takes Discord webhooks works.',
+    slack: 'An incoming webhook from Slack, Mattermost, Rocket.Chat or anything else that takes Slack’s {"text": …}.',
+  };
+  const chanFail = (e) => { if (!e.cancelled) toast(e.message, 'error'); };
+  function alertChannels(list) {
+    const status = (c) => {
+      if (!c.last) return h('span', { class: 'stat-sub' }, 'Not tried yet');
+      if (c.last.ok) return h('span', null, h('span', { class: 'badge-tag ok' }, 'Delivered'), ' ', h('span', { class: 'stat-sub' }, `${ago(c.last.at)}${c.last.test ? ' (test)' : ''}`));
+      return h('span', null, h('span', { class: 'badge-tag bad' }, c.failures > 1 ? `Failed ${c.failures} times in a row` : 'Failed'), ' ',
+        h('span', { class: 'stat-sub' }, `${ago(c.last.at)}${c.last.test ? ' (test)' : ''}: ${c.last.error || ''}`));
+    };
+    const test = async (c, btn) => {
+      btn.disabled = true;
+      try {
+        const { result } = await api('POST', `/admin/alerts/channels/${c.id}/test`);
+        if (result.ok) toast(`Delivered to ${c.name}.`); else toast(`${c.name}: ${result.error}`, 'error');
+      } catch (e) { chanFail(e); }
+      btn.disabled = false;
+      healthPage();
+    };
+    const setOn = async (c, on) => {
+      try {
+        const r = on ? await api('PUT', `/admin/alerts/channels/${c.id}`, { enabled: true })
+          : await withPassword((x) => api('PUT', `/admin/alerts/channels/${c.id}`, { enabled: false, ...x }), { title: 'Confirm turning off an alert channel', text: `Alerts stop going to ${c.name}. That needs your password.` });
+        if (r) toast(on ? `${c.name} is on.` : `${c.name} is off.`);
+      } catch (e) { chanFail(e); }
+      healthPage();
+    };
+    const remove = async (c) => {
+      if (!(await confirmDialog({ title: `Remove ${c.name}?`, text: 'Alerts stop going there right away.', confirm: 'Remove', danger: true }))) return;
+      try {
+        const r = await withPassword((x) => api('DELETE', `/admin/alerts/channels/${c.id}`, x), { title: 'Confirm removing an alert channel', text: `${c.name} stops getting alerts. That needs your password.` });
+        if (r) toast(`${c.name} removed.`);
+      } catch (e) { chanFail(e); }
+      healthPage();
+    };
+    return [
+      h('div', { class: 'admin-head' }, h('h3', null, 'Where alerts go'), h('button', { class: 'btn primary sm', 'data-focus': 'chan-add', onclick: () => channelDialog() }, icon('plus'), 'Add a channel')),
+      h('p', { class: 'field-hint' }, 'Besides the owner’s email: ntfy (ntfy.sh or your own), a signed webhook, Discord or Slack. Each gets the same words as the email. Addresses and tokens are kept encrypted and only shown masked here.'),
+      list.length ? h('div', { class: 'adm-table' },
+        h('div', { class: 'adm-row chan-row head' }, h('span', null, 'Channel'), h('span', null, 'Goes to'), h('span', null, 'Last delivery'), h('span')),
+        ...list.map((c) => h('div', { class: `adm-row chan-row${c.enabled ? '' : ' off'}`, 'data-channel': c.id },
+          h('span', null, h('strong', null, c.name), ' ', h('span', { class: 'badge-tag' }, c.kindLabel), c.enabled ? null : h('span', { class: 'badge-tag warn' }, 'Off')),
+          h('span', { class: 'stat-sub chan-where' }, c.where),
+          status(c),
+          h('span', { class: 'row gap tight chan-actions' },
+            h('button', { class: 'btn ghost sm', 'data-focus': `chan-test:${c.id}`, onclick: (e) => test(c, e.currentTarget) }, 'Test'),
+            h('button', { class: 'btn ghost sm', 'data-focus': `chan-onoff:${c.id}`, onclick: () => setOn(c, !c.enabled) }, c.enabled ? 'Turn off' : 'Turn on'),
+            h('button', { class: 'btn ghost sm', 'data-focus': `chan-change:${c.id}`, onclick: () => channelDialog(c) }, 'Change'),
+            h('button', { class: 'btn ghost sm danger-text', 'data-focus': `chan-remove:${c.id}`, onclick: () => remove(c) }, 'Remove')))))
+        : h('p', { class: 'muted-p' }, 'Only the owner’s email so far.'),
+    ];
+  }
+  // Adding a channel (no `cur`) or changing one. Empty address fields keep what's there.
+  function channelDialog(cur = null) {
+    let kind = cur ? cur.kind : 'ntfy';
+    const name = h('input', { class: 'input', maxlength: '40', placeholder: 'e.g. My phone', value: cur ? cur.name : '' });
+    const url = h('input', { class: 'input', type: 'url', maxlength: '2000', autocomplete: 'off', spellcheck: 'false' });
+    const topic = h('input', { class: 'input', maxlength: '64', autocomplete: 'off', spellcheck: 'false', placeholder: cur ? 'unchanged' : 'e.g. hearth-alerts-k3x9q' });
+    const token = h('input', { class: 'input', type: 'password', maxlength: '256', autocomplete: 'new-password', placeholder: cur ? 'unchanged' : 'tk_… (optional)' });
+    if (!cur) url.value = 'https://ntfy.sh';
+    const kinds = h('div', { class: 'chips', role: 'group', 'aria-label': 'Kind of channel' });
+    const fields = h('div', { class: 'stack' });
+    const draw = () => {
+      clear(kinds).append(...Object.entries(CH_KIND).map(([k, l]) => h('button', { type: 'button', class: `chip${kind === k ? ' active' : ''}`, 'aria-pressed': String(kind === k), onclick: () => {
+        if (kind === 'ntfy' && url.value === 'https://ntfy.sh') url.value = '';
+        kind = k;
+        if (k === 'ntfy' && !url.value) url.value = 'https://ntfy.sh';
+        draw();
+      } }, l)));
+      url.placeholder = cur ? `unchanged (${cur.where})` : { ntfy: 'https://ntfy.sh', webhook: 'https://example.com/hearth-alerts', discord: 'https://discord.com/api/webhooks/…', slack: 'https://hooks.slack.com/services/…' }[kind];
+      clear(fields).append(
+        h('p', { class: 'field-hint' }, CH_HINT[kind]),
+        kind === 'ntfy' ? field('Server', url, 'https://ntfy.sh, or your own ntfy (one on your own network needs ALERT_PRIVATE_HOSTS on the server).') : field(kind === 'webhook' ? 'Address' : 'Webhook URL', url),
+        kind === 'ntfy' ? field('Topic', topic) : null,
+        kind === 'ntfy' ? field('Access token', token, 'For an ntfy that needs a login: a token with write access to the topic.') : null,
+        field('Name', name, 'Shown here and in the audit log.'),
+        cur ? h('p', { class: 'field-hint' }, kind === 'ntfy' ? 'Changing where it goes needs your password. A different server needs the topic (and the access token, if it needs one) typed again: the saved ones only go to the old server.' : 'Changing where it goes needs your password.') : null);
+    };
+    draw();
+    modal({ title: cur ? `Change ${cur.name}` : 'Add an alert channel', size: 'md',
+      body: h('div', { class: 'stack' }, cur ? null : kinds, fields),
+      actions: [{ label: 'Cancel' }, { label: cur ? 'Save' : 'Add', kind: 'primary', action: async () => {
+        const where = {};
+        if (url.value.trim()) where.url = url.value.trim();
+        if (kind === 'ntfy' && topic.value.trim()) where.topic = topic.value.trim();
+        if (kind === 'ntfy' && token.value.trim()) where.token = token.value.trim();
+        if (!cur) {
+          const r = await api('POST', '/admin/alerts/channels', { kind, name: name.value, ...where });
+          toast(`${r.channel.name} added. Try Test to see it arrive.`);
+          healthPage();
+          if (r.secret) setTimeout(() => signingSecret(r.secret), 150);
+          return;
+        }
+        const retarget = Object.keys(where).length > 0;
+        const send = (x) => api('PUT', `/admin/alerts/channels/${cur.id}`, { name: name.value, ...where, ...x });
+        const r = retarget ? await withPassword(send, { title: 'Confirm changing where alerts go', text: 'Changing where an alert channel points needs your password.' }).catch((e) => { if (e.cancelled) return null; throw e; }) : await send({});
+        if (!r) return false;
+        toast('Saved.');
+        healthPage();
+      } }] });
+  }
+  // A webhook's signing secret: shown this once (the server keeps it sealed and never sends it again).
+  function signingSecret(secret) {
+    const ok = h('input', { type: 'checkbox' });
+    let m;
+    const done = h('button', { class: 'btn primary', disabled: true, onclick: () => m.close() }, 'Done');
+    ok.addEventListener('change', () => { done.disabled = !ok.checked; });
+    m = modal({ title: 'Webhook signing secret', size: 'md', dismissable: false,
+      body: h('div', { class: 'stack' },
+        h('p', { class: 'muted-p' }, 'Shown once. Your receiver checks each alert with it: X-Hearth-Signature is v1= and the HMAC-SHA256 of "<X-Hearth-Timestamp>.<body>" with this secret, the same as bot webhooks.'),
+        h('div', { class: 'cmd-box secret-box' }, h('code', null, secret)),
+        h('div', null, h('button', { class: 'btn sm', onclick: () => { copyText(secret); toast('Copied.'); } }, icon('copy'), 'Copy')),
+        h('label', { class: 'row gap tight' }, ok, h('span', null, 'I saved it somewhere safe')),
+        h('div', null, done)) });
   }
 
   async function regions() {
@@ -544,6 +703,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         ),
         h('div', { class: 'cmd-box' }, h('code', null, command), h('button', { class: 'btn sm', onclick: () => { copyText(command); toast('Copied.'); } }, icon('copy'), 'Copy')),
         h('p', { class: 'field-hint' }, 'The link works for 24 hours. It installs the call relay with this server\u2019s secret and a tiny check-in that reports here every minute. Within a minute of finishing, the region shows as online and calls start using it.'),
+        h('p', { class: 'field-hint' }, 'The line checks the download against the SHA-256 it carries before running anything. If that says FAILED, nothing ran: make a new command here.'),
         h('p', { class: 'field-hint' }, 'If the VPS provider has a firewall in its control panel, open UDP + TCP 3478 and UDP 49160\u201349400 there.')),
     });
     // An install command carries this server's relay secret, so making one asks for your password again.
@@ -599,7 +759,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
         ...[
           ['Oracle Cloud Always Free', '$0', 'Arm VM (2 CPU / 12 GB since mid-2026) with 10 TB traffic a month. Many regions. Needs a card to sign up; free VMs can be hard to get in busy regions.'],
           ['Hetzner Cloud', '\u2248 \u20ac5.50/mo', 'Germany and Finland with 20 TB traffic: best value for Europe. Their US (1 TB) and Singapore (0.5 TB) plans include little traffic. The cheapest plans sell out at times.'],
-          ['Contabo (your current host)', '\u2248 $5\u20137/mo', 'EU, US, UK, Asia, Australia. Lots of traffic included. Same account you already have.'],
+          ['Contabo', '\u2248 $5\u20137/mo', 'EU, US, UK, Asia, Australia. Lots of traffic included.'],
           ['Vultr / DigitalOcean / Linode', '$4\u20136/mo', '30+ cities worldwide, 0.5\u20132 TB traffic. Good for places the others don\u2019t cover (South America, India, Japan, Australia).'],
         ].map(([n, p2, t]) => h('div', { class: 'adm-row three' }, h('b', null, n), h('span', null, p2), h('span', { class: 'stat-sub' }, t)))),
       h('p', { class: 'field-hint' }, 'Start with the region where most people who can\u2019t connect live (Europe and US East cover most friend groups). Two or three regions is plenty for thousands of people.'));
@@ -770,6 +930,7 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
       h('p', { class: 'field-hint' }, 'Turn whole features on or off for everyone. Nothing is deleted when you turn something off.'),
       sw('Watch together', 'watch', 'Synced YouTube, Vimeo, Twitch and video links in calls.'),
       sw('GIF picker', 'gifs'),
+      sw('Link previews', 'linkPreviews', 'Members can ask this server to fetch a page so their message carries a preview. The server sees those links; people reading never contact the site.'),
       sw('Profile comment walls', 'comments'),
       sw('Custom CSS on profile pages', 'customCss', 'Turned off, everyone\u2019s page shows without their CSS (it\u2019s kept, not deleted).'),
       h('div', { class: 'kv' }, h('span', null, 'Who can create servers'), h('div', { class: 'chips' }, [['everyone', 'Everyone'], ['staff', 'Staff only']].map(([k, l]) => h('button', { class: `chip${o.features.createServers === k ? ' active' : ''}`, onclick: () => save({ features: { createServers: k } }) }, l)))),
@@ -865,6 +1026,9 @@ export function adminView({ tab = 'overview', setTab, openReports = 0, onCount, 
   wrap.append(nav, body);
   draw();
   wrap._stop = () => clearInterval(timer);
+  // Live changes (an alert, another admin's change to the alert channels) redraw the Health page's own content only:
+  // a whole new admin view would jump back to the top and lose focus. Nothing happens when another tab is showing.
+  wrap._refreshHealth = () => { if (tab === 'health' && document.contains(body)) healthPage().catch(() => {}); };
   return wrap;
 }
 
@@ -905,9 +1069,26 @@ async function userModal(id, refresh, myRank = 2) {
         roleTag(u.role),
         u.suspendedAt ? h('span', { class: 'badge-tag bad' }, `Suspended ${ago(u.suspendedAt)}${u.suspendedUntil ? ` until ${fmtStamp(u.suspendedUntil)}` : ''}${u.suspendReason ? `: ${u.suspendReason}` : ''}`) : null,
         h('span', { class: 'stat-sub' }, `Joined ${fmtStamp(u.createdAt)} \u00b7 ${u.servers.length} servers \u00b7 made ${u.reportsBy} reports`)),
+      // A channel webhook's account: suspending it, or the person who made its address, pauses it.
+      u.webhook ? h('p', { class: 'field-hint' }, `Channel webhook \u201c${u.webhook.name}\u201d${u.webhook.deleted ? ' (deleted)' : ''} in #${u.webhook.channel || '?'} \u00b7 ${u.webhook.server || '?'}. Its address was made by `,
+        u.webhook.madeBy ? userCell(u.webhook.madeBy, (x) => userModal(x, refresh, myRank)) : 'a deleted account',
+        '. Suspending either account pauses it.') : null,
       h('h4', null, 'IP addresses'),
       h('div', { class: 'adm-table' }, ...u.ips.map((x) => h('div', { class: 'adm-row three' }, ipChip(x.ip), h('span', { class: 'stat-sub' }, `first ${fmtStamp(x.firstSeen)}`), h('span', { class: 'stat-sub' }, `last ${ago(x.lastSeen)}`)))),
       h('p', { class: 'field-hint' }, `Email: ${u.emailMasked || 'none'} \u00b7 Two-factor: ${u.totpEnabled ? 'on' : 'off'} \u00b7 Recovery key: ${u.hasRecovery ? 'saved' : 'none'}`),
+      // A reset without the recovery key: nobody's app shares server or group keys with them until someone vouches.
+      u.keysResetAt ? h('div', { class: 'row gap wrap' },
+        h('span', { class: 'badge-tag bad' }, `New keys from a password reset without the recovery key, ${ago(u.keysResetAt)} \u2014 not verified yet${u.keysWaiting ? ` in ${u.keysWaiting} ${u.keysWaiting === 1 ? 'server or group' : 'servers and groups'} they were in before` : ''}`),
+        // It can't be taken back, so it takes your password (and a fresh two-factor code when that's on), in one dialog.
+        myRank >= 2 && !u.self ? h('button', { class: 'chip', onclick: async () => {
+          try {
+            const r = await withPassword((x) => api('POST', `/admin/users/${u.id}/keys/verify`, x), { title: `Mark ${u.username}\u2019s new keys as verified?`, button: 'Mark as verified',
+              text: 'Only once you\u2019re sure it\u2019s really them and not someone who got into their email: for example, they read you the safety number from your profile in person or on a call. Everyone\u2019s apps then share the keys to all their servers and groups with them, including ones where nobody has verified them yet. This goes in the audit log.' });
+            if (!r) return;
+            toast('Marked as verified. Their servers\u2019 keys are being shared with them.'); m.close(); userModal(id, refresh, myRank);
+          } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
+        } }, 'Mark as verified') : null) : null,
+      !u.keysResetAt && u.keysVouched ? h('p', { class: 'field-hint' }, `New keys from their last password reset were verified by ${u.keysVouched.by ? u.keysVouched.by.displayName : 'a deleted account'}, ${fmtStamp(u.keysVouched.at)}.`) : null,
       h('h4', null, `Signed-in devices \u2014 ${u.sessions.length}`),
       h('div', { class: 'adm-table' }, ...u.sessions.map((x) => h('div', { class: 'adm-row three' }, h('span', null, device(x.ua)), x.ip ? ipChip(x.ip) : h('span'), h('span', { class: 'stat-sub' }, `active ${ago(x.lastSeen)}`)))),
       u.reportsAgainst.length ? h('h4', null, `Reports about them \u2014 ${u.reportsAgainst.length}`) : null,

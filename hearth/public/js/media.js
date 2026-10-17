@@ -48,6 +48,28 @@ export async function prepareImage(file, { compress = true } = {}) {
   return out;
 }
 
+// A link preview's picture, made small enough to travel inside the encrypted message: at most 400 px and 16 KiB,
+// WebP (JPEG where the browser can't make WebP). Drawing it again drops any metadata; a GIF keeps its first
+// frame. Returns { type, data (base64), w, h }, or null if it can't be made that small (or isn't a picture).
+const THUMB_STEPS = [[400, 0.72], [320, 0.62], [240, 0.55]];
+export async function previewThumb(bytes, type) {
+  if (typeof createImageBitmap !== 'function') return null;
+  let bitmap;
+  try { bitmap = await createImageBitmap(new Blob([bytes], { type })); } catch { return null; }
+  try {
+    for (const [side, q] of THUMB_STEPS) {
+      const r = await scaled(bitmap, side, q);
+      if (r.blob && r.blob.size <= 16384 && /^image\/(webp|jpeg)$/.test(r.blob.type)) {
+        const buf = new Uint8Array(await r.blob.arrayBuffer());
+        let s = '';
+        for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+        return { type: r.blob.type, data: btoa(s), w: r.w, h: r.h };
+      }
+    }
+    return null;
+  } catch { return null; } finally { if (bitmap.close) bitmap.close(); }
+}
+
 // Load things one-by-one-ish: at most `limit` downloads/decryptions at the same time.
 export function makeQueue(limit = 3) {
   let active = 0;

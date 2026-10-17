@@ -13,10 +13,7 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Hearth">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Figtree:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap">
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bungee&family=Caveat:wght@600&family=Comfortaa:wght@600&family=Creepster&family=Monoton&family=Orbitron:wght@600&family=Pacifico&family=Playfair+Display:wght@600&family=Press+Start+2P&family=Righteous&family=Space+Mono:wght@700&display=swap">
+  <link rel="stylesheet" href="/fonts/fonts.css">
   <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
@@ -29,6 +26,7 @@
         <h1 data-instance-name>Hearth</h1>
       </div>
       <p class="auth-tagline" data-instance-tagline hidden></p>
+      <p id="auth-invite" class="auth-invite" role="status" hidden></p>
 
       <p id="insecure-warning" class="auth-warn" hidden>
         This page was opened over plain http, so your browser blocks encryption and microphone access.

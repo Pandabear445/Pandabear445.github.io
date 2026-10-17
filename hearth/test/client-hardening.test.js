@@ -422,7 +422,7 @@ test('infra-1: build/sign-update.js signs every latest*.yml and bakes the public
     fs.writeFileSync(path.join(dist, 'latest-linux.yml'), release('1.30.0', appimage));
     const { privateKeyPem, publicKey } = UV.generateKeys();
     const script = path.join(tmp, 'build', 'sign-update.js');
-    const run = (args, key) => spawnSync(process.execPath, [script, ...args], { env: { ...process.env, GITHUB_ACTIONS: '', UPDATE_SIGNING_KEY: key }, encoding: 'utf8' });
+    const run = (args, key, pub = publicKey) => spawnSync(process.execPath, [script, ...args], { env: { ...process.env, GITHUB_ACTIONS: '', UPDATE_SIGNING_KEY: key, UPDATE_PUBLIC_KEY: pub }, encoding: 'utf8' });
     for (const key of [privateKeyPem, Buffer.from(privateKeyPem).toString('base64')]) {
       const r = run(['sign', dist], key);
       assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -432,7 +432,8 @@ test('infra-1: build/sign-update.js signs every latest*.yml and bakes the public
         assert.equal(ok.ok, true, `${name}: ${ok.error}`);
       }
     }
-    const baked = run(['bake'], privateKeyPem);
+    // Locally, without the variable, bake uses the private key's public half.
+    const baked = run(['bake'], privateKeyPem, '');
     assert.equal(baked.status, 0, baked.stdout + baked.stderr);
     assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, 'hearth.config.json'), 'utf8')).updatePublicKey, publicKey);
     assert.notEqual(run(['sign', dist], '').status, 0, 'no key: refuses');
@@ -446,6 +447,49 @@ test('infra-1: build/sign-update.js signs every latest*.yml and bakes the public
   assert.ok(wf.indexOf('node build/sign-update.js bake') < wf.indexOf('npx electron-builder --publish never'), 'bakes the key before building');
   assert.match(wf, /hearth\/desktop\/dist\/latest\*\.yml\.sig/, 'uploads the signatures');
   assert.match(wf, /files=\([^)]*dist\/latest\*\.yml\.sig\)/, 'copies them to the server (the pinned-host scp step)');
+});
+
+test('infra-1 / ci-4: CI bakes only the public key, and signs only with its private half', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-sign-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'build'));
+    fs.copyFileSync(path.join(DESKTOP, 'build', 'sign-update.js'), path.join(tmp, 'build', 'sign-update.js'));
+    fs.copyFileSync(path.join(DESKTOP, 'update-verify.js'), path.join(tmp, 'update-verify.js'));
+    fs.copyFileSync(path.join(DESKTOP, 'hearth.config.json'), path.join(tmp, 'hearth.config.json'));
+    const dist = path.join(tmp, 'dist'); fs.mkdirSync(dist);
+    fs.writeFileSync(path.join(dist, 'latest.yml'), release('1.30.0', crypto.randomBytes(1000)));
+    const a = UV.generateKeys(); const b = UV.generateKeys();
+    const run = (args, env) => spawnSync(process.execPath, [path.join(tmp, 'build', 'sign-update.js'), ...args], { env: { ...process.env, GITHUB_ACTIONS: '', UPDATE_SIGNING_KEY: '', UPDATE_PUBLIC_KEY: '', ...env }, encoding: 'utf8' });
+    // The build bakes from the public key alone: no private key anywhere near it.
+    let r = run(['bake'], { UPDATE_PUBLIC_KEY: a.publicKey });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, 'hearth.config.json'), 'utf8')).updatePublicKey, a.publicKey);
+    assert.notEqual(run(['bake'], { UPDATE_PUBLIC_KEY: 'not a key' }).status, 0);
+    // Signing with a key that isn't the baked one's private half would make the apps refuse the update: refused.
+    r = run(['sign', dist], { UPDATE_SIGNING_KEY: b.privateKeyPem, UPDATE_PUBLIC_KEY: a.publicKey });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stdout, /isn't the private half of UPDATE_PUBLIC_KEY/);
+    assert.doesNotMatch(r.stdout + r.stderr, /PRIVATE KEY/);
+    assert.ok(!fs.existsSync(path.join(dist, 'latest.yml.sig')), 'nothing signed');
+    // The key alone, without the variable (the old setup): the apps were built with no key, so signing them would let
+    // installed apps take an update that never checks the next one. Refused, with the public half to set.
+    r = run(['sign', dist], { UPDATE_SIGNING_KEY: a.privateKeyPem });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stdout, /UPDATE_PUBLIC_KEY isn't set/);
+    assert.ok(r.stdout.includes(a.publicKey), 'says what to set UPDATE_PUBLIC_KEY to');
+    assert.doesNotMatch(r.stdout + r.stderr, /PRIVATE KEY/);
+    assert.ok(!fs.existsSync(path.join(dist, 'latest.yml.sig')), 'nothing signed');
+    // pubkey: the public half of an existing secret, never the private key.
+    r = run(['pubkey'], { UPDATE_SIGNING_KEY: a.privateKeyPem });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim(), a.publicKey);
+    assert.equal(run(['pubkey'], { UPDATE_SIGNING_KEY: Buffer.from(a.privateKeyPem).toString('base64') }).stdout.trim(), a.publicKey);
+    assert.notEqual(run(['pubkey'], {}).status, 0, 'no key: refuses');
+    r = run(['sign', dist], { UPDATE_SIGNING_KEY: a.privateKeyPem, UPDATE_PUBLIC_KEY: a.publicKey });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const ok = UV.verifyFeed({ name: 'latest.yml', yml: fs.readFileSync(path.join(dist, 'latest.yml')), sig: fs.readFileSync(path.join(dist, 'latest.yml.sig'), 'utf8'), publicKey: a.publicKey });
+    assert.equal(ok.ok, true, ok.error);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
 // ------------------------------------------------------------------ xss-6: shared looks

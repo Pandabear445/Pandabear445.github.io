@@ -446,16 +446,45 @@ function listedOf(user) {
 export function listedPastKeys(user, at = 0) {
   return at > 0 ? listedOf(user).filter((k) => at <= k.until) : [];
 }
+// A key as the server lists it, or null for none (missing, null or empty).
+const keyIn = (k) => (typeof k === 'string' && k ? k : null);
+// How someone's keys, as the server tells them now, compare with what this device pinned for them (p, or none):
+//   'pin'      first sight: pin these keys
+//   'fill'     pinned before they had a signing key, and they have one now: add it to the pin (trust on first use)
+//   'ok'       nothing to change
+//   'changed'  not the keys this device holds as theirs
+// The server's whole answer about someone always carries both key fields (publicKey, signPublicKey). A record that
+// says nothing about keys (neither field: a placeholder while it loads, a presence update) leaves the pin alone. But
+// once this device has pinned someone, a record with no identity key (null, empty, or the field left out) that says
+// anything about keys, or one with no signing key or another one, is a change: otherwise a server could blank or
+// leave out the key it can't fake and slip in a signing key of its own. A real account never loses its identity key,
+// and never loses its signing key without a new identity key (a password reset gives both).
+// The exception is an account deleted by an older version of Hearth, which cleared both keys: deleted, with neither,
+// there is nothing the server could use, so it's left as it was pinned (calls with a deleted account are refused
+// anyway, secure.js checkSdp). Someone pinned before they had a signing key gets the first one listed for them,
+// unless this device verified them by safety number: those numbers covered "no signing key", so a new one is a
+// change to verify again.
+function judgePin(p, user) {
+  const e = keyIn(user.publicKey);
+  const s = keyIn(user.signPublicKey);
+  if (!p) return e ? 'pin' : 'ok';
+  if (!e) {
+    if (user.deleted && !s) return 'ok';
+    return 'publicKey' in user || 'signPublicKey' in user ? 'changed' : 'ok';
+  }
+  if (p.e !== e) return 'changed';
+  if (p.s) return (s ? s !== p.s : 'signPublicKey' in user) ? 'changed' : 'ok';
+  if (s) return p.verified ? 'changed' : 'fill';
+  return 'ok';
+}
 // Returns 'ok' | 'changed'. New people are pinned automatically (their current keys only).
 export function checkPin(myId, user) {
-  if (!user || !user.publicKey || user.id === myId) return 'ok';
+  if (!user || user.id === myId) return 'ok';
   const pins = loadPins(myId);
-  const p = pins[user.id];
-  if (!p) { pins[user.id] = { e: user.publicKey, s: user.signPublicKey || null }; savePins(myId, pins); return 'ok'; }
-  if (p.e !== user.publicKey) return 'changed';
-  if (p.s && user.signPublicKey && p.s !== user.signPublicKey) return 'changed';
-  if (!p.s && user.signPublicKey) { p.s = user.signPublicKey; savePins(myId, pins); }
-  return 'ok';
+  const r = judgePin(pins[user.id], user);
+  if (r === 'pin') { pins[user.id] = { e: user.publicKey, s: keyIn(user.signPublicKey) }; savePins(myId, pins); return 'ok'; }
+  if (r === 'fill') { pins[user.id].s = user.signPublicKey; savePins(myId, pins); return 'ok'; }
+  return r;
 }
 // checkPin for many people at once (a member list): the same pinning and the same answer for each person, with
 // the store read and saved once instead of once per person. Returns the ids whose keys changed.
@@ -464,11 +493,11 @@ export function checkPins(myId, users) {
   const changed = new Set();
   let save = false;
   for (const user of users) {
-    if (!user || !user.publicKey || user.id === myId) continue;
-    const p = pins[user.id];
-    if (!p) { pins[user.id] = { e: user.publicKey, s: user.signPublicKey || null }; save = true; continue; }
-    if (p.e !== user.publicKey || (p.s && user.signPublicKey && p.s !== user.signPublicKey)) { changed.add(user.id); continue; }
-    if (!p.s && user.signPublicKey) { p.s = user.signPublicKey; save = true; }
+    if (!user || user.id === myId) continue;
+    const r = judgePin(pins[user.id], user);
+    if (r === 'changed') changed.add(user.id);
+    else if (r === 'pin') { pins[user.id] = { e: user.publicKey, s: keyIn(user.signPublicKey) }; save = true; }
+    else if (r === 'fill') { pins[user.id].s = user.signPublicKey; save = true; }
   }
   if (save) savePins(myId, pins);
   return changed;
@@ -480,11 +509,13 @@ export function listedRetiredAt(user, e) {
 }
 // Trusting someone's new keys (after comparing safety numbers). Only the keys this device trusted until now go on
 // record, for what was written before they were replaced: when the server says that happened if that's earlier
-// than now (a key that leaked shouldn't count for longer than it was theirs), otherwise now.
+// than now (a key that leaked shouldn't count for longer than it was theirs), otherwise now. A record with no identity
+// key has nothing to trust: false, and the pin stays as it was.
 export function acceptPin(myId, user) {
+  if (!user || !keyIn(user.publicKey)) return false;
   const pins = loadPins(myId);
   const prev = pins[user.id];
-  const cur = { e: user.publicKey, s: user.signPublicKey || null };
+  const cur = { e: user.publicKey, s: keyIn(user.signPublicKey) };
   const listed = prev ? listedRetiredAt(user, prev.e) : 0;
   const until = listed && listed < Date.now() ? listed : Date.now();
   const old = (prev ? [...(Array.isArray(prev.old) ? prev.old : []), { e: prev.e, s: prev.s || null, until }] : [])
@@ -492,6 +523,7 @@ export function acceptPin(myId, user) {
       && all.findIndex((x) => x && x.e === k.e && x.s === k.s) === i);
   pins[user.id] = { ...cur, verified: true, ...(old.length ? { old: old.slice(-10) } : {}) };
   savePins(myId, pins);
+  return true;
 }
 // The keys this device pinned for someone: { e, s } (the ones it holds as theirs now) and `old` ([{ e, s }],
 // newest first): keys it pinned for them before, only with `at` (when something was written) and only those

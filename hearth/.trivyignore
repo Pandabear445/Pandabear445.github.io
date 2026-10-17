@@ -2,6 +2,6 @@
 
 # DS-0002 "no USER in Dockerfile": Hearth never runs as root, but the switch happens in the entrypoint
 # (deploy/docker-entrypoint.sh) instead of a USER line. docker-compose.yml starts the container as uid 1000;
-# older docker-compose.yml files (which the update tool keeps) start it as root, and the entrypoint then fixes
+# older docker-compose.yml files (which hearth-update keeps) start it as root, and the entrypoint then fixes
 # the data folder's owner and drops to uid 1000 before Hearth starts. A USER line would break those installs.
 DS-0002

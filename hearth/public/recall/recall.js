@@ -18,6 +18,13 @@ const wait = ms => new Promise(r => setTimeout(r, reduceMotion ? 0 : ms));
    first, because a shared deck file is someone else's data. */
 const HB = window.parent !== window ? { theme:null } : null;
 function hbSend(t, data){ if (HB) parent.postMessage({ recall:1, t, ...data }, '*'); }
+// Keys, clicks and touches in here never reach Hearth's page, so Hearth wouldn't know you're studying and could show
+// you as Away. It's told "in use" (nothing about what was pressed) on input, at most every 30 seconds.
+if (HB){
+  let lastActive = 0;
+  const active = () => { const t = Date.now(); if (t - lastActive < 30000) return; lastActive = t; hbSend('active', {}); };
+  ['keydown', 'pointerdown', 'pointermove', 'wheel', 'touchstart'].forEach(ev => addEventListener(ev, active, { capture:true, passive:true }));
+}
 const ID_RE = /^[\w-]{1,40}$/;
 const safeId = id => typeof id === 'string' && ID_RE.test(id) ? id : nid();
 const safeImg = s => typeof s === 'string' && s.length < 4e6 && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(s) ? s : '';

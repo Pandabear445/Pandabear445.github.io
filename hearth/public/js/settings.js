@@ -1,6 +1,6 @@
 // User settings: profile customization (all free), account, voice & audio, appearance.
 import { h, clear, icon, toast, playSound } from './util.js';
-import { api, upload } from './api.js';
+import { api, upload, setToken } from './api.js';
 import { EVENTS as SOUND_EVENTS, LIBRARY as SOUND_LIBRARY, soundPrefs, setSoundPrefs, resetSoundPrefs, setCustomSound, customSoundName } from './sounds.js';
 import * as E2EE from './e2ee.js';
 import { profileCard, FONT_STACKS, cropStyle, customFxLayer } from './profile-ui.js';
@@ -9,9 +9,12 @@ import { openCropper } from './cropper.js';
 import { modal, confirmDialog, field } from './ui.js';
 import { runExport, EXPORT_LIMITS, quietNow } from './usability.js';
 import { androidApp } from './android.js';
+import { reasonText } from './android-push.js';
 import { desktopSettingsSection } from './desktop-settings.js';
+import { OUTSIDE_MODES, OUTSIDE_LABELS, outsideMode } from './outside.js';
 import { pickGame, gameImg, openActivityPicker, startDesktopDetection } from './activity.js';
 import { getKeybinds, saveKeybinds, comboLabel, recordCombo, DEFAULT_KEYBINDS } from './keybinds.js';
+import { clearsLabel } from './presence.js';
 import {
   THEMES, BACKGROUNDS, LAYOUT_PRESETS, DEFAULTS, UI_FONTS, CORNERS, loadAppearance, saveAppearance, resetAppearance, applyAppearance,
   gradientCss, canAnimate, isSolid, saveBgImage, loadBgImage, clearBgImage, exportAppearance, importAppearance,
@@ -196,7 +199,12 @@ function profileTab(app, setDirty) {
 
   const save = async () => {
     try {
-      const u = await api('PATCH', '/me/profile', draft);
+      // The custom status goes only when it was edited here, so one that cleared itself since this page opened
+      // isn't put back (and one that's unchanged keeps the time it clears).
+      // (Not called `body`: that's this tab, which is swapped for a fresh one below.)
+      const payload = { ...draft };
+      if (JSON.stringify(draft.customStatus) === JSON.stringify(JSON.parse(original).customStatus)) delete payload.customStatus;
+      const u = await api('PATCH', '/me/profile', payload);
       app.onMe(u);
       setDirty(false);
       toast('Profile saved.');
@@ -356,7 +364,10 @@ function profileTab(app, setDirty) {
       field('Display name', displayName, 'Shown instead of your username.'),
       field('Pronouns', pronouns),
       h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'About me', bioCount), bio),
-      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Custom status'), h('div', { class: 'row gap' }, csEmoji, csText))),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Custom status'), h('div', { class: 'row gap' }, csEmoji, csText),
+        h('span', { class: 'field-hint' }, S.me.customStatusExpiresAt
+          ? `${clearsLabel(S.me.customStatusExpiresAt)} A new status set here stays until you clear it; to have one clear itself, use Set a custom status in your status menu.`
+          : 'Stays until you clear it. To have it clear itself, use Set a custom status in your status menu.'))),
     section('Pictures', mediaHost),
     fold('Name style', 'Color, gradient, font and effects',
       h('div', { class: 'grid-2' },
@@ -411,6 +422,7 @@ function accountTab(app, setDirty, go) {
   const oldPw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
   const newPw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
   const confirmPw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
+  const pwCode = codeField(S); // with two-factor on, a fresh code every time
   const msg = h('p', { class: 'form-error', role: 'alert' });
   const btn = h('button', { class: 'btn primary', onclick: async () => {
     msg.textContent = '';
@@ -419,16 +431,23 @@ function accountTab(app, setDirty, go) {
     btn.disabled = true;
     btn.textContent = 'Re-encrypting your key…';
     try {
+      pwCode.row.hidden = !S.me.totpEnabled; // (two-factor may have been turned on since this page was drawn)
+      const second = pwCode.value();
       const salt = E2EE.newKdfSalt();
-      const oldParams = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
-      const oldK = await E2EE.deriveKeys(S.me.username, oldPw.value, oldParams);
+      const oldK = await E2EE.deriveKeys(S.me.username, oldPw.value, kdfParams(S));
       const newK = await E2EE.deriveKeys(S.me.username, newPw.value, { kdf: 'argon2id', salt });
-      const locked = await lockedKey(oldK.authKey).catch((x) => { throw x.code === 'bad_password' ? new Error('Your current password is not right.') : x; });
+      // The code goes with the first request (the locked key); its step-up ticket stands in for it on the second.
+      let locked;
+      try { locked = await lockedKey(oldK.authKey, second); } catch (x) { throw x.code === 'bad_password' ? new Error('Your current password is not right.') : pwCode.error(x) || x; }
       let enc;
-      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, locked); } catch { throw new Error('Your current password is not right.'); }
-      await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }));
+      try { enc = await E2EE.rewrapPrivateKey(oldK.wrapKey, newK.wrapKey, locked.encPrivateKey); } catch { throw new Error('Your current password is not right.'); }
+      let r;
+      try { r = await withCode((x) => api('POST', '/me/password', { oldAuthKey: oldK.authKey, newAuthKey: newK.authKey, encPrivateKey: enc, salt, ...x }), locked.stepUpTicket); } catch (x) { throw pwCode.error(x) || x; }
+      // This device stays signed in with a new token (a copy of the old one stops working); every tab of this
+      // browser switches to it and reconnects.
+      if (r.token) setToken(r.token);
       S.me = { ...S.me, kdf: 'argon2id', kdfSalt: salt };
-      oldPw.value = ''; newPw.value = ''; confirmPw.value = '';
+      oldPw.value = ''; newPw.value = ''; confirmPw.value = ''; pwCode.input.value = '';
       toast('Password changed. Other devices were logged out.');
     } catch (e) {
       if (!e.cancelled) msg.textContent = e.message;
@@ -492,7 +511,7 @@ function accountTab(app, setDirty, go) {
         h('span', { class: 'field-hint' }, 'Open a DM and click \u201cEnd-to-end encrypted\u201d to compare safety numbers with a friend.'))),
     section('Change password',
       h('p', { class: 'muted-p' }, 'Your password locks your encryption key, so changing it re-locks the key on this device. Forgot it? Use \u201cForgot your password?\u201d on the sign-in screen (needs a confirmed email; keep a recovery key to keep your old messages).'),
-      field('Current password', oldPw), field('New password', newPw), field('Confirm new password', confirmPw), msg,
+      field('Current password', oldPw), field('New password', newPw), field('Confirm new password', confirmPw), pwCode.row, msg,
       h('div', null, btn)),
     section('Session',
       h('button', { class: 'btn danger', onclick: () => app.logout() }, 'Log out of this device'),
@@ -511,45 +530,87 @@ async function deleteAccount(app) {
     body: h('div', { class: 'stack' }, h('p', { class: 'warn-box' }, `Deleting ${S.me.username} for good.`), field('Username', confirmName)),
     actions: [{ label: 'Cancel' }, { label: 'Delete forever', kind: 'danger', action: async () => {
       if (confirmName.value.trim() !== S.me.username) throw new Error('That isn’t your username.');
-      await withCode((x) => api('DELETE', '/me', { authKey: keys.authKey, confirm: S.me.username, ...x }));
+      await withCode((x) => api('DELETE', '/me', { authKey: keys.authKey, confirm: S.me.username, ...x }), keys.ticket);
       sessionStorage.setItem('hearth.signedOutWhy', 'Your account was deleted.');
       app.logout();
     } }] });
 }
 
 // ------------------------------------------------------------------ account safety: email, recovery key, 2FA
-// Your password-locked private key. The server only hands it out with the password, plus a two-factor code when
-// that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). A
-// wrong password fails here.
-async function lockedKey(authKey) {
-  try { return (await withCode((x) => api('POST', '/me/keys/wrapped', { authKey, ...x }))).encPrivateKey; } catch (e) {
+const kdfParams = (S) => (S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' });
+// A typed two-factor code as the server takes it: 6 digits from the app, or a backup code.
+const codeArgs = (c) => (/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c });
+// The two-factor code field of the "Confirm it’s you" dialogs. With two-factor on, sensitive changes always take a
+// fresh code (a session token copied at sign-in plus a typed password mustn't be enough), so the field is there
+// from the start. For the two that don't need one right after a two-factor sign-in (shown: false), it appears if
+// the server asks.
+function codeField(S, { shown = true } = {}) {
+  const input = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code', spellcheck: 'false', autocapitalize: 'off' });
+  const spent = h('span', { class: 'field-hint', role: 'status', hidden: true }, 'That code has been used. Enter a new one to try again.');
+  const row = field('Code from your app (or a backup code)', input);
+  row.append(spent);
+  input.addEventListener('input', () => { spent.hidden = true; });
+  row.hidden = !(S.me.totpEnabled && shown);
+  return {
+    row, input,
+    // What to send with the request: the typed code, or nothing while the field is hidden or empty. Then the server
+    // says whether it wants one (need_2fa, below): what this app knows can be out of date, say if two-factor was
+    // just turned off for you by an admin because your phone was lost.
+    value() {
+      const c = row.hidden ? '' : input.value.trim().replace(/\s/g, '');
+      return c ? codeArgs(c) : {};
+    },
+    // The error to show in the dialog when the server turned the code down (or wants one), else null.
+    error(e) {
+      if (e.code === 'need_2fa') { row.hidden = false; input.focus(); return new Error('This change needs a code from your authenticator app (or one of your backup codes).'); }
+      if (e.code === 'bad_2fa') { input.value = ''; input.focus(); return e; }
+      // Turned down for another reason after the code was checked: each code works once, so it's spent. The field is
+      // emptied for the next try (sending it again would be "not right").
+      if (e.codeUsed && !row.hidden && input.value) { input.value = ''; spent.hidden = false; }
+      return null;
+    },
+  };
+}
+// Your password-locked private key. The server only hands it out with the password, plus a fresh two-factor code
+// when that's on (a session alone isn't enough, so a stolen one can't be used to guess the password offline). With
+// a code it also hands back a step-up ticket, which stands in for that code on the next request of the same change
+// (each code works once, and that request wants one too). A wrong password fails here.
+async function lockedKey(authKey, code = {}) {
+  try { return await api('POST', '/me/keys/wrapped', { authKey, ...code }); } catch (e) {
     if (e.code === 'bad_password') throw Object.assign(new Error('That password isn’t right.'), { code: 'bad_password' });
     throw e;
   }
 }
-// Asks for the password again (sensitive changes). It must also unlock your key on this device. Resolves with
-// the derived keys plus the locked private key (encPrivateKey), or null if cancelled.
+// Asks for the password again, plus a two-factor code when it's on, for a change that needs your key unlocked on
+// this device (a recovery key) or is confirmed in a second step (deleting the account). The password must unlock
+// your key here. Resolves with the derived keys, the locked private key (encPrivateKey) and the step-up ticket for
+// the next request (ticket: pass it to withCode), or null if cancelled.
 function askPassword(app, { title = 'Confirm it’s you', text = '', button = 'Continue' } = {}) {
   const S = app.S;
   return new Promise((resolve) => {
     const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    const code = codeField(S);
+    let derived = null; // the slow password step isn't repeated when only the code was wrong
     modal({ title, size: 'sm', onClose: () => resolve(null),
-      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw)),
+      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw), code.row),
       actions: [{ label: 'Cancel' }, { label: button, kind: 'primary', action: async () => {
         // (The password hashing library's own message for an empty one means nothing to people.)
         if (!pw.value) throw new Error('Enter your password.');
-        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
-        const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        const encPrivateKey = await lockedKey(keys.authKey);
-        try { await E2EE.unwrapPrivateKey(keys.wrapKey, encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
-        resolve({ ...keys, encPrivateKey });
+        const second = code.value();
+        if (!derived || derived.pw !== pw.value) derived = { pw: pw.value, keys: await E2EE.deriveKeys(S.me.username, pw.value, kdfParams(S)) };
+        const { keys } = derived;
+        let r;
+        try { r = await lockedKey(keys.authKey, second); } catch (e) { throw code.error(e) || e; }
+        try { await E2EE.unwrapPrivateKey(keys.wrapKey, r.encPrivateKey); } catch { throw new Error('That password isn’t right.'); }
+        resolve({ ...keys, encPrivateKey: r.encPrivateKey, ticket: r.stepUpTicket || null });
       } }] });
   });
 }
-// Runs a sensitive request. If the server also wants a two-factor code (it does when two-factor is on, unless
-// this device passed it in the last few minutes), asks for one and sends the request again with it.
-function withCode(fn) {
-  return fn({}).catch((e) => {
+// Sends the next request of a change that began with askPassword (or lockedKey): its step-up ticket stands in for
+// the two-factor code. If the server still wants a code (no ticket, or it ran out: it lasts 5 minutes), asks for
+// one and sends the request again with it.
+function withCode(fn, ticket = null) {
+  return fn(ticket ? { stepUpTicket: ticket } : {}).catch((e) => {
     if (e.code !== 'need_2fa') throw e;
     return new Promise((resolve, reject) => {
       const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
@@ -558,7 +619,8 @@ function withCode(fn) {
         body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'This change needs a code from your authenticator app (or one of your backup codes).'), field('Code', code)),
         actions: [{ label: 'Cancel' }, { label: 'Continue', kind: 'primary', action: async () => {
           const c = code.value.trim().replace(/\s/g, '');
-          const out = await fn(/^\d{6}$/.test(c) ? { totp: c } : { backupCode: c });
+          if (!c) throw new Error('Enter the code from your authenticator app (or a backup code).');
+          const out = await fn(codeArgs(c));
           done = true; resolve(out);
         } }] });
     });
@@ -579,12 +641,35 @@ export function displayNameDialog(app, onDone) {
     } }] });
   setTimeout(() => inp.select(), 50);
 }
-// Password (and a two-factor code if needed) for a sensitive request: fn gets { authKey, totp|backupCode }.
-// Resolves to null if the person cancels.
-export async function confirmedCall(app, fn, opts) {
-  const keys = await askPassword(app, opts);
-  if (!keys) return null;
-  return withCode((x) => fn({ authKey: keys.authKey, ...x }));
+// Password (and a two-factor code when it's on) for a sensitive request, in one dialog: fn gets
+// { authKey, totp|backupCode } and what it returns is what this resolves to (null if the person cancels). A wrong
+// password or code is said in the dialog, which stays open; any other refusal closes it and rejects, for the
+// caller to show. grace: true for the two changes a two-factor sign-in in the last 10 minutes covers (starting a
+// data export, clearing unused files): their code field only shows if the server asks for one.
+export function confirmedCall(app, fn, { title = 'Confirm it’s you', text = '', button = 'Continue', grace = false, kind = 'primary' } = {}) {
+  const S = app.S;
+  return new Promise((resolve, reject) => {
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    const code = codeField(S, { shown: !grace });
+    let derived = null; let settled = false;
+    modal({ title, size: 'sm', onClose: () => { if (!settled) resolve(null); },
+      body: h('div', { class: 'stack' }, text ? h('p', { class: 'muted-p' }, text) : '', field('Your password', pw), code.row),
+      actions: [{ label: 'Cancel' }, { label: button, kind, action: async () => {
+        if (!pw.value) throw new Error('Enter your password.');
+        const second = code.value();
+        if (!derived || derived.pw !== pw.value) derived = { pw: pw.value, keys: await E2EE.deriveKeys(S.me.username, pw.value, kdfParams(S)) };
+        let out;
+        try { out = await fn({ authKey: derived.keys.authKey, ...second }); } catch (e) {
+          if (e.code === 'bad_password') { pw.focus(); throw new Error('That password isn’t right.'); }
+          const why = code.error(e);
+          if (why) throw why;
+          if (e.status === 429) throw e; // too many tries for now: said here, so the person can try again later
+          settled = true; reject(e); return undefined;
+        }
+        settled = true; resolve(out);
+        return undefined;
+      } }] });
+  });
 }
 function showSecretOnce({ title, intro, secret, filename, note }) {
   return new Promise((resolve) => {
@@ -616,13 +701,21 @@ function securitySections(app) {
   const addEmail = async () => {
     const email = h('input', { class: 'input', type: 'email', autocomplete: 'email', placeholder: 'you@example.com' });
     const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+    const code = codeField(S); // with two-factor on, a fresh code every time
+    let derived = null;
     modal({ title: S.me.email ? 'Change your email' : 'Add an email', size: 'sm',
-      body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw)),
+      body: h('div', { class: 'stack' }, h('p', { class: 'muted-p' }, 'Only used to reset your password and for security notices. Never shown to anyone.'), field('Email', email), field('Your password', pw), code.row),
       actions: [{ label: 'Cancel' }, { label: 'Send code', kind: 'primary', action: async () => {
         if (!pw.value) throw new Error('Enter your password.');
-        const params = S.me.kdf === 'argon2id' ? { kdf: 'argon2id', salt: S.me.kdfSalt } : { kdf: 'pbkdf2' };
-        const keys = await E2EE.deriveKeys(S.me.username, pw.value, params);
-        setTimeout(() => withCode((x) => api('POST', '/me/email', { email: email.value.trim(), authKey: keys.authKey, ...x })).then((r) => verifyEmail(r.sentTo)).catch(quiet), 150);
+        const second = code.value();
+        if (!derived || derived.pw !== pw.value) derived = { pw: pw.value, keys: await E2EE.deriveKeys(S.me.username, pw.value, kdfParams(S)) };
+        // Sent from here, so a wrong password or code is said in this dialog.
+        let r;
+        try { r = await api('POST', '/me/email', { email: email.value.trim(), authKey: derived.keys.authKey, ...second }); } catch (e) {
+          if (e.code === 'bad_password') { pw.focus(); throw new Error('That password isn’t right.'); }
+          throw code.error(e) || e;
+        }
+        setTimeout(() => verifyEmail(r.sentTo), 150);
       } }] });
   };
   const drawEmail = () => {
@@ -630,7 +723,7 @@ function securitySections(app) {
     if (S.me.email) {
       emailBox.append(h('div', { class: 'kv' }, h('span', null, 'Email'), h('strong', null, S.me.email, ' ', h('span', { class: 'rpill ok' }, 'Confirmed'))),
         h('div', { class: 'row gap' }, h('button', { class: 'btn sm', onclick: addEmail }, 'Change'),
-          h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app, { text: 'Without an email you can’t reset a forgotten password.' }); if (!k) return; withCode((x) => api('DELETE', '/me/email', { authKey: k.authKey, ...x })).then((u) => { refresh(u); toast('Email removed.'); }).catch(quiet); } }, 'Remove')));
+          h('button', { class: 'btn ghost sm', onclick: () => confirmedCall(app, (x) => api('DELETE', '/me/email', x), { text: 'Without an email you can’t reset a forgotten password.', button: 'Remove email' }).then((u) => { if (u) { refresh(u); toast('Email removed.'); } }).catch(quiet) }, 'Remove')));
     } else {
       emailBox.append(h('p', { class: 'muted-p' }, 'Add an email so you can reset your password if you ever forget it.'),
         S.config.emailEnabled ? h('div', null, h('button', { class: 'btn primary', onclick: addEmail }, 'Add an email'))
@@ -645,7 +738,7 @@ function securitySections(app) {
     const code = E2EE.newRecoveryCode();
     const salt = E2EE.newKdfSalt();
     const sealed = await E2EE.rewrapPrivateKey(keys.wrapKey, await E2EE.recoveryWrapKey(code, salt), keys.encPrivateKey);
-    const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }));
+    const u = await withCode((x) => api('PUT', '/me/recovery', { authKey: keys.authKey, encPrivateKeyRecovery: sealed, recoverySalt: salt, ...x }), keys.ticket);
     await showSecretOnce({ title: `${S.config.name} recovery key for ${S.me.username}`, intro: 'Save this key. If you forget your password, the email reset plus this key brings back everything, including your old messages. It’s shown only now.',
       secret: code, filename: `${S.config.name.replace(/\W+/g, '-')}-recovery-key-${S.me.username}.txt`, note: 'Anyone with this key AND access to your email could get into your account, so keep it private (a password manager is ideal).' });
     refresh(u);
@@ -656,7 +749,7 @@ function securitySections(app) {
       ? h('div', { class: 'kv' }, h('span', null, 'Recovery key'), h('span', { class: 'rpill ok' }, 'Saved'))
       : h('p', { class: 'warn-box' }, 'No recovery key yet. If you forget your password, an email reset gets you back in, but your old direct messages would be lost for good.'),
     h('div', { class: 'row gap' }, h('button', { class: `btn ${S.me.hasRecovery ? 'sm' : 'primary'}`, onclick: () => makeRecovery().catch(quiet) }, S.me.hasRecovery ? 'Make a new one' : 'Create a recovery key'),
-      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: async () => { const k = await askPassword(app); if (!k) return; withCode((x) => api('DELETE', '/me/recovery', { authKey: k.authKey, ...x })).then((u) => { refresh(u); toast('Recovery key removed.'); }).catch(quiet); } }, 'Remove') : ''));
+      S.me.hasRecovery ? h('button', { class: 'btn ghost sm', onclick: () => confirmedCall(app, (x) => api('DELETE', '/me/recovery', x), { text: 'Without a recovery key, a password reset by email can’t bring back your old messages.', button: 'Remove recovery key' }).then((u) => { if (u) { refresh(u); toast('Recovery key removed.'); } }).catch(quiet) }, 'Remove') : ''));
   };
   // ---- two-factor
   const tfaBox = h('div', { class: 'stack' });
@@ -677,16 +770,18 @@ function securitySections(app) {
         h('div', { class: 'tfa-setup' }, qr, h('div', { class: 'stack' }, h('span', { class: 'field-label' }, 'Can’t scan? Type this key:'), h('code', { class: 'mono-sm' }, r.secret), field('Then enter the code it shows', code)))),
       actions: [{ label: 'Cancel' }, { label: 'Turn on', kind: 'primary', action: async () => {
         const res = await api('POST', '/me/2fa/enable', { code: code.value });
+        // This device stays signed in with a new token (a copy of the old one is signed out with the other devices);
+        // every tab of this browser switches to it and reconnects.
+        if (res.token) setToken(res.token);
         setTimeout(async () => {
           await showSecretOnce({ title: `${S.config.name} backup codes for ${S.me.username}`, intro: 'If you lose your phone, each of these codes signs you in once. Keep them somewhere safe.', secret: res.backupCodes.join('\n'), filename: `${S.config.name.replace(/\W+/g, '-')}-backup-codes-${S.me.username}.txt` });
           refresh(res.user); toast('Two-factor sign-in is on. Other devices were signed out.');
         }, 150);
       } }] });
   };
-  // The password and a code in one dialog, sent together. (Asking for the password first with askPassword fetches
-  // the locked key, which takes a code of its own once the last one is 10 minutes old. That used up the code on
-  // the phone, so the one asked for next was refused until the app showed a new one.) Nothing needs unlocking
-  // here, so the password is only checked by the server.
+  // The password and a code in one dialog, sent together. (Asking for the password first with askPassword would
+  // fetch the locked key, which takes a code of its own; this request wants one too, and codes work once.) Nothing
+  // needs unlocking here, so the password is only checked by the server.
   const disable2fa = () => {
     const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const code = h('input', { class: 'input', autocomplete: 'one-time-code', placeholder: '123456 or a backup code' });
@@ -737,7 +832,10 @@ function securitySections(app) {
         const st = app.sec.stateOf(sv.id);
         const held = app.sec.heldEpochs(sv.id);
         const ok = !st || !st.keyEpoch || held.includes(st.keyEpoch);
-        return { name: sv.name || 'group chat', ok, why: ok ? '' : 'waiting for another member to share it (happens automatically when one is online)' };
+        // Joined a server that hides older messages from new members: their key is the next one, not shared.
+        const fresh = st && st.since && st.since.epoch > st.keyEpoch;
+        return { name: sv.name || 'group chat', ok, why: ok ? '' : fresh ? 'your key is on its way: this server gives new members a fresh key, which can take a few minutes'
+          : 'waiting for another member to share it (happens automatically when one is online)' };
       });
       const mine = await runAccountChecks({ me: S.me, privateKey: S.privateKey, signKey: S.signKey, serverKeys });
       const all = [...generic, ...mine];
@@ -951,13 +1049,14 @@ function keybindsEditor() {
     h('div', null, h('button', { class: 'btn ghost sm', type: 'button', onclick: async () => { await saveKeybinds({ ...DEFAULT_KEYBINDS }); root.replaceWith(keybindsEditor()); toast('Keybinds reset.'); } }, 'Reset to defaults')));
   return root;
 }
-function keybindsTab() {
+function keybindsTab(app) {
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Keybinds'),
     section('Voice', keybindsEditor()),
     section('Everywhere in Hearth',
-      ...[['Search everything', 'Ctrl + K'], ['Previous / next channel', 'Alt + \u2191 / \u2193'], ['Close menus, cancel a reply or an edit', 'Esc'], ['New line in a message', 'Shift + Enter'], ['Edit your last message', '\u2191 in an empty box']]
-        .map(([a, k]) => h('div', { class: 'kv' }, h('span', null, a), h('kbd', null, k)))));
+      ...[['Search everything', 'Ctrl + K'], ['Previous / next channel', 'Alt + \u2191 / \u2193'], ['Mark the server you\u2019re in as read', 'Shift + Esc'], ['Close menus, cancel a reply or an edit', 'Esc'], ['New line in a message', 'Shift + Enter'], ['Edit your last message', '\u2191 in an empty box']]
+        .map(([a, k]) => h('div', { class: 'kv' }, h('span', null, a), h('kbd', null, k))),
+      app && app.openShortcuts ? h('div', null, h('button', { class: 'btn ghost sm', type: 'button', onclick: () => app.openShortcuts() }, icon('info'), 'See all shortcuts (Ctrl + /)')) : null));
 }
 
 // ------------------------------------------------------------------ appearance tab
@@ -1239,7 +1338,7 @@ function notificationsTab(app) {
       state),
     soundsSection(),
     quietHoursSection(app),
-    section('Push (when Hearth is closed)', pushToggleRow(app), previewsRow(app)),
+    section('Push (when Hearth is closed)', ...pushRows(app), previewsRow(app)),
     perServerNotifications(app),
   );
 }
@@ -1297,8 +1396,24 @@ function perServerNotifications(app) {
 }
 
 // ------------------------------------------------------------------ chat tab
+// Link previews (docs/design/LINK-PREVIEWS.md): whether the composer offers, builds or skips a preview for a link
+// you send, and whether previews other people built show in messages.
+function linkPreviewSection(app, c, set) {
+  const off = (app.S.config.features || {}).linkPreviews === false;
+  const mode = h('select', { class: 'input sm', 'aria-label': 'When I send a link', disabled: off, onchange: (e) => set('linkPreviews', e.target.value) },
+    h('option', { value: 'ask' }, 'Ask each time'), h('option', { value: 'always' }, 'Always'), h('option', { value: 'never' }, 'Never'));
+  mode.value = ['ask', 'always', 'never'].includes(c.linkPreviews) ? c.linkPreviews : 'ask';
+  return section('Link previews',
+    h('div', { class: 'toggle-row' },
+      h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'When I send a link'),
+        h('span', { class: 'field-hint' }, off ? 'This server has link previews turned off.'
+          : 'To build a preview, your Hearth server fetches the page for you, so it sees the link (not your message). The site sees the server, not you. “Always” also asks first for links that look private, like sign-in or reset links.')),
+      mode),
+    toggle('Show link previews in messages', c.linkCards !== false, (v) => set('linkCards', v), 'Built by the sender and sent inside the encrypted message: your device never contacts the linked site.'));
+}
+
 function chatTab(app) {
-  const cur = () => ({ enterToSend: true, embeds: true, markdown: true, jumbo: true, compressImages: true, ...JSON.parse(localStorage.getItem('hearth.chat') || '{}') });
+  const cur = () => ({ enterToSend: true, embeds: true, markdown: true, jumbo: true, compressImages: true, linkPreviews: 'ask', linkCards: true, ...JSON.parse(localStorage.getItem('hearth.chat') || '{}') });
   const set = (k, v) => { const c = cur(); c[k] = v; localStorage.setItem('hearth.chat', JSON.stringify(c)); app.rerender(); };
   const c = cur();
   return h('div', { class: 'set-form narrow' },
@@ -1309,9 +1424,10 @@ function chatTab(app) {
       h('div', { class: 'kv' }, h('span', null, 'Mention someone'), h('kbd', null, '@ then a name'))),
     section('Display',
       toggle('Optimize photos before sending', c.compressImages !== false, (v) => set('compressImages', v), 'Big photos are resized to 2560 px and made much smaller (also removing hidden location data). Turn off to always send the original file.'),
-      toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'Pasted image URLs are loaded from the other site, which can see your IP address.'),
-      toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers|| and > quotes.'),
+      toggle('Show image links as previews', c.embeds, (v) => set('embeds', v), 'By default a picture from another site waits for a click, since that site sees your IP address (Privacy & safety \u2192 Outside images).'),
+      toggle('Format messages with Markdown', c.markdown, (v) => set('markdown', v), '**bold**, *italic*, `code`, ||spoilers||, # headings, - lists, > and >>> quotes, and #channel links.'),
       toggle('Large emoji when a message is only emoji', c.jumbo, (v) => set('jumbo', v))),
+    linkPreviewSection(app, c, set),
     section('Screen sharing',
       toggle('Hide DMs while I share my screen', c.hideDmsWhileSharing !== false, (v) => set('hideDmsWhileSharing', v), 'Direct messages and group chats are covered, and their previews and notifications hidden, while you share your screen. You can still open one with \u201cShow while sharing\u201d.')),
   );
@@ -1356,6 +1472,7 @@ function storageTab(app) {
     const w = f.where;
     if (!w) return KIND[f.kind] || 'File';
     if (w.type === 'unsent') return 'Uploaded, not sent (removed after a day)';
+    if (w.type === 'scheduled') return `Waiting with a scheduled message (due ${new Date(w.sendAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })})`;
     if (w.type === 'dm') return 'In a direct message';
     const s = (app.S.servers || []).find((x) => x.id === w.serverId);
     const c = s && (s.channels || []).find((x) => x.id === w.channelId);
@@ -1412,9 +1529,18 @@ function storageTab(app) {
 function sessionsTab(app) {
   const list = h('div', { class: 'stack' }, h('span', { class: 'spinner' }));
   const ended = h('div', { class: 'stack' });
-  const othersBtn = h('button', { class: 'btn danger', hidden: true, onclick: () => {
-    modal({ title: 'Log out all other devices?', size: 'sm', body: h('p', { class: 'muted-p' }, 'Every other device is signed out right away and has to sign in again (with your password, and your two-factor code if it’s on). This device stays signed in.'),
-      actions: [{ label: 'Cancel' }, { label: 'Log out others', kind: 'danger', action: async () => { const r = await api('POST', '/me/sessions/revoke-others'); toast(r.count ? `Signed out ${r.count} device${r.count === 1 ? '' : 's'}.` : 'No other devices were signed in.'); load(); } }] });
+  // Shown even when this is the only device listed: a copy of this device's own sign-in doesn't show up as another
+  // device. It takes the password (and a two-factor code when it's on), because this device gets a new sign-in
+  // token too, which signs out any copy of it: the server only does that for someone who knows the password.
+  const othersBtn = h('button', { class: 'btn danger', onclick: async () => {
+    try {
+      const r = await confirmedCall(app, (x) => api('POST', '/me/sessions/revoke-others', x), { title: 'Log out all other devices?', kind: 'danger', button: 'Log out others',
+        text: 'Every other device is signed out right away and has to sign in again (with your password, and your two-factor code if it’s on). This device stays signed in with a new sign-in, so a copy of it taken earlier stops working too.' });
+      if (!r) return;
+      // Every tab of this browser switches to the new token and reconnects.
+      if (r.token) setToken(r.token);
+      toast(r.count ? `Signed out ${r.count} device${r.count === 1 ? '' : 's'}.` : 'No other devices were signed in. This device has a new sign-in.'); load();
+    } catch (e) { if (!e.cancelled) toast(e.message, 'error'); }
   } }, 'Log out all other devices');
   const row = (x, live) => {
     const d = deviceOf(x.ua);
@@ -1435,7 +1561,6 @@ function sessionsTab(app) {
     try {
       const r = await api('GET', '/me/sessions');
       clear(list).append(...r.active.map((x) => row(x, true)));
-      othersBtn.hidden = r.active.length < 2;
       clear(ended);
       if (r.ended.length) ended.append(h('h4', { class: 'sub-title' }, 'Recently signed out'), ...r.ended.map((x) => row(x, false)));
       info.textContent = `A device that isn’t used for ${r.idleDays} days is signed out automatically, and every sign-in ends after ${r.maxDays} days.`;
@@ -1453,8 +1578,14 @@ function sessionsTab(app) {
 function privacyTab(app) {
   const p = { dms: 'everyone', friendRequests: 'everyone', ...(app.S.me.privacy || {}) };
   const save = async (k, v) => {
-    try { const out = await api('PATCH', '/me/privacy', { [k]: v }); app.S.me.privacy = out; toast('Saved.'); } catch (e) { toast(e.message, 'error'); }
+    try {
+      const out = await api('PATCH', '/me/privacy', { [k]: v });
+      app.S.me.privacy = out; toast('Saved.');
+      if (k === 'outsideImages') app.redrawImageLinks(); // image links already on screen follow the new choice
+    } catch (e) { toast(e.message, 'error'); }
   };
+  const outside = chips(OUTSIDE_MODES.map((m) => [m, m === 'ask' ? `${OUTSIDE_LABELS[m]} (default)` : OUTSIDE_LABELS[m]]), outsideMode(p), (v) => save('outsideImages', v));
+  outside.setAttribute('aria-label', 'Outside images');
   const blockedHost = h('div', { class: 'stack' });
   const drawBlocked = () => {
     clear(blockedHost);
@@ -1469,18 +1600,45 @@ function privacyTab(app) {
   drawBlocked();
   return h('div', { class: 'set-form narrow' },
     h('h2', { class: 'set-title' }, 'Privacy & safety'),
+    awaySection(app),
     section('Direct messages',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Who can start a DM with you'),
         chips([['everyone', 'Anyone who shares a server'], ['friends', 'Friends only']], p.dms, (v) => save('dms', v)))),
     section('Friend requests',
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Who can send you friend requests'),
         chips([['everyone', 'Everyone'], ['mutual', 'People in my servers'], ['nobody', 'Nobody']], p.friendRequests, (v) => save('friendRequests', v)))),
+    section('Outside images',
+      h('p', { class: 'set-sub' }, 'A picture linked from another site loads from that site, which then sees your IP address. Files people send, link preview pictures and GIFs this server passes through for you always show. This choice follows you to all your devices.'),
+      outside),
     section('Blocked people',
       h('p', { class: 'set-sub' }, 'Blocked people can\u2019t DM you or send friend requests. Their messages in shared servers are hidden behind a click. They aren\u2019t notified.'),
       blockedHost),
+    // Your word filter and the lists your servers suggest (wordfilter-app.js).
+    app.wordFilter ? app.wordFilter.settingsSection() : null,
     exportSection(app),
   );
 }
+// Automatic Away (server/presence.js): how long without using Hearth before people see you as Away. Kept on the
+// account, so every device uses the same time.
+const AWAY_AFTER = [[5, '5 minutes'], [10, '10 minutes'], [15, '15 minutes'], [30, '30 minutes'], [0, 'Never']];
+function awaySection(app) {
+  const desktop = window.hearthDesktop && typeof window.hearthDesktop.idleSeconds === 'function';
+  const sel = h('select', { class: 'input sm', 'aria-label': 'Show me as Away after', onchange: async () => {
+    try {
+      const r = await api('PATCH', '/me/status', { awayAfter: Number(sel.value) });
+      app.onMe({ id: app.S.me.id, awayAfter: r.awayAfter });
+      app.checkAway();
+      toast('Saved.');
+    } catch (e) { sel.value = String(app.S.me.awayAfter); toast(e.message, 'error'); }
+  } }, AWAY_AFTER.map(([v, label]) => h('option', { value: String(v) }, label)));
+  sel.value = String(Number.isFinite(app.S.me.awayAfter) ? app.S.me.awayAfter : 10);
+  return section('Online status',
+    h('div', { class: 'toggle-row' },
+      h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Show me as Away after'),
+        h('span', { class: 'field-hint' }, `When you haven\u2019t used Hearth for this long, people see you as Away, and Online again as soon as you\u2019re back. ${desktop ? 'In the desktop app, using anything on your computer counts.' : 'In a browser, using this tab counts; the desktop app counts anything you do on your computer.'} Being in a call counts too. With Hearth open on several devices, you\u2019re Away once none of them is in use. Only while your status is Online: Do Not Disturb and Invisible never change. Like Online, everyone signed in on this Hearth sees it, so they can tell when you stop and start using it.`)),
+      sel));
+}
+
 // Export my data: your account, profile, servers and every message you can decrypt, as JSON plus attachments in a
 // zip. The server sends ciphertext; it's decrypted and packed on this device. Starting needs your password.
 function exportSection(app) {
@@ -1490,12 +1648,12 @@ function exportSection(app) {
   const cancel = h('button', { class: 'btn ghost sm', hidden: true, onclick: () => ctl && ctl.abort() }, 'Cancel');
   const start = h('button', { class: 'btn', onclick: async () => {
     let res;
-    try { res = await confirmedCall(app, (x) => api('POST', '/me/export', x), { title: 'Export your data', text: 'This makes a zip of your account and the messages you can read, on this device.', button: 'Start export' }); } catch (e) { quiet(e); return; }
+    try { res = await confirmedCall(app, (x) => api('POST', '/me/export', x), { title: 'Export your data', text: 'This makes a zip of your account and the messages you can read, on this device.', button: 'Start export', grace: true }); } catch (e) { quiet(e); return; }
     if (!res) return;
     ctl = new AbortController();
     start.disabled = true; cancel.hidden = false; bar.hidden = false;
     try {
-      const { blob, manifest } = await runExport({ token: res.token, S: app.S, sec: app.sec, decryptMessage: app.decryptMessage, signal: ctl.signal,
+      const { blob, manifest } = await runExport({ token: res.token, S: app.S, sec: app.sec, decryptMessage: app.decryptMessage, signal: ctl.signal, wordFilter: app.wordFilter ? app.wordFilter.exportable() : null,
         onProgress: (text, f) => { status.textContent = text; bar.firstChild.style.width = Math.round(f * 100) + '%'; } });
       const url = URL.createObjectURL(blob);
       h('a', { href: url, download: `hearth-export-${app.S.me.username}-${new Date().toISOString().slice(0, 10)}.zip` }).click();
@@ -1665,31 +1823,88 @@ function layoutTab(app) {
 }
 
 // ------------------------------------------------------------------ apps & devices tab
-function pushToggleRow(app) {
+// The push switch and, in the Android app, the push app row under it: each redraws the other after a change, so
+// the push app (and its Change button) shows only while push is on.
+function pushRows(app) {
+  let appRow = null;
+  const toggle = pushToggleRow(app, () => appRow && appRow.redraw());
+  if (androidApp.push) appRow = androidPushAppRow(app, () => toggle.refresh());
+  return [toggle, appRow];
+}
+function pushToggleRow(app, onChanged = () => {}) {
   const note = h('span', { class: 'field-hint' }, 'Checking\u2026');
+  const label = h('span', { class: 'toggle-label' }, androidApp.on ? 'Notifications when Hearth is closed' : 'Push notifications on this device');
   const box = h('input', { type: 'checkbox', disabled: true });
   const row = h('label', { class: 'toggle-row' },
-    h('span', { class: 'toggle-text' }, h('span', { class: 'toggle-label' }, 'Push notifications on this device'), note),
+    h('span', { class: 'toggle-text' }, label, note),
     h('span', { class: 'switch' }, box, h('span', { class: 'switch-track' })));
   const refresh = async () => {
     const st = await app.push.status().catch(() => 'unsupported');
+    // In the Android app, through a push app such as ntfy (android-push.js); elsewhere, the browser's own.
+    const inApp = !!app.push.android;
     box.checked = st === 'on';
     box.disabled = st === 'unsupported' || st === 'blocked';
     note.textContent = {
-      on: 'You\u2019ll get notified about DMs, mentions and replies even when Hearth is closed. Notifications say who and where, never what \u2014 messages stay encrypted.',
-      off: 'Get notified about DMs, mentions and replies even when Hearth is closed.',
-      blocked: 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings.',
-      unsupported: /iPhone|iPad/.test(navigator.userAgent) && !app.isInstalled ? 'On iPhone and iPad, add Hearth to your Home Screen first, then turn this on inside the app.'
-        : !(app.S.config && app.S.config.pushEnabled) ? 'Push notifications are turned off on this server.' : 'This browser doesn\u2019t support push notifications.',
-    }[st];
+      on: inApp ? 'You\u2019ll get notifications even after you swipe Hearth away. They say \u201cNew message\u201d (or who, if you show names below), never what a message says.'
+        : 'You\u2019ll get notified about DMs, mentions and replies even when Hearth is closed. Notifications say who and where, never what \u2014 messages stay encrypted.',
+      off: inApp ? 'Get notified about DMs, mentions, replies and calls even after you swipe Hearth away. Needs a push app such as ntfy.'
+        : 'Get notified about DMs, mentions and replies even when Hearth is closed.',
+      nodistributor: reasonText.noDistributor,
+      failed: reasonText[(app.push.android && app.push.android.last && app.push.android.last.reason) || ''] || reasonText.INTERNAL_ERROR,
+      blocked: inApp ? reasonText.blocked : 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings.',
+      unsupported: androidApp.on && !(app.S.config && app.S.config.pushEnabled) ? 'Push notifications are turned off on this server.'
+        : androidApp.on ? 'Update the Hearth app to get notifications after you swipe it away.'
+          : /iPhone|iPad/.test(navigator.userAgent) && !app.isInstalled ? 'On iPhone and iPad, add Hearth to your Home Screen first, then turn this on inside the app.'
+            : !(app.S.config && app.S.config.pushEnabled) ? 'Push notifications are turned off on this server.' : 'This browser doesn\u2019t support push notifications.',
+    }[st] || '';
   };
   box.addEventListener('change', async () => {
     box.disabled = true;
-    try { if (box.checked) await app.push.enable(); else await app.push.disable(); toast(box.checked ? 'Push notifications are on for this device.' : 'Push notifications are off for this device.'); } catch (e) { toast(e.message, 'error'); }
-    refresh();
+    const inApp = !!app.push.android;
+    try {
+      if (box.checked) await app.push.enable(); else await app.push.disable();
+      toast(box.checked ? (inApp ? 'Notifications are on, even when Hearth is closed.' : 'Push notifications are on for this device.') : (inApp ? 'Notifications when Hearth is closed are off.' : 'Push notifications are off for this device.'));
+    } catch (e) { if (e.code !== 'CANCELLED') toast(e.message, 'error'); }
+    await refresh();
+    onChanged();
   });
   refresh();
+  row.refresh = refresh;
   return row;
+}
+// Android app: which push app delivers Hearth's notifications while it's closed, and what that means.
+function androidPushAppRow(app, onChanged = () => {}) {
+  const box = h('div', { class: 'stack' });
+  const cfg = app.S.config || {};
+  let drawing = 0;
+  const draw = async () => {
+    const p = app.push.android;
+    if (!p) return;
+    const mine = ++drawing;
+    // Only while push is on: "Change" re-registers, which would turn push back on for someone who turned it off.
+    const on = (await app.push.status().catch(() => 'off')) === 'on';
+    const st = p.last || {};
+    if (mine !== drawing) return; // a newer redraw started meanwhile
+    clear(box);
+    if (on && st.distributor) {
+      box.append(h('div', { class: 'row gap' },
+        h('span', { class: 'muted-p' }, `Push app: ${st.distributorName || st.distributor}`),
+        h('button', { class: 'btn ghost sm', onclick: async (e) => {
+          e.currentTarget.disabled = true;
+          try { await app.push.choose(); toast('Notifications now come through the push app you picked.'); } catch (x) { if (x.code !== 'CANCELLED') toast(x.message, 'error'); }
+          await draw();
+          onChanged();
+        } }, 'Change')));
+    }
+    box.append(h('p', { class: 'field-hint' }, 'How it works: a push app on your phone (such as ntfy, free on F-Droid and Google Play) keeps one connection open for all your apps and wakes Hearth when something happens. It only passes on notifications encrypted for this phone, and never sees what anyone writes. For notifications without delay, let the push app run without battery limits.'));
+    if (cfg.pushNtfy) {
+      box.append(h('p', { class: 'field-hint' }, 'This server runs its own ntfy, so no outside service is involved: in the ntfy app, open Settings \u2192 Default server and enter ',
+        h('code', null, cfg.pushNtfy), ', then turn notifications off and on here.'));
+    }
+  };
+  draw();
+  box.redraw = draw;
+  return box;
 }
 // In the Android app: notifications come from the app itself while it's open or in the background.
 function androidNotifyRow() {
@@ -1702,6 +1917,7 @@ function androidNotifyRow() {
       : st === 'denied' ? 'Notifications are blocked. Turn them on in Android Settings \u2192 Apps \u2192 Hearth \u2192 Notifications.'
         : 'Allow the app to notify you about new messages.'));
     if (st === 'default') box.append(h('div', null, h('button', { class: 'btn primary', onclick: async () => { await Notification.requestPermission(); draw(); } }, 'Allow notifications')));
+    box.append(h('p', { class: 'field-hint' }, 'Update the Hearth app to get notifications after you swipe it away, and calls that keep going with the screen locked.'));
   };
   draw();
   return box;
@@ -1743,8 +1959,9 @@ function appsTab(app) {
       dl.length || cfg.desktopUrl
         ? h('div', null, h('a', { class: 'btn ghost', href: '/download', target: '_blank', rel: 'noopener' }, icon('download'), 'Download page'))
         : h('p', { class: 'field-hint' }, 'The server owner hasn\u2019t published desktop installers yet.')),
-    androidApp.on ? section('Notifications', androidNotifyRow())
-      : section('Notifications', pushToggleRow(app),
+    // An older Android app can't get notifications while it's closed: it shows its own row and asks to be updated.
+    androidApp.on && !androidApp.push ? section('Notifications', androidNotifyRow())
+      : section('Notifications', ...pushRows(app),
         h('p', { class: 'field-hint' }, 'Turn this on separately on each phone or computer you use.')),
     section('Share', h('p', { class: 'muted-p' }, 'Send friends this link to get the app:'),
       h('div', { class: 'row gap' }, h('input', { class: 'input mono', readonly: true, value: `${location.origin}/download`, 'aria-label': 'Download page link' }),

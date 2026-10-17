@@ -24,10 +24,22 @@ export function displayName(u) {
   if (!u) return 'Unknown';
   return (u.profile && u.profile.displayName) || u.username;
 }
+// Someone's nickname in one server (server/nicknames.js), or ''. Group chats have none, and without a server (DMs,
+// friends, profiles) there's never one.
+export function nicknameIn(server, userId) {
+  if (!server || server.kind === 'group' || !userId) return '';
+  return (server.nicknames || {})[userId] || '';
+}
+// The name someone goes by in this server: their nickname there, else their display name. Pass the server only
+// where the name is shown inside it (its member list, messages, calls); everywhere else use displayName.
+export function displayNameIn(server, u) {
+  return (u && nicknameIn(server, u.id)) || displayName(u);
+}
 
 export function presenceOf(u, meId) {
   if (!u) return 'offline';
-  if (u.id === meId && u.status) return u.status === 'invisible' ? 'invisible' : u.status;
+  // Your own dot shows the status you picked, or Away while the server shows you as away for being inactive.
+  if (u.id === meId && u.status) return u.status === 'online' && u.autoAway ? 'idle' : u.status;
   return u.presence || 'offline';
 }
 
@@ -59,8 +71,12 @@ export function avatarEl(u, size = 40, { status = false, meId = '', speaking = f
   return wrap;
 }
 
-export function nameEl(u, { tag = 'span', cls = '', roleColor = '' } = {}) {
+// server: the server it's shown in, so the name is their nickname there. The element remembers it (data-name-in),
+// and its role color, so it's drawn the same way again when the person or their nickname changes.
+export function nameEl(u, { tag = 'span', cls = '', roleColor = '', server = null } = {}) {
   const p = (u && u.profile) || {};
+  const shown = displayNameIn(server, u);
+  const inServer = server && server.kind !== 'group' ? server.id : '';
   const effect = p.nameEffect || 'none';
   const gradient = !!p.nameColor2 || effect === 'flow';
   // The default white name follows the theme's text color so it stays readable in light mode.
@@ -77,9 +93,9 @@ export function nameEl(u, { tag = 'span', cls = '', roleColor = '' } = {}) {
       '--nglow': p.nameGlow || 'var(--n1x)',
       fontFamily: FONT_STACKS[p.nameFont] || 'inherit',
     },
-    dataset: { userName: u ? u.id : '' },
-  }, displayName(u));
-  if (effect === 'glitch') el.dataset.text = displayName(u);
+    dataset: { userName: u ? u.id : '', ...(inServer ? { nameIn: inServer } : {}), ...(roleColor ? { roleColor } : {}) },
+  }, shown);
+  if (effect === 'glitch') el.dataset.text = shown;
   if (p.nameColor3) el.classList.add('grad-multi');
   if (p.nameFont === 'Press Start 2P') el.classList.add('font-tiny');
   if (p.nameFont === 'Monoton' || p.nameFont === 'Bungee') el.classList.add('font-wide');
@@ -154,7 +170,9 @@ export function songPlayer(u, p) {
   sync();
   return btn;
 }
-export function profileCard(u, { meId = '', actions = null, compact = false, mutual = null, topFriends = null } = {}) {
+// nickname: { name, place, edit } when the card is opened inside a server where they have one: the nickname, the
+// server's name, and (when the viewer may change it) what Change does. The big name stays their display name.
+export function profileCard(u, { meId = '', actions = null, compact = false, mutual = null, topFriends = null, nickname = null } = {}) {
   const p = u.profile || {};
   const style = p.cardStyle || 'gradient';
   const noBanner = p.showBanner === false;
@@ -176,6 +194,11 @@ export function profileCard(u, { meId = '', actions = null, compact = false, mut
   inner.append(nameEl(u, { tag: 'div', cls: 'pc-name' }));
   inner.append(h('div', { class: 'pc-handle' }, u.username, p.pronouns ? h('span', { class: 'pc-pronouns' }, p.pronouns) : null,
     u.supporter ? h('span', { class: 'supporter-tag', title: 'Helps pay for this server' }, '\uD83D\uDC9C Supporter') : null));
+  if (nickname && nickname.name) {
+    inner.append(h('div', { class: 'pc-section pc-nick' }, h('div', { class: 'pc-label' }, `Nickname in ${nickname.place}`),
+      h('div', { class: 'pc-nick-row' }, h('span', { class: 'pc-nick-name' }, nickname.name),
+        nickname.edit ? h('button', { class: 'link-btn', 'aria-label': `Change nickname in ${nickname.place}`, onclick: nickname.edit }, 'Change') : null)));
+  }
   const act = activityCards(u, { compact: true });
   if (act) inner.append(h('div', { class: 'pc-section' }, act));
   if (p.bio) {

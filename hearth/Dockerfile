@@ -30,7 +30,8 @@ RUN apt-get update \
 # Program files stay owned by root, so the app (which runs as the unprivileged "node" user, uid 1000)
 # can read them but never change them. Only /data is writable for it.
 COPY --from=deps /app/node_modules ./node_modules
-COPY package.json ./
+# The MIT license travels with every copy of the image.
+COPY package.json LICENSE ./
 COPY server ./server
 COPY public ./public
 # Admin → Regions serves this script to new relay servers.
@@ -46,7 +47,7 @@ HEALTHCHECK --interval=30s --timeout=6s --start-period=40s --retries=3 \
   CMD ["node", "-e", "const p=process.env.PORT||3000,h=require('http'),s=require('https');const t=(m,u)=>new Promise((ok,no)=>{const r=m.get(u+'://127.0.0.1:'+p+'/api/health/live',{rejectUnauthorized:false,timeout:4000},x=>{x.resume();x.statusCode===200?ok():no()});r.on('error',no);r.on('timeout',()=>r.destroy(new Error('timeout')))});const o=String(process.env.HTTPS).toLowerCase()==='false'?[[h,'http'],[s,'https']]:[[s,'https'],[h,'http']];t(...o[0]).catch(()=>t(...o[1])).then(()=>process.exit(0),()=>process.exit(1))"]
 
 # Hearth never runs as root. docker-compose.yml starts it as uid 1000 directly. If the container is started
-# as root anyway (plain `docker run`, or a docker-compose.yml from before this change, which the update tool
+# as root anyway (plain `docker run`, or a docker-compose.yml from before this change, which hearth-update
 # keeps as it is), the entrypoint hands /data to uid 1000 — older images wrote it as root — and then
 # permanently drops to that user before Hearth starts.
 ENTRYPOINT ["/usr/local/bin/hearth-entrypoint"]

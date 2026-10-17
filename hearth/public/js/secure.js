@@ -6,6 +6,9 @@
 import * as E2EE from './e2ee.js';
 import { api } from './api.js';
 import { cleanFiles } from './attachments.js';
+import { cleanLinks } from './linkpreview.js';
+import { cleanX } from './disappear.js';
+import { bindingOf } from './binding.js';
 
 // The news bot's account (server/newsbot.js): the only one that still posts plaintext channel messages.
 const NEWS_BOT_ID = 'newsbot00000000000001';
@@ -18,7 +21,51 @@ function cleanPoll(p) {
   return { q: String(p.q || '').slice(0, 300), o, m: !!p.m };
 }
 
+// Marks the server sends only while they're set (server/index.js publicUser: keysReset, deleted, bot).
+const ONLY_WHILE_SET = ['keysReset', 'deleted', 'bot'];
+// A user object from the server on top of what the app had. A whole one (it always has publicKey) that leaves one of
+// those marks out means it's off now (keysReset: they're verified; deleted: the account isn't), so it mustn't linger
+// from before: a single record that said "deleted" would otherwise refuse that person's calls until a reload.
+export function mergeUser(old, x) {
+  const u = { ...(old || {}), ...x };
+  if (x && 'publicKey' in x) for (const k of ONLY_WHILE_SET) if (!(k in x)) delete u[k];
+  return u;
+}
+
+// What the app says when it refused a call connection (app.js callWarning; why from checkSdp, or 'self' from
+// voice.js handleSignal).
+export function callRefusedText(why, name) {
+  if (why === 'key-changed') return `${name}’s security key changed, so their call connection was blocked. Compare safety numbers with them (their profile → Verify encryption) before you talk.`;
+  if (why === 'deleted') return `Blocked a call connection in the name of ${name}: that account was deleted, so it can’t be in a call.`;
+  if (why === 'no-key') return `Blocked a call connection from ${name}: the server lists no usable security key for them, so it can’t be checked.`;
+  if (why === 'lookup-failed') return `Blocked a call connection from ${name}: their security key couldn’t be loaded to check it.`;
+  if (why === 'self') return 'Blocked a call connection that claimed to come from your own account. Only the server could have sent it.';
+  return `Blocked a voice connection from ${name}: its security signature didn't check out.`;
+}
+// Why there are no safety numbers to compare with someone (app.js openSafetyNumber), or null when there are: the
+// server lists no identity key for them (one that blanked or left it out, a bot, or an account deleted long ago).
+export function noSafetyNumbersText(user, name) {
+  if (!user || (typeof user.publicKey === 'string' && user.publicKey)) return null;
+  return user.deleted ? 'This account was deleted, so there are no safety numbers to compare.'
+    : `The server lists no security key for ${name}, so there are no safety numbers to compare. Calls with them stay blocked until it lists their key again.`;
+}
+
 export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () => {} }) {
+  // A link preview the sender put in the message (linkpreview.js cleanLinks), as { l } or nothing at all.
+  // Never throws: a bad preview must not make the message itself unreadable.
+  const linksIn = (payload) => {
+    if (payload.l === undefined) return {};
+    try {
+      const origin = typeof location !== 'undefined' ? location.host : '';
+      const l = cleanLinks(payload.l, String(payload.t || ''), { origin, anyPort: !!(S.config && S.config.linkPreviewAnyPort) });
+      return l ? { l } : {};
+    } catch { return {}; }
+  };
+  // Where the message says it belongs (binding.js, crypto-7), as { b } or nothing: the app checks it against what
+  // the server says. Never throws either.
+  const bindIn = (payload) => {
+    try { const b = bindingOf(payload); return b ? { b } : {}; } catch { return {}; }
+  };
   const groupKeys = new Map(); // serverId -> Map(epoch -> Uint8Array)
   const states = new Map(); // serverId -> key state from the server
   const waiters = new Map(); // serverId -> [resolve]
@@ -34,10 +81,23 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   async function userWithKeys(id) {
     let u = S.users[id];
     if (u && (u.publicKey || u.deleted)) return u;
-    if (!fetching.has(id)) fetching.set(id, api('GET', '/users/' + id).then((x) => { S.users[id] = { ...(S.users[id] || {}), ...x }; return S.users[id]; }).finally(() => fetching.delete(id)));
+    if (!fetching.has(id)) fetching.set(id, api('GET', '/users/' + id).then((x) => { S.users[id] = mergeUser(S.users[id], x); return S.users[id]; }).finally(() => fetching.delete(id)));
     u = await fetching.get(id);
     return u;
   }
+  // crypto-2: someone whose keys a password reset without their recovery key replaced, and who is still held back in
+  // at least one server or group they were in before (nobody there who knew them has verified them yet).
+  const awaitingVerify = (user) => !!user && !!user.keysReset;
+  // Held back in this server or group: the server keeps its key from them (and won't store one handed to them) until
+  // someone here verifies them, so the apps don't try either; their own app says to ask for it. A member's word only
+  // counts where they're a member, so someone can be held in one server and not in another: the server's list says
+  // which (a state without one falls back on the account-wide mark).
+  function isHeld(serverId, id) {
+    const st = states.get(serverId);
+    if (st && Array.isArray(st.held)) return st.held.includes(id);
+    return awaitingVerify(id === S.me.id ? S.me : S.users[id]);
+  }
+  const heldBack = (serverId, id) => id !== S.me.id && isHeld(serverId, id);
   function trust(user) {
     if (!user || user.id === S.me.id) return true;
     const ok = E2EE.checkPin(S.me.id, user) === 'ok';
@@ -47,7 +107,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   const keyChanged = (user) => !!user && user.id !== S.me.id && E2EE.checkPin(S.me.id, user) === 'changed';
   // keyChanged for a whole list at once (the member list): a Set of the ids whose keys changed.
   const keysChanged = (users) => E2EE.checkPins(S.me.id, users);
-  function acceptKeys(user) { E2EE.acceptPin(S.me.id, user); warned.delete(user.id); }
+  // false (and nothing trusted) for a record with no identity key: there's nothing to verify.
+  function acceptKeys(user) { const ok = E2EE.acceptPin(S.me.id, user); if (ok) warned.delete(user.id); return ok; }
   // Someone's keys to open (which: 'e', identity keys) or check (which: 's', signing keys) what they wrote at
   // `at` (ms; 0 if unknown), best first, each with how far it's trusted:
   //   'now'     their current key, or the one this device pinned for them (the same one unless it changed)
@@ -65,7 +126,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (user.id === S.me.id) { if (proven) add(proven[which], 'now'); return out; }
     const changed = keyChanged(user);
     const p = E2EE.pinnedKeys(S.me.id, user, at);
-    if (!changed) add(user[field], 'now');
+    // A key the server lists counts as theirs only next to the identity key this device pinned for them (pinned on
+    // first sight, so that's everyone with keys): never from a record that leaves the identity key out, whatever
+    // the pin check made of it.
+    if (!changed && p.e && user.publicKey === p.e) add(user[field], 'now');
     if (p[which]) {
       if (!changed) add(p[which], 'now');
       else {
@@ -164,6 +228,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   async function applyState(st) {
     if (!st) return;
+    const heldList = (x) => (Array.isArray(x && x.held) ? [...x.held].sort().join() : '');
+    const heldChanged = heldList(states.get(st.serverId)) !== heldList(st); // the member list's shields
     states.set(st.serverId, st);
     const mine = keysFor(st.serverId);
     const server = S.servers.find((s) => s.id === st.serverId);
@@ -229,7 +295,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (fresh.length) keepForMyself(st.serverId, fresh);
     (waiters.get(st.serverId) || []).forEach((r) => r());
     waiters.delete(st.serverId);
-    onKeysChanged(st.serverId, added);
+    onKeysChanged(st.serverId, added, heldChanged);
     maintain(st.serverId);
   }
 
@@ -274,8 +340,10 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!st || busy.has(serverId)) return;
     const server = S.servers.find((s) => s.id === serverId);
     if (!server) return;
-    const needsRotate = (st.needsRotation || !st.keyEpoch) && !held(serverId);
-    const needsShare = !needsRotate && st.missing && st.missing.some((id) => id !== S.me.id) && currentKey(serverId);
+    const needsRotate = (st.needsRotation || !st.keyEpoch) && !held(serverId) && mayMakeKey(server);
+    const shareWith = (st.missing || []).filter((id) => id !== S.me.id && !heldBack(serverId, id));
+    // Held back here yourself: the server takes no key from you to pass on (it might be one you made alone).
+    const needsShare = !needsRotate && !isHeld(serverId, S.me.id) && shareWith.length > 0 && currentKey(serverId);
     if (!needsRotate && !needsShare) return;
     busy.add(serverId);
     // Runs right away (no timers: background tabs throttle them). If several members do this at once,
@@ -283,12 +351,15 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     (async () => {
       try {
         if (needsRotate) await rotate(serverId);
-        else await share(serverId, st.missing.filter((id) => id !== S.me.id));
+        else await share(serverId, shareWith);
       } catch (e) {
-        if (!['epoch', 'members', ...LIMITED].includes(e.code)) console.warn('Key maintenance failed', e.message);
+        if (!['epoch', 'members', 'keys_unverified', ...LIMITED].includes(e.code)) console.warn('Key maintenance failed', e.message);
       } finally { busy.delete(serverId); }
     })();
   }
+  // While you wait to be verified here yourself, you can only make the key of a server nobody else is in (the server
+  // refuses otherwise: the others would be handed a key that your unverified keys chose).
+  const mayMakeKey = (server) => !isHeld(server.id, S.me.id) || server.memberIds.every((id) => id === S.me.id);
   // The server said "not you, not now" to a new key from us (we came back after being away, or we reported the
   // last key broken, so someone else makes the next one): don't keep asking for a minute.
   const LIMITED = ['rotate_too_soon', 'rate_limited'];
@@ -313,7 +384,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   }
   // Someone's keys changed under us: fetch them fresh before trying again.
   async function refreshUsers(ids) {
-    await Promise.all(ids.map((id) => api('GET', '/users/' + id).then((x) => { S.users[id] = { ...(S.users[id] || {}), ...x }; }).catch(() => {})));
+    await Promise.all(ids.map((id) => api('GET', '/users/' + id).then((x) => { S.users[id] = mergeUser(S.users[id], x); }).catch(() => {})));
   }
 
   async function rotate(serverId) {
@@ -322,7 +393,8 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     if (!server || !st) return;
     const epoch = st.keyEpoch + 1;
     const raw = E2EE.newGroupKey();
-    const { wraps, pubs } = await wrapFor(serverId, epoch, raw, server.memberIds);
+    // Everyone but whoever waits to be verified (the server wouldn't keep their copy).
+    const { wraps, pubs } = await wrapFor(serverId, epoch, raw, server.memberIds.filter((id) => !heldBack(serverId, id)));
     const check = await E2EE.keyCheck(raw, serverId, epoch);
     const next = await api('POST', `/servers/${serverId}/keys/rotate`, { epoch, check, wraps, pubs }).catch(async (e) => {
       if (e.code === 'stale_keys') { await refreshUsers(server.memberIds.filter((id) => id !== S.me.id)); setTimeout(() => maintain(serverId), 500); }
@@ -337,7 +409,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     const ck = currentKey(serverId);
     const server = S.servers.find((s) => s.id === serverId);
     if (!ck || !server || !userIds.length) return;
-    const ids = userIds.filter((id) => server.memberIds.includes(id));
+    const ids = userIds.filter((id) => server.memberIds.includes(id) && !heldBack(serverId, id));
     if (!ids.length) return;
     const { wraps, pubs } = await wrapFor(serverId, ck.epoch, ck.raw, ids);
     const r = await api('POST', `/servers/${serverId}/keys/share`, { epoch: ck.epoch, wraps, pubs });
@@ -346,12 +418,19 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
 
   // Wait until we can send in this server (rotating ourselves if the key needs refreshing).
   async function ready(serverId) {
+    const server = S.servers.find((s) => s.id === serverId);
+    // Waiting to be verified: nobody shares the key with you, so there's nothing to wait for here.
+    if (!currentKey(serverId) && server && !mayMakeKey(server)) {
+      const err = new Error('Your password was reset without your recovery key, so someone here who knew you before has to verify you before you can read or send messages here. Ask one of them to compare safety numbers with you.');
+      err.code = 'unverified';
+      throw err;
+    }
     for (let i = 0; i < 4; i++) {
       if (i && rolledBack(serverId)) break; // still older than a key we have, even after asking again
       const ck = currentKey(serverId);
       if (ck) return ck;
       const st = states.get(serverId);
-      if (st && (st.needsRotation || !st.keyEpoch) && !busy.has(serverId) && !held(serverId)) {
+      if (st && (st.needsRotation || !st.keyEpoch) && !busy.has(serverId) && !held(serverId) && (!server || mayMakeKey(server))) {
         busy.add(serverId);
         // Refused for us (see holds): another member's app makes the new key, so wait for it like for a share.
         try { await rotate(serverId); } catch (e) {
@@ -367,7 +446,12 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       err.code = 'rollback';
       throw err;
     }
-    const err = new Error('You don\u2019t have this server\u2019s encryption key yet. It arrives as soon as another member comes online.');
+    // Joined a server that keeps what came before from new members: the key is the next one, made for you (since:
+    // where your history starts, server/joinhistory.js), never the one in use when you joined.
+    const st = states.get(serverId);
+    const err = new Error(st && st.since && st.since.epoch > st.keyEpoch
+      ? 'Your encryption key for this server is on its way: it gives new members a fresh key, which can take a few minutes.'
+      : 'You don\u2019t have this server\u2019s encryption key yet. It arrives as soon as another member comes online.');
     err.code = 'no-key';
     throw err;
   }
@@ -406,7 +490,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       const { payload, signedBy } = await E2EE.decryptGroup({ raw, serverId, channelId, authorId, authorSignPub: keys.map((k) => k.key), text });
       const how = signedBy ? keys.find((k) => k.key === signedBy).trust : null;
       return {
-        t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p),
+        t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload), ...bindIn(payload),
         verified: how === 'now' || how === 'pinned', ...(how && how !== 'now' ? { keyNote: how } : {}),
       };
     } catch {
@@ -422,11 +506,29 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
     const author = S.users[m.authorId];
     const bot = !!m.bot && (m.authorId === NEWS_BOT_ID || (!!author && !!author.bot));
     if (!bot && S.e2eeSince && Number(m.createdAt) > S.e2eeSince) return { forged: true, error: true, t: '', f: [] };
-    return { t: m.content || '', f: cleanFiles(m.attachments), legacy: true, verified: false, embed: m.embed || null, bot };
+    return { t: m.content || '', f: cleanFiles(m.attachments), legacy: true, verified: false, embed: m.embed || null, bot, webhook: bot ? hookOf(m.webhook) : null };
+  }
+  // A channel webhook's post: the name and picture the program asked for (the picture is an https address the app
+  // only loads through this server's avatar proxy, by the link the server signed for it: avatarSrc, sent only for
+  // pictures on known avatar hosts), and whether it may ping.
+  function hookOf(w) {
+    if (!w || typeof w !== 'object') return null;
+    return {
+      id: String(w.id || ''), name: typeof w.name === 'string' && w.name ? w.name.slice(0, 64) : null,
+      avatar: typeof w.avatar === 'string' && /^https:\/\//.test(w.avatar) ? w.avatar : null, pings: w.pings === true,
+      avatarSrc: typeof w.avatarSrc === 'string' && /^\/media\/avatar\//.test(w.avatarSrc) ? w.avatarSrc : null,
+    };
+  }
+  // A bot post from an account this device hasn't loaded (a channel webhook's, or a bot removed since): load it first,
+  // so it's checked as a bot's instead of being hidden as a message only the server could have written.
+  async function loadBotAuthor(x) {
+    if (x && x.bot && x.authorId && !S.users[x.authorId]) { try { await userWithKeys(x.authorId); } catch { /* stays unknown */ } }
   }
 
   async function decryptChannelMessage(m) {
     if (m.dec && !m.dec.pending) return;
+    if (m.legacy) await loadBotAuthor(m);
+    if (m.reply && !m.reply.ciphertext) await loadBotAuthor(m.reply);
     if (m.legacy) m.dec = openLegacy(m);
     else {
       // If a key arrives while we're decrypting, try again so we never keep a stale "waiting" result.
@@ -476,7 +578,7 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
       for (const { key, trust: how } of await dmKeys(dmId, at)) {
         try {
           const { payload, legacy } = await E2EE.decryptDm({ myPriv: S.privateKey, theirPub: key, dmId, authorId, text });
-          return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
+          return { t: String(payload.t || ''), f: cleanFiles(payload.f), p: cleanPoll(payload.p), x: cleanX(payload.x), ...linksIn(payload), ...bindIn(payload), legacyFormat: !!legacy, ...(how !== 'now' ? { keyNote: how } : {}) };
         } catch { /* not this key */ }
       }
       throw new Error('Missing key');
@@ -506,11 +608,31 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   // ---------------------------------------------------------------- voice handshakes
   const sdpText = (channelId, from, to, desc) => `hearth-voice|${channelId}|${from}|${to}|${desc.type}|${desc.sdp}`;
   const signSdp = (channelId, toUserId, desc) => E2EE.sign(S.signKey, sdpText(channelId, S.me.id, toUserId, desc));
-  async function verifySdp(channelId, fromUserId, desc, sig) {
-    const u = await userWithKeys(fromUserId);
-    if (!u || !u.signPublicKey || keyChanged(u)) return false;
-    return E2EE.verify(u.signPublicKey, sdpText(channelId, fromUserId, S.me.id, desc), sig);
+  // Whether an offer or answer really comes from that person: { ok: true }, or { ok: false, why } with why one of
+  //   'no-key'         the server lists no identity key for them (a bot has none), or no signing key at all
+  //   'deleted'        the server says the account was deleted (it can't sign in, so it's never in a call)
+  //   'key-changed'    their keys aren't the ones this device pinned for them (e2ee.js judgePin), until you compare
+  //                    safety numbers and accept the new ones
+  //   'lookup-failed'  their keys couldn't be loaded
+  //   'bad-signature'  no signature, a wrong one, or one claiming to come from your own account
+  // The signature is checked with the signing key this device pinned for them (pinned on first sight, trust on first
+  // use), never just the one the server lists now: the DTLS fingerprint inside the SDP is what the encrypted
+  // connection is checked against, so a server that could get its own key accepted could sit in the middle.
+  async function checkSdp(channelId, fromUserId, desc, sig) {
+    if (!fromUserId || fromUserId === S.me.id || !desc || typeof desc.sdp !== 'string' || !sig) return { ok: false, why: 'bad-signature' };
+    let u;
+    try { u = await userWithKeys(fromUserId); } catch { u = null; }
+    if (!u) return { ok: false, why: 'lookup-failed' };
+    // (An account deleted by an older version has no keys at all; one that lists a signing key without an identity
+    // key is no real deletion, e2ee.js judgePin.)
+    if (!u.publicKey) return { ok: false, why: u.deleted && !keyChanged(u) ? 'deleted' : 'no-key' };
+    if (keyChanged(u)) return { ok: false, why: 'key-changed' };
+    if (u.deleted) return { ok: false, why: 'deleted' };
+    const signKey = E2EE.pinnedKeys(S.me.id, u).s;
+    if (!signKey) return { ok: false, why: 'no-key' };
+    return (await E2EE.verify(signKey, sdpText(channelId, fromUserId, S.me.id, desc), sig)) ? { ok: true } : { ok: false, why: 'bad-signature' };
   }
+  const verifySdp = async (channelId, fromUserId, desc, sig) => (await checkSdp(channelId, fromUserId, desc, sig)).ok;
 
   function reset() {
     groupKeys.clear(); states.clear(); busy.clear(); warned.clear(); rewrapped.clear(); keeping.clear(); unverified.clear(); holds.clear();
@@ -518,9 +640,9 @@ export function createSecure({ S, onKeysChanged = () => {}, onKeyWarning = () =>
   }
 
   return {
-    ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain,
+    ensureSigningKey, applyState, stateOf, currentKey, ready, refresh, forceRotate, maintain, awaitingVerify, heldBack, isHeld,
     encryptChannel, decryptChannelMessage, encryptDm, decryptDmMessage, decryptAttachment,
-    signSdp, verifySdp, keyChanged, keysChanged, acceptKeys, trust, userWithKeys, reset,
+    signSdp, verifySdp, checkSdp, keyChanged, keysChanged, acceptKeys, trust, userWithKeys, reset,
     heldEpochs: (serverId) => [...keysFor(serverId).keys()],
     keysSaved: (serverId) => keeping.get(serverId) || Promise.resolve(), // our own copies are stored back
     signKeysFor,

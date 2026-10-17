@@ -3,24 +3,37 @@
 #   and from the Actions tab ("Run workflow").
 #   Result: download them from the run's "Artifacts" section, or the release for tags.
 #   Optional repository variable HEARTH_SERVER (e.g. https://chat.example.com): bakes your server's address in
-#   so people don't have to type it.
+#   so people don't have to type it. The Android app then also opens https://that-server/invite/... links itself
+#   (Android App Links: set ANDROID_CERT_SHA256 on the server, see hearth/.env.example).
 #   Optional secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD:
-#   sign Android builds with your own key (see hearth/mobile/README.md). Without them a key is generated once
-#   and kept in the Actions cache. With them, a Google Play bundle (.aab) is built too.
+#   sign Android builds with your own key (see hearth/mobile/README.md); with them, a Google Play bundle (.aab) is
+#   built too. Without them the APK is built UNSIGNED (Hearth-<version>-UNSIGNED.apk, artifact
+#   hearth-android-UNSIGNED): Android won't install it, and it's never attached to a release or copied to your
+#   server. No signing key is ever made or kept here.
 #   Optional secrets VPS_HOST / VPS_USER / VPS_SSH_KEY / VPS_DOWNLOADS_DIR: copy the installers to your server's
 #   data/downloads folder, where they show up on https://your-server/download. Use a user that can only write
 #   that folder (not root). With them, VPS_HOST_FINGERPRINT is required too: the server's SSH host key
 #   fingerprint (on the server: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub, the SHA256:... part), so the
 #   copy refuses any other machine.
-#   Optional secret UPDATE_SIGNING_KEY (an Ed25519 private key; make one with
-#   `node hearth/desktop/build/sign-update.js keygen`): signs the desktop update files (latest*.yml.sig) and
-#   builds the matching public key into the apps, which then only install updates signed with it. Without it
-#   the apps still update, but ask first and say the update can't be verified.
+#   Optional secret UPDATE_SIGNING_KEY and variable UPDATE_PUBLIC_KEY (an Ed25519 key pair; make one with
+#   `node hearth/desktop/build/sign-update.js keygen`): the public key is built into the apps, which then only
+#   install updates signed with the private one; the private key signs the desktop update files (latest*.yml.sig)
+#   in the sign-updates job, which runs no code from npm packages, and only when UPDATE_PUBLIC_KEY is set to its
+#   public half (already have the secret? don't make a new pair: the sign-updates job prints the public half to
+#   use, as does `sign-update.js pubkey`). Without the key pair the apps still update, but ask first and say the
+#   update can't be verified.
 #
 #   Security: every job only gets read access to the repository, except "release" (it creates the GitHub
 #   release). Actions are pinned to exact commits (the comment says which version; Dependabot updates them),
 #   checkouts don't keep the token, and the Android build installs exactly what's in its package-lock.json.
 #   The server copy uses the runner's own ssh/scp, so no third-party code ever handles VPS_SSH_KEY.
+#   The jobs that sign update files or publish releases (sign-updates, play-upload, release, publish-to-vps) run
+#   in the GitHub environment "production", and only for app-v* tags and the default branch: put
+#   UPDATE_SIGNING_KEY, PLAY_SERVICE_ACCOUNT_JSON and the VPS_* secrets there (Settings > Environments), delete the
+#   repository secrets of the same names, and add its protection rules (only the default branch and app-v* tags;
+#   required reviewers if you want to approve each one). The release and the server copy take only the final
+#   artifacts and refuse an unsigned APK, the Play bundle and SignPath's unsigned inputs. Still repository-wide:
+#   the Windows and Android signing secrets, which the build jobs use on every branch.
 #
 #   Code signing (all optional; builds stay unsigned without them; step-by-step guide: hearth/docs/SIGNING.md):
 #     Windows, Azure Artifact Signing: secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET and
@@ -90,14 +103,16 @@ jobs:
         if: env.SERVER != ''
         run: node -e "const f='hearth.config.json';const c=require('./'+f);c.defaultServer=process.env.SERVER;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
       # Signed updates: the installed app gets the public key and refuses updates not signed with the private one.
+      # Only the public half comes here: the private key never reaches a job that runs npm packages' code (the
+      # sign-updates job below signs with it).
       - name: Bake in the update signing key
         env:
-          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
         run: |
-          if [ -n "$UPDATE_SIGNING_KEY" ]; then
+          if [ -n "$UPDATE_PUBLIC_KEY" ]; then
             node build/sign-update.js bake
           else
-            echo "::warning title=Update signing::No UPDATE_SIGNING_KEY secret: these apps can't verify their updates and will ask before installing each one. See hearth/desktop/build/sign-update.js."
+            echo "::warning title=Update signing::No UPDATE_PUBLIC_KEY variable: these apps can't verify their updates and will ask before installing each one. Have an UPDATE_SIGNING_KEY secret already? Set UPDATE_PUBLIC_KEY to its public half (the sign-updates job prints it; don't make a new pair). See hearth/docs/SIGNING.md."
           fi
       - run: npm ci --no-audit --no-fund
       # Windows: sign with Azure Artifact Signing or a .pfx certificate when those secrets exist; otherwise an
@@ -204,14 +219,8 @@ jobs:
             if ($s.Status -ne 'Valid') { $bad = $true }
           }
           if ($bad) { Write-Host "::error::An .exe is not validly signed."; exit 1 }
-      # Last, after anything that rewrites latest.yml (SignPath's after-signing.js): sign the update files.
-      # macOS doesn't update itself, so there's nothing to sign there.
-      - name: Sign the update files
-        if: runner.os != 'macOS'
-        env:
-          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-        run: |
-          if [ -n "$UPDATE_SIGNING_KEY" ]; then node build/sign-update.js sign dist; fi
+      # The update files are signed in the sign-updates job, after anything here that rewrites latest.yml
+      # (SignPath's after-signing.js).
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hearth-desktop-${{ runner.os }}
@@ -222,16 +231,66 @@ jobs:
             hearth/desktop/dist/*.deb
             hearth/desktop/dist/*.blockmap
             hearth/desktop/dist/latest*.yml
-            hearth/desktop/dist/latest*.yml.sig
           if-no-files-found: error
+
+  # Signs the desktop update files (latest*.yml.sig) for builds that reach people's apps: tags and the default
+  # branch. A job of its own, so UPDATE_SIGNING_KEY never shares a runner with code from npm packages: it only runs
+  # the repository's build/sign-update.js (Node's own modules) on the files the desktop job made. macOS doesn't
+  # update itself, so there's nothing to sign for it.
+  sign-updates:
+    needs: desktop
+    if: startsWith(github.ref, 'refs/tags/app-v') || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: hearth/desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hearth-desktop-Windows
+          path: hearth/desktop/dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hearth-desktop-Linux
+          path: hearth/desktop/dist
+      # sign-update.js refuses (and prints the public half to put in UPDATE_PUBLIC_KEY) when the variable isn't set:
+      # the apps were then built without a key, and signing them would let installed apps take an update that
+      # never checks another one.
+      - name: Sign the update files
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_KEY" ]; then
+            node build/sign-update.js sign dist
+          elif [ -n "$UPDATE_PUBLIC_KEY" ]; then
+            echo "::error title=Update signing::These apps were built with UPDATE_PUBLIC_KEY, but there's no UPDATE_SIGNING_KEY secret here to sign their updates with, so they would refuse them. Add it to the production environment."
+            exit 1
+          else
+            echo "::warning title=Update signing::No UPDATE_SIGNING_KEY secret: the update files aren't signed."
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hearth-desktop-update-signatures
+          path: hearth/desktop/dist/latest*.yml.sig
+          if-no-files-found: ignore
 
   android:
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: hearth/mobile
-    env:
-      HAS_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+    outputs:
+      signed: ${{ steps.secretkey.outputs.found }}
+      version: ${{ steps.v.outputs.name }}
+      code: ${{ steps.v.outputs.code }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -269,6 +328,9 @@ jobs:
         run: |
           npx cap add android
           cp native/*.java android/app/src/main/java/app/hearth/mobile/
+          # Push while the app is closed (UnifiedPush, an exact version), calls that keep going with the screen
+          # locked, invite links, the status bar icon and the app's unit tests. Fails if the template changed.
+          node scripts/patch-android.js android
           # Microphone and camera for calls and voice messages, notifications for new messages.
           sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />#' android/app/src/main/AndroidManifest.xml
           grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
@@ -281,15 +343,20 @@ jobs:
                   versionCode $VERSION_CODE
                   versionName "$VERSION_NAME"
               }
-              signingConfigs {
-                  hearth {
-                      storeFile file(System.getenv("HEARTH_KEYSTORE"))
-                      storePassword System.getenv("HEARTH_KEYSTORE_PASSWORD")
-                      keyAlias System.getenv("HEARTH_KEY_ALIAS")
-                      keyPassword System.getenv("HEARTH_KEY_PASSWORD")
+          }
+          // Signed only with your own key (the ANDROID_KEYSTORE_* secrets); without one the release APK stays unsigned.
+          if (System.getenv("HEARTH_KEYSTORE")) {
+              android {
+                  signingConfigs {
+                      hearth {
+                          storeFile file(System.getenv("HEARTH_KEYSTORE"))
+                          storePassword System.getenv("HEARTH_KEYSTORE_PASSWORD")
+                          keyAlias System.getenv("HEARTH_KEY_ALIAS")
+                          keyPassword System.getenv("HEARTH_KEY_PASSWORD")
+                      }
                   }
+                  buildTypes { release { signingConfig signingConfigs.hearth } }
               }
-              buildTypes { release { signingConfig signingConfigs.hearth } }
           }
           EOF
       - name: App icon
@@ -297,89 +364,130 @@ jobs:
         run: npx --no -- capacitor-assets generate --android --assetPath resources --iconBackgroundColor '#100e16' --iconBackgroundColorDark '#100e16' --splashBackgroundColor '#100e16' --splashBackgroundColorDark '#100e16'
       - run: npx cap sync android
 
+      # Signing only with your own key, from the ANDROID_KEYSTORE_* secrets. Without them the APK is built unsigned,
+      # named and uploaded as UNSIGNED, and never released or copied to your server (Android won't install it
+      # anyway). No key is ever made or kept here: anything in the Actions cache can be read by other runs.
       - name: Signing key from secrets
         id: secretkey
         env:
           KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           if [ -n "$KS" ]; then
+            if [ -z "$KS_PASSWORD" ]; then echo "::error title=Android signing::ANDROID_KEYSTORE_BASE64 is set, but ANDROID_KEYSTORE_PASSWORD isn't."; exit 1; fi
+            umask 077
             echo "$KS" | base64 -d > "$RUNNER_TEMP/hearth.jks"
             echo "found=1" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice title=Android signing::No ANDROID_KEYSTORE_BASE64 secret: using the key kept in the Actions cache, and no Google Play bundle. See hearth/docs/SIGNING.md."
+            echo "::warning title=Android signing::No ANDROID_KEYSTORE_BASE64 secret: this APK is UNSIGNED (Android won't install it), it is never released or copied to your server, and no Google Play bundle is made. See hearth/docs/SIGNING.md."
           fi
-      - name: Saved signing key
-        if: steps.secretkey.outputs.found != '1'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.hearth-android-key
-          key: hearth-android-key-v1
-      - name: Make a signing key (first build only)
-        if: steps.secretkey.outputs.found != '1'
-        run: |
-          mkdir -p ~/.hearth-android-key
-          if [ ! -f ~/.hearth-android-key/hearth.jks ]; then
-            keytool -genkeypair -v -keystore ~/.hearth-android-key/hearth.jks -storepass hearth-build -keypass hearth-build \
-              -alias hearth -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Hearth"
-          fi
-          cp ~/.hearth-android-key/hearth.jks "$RUNNER_TEMP/hearth.jks"
       # The APK is for installing directly (your server's /download page). The .aab bundle is what Google Play
       # takes; it's only built with your own permanent key, since Play remembers the key of the first upload.
       - name: Build the APK (and the Play bundle)
         working-directory: hearth/mobile/android
         env:
-          HEARTH_KEYSTORE: ${{ runner.temp }}/hearth.jks
-          HEARTH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
+          HEARTH_KEYSTORE: ${{ steps.secretkey.outputs.found == '1' && format('{0}/hearth.jks', runner.temp) || '' }}
+          HEARTH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           HEARTH_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'hearth' }}
-          HEARTH_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD || 'hearth-build' }}
+          HEARTH_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD }}
           BUNDLE: ${{ steps.secretkey.outputs.found == '1' && 'bundleRelease' || '' }}
           VERSION_NAME: ${{ steps.v.outputs.name }}
           VERSION_CODE: ${{ steps.v.outputs.code }}
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease ${BUNDLE:+"$BUNDLE"}
-          mkdir -p ../dist ../play
-          cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-$VERSION_NAME.apk"
+          ./gradlew --no-daemon assembleRelease testReleaseUnitTest ${BUNDLE:+"$BUNDLE"}
+          mkdir -p ../dist ../play ../unsigned
+          if [ -n "$HEARTH_KEYSTORE" ]; then
+            cp app/build/outputs/apk/release/app-release.apk "../dist/Hearth-$VERSION_NAME.apk"
+          else
+            # Not signed: kept apart from the real thing, and named so nobody mistakes it for a release.
+            cp app/build/outputs/apk/release/app-release-unsigned.apk "../unsigned/Hearth-$VERSION_NAME-UNSIGNED.apk"
+          fi
           if [ -n "$BUNDLE" ]; then cp app/build/outputs/bundle/release/app-release.aab "../play/Hearth-$VERSION_NAME-$VERSION_CODE.aab"; fi
+      # What actually went into the APK: the push library's receiver, Hearth's unexported push service, the call
+      # service with its type and permissions, and the invite link filter.
+      - name: Check the merged manifest
+        run: |
+          m=$(grep -rl HearthPushService android/app/build/intermediates --include AndroidManifest.xml | grep -i release | grep -iv unittest | sort | head -1)
+          node scripts/patch-android.js --check-merged "$m"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.secretkey.outputs.found == '1'
         with:
           name: hearth-android
           path: hearth/mobile/dist/*.apk
           if-no-files-found: error
+      # Unsigned (no signing secrets): only shows the build works. Not installable; never released or published.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.secretkey.outputs.found != '1'
+        with:
+          name: hearth-android-UNSIGNED
+          path: hearth/mobile/unsigned/*-UNSIGNED.apk
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.secretkey.outputs.found == '1'
         with:
           name: hearth-android-play-bundle
           path: hearth/mobile/play/*.aab
           if-no-files-found: error
-      # Google Play internal testing: friends you add as testers install and update Hearth from the Play Store,
-      # without the "unknown apps" and Play Protect warnings. Tags, the default branch and manual runs only.
+
+  # Google Play internal testing: friends you add as testers install and update Hearth from the Play Store,
+  # without the "unknown apps" and Play Protect warnings. Tags and the default branch only (pushed or run by hand),
+  # as the production environment's rules allow, with a bundle signed with your own key. A job of its own, in the
+  # production environment, so the Play account's key never shares a runner with the build's npm and Gradle code.
+  play-upload:
+    needs: android
+    if: >-
+      needs.android.outputs.signed == '1' &&
+      (startsWith(github.ref, 'refs/tags/app-v') || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      HAS_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: env.HAS_PLAY == 'true'
+        with:
+          name: hearth-android-play-bundle
+          path: play
       - name: Upload to Google Play (internal testing)
-        if: >-
-          env.HAS_PLAY == 'true' && steps.secretkey.outputs.found == '1' &&
-          (startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch || github.event_name == 'workflow_dispatch')
+        if: env.HAS_PLAY == 'true'
         uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: app.hearth.mobile
-          releaseFiles: hearth/mobile/play/*.aab
-          releaseName: ${{ steps.v.outputs.name }} (${{ steps.v.outputs.code }})
+          releaseFiles: play/*.aab
+          releaseName: ${{ needs.android.outputs.version }} (${{ needs.android.outputs.code }})
           track: internal
           status: ${{ vars.PLAY_RELEASE_STATUS || 'completed' }}
 
   release:
-    needs: [desktop, android]
+    needs: [desktop, android, sign-updates]
     if: startsWith(github.ref, 'refs/tags/app-v')
     runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: write # the only job that writes: it creates the GitHub release
     steps:
+      # Only the final files: the desktop builds with their update signatures, and the signed APK. Never SignPath's
+      # unsigned inputs (hearth-windows-unsigned-*), an unsigned APK, or the Play bundle (not installable by itself).
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          pattern: hearth-desktop-*
           path: dist
           merge-multiple: true
-      - name: Leave out the Google Play bundle (it isn't installable by itself)
-        run: rm -f dist/*.aab
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: needs.android.outputs.signed == '1'
+        with:
+          name: hearth-android
+          path: dist
+      - name: Refuse unsigned and intermediate files
+        run: |
+          shopt -s nullglob nocaseglob
+          bad=(dist/*unsigned* dist/*.aab)
+          if [ ${#bad[@]} -gt 0 ]; then echo "::error::Not releasing unsigned or intermediate files: ${bad[*]}"; exit 1; fi
+          apks=(dist/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then echo "::warning title=Android::No signed APK in this release: add the ANDROID_KEYSTORE_* secrets (hearth/mobile/README.md)."; fi
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
@@ -388,19 +496,34 @@ jobs:
   # Only release builds reach everyone's apps (the desktop app updates itself from this folder): tags and the
   # default branch, whether pushed or run by hand. Never another branch, not even by a manual run.
   publish-to-vps:
-    needs: [desktop, android]
+    needs: [desktop, android, sign-updates]
     if: >-
-      always() && (needs.desktop.result == 'success' || needs.android.result == 'success') &&
-      (startsWith(github.ref, 'refs/tags/app-v') || github.ref_name == github.event.repository.default_branch)
+      always() && (needs.sign-updates.result == 'success' || needs.android.result == 'success') &&
+      (startsWith(github.ref, 'refs/tags/app-v') || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-latest
+    environment: production
     env:
       HAS_VPS: ${{ secrets.VPS_HOST != '' }}
     steps:
+      # Only the final files, as for the release: the desktop builds once their update files are signed, and the
+      # signed APK. Nothing unsigned or intermediate ever reaches the download folder people's apps update from.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        if: env.HAS_VPS == 'true'
+        if: env.HAS_VPS == 'true' && needs.sign-updates.result == 'success'
         with:
+          pattern: hearth-desktop-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: env.HAS_VPS == 'true' && needs.android.result == 'success' && needs.android.outputs.signed == '1'
+        with:
+          name: hearth-android
+          path: dist
+      - name: Refuse unsigned and intermediate files
+        if: env.HAS_VPS == 'true'
+        run: |
+          shopt -s nullglob nocaseglob
+          bad=(dist/*unsigned* dist/*.aab)
+          if [ ${#bad[@]} -gt 0 ]; then echo "::error::Not publishing unsigned or intermediate files: ${bad[*]}"; exit 1; fi
       # The runner's own OpenSSH does the copy: no third-party action (or the image or download one could swap in
       # without a new commit) ever sees VPS_SSH_KEY. ssh only talks to the machine whose host key matches
       # VPS_HOST_FINGERPRINT, which is required: without it nothing is copied.

@@ -1,5 +1,6 @@
 // The only bridge between the page and the desktop shell. The page can set the unread badge,
-// bring the window forward, (on the connect screen) choose a server, and get the game/song being played.
+// bring the window forward, (on the connect screen) choose a server, get the game/song being played, and ask how
+// long the computer has gone unused (for automatic Away).
 // main.js checks that every message comes from the main window showing your server's own pages (exactly
 // its origin; see origin.js) or the built-in connect screen. Screen sharing has no channel here: the app
 // shows its own picker (picker.html), so the page never sees your windows.
@@ -43,6 +44,9 @@ contextBridge.exposeInMainWorld('hearthDesktop', {
   onUpdateState: (cb) => listen('update-state', cb),
   // Back from sleep / lock screen.
   onResume: (cb) => ipcRenderer.on('resume', () => cb()),
+  // Automatic Away: how many seconds since the last keyboard or mouse input anywhere on the computer (resolves
+  // to a number). Only that number: never what was pressed, or where.
+  idleSeconds: () => ipcRenderer.invoke('idle-time'),
   // Ctrl+, (Cmd+, on Mac), the menu or the tray asks the page to open Settings.
   onOpenSettings: (cb) => ipcRenderer.on('open-settings', () => cb()),
   // The app's own settings (Settings → Apps & devices). getDesktopSettings() resolves to

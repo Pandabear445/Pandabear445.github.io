@@ -2,14 +2,13 @@ package app.hearth.mobile;
 
 import android.Manifest;
 import android.app.AlertDialog;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 import android.net.http.SslCertificate;
@@ -51,6 +50,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -64,15 +64,29 @@ import java.util.Set;
  * Hearth for Android: a web view showing your Hearth server, plus the few things a web view can't do alone:
  *  - self-signed certificates: asks once, shows the fingerprint, remembers that exact certificate
  *  - notifications while the app is open or in the background, and saving files to Downloads
+ *  - notifications while the app is closed, through a UnifiedPush push app (HearthPush, HearthPushService)
+ *  - calls that keep going with the screen locked (CallService)
+ *  - invite links (hearth://invite/... and, for an app built for one server, https://that-server/invite/...)
  *  - links to other sites open in the browser; only your server (and the connect screen) load in the app
  * The page talks to this code through window.HearthAndroid, which exists only on your server's own pages
  * and the connect screen; BridgePolicy decides which of them may send what (only the connect screen may
- * change the server).
+ * change the server; only the server's page may manage push and calls).
  */
 public class MainActivity extends BridgeActivity {
     private static final String PREFS = "hearth";
-    private static final String CHANNEL = "messages";
+    private static final String CHANNEL = HearthNotifications.MESSAGES;
     private static final int NOTIFY_PERMISSION = 7101;
+
+    // Whether Hearth is on screen (a push that arrives then is left to the open app), and the running activity
+    // (for the push and call services, which outlive it).
+    private static volatile boolean foreground;
+    private static WeakReference<MainActivity> live = new WeakReference<>(null);
+    // Waiting for the server's page to be ready: where a tapped notification should open, and an invite link
+    // ({ origin or "", code }). pageApi: what the page's android.js understands (1 = from before these existed).
+    private String pendingOpen;
+    private String[] pendingInvite;
+    private boolean pageReady;
+    private int pageApi = 1;
 
     private SharedPreferences prefs;
     private final List<SslErrorHandler> pendingSsl = new ArrayList<>();
@@ -91,12 +105,8 @@ public class MainActivity extends BridgeActivity {
         web.getSettings().setMediaPlaybackRequiresUserGesture(false);
         bridge.setWebViewClient(new HearthClient(bridge));
         listen();
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel ch = new NotificationChannel(CHANNEL, "Messages", NotificationManager.IMPORTANCE_HIGH);
-            ch.setDescription("New messages and mentions");
-            getSystemService(NotificationManager.class).createNotificationChannel(ch);
-        }
+        live = new WeakReference<>(this);
+        HearthNotifications.ensureChannels(this);
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -106,14 +116,41 @@ public class MainActivity extends BridgeActivity {
                 else moveTaskToBack(true); // keep running so messages keep arriving
             }
         });
-        handleNotificationTap(getIntent());
+        handleIntent(getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        handleNotificationTap(intent);
+        handleIntent(intent);
     }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        foreground = true;
+        // A call rang while Hearth was closed, and Hearth was opened some other way than its notification (the
+        // launcher, Recents): the ringtone stops, and the app goes to the call as a tap on the notification would
+        // (the page shows its own ring card if the call is still on).
+        String call = HearthNotifications.stopRinging(this);
+        if (call != null) openPath(call);
+    }
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        foreground = false;
+    }
+
+    @Override
+    public void onDestroy() {
+        // The web view, and any call in it, ends with this activity: so does the call notification.
+        if (live.get() == this) { live = new WeakReference<>(null); CallService.stop(this); }
+        foreground = false;
+        super.onDestroy();
+    }
+
+    static boolean isForeground() { return foreground; }
 
     // ------------------------------------------------------------------ status bar, navigation bar, keyboard
     // Android 15+ draws every app edge to edge (behind the status and navigation bars) and no longer shrinks
@@ -135,6 +172,18 @@ public class MainActivity extends BridgeActivity {
 
     // ------------------------------------------------------------------ which pages may load in the app
     private String serverOrigin() { return prefs.getString("server", ""); }
+
+    // The one place the saved server changes. Leaving a server removes this phone's push registration for it
+    // (the old server would otherwise keep a working address for this phone), and ends a call there.
+    private void setServerOrigin(String o) {
+        String old = serverOrigin();
+        if (!o.equals(old)) {
+            HearthPush.unregister(this, PushPolicy.instanceFor(old));
+            CallService.stop(this);
+        }
+        prefs.edit().putString("server", o).apply();
+        listen();
+    }
 
     private static String originOf(String url) {
         try {
@@ -177,8 +226,7 @@ public class MainActivity extends BridgeActivity {
             // without window.HearthAndroid, which can't tell us directly).
             String from = view.getUrl() == null ? "" : originOf(view.getUrl());
             if (from.equals(localOrigin()) && (url.startsWith("https://") || url.startsWith("http://"))) {
-                prefs.edit().putString("server", originOf(url)).apply();
-                listen();
+                setServerOrigin(originOf(url));
                 return false;
             }
             if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("about:")) return false;
@@ -188,6 +236,16 @@ public class MainActivity extends BridgeActivity {
                 Toast.makeText(MainActivity.this, "No app can open this link", Toast.LENGTH_SHORT).show();
             }
             return true;
+        }
+
+        @Override
+        public void onPageStarted(WebView view, String url, Bitmap favicon) {
+            super.onPageStarted(view, url, favicon);
+            pageReady = false; // until the new page says hello
+            // A new page (a reload after an update, switching server, an error page): any call lived in the page
+            // being replaced, so its notification and the microphone service go too. (Only whole-page loads get
+            // here, never the page's own #links.)
+            CallService.stop(MainActivity.this);
         }
 
         @Override
@@ -253,13 +311,32 @@ public class MainActivity extends BridgeActivity {
             String from = sourceOrigin == null ? "" : originOf(sourceOrigin.toString());
             if (!BridgePolicy.allowed(type, from, localOrigin(), serverOrigin())) return;
             switch (type) {
-                case "hello": reply.postMessage(info().toString()); break;
+                case "hello": {
+                    // Only the server's own page gets push state, a tapped notification's address or an invite.
+                    boolean server = from.equals(serverOrigin());
+                    pageReady = server;
+                    pageApi = Math.max(1, m.optInt("v", 1));
+                    reply.postMessage(info(server).toString());
+                    break;
+                }
                 case "setServer": {
                     String o = originOf(m.optString("origin"));
-                    if (o.startsWith("https://") || o.startsWith("http://")) { prefs.edit().putString("server", o).apply(); listen(); }
+                    if (o.startsWith("https://") || o.startsWith("http://")) setServerOrigin(o);
                     reply.postMessage("{\"type\":\"serverSet\"}");
                     break;
                 }
+                case "pushState": reply.postMessage(HearthPush.state(this, true).toString()); break;
+                case "pushRegister":
+                case "pushPick":
+                    HearthPush.register(this, m.optString("vapid"), "pushPick".equals(type));
+                    reply.postMessage(HearthPush.state(this, true).toString());
+                    break;
+                case "pushUnregister":
+                    HearthPush.unregister(this, HearthPush.currentInstance(this));
+                    reply.postMessage(HearthPush.state(this, true).toString());
+                    break;
+                case "callStart": CallService.start(this, m.optString("title")); break;
+                case "callEnd": CallService.stop(this); break;
                 case "changeServer": showConnect("?change=1"); break;
                 case "notify": notify(m.optString("title"), m.optString("body"), m.optString("tag")); break;
                 case "cancel": NotificationManagerCompat.from(this).cancel(m.optString("tag"), 1); break;
@@ -280,7 +357,7 @@ public class MainActivity extends BridgeActivity {
         return "default";
     }
 
-    private JSONObject info() throws Exception {
+    private JSONObject info(boolean fromServer) throws Exception {
         String version = "";
         try { version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) { }
         JSONObject o = new JSONObject();
@@ -288,6 +365,13 @@ public class MainActivity extends BridgeActivity {
         o.put("version", version);
         o.put("notify", notifyState());
         o.put("server", serverOrigin());
+        if (fromServer) {
+            o.put("push", HearthPush.state(this, true));
+            o.put("call", true); // this app keeps calls going with the screen off
+            if (pendingOpen != null) { o.put("open", pendingOpen); pendingOpen = null; }
+            String code = takeInvite();
+            if (code != null) o.put("invite", code);
+        }
         return o;
     }
 
@@ -297,6 +381,28 @@ public class MainActivity extends BridgeActivity {
             WebView w = getBridge().getWebView();
             if (isOurs(w.getUrl() == null ? "" : w.getUrl())) w.evaluateJavascript(js, null);
         });
+    }
+
+    // Only to the server's own page (not the connect screen): push keys and call controls belong to it.
+    private void toServerPage(String event, String detailJson) {
+        String js = "window.dispatchEvent(new CustomEvent(" + JSONObject.quote(event) + ",{detail:" + detailJson + "}))";
+        runOnUiThread(() -> {
+            WebView w = getBridge().getWebView();
+            String o = originOf(w.getUrl() == null ? "" : w.getUrl());
+            if (!o.isEmpty() && o.equals(serverOrigin())) w.evaluateJavascript(js, null);
+        });
+    }
+
+    /** The push registration changed (a new address, a failure, the push app unregistered us). */
+    static void pushChanged(JSONObject st) {
+        MainActivity a = live.get();
+        if (a != null) a.toServerPage("hearth-push", st.toString());
+    }
+
+    /** Hang up from the call notification: the page leaves the call. */
+    static void hangUpFromNotification() {
+        MainActivity a = live.get();
+        if (a != null) a.toServerPage("hearth-hangup", "true");
     }
 
     private void askNotify() {
@@ -331,12 +437,59 @@ public class MainActivity extends BridgeActivity {
         try { NotificationManagerCompat.from(this).notify(tag, 1, b.build()); } catch (SecurityException ignored) { }
     }
 
-    private void handleNotificationTap(Intent intent) {
+    private void handleIntent(Intent intent) {
         if (intent == null) return;
+        // A notification posted while the app was closed: open the place it's about once the page is ready.
+        String open = intent.getStringExtra(HearthNotifications.EXTRA_OPEN);
+        if (open != null) {
+            intent.removeExtra(HearthNotifications.EXTRA_OPEN);
+            openPath(open);
+            return;
+        }
+        // An invite link.
+        if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
+            String[] invite = InviteLinks.parse(intent.getData().toString());
+            intent.setData(null);
+            if (invite == null) return;
+            if (!serverOrigin().isEmpty() && !InviteLinks.forServer(invite, serverOrigin())) {
+                Toast.makeText(this, "This invite is for " + invite[0] + ". Switch to that server first (Settings \u2192 Apps & devices).", Toast.LENGTH_LONG).show();
+                return;
+            }
+            pendingInvite = invite;
+            if (pageReady) deliverInvite();
+            return;
+        }
+        // A notification the open page posted (it handles its own clicks).
         String tag = intent.getStringExtra("hearthTag");
         if (tag == null) return;
         intent.removeExtra("hearthTag");
         toPage("hearth-notification-click", JSONObject.quote(tag));
+    }
+
+    // Opens one of the app's own addresses in the server's page: now if it's ready, else once it says hello.
+    private void openPath(String path) {
+        pendingOpen = PushPolicy.safeOpenPath(path);
+        if (pageReady) {
+            if (pageApi >= 2) toServerPage("hearth-open", JSONObject.quote(pendingOpen));
+            pendingOpen = null;
+        }
+    }
+
+    // The invite waiting for this server, if any (once).
+    private String takeInvite() {
+        if (pendingInvite == null || !InviteLinks.forServer(pendingInvite, serverOrigin())) return null;
+        String code = pendingInvite[1];
+        pendingInvite = null;
+        return code;
+    }
+
+    // The page is already open: a current page shows the "Join a server" box in place (a call keeps going); an
+    // older one gets the invite page loaded instead.
+    private void deliverInvite() {
+        String code = takeInvite();
+        if (code == null) return;
+        if (pageApi >= 2) toServerPage("hearth-invite", JSONObject.quote(code));
+        else getBridge().getWebView().loadUrl(InviteLinks.target(serverOrigin(), code));
     }
 
     // ------------------------------------------------------------------ saving files to Downloads/Hearth

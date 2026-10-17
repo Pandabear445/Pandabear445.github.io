@@ -54,7 +54,9 @@ test('password change signs out every other session, live connections included; 
   const r = await srv.api('POST', '/me/password', { token: u.token, ip: u.ip, body: { oldAuthKey: u.authKey, newAuthKey: hex(32), encPrivateKey: 'Z'.repeat(60), salt: 'S'.repeat(24) } });
   assert.equal(r.status, 200, r.text);
   assert.equal((await srv.api('GET', '/bootstrap', { token: other, ip: u.ip })).status, 401);
-  assert.equal((await srv.api('GET', '/bootstrap', { token: u.token, ip: u.ip })).status, 200);
+  // The current session stays signed in, with a new token (auth-11): the old one stops working.
+  assert.equal((await srv.api('GET', '/bootstrap', { token: r.json.token, ip: u.ip })).status, 200);
+  assert.equal((await srv.api('GET', '/bootstrap', { token: u.token, ip: u.ip })).status, 401);
   assert.ok(await waitFor(() => sock.disconnected));
   const row = srv.sql('SELECT revoke_reason FROM sessions WHERE token_hash = ?', crypto.createHash('sha256').update(other).digest('hex'))[0];
   assert.equal(row.revoke_reason, 'password_changed');

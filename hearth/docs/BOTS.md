@@ -93,12 +93,14 @@ Base URL: `https://<your hearth>/api/bot/v1`. JSON in and out. Every error looks
 - `GET /me` → `{ id, username, name, description, avatar, requestedScopes, token: { id, installationId }, webhook }`
 - `GET /installations` → `{ installations: [{ id, serverId, serverName, scopes, allChannels, channelIds, events, enabled, createdAt }] }`
 - `GET /installations/:id/channels` (`channels.read`) → `{ channels: [{ id, name, type, topic, category }] }`
-- `GET /installations/:id/members?after=<userId>` (`members.read`) → `{ members: [{ id, username, displayName, joinedAt }], next }` (1000 per page)
+- `GET /installations/:id/members?after=<userId>` (`members.read`) → `{ members: [{ id, username, displayName, nickname, joinedAt }], next }` (1000 per page; `nickname` is what they go by in this server, or null)
 
 ### Messages
 
 - `GET /channels/:id/messages?before=<id>&limit=50` (`messages.read.metadata`) →
-  `{ messages: [{ messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo }] }`
+  `{ messages: [{ messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo, expiresAt }] }`
+  (`expiresAt`: when a message in a channel with disappearing messages goes, or `null`; messages whose time has passed
+  are never listed, and acting on one is 404)
 - `POST /channels/:id/messages` (`messages.send`) `{ content, replyTo? }` → `{ message: { …metadata, content } }`
 - `PATCH /messages/:id` (`messages.send`, own only) `{ content }`
 - `DELETE /messages/:id` (`messages.send`, own only)
@@ -130,7 +132,7 @@ Hearth POSTs each event to the bot's webhook address as JSON:
   "type": "message.created",
   "createdAt": 1791660986167,
   "botId": "…", "installationId": "…", "serverId": "…",
-  "data": { "messageId": "…", "channelId": "…", "authorId": "…", "authorIsBot": false, "createdAt": 1791660986160, "editedAt": null, "threadId": null, "replyTo": null }
+  "data": { "messageId": "…", "channelId": "…", "authorId": "…", "authorIsBot": false, "createdAt": 1791660986160, "editedAt": null, "threadId": null, "replyTo": null, "expiresAt": null }
 }
 ```
 
@@ -139,8 +141,8 @@ each attempt), `X-Hearth-Signature: v1=<hex>`, `Content-Type: application/json`.
 
 | Type | Needs | `data` |
 |---|---|---|
-| `message.created` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo` |
-| `message.deleted` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, threadId, deletedBy` |
+| `message.created` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, authorIsBot, createdAt, editedAt, threadId, replyTo, expiresAt` (`expiresAt`: when it disappears, in a channel with disappearing messages; else `null`) |
+| `message.deleted` | `messages.read.metadata`, channel allowed | `messageId, channelId, authorId, threadId, deletedBy` (one per message, also for a moderator's bulk delete and a ban's message cleanup; a disappearing message that reached its time comes with `deletedBy: null, expired: true`) |
 | `reaction.added` | `messages.read.metadata`, channel allowed | `messageId, channelId, userId, emoji` |
 | `member.joined` | `members.read` | `serverId, userId, joinedAt` |
 | `member.left` | `members.read` | `serverId, userId` |
@@ -274,10 +276,99 @@ Tuning (rarely needed): `BOT_WEBHOOK_TIMEOUT_MS` (5000), `BOT_RETRY_BASE_MS` (15
 Tests: `test/bots.test.js` (the platform, against local mock HTTPS servers) and `test/bots-example.test.js`
 (the example bot as its own process).
 
-## 10. Known limits
+## 10. Incoming webhooks (Discord- and Slack-compatible)
+
+For programs that only need to **post**, a channel can have webhook addresses, like Discord's. Uptime Kuma,
+Grafana, Home Assistant, Jellyfin, GitHub Actions and most CI tools already post to Discord webhook URLs: paste a
+Hearth one instead and they keep working, with no bot to write. The code is in `server/webhooks.js` (server) and
+`public/js/webhooks.js` (Channel settings → Webhooks).
+
+```
+https://<your hearth>/api/webhooks/<id>/<secret>          Discord-style JSON, Slack-style JSON or form, plain text
+https://<your hearth>/api/webhooks/<id>/<secret>/slack    Slack-style (text, attachments, blocks)
+https://<your hearth>/api/webhooks/<id>/<secret>/github   a GitHub repository webhook (content type application/json)
+```
+
+**Who:** people with **Manage Channels** in that channel (and server-wide), or **Manage Server**, can make, rename,
+re-key ("New address") and delete them, in Channel settings → Webhooks (or right-click the channel → Webhooks). Not
+in group chats. Up to 10 per channel and 50 per server.
+
+- Making, renaming and re-keying one is posting in that channel through it, so it also needs **Send Messages**
+  there. Manage Channels doesn't get around a read-only channel, and a timed-out member can't do any of the three
+  until the timeout ends (owners and Administrators have every permission, so this changes nothing for them).
+- A webhook belongs to whoever made its **current address** (`created_by`; re-keying moves it to the person who
+  re-keyed). Anyone else can rename, re-key, delete it or change its pings only if their highest role is above that
+  person's, or that person has left the server. Roles members pick themselves don't count here, on either side, so
+  picking one neither protects your webhook nor gets you past someone else's. Hearth has no separate Manage
+  Webhooks permission.
+
+**The address is the password.** Its secret (256 random bits) is shown once; only `SHA-256(id.secret)` is kept.
+"New address" replaces it at once (the old one stops working). Making, changing, re-keying and deleting are in the
+audit log (`webhook_created`, `webhook_changed`, `webhook_token_rotated`, `webhook_deleted`), by id, never the
+secret. A wrong id and a wrong secret get the same `404 Unknown Webhook`. Hearth doesn't log full request
+addresses, but a proxy in front of it might: keep its access log private, or re-key a webhook if it leaks.
+
+**What a post looks like.** It comes from the webhook's own bot account (`users.is_bot = 1`, no `bots` row: it
+can't sign in or use the bot API), with a **BOT** tag and the label **"Webhook · not end-to-end encrypted"**. Like
+other bot posts it's stored sealed with the server's at-rest key, not end-to-end encrypted, and shown through the
+app's escaping Markdown. What's understood:
+
+| Sent | Becomes |
+|---|---|
+| `content` (up to 2000) | the text. `[label](https://…)` links show as `label (https://…)`, `<t:…>` as a UTC date, `#` headings as bold. |
+| `username` (up to 80) | the name shown on this post: control, invisible and direction characters removed, at most 32 characters, checked by the word filter. The webhook's own name is in the label's tooltip, and its profile opens on click. |
+| `avatar_url` | an `https` picture on Discord's (`cdn.discordapp.com`, `media.discordapp.net`), GitHub's (`avatars.githubusercontent.com`, `raw.githubusercontent.com`) or Gravatar's picture hosts, or a host the admin lists in `WEBHOOK_AVATAR_HOSTS`. It's shown through the server's avatar proxy (`/media/avatar`: netguard, images only, and only from those hosts, redirects included), by a link the server signs for that avatar when it sends the post to an app. The server never fetches it when the post arrives; the proxy fetches it when someone's app shows the post. An avatar anywhere else is kept with the post but not shown (the webhook's own picture is), so a webhook can't make the server fetch any picture on the internet. |
+| `embeds[]` (up to 10, 6000 characters in all) | text: author, **title** with a coloured dot for `color` (🔴 🟠 🟡 🟢 🔵 🟣), `url`, description, **field name** / value, footer and timestamp (a time with no zone, like Uptime Kuma's `2026-10-11 05:00:00.123`, is UTC). Pictures (image, thumbnail, icons) are left out. |
+| `allowed_mentions` | narrows what a webhook that may ping pings, as on Discord. |
+| Slack `text`, `attachments[]`, `blocks[]` (header, section, context, rich_text) | the same, from Slack's mrkdwn (`<url\|label>`, `<!here>`, `*bold*`). Rich text (what Slack's composer and Block Kit Builder make) keeps its bold, italic, strike, code, links, emoji, lists, code blocks and quotes. With blocks, `text` is only the fallback, as in Slack: it's shown when none of the blocks is one of these kinds. A form body `payload=<json>` works too. |
+| `text/plain` (up to 4000) | the text as it is. |
+| GitHub `push`, `pull_request`, `issues`, `issue_comment`, `release`, `star`, `fork` | one line each, like Discord's `/github` address; `ping` and other events are accepted and not shown. |
+
+**Answers** are Discord's: `204` (or the message with `?wait=true`), `400` with `{ message, code }`
+(`50006` empty, `50035` Invalid Form Body with the field's path in `errors`, `50109` bad JSON or an unsupported type,
+`200000` the word filter), `404 { code: 10015 }`, `413 { code: 40005 }` over 64 KB (1 MB for `/github`),
+`429 { retry_after, global: false }` with `Retry-After`, `403 { code: 50001 }` while the webhook is paused (below) and
+`403` from a banned address, `408` when the body doesn't arrive within 15 seconds of the request, `503` during
+maintenance. `GET` on the address returns `{ type, id, name, channel_id, guild_id }` (never the secret).
+
+The address is checked when the request arrives and the webhook is read again once the body is in, so a request
+that was already on its way when the address was re-keyed, the webhook deleted or paused, or its pings turned off,
+gets the answer it would get now.
+
+**Pings are off by default.** `@everyone`, `@here`, role mentions and `@names` in a webhook's post are defused before
+it's stored (an invisible space after the `@`; a role mention becomes the role's plain name), so nobody is pinged or
+counted as mentioned. Only someone with **Mention Everyone** in that channel can turn pings on for a webhook, or get a
+new address for one that has them (otherwise re-keying would hand them pings they don't have). Turning pings off is
+always allowed. With pings on, mentions work as they would from a member allowed to ping, including push
+notifications and mention counts. Either way, people who chose **All messages** for the channel or the server (and
+can see the channel) get a push for each post, as for anyone's message. Role names put in place of a defused role
+mention lose `<`, `>`, `@` and `&`, so a role named like a mention can't bring one back.
+
+**Limits:** 5 posts per 2 seconds and 1000 per hour per webhook, 30 per minute per channel (from all its webhooks),
+300 requests per minute per network, and 30 wrong addresses per minute per network (an IPv4 address, or an IPv6
+/64). Managing them: 60 requests per
+minute per person, 20 new webhooks per hour and 60 per day (each one is an account), 20 new addresses per hour.
+
+**Pauses.** A paused webhook answers `403 { code: 50001 }` and the list says why. It pauses while the person who
+made its current address is suspended on the instance, banned from the server or timed out there (they still know
+the address), and while its own account is suspended (what an instance admin does when its posts are reported; the
+admin's page for that account shows the webhook and who made its address). A new address from another manager
+makes the webhook theirs and starts it again. A webhook keeps working when the person who made it simply leaves
+the server (the list says so), as on Discord.
+
+**Lifetime.** Deleting a webhook stops its address for good. While its posts are still in the channel, its row
+stays as a tombstone and its account is marked deleted, so those posts keep their author and nothing can post as
+it again. When no post of it is left (it never posted, or its channel or server is deleted), the row goes and its
+account is wiped like a deleted person's: a freed `deleted-…` username and the name "Deleted webhook". Webhook
+accounts aren't counted as users on the admin dashboard and don't appear in the admin's plain user list (searching
+finds them, marked as bots).
+
+## 11. Known limits
 
 - Bot avatars: the `avatar` column exists, but there's no upload yet, so bots show their initials.
-- Bot messages are text only (Markdown): no attachments or embeds.
+- Bot messages are text only (Markdown): no attachments or embeds. Webhook embeds are turned into text.
+- Webhooks don't take files (multipart bodies are refused), can't edit or delete their posts afterwards, and ignore
+  Discord's `thread_id`, `tts` and components.
 - Interactions and rate limits are kept in memory, so a restart drops open interactions (the app then says the
   bot didn't answer) and resets counters. A multi-process setup would need a shared store.
 - Bots can't post in threads or reply to people privately (DMs).

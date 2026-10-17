@@ -1,0 +1,18 @@
+{
+  "id": "hearth",
+  "name": "Hearth",
+  "version": "1.29.0",
+  "description": "Self-hosted chat for friend groups and small communities: servers, voice, video and screen sharing, with messages, files and calls end-to-end encrypted in the app. Needs an https domain.",
+  "logo": "hearth.svg",
+  "links": {
+    "github": "https://github.com/Pandabear445/Hearth-chat",
+    "website": "https://arc32.me",
+    "docs": "https://github.com/Pandabear445/Hearth-chat/tree/main/hearth#readme"
+  },
+  "tags": [
+    "chat",
+    "communication",
+    "voice",
+    "self-hosted"
+  ]
+}

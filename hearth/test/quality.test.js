@@ -44,6 +44,8 @@ before(async () => {
 after(async () => { sockets.forEach((s) => s.close()); await srv.stop(); });
 
 // ------------------------------------------------------------------ schema
+// The version this code writes (the v18 indexes must survive every later upgrade too).
+const CURRENT = Number(/const SCHEMA_VERSION = (\d+);/.exec(fs.readFileSync(path.join(__dirname, '..', 'server', 'db.js'), 'utf8'))[1]);
 const V18 = {
   idx_messages_pins: { table: 'messages', cols: ['channel_id', 'pinned_at'], where: /WHERE pinned_at IS NOT NULL/ },
   idx_dm_messages_pins: { table: 'dm_messages', cols: ['dm_id', 'pinned_at'], where: /WHERE pinned_at IS NOT NULL/ },
@@ -64,13 +66,14 @@ function checkIndexes(s) {
   } finally { d.close(); }
 }
 
-test('the database is at version 18 and has the v18 indexes', () => {
+test('the database is at the current version and has the v18 indexes', () => {
   const d = srv.db();
-  try { assert.equal(d.pragma('user_version', { simple: true }), 18); } finally { d.close(); }
+  try { assert.equal(d.pragma('user_version', { simple: true }), CURRENT); } finally { d.close(); }
   checkIndexes(srv);
 });
 
 test('upgrading a version 17 database builds the v18 indexes, after a backup copy; a newer one is still refused', async () => {
+  assert.ok(CURRENT >= 18, `schema ${CURRENT}`);
   const s = await startServer();
   try {
     const u = await s.register();
@@ -78,18 +81,18 @@ test('upgrading a version 17 database builds the v18 indexes, after a backup cop
     s.sql('PRAGMA user_version = 17');
     await s.restart();
     const d = s.db();
-    try { assert.equal(d.pragma('user_version', { simple: true }), 18); } finally { d.close(); }
+    try { assert.equal(d.pragma('user_version', { simple: true }), CURRENT); } finally { d.close(); }
     checkIndexes(s);
-    assert.equal(fs.readdirSync(path.join(s.dir, 'backups')).filter((f) => /^hearth-before-v18-.*\.db$/.test(f)).length, 1);
+    assert.equal(fs.readdirSync(path.join(s.dir, 'backups')).filter((f) => new RegExp(`^hearth-before-v${CURRENT}-.*\\.db$`).test(f)).length, 1);
     assert.equal((await s.api('GET', '/me/sessions', { token: u.token, ip: u.ip })).status, 200, 'sign-ins survive the upgrade');
     // Restarting again changes nothing (the block is idempotent) and makes no second copy.
     await s.restart();
     checkIndexes(s);
-    assert.equal(fs.readdirSync(path.join(s.dir, 'backups')).filter((f) => f.startsWith('hearth-before-v18-')).length, 1);
+    assert.equal(fs.readdirSync(path.join(s.dir, 'backups')).filter((f) => f.startsWith(`hearth-before-v${CURRENT}-`)).length, 1);
     // A database from a newer Hearth is still refused, untouched.
-    s.sql('PRAGMA user_version = 19');
+    s.sql(`PRAGMA user_version = ${CURRENT + 1}`);
     await assert.rejects(s.restart(), /didn't start/);
-    assert.match(s.log, /database version 19; this version understands up to 18/);
+    assert.match(s.log, new RegExp(`database version ${CURRENT + 1}; this version understands up to ${CURRENT}`));
   } finally { await s.stop(); }
 });
 

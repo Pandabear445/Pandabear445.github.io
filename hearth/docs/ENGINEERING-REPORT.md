@@ -27,9 +27,9 @@ encryption").
   unchanged since the baseline, and `npm audit` on today's tree still reports **0 vulnerabilities** (observed while
   writing this report, both the full audit and `--omit=dev --audit-level=high`).
 - **Syntax:** the baseline syntax checks passed (audit notes). Re-run on today's tree: `node --check` on all 98
-  JavaScript files in `server/`, `public/`, `desktop/`, `scripts/`, `tools/`, `mobile/www/` and `test/` passes,
-  and `bash -n` passes on `hearth-update.sh`, `make-update-zip.sh`, `setup-turn.sh`, `harden-vps.sh` and
-  `tools/update-hearth.sh`.
+  JavaScript files in `server/`, `public/`, `desktop/`, `scripts/`, `mobile/www/` and `test/` passes, and
+  `bash -n` passes on `hearth-update.sh`, `make-update-zip.sh`, `setup-turn.sh` and `harden-vps.sh` (and on the
+  update tools in `tools/`, since removed from the repository).
 - **Routes:** 242 HTTP routes and 13 Socket.IO events at the baseline; 248 and 13 now (see [ROUTES.md](ROUTES.md)).
 
 ## 2. Method
@@ -78,22 +78,26 @@ encryption").
 | crypto | `3933a34` | 1 blocker, 3 major, 4 minor | `7f106a6` | 9 |
 
 (The last column counts findings closed by that batch, in full or part: 106 in all. A batch also fixed findings
-from other areas, e.g. `auth` fixed `admin-1` and `admin-3`. The 18 documented and 3 deferred findings belong to no
-batch.)
+from other areas, e.g. `auth` fixed `admin-1` and `admin-3`. The 18 findings documented and 3 deferred then belong to
+no batch; six of them (`auth-6`, `auth-11`, `xss-7`, `xss-8`, `crypto-2` and `crypto-7`) were fixed or partly fixed
+later, in 1.29.0 (§3, §5).)
 
 ## 3. Results at a glance
 
 | Status | Count | Meaning |
 |---|---|---|
-| Fixed | 78 | The problem is closed in code and a test proves it. |
-| Partly fixed | 28 | The confirmed problem is closed; a remaining part was deferred (§5). |
-| Documented | 18 | No code change: the docs now say what the code does (overclaims corrected, limitations stated). |
-| Deferred | 3 | Not changed; documented as a limit (`auth-11`, `crypto-7`, `admin-12`). |
+| Fixed | 82 | The problem is closed in code and a test proves it. |
+| Partly fixed | 30 | The confirmed problem is closed; a remaining part was deferred (§5). |
+| Documented | 14 | No code change: the docs now say what the code does (overclaims corrected, limitations stated). |
+| Deferred | 1 | Not changed; documented as a limit (`admin-12`). |
 | **Total** | **127** | |
 
-By severity: 8 high (6 fixed, 2 partly fixed), 47 medium (36 fixed, 10 partly fixed, 1 documented), 67 low (35
-fixed, 14 partly fixed, 15 documented, 3 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
-vulnerabilities, 38 bugs, 19 overclaims, 14 limitations, 13 hardening, 3 performance.
+By severity: 8 high (6 fixed, 2 partly fixed), 47 medium (36 fixed, 11 partly fixed), 67 low (39
+fixed, 15 partly fixed, 12 documented, 1 deferred), 5 info (1 fixed, 2 partly fixed, 2 documented). By kind: 40
+vulnerabilities, 38 bugs, 19 overclaims, 14 limitations, 13 hardening, 3 performance. Since 1.28.0 (in 1.29.0):
+`auth-6`, `auth-11`, `xss-8` and `data-4` are fixed, and `xss-7`, `crypto-2` and `crypto-7` partly fixed (they were
+documented, deferred or partly fixed); `files-6`, `files-10`, `crypto-8` and `crypto-13` stay partly fixed, with
+more of each done (§5).
 
 All fixes are **implemented**. Every fixed or partly fixed finding with a proving test below is **tested locally**
 (§6: 357 of 358 tests passed, 1 skipped) and **tested in CI** in the `tests` job at `dec63ee`, except the parts
@@ -114,12 +118,12 @@ where the docs now state the behaviour.
 | auth-3 | medium | vulnerability | Instance-wide sign-up, sign-in and reset counters are consumed by captcha-less requests (cheap DoS for everyone) | Fixed | `auth-hardening.test.js` |
 | auth-4 | medium | bug | Outstanding password-reset links survive password change, email change and email removal | Fixed | `auth-hardening.test.js` |
 | auth-5 | medium | limitation | Any session token, including a stolen one, can fetch the password-wrapped identity key and its salt for offline password guessing | Fixed | `crypto-hardening.test.js` |
-| auth-6 | low | overclaim | Docs promise a fresh 2FA code for sensitive changes, but stepUp skips it for 10 minutes after any 2FA sign-in | Documented | — (SECURITY.md row 6, §4) |
+| auth-6 | low | overclaim | Docs promise a fresh 2FA code for sensitive changes, but stepUp skips it for 10 minutes after any 2FA sign-in | Fixed | `auth-hardening.test.js` |
 | auth-7 | low | bug | Push subscriptions are not tied to sessions: logged-out, revoked, password-changed and suspended devices keep getting notifications | Fixed | `outbound-hardening.test.js` |
 | auth-8 | low | bug | IP bans don't stop existing sessions over HTTP, and /auth/reset hands banned IPs a fresh session | Fixed | `auth-hardening.test.js` |
 | auth-9 | low | bug | Legacy PBKDF2 accounts: enumerable through /auth/params, and a full password change through the 'upgrade' flag skips revocation, audit log and email notice | Partly fixed | `auth-hardening.test.js` |
 | auth-10 | low | vulnerability | POST /me/email reveals whether an address belongs to another account | Fixed | `auth-hardening.test.js` |
-| auth-11 | low | hardening | The current session token is never rotated, so a copy of it survives password change, 2FA enable and 'log out other devices' | Deferred | — (SECURITY.md row 7, §4) |
+| auth-11 | low | hardening | The current session token is never rotated, so a copy of it survives password change, 2FA enable and 'log out other devices' | Fixed | `auth-hardening.test.js`, `outbound-hardening.test.js` |
 | auth-12 | low | bug | Any server-initiated socket disconnect makes the client revoke its own session and wipe its keys | Fixed | `voice-hardening.test.js` |
 | auth-13 | low | hardening | The 7-day media token in /bootstrap isn't bound to a session and outlives logout, suspension and account deletion | Fixed | `auth-hardening.test.js` |
 
@@ -128,18 +132,18 @@ where the docs now state the behaviour.
 | ID | Severity | Kind | Title | Status | Proving test |
 |---|---|---|---|---|---|
 | crypto-1 | high | bug | Server-channel history is lost for good when the member who handed out a key deletes their account or resets without a recovery key | Fixed | `crypto-hardening.test.js` |
-| crypto-2 | medium | overclaim | An attacker who controls only the victim's email (no 2FA) can read the victim's servers and groups, but the docs say 'not its messages' | Documented | — (SECURITY.md row 10, §4; README) |
+| crypto-2 | medium | overclaim | An attacker who controls only the victim's email (no 2FA) can read the victim's servers and groups, but the docs say 'not its messages' | Partly fixed (holding back reset accounts done since: §5) | `keys-reset-hardening.test.js` |
 | crypto-3 | medium | bug | Any member can rotate the server key without limit and with junk key bundles: blocks sending and grows storage without bound | Partly fixed | `crypto-hardening.test.js` |
 | crypto-4 | medium | bug | After someone deletes their account, the other person can no longer read any of their DMs, and all their channel messages show 'could not be verified' | Fixed | `crypto-hardening.test.js` |
 | crypto-5 | low | overclaim | The server alone decides the key epoch: a key handoff from a non-member is accepted, rotation can be suppressed or rolled back, and the 'watch the member list' advice doesn't hold | Partly fixed | `crypto-hardening.test.js` |
 | crypto-6 | low | overclaim | The server can post plaintext 'legacy' channel messages as any member; they are shown as verified with only an 'Older message' label | Fixed | `crypto-hardening.test.js` |
-| crypto-7 | low | overclaim | Ciphertext isn't bound to message id, reply, thread, time or edit version: the server can replay, re-thread and undo edits | Deferred | — (SECURITY.md §1, §4; README) |
-| crypto-8 | low | hardening | /bootstrap gives any session the password-wrapped identity key and its salt, and there is no way to rotate the identity key after a compromise | Partly fixed | `crypto-hardening.test.js` |
+| crypto-7 | low | overclaim | Ciphertext isn't bound to message id, reply, thread, time or edit version: the server can replay, re-thread and undo edits | Partly fixed (binding done since: §5) | `message-binding.test.js`, e2e › message binding |
+| crypto-8 | low | hardening | /bootstrap gives any session the password-wrapped identity key and its salt, and there is no way to rotate the identity key after a compromise | Partly fixed (copies pruned since: §5) | `crypto-hardening.test.js`, `data-hardening.test.js` |
 | crypto-9 | low | overclaim | The server learns which GIFs people send and view in end-to-end encrypted chats | Documented | — (SECURITY.md §4; README (GIFs)) |
 | crypto-10 | low | bug | Recall sync stops at 5000 items; on a new device this can overwrite the study profile and delete pictures | Fixed | `data-hardening.test.js` |
 | crypto-11 | low | hardening | Signing-key upload has no proof of possession, and contacts silently pin a first signing key | Partly fixed | `crypto-hardening.test.js` |
 | crypto-12 | low | overclaim | README and landing-page claims are stronger than SECURITY.md and the code ('not even the person hosting it', 'none of it passes through your server') | Documented | — (README, index.html, SECURITY.md §4) |
-| crypto-13 | info | limitation | Joining never rotates the key: new and re-joining members read the current-epoch backlog, including a kicked member who comes back with an old invite | Partly fixed | `crypto-hardening.test.js` |
+| crypto-13 | info | limitation | Joining never rotates the key: new and re-joining members read the current-epoch backlog, including a kicked member who comes back with an old invite | Partly fixed (an option to hide history added since: §5) | `crypto-hardening.test.js`, `join-history.test.js` |
 
 ### Server, channel and role authorization (authz, 16 findings)
 
@@ -171,11 +175,11 @@ where the docs now state the behaviour.
 | files-3 | medium | vulnerability | Storage quota and daily upload limit are not reserved, so concurrent uploads overrun them by an unbounded multiple | Fixed | `files-hardening.test.js` |
 | files-4 | medium | vulnerability | GIF library uploads bypass storage accounting, daily limits, admin bulk-delete and the GIFs feature switch | Fixed | `files-hardening.test.js` |
 | files-5 | medium | vulnerability | Crafted attachment metadata makes recipients fetch arbitrary third-party URLs, ignoring the 'image previews' privacy switch | Fixed | `files-hardening.test.js` |
-| files-6 | low | limitation | Profile avatars, banners and backgrounds are stored and served byte-for-byte, keeping EXIF/GPS metadata, and are public to any signed-in user | Partly fixed | `files-hardening.test.js` |
+| files-6 | low | limitation | Profile avatars, banners and backgrounds are stored and served byte-for-byte, keeping EXIF/GPS metadata, and are public to any signed-in user | Partly fixed (GIFs and songs done since: §5) | `files-hardening.test.js` |
 | files-7 | low | overclaim | SECURITY.md and README claim file lengths are padded, but attachment blobs are uploaded unpadded (exact plaintext size leaks) | Documented | — (SECURITY.md §1; README) |
 | files-8 | low | overclaim | SECURITY.md claims API keys are encrypted at rest, but GIPHY/KLIPY/RAWG/Last.fm keys are stored in plaintext | Fixed | `admin-hardening.test.js` |
 | files-9 | low | limitation | Attachment permission and moderation controls are advisory because the encrypted payload references blobs the server never sees | Documented | — (SECURITY.md §4) |
-| files-10 | low | hardening | Media proxy tokens are not bound to the target URL and proxies follow redirects, widening SSRF/open-proxy exposure | Partly fixed | `files-hardening.test.js` |
+| files-10 | low | hardening | Media proxy tokens are not bound to the target URL and proxies follow redirects, widening SSRF/open-proxy exposure | Partly fixed (signed links done since; a person's own feed still picks the pictures: §5) | `files-hardening.test.js`, `outbound-hardening.test.js` |
 | files-11 | low | vulnerability | Learned (auto-collected) library GIFs skip the word filter and bind the chosen URL to a client-supplied id, enabling library poisoning | Fixed | `files-hardening.test.js` |
 
 ### Outbound requests (SSRF) (ssrf, 5 findings)
@@ -222,7 +226,7 @@ where the docs now state the behaviour.
 | admin-8 | medium | vulnerability | Plaintext database snapshot is written inside data/backups/encrypted/ (the folder the docs say to rclone off-site) and is never cleaned up after a crash | Fixed | `admin-hardening.test.js` |
 | admin-9 | low | bug | Creator-membership invoices are also recorded as instance donations by /api/pay/stripe | Fixed | `admin-hardening.test.js` |
 | admin-10 | low | bug | 'Roles with moderator powers can't be sold' is only checked when a tier is created or edited; later role edits or channel overrides bypass it | Fixed | `admin-hardening.test.js` |
-| admin-11 | low | vulnerability | Server update packages are not authenticated; the Mac/Linux tool silently installs the newest *hearth*/*update* zip from ~/Downloads as root | Partly fixed | `infra-hardening.test.js` |
+| admin-11 | low | vulnerability | Server update packages are not authenticated; the Mac/Linux tool silently installs the newest *hearth*/*update* zip from ~/Downloads as root | Partly fixed (signing done since: §5) | `infra-hardening.test.js`, `update-signing.test.js` |
 | admin-12 | low | limitation | Supporter payments ignore refunds and chargebacks; a one-off payment can grant up to 400 days | Deferred | — (SECURITY.md §4; RUNNING-HEARTH.md) |
 
 ### Client rendering (xss, 9 findings)
@@ -235,8 +239,8 @@ where the docs now state the behaviour.
 | xss-2 | medium | vulnerability | Invisible status leaks through lastSeen on profile pages and People, including to users the owner has blocked | Fixed | `client-hardening.test.js` |
 | xss-5 | medium | vulnerability | Profile writes have no rate limit, and each one pushes the full public profile to every connected socket on the instance | Fixed | `client-hardening.test.js` |
 | xss-6 | low | bug | A shared 'look' file can inject CSS into the app background via an unchecked bg.angle (persistent outside-URL beacon) | Fixed | `client-hardening.test.js` |
-| xss-7 | low | overclaim | The CSP comment and SECURITY.md row 25 say data can't leave, but img-src/media-src https:, third-party frames and navigation allow it | Documented | — (SECURITY.md row 25; README) |
-| xss-8 | low | limitation | Users' IPs reach third parties: Google Fonts on every load, auto-loaded image links, direct watch-together videos | Documented | — (SECURITY.md §4; README) |
+| xss-7 | low | overclaim | The CSP comment and SECURITY.md row 25 say data can't leave, but img-src/media-src https:, third-party frames and navigation allow it | Partly fixed | `outside-hardening.test.js`, `platform.test.js` |
+| xss-8 | low | limitation | Users' IPs reach third parties: Google Fonts on every load, auto-loaded image links, direct watch-together videos | Fixed | `outside-hardening.test.js`, e2e (outside images, watch together) |
 | xss-9 | info | hardening | Watch-together iframes have no sandbox attribute, and YouTube commands are posted with targetOrigin '*' | Fixed | `client-hardening.test.js` |
 
 ### Infrastructure, desktop and CI (infra, 12 findings)
@@ -275,7 +279,7 @@ where the docs now state the behaviour.
 | data-13 | medium | bug | Any account can stall the whole server for 2.5-4 s per request with GET /api/me/study (100 MB in one synchronous response); sync also silently truncates at 5000 rows | Fixed | `data-hardening.test.js` |
 | data-3 | medium | performance | Join/leave triggers O(members^2) work (emitServer + emitKeyState) with no rate limit; one invited user can freeze a large server's instance | Partly fixed | `data-hardening.test.js` |
 | data-2 | medium | bug | Threads are fetched without LIMIT and deleted with one IN(?...) list: big threads stall the server, and over 32766 replies the root can't be viewed or deleted (files already gone) | Fixed | `data-hardening.test.js` |
-| data-4 | low | bug | Migrations are not atomic and the v12 step is not idempotent: an interrupted upgrade (or interrupted first start) leaves a permanent crash loop, and each restart writes another full DB copy | Partly fixed | `data-hardening.test.js` |
+| data-4 | low | bug | Migrations are not atomic and the v12 step is not idempotent: an interrupted upgrade (or interrupted first start) leaves a permanent crash loop, and each restart writes another full DB copy | Fixed (old copies pruned since 1.29.0, see crypto-8 in §5) | `data-hardening.test.js` |
 | data-6 | medium | vulnerability | Encrypted backup writes a plaintext DB snapshot into backups/encrypted/ and leaves it there if the process stops mid-backup | Fixed | `admin-hardening.test.js` |
 | data-7 | medium | bug | Any upload deleted while a backup streams aborts the whole encrypted backup and leaves a large .hbk.part that is never cleaned | Fixed | `admin-hardening.test.js` |
 | data-8 | medium | bug | Deleting a server cascade-deletes membership rows even when the Stripe cancellation failed, so subscribers keep being billed with no local record | Fixed | `admin-hardening.test.js` |
@@ -293,8 +297,6 @@ where the docs now state the behaviour.
 
 | ID | What stays | Why |
 |---|---|---|
-| auth-11 | The session that changes the password, turns on 2FA or logs out other devices keeps its token, so a copy of that one token survives. | Rotating it changes the response contract and the client's token handling: tabs share one token in `localStorage`, and a naive server-only change would sign users out of their other tabs and wipe their keys. A design (rotate in place, tabs pick up the new token, sweeper closes sockets on the old one) is recorded. |
-| crypto-7 | A message's id, reply, thread, time and edit version are not inside the ciphertext, so the server can replay, re-thread, re-date or roll back an edit. | A protocol change with false-positive risk (the server legitimately clears a reply whose target is gone). The recorded design adds a client UUID, reply, thread, time and edit counter to the encrypted payload, backward compatible, with a "may have been moved" flag. |
 | admin-12 | Refunds and chargebacks don't reduce supporter time; a one-off payment can give up to 400 days. | Needs product decisions (partial refunds, Ko-fi has no refund webhook) and a schema change to store charge ids. The manual workaround (unmark in Admin → Users) is logged. |
 
 **Deferred parts of partly fixed findings**
@@ -309,24 +311,27 @@ where the docs now state the behaviour.
 | authz-13 | A kicked (not banned) member's invite links keep working. | Revoking them would silently break links shared legitimately; owners can now list and revoke any link. |
 | crypto-3 | `keyState` is not paged. | Growth is now bounded (strict 600-character bundles, rotation limits); paging fits the message-pagination work. |
 | crypto-5 | The member list isn't bound into a key handoff, and nothing stops a rollback across page reloads. | A persisted maximum epoch would lock everyone out after a legitimate backup restore until an admin restore flow exists. |
-| crypto-8 | No "replace my identity key" feature; pre-upgrade database copies aren't pruned or encrypted. | New user-facing feature, and backup infrastructure work. |
+| crypto-7 | Done since (1.29.0, `public/js/binding.js`): every new message carries a random id, its reply, its thread, its time and an edit count inside the encrypted payload, and readers' apps flag one the server moved, re-dated, showed twice or served from before an edit. What stays: it's detection, not prevention; messages from older apps carry none of it; a rollback is caught only by a device that saw the newer edit (each device remembers at most 2000 edited messages, the author with the most entries losing their oldest first, so a server with very many accounts can still wear that down), and a replay only while both copies are loaded; a reply shown without its original reads as "no longer available", not as moved, only if the server also denies that original to the app's lookup (a thread reply shown outside its thread is always flagged: this server never does that by itself); the time check trusts the clock correction the server gives the sender's app at start-up (clamped to a day; a device further off is warned), and allows a scheduled message a day's lateness; a scheduled message's time comes only from its sender (their own copy, a time they pick, Send now), never from the server, but its `sch` mark tells every recipient's app it was scheduled and when it was due. | A device-local check can't know what it never saw; syncing edit counts between devices goes through the server it guards against. Older apps' messages can't be bound after the fact. The lateness a scheduled message is allowed needs a mark readers can see. |
+| crypto-8 | Done since (1.29.0): pre-upgrade database copies are pruned once an upgrade goes through, keeping the newest `PRE_UPGRADE_KEEP` (3 by default; `0` keeps all), never the one that upgrade made, and only files named exactly as Hearth names them. What stays: no "replace my identity key" feature; the copies aren't encrypted. | A new user-facing feature. The copies are plain SQLite files like `data/hearth.db` beside them, so a key on the same disk would add little; the encrypted backups are the copies meant to leave the machine. |
 | crypto-11 | A contact's first signing key is still pinned silently. | Flagging it would show a false "security key changed" for every contact of every older account. Uploads now need proof of possession. |
-| crypto-13 | No "new members can't read history" option; file blobs aren't padded. | Product decisions, and padding needs a versioned blob format. Same-account rejoin now forces a new key. |
+| crypto-13 | Done since (1.29.0): an option, "New members can't read messages from before they joined" (Server settings → Overview → Privacy, `server/joinhistory.js`). With it on, every join replaces the key before the next message (joins close together share one; a flood waits a minute per key made in the last hour; while an older member is online, that member's app makes it, not the newcomer's), the newcomer is only ever handed keys from after their join (keys/share, keyState, keys/self, rejoin), and nothing from before is served to them (messages, threads, pins, search, saved, unread and thread pings, export, quotes, timer changes, report evidence if they moderate later, live events; voice chats too). A thread started before stays closed, replies written since included. Changing it is limited per person (10 an hour), so one manager can't use up everyone's changes and leave it off. A member held back until verified (`crypto-2`) gets no key either way, and doesn't count as an older member who could make the newcomer's key. What stays: with it off (the default), a new member still reads the current key's backlog; a newcomer held back when they join is handed, once verified, only the key that's current at that point: keys made while they were held (the one their join asked for, if it has been replaced since) stay out of reach, so messages under those show as locked; the server still decides when keys change (`crypto-5`); file blobs aren't padded. | It's off by default because each join then replaces the key for everyone and many communities want newcomers to read back. Padding needs a versioned blob format. Same-account rejoin always forces a new key. |
 | crypto review-4/5 | A second account can make one account leave and rejoin to trigger rotations; a different account with a kept invite still gets the current key. | Needed rotations are never held up; broken keys are replaced after two reports. Documented: revoke invites after removing someone. |
-| files-6 | Pictures uploaded before this version keep their metadata; GIF comment blocks and profile songs' ID3 tags aren't stripped. | Rewriting existing user files in place is irreversible if an edge case slips through. |
-| files-10 | Media tokens aren't bound to the target URL; `/media/news` is an open image proxy for signed-in users; `ART_HOSTS` has broad suffixes. | Needs server-issued signed URLs on all three clients; narrowing hosts could break music art. |
+| files-6 | Done since (1.29.0): uploads lose GIF comment, plain-text and application blocks (looping and colour profile kept) and profile songs' tags (MP3 ID3v2, ID3v1, APE and Lyrics3; WAV metadata chunks and those tags after the RIFF data; M4A `udta`/`meta` boxes at every level and the purchase `pinf` box turned into same-size `free` boxes), with frames and audio kept byte for byte. Songs are cleaned in a worker of their own, and a WAV or M4A with more than 10,000 chunks or boxes is refused, so a song can't hold up anyone's picture uploads. What stays: pictures and songs uploaded before this version keep their metadata; OGG songs keep their comments. | Rewriting existing user files in place is irreversible if an edge case slips through. OGG comments sit inside its pages, which would have to be rebuilt with new checksums. |
+| files-10 | Done since (1.29.0): `/media/news`, `/media/avatar` and `/media/art` fetch only addresses the server signed when it handed them to an app (an HMAC over the address and an end time 24 to 30 hours away, on top of the session-bound media token). Webhook avatars are signed only on known avatar hosts (Discord, GitHub, Gravatar, plus `WEBHOOK_AVATAR_HOSTS`) and `/media/avatar` fetches only from those, redirects included; feed previews carry no picture links. `ART_HOSTS` lost `fastly.net`, `googleusercontent.com` and `ggpht.com`, which no art source uses. What stays: `/media/news` can still be pointed at any public picture by anyone who follows a feed they host (a personal tracker, or a feed in a server of their own): the bot signs the pictures its items name, so signed links only add steps, and it works a few items at a time (feed and tracker checks are rate limited). GIF proxy links still need only the media token. | Showing a feed's pictures is the news bot's job, and the feed's author chooses them; caching each picture when an item arrives would still fetch whatever the author named. The proxy fetches public addresses and images only, 8 MB at most. A GIF link is inside an end-to-end encrypted message the server can't read, so it can't sign it; the GIF proxy reaches only the exact GIPHY and KLIPY media hosts. |
 | ssrf-5 / platform-2 / platform-3 | No process-wide `uncaughtException` policy; no push-service allow-list; push encryption runs on the main thread. | Platform-wide policy; an allow-list would break self-hosted push services; the work is now bounded. |
 | outbound review-3 | Local-name lookups (`.local`, single-label) share two system-lookup slots. | Removing them breaks `/etc/hosts` names that `ART_PROXY_EXTRA_HOSTS` relies on; public names can't be delayed. |
 | voice-1 | Watch-together state is sent whole on every change. | Delta updates change the protocol; amplification is bounded (64 KB state, 4 broadcasts a second). |
 | voice-4 | No per-session socket cap and no per-network handshake limit. | Tabs share one session; a NAT full of users reconnecting after a restart would be locked out. The per-user cap of 30 sockets and shared event budget cover it. |
 | voice-9 | Anyone who can sign up gets relay logins; no default total bandwidth cap; existing installs need `setup-turn.sh` again. | Product decision; the right total depends on each VPS plan. |
-| admin-11 | Server update zips are checksum-checked, not signed. | Needs a release signing key and a key-management decision (minisign or `ssh-keygen -Y` design recorded). |
+| crypto-2 | Done since (1.29.0): a reset without the recovery key marks the account (`users.keys_reset_at`) when it shares a server or group with anyone, and holds it back in each of them. In a server or group where it's held, the server keeps no key for it (shares and rotations skip it; an older app's copy is dropped), it can't make a key for others, hand on a key it made alone (a newcomer then gets a fresh key instead), create or list invites, see invite codes in that server's audit log, or add people to the group; the apps skip it and show why. A member who was in a server or group with the person before the reset (and isn't marked) compares safety numbers and vouches for the key they compared: that lifts the hold only in the servers and groups the voucher is in now (`key_vouches`), keys they hold anyway, so a second account an attacker put in a public server beforehand opens only that server. Once every server and group the person was in before the reset (including any left since) has a vouch, or an instance admin verifies them from Admin → Users, the mark goes everywhere. While marked anywhere they can't start group chats, give out staff roles or hand over ownership. Everything is in the audit log. What stays: invite links made before the reset keep working; resets before 1.29.0 aren't marked; a member of a server or group who is fooled into vouching opens that one; once the mark has gone, servers joined afterwards aren't held; a device that never saw someone's old key still writes new direct messages to the new key (first-use trust, as for any contact), and calls aren't held back; if every server an instance admin was in before their reset holds a second account of the attacker's, those can lift the admin's mark, and the admin can then verify other taken-over accounts from Admin → Users. | Old links were made by the real owner and may be in use, and a held-back account can't list them. Marking old resets now would cut people off from keys they were given long ago and may have been verified for on each device. A vouch is a member's own judgement, like inviting someone. DMs and calls follow the safety-number model; holding them too is a separate change. Admin verification is the way out for someone nobody can vouch for; tying it to more than the admin's own mark needs a record of when roles were given. |
+| admin-11 | Done since: zips are signed (Ed25519, `scripts/update-key.js`) and each server pins one key in `/etc/hearth-update.pub`. What stays: the first key is trusted on first use, a server that never ran `hearth-update` has no trusted updater installed until its operator installs one from the current Hearth (README, "Upgrading"), and a server with neither OpenSSL 3.0+ nor Node stays on checksums. | The owner makes the key (none is committed); see docs/SIGNING.md, "Signing server updates". |
+| xss-7 | Done since: the CSP comment says what the policy really does, and the policy no longer names Google Fonts or allows blob: frames (both unused). What stays: `img-src` and `media-src` still allow any https: site (an image link someone clicks open, a watch-together video file), so injected markup could still send data out in a picture address; the YouTube, Vimeo and Twitch frames and navigation stay too. | Narrowing them needs every outside picture and video to go through a proxy on the server, which would then fetch (and see) every link people open: a product decision. Image links now wait for a click by default (`xss-8`), so the everyday leak is gone. |
 | infra-1 | Updates come from whatever server the app is connected to; `data/downloads` is writable by Hearth; the SignPath certificate thumbprint isn't pinned. | Signed updates make the feed's origin irrelevant for builds with a key; the rest are deploy changes or need external information. Apps released before signing install the hop to the first signed build the old way. |
 | infra-2 | No always-visible native "sharing your screen" indicator; an old-style capture request gets the whole screen for about 3 s after a pick. | UX work; Electron can't tell the two request kinds apart, so the window is shortened, not closed. |
 | infra-3 | Using a non-root deploy user is up to the operator. | The workflow can't enforce VPS and GitHub settings; the docs recommend it. |
 | infra-5 | Static `TURN_USERNAME`/`TURN_CREDENTIAL` still work. | Removing them would break existing deployments; the server warns at start-up. |
 | infra-12 | `trustedSelfSignedHosts` still accepts any certificate; the committed `defaultServer` is the author's server. | Desktop behaviour change and product decision; the docs now warn. |
-| data-3 / data-9 / data-10 / data-4 | Full server views on role/channel edits; no `/bootstrap` rate limit; no admin-only indexes; old pre-upgrade copies never pruned. | Protocol change; a 429 there breaks start-up; write cost on the busiest table; product decision. |
+| data-3 / data-9 / data-10 | Full server views on role/channel edits; no `/bootstrap` rate limit; no admin-only indexes. | Protocol change; a 429 there breaks start-up; write cost on the busiest table. |
 
 ## 6. Verification
 
@@ -389,7 +394,7 @@ and in CI (`client-hardening.test.js` › infra-1…).
 | Desktop builds (Windows, macOS, Linux) | tested in CI (build only); not run here (no Wine) |
 | Android bridge policy | implemented; tested locally (`javac`) and in CI |
 | Android build | tested in CI (build only); not run here (no Android SDK) |
-| Update tools and `hearth-update.sh` | tested locally with stubbed system commands; not verified on a real VPS |
+| `hearth-update.sh` | tested locally with stubbed system commands; not verified on a real VPS (the update tools tested here were later removed from the repository) |
 | CI workflow rules (permissions, pinning, host-key pinning, release-only publishing) | static checks tested locally and in CI; the publish step itself not verified (it only runs for release builds) |
 | TURN bandwidth caps | config generation tested locally; not verified against a running coturn |
 | Watch-together sandboxed players | implemented; not verified against the live YouTube, Vimeo and Twitch players |
@@ -444,10 +449,14 @@ handles metadata.
 The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 
 1. **A malicious or compromised server** can serve modified app code (web, desktop and Android all load it), add
-   hidden members or call listeners, hold back or roll back key changes across reloads, and replay or re-thread
-   messages. End-to-end encryption protects stored data, not a hostile host.
-2. **Email takeover without 2FA** gets the account with new keys, and with them each server's current key from any
-   member device that never saw the old key (`crypto-2`).
+   hidden members or call listeners, hold back or roll back key changes across reloads, and withhold messages.
+   Apps flag a message it replays, re-threads, re-dates or rolls back to before an edit (`crypto-7`, 1.29.0), on
+   messages from apps with that change and within the limits in §5. End-to-end encryption protects stored data,
+   not a hostile host.
+2. **Email takeover without 2FA** gets the account with new keys. Since `crypto-2` those get no server's or group's
+   key, and can't bring anyone in there, until a member of it who knew the person verifies them (a member's word only
+   counts where they're a member); but anyone whose device never saw the old key still writes new direct messages to
+   the new key, and calls aren't held back.
 3. **Metadata** stays visible to the server: who talks to whom and when, file sizes, GIF picks and loads, search
    metadata, presence (to everyone on the instance) and profiles.
 4. **Private channels** share the server's key; only access checks separate them.
@@ -471,18 +480,25 @@ The full list is [SECURITY.md](../SECURITY.md) §4. The ones that matter most:
 
 1. Done: the gitleaks false positive is listed in `.gitleaksignore` at the repository root, and the CSP comment is
    corrected. New tests should use values that don't look like keys.
-2. Set the `UPDATE_SIGNING_KEY` secret (if it isn't set) and `VPS_HOST_FINGERPRINT`, and publish one signed
-   release so installed apps move to signed updates.
-3. Sign server update zips (`admin-11`), and pin the trust anchor in `hearth-update`.
-4. Make step-up always ask for a code for password, email, recovery-key and key-export changes (`auth-6`), and rotate
-   the current session token on password change (`auth-11`).
-5. Bind message id, reply, thread, time and edit version into the ciphertext (`crypto-7`), and the member list into
-   key handoffs (`crypto-5`).
-6. Rotate the server key after a reset without a recovery key, or keep a reset account out of key sharing until a
-   member verifies it (`crypto-2`).
+2. Set the `UPDATE_SIGNING_KEY` secret and `UPDATE_PUBLIC_KEY` variable (if they aren't set; with an existing
+   secret the variable is its public half, `sign-update.js pubkey`, never a new pair) and `VPS_HOST_FINGERPRINT`,
+   with the secrets in the `production` environment (since the sign and publish jobs moved there) and the
+   repository secrets of the same names deleted, and publish one signed release so installed apps move to signed
+   updates. If Android builds used the key the old workflow cached, follow "Moving off the old built-in key" in
+   `mobile/README.md`.
+3. Done: server update zips are signed (`admin-11`) and `hearth-update` pins the trust anchor. Make the key
+   (`node scripts/update-key.js keygen`), commit `update-signing.pub` and publish one signed release.
+4. Done: step-up always asks for a fresh code (`auth-6`; only starting a data export and clearing unused files keep
+   the 10-minute grace), and a password change, turning on 2FA and "log out all other devices" with the password
+   give the current session a new token (`auth-11`).
+5. Done in 1.29.0 (in part, see §5): message id, reply, thread, time and edit version are bound into the ciphertext
+   (`crypto-7`). Still to do: bind the member list into key handoffs (`crypto-5`).
+6. Partly done: a reset account is kept out of each server's and group's key sharing, invites and group adds until a
+   member there (or an instance admin) verifies it (`crypto-2`). Left: direct messages and calls, and resets from
+   before 1.29.0.
 7. Per-region relay secrets and a rotate action (`voice-10`); a total bandwidth cap per region.
-8. Self-host the app's fonts and offer click-to-load for outside images (`xss-8`), then tighten `img-src` and
-   `media-src` (`xss-7`).
+8. Done: the app's fonts are served by Hearth itself and outside images wait for a click (`xss-8`). Still open:
+   tighten `img-src` and `media-src` (`xss-7`), which needs a picture and video proxy on the server.
 9. Close the open review minors in §9 item 9.
 10. Run the Electron end-to-end test and the browser suites (`test:e2e`, `test:voice`, `test:a11y`) in CI (install
     Playwright and Electron there), and run a real `hearth-update` and `setup-turn.sh` on a test VPS.
@@ -674,3 +690,91 @@ CodeQL (`security-extended`, the same queries as CI) was run locally on 1.28.0 w
 Each fix was checked by a fresh CodeQL database and analysis (CodeQL 2.27.2, the same queries as CI). The
 remaining result count is 0, apart from the turned-off rate-limiting rule. On GitHub, alerts close when the
 CodeQL job runs on the default branch with these changes.
+
+## 13. Android: notifications when closed, calls with the screen off, invite links
+
+Built from `docs/design/ANDROID-PUSH.md` (NEXT.md picks 1 and 12). No schema change.
+
+- **Server.** `/push/subscribe` checks the keys (a P-256 point, a 16-byte secret) and takes `replaces`, which
+  deletes the caller's own old address in the same transaction. `PUSH_HOSTS` and `PUSH_PRIVATE_HOSTS` go through
+  netguard at subscribe and on every send. Deviation from the design: a private host is `name:port` (443 by
+  default), because a private address skips netguard's own-address check, so the exception is kept to one service.
+  `sendPush` now treats only 2xx as delivered: 429 waits for `Retry-After` without a failure, everything else backs
+  off and drops after 8 (before, 403/5xx/507 counted as success), with a once-an-hour `push refused` log line by
+  host. Payloads are capped, cleaned of control characters, padded to 256-byte steps and stamped with `at`; call
+  pushes open `#call/<room>`. `/api/config` has `pushNtfy`; `/.well-known/assetlinks.json` vouches for the app
+  (`ANDROID_CERT_SHA256`).
+- **Native.** UnifiedPush connector 3.3.5, read from its published sources before coding: `register` has no
+  `@Throws`, so Java catches `Exception` and checks for `VapidNotValidException`; `PushEndpoint.getTemporary()`
+  exists. `CallService` is a `microphone` foreground service (Android's documented type for communication apps;
+  `phoneCall` needs ConnectionService or the dialer role). Invites are delivered to the open page (`#invite/…`)
+  instead of reloading it, so a call survives; an older page gets the invite page loaded.
+- **Page.** `android-push.js` (pure, tested in Node), `android.js` (bridge, `hello` v2), Android branches in
+  `app.js` push functions, sign-out unregistering, a one-time offer, and `#call/`, `#d/`, `#invite/` links. Hash
+  links now also open on the first start (they used to wait for a reconnect when "What's new" wasn't shown).
+- **Checked here:** `test/android-push.test.js` (20: the fake ntfy decrypts with `http_ece`; javac runs the pure
+  Java), the e2e flow with a simulated bridge, and a local type-check of all native Java against the real
+  Android 16 framework jar, the connector 3.3.5 classes and kotlin-stdlib (AndroidX/Capacitor stubbed), plus the
+  JUnit tests. **Not checked here:** a Gradle build and anything on a device (mobile/README.md).
+- **After review.** Any new page load (*Reload now*, switching server, an error page) stops the call service, and
+  the page also sends `callEnd` on `pagehide`. Opening Hearth while a call push rings cancels it (it's insistent)
+  and opens that call. Deviation from the design: *Change* no longer calls `removeDistributor` first (backing out
+  lost the registration) and no longer goes through Android's `unifiedpush://link` resolution, which answers
+  silently with the default push app: it shows Hearth's own list of every distributor (legacy ones too), and a cancel
+  restores the registration. Turning push on resolves the default first, so backing out of Android's list isn't
+  followed by Hearth's. `#call/` links ring only for a DM call with the other person in it or a group chat's call
+  (the calls the server rings); a link to a server voice channel just opens the server. The lock-screen claim was
+  wrong: Android shows the full notification there unless the phone hides sensitive content, so the call
+  notification's title now follows the previews setting ("In a call" by default), like pushes already did.
+
+## 14. Alert channels and metrics for operators
+
+Closes two items from `docs/OPERATIONS.md` §8 ("Other alert channels", "Metrics export"). No schema change: the
+channels live in one sealed-per-field setting (`alertChannels`).
+
+- **Alert channels** (`server/alertchannels.js`; routes in `health.js`; Admin → Health → *Where alerts go*): ntfy
+  (JSON publish, optional Bearer token), a generic webhook signed with bots.js `sign` (HMAC-SHA256 over
+  `"<timestamp>.<body>"`), and Discord- and Slack-style webhooks (`allowed_mentions` empty; Slack markup escaped).
+  `alerts.raise` hands each sent alert to every switched-on channel without waiting; the words are the email's.
+- **Threats considered.** *A hidden redirect of alerts:* turning a channel off, changing its address, topic or token,
+  and removing it need step-up, the password and a fresh two-factor code when it's on (`auth-6`; adding, renaming,
+  turning on don't; a new address is checked before the code is asked for), and everything is audit-logged. *SSRF:* every
+  delivery goes through netguard (https, all addresses public, pinned, no redirects, deadline, 16 KB cap); private
+  hosts only by name in `ALERT_PRIVATE_HOSTS` (`name` or `name:port`, like `PUSH_PRIVATE_HOSTS`), and only those may
+  use http, so a token never crosses the internet in the clear. *Secret disclosure:* addresses, topics, tokens and
+  the signing secret are sealed with `sealSecret`; the API, the dashboard and the audit log get a masked form only;
+  the signing secret is returned once; a long first label of a host name (some services put the secret there) and
+  an ntfy server's path are masked too. *A stored credential following a new address:* an ntfy channel moved to
+  another origin doesn't keep its topic or token (the topic must be given again; the token is dropped unless given),
+  so an admin who only ever saw them masked can't redirect them to their own server and press Test. *Crowding out
+  real alerts:* all failing channels share one alert (`alert_channels`) that sits outside the 12-an-hour cap and goes
+  at most hourly, and failed Test presses aren't counted toward "failing", so adding broken channels (no password
+  needed) can't hold back a real alert. *A near-off cooldown:* lengthening the cooldown past an hour needs step-up
+  like turning alerts off. *Alert loops:* the failing-channels alert isn't raised about its own delivery.
+  *Enumeration:* channel ids are random 64-bit values; admins only.
+- **Metrics** (`server/metrics.js`): `GET /metrics`, Prometheus text 0.0.4, off unless `METRICS_TOKEN` (16+
+  characters). Bearer only, compared as SHA-256 digests with `timingSafeEqual`; 20 wrong tokens per network in 10
+  minutes and that network is refused before any comparison. Labels: status class, job name, message kind, version.
+  Kept as is after review: someone sharing the scraper's network (Docker's gateway address, when visitors reach the
+  published port directly) can lock it out for 10 minutes; letting the right token through regardless would tell a
+  guesser which guess was right. `docs/OPERATIONS.md` says to scrape from an address of its own.
+- **Found and fixed on the way:** `PUT /api/admin/alerts` asked for the password only when `enabled` or `email` was
+  exactly `false`, but stored any falsy value as off, so `{"enabled": null}` (or `0`, `""`) turned alerts off
+  without step-up. Any falsy value now counts as turning off, there and for channels. The same route let any admin
+  set the cooldown to a week without the password; longer than an hour now needs it.
+- **Fixed after review:** per-channel failure alerts that could fill the hourly cap; Test failures counted toward
+  "failing"; an ntfy token and topic carried to a new server; a base path named like the topic cut off; unmasked
+  secret host names; and every channel action (and every live alert) rebuilding the whole admin view, which threw
+  the Health page back to the top and dropped focus for every admin watching it.
+- **Checked here:** `test/alert-channels-metrics.test.js` (21: permissions for members, moderators and signed-out
+  callers; step-up on off/retarget/remove, the null/0/"" bypass and a longer cooldown; masking in answers, health,
+  the audit log and at rest, including secret host names; an ntfy topic address pasted as the server, and a base
+  path named like the topic kept; moving an ntfy channel never takes its topic or token along; nine broken channels
+  and failed Tests can't cap a real alert, and their one alert names them; 17 refused
+  addresses including disguised and DNS-hidden ones; DNS rebinding at delivery; ntfy by LAN name with a token, signed
+  webhook, Discord and Slack delivered to local servers; error, 401, timeout, redirect and endless answers; the
+  self-alert; rate limits; metrics off, short token, auth, guess limit and content), `observability.test.js`, and an
+  e2e flow (31) that adds a webhook channel, sees its secret once, tests it (the page stays scrolled where it was,
+  focus on the button) and removes it with the password.
+  **Not checked here:** a real ntfy.sh, Discord or Slack (their formats are from their documentation), and a real
+  Prometheus scrape.

@@ -19,6 +19,7 @@
 // See docs/BOTS.md for the developer side.
 const crypto = require('crypto');
 const jobs = require('./jobs');
+const DISAPPEAR = require('./disappear');
 const netguard = require('./netguard');
 
 const SCOPES = {
@@ -67,8 +68,8 @@ const parseList = (s, d = []) => { try { const v = JSON.parse(s); return Array.i
 const sign = (secret, ts, body) => crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
 
 module.exports = function setupBots(ctx) {
-  const { api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, checkWords,
-    perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, reactionsFor, deleteMessageTree, emitServer,
+  const { api, express, db, fail, HttpError, wrap, rateLimit, newId, seal, unseal, sealSecret, openSecret, auth, stepUp, auditLog, serverAudit, checkWords,
+    perms, PM, getUserRow, publicUser, requireServer, requireChannel, serializeMessage, toChannel, toChannelAbout, emitChannelMessage, reactionsFor, deleteMessageTree, emitServer,
     getIo, features, isStaff, isInstanceAdmin, maintenance, newsBot } = ctx;
   const now = () => Date.now();
   const io = () => getIo() || { to: () => ({ emit() {} }), sockets: { sockets: new Map() } };
@@ -136,31 +137,50 @@ module.exports = function setupBots(ctx) {
   function envelope(type, bot, inst, data, id = newId()) {
     return { id, body: JSON.stringify({ v: 1, id, type, createdAt: now(), botId: bot.id, installationId: inst ? inst.id : null, serverId: inst ? inst.server_id : null, data }) };
   }
-  function enqueue(type, bot, inst, data) {
+  function store(type, bot, inst, data) {
     const e = envelope(type, bot, inst, data);
     db.prepare('INSERT INTO bot_deliveries (id, bot_id, installation_id, server_id, type, body, status, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?)')
       .run(e.id, bot.id, inst ? inst.id : null, inst ? inst.server_id : null, type, e.body, now(), now());
-    setImmediate(pumpSafely);
     return e.id;
+  }
+  function enqueue(type, bot, inst, data) {
+    const id = store(type, bot, inst, data);
+    pumpSoon();
+    return id;
   }
   // Something happened in a server: tell every installation allowed to know. `channel` is the channel it
   // happened in (checked against each installation's allow-list); `actorId` is who did it (a bot never hears
   // about its own actions, so a bot answering an event can't set off an endless loop with itself).
-  function event(type, serverId, data, { channel = null, actorId = null } = {}) {
+  function listeners(type, serverId, { channel = null, actorId = null } = {}) {
     const scope = EVENTS[type];
-    if (scope === undefined || type === 'command.invoked') return;
+    if (scope === undefined || type === 'command.invoked') return [];
     const rows = db.prepare(`SELECT i.* FROM bot_installations i JOIN bots b ON b.id = i.bot_id
         WHERE i.server_id = ? AND i.enabled = 1 AND b.disabled = 0 AND b.webhook_url IS NOT NULL`).all(serverId);
-    if (!rows.length) return;
+    if (!rows.length) return [];
     const srv = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
+    const out = [];
     for (const inst of rows) {
       if (inst.bot_id === actorId) continue;
       if (scope && !hasScope(inst, scope)) continue;
       const wanted = inst.events ? parseList(inst.events) : null;
       if (wanted && !wanted.includes(type)) continue;
       if (channel && !channelAllowed(inst, channel, srv)) continue;
-      enqueue(type, botRow(inst.bot_id), inst, data);
+      out.push({ bot: botRow(inst.bot_id), inst });
     }
+    return out;
+  }
+  function event(type, serverId, data, opts = {}) {
+    for (const { bot, inst } of listeners(type, serverId, opts)) enqueue(type, bot, inst, data);
+  }
+  // The same event many times over from one channel (a moderator's bulk delete, a ban's message cleanup): who may
+  // hear it is worked out once, every delivery is written in one transaction, and the sender wakes up once.
+  // One at a time, thousands of these kept the server busy for seconds.
+  function events(type, serverId, list, opts = {}) {
+    if (!list.length) return;
+    const to = listeners(type, serverId, opts);
+    if (!to.length) return;
+    db.transaction(() => { for (const { bot, inst } of to) for (const data of list) store(type, bot, inst, data); })();
+    pumpSoon();
   }
 
   // One POST to the bot's webhook. Resolves { ok, status, error }; never throws.
@@ -193,6 +213,10 @@ module.exports = function setupBots(ctx) {
   // The wake-ups (after a send, at the next retry) run it as a safe job too: a database error is logged and shown
   // in Admin → Health instead of stopping the server.
   const pumpSafely = jobs.job('bots.deliveries', pump);
+  // Wake-ups asked for in the same turn (sends finishing together, a burst of new events) share one pump: each
+  // pump reads the due deliveries, and thousands of them after a moderator's bulk delete kept the server busy.
+  let soon = false;
+  const pumpSoon = () => { if (soon) return; soon = true; setImmediate(() => { soon = false; pumpSafely(); }); };
   function pump() {
     if (pumping) { again = true; return; }
     pumping = true;
@@ -236,7 +260,7 @@ module.exports = function setupBots(ctx) {
     } finally {
       sending.delete(d.id);
       inflight.set(d.bot_id, inflight.get(d.bot_id) - 1);
-      setImmediate(pumpSafely);
+      pumpSoon();
     }
   }
   // Also on a timer (a safe job: errors are logged and counted in Admin → Health), in case a wake-up was missed.
@@ -264,7 +288,7 @@ module.exports = function setupBots(ctx) {
     let n = 0;
     const list = Array.isArray(ids) ? ids.slice(0, 100).map(String) : db.prepare("SELECT id FROM bot_deliveries WHERE installation_id = ? AND status = 'dead'").all(inst.id).map((r) => r.id);
     db.transaction(() => list.forEach((id) => { n += st.run(now(), id, inst.id).changes; }))();
-    setImmediate(pumpSafely);
+    pumpSoon();
     return n;
   }
   const clearDead = (inst) => db.prepare("DELETE FROM bot_deliveries WHERE installation_id = ? AND status = 'dead'").run(inst.id).changes;
@@ -371,23 +395,36 @@ module.exports = function setupBots(ctx) {
   }
 
   // ------------------------------------------------------------------ posting as a bot
+  // The insert and live update every bot post shares (installed bots here, channel webhooks in webhooks.js).
+  // Stored like the news bot's posts: sealed with the server's at-rest key, marked as a bot post. `extra` is
+  // anything else the app shows with it (a webhook's name for this post, say).
+  // A disappearing channel's timer covers bot posts too (stamped like everyone's, see server/disappear.js).
+  function botPost(authorId, c, content, { replyTo = null, extra = {} } = {}) {
+    const id = newId();
+    const t = now();
+    const expiresAt = DISAPPEAR.stamp({ secs: c.disappear_secs, t });
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id, expires_at) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?)')
+      .run(id, c.id, authorId, seal({ ...extra, content, attachments: [], bot: true }), replyTo, t, expiresAt);
+    DISAPPEAR.arm(expiresAt);
+    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
+    // Like a member's message: without the quote for members the message it replies to is from before
+    // (server/joinhistory.js).
+    emitChannelMessage(c, row, 'message:new', serializeMessage(row, c));
+    event('message.created', c.server_id, metaOf(row, c), { channel: c, actorId: authorId });
+    return row;
+  }
   function postAsBot(bot, inst, c, content, replyTo) {
     rateLimit(`botmsg:${bot.id}:${c.id}`, 10, 10000);
     rateLimit('botmsgh:' + bot.id, 1000, 3600000);
     let reply = replyTo ? String(replyTo) : null;
-    if (reply && !db.prepare('SELECT 1 FROM messages WHERE id = ? AND channel_id = ?').get(reply, c.id)) reply = null;
-    const id = newId();
-    // Stored like the news bot's posts: sealed with the server's at-rest key, marked as a bot post.
-    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL)')
-      .run(id, c.id, bot.id, seal({ content, attachments: [], bot: true }), reply, now());
-    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
-    toChannel(c).emit('message:new', serializeMessage(row, c));
-    event('message.created', c.server_id, metaOf(row, c), { channel: c, actorId: bot.id });
+    if (reply && !DISAPPEAR.alive(db.prepare('SELECT expires_at FROM messages WHERE id = ? AND channel_id = ?').get(reply, c.id))) reply = null;
+    const row = botPost(bot.id, c, content, { replyTo: reply });
     markOk(inst.id);
     return row;
   }
   const isBotUser = (id) => !!(getUserRow(id) || {}).is_bot;
-  const metaOf = (m, c) => ({ messageId: m.id, channelId: c.id, authorId: m.author_id, authorIsBot: isBotUser(m.author_id), createdAt: m.created_at, editedAt: m.edited_at || null, threadId: m.thread_id || null, replyTo: m.reply_to || null });
+  // expiresAt: when a disappearing message goes (null: it doesn't).
+  const metaOf = (m, c) => ({ messageId: m.id, channelId: c.id, authorId: m.author_id, authorIsBot: isBotUser(m.author_id), createdAt: m.created_at, editedAt: m.edited_at || null, threadId: m.thread_id || null, replyTo: m.reply_to || null, expiresAt: m.expires_at || null });
 
   // ------------------------------------------------------------------ the bot API: /api/bot/v1
   const bapi = express.Router();
@@ -439,7 +476,7 @@ module.exports = function setupBots(ctx) {
   }
   const botMessage = (req, id, scope) => {
     const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(String(id));
-    if (!m) fail(404, 'No such message.', 'not_found');
+    if (!DISAPPEAR.alive(m)) fail(404, 'No such message.', 'not_found');
     return { m, ...botChannel(req, m.channel_id, scope) };
   };
   const instOut = (inst) => {
@@ -469,18 +506,20 @@ module.exports = function setupBots(ctx) {
     needScope(inst, 'members.read');
     markOk(inst.id);
     const after = String(req.query.after || '');
-    const rows = db.prepare(`SELECT m.user_id, m.joined_at, u.username, u.profile FROM members m JOIN users u ON u.id = m.user_id
+    // nickname: what they go by in this server (server/nicknames.js), or null.
+    const rows = db.prepare(`SELECT m.user_id, m.joined_at, m.nickname, u.username, u.profile FROM members m JOIN users u ON u.id = m.user_id
         WHERE m.server_id = ? AND m.user_id > ? ORDER BY m.user_id LIMIT 1000`).all(inst.server_id, after);
-    res.json({ members: rows.map((r) => { let p = {}; try { p = JSON.parse(r.profile || '{}'); } catch { /* */ } return { id: r.user_id, username: r.username, displayName: p.displayName || r.username, joinedAt: r.joined_at }; }), next: rows.length === 1000 ? rows[rows.length - 1].user_id : null });
+    res.json({ members: rows.map((r) => { let p = {}; try { p = JSON.parse(r.profile || '{}'); } catch { /* */ } return { id: r.user_id, username: r.username, displayName: p.displayName || r.username, nickname: r.nickname || null, joinedAt: r.joined_at }; }), next: rows.length === 1000 ? rows[rows.length - 1].user_id : null });
   });
   // Message metadata (never content: people's messages are end-to-end encrypted, and other bots' posts aren't
   // this bot's business either).
   bapi.get('/channels/:id/messages', (req, res) => {
     const { c, inst } = botChannel(req, req.params.id, 'messages.read.metadata');
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 50));
+    const t = now();
     const rows = req.query.before
-      ? db.prepare('SELECT * FROM messages WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?').all(c.id, String(req.query.before), limit)
-      : db.prepare('SELECT * FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?').all(c.id, limit);
+      ? db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND ${DISAPPEAR.LIVE} AND id < ? ORDER BY id DESC LIMIT ?`).all(c.id, t, String(req.query.before), limit)
+      : db.prepare(`SELECT * FROM messages WHERE channel_id = ? AND ${DISAPPEAR.LIVE} ORDER BY id DESC LIMIT ?`).all(c.id, t, limit);
     markOk(inst.id);
     res.json({ messages: rows.map((m) => metaOf(m, c)) });
   });
@@ -498,7 +537,7 @@ module.exports = function setupBots(ctx) {
     rateLimit(`botmsg:${req.bot.id}:${c.id}`, 10, 10000);
     db.prepare('UPDATE messages SET body = ?, edited_at = ? WHERE id = ?').run(seal({ content, attachments: [], bot: true }), now(), m.id);
     const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(m.id);
-    toChannel(c).emit('message:update', serializeMessage(row, c));
+    emitChannelMessage(c, row, 'message:update', serializeMessage(row, c));
     markOk(inst.id);
     res.json({ message: { ...metaOf(row, c), content } });
   });
@@ -517,7 +556,7 @@ module.exports = function setupBots(ctx) {
     if (!emoji || emoji.length > 64) fail(400, 'Pick an emoji (up to 64 characters).', 'bad_emoji');
     return { ...r, emoji };
   };
-  const emitReactions = (c, m) => toChannel(c).emit('reaction:update', { messageId: m.id, channelId: c.id, reactions: reactionsFor([m.id])[m.id] || [] });
+  const emitReactions = (c, m) => toChannelAbout(c, m).emit('reaction:update', { messageId: m.id, channelId: c.id, reactions: reactionsFor([m.id])[m.id] || [] });
   bapi.put('/messages/:id/reactions/:emoji', (req, res) => {
     const { m, c, inst, emoji } = reactionTarget(req);
     rateLimit('botreact:' + req.bot.id, 20, 10000);
@@ -864,6 +903,7 @@ module.exports = function setupBots(ctx) {
     db.prepare('INSERT INTO bot_installations (id, bot_id, server_id, installed_by, scopes, channels, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)')
       .run(id, bot.id, s.id, req.userId, JSON.stringify(scopes), JSON.stringify(channels), now());
     auditLog(req, 'bot_installed', s.id, `${bot.name} (${bot.id}): ${scopes.join(' ') || 'no scopes'}; channels ${channels === '*' ? 'all public' : channels.length}`);
+    serverAudit(s, req.userId, 'bot_add', bot.id, { name: bot.name, scopes, channels: channels === '*' ? 'all' : channels.length });
     const inst = db.prepare('SELECT * FROM bot_installations WHERE id = ?').get(id);
     if (bot.webhook_url) enqueue('bot.installed', bot, inst, { serverId: s.id, serverName: s.name, scopes, channelIds: allowedChannels(inst).map((c) => c.id), allChannels: channels === '*', installedBy: req.userId });
     io().to(`server:${s.id}`).emit('user:update', publicUser(getUserRow(bot.id)));
@@ -893,7 +933,12 @@ module.exports = function setupBots(ctx) {
       db.prepare('UPDATE bot_installations SET enabled = ? WHERE id = ?').run(b.enabled ? 1 : 0, inst.id);
       changes.push(b.enabled ? 'resumed' : 'paused');
     }
-    if (changes.length) auditLog(req, 'bot_access_changed', s.id, `${bot.name} (${bot.id}): ${changes.join(', ')}`);
+    if (changes.length) {
+      auditLog(req, 'bot_access_changed', s.id, `${bot.name} (${bot.id}): ${changes.join(', ')}`);
+      serverAudit(s, req.userId, 'bot_update', bot.id, { name: bot.name, scopes: b.scopes !== undefined || b.channels !== undefined ? scopes : undefined,
+        channels: b.scopes !== undefined || b.channels !== undefined ? (channels === '*' ? 'all' : channels.length) : undefined,
+        paused: b.enabled !== undefined && !!b.enabled !== !!inst.enabled ? !b.enabled : undefined });
+    }
     emitServer(s.id);
     res.json(installedOut(db.prepare('SELECT * FROM bot_installations WHERE id = ?').get(inst.id)));
   });
@@ -910,6 +955,7 @@ module.exports = function setupBots(ctx) {
     for (const it of interactions.values()) if (it.installationId === inst.id) finish(it, 'failed', { error: 'The bot was removed from this server.' });
     if (bot.webhook_url) enqueue('bot.uninstalled', bot, inst, { serverId: s.id });
     auditLog(req, 'bot_uninstalled', s.id, `${bot.name} (${bot.id})`);
+    serverAudit(s, req.userId, 'bot_remove', bot.id, { name: bot.name });
     emitServer(s.id);
     res.json({ ok: true });
   });
@@ -927,7 +973,7 @@ module.exports = function setupBots(ctx) {
   });
   api.delete('/servers/:id/bots/:botId/deliveries/dead', auth, limitUi, (req, res) => res.json({ cleared: clearDead(managedInstall(req)) }));
 
-  return { event, serverBots, SCOPES, EVENTS, sign, pump };
+  return { event, events, serverBots, botPost, SCOPES, EVENTS, sign, pump };
 };
 module.exports.sign = sign;
 module.exports.SCOPES = SCOPES;

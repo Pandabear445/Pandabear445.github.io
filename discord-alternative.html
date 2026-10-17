@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hearth vs Discord: an honest comparison</title>
+<meta name="description" content="Hearth is a free, open-source chat app you can host yourself, with end-to-end encrypted messages and files, and calls encrypted between the people in them. How it compares with Discord, what it can't do, and when to pick something else.">
+<link rel="canonical" href="https://arc32.me/discord-alternative.html">
+<meta property="og:title" content="Hearth vs Discord: an honest comparison">
+<meta property="og:description" content="A free, self-hostable Discord alternative with end-to-end encrypted messages and files, and calls encrypted between the people in them. What's the same, what's different, and its limits.">
+<meta property="og:image" content="https://arc32.me/site/og.png">
+<meta property="og:url" content="https://arc32.me/discord-alternative.html">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Hearth vs Discord: an honest comparison">
+<meta name="twitter:description" content="A free, self-hostable Discord alternative with end-to-end encrypted messages and files, and calls encrypted between the people in them. What's the same, what's different, and its limits.">
+<meta name="twitter:image" content="https://arc32.me/site/og.png">
+<meta name="theme-color" content="#100e16">
+<link rel="icon" href="site/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="site/icon-192.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #100e16; --s1: #18151f; --s2: #201c29; --line: #2e2939;
+    --text: #f3eff8; --text-2: #b9b1c7; --muted: #8a8299;
+    --accent: #f2a541; --accent-2: #ff7a59; --ink: #1a1206;
+    --good: #4fd18b;
+    --r: 18px;
+    --font: 'Figtree', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --display: 'Bricolage Grotesque', 'Figtree', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.6 var(--font); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+  a { color: inherit; }
+  .wrap { width: min(1160px, 100% - 32px); margin-inline: auto; }
+  .narrow { width: min(860px, 100% - 32px); margin-inline: auto; }
+  h1, h2, h3 { font-family: var(--display); letter-spacing: -.02em; line-height: 1.08; margin: 0; }
+  p { margin: 0; }
+  p + p { margin-top: 14px; }
+
+  nav { position: sticky; top: 0; z-index: 10; background: rgb(16 14 22 / .78); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid rgb(255 255 255 / .05); }
+  nav .wrap { display: flex; align-items: center; gap: 24px; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font: 800 21px var(--display); text-decoration: none; }
+  .brand img { width: 30px; height: 30px; border-radius: 9px; }
+  .nav-links { display: flex; gap: 22px; margin-left: auto; font-size: 15px; color: var(--text-2); }
+  .nav-links a { text-decoration: none; }
+  .nav-links a:hover, .nav-links a[aria-current] { color: var(--text); }
+  @media (max-width: 720px) { .nav-links { display: none; } nav .btn { margin-left: auto; } }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font: 700 16px var(--font); text-decoration: none; border: 1px solid transparent; transition: transform .15s, background .15s, border-color .15s; white-space: nowrap; }
+  .btn:hover { transform: translateY(-1px); }
+  .btn.primary { background: var(--accent); color: var(--ink); }
+  .btn.primary:hover { background: #f7b65c; }
+  .btn.ghost { border-color: var(--line); background: rgb(255 255 255 / .03); }
+  .btn.ghost:hover { border-color: #4a4359; }
+  .btn.sm { padding: 8px 14px; font-size: 14px; border-radius: 10px; }
+
+  .hero { position: relative; padding: 72px 0 24px; }
+  .hero::before { content: ''; position: absolute; inset: -120px 0 auto; height: 520px; z-index: -1; pointer-events: none;
+    background: radial-gradient(600px 280px at 30% 30%, rgb(242 165 65 / .18), transparent 70%), radial-gradient(500px 240px at 80% 10%, rgb(255 122 89 / .12), transparent 70%); }
+  .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 12px; }
+  .hero h1 { font-size: clamp(36px, 6vw, 60px); font-weight: 800; max-width: 18ch; }
+  .hero h1 em { font-style: normal; background: linear-gradient(100deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--text-2); margin-top: 20px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+  .dated { margin-top: 18px; font-size: 14px; color: var(--muted); }
+
+  section { padding: 56px 0; }
+  .sec-head { margin-bottom: 28px; }
+  .sec-head h2 { font-size: clamp(28px, 4vw, 40px); font-weight: 800; }
+  .sec-head p { color: var(--text-2); margin-top: 12px; font-size: 18px; }
+  .prose p, .prose li { color: var(--text-2); }
+  .prose ul { margin: 14px 0 0; padding-left: 22px; display: grid; gap: 8px; }
+  .prose a, td a { color: var(--accent); }
+  strong { color: var(--text); }
+
+  /* comparison table: a table on wide screens, one card per row on phones */
+  .compare-table { width: 100%; border-collapse: collapse; background: var(--s1); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; font-size: 15.5px; }
+  .compare-table th, .compare-table td { text-align: left; vertical-align: top; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .compare-table tr:last-child th, .compare-table tr:last-child td { border-bottom: 0; }
+  .compare-table thead th { font: 700 14px var(--font); letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: var(--s2); }
+  .compare-table tbody th { font-weight: 700; width: 22%; color: var(--text); }
+  .compare-table td { color: var(--text-2); width: 39%; }
+  .compare-table td.hearth { color: var(--text); }
+  @media (max-width: 720px) {
+    .compare-table, .compare-table tbody, .compare-table tr, .compare-table th, .compare-table td { display: block; width: auto; }
+    .compare-table thead { display: none; }
+    .compare-table tr { border-bottom: 1px solid var(--line); padding: 6px 0; }
+    .compare-table tr:last-child { border-bottom: 0; }
+    .compare-table th, .compare-table td { border-bottom: 0; padding: 6px 16px; }
+    .compare-table tbody th, .compare-table td { width: auto; }
+    .compare-table tbody th { padding-top: 12px; }
+    .compare-table td::before { content: attr(data-label); display: block; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  }
+
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--s1); border: 1px solid var(--line); border-radius: var(--r); padding: 22px; min-width: 0; }
+  .card h3 { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
+  .card p { color: var(--text-2); font-size: 15.5px; }
+  .card a { color: var(--accent); }
+
+  .final { text-align: center; padding: 72px 0 88px; }
+  .final .card { padding: 48px 24px; background: radial-gradient(500px 220px at 50% 0%, rgb(242 165 65 / .16), transparent 70%), var(--s1); }
+  .final h2 { font-size: clamp(28px, 4.4vw, 44px); font-weight: 800; }
+  .final p { margin-top: 12px; }
+  .final .cta { justify-content: center; }
+
+  footer { border-top: 1px solid var(--line); padding: 32px 0 48px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; }
+  footer a { text-decoration: none; color: var(--text-2); }
+  footer a:hover { color: var(--text); }
+  footer nav { all: unset; display: flex; gap: 20px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<nav aria-label="Main">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="site/icon-192.png" alt="" width="30" height="30">Hearth</a>
+    <div class="nav-links">
+      <a href="./#features">Features</a>
+      <a href="discord-alternative.html" aria-current="page">vs Discord</a>
+      <a href="./#host">Host your own</a>
+      <a href="./#faq">FAQ</a>
+      <a href="https://github.com/Pandabear445/Hearth-chat/tree/main/hearth">GitHub</a>
+    </div>
+    <a class="btn primary sm" href="https://kappachat.duckdns.org">Open Hearth</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="narrow">
+    <div class="eyebrow">Hearth vs Discord</div>
+    <h1>A Discord alternative you can <em>run yourself.</em></h1>
+    <p class="lede">Hearth is a free, open-source (MIT) chat app for friend groups and small communities: servers with text and voice channels, roles, threads, DMs and group chats, voice and video with screen sharing, and watching videos together. Messages and files are end-to-end encrypted in the app, and calls are encrypted between the people in them. You can join the public community server, or host your own on a small VPS or a computer at home.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://kappachat.duckdns.org">Join the community</a>
+      <a class="btn ghost" href="./#host">Host your own</a>
+    </div>
+    <p class="dated">Written in October 2026. Discord changes often: check its own pages for the current details.</p>
+  </div>
+</header>
+
+<section id="compare">
+  <div class="narrow">
+    <div class="sec-head">
+      <h2>Side by side</h2>
+      <p>The everyday features are much alike. The differences are in who can read what, who runs the server, and what it costs.</p>
+    </div>
+    <table class="compare-table">
+      <thead>
+        <tr><th scope="col"></th><th scope="col">Hearth</th><th scope="col">Discord</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Messages and files</th>
+          <td class="hearth" data-label="Hearth">End-to-end encrypted in your app before they're sent, in servers, DMs and group chats. The server stores only encrypted data.</td>
+          <td data-label="Discord">Not end-to-end encrypted: Discord's servers can read them.</td>
+        </tr>
+        <tr>
+          <th scope="row">Voice, video and screen share</th>
+          <td class="hearth" data-label="Hearth">Encrypted between the people in the call (DTLS-SRTP, with signed handshakes), also when a relay passes the packets along.</td>
+          <td data-label="Discord">End-to-end encrypted with its DAVE protocol, rolled out from 2024.</td>
+        </tr>
+        <tr>
+          <th scope="row">What the server still sees</th>
+          <td class="hearth" data-label="Hearth">Who is in which server, who talks to whom and when, reactions, server and channel names, profiles and file sizes. The <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md">security notes</a> list it all.</td>
+          <td data-label="Discord">Everything that isn't end-to-end encrypted, which includes every text message and file.</td>
+        </tr>
+        <tr>
+          <th scope="row">Ads and paid tiers</th>
+          <td class="hearth" data-label="Hearth">No ads, and every feature works for everyone. Whoever runs each Hearth decides what supporters who chip in get: a 💜 badge, and optionally more storage and bigger files. Creators can sell memberships to their own community.</td>
+          <td data-label="Discord">Free, with a Nitro subscription for extras (bigger uploads, better streams, profile perks) and sponsored Quests.</td>
+        </tr>
+        <tr>
+          <th scope="row">Self-hosting</th>
+          <td class="hearth" data-label="Hearth">Yes: one Node.js process and a SQLite file, started with Docker. No outside services needed.</td>
+          <td data-label="Discord">No.</td>
+        </tr>
+        <tr>
+          <th scope="row">Who holds your data</th>
+          <td class="hearth" data-label="Hearth">Whoever runs the server you're on: you, a friend, or the public community server.</td>
+          <td data-label="Discord">Discord.</td>
+        </tr>
+        <tr>
+          <th scope="row">ID or face checks</th>
+          <td class="hearth" data-label="Hearth">Hearth never asks for ID documents or face scans, so there's no ID database to leak. Whoever runs each Hearth sets its Terms, including the minimum age.</td>
+          <td data-label="Discord">Rolling out age checks worldwide from September 2026: an account Discord can't confirm as adult may be asked for a face scan or an ID. In October 2025 Discord disclosed a breach at a third-party support vendor that exposed some users' ID photos.</td>
+        </tr>
+        <tr>
+          <th scope="row">Big calls</th>
+          <td class="hearth" data-label="Hearth">Calls go directly between people, with no media server, so video works best with up to about 4 to 6 cameras on. Voice-only handles more.</td>
+          <td data-label="Discord">Media servers carry calls and Go Live streams, so large calls and big audiences work.</td>
+        </tr>
+        <tr>
+          <th scope="row">IP addresses in calls</th>
+          <td class="hearth" data-label="Hearth">Because calls go directly between people, everyone in a call can see each other's IP address, and anyone allowed to join a voice channel can collect them. A call switched to a region (a relay the server's owner runs) goes through that relay only, so people in it see the relay's address instead, unless that relay stops answering and the call falls back to connecting directly. The server always sees everyone's. <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md#4-what-each-adversary-can-still-do-honest-limits">Details</a>.</td>
+          <td data-label="Discord">Media servers sit between people, so people in a call don't see each other's IP address. Discord sees everyone's.</td>
+        </tr>
+        <tr>
+          <th scope="row">Bots and integrations</th>
+          <td class="hearth" data-label="Hearth">Bots with slash commands, signed outgoing webhooks, incoming webhooks that take Discord- and Slack-style posts (Uptime Kuma, Home Assistant, Grafana, GitHub), and a news bot for feeds. Bot posts are marked as not end-to-end encrypted.</td>
+          <td data-label="Discord">A huge ecosystem of bots and integrations.</td>
+        </tr>
+        <tr>
+          <th scope="row">Apps</th>
+          <td class="hearth" data-label="Hearth">Any browser, installable on every system; desktop apps for Windows, Mac and Linux and an Android app, built by each server's owner (GitHub Actions) and downloaded from that server's own page, not from an app store. On iPhone it's the installable web app (with notifications).</td>
+          <td data-label="Discord">Windows, Mac, Linux, Android, iOS and the web.</td>
+        </tr>
+        <tr>
+          <th scope="row">Profiles</th>
+          <td class="hearth" data-label="Hearth">A full MySpace-style page for everyone, free: themes, a profile song, top 8, a comment wall and your own CSS.</td>
+          <td data-label="Discord">Profile decorations, effects and more customisation come with Nitro or from the Shop.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="bring">
+  <div class="narrow prose">
+    <div class="sec-head">
+      <h2>Bring your Discord server</h2>
+      <p>Moving a community is mostly about structure, and Hearth can copy that for you.</p>
+    </div>
+    <p><strong>Add a server → Import from Discord</strong> starts a new server from a Discord server template: its roles, categories, channels and channel permissions. Hearth shows you how to copy the template in your browser (it never contacts Discord or asks for a Discord login), and before anything is created it lists what won't come over and anything Hearth would allow that Discord didn't.</p>
+    <p>Members, messages and emoji don't come with it yet. Everyone joins through an invite link, which can expire and have a use limit. The full mapping is in <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/docs/IMPORT.md">IMPORT.md</a>.</p>
+  </div>
+</section>
+
+<section id="other">
+  <div class="narrow">
+    <div class="sec-head">
+      <h2>When to pick something else</h2>
+      <p>Hearth is built for friend groups and small communities. Some needs are better served elsewhere (as of October 2026):</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h3>Matrix (Element)</h3>
+        <p>If you need federation, where people on servers run by different people talk to each other, or bridges to other chat networks. Hearth has neither, on purpose: a bridge has to decrypt messages to pass them on.</p>
+      </div>
+      <div class="card">
+        <h3>TeamSpeak</h3>
+        <p>If what you mostly want is voice for gaming, with many people in one channel.</p>
+      </div>
+      <div class="card">
+        <h3>Stoat (formerly Revolt)</h3>
+        <p>If you want a Discord-style service that someone else hosts and runs for you.</p>
+      </div>
+      <div class="card">
+        <h3>Staying on Discord</h3>
+        <p>If your community depends on large video calls, streaming to big audiences, public server discovery or a particular bot.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="limits">
+  <div class="narrow prose">
+    <div class="sec-head">
+      <h2>Honest limits</h2>
+      <p>Self-hosting communities ask these first, so here they are.</p>
+    </div>
+    <ul>
+      <li><strong>The server sees metadata:</strong> who talks to whom and when, even though it can't read what's said.</li>
+      <li><strong>The app's code comes from the server.</strong> The web, desktop and Android apps load it from the server you use, so you're trusting whoever runs it not to change that code. That's true of any web app; pick a server you trust, or host your own.</li>
+      <li><strong>No federation or bridges</strong>, by design.</li>
+      <li><strong>Group video doesn't scale</strong> to big calls (see the table).</li>
+      <li><strong>People in a call can see each other's IP address</strong>, because calls go directly between people, unless the call is switched to a region (a relay the server's owner runs; in a server, anyone with Manage Channels can switch it). If that matters to your community (doxxing, attacks on someone's home connection), set up a region and use it, or only let people you trust into voice channels. See <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md#4-what-each-adversary-can-still-do-honest-limits">SECURITY.md §4</a>.</li>
+      <li><strong>No independent security audit yet.</strong> The threat model and every known limit are in <a href="https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md">SECURITY.md</a>.</li>
+      <li><strong>How it's built:</strong> most of the code is written with an AI coding assistant, and the commit history shows which changes were. Every change runs the automated test suite in CI, including a suite of attacks against the server and the encryption.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="final">
+  <div class="narrow">
+    <div class="card">
+      <h2>Try it with your friends.</h2>
+      <p>Sign up on the community server in a minute, or run your own.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://kappachat.duckdns.org">Join the community</a>
+        <a class="btn ghost" href="./#host">Host your own</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Hearth · MIT licensed · made for friend groups</span>
+    <nav aria-label="Footer">
+      <a href="./">Home</a>
+      <a href="https://kappachat.duckdns.org/download">Download</a>
+      <a href="https://kappachat.duckdns.org/terms">Terms</a>
+      <a href="code-signing.html">Code signing</a>
+      <a href="https://github.com/Pandabear445/Hearth-chat/tree/main/hearth">GitHub</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

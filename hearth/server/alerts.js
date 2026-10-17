@@ -1,12 +1,13 @@
 // Alerts for the instance owner: things that need a person to look, sent to the owner's confirmed email (through the
-// accounts module's notify) and to the admin dashboard live (the 'admins' socket room, as 'admin:alert').
+// accounts module's notify), to the admin dashboard live (the 'admins' socket room, as 'admin:alert'), and to the
+// alert channels an admin added (ntfy, a signed webhook, Discord or Slack: server/alertchannels.js).
 //
 // Kinds: repeated application errors, failed backups and restore tests, a background job failing again and again,
 // a relay region going quiet, low disk space, and sign-in abuse spikes (from the security log).
 //
 // No storms: each alert has a key, and the same key is sent at most once per cooldown (default an hour), however
-// often it fires; on top of that at most MAX_PER_HOUR alerts go out per hour in all. What was held back is counted
-// and mentioned in the next one. Alerts never carry secrets or message content: only what happened, counts and
+// often it fires; on top of that at most MAX_PER_HOUR alerts go out per hour in all (the one saying alert channels
+// are failing has its own hourly slot instead). What was held back is counted and mentioned in the next one. Alerts never carry secrets or message content: only what happened, counts and
 // short, scrubbed error descriptions.
 const log = require('./log');
 
@@ -63,10 +64,15 @@ module.exports = function setupAlerts(ctx) {
     return state;
   };
   const persist = () => { try { setSetting('alertState', JSON.stringify(state)); } catch (e) { log.warn('alerts', 'save_failed', { err: e }); } };
-  const sentLastHour = () => load().recent.filter((a) => a.delivered && a.at > now() - 3600000).length;
+  // The alert channels (set by health.js once it has made them): each sent alert goes to every switched-on one.
+  let channels = null;
+  const sentLastHour = () => load().recent.filter((a) => a.delivered && !a.outsideCap && a.at > now() - 3600000).length;
 
   // raise(key, { severity: 'warning'|'critical', title, detail }). Returns 'sent', 'cooldown', 'capped' or 'off'.
-  function raise(key, { severity = 'warning', title, detail = '' }) {
+  // outsideCap: for the one alert about the alert channels themselves (alertchannels.js). It never takes one of the
+  // hour's MAX_PER_HOUR, so broken channels (however many, and whoever added them) can't crowd out a real alert, and
+  // it goes at most once an hour whatever the cooldown is set to.
+  function raise(key, { severity = 'warning', title, detail = '' }, { outsideCap = false } = {}) {
     const c = config();
     const st = load();
     const k = st.keys[key] || { lastSent: 0, suppressed: 0 };
@@ -74,10 +80,11 @@ module.exports = function setupAlerts(ctx) {
     k.active = true;
     k.lastSeen = now();
     if (!c.enabled) return 'off';
-    if (k.lastSent && now() - k.lastSent < c.cooldownMin * 60000) { k.suppressed++; return 'cooldown'; }
-    if (sentLastHour() >= MAX_PER_HOUR) { k.suppressed++; return 'capped'; }
+    const cooldownMin = outsideCap ? Math.max(60, c.cooldownMin) : c.cooldownMin;
+    if (k.lastSent && now() - k.lastSent < cooldownMin * 60000) { k.suppressed++; return 'cooldown'; }
+    if (!outsideCap && sentLastHour() >= MAX_PER_HOUR) { k.suppressed++; return 'capped'; }
     const held = k.suppressed;
-    const alert = { key, severity, title: log.scrub(title).slice(0, 140), detail: log.scrub(detail).slice(0, 600), at: now(), held, delivered: true };
+    const alert = { key, severity, title: log.scrub(title).slice(0, 140), detail: log.scrub(detail).slice(0, 600), at: now(), held, delivered: true, ...(outsideCap ? { outsideCap: true } : {}) };
     k.lastSent = alert.at; k.suppressed = 0;
     st.recent.unshift(alert);
     st.recent = st.recent.slice(0, 30);
@@ -89,6 +96,8 @@ module.exports = function setupAlerts(ctx) {
       const text = `${alert.title}\n\n${alert.detail}${held ? `\n\n(${held} more like this were held back since the last email.)` : ''}\n\nOpen Admin → Health for details. You get at most one email like this every ${c.cooldownMin} minutes; turn them off in Admin → Health.`;
       try { notify(owner, `${severity === 'critical' ? 'needs attention now' : 'needs a look'}: ${alert.title}`, text, { footer: '' }); } catch (e) { log.warn('alerts', 'email_failed', { err: e }); }
     }
+    // The same words as the email, in the background: a slow channel never holds up whatever raised the alert.
+    if (channels) { try { channels.deliverAll({ key, severity, title: alert.title, detail: alert.detail, held, at: alert.at }); } catch (e) { log.warn('alerts', 'channels_failed', { err: e }); } }
     return 'sent';
   }
   // The condition is over: the next time it happens counts as new (once the cooldown has passed).
@@ -113,9 +122,11 @@ module.exports = function setupAlerts(ctx) {
 
   return {
     raise, clear, config, setConfig, countError, countSecurity, jobFailed, jobRecovered, thresholds,
-    recent: () => load().recent.map(({ delivered, ...a }) => a), // eslint-disable-line no-unused-vars
+    useChannels: (c) => { channels = c; },
+    recent: () => load().recent.map(({ delivered, outsideCap, ...a }) => a), // eslint-disable-line no-unused-vars
     stats: () => ({ errors10m: errors.count(), authFails10m: security.count(), authByKind: security.byKind() }),
   };
 };
 module.exports.windowCounter = windowCounter;
+module.exports.MAX_PER_HOUR = MAX_PER_HOUR;
 module.exports.SECURITY_TYPES = SECURITY_TYPES;

@@ -15,13 +15,13 @@ const jobs = require('./jobs');
 
 module.exports = function setupMemberships(ctx) {
   const { api, auth, db, fail, wrap, rateLimit, getSetting, setSetting, requireInstanceAdmin, requireServer, requireOwner,
-    isMember, emitServer, emitTo, seal, unseal, newId, brief, PM, mailPublicUrl, auditLog, stepUp, sealSecret, openSecret } = ctx;
+    isMember, emitServer, emitTo, seal, unseal, newId, brief, PM, mailPublicUrl, auditLog, serverAudit, stepUp, sealSecret, openSecret } = ctx;
   const now = () => Date.now();
   const API = () => (process.env.STRIPE_API_BASE || 'https://api.stripe.com').replace(/\/+$/, '');
   const MAX_TIERS = 5;
-  // A role you can buy can't come with moderator powers.
+  // A role you can buy can't come with moderator powers. Reading the audit log counts: it shows who moderated whom.
   const POWERFUL = PM.ADMINISTRATOR | PM.MANAGE_SERVER | PM.MANAGE_ROLES | PM.MANAGE_CHANNELS | PM.MANAGE_MESSAGES
-    | PM.MANAGE_EMOJIS | PM.KICK_MEMBERS | PM.BAN_MEMBERS;
+    | PM.MANAGE_EMOJIS | PM.KICK_MEMBERS | PM.BAN_MEMBERS | PM.MUTE_MEMBERS | PM.MOVE_MEMBERS | PM.VIEW_AUDIT_LOG | PM.MANAGE_NICKNAMES;
   const LIVE = ['active', 'past_due']; // past_due: Stripe is still retrying the card, so they keep access meanwhile
 
   // ------------------------------------------------------------------ settings (Admin → Money)
@@ -72,12 +72,20 @@ module.exports = function setupMemberships(ctx) {
   const tierRow = (id) => db.prepare('SELECT * FROM membership_tiers WHERE id = ?').get(id);
   const account = (sid) => db.prepare('SELECT * FROM creator_accounts WHERE server_id = ?').get(sid);
   const roleRow = (sid, rid) => rid && db.prepare('SELECT * FROM roles WHERE id = ? AND server_id = ?').get(rid, sid);
-  // A role that comes with moderator powers, either itself or through a channel override.
-  const powerful = (r) => !!r && (!!(r.permissions & POWERFUL)
-    || !!db.prepare("SELECT 1 FROM channel_overrides WHERE target_type = 'role' AND target_id = ? AND (allow & ?) != 0").get(r.id, POWERFUL));
+  // A role that comes with moderator powers, either itself or through a channel override. `bits` lets
+  // self-assignable roles (server/selfroles.js) ask about a wider set with the same test.
+  const powerful = (r, bits = POWERFUL) => !!r && (!!(r.permissions & bits)
+    || !!db.prepare("SELECT 1 FROM channel_overrides WHERE target_type = 'role' AND target_id = ? AND (allow & ?) != 0").get(r.id, bits));
   // The membership that gives a role, while it's on sale or anyone still has it (or is signing up), or null.
   const tierForRole = (rid) => (rid && db.prepare(`SELECT t.* FROM membership_tiers t WHERE t.role_id = ? AND (t.active = 1
     OR EXISTS (SELECT 1 FROM memberships m WHERE m.tier_id = t.id AND m.status IN ('active', 'past_due', 'pending'))) ORDER BY t.active DESC, t.created_at LIMIT 1`).get(rid)) || null;
+  // { roleId: membership name } for every role tierForRole would find, in one query (server views, server/index.js).
+  const soldRoles = (sid) => {
+    const out = {};
+    for (const t of db.prepare(`SELECT t.role_id, t.name FROM membership_tiers t WHERE t.server_id = ? AND t.role_id IS NOT NULL AND (t.active = 1
+        OR EXISTS (SELECT 1 FROM memberships m WHERE m.tier_id = t.id AND m.status IN ('active', 'past_due', 'pending'))) ORDER BY t.active, t.created_at DESC`).all(sid)) out[t.role_id] = t.name;
+    return out;
+  };
   const publicTier = (t) => {
     const r = roleRow(t.server_id, t.role_id);
     return { id: t.id, name: t.name, description: t.description, priceCents: t.price_cents, currency: t.currency, active: !!t.active,
@@ -102,16 +110,20 @@ module.exports = function setupMemberships(ctx) {
     const want = new Set(db.prepare(`SELECT t.role_id FROM memberships m JOIN membership_tiers t ON t.id = m.tier_id
       WHERE m.server_id = ? AND m.user_id = ? AND m.status IN ('active', 'past_due') AND t.role_id IS NOT NULL`).all(sid, uid).map((r) => r.role_id));
     const has = new Set(db.prepare('SELECT role_id FROM member_roles WHERE server_id = ? AND user_id = ?').all(sid, uid).map((r) => r.role_id));
-    let changed = false;
+    const added = []; const removed = [];
     for (const rid of tierRoles) {
       const role = roleRow(sid, rid);
       if (!role) continue;
       // Moderator powers can't be bought: a tier role that got them later (an edit, an override) isn't handed out.
       if (want.has(rid) && !has.has(rid) && powerful(role)) { log.warn('memberships', 'role_withheld', { msg: `Not giving the membership role "${role.name}": it has moderator powers.` }); continue; }
-      if (want.has(rid) && !has.has(rid)) { db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(sid, uid, rid); changed = true; }
-      if (!want.has(rid) && has.has(rid)) { db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(sid, uid, rid); changed = true; }
+      if (want.has(rid) && !has.has(rid)) { db.prepare('INSERT INTO member_roles (server_id, user_id, role_id) VALUES (?, ?, ?)').run(sid, uid, rid); added.push({ id: rid, name: role.name }); }
+      if (!want.has(rid) && has.has(rid)) { db.prepare('DELETE FROM member_roles WHERE server_id = ? AND user_id = ? AND role_id = ?').run(sid, uid, rid); removed.push({ id: rid, name: role.name }); }
     }
-    if (changed) emitServer(sid);
+    if (added.length || removed.length) {
+      // In the server's audit log as done by Hearth itself, because of a membership starting or ending.
+      if (serverAudit) serverAudit(sid, null, 'member_roles', uid, { added, removed, membership: true });
+      emitServer(sid);
+    }
   }
 
   const STATUS = { active: 'active', trialing: 'active', past_due: 'past_due', incomplete: 'pending', unpaid: 'ended', canceled: 'ended', incomplete_expired: 'ended', paused: 'ended' };
@@ -306,6 +318,8 @@ module.exports = function setupMemberships(ctx) {
       const r = roleRow(s.id, roleId);
       if (!r || r.id === s.id) fail(400, 'Pick one of this server’s roles (not @everyone).');
       if (powerful(r)) fail(400, `"${r.name}" has moderator powers (itself or in a channel), so it can’t be sold. Pick or make a role without them.`);
+      // Members could pick it for free.
+      if (r.self_assign) fail(400, `Members can pick "${r.name}" themselves, so it can’t be sold. Turn that off in its role settings, or pick another role.`);
       const other = db.prepare('SELECT name FROM membership_tiers WHERE server_id = ? AND role_id = ? AND id != ?').get(s.id, roleId, current.id || '');
       if (other) fail(400, `"${r.name}" already belongs to the "${other.name}" membership.`);
     }
@@ -468,5 +482,5 @@ module.exports = function setupMemberships(ctx) {
   jobs.every('memberships.reconcile', 3600000, reconcile);
   jobs.every('memberships.retry_cancellations', 3600000, retryCancellations, { firstDelay: 5000 });
 
-  return { offers, syncRoles, onLeave, onServerDeleted, usable, POWERFUL, tierForRole, retryCancellations };
+  return { offers, syncRoles, onLeave, onServerDeleted, usable, POWERFUL, powerful, tierForRole, soldRoles, retryCancellations };
 };

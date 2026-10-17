@@ -1,8 +1,8 @@
 # Running Hearth: capacity, regions, costs and money
 
 Numbers here were measured with Hearth 1.16 (still true for 1.18) under load (simulated app windows connected over WebSockets,
-real message traffic through the real server), not guessed. Your server: 6 vCPU, 12 GB RAM,
-200 GB SSD (152.4 GB free), 300 Mbit/s.
+real message traffic through the real server) on a small VPS, not guessed. The disk and bandwidth examples below
+assume about 150 GB of free disk and a 300 Mbit/s port: scale them to your own plan.
 
 ## How many people can it hold?
 
@@ -27,7 +27,7 @@ chatting in the same server** at that rate (that's 20 messages a second — fast
 **What runs out first: disk space.** Text is tiny (an encrypted message is about 1 KB, so a million messages
 is about 1 GB). Pictures and files are what fill the disk:
 
-| Average stored per person | People that fit in 152 GB |
+| Average stored per person | People that fit in 150 GB |
 |---|---|
 | 1,000 MB (the default limit, everyone full) | ~150 |
 | 250 MB | ~600 |
@@ -38,7 +38,7 @@ Recommendation: set **Storage per person to 250 MB** (Admin → Storage & limits
 Watch the Storage tab; when free space drops under ~20 %, raise the plan's disk ("more storage available")
 or lower limits. Keep the GIF library cap (default 5 GB) in mind too.
 
-**Bandwidth (300 Mbit/s ≈ 37 MB/s).** Chat text is negligible. Calls go directly between people, so they use
+**Bandwidth (a 300 Mbit/s port ≈ 37 MB/s).** Chat text is negligible. Calls go directly between people, so they use
 none of your bandwidth — except calls that need the relay (TURN) if it runs on this same server: about
 3,000 relayed voice streams or ~100 relayed video streams fill the port. `scripts/setup-turn.sh` caps each relayed
 connection at 6 Mbit/s each way (`TURN_MAX_MBIT`); set `TURN_CAPACITY_MBIT` to cap all relayed calls together
@@ -56,7 +56,7 @@ than splitting Hearth across machines.
 
 ## Cost per person
 
-If this is a ~$8/month VPS (check your bill): with 1,000 people using it in a month that's **under 1 cent per
+On a typical ~$8/month VPS (check your own bill): with 1,000 people using it in a month that's **under 1 cent per
 person per month**; with 5,000 it's 0.16 cents. That's the honest, headline number for "cost effective".
 
 ## More regions, linked together
@@ -74,7 +74,9 @@ delay. So a region is a small relay server near people.
 
 1. *Add a region* → name it (e.g. "Frankfurt") → confirm with your password → you get a one-line install command.
    (Adding, reinstalling, renaming and removing regions are all written to the audit log.)
-2. Rent the cheapest VPS there, log in as root, paste the line. It installs the relay with your server's secret,
+2. Rent the cheapest VPS there, log in as root, paste the line. It downloads the installer over https, checks it
+   against the SHA-256 in the line (a changed or cut-off download never runs; if it says FAILED, make a new
+   command), and then installs the relay with your server's secret,
    plus a tiny check-in that reports to your server every minute (address, CPU, memory, traffic this month). The
    address a region reports must be a real public IP; private, loopback and look-alike spellings are refused.
 3. Within a minute the region shows **Online** in Admin → Regions, and every call includes it.
@@ -105,7 +107,8 @@ talks to your server.
 **What a region holds.** The relay secret is the same on every relay (the main one and each region), so someone
 who breaks into one region can make relay logins that work on all of them, and can change the address that region
 reports. Only rent regions from providers you'd trust with that. To change the secret, set a new one (Settings →
-Instance → Calls, or `sudo bash scripts/setup-turn.sh` again) and **Reinstall** every region. Relay logins already
+Instance → Calls, or `sudo bash scripts/setup-turn.sh --new-secret`; a plain re-run keeps the old one) and
+**Reinstall** every region. Relay logins already
 handed out keep working until they run out (12–18 hours).
 
 **Where to put them, cheaply** (prices checked October 2026; they change):
@@ -114,7 +117,7 @@ handed out keep working until they run out (12–18 hours).
 |---|---|---|
 | Oracle Cloud Always Free | $0 | Arm VM (2 CPU / 12 GB since mid-2026) with **10 TB traffic a month**. Many regions. Needs a card; free VMs can be hard to get in busy regions. |
 | Hetzner Cloud | ≈ €5.50/mo | Germany/Finland with 20 TB traffic: best value for Europe. US (1 TB) and Singapore (0.5 TB) include little traffic. Cheapest plans sometimes sold out. |
-| Contabo (your current host) | ≈ $5–7/mo | EU, US, UK, Asia, Australia; lots of traffic. Same account you have. |
+| Contabo | ≈ $5–7/mo | EU, US, UK, Asia, Australia; lots of traffic. |
 | Vultr / DigitalOcean / Linode | $4–6/mo | 30+ cities, 0.5–2 TB traffic. For South America, India, Japan, Australia. |
 
 Traffic is the number to watch, not CPU: a relayed video call is about 1–2 Mbit/s per person each way, so 1 TB
@@ -143,20 +146,25 @@ their `docker-compose.yml`, so `hearth-update` adds `TRUST_PROXY=<your proxy net
 and says so.
 
 **Shipping a server update.** `bash scripts/make-update-zip.sh [folder]` makes `hearth-update-<version>.zip` and
-`hearth-update-<version>.zip.sha256` from the last commit (default folder: `hearth/dist`, which git ignores). Hand
-out both, and put the SHA-256 in the release notes too. The update tools and `hearth-update` refuse a zip that
-doesn't match the `.sha256` next to it, print the SHA-256 they install, and check the upload again on the server
-in a private temporary folder. Without a `.sha256` they only print the SHA-256, so compare it yourself. A checksum
-isn't a signature: someone who can replace both files can replace both, which is why the published copy matters.
-Exit codes 90–92 from the tools mean the updater never ran (damaged upload, no updater in the zip, no private
-folder).
+`hearth-update-<version>.zip.sha256` from the last commit (default folder: `hearth/dist`, which git ignores), and
+`hearth-update-<version>.zip.sig` when you have a server update signing key (`node scripts/update-key.js keygen`
+once, then commit `update-signing.pub`; see [SIGNING.md](SIGNING.md#signing-server-updates)). Hand out all three,
+and put the SHA-256 in the release notes too. Operators upload the three files to their server and run
+`sudo hearth-update <zip>` there (README, "Upgrading"). `hearth-update` refuses a zip that doesn't match the
+`.sha256` next to it, prints the SHA-256 it installs, and checks a private copy of the zip. Without a `.sha256` it
+only prints the SHA-256, so compare it yourself. A checksum isn't a signature: someone who can replace both files
+can replace both. Once a server has pinned your key (`/etc/hearth-update.pub`), it also refuses any zip that isn't
+signed with it, before anything in it runs.
 
-**Shipping the desktop apps.** Set the `UPDATE_SIGNING_KEY` secret so installed apps only take updates you signed
-(see [SIGNING.md](SIGNING.md#signing-desktop-updates)). To have GitHub copy the installers to your server, add
-`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DOWNLOADS_DIR` **and** `VPS_HOST_FINGERPRINT`: the `SHA256:…` value from
+**Shipping the desktop apps.** Set the `UPDATE_SIGNING_KEY` secret (in the `production` environment) and the `UPDATE_PUBLIC_KEY` variable so installed apps only take updates you signed
+(see [SIGNING.md](SIGNING.md#signing-desktop-updates); if you already have the secret, the variable is its public half,
+not a new pair). To have GitHub copy the installers to your server, add
+`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DOWNLOADS_DIR` **and** `VPS_HOST_FINGERPRINT` (also in the `production`
+environment): the `SHA256:…` value from
 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server. Without the fingerprint the copy step fails and
 copies nothing. Use a user with no sudo that can only write `data/downloads`, not root. Only `app-v*` tags and the
-default branch are copied.
+default branch are copied. Delete any repository secrets with these names once they're in the environment: every
+branch's workflows can read a repository secret.
 
 **The call relay (TURN).** Relay passwords are per person and run out 12–18 hours after they're handed out; the app
 fetches new ones by itself. Relay setups made before the bandwidth caps need `sudo bash scripts/setup-turn.sh` run
@@ -243,7 +251,8 @@ Avoid: ads, tracking pixels, selling data, paywalling safety or privacy features
 * **Where:** short videos of profile customization (MySpace nostalgia travels well), invite links passed
   between friend groups (each server owner becomes a recruiter), privacy and self-hosting communities
   (r/privacy, r/selfhosted), and a "Show HN"/Product Hunt launch when you're ready for a spike — the
-  capacity numbers above say one server can take it.
+  capacity numbers above say one server can take it. Dated steps that follow each place's rules, and texts to
+  start from, are in [GROWTH.md](GROWTH.md).
 * **Be careful with:** claims you can't back up. "End-to-end encrypted" is true for messages, files and calls;
   who-talks-to-whom (metadata) is visible to the server — say so. Don't promise that even a hostile host can't
   read chats: the apps load their code from the server, so people are trusting whoever runs it (see SECURITY.md

@@ -1,0 +1,38 @@
+manifestVersion: 2.0
+id: hearth
+storage:
+  dataRoot: data
+category: social
+name: Hearth
+version: "1.29.0"
+tagline: Self-hosted, end-to-end encrypted chat for friend groups
+description: >-
+  First run: the first account to sign up becomes this Hearth's owner, so create yours right after installing.
+  Your friends need their own way in: turn off "Require Umbrel login" for Hearth in its settings once your account
+  exists, and give them an https address through a domain or a tunnel (Cloudflare Tunnel, Tailscale Funnel).
+
+
+  Hearth is a chat app for friend groups and small communities: servers with text and voice channels, roles,
+  threads, direct messages and group chats, voice and video calls with screen sharing, and watching videos
+  together. Messages, files and calls are end-to-end encrypted in the app, so the server stores only encrypted data.
+  It still sees who talks to whom and when, and the app's code comes from the server, so people trust whoever runs
+  it.
+
+
+  Calls go directly between people (or through a relay), so group video works best with up to about 4 to 6 cameras.
+  Desktop apps for Windows, Mac and Linux, an Android app and an installable web app connect to your server. Free,
+  MIT licensed, no ads or paid tiers.
+releaseNotes: ""
+developer: Pandabear445
+website: https://arc32.me
+dependencies: []
+repo: https://github.com/Pandabear445/Hearth-chat
+support: https://github.com/Pandabear445/Hearth-chat/issues
+port: 3297
+gallery: []
+path: ""
+requiresHttps: true
+defaultUsername: ""
+defaultPassword: ""
+submitter: Pandabear445
+submission: https://github.com/getumbrel/umbrel-apps/pull/0000

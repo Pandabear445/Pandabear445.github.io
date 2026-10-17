@@ -12,9 +12,10 @@
 //   limit    page size, 1-200 (default 100)
 //
 // Access is worked out again on every request (servers you're in, channels you can view, DMs you're part
-// of), so a scope or cursor kept from earlier can't reach anything you've since lost. Work is bounded: one
-// page is at most 200 messages, scope=all and s: look at no more than MAX_SOURCES conversations per page
-// (those with the newest matching messages), and each person gets 60 requests a minute.
+// of), so a scope or cursor kept from earlier can't reach anything you've since lost; in a server you joined with
+// "New members can't read messages from before they joined" on, nothing from before you joined (server/joinhistory.js).
+// Work is bounded: one page is at most 200 messages, scope=all and s: look at no more than MAX_SOURCES conversations
+// per page (those with the newest matching messages), and each person gets 60 requests a minute.
 
 // Newest-first positions inside one conversation, strictly between lo and hi. Each is a range scan over a
 // covering index (see "v17 (search)" in db.js), so it never reads message rows or sorts. The index is named:
@@ -28,8 +29,10 @@ const SQL = {
   da: `SELECT created_at AS t, id FROM dm_messages INDEXED BY idx_dm_messages_author_time WHERE dm_id = ? AND author_id = ? ${RANGE}`,
 };
 
+const { alive } = require('./disappear');
+
 module.exports = function setupSearch(ctx) {
-  const { api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor } = ctx;
+  const { api, auth, db, fail, rateLimit, canIn, PM, requireServer, requireChannel, requireDm, serializeMessage, serializeDmMessage, reactionsFor, history } = ctx;
   const DEFAULT_LIMIT = 100;
   const MAX_LIMIT = 200;
   const MAX_SOURCES = 100;
@@ -59,15 +62,22 @@ module.exports = function setupSearch(ctx) {
     return Number(v);
   }
 
-  const positions = (src, from, hi, lo, n) => db.prepare(SQL[src.kind + (from ? 'a' : '')])
-    .all(src.id, ...(from ? [from] : []), hi[0], hi[1], lo[0], lo[1], n).map((r) => [r.t, r.id]);
+  // A channel in a server where the caller's history starts later (they joined with "New members can't read messages
+  // from before they joined" on, server/joinhistory.js) is only searched from then: src.since raises the floor.
+  const floorOf = (src, lo) => (src.since && cmp([src.since.at, ''], lo) > 0 ? [src.since.at, ''] : lo);
+  const positions = (src, from, hi, lo, n) => {
+    const low = floorOf(src, lo);
+    return db.prepare(SQL[src.kind + (from ? 'a' : '')]).all(src.id, ...(from ? [from] : []), hi[0], hi[1], low[0], low[1], n).map((r) => [r.t, r.id]);
+  };
 
   // The conversations a request may read. Single channels and DMs are checked up front (404 like the history
-  // endpoints); channels found through s: or all are checked one by one, only as far as they're needed.
+  // endpoints); channels found through s: or all are checked one by one, only as far as they're needed. Voice
+  // channels count too (v19): their chats are channel messages like any other (a voice channel without one has no
+  // messages, so it drops out at the first lookup).
   function sources(scope, uid, from) {
     if (scope === 'all') {
       const chans = db.prepare(`SELECT c.* FROM channels c JOIN members m ON m.server_id = c.server_id
-        WHERE m.user_id = ? AND c.type = 'text'`).all(uid).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
+        WHERE m.user_id = ? AND c.type IN ('text', 'voice')`).all(uid).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
       const dms = db.prepare('SELECT id, user_a, user_b FROM dm_channels WHERE user_a = ? OR user_b = ?').all(uid, uid)
         .filter((d) => !from || from === d.user_a || from === d.user_b).map((d) => ({ kind: 'd', id: d.id }));
       return [...chans, ...dms];
@@ -76,7 +86,7 @@ module.exports = function setupSearch(ctx) {
     if (kind === 'c') { const c = requireChannel(id, uid); return [{ kind: 'c', id: c.id, channel: c }]; }
     if (kind === 'd') { const d = requireDm(id, uid); return !from || from === d.user_a || from === d.user_b ? [{ kind: 'd', id: d.id }] : []; }
     const s = requireServer(id, uid);
-    return db.prepare("SELECT * FROM channels WHERE server_id = ? AND type = 'text'").all(s.id).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
+    return db.prepare("SELECT * FROM channels WHERE server_id = ? AND type IN ('text', 'voice')").all(s.id).map((c) => ({ kind: 'c', id: c.id, channel: c, check: true }));
   }
 
   api.get('/search/messages', auth, (req, res) => {
@@ -104,7 +114,13 @@ module.exports = function setupSearch(ctx) {
     const servers = new Map();
     const serverRow = (id) => { if (!servers.has(id)) servers.set(id, db.prepare('SELECT * FROM servers WHERE id = ?').get(id)); return servers.get(id); };
     const live = [];
+    const starts = new Map(); // server id -> the caller's history start there (null: all of it)
     for (const src of sources(scope, uid, from)) {
+      if (src.kind === 'c') {
+        const sid = src.channel.server_id;
+        if (!starts.has(sid)) starts.set(sid, history.startOf(sid, uid));
+        src.since = starts.get(sid);
+      }
       const top = positions(src, from, hi, lo, 1)[0];
       if (top) live.push({ ...src, top });
     }
@@ -142,7 +158,12 @@ module.exports = function setupSearch(ctx) {
     const messages = [];
     for (const { p, src } of page) {
       const row = rows.get(src.kind + p[1]);
-      if (row) messages.push(src.kind === 'c' ? serializeMessage(row, src.channel, reactions) : serializeDmMessage(row, reactions));
+      // A disappearing message whose time has passed isn't a result, even before the sweep deletes it; nor is one
+      // locked with a key from before the caller's (the few sent while theirs was on its way), nor a reply in a thread
+      // started before the caller joined (that thread is closed to them, server/joinhistory.js).
+      if (row && alive(row) && (src.kind !== 'c' || history.visible(row, src.since))) {
+        messages.push(src.kind === 'c' ? serializeMessage(row, src.channel, reactions, src.since) : serializeDmMessage(row, reactions));
+      }
     }
     res.json({ messages, nextCursor: more && page.length ? encodeCursor(page[page.length - 1].p) : null, conversations: chosen.length });
   });

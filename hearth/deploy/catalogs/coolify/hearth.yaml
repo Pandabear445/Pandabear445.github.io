@@ -1,0 +1,39 @@
+# documentation: https://github.com/Pandabear445/Hearth-chat/tree/main/hearth#readme
+# slogan: Self-hosted chat for friend groups: servers, voice, video and screen sharing, end-to-end encrypted in the app.
+# category: communication
+# tags: chat, communication, voice, video, discord, self-hosted, end-to-end encryption
+# logo: svgs/hearth.svg
+# port: 3000
+
+# Staging copy of the Coolify service template (templates/compose/hearth.yaml in coollabsio/coolify); see README.md
+# next to this folder. Give the service an https:// domain: Hearth's encryption and microphones only work on https
+# pages, and a generated http://...sslip.io address won't do. The first account to sign up becomes the owner, so
+# sign-up needs a random code Coolify makes at install (SERVICE_PASSWORD_REGISTRATION, under Environment Variables)
+# until you change it in Admin -> Registration & Terms.
+services:
+  hearth:
+    image: ghcr.io/pandabear445/hearth:1.29.0
+    user: "1000:1000"
+    environment:
+      - SERVICE_URL_HEARTH_3000
+      - DATA_DIR=/data
+      # Coolify's proxy serves the https and passes each visitor's address on; the port isn't published.
+      - HTTPS=false
+      - TRUST_PROXY=${TRUST_PROXY:-1}
+      - REGISTRATION_CODE=${SERVICE_PASSWORD_REGISTRATION}
+      - INSTANCE_NAME=${INSTANCE_NAME:-Hearth}
+    volumes:
+      # A new named volume starts out as the image's /data, which belongs to uid 1000.
+      - hearth-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # Health: the image's own check (/api/health/live).
+
+volumes:
+  hearth-data:

@@ -8,8 +8,12 @@
 //         image (extra pictures some phones append, like depth maps or "motion photo" data).
 //   PNG:  eXIf, tEXt, iTXt (XMP), zTXt and tIME chunks.
 //   WebP: EXIF and XMP chunks (and their flags in the VP8X header).
+//   GIF:  comment and plain-text blocks, application blocks other than looping (NETSCAPE2.0, ANIMEXTS1.0) and the
+//         colour profile (ICCRGBG1), so XMP and editors' own data too, and anything after the end of the file.
+//         Frames, their timing and transparency (graphic control blocks) are copied byte for byte.
 // The orientation is the one EXIF value that changes how a picture looks (a phone photo taken upright is
-// stored sideways), so it's written back on its own in a tiny EXIF block. GIFs have no EXIF and are left alone.
+// stored sideways), so it's written back on its own in a tiny EXIF block. GIFs have no EXIF.
+// Profile songs lose their tags the same way, in a worker of their own: see server/audiometa.js.
 //
 // A file that's cut off or damaged part way is cleaned as far as it can be read, and the rest is kept as it is
 // (browsers still show such files). Metadata comes first in a real photo, so a cut-off phone photo still loses
@@ -18,6 +22,7 @@
 //
 // Uploads are cleaned in a worker thread (stripFile), so even a big picture never holds up chat for anyone else.
 const fs = require('fs');
+const { AudioRejected, stripAudioFile } = require('./audiometa');
 
 const SOI = 0xd8;
 const EOI = 0xd9;
@@ -281,102 +286,175 @@ function stripWebp(buf) {
   return out.build();
 }
 
-// The picture without its metadata, or null when there was nothing to remove (or it isn't a JPEG, PNG or WebP).
+// ---------------------------------------------------------------- GIF
+// files-6: a GIF is a header, a logical screen descriptor with an optional global colour table, then blocks: images
+// (0x2C), extensions (0x21 + a label) and the trailer (0x3B). Images and extensions end in "sub-blocks" (a length
+// byte, that many bytes, until a zero length). Comments (label 0xFE) and plain text (0x01) can hold any text, and
+// application blocks (0xFF) are how editors store XMP and their own data; decoders skip all three. Only the
+// application blocks that change how the GIF plays or looks are kept.
+const GIF_KEEP_APPS = new Set(['NETSCAPE', 'ANIMEXTS', 'ICCRGBG1']);
+const gifTableSize = (packed) => (packed & 0x80 ? 3 * (1 << ((packed & 7) + 1)) : 0);
+function stripGif(buf) {
+  const n = buf.length;
+  if (n < 13 || buf.toString('latin1', 0, 3) !== 'GIF' || !/^8[79]a$/.test(buf.toString('latin1', 3, 6))) return null;
+  // Where the sub-blocks starting at k end (after the zero length), or -1 if the file is cut off before that.
+  const subBlocksEnd = (k) => {
+    while (k < n) {
+      const len = buf[k];
+      k += 1 + len;
+      if (len === 0) return k;
+    }
+    return -1;
+  };
+  const out = pieces(buf);
+  let i = 13 + gifTableSize(buf[10]);
+  if (i > n) return null; // cut off inside the colour table
+  out.keep(0, i);
+  let changed = false;
+  let blocks = 0;
+  while (i < n) {
+    if (++blocks > MAX_CHUNKS) throw tooComplex();
+    const b = buf[i];
+    if (b === 0x3b) { // the trailer: anything after it is dropped
+      out.keep(i, i + 1);
+      if (i + 1 < n) changed = true;
+      return changed ? out.build() : null;
+    }
+    let end = -1;
+    if (b === 0x2c && i + 10 <= n) { // a frame: descriptor, optional local colour table, LZW code size, image data
+      const data = i + 10 + gifTableSize(buf[i + 9]) + 1;
+      if (data <= n) end = subBlocksEnd(data);
+      if (end < 0) break; // cut off: keep the rest
+      out.keep(i, end);
+    } else if (b === 0x21 && i + 2 <= n) {
+      const label = buf[i + 1];
+      end = subBlocksEnd(i + 2);
+      if (end < 0) break;
+      // An application block's first sub-block is its 11-byte name: 8 letters and a 3-byte version.
+      const app = label === 0xff && buf[i + 2] === 11 && i + 11 <= n ? buf.toString('latin1', i + 3, i + 11) : null;
+      if (label === 0xfe || label === 0x01 || (label === 0xff && !GIF_KEEP_APPS.has(app))) changed = true;
+      else out.keep(i, end); // graphic control (timing, transparency), looping, colour profile, and labels we don't know
+    } else break; // not a block a GIF has (a damaged file): keep the rest as it is
+    i = end;
+  }
+  out.keep(i, n);
+  return changed ? out.build() : null;
+}
+
+// The picture without its metadata, or null when there was nothing to remove (or it isn't a JPEG, PNG, WebP or GIF).
 // Throws ImageRejected for a file that can't be cleaned: such a file isn't kept with its metadata by mistake.
 function stripImageMetadata(buf) {
   try {
-    return stripJpeg(buf) || stripPng(buf) || stripWebp(buf);
+    return stripJpeg(buf) || stripPng(buf) || stripWebp(buf) || stripGif(buf);
   } catch (e) {
     throw e instanceof ImageRejected ? e : new ImageRejected('This picture couldn\u2019t be read.');
   }
 }
 
-// ---------------------------------------------------------------- the worker thread
-// Uploads are cleaned in a worker (like the news bot's feed reader): it reads the file, writes the cleaned copy
-// under a temporary name and renames it over the original, so a failure never leaves half a file. It handles
-// pictures in order; if it goes quiet for STRIP_LIMIT_MS (or stops), the picture it was working on is refused and
-// the others are handed to a new worker.
+// ---------------------------------------------------------------- the worker threads
+// Uploads are cleaned in worker threads (like the news bot's feed reader): one for pictures and one for profile
+// songs, so a big song (they can be many times the size of a picture) never keeps someone's avatar or emoji
+// waiting. A worker reads the file, writes the cleaned copy under a temporary name and renames it over the original,
+// so a failure never leaves half a file. Each worker handles its files in order; if it goes quiet for
+// STRIP_LIMIT_MS (or stops), the file it was working on is refused and the others are handed to a new worker.
 const STRIP_LIMIT_MS = +process.env.IMAGE_STRIP_LIMIT_MS || 15000;
-let worker = null;
+// The file was refused because checking it ran out of time: that says nothing about the file itself (the server
+// may just be busy), so the upload gets its own message instead of "save it again as a normal file".
+class StripTimedOut extends ImageRejected {}
 let jobSeq = 0;
-let watchdog = null;
-const jobs = new Map(); // id -> { file, resolve, reject }, oldest first
-function startWorker() {
-  const { Worker } = require('worker_threads');
-  // The image data itself is outside this limit; the cleaning code needs very little memory of its own.
-  const w = new Worker(__filename, { workerData: { imageStripper: true }, resourceLimits: { maxOldGenerationSizeMb: 64 } });
-  w.on('message', ({ id, size, err, rejected }) => {
-    const job = jobs.get(id);
-    if (job) {
-      jobs.delete(id);
-      if (err) job.reject(rejected ? new ImageRejected(err) : new Error(err)); else job.resolve(size);
-    }
-    arm(); // it's making progress
-  });
-  w.on('error', () => replaceWorker(w));
-  w.on('exit', () => replaceWorker(w));
-  return w;
-}
-function replaceWorker(w) {
-  if (!w || worker !== w) return;
-  worker = null;
-  w.terminate().catch(() => {});
-  const first = jobs.keys().next();
-  if (!first.done) {
-    const job = jobs.get(first.value);
-    jobs.delete(first.value);
-    fs.promises.unlink(job.file + '.tmp').catch(() => {});
-    job.reject(new ImageRejected('This picture couldn\u2019t be checked.'));
+function lane() {
+  let worker = null;
+  let watchdog = null;
+  const jobs = new Map(); // id -> { file, audio, resolve, reject }, oldest first
+  function startWorker() {
+    const { Worker } = require('worker_threads');
+    // The file data itself is outside this limit; the cleaning code needs very little memory of its own.
+    const w = new Worker(__filename, { workerData: { imageStripper: true }, resourceLimits: { maxOldGenerationSizeMb: 64 } });
+    w.on('message', ({ id, size, err, rejected }) => {
+      const job = jobs.get(id);
+      if (job) {
+        jobs.delete(id);
+        if (err) job.reject(rejected ? new ImageRejected(err) : new Error(err)); else job.resolve(size);
+      }
+      arm(); // it's making progress
+    });
+    w.on('error', () => replaceWorker(w, false));
+    w.on('exit', () => replaceWorker(w, false));
+    return w;
   }
-  if (jobs.size) {
-    try {
-      worker = startWorker();
-      for (const [id, job] of jobs) worker.postMessage({ id, file: job.file });
-    } catch (e) {
-      worker = null;
-      for (const job of jobs.values()) job.reject(e);
-      jobs.clear();
+  function replaceWorker(w, timedOut) {
+    if (!w || worker !== w) return;
+    worker = null;
+    w.terminate().catch(() => {});
+    const first = jobs.keys().next();
+    if (!first.done) {
+      const job = jobs.get(first.value);
+      jobs.delete(first.value);
+      fs.promises.unlink(job.file + '.tmp').catch(() => {});
+      job.reject(timedOut ? new StripTimedOut('Checking this file took too long.') : new ImageRejected(job.audio ? 'This song couldn\u2019t be checked.' : 'This picture couldn\u2019t be checked.'));
     }
+    if (jobs.size) {
+      try {
+        worker = startWorker();
+        for (const [id, job] of jobs) worker.postMessage({ id, file: job.file, audio: job.audio });
+      } catch (e) {
+        worker = null;
+        for (const job of jobs.values()) job.reject(e);
+        jobs.clear();
+      }
+    }
+    arm();
   }
-  arm();
-}
-// Restarts the watchdog, and lets the worker keep the process running only while it has pictures to finish.
-function arm() {
-  clearTimeout(watchdog);
-  watchdog = null;
-  if (worker) { if (jobs.size) worker.ref(); else worker.unref(); }
-  if (!jobs.size) return;
-  watchdog = setTimeout(() => replaceWorker(worker), STRIP_LIMIT_MS);
-  watchdog.unref();
-}
-// Cleans the picture at this path in place. Resolves to its new size, or null if nothing had to be removed.
-function stripFile(file) {
-  return new Promise((resolve, reject) => {
+  // Restarts the watchdog, and lets the worker keep the process running only while it has files to finish.
+  function arm() {
+    clearTimeout(watchdog);
+    watchdog = null;
+    if (worker) { if (jobs.size) worker.ref(); else worker.unref(); }
+    if (!jobs.size) return;
+    watchdog = setTimeout(() => replaceWorker(worker, true), STRIP_LIMIT_MS);
+    watchdog.unref();
+  }
+  return (file, audio) => new Promise((resolve, reject) => {
     const id = ++jobSeq;
     try { if (!worker) worker = startWorker(); } catch (e) { return reject(e); }
-    jobs.set(id, { file, resolve, reject });
-    worker.postMessage({ id, file });
+    jobs.set(id, { file, audio, resolve, reject });
+    worker.postMessage({ id, file, audio });
     if (!watchdog) arm(); else worker.ref();
   });
+}
+const lanes = { pictures: lane(), songs: lane() };
+// Cleans the picture (or, with audio: true, the profile song) at this path in place. Resolves to its new size, or
+// null if nothing had to be removed. Rejects with ImageRejected for a file that can't be cleaned (StripTimedOut when
+// it took too long).
+function stripFile(file, { audio = false } = {}) {
+  return (audio ? lanes.songs : lanes.pictures)(file, !!audio);
 }
 {
   const { isMainThread, parentPort, workerData } = require('worker_threads');
   if (!isMainThread && workerData && workerData.imageStripper) {
-    parentPort.on('message', ({ id, file }) => {
+    parentPort.on('message', ({ id, file, audio }) => {
       const tmp = file + '.tmp';
       try {
-        const clean = stripImageMetadata(fs.readFileSync(file));
-        if (clean) {
-          fs.writeFileSync(tmp, clean);
-          fs.renameSync(tmp, file);
+        let size = null;
+        if (audio) {
+          // Songs are copied piece by piece (they can be much bigger than pictures), never read whole.
+          size = stripAudioFile(file, tmp);
+          if (size != null) fs.renameSync(tmp, file);
+        } else {
+          const clean = stripImageMetadata(fs.readFileSync(file));
+          if (clean) {
+            fs.writeFileSync(tmp, clean);
+            fs.renameSync(tmp, file);
+            size = clean.length;
+          }
         }
-        parentPort.postMessage({ id, size: clean ? clean.length : null });
+        parentPort.postMessage({ id, size });
       } catch (e) {
         try { fs.unlinkSync(tmp); } catch { /* not written */ }
-        parentPort.postMessage({ id, err: String(e.message || e), rejected: e instanceof ImageRejected });
+        parentPort.postMessage({ id, err: String(e.message || e), rejected: e instanceof ImageRejected || e instanceof AudioRejected });
       }
     });
   }
 }
 
-module.exports = { stripImageMetadata, stripFile, ImageRejected, tiffOrientation, crc32 };
+module.exports = { stripImageMetadata, stripFile, ImageRejected, StripTimedOut, tiffOrientation, crc32 };

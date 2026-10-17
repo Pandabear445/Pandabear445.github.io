@@ -42,7 +42,17 @@ async function main() {
     server, browser, people: {}, state: {},
     // Fresh passwords every run (none are kept in the repository).
     pw: { alice: newPassword(), bob: newPassword(), carl: newPassword(), relay: newPassword() },
-    async open(name) { const p = await Person.open(browser, server.base, name); t.people[name] = p; return p; },
+    // Everyone ever opened, also once closed or opened again under the same name (t.people keeps the latest): the
+    // checks after the flows, the failure report and the kept logs cover each of them.
+    opened: [],
+    async open(name) {
+      const p = await Person.open(browser, server.base, name);
+      const again = t.opened.filter((q) => q.name === name).length;
+      p.tag = again ? `${name}-${again + 1}` : name;
+      t.opened.push(p);
+      t.people[name] = p;
+      return p;
+    },
   };
   console.log(`Hearth e2e: server ${server.base} (data ${server.dir})`);
   let failure = null;
@@ -64,10 +74,9 @@ async function main() {
   // After the flows: nothing in any page threw an uncaught error, and the server never answered with a 5xx.
   if (!failure) {
     try {
-      const people = Object.values(t.people);
-      const thrown = people.flatMap((p) => p.pageErrors.map((m) => `${p.name}: ${m}`));
+      const thrown = t.opened.flatMap((p) => p.pageErrors.map((m) => `${p.tag}: ${m}`));
       check(!thrown.length, `Uncaught errors in the app:\n  ${thrown.join('\n  ')}`);
-      const broken = people.flatMap((p) => p.serverErrors.map((m) => `${p.name}: ${m}`));
+      const broken = t.opened.flatMap((p) => p.serverErrors.map((m) => `${p.tag}: ${m}`));
       check(!broken.length, `Server errors (5xx):\n  ${broken.join('\n  ')}`);
       console.log('  ok   no uncaught page errors, no server errors');
     } catch (e) { failure = { name: 'page and server errors', error: e }; }
@@ -77,7 +86,7 @@ async function main() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-e2e-failure-'));
     const err = failure.error;
     fs.writeFileSync(path.join(dir, 'error.txt'), `${failure.name}\n\n${err && err.stack ? err.stack : err}\n`);
-    for (const p of Object.values(t.people)) await p.capture(dir).catch(() => {});
+    for (const p of t.opened) await p.capture(dir).catch(() => {});
     fs.writeFileSync(path.join(dir, 'server.log'), server.log);
     console.log(`\n${failure.name}:\n${String(err && err.message ? err.message : err).split('\n').map((l) => `  ${l}`).join('\n')}`);
     console.log(`\nFailure report (screenshots, pages, console logs, server log): ${dir}`);
@@ -86,7 +95,7 @@ async function main() {
   await server.stop({ keep });
   if (keep) {
     fs.writeFileSync(path.join(server.dir, 'server.log'), server.log);
-    for (const p of Object.values(t.people)) fs.writeFileSync(path.join(server.dir, `${p.name.replace(/\W+/g, '_')}.console.log`), p.log.join('\n') + '\n');
+    for (const p of t.opened) fs.writeFileSync(path.join(server.dir, `${p.tag.replace(/\W+/g, '_')}.console.log`), p.log.join('\n') + '\n');
     console.log(`Data and logs kept in ${server.dir}`);
   }
   console.log(`\n${passed}/${flows.length} flows passed in ${secs(Date.now() - started)}${failure ? '' : ', all good'}.`);

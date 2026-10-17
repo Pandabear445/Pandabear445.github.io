@@ -68,8 +68,7 @@ try {
 
   for (const size of SIZES) {
     const page = await H.newPage(size);
-    // Web fonts come from Google; blocking them keeps screenshots the same online and offline.
-    await page.route(/fonts\.(googleapis|gstatic)\.com/, (r) => r.abort());
+    // The app's fonts come from Hearth itself (public/fonts), so screenshots are the same online and offline.
     await page.addInitScript((css) => document.addEventListener('DOMContentLoaded', () => {
       const s = document.createElement('style'); s.textContent = css; document.head.append(s);
     }), STEADY_CSS);

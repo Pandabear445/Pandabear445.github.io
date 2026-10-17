@@ -20,22 +20,39 @@ const PERMS = {
   MANAGE_EMOJIS: 1 << 14,
   CREATE_THREADS: 1 << 15,
   EMBED_LINKS: 1 << 16,
+  // Voice moderation: server-mute people for everyone, and disconnect them or move them to another voice channel.
+  MUTE_MEMBERS: 1 << 17,
+  MOVE_MEMBERS: 1 << 18,
+  // v19 (server audit): read the server's audit log (server/serveraudit.js). Owners and Administrators always can.
+  VIEW_AUDIT_LOG: 1 << 19,
+  // v19 (nicknames): set your own nickname in a server, and change or reset the nicknames of people below you
+  // (server/nicknames.js). Everyone has the first by default; the second is a moderator power.
+  CHANGE_NICKNAME: 1 << 20,
+  MANAGE_NICKNAMES: 1 << 21,
   ADMINISTRATOR: 1 << 30,
 };
 const ALL = Object.values(PERMS).reduce((a, b) => a | b, 0);
 const P = PERMS;
 const DEFAULT_EVERYONE = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
-  | P.CONNECT | P.SPEAK | P.CREATE_INVITE | P.CREATE_THREADS;
+  | P.CONNECT | P.SPEAK | P.CREATE_INVITE | P.CREATE_THREADS | P.CHANGE_NICKNAME;
 // Permissions that only make sense per channel (used to validate overrides). Create Invite isn't one: invites
-// are for the whole server, so a per-channel toggle would look like it does something when it doesn't.
+// are for the whole server, so a per-channel toggle would look like it does something when it doesn't. Nor is
+// Mute Members: a server mute holds in every voice channel. Move Members is: it's checked in the voice channel the
+// person is in (and, for a move, the one they go to).
 const CHANNEL_SCOPED = P.VIEW_CHANNEL | P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.EMBED_LINKS
-  | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES;
+  | P.MENTION_EVERYONE | P.MANAGE_MESSAGES | P.CONNECT | P.SPEAK | P.CREATE_THREADS | P.MANAGE_CHANNELS | P.MANAGE_ROLES
+  | P.MOVE_MEMBERS;
 // What everyone in a group chat can do. Only its owner manages it (adds channels, deletes other people's
-// messages…); renaming it and changing its picture are allowed to everyone by those routes themselves.
-const GROUP_MEMBER = DEFAULT_EVERYONE | P.MENTION_EVERYONE;
+// messages…); renaming it and changing its picture are allowed to everyone by those routes themselves. Group chats
+// have no nicknames.
+const GROUP_MEMBER = (DEFAULT_EVERYONE | P.MENTION_EVERYONE) & ~P.CHANGE_NICKNAME;
 // What a member who is timed out can't do until it ends: anything that posts or speaks. Reading, joining a call
-// to listen and leaving still work. Owners and Administrators can't be timed out (the route refuses them).
-const TALK = P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.MENTION_EVERYONE | P.CREATE_THREADS | P.SPEAK | P.EMBED_LINKS | P.CREATE_INVITE;
+// to listen and leaving still work. Owners and Administrators can't be timed out (the route refuses them). The
+// moderator toolkit's routes (voice moderation, bulk delete, a ban's message cleanup) also wait for it to end.
+// A nickname is something everyone in the server sees, so changing your own waits too (and nicknames.js makes
+// Manage Nicknames wait as well).
+const TALK = P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.MENTION_EVERYONE | P.CREATE_THREADS | P.SPEAK | P.EMBED_LINKS | P.CREATE_INVITE
+  | P.CHANGE_NICKNAME;
 
 function makePerms(db) {
   // Only roles held by a current member count: a role row left behind by someone who left can never come back
@@ -136,6 +153,14 @@ function makePerms(db) {
     if (server.owner_id === userId) return Infinity;
     return Math.max(0, ...rolesOf(server.id, userId).map((r) => r.position));
   }
+  // The same, leaving out roles members can pick themselves (roles.self_assign): for role-order checks that
+  // pickable roles aren't kept below (server/selfroles.js keeps them below the powers in its REACH list), so a role
+  // anyone can give themselves never puts anyone above anyone there. Changing a webhook someone else made
+  // (server/webhooks.js) is one; a moderator whose power comes from a member override is another (selfroles.js).
+  function topAssigned(server, userId) {
+    if (server.owner_id === userId) return Infinity;
+    return Math.max(0, ...rolesOf(server.id, userId).filter((r) => !r.self_assign).map((r) => r.position));
+  }
 
   // Is any member possibly blocked from seeing this channel? (Then events go to individuals, not the room.)
   function restricted(server, ch) {
@@ -144,7 +169,7 @@ function makePerms(db) {
     return !!db.prepare('SELECT 1 FROM channel_overrides WHERE channel_id = ? AND (deny & ?) != 0').get(ch.id, P.VIEW_CHANNEL);
   }
 
-  return { base, channel, forServer, top, restricted, rolesOf, timedOut };
+  return { base, channel, forServer, top, topAssigned, restricted, rolesOf, timedOut };
 }
 
 module.exports = { PERMS, ALL, DEFAULT_EVERYONE, CHANNEL_SCOPED, GROUP_MEMBER, TALK, makePerms };

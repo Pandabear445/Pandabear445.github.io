@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Hearth updater — installs an update zip on this server, safely.
 #
-#   hearth-update path/to/update.zip         install an update (checked against update.zip.sha256 next to it)
+#   hearth-update path/to/update.zip         install an update (checked against update.zip.sha256 next to it, and
+#                                            update.zip.sig once this server has an update signing key)
+#   hearth-update --verify path/to/update.zip    only check an update (checksum, signature, version); changes nothing
 #   hearth-update --rollback [backup]        go back to the version before the last update (or a chosen backup)
 #   hearth-update --status                   where Hearth is, how it runs, its version, health, backups, disk space
 #   hearth-update --logs                     Hearth's last 80 log lines (handy when reporting a problem)
 #   hearth-update --list                     the saved backups
 #   add --yes to skip the "are you sure?" question (for scripts)
+#   add --allow-unsigned to install an update without a valid signature anyway (only one you checked yourself)
+#   add --allow-downgrade to install a signed update that is older than the installed version
 #
 # What it does:
+#   0. Checks the update is the published one: its checksum, and its signature by the key this server pinned.
 #   1. Finds your Hearth folder and how it runs (Docker, systemd, pm2 or plain node).
 #   2. Saves a copy of the current program files and database.
 #   3. Copies in the new files — never touching data/, .env, docker-compose.yml or deploy/Caddyfile.
@@ -22,30 +27,39 @@ BACKUP_ROOT="${HEARTH_BACKUP_ROOT:-/root/hearth-backups}"
 CONF="${HEARTH_UPDATE_CONF:-/etc/hearth-update.conf}"
 BIN="${HEARTH_UPDATE_BIN:-/usr/local/bin/hearth-update}"
 LOCK="${HEARTH_UPDATE_LOCK:-/run/lock/hearth-update.lock}"
+# The update signing key this server trusts: root's, outside the Hearth folder (see "is it the published update?").
+PIN="${HEARTH_UPDATE_PUBKEY:-/etc/hearth-update.pub}"
 KEEP=5
 
 c_y=$'\033[1;33m'; c_g=$'\033[1;32m'; c_r=$'\033[1;31m'; c_b=$'\033[1m'; c_0=$'\033[0m'
 step() { printf '%s▸%s %s\n' "$c_y" "$c_0" "$*"; }
 ok()   { printf '%s✓%s %s\n' "$c_g" "$c_0" "$*"; }
 warn() { printf '%s!%s %s\n' "$c_y" "$c_0" "$*"; }
+loud() { printf '%s!! %s%s\n' "$c_r" "$*" "$c_0"; }
 die()  { printf '%s✗ %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "Run this as root (or with sudo)."
 
-# Parse arguments: one action plus an optional --yes.
-ACTION=update; ARG=""; YES=0
+# Parse arguments: one action plus optional --yes, --allow-unsigned and --allow-downgrade.
+ACTION=update; ARG=""; YES=0; ALLOW_UNSIGNED=0; ALLOW_DOWNGRADE=0
 for a in "$@"; do
   case "$a" in
+    --verify) ACTION=verify ;;
+    --allow-unsigned) ALLOW_UNSIGNED=1 ;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1 ;;
     --rollback) ACTION=rollback ;;
     --status|--doctor) ACTION=status ;;
     --logs) ACTION=logs ;;
     --list) ACTION=list ;;
     --yes|-y) YES=1 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) die "Unknown option: $a (try --help)" ;;
     *) ARG="$a" ;;
   esac
 done
+# A zip named from where you are stays that zip (and its .sha256 and .sig stay the ones next to it): everything
+# below runs from the Hearth folder.
+if [ -n "$ARG" ] && { [ "$ACTION" = update ] || [ "$ACTION" = verify ]; } && [[ "$ARG" != /* ]]; then ARG="$PWD/$ARG"; fi
 
 mkdir -p "$BACKUP_ROOT"
 LOG="$BACKUP_ROOT/last-update.log"
@@ -70,7 +84,11 @@ WORK=""
 on_exit() {
   local code=$?
   [ -n "$WORK" ] && rm -rf "$WORK"
-  [ "$code" -ne 0 ] && printf '%s✗ Stopped (exit code %s). Full log: %s%s\n' "$c_r" "$code" "$LOG" "$c_0"
+  # (Only updates and rollbacks write the log; pointing to it otherwise would show an older run's.)
+  if [ "$code" -ne 0 ]; then
+    if [ "$ACTION" = update ] || [ "$ACTION" = rollback ]; then printf '%s✗ Stopped (exit code %s). Full log: %s%s\n' "$c_r" "$code" "$LOG" "$c_0"
+    else printf '%s✗ Stopped (exit code %s).%s\n' "$c_r" "$code" "$c_0"; fi
+  fi
   return 0
 }
 trap on_exit EXIT
@@ -82,9 +100,18 @@ need() {
 }
 need unzip; need rsync; need curl
 
+# Puts $1 in place as the installed updater: a new file renamed over the old one, never written into it, because a
+# running hearth-update (often this very one) keeps reading its script as it goes and would run pieces of the new
+# file. Always 755, whatever the umask: a program any account may read (copies of the old update tools, no longer
+# part of Hearth, read it as the login user before using sudo).
+install_updater() {
+  local t; t="$(mktemp "$BIN.XXXXXX" 2>/dev/null)" || return 1
+  if cp -- "$1" "$t" && chmod 755 "$t" && mv -fT "$t" "$BIN"; then return 0; fi
+  rm -f "$t"; return 1
+}
 # Keep a copy of this script at /usr/local/bin/hearth-update so "hearth-update --rollback" always works.
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-if [ "$SELF" != "$BIN" ] && [ -f "$SELF" ]; then cp "$SELF" "$BIN" && chmod +x "$BIN"; fi
+if [ "$SELF" != "$BIN" ] && [ -f "$SELF" ]; then install_updater "$SELF" || warn "Couldn't save a copy of the updater as $BIN."; fi
 
 # ---------------------------------------------------------------- find the install
 find_install() {
@@ -242,6 +269,181 @@ RSYNC_EXCLUDES=(--exclude /data --exclude '/data-backup*' --exclude /.env --excl
 version() { { grep -m1 '"version"' "${1:-.}/package.json" 2>/dev/null || echo '"version": "unknown"'; } | sed -E 's/.*"version": *"([^"]+)".*/\1/'; }
 backups() { ls -1dt "$BACKUP_ROOT"/*/ 2>/dev/null | sed 's:/$::' || true; }
 free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2 { print $4 }' || echo 0; }
+zip_version() { local pj; pj="$(unzip -p "$1" hearth/package.json 2>/dev/null)" || pj=""; grep -m1 '"version"' <<< "$pj" | sed -E 's/.*"version": *"([^"]+)".*/\1/' || true; }
+
+# ---------------------------------------------------------------- is it the published update?
+# Signed updates (docs/SIGNING.md, "Signing server updates"). This server trusts one Ed25519 key, pinned in $PIN:
+# root's file, outside the Hearth folder, so neither Hearth nor an npm install script can swap it. It comes from
+# the installed Hearth's update-signing.pub the first time (only when that file is root's alone), and afterwards
+# only from an update that passed the check against the key before it: changing the key takes an update signed by
+# the old one (or --allow-unsigned). Nothing is pinned on a server that can't check signatures: it stays on
+# checksums, as before signing. Everything here reads a private copy of the zip, before anything in it is unpacked
+# or run. (sudo hearth-update <zip> runs this check with the updater already on the server, never the zip's own.)
+SIG_CONTEXT=hearth-server-update-v1 # what's signed: "<this>\n<the zip's SHA-256 in hex>\n" (scripts/update-key.js)
+UNVERIFIED=0 # 1 once --allow-unsigned let a zip through that didn't pass
+CANT_VERIFY="this server can't check Ed25519 signatures (that takes OpenSSL 3.0 or newer, as on Debian 12 and Ubuntu 22.04, or Node.js)"
+key_in() { # stdin: an update-signing.pub ('#' comment lines, then one line of base64) -> the key, or fail
+  local k; k="$(grep -v '^[[:space:]]*#' | tr -d ' \t\r\n')" || true
+  [[ "$k" =~ ^MCowBQYDK2VwAyEA[A-Za-z0-9+/]{43}=$ ]] || return 1
+  echo "$k"
+}
+# Checks an Ed25519 signature with $1: openssl (pkeyutl -rawin, OpenSSL 3.0 and newer) or node (OpenSSL 1.1.1, as
+# on Ubuntu 20.04 and Debian 11, can't check them at all; Hearth needs Node outside Docker anyway).
+NODE_VERIFY='const c=require("node:crypto"),f=require("node:fs"),[k,m,s]=process.argv.slice(1);process.exit(c.verify(null,f.readFileSync(m),c.createPublicKey({key:Buffer.from(k,"base64"),format:"der",type:"spki"}),f.readFileSync(s))?0:1)'
+ed25519_with() { # $1 = openssl or node, $2 = public key (base64), $3 = message file, $4 = signature file
+  local v rc=1
+  case "$1" in
+    openssl)
+      v="$(mktemp -d)" || return 1 # (these run inside conditions, where a failure wouldn't stop the script)
+      printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$2" > "$v/key.pem"
+      openssl pkeyutl -verify -pubin -inkey "$v/key.pem" -rawin -in "$3" -sigfile "$4" >/dev/null 2>&1 && rc=0
+      rm -rf "$v" ;;
+    node) (cd / && NODE_OPTIONS='' node -e "$NODE_VERIFY" "$2" "$3" "$4") >/dev/null 2>&1 && rc=0 ;; # (nothing from the Hearth folder)
+  esac
+  return "$rc"
+}
+# Which of the two checks signatures here, found once by RFC 8032's test 2: its signature has to pass, and the same
+# signature over another message has to fail (so a tool that always says yes never counts). Fails when neither does.
+VERIFIER=""
+can_verify() {
+  if [ -z "$VERIFIER" ]; then
+    VERIFIER=none
+    local v t; v="$(mktemp -d)" || return 1
+    printf r > "$v/good"; printf s > "$v/bad"
+    base64 -d <<< 'kqAJqfDUyrhyDoILX2QlQKKye1QWUD+Ps3YiI+vbadoIWsHkPhWZbkWPNhPQ8R2MOHsurrQwKu6wDSkWErsMAA==' > "$v/sig"
+    for t in openssl node; do
+      command -v "$t" >/dev/null 2>&1 || continue
+      if ed25519_with "$t" 'MCowBQYDK2VwAyEAPUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=' "$v/good" "$v/sig" \
+         && ! ed25519_with "$t" 'MCowBQYDK2VwAyEAPUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=' "$v/bad" "$v/sig"; then VERIFIER="$t"; break; fi
+    done
+    rm -rf "$v"
+  fi
+  [ "$VERIFIER" != none ]
+}
+sig_ok() { # $1 = the zip's SHA-256, $2 = signature (base64), $3 = public key: is it this key's signature?
+  local v rc=1; v="$(mktemp -d)" || return 1
+  printf '%s\n%s\n' "$SIG_CONTEXT" "$1" > "$v/msg"
+  base64 -d <<< "$2" > "$v/sig" 2>/dev/null && ed25519_with "$VERIFIER" "$3" "$v/msg" "$v/sig" && rc=0
+  rm -rf "$v"; return "$rc"
+}
+# Is file $1 root's alone: root's, not a link, not writable by anyone else, and in folders only root can change all
+# the way up? (A folder everyone may write to is fine when it's sticky, like /tmp: others can't rename root's files
+# in it.) The installed Hearth's update-signing.pub is only trusted like that: a Hearth folder that belongs to
+# Hearth's own account (plain installs) would let that account choose the key root pins.
+root_only() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  local d u m; d="$(readlink -f "$(dirname "$1")")" && [ -n "$d" ] || return 1
+  read -r u m <<< "$(stat -c '%u %a' "$d/$(basename "$1")" 2>/dev/null)" || true
+  [ "${u:-}" = 0 ] && (( (8#${m:-777} & 8#022) == 0 )) || return 1
+  while :; do
+    read -r u m <<< "$(stat -c '%u %a' "$d" 2>/dev/null)" || true
+    [ "${u:-}" = 0 ] && { (( (8#${m:-777} & 8#022) == 0 )) || (( 8#${m:-0} & 8#1000 )); } || return 1
+    [ "$d" = / ] && return 0
+    d="$(dirname "$d")"
+  done
+}
+write_pin() { # $1 = key, $2 = where it came from. Replaces $PIN in one step, never writing through a link.
+  local t; t="$(mktemp "$PIN.XXXXXX" 2>/dev/null)" || return 1
+  if printf '# Hearth server update signing key, pinned by hearth-update on %s (%s).\n# This server only installs updates signed with it (docs/SIGNING.md). Delete this file to stop checking.\n%s\n' \
+       "$(date +%F)" "$2" "$1" > "$t" && chmod 644 "$t" && mv -fT "$t" "$PIN"; then return 0; fi
+  rm -f "$t"; return 1
+}
+# Is version $1 older than $2? (1.9.3 < 1.10.0, 1.2.0-beta.1 < 1.2.0; anything that isn't a version: no.)
+ver_older() {
+  local a="${1%%+*}" b="${2%%+*}" re='^[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?$'
+  [[ "$a" =~ $re ]] && [[ "$b" =~ $re ]] && [ "$a" != "$b" ] || return 1
+  local ac="${a%%-*}" bc="${b%%-*}"
+  if [ "$ac" = "$bc" ]; then
+    [ "$a" = "$ac" ] && return 1 # $1 is the release itself
+    [ "$b" = "$bc" ] && return 0 # $1 is a pre-release of $2
+    ac="$a"; bc="$b"
+  fi
+  [ "$(printf '%s\n%s\n' "$ac" "$bc" | sort -V | head -1)" = "$ac" ]
+}
+check_update() { # $1 = the zip as given (its .sha256 and .sig are next to it), $2 = the private copy
+  local name key="" from="" bad="" sig=""; name="$(basename "$1")"
+  # Compare the update with its SHA-256 when there's one to compare with: update.zip.sha256 next to it (made with
+  # each release by scripts/make-update-zip.sh and uploaded with the zip). A mismatch stops here, before anything
+  # is unpacked or run.
+  SUM="$(sha256sum "$2" | cut -d' ' -f1)"
+  if [ -f "$1.sha256" ]; then
+    WANT="$(tr -d '\r' < "$1.sha256" | awk 'NR == 1 { print tolower($1) }')"
+    [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || die "$1.sha256 doesn't contain a SHA-256 checksum."
+    [ "$WANT" = "$SUM" ] || die "$1 doesn't match its checksum ($1.sha256): it's damaged or not the published update. Nothing was changed."
+    ok "Checksum matches ($SUM)."
+  else
+    warn "No $name.sha256 next to the update, so it can't be checked. Its SHA-256 is $SUM: compare it with the one published for this release."
+  fi
+  # The key this server trusts.
+  if [ -e "$PIN" ]; then
+    from="pinned in $PIN"
+    key="$(key_in < "$PIN" 2>/dev/null)" || { key=""; bad="can't be checked: $PIN isn't an update signing key (fix it, or delete it to stop checking)"; }
+  elif [ -f "$DIR/update-signing.pub" ]; then
+    from="it came with the installed Hearth"
+    if ! root_only "$DIR/update-signing.pub"; then
+      warn "The installed Hearth's update-signing.pub (or a folder it's in) can be changed by an account other than root, so it isn't trusted: the first update that brings a key pins that one."
+    elif ! key="$(key_in < "$DIR/update-signing.pub")"; then
+      key=""; bad="can't be checked: the installed Hearth's update-signing.pub isn't an update signing key"
+    elif ! can_verify; then
+      key=""; warn "The installed Hearth has an update signing key, but $CANT_VERIFY, so it isn't pinned: updates are only checked against their checksum."
+    elif [ "$ACTION" = update ]; then
+      if write_pin "$key" "$from"; then ok "Pinned the update signing key that came with this Hearth ($key): this server now only installs updates signed with it."
+      else warn "Couldn't save the update signing key to $PIN, so it's only used for this update."; fi
+    fi
+  fi
+  if [ -f "$1.sig" ]; then sig="$(tr -d '\r' < "$1.sig" | awk 'NF { print $1; exit }')"; fi
+  if [ -n "$key" ]; then
+    # (A pinned key on a server that can't check it: refused, never quietly back to checksums.)
+    if [ -z "$sig" ]; then bad="isn't signed (no $name.sig next to it)"
+    elif [[ ! "$sig" =~ ^[A-Za-z0-9+/]{86}==$ ]]; then bad="comes with a $name.sig that isn't a signature"
+    elif ! can_verify; then bad="can't be checked: $CANT_VERIFY. Install one of them (or delete $PIN to go back to checksums only)"
+    elif sig_ok "$SUM" "$sig" "$key"; then ok "Signed with this server's update key ($key)."
+    else bad="has a signature that doesn't match this server's update key: it isn't the published update, or another key signed it"
+    fi
+  elif [ -z "$bad" ]; then
+    if [ -n "$sig" ]; then warn "$name is signed, but this server has no update signing key pinned yet, so only its checksum was checked."
+    else warn "$name isn't signed (no $name.sig next to it). This server has no update signing key pinned yet, so only its checksum was checked."; fi
+  fi
+  if [ -n "$bad" ]; then
+    if [ "$ALLOW_UNSIGNED" != 1 ]; then
+      warn "This server only installs updates signed with its update key${key:+ ($key, $from)}."
+      warn "If you're sure this update is genuine (compare its SHA-256, $SUM, with the one its publisher posted), run again with --allow-unsigned."
+      die "$name $bad. Nothing was changed."
+    fi
+    UNVERIFIED=1
+    loud "$name $bad."
+    loud "Going ahead anyway because of --allow-unsigned. Only do this with an update you checked yourself: its SHA-256 is"
+    loud "$SUM. Compare it with the one its publisher posted somewhere other than the download."
+  fi
+  unzip -Z1 "$2" 'hearth/server/index.js' >/dev/null 2>&1 || die "$name doesn't look like a Hearth update."
+  # A server that checks signatures never goes back to an older version by itself: an old, signed update could
+  # bring back problems fixed since. (The zip's contents are only read once its signature checked out.)
+  if [ -n "$key$bad" ]; then
+    local new; new="$(zip_version "$2")"
+    if ver_older "$new" "$(version)"; then
+      if [ "$ALLOW_DOWNGRADE" = 1 ]; then warn "Installing $new over the newer $(version), because of --allow-downgrade."
+      else
+        warn "To undo an update, use hearth-update --rollback (it puts back your own backup). To install this older one anyway,"
+        warn "  put it and its .sig on the server and run there: sudo hearth-update --allow-downgrade /path/to/the.zip."
+        die "$name is Hearth $new, older than the installed $(version). Nothing was changed."
+      fi
+    fi
+  fi
+}
+# After a good update: the key it brought becomes the one this server trusts. It was checked against the key
+# before it (or the operator overrode that with --allow-unsigned), so a new key is only ever taken from an update
+# the old key signed. An update without update-signing.pub leaves the pinned key as it is.
+pin_key() {
+  local new old=""; new="$(unzip -p "$WORK/update.zip" hearth/update-signing.pub 2>/dev/null | key_in)" || return 0
+  if [ -e "$PIN" ]; then old="$(key_in < "$PIN" 2>/dev/null)" || old=""; fi
+  [ "$new" != "$old" ] || return 0
+  # A key this server can't check would refuse every later update, so it stays on checksums instead.
+  if ! can_verify; then warn "This update brings an update signing key ($new), but $CANT_VERIFY, so it isn't pinned: updates stay checked against their checksum only."; return 0; fi
+  if ! write_pin "$new" "it came with Hearth $(version)"; then warn "Couldn't save the update signing key to $PIN."; return 0; fi
+  if [ -z "$old" ]; then ok "This server now only installs updates signed with the key this update brought: $new (pinned in $PIN)."
+  elif [ "$UNVERIFIED" = 1 ]; then loud "The update signing key is now $new: it came with an update installed with --allow-unsigned."
+  else ok "The update signing key is now $new. This update was signed with the previous key, so the change is trusted."; fi
+}
 
 # Behind Caddy (Docker setup): make Caddy hold requests for a moment while Hearth restarts, instead of
 # showing "502 Bad Gateway". Only touches that one setting, validates with Caddy, and undoes it on any doubt.
@@ -364,6 +566,19 @@ restore() { # $1 = backup folder
 }
 
 # ---------------------------------------------------------------- other modes
+if [ "$ACTION" = verify ]; then
+  # The same checks an update starts with, to check a zip before installing it. Changes nothing; doesn't even
+  # pin a key.
+  [ -n "$ARG" ] || die "Which update? Usage: hearth-update --verify path/to/update.zip"
+  [ -f "$ARG" ] || die "Update file not found: $ARG"
+  WORK="$(mktemp -d)"
+  cp -- "$ARG" "$WORK/update.zip" || die "Couldn't copy the update into a private folder (is the disk full?)."
+  check_update "$ARG" "$WORK/update.zip"
+  if [ "$UNVERIFIED" = 1 ]; then loud "$(basename "$ARG") (Hearth $(zip_version "$WORK/update.zip")) is NOT verified; it would only be installed because of --allow-unsigned."
+  else ok "$(basename "$ARG") (Hearth $(zip_version "$WORK/update.zip")) passed the checks for this server (installed: $(version))."; fi
+  exit 0
+fi
+
 if [ "$ACTION" = list ]; then
   [ -n "$(backups)" ] || { echo "No backups yet in $BACKUP_ROOT."; exit 0; }
   echo "Backups (newest first) — roll back to one with: hearth-update --rollback <name>"
@@ -391,6 +606,13 @@ if [ "$ACTION" = status ]; then
   printf '  free disk: %s MB\n' "$(free_mb "$DIR")"
   printf '  database:  %s\n' "$(du -sh data/hearth.db 2>/dev/null | cut -f1 || echo '?')"
   printf '  backups:   %s in %s (newest: %s)\n' "$(backups | wc -l)" "$BACKUP_ROOT" "$(basename "$(backups | head -1)" 2>/dev/null || echo none)"
+  if [ -e "$PIN" ]; then
+    printf '  update key: %s (pinned in %s: only updates signed with it are installed)\n' "$(key_in < "$PIN" 2>/dev/null || echo 'not a key, so every update is refused')" "$PIN"
+    can_verify || warn "But $CANT_VERIFY, so every update is refused until one of them is installed (or $PIN is deleted)."
+  elif ! can_verify; then printf "  update key: none (%s, so updates are only checked against their .sha256)\n" "$CANT_VERIFY"
+  elif [ -f update-signing.pub ] && root_only "$DIR/update-signing.pub"; then printf '  update key: none pinned yet (the next update pins the one this Hearth came with)\n'
+  elif [ -f update-signing.pub ]; then printf "  update key: none pinned yet (this Hearth's update-signing.pub isn't root's alone, so the first update that brings a key pins that one)\n"
+  else printf '  update key: none (updates are only checked against their .sha256)\n'; fi
   [ -f .env ] || warn "There's no .env file, so every setting is at its default (that's fine for a quick start)."
   # How many connections Hearth may hold open (each open app window is one).
   HPID=""
@@ -434,19 +656,10 @@ fi
 [ -n "$ARG" ] || die "Which update? Usage: hearth-update path/to/update.zip"
 ZIP="$ARG"
 [ -f "$ZIP" ] || die "Update file not found: $ZIP"
-# Compare the update with its SHA-256 when there's one to compare with: update.zip.sha256 next to it (made with
-# each release by scripts/make-update-zip.sh; the update tools write it from the file you confirmed on your
-# computer). A mismatch stops here, before anything is unpacked or run.
-SUM="$(sha256sum "$ZIP" | cut -d' ' -f1)"
-if [ -f "$ZIP.sha256" ]; then
-  WANT="$(tr -d '\r' < "$ZIP.sha256" | awk 'NR == 1 { print tolower($1) }')"
-  [[ "$WANT" =~ ^[0-9a-f]{64}$ ]] || die "$ZIP.sha256 doesn't contain a SHA-256 checksum."
-  [ "$WANT" = "$SUM" ] || die "$ZIP doesn't match its checksum ($ZIP.sha256): it's damaged or not the published update. Nothing was changed."
-  ok "Checksum matches ($SUM)."
-else
-  warn "No $(basename "$ZIP").sha256 next to the update, so it can't be checked. Its SHA-256 is $SUM: compare it with the one published for this release."
-fi
-unzip -Z1 "$ZIP" 'hearth/server/index.js' >/dev/null 2>&1 || die "$ZIP doesn't look like a Hearth update."
+# A private copy is what gets checked and unpacked, so the zip can't change in between, whoever can write where it is.
+WORK="$(mktemp -d)"
+cp -- "$ZIP" "$WORK/update.zip" || die "Couldn't copy the update into a private folder (is the disk full?). Nothing was changed."
+check_update "$ZIP" "$WORK/update.zip"
 # Is the current version still on the old "every private address is a proxy" rule? (See trust_proxy_upgrade.)
 OLD_TRUST_RULE=0; [ -f server/proxytrust.js ] || OLD_TRUST_RULE=1
 
@@ -460,13 +673,12 @@ if [ "${HAVE_MB:-0}" -lt "$NEED_MB" ]; then
   die "Not enough free disk space: ${HAVE_MB} MB free, about ${NEED_MB} MB needed. Free some space (e.g. 'docker system prune' or delete old folders in $BACKUP_ROOT) and try again."
 fi
 
-WORK="$(mktemp -d)"
 step "Unpacking the update…"
-unzip -q "$ZIP" -d "$WORK"
+unzip -q "$WORK/update.zip" 'hearth/*' -d "$WORK" # (only hearth/: nothing in the zip can land on the checked copy)
 NEW="$WORK/hearth"
 ok "New version: $(version "$NEW")"
 # Keep the updater itself up to date too (when run as "hearth-update <zip>", the old copy is what's running).
-if [ -f "$NEW/scripts/hearth-update.sh" ]; then cp "$NEW/scripts/hearth-update.sh" "$BIN" && chmod +x "$BIN"; fi
+if [ -f "$NEW/scripts/hearth-update.sh" ]; then install_updater "$NEW/scripts/hearth-update.sh" || warn "Couldn't update $BIN; it stays the old version."; fi
 # Plain mode with the program files owned by Hearth's user: that user prepares the new version, and the files
 # it ends up with stay that user's, as they were before the update.
 if [ "$STAGE_AS" != root ]; then chmod 711 "$WORK"; chown -R "$STAGE_AS:" "$NEW"; fi
@@ -520,6 +732,8 @@ if healthy; then
   T1=$(date +%s%N)
   ok "Hearth $(version) is running. Offline for $(awk "BEGIN { printf \"%.1f\", ($T1 - $T0) / 1e9 }") seconds."
   ok "Your database was backed up to $BK"
+  pin_key || true
+  if [ "$UNVERIFIED" = 1 ]; then loud "This update was installed WITHOUT a valid signature (--allow-unsigned)."; fi
   if [ "$MODE" = docker ]; then docker image prune -f >/dev/null 2>&1 || true; fi
   backups | tail -n +$((KEEP + 1)) | xargs -r -d '\n' rm -rf
   printf 'Log saved to %s\n' "$LOG"

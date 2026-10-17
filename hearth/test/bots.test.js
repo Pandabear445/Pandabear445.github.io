@@ -271,7 +271,7 @@ test('bot messages: plaintext and marked as a bot’s, length-limited, word-filt
   // Metadata only, never content, even through the read API.
   const meta = await bot(A.token, 'GET', `/channels/${general.id}/messages`);
   assert.ok(meta.json.messages.length >= 1);
-  for (const m of meta.json.messages) assert.deepEqual(Object.keys(m).sort(), ['authorId', 'authorIsBot', 'channelId', 'createdAt', 'editedAt', 'messageId', 'replyTo', 'threadId']);
+  for (const m of meta.json.messages) assert.deepEqual(Object.keys(m).sort(), ['authorId', 'authorIsBot', 'channelId', 'createdAt', 'editedAt', 'expiresAt', 'messageId', 'replyTo', 'threadId']);
 });
 
 test('adding scopes or channels needs approval again; taking them away doesn’t', async () => {
@@ -303,7 +303,7 @@ test('events: metadata only, only about channels the installation can see, and n
   assert.ok(gotA && gotB);
   for (const e of [gotA, gotB]) {
     assert.equal(e.json.v, 1);
-    assert.deepEqual(Object.keys(e.json.data).sort(), ['authorId', 'authorIsBot', 'channelId', 'createdAt', 'editedAt', 'messageId', 'replyTo', 'threadId']);
+    assert.deepEqual(Object.keys(e.json.data).sort(), ['authorId', 'authorIsBot', 'channelId', 'createdAt', 'editedAt', 'expiresAt', 'messageId', 'replyTo', 'threadId']);
     assert.ok(!e.raw.toString().includes(open.ciphertext.slice(3, 40)), 'no ciphertext either');
     assert.equal(e.json.data.authorId, bob.id);
   }

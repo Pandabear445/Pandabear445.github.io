@@ -51,6 +51,37 @@ const freePort = () => new Promise((resolve, reject) => {
   s.on('error', reject);
 });
 
+// A stand-in web site for link previews: https://news.preview-site.net:<port>/, served from this process with a
+// throwaway certificate the server is told to trust. The server finds the name through a small preload (every
+// other name is looked up as usual), and may reach it on 127.0.0.1 because it's listed in
+// LINK_PREVIEW_ALLOW_PRIVATE (tests only). hits: the paths it was asked for.
+async function startPreviewSite(dir) {
+  const https = await import('node:https');
+  const selfsigned = createRequire(path.join(ROOT, 'package.json'))('selfsigned');
+  const host = 'news.preview-site.net';
+  const pems = await selfsigned.generate([{ name: 'commonName', value: host }], { keySize: 2048, algorithm: 'sha256', extensions: [{ name: 'subjectAltName', altNames: [{ type: 2, value: host }] }] });
+  const ca = path.join(dir, 'preview-site-ca.pem');
+  fs.writeFileSync(ca, pems.cert);
+  const preload = path.join(dir, 'preview-site-dns.js');
+  fs.writeFileSync(preload, `const dns = require('dns');
+require(${JSON.stringify(path.join(ROOT, 'server', 'netguard.js'))}).setResolver((name) => (name.toLowerCase() === ${JSON.stringify(host)}
+  ? [{ address: '127.0.0.1', family: 4 }] : dns.promises.lookup(name, { all: true, verbatim: true })));\n`);
+  const cover = makePng(320, 200);
+  const hits = [];
+  const server = https.createServer({ key: pems.private, cert: pems.cert }, (req, res) => {
+    hits.push(req.url);
+    if (req.url === '/cover.png') { res.writeHead(200, { 'content-type': 'image/png' }); return res.end(cover); }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html><html><head><title>Fallback title</title>
+      <meta property="og:title" content="Pineapple harvest report"><meta property="og:site_name" content="Preview Site">
+      <meta property="og:description" content="This year&#39;s crop, field by field."><meta property="og:image" content="/cover.png">
+      <script>document.title = 'never run'</script></head><body>Story</body></html>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  return { host, port, base: `https://${host}:${port}`, hits, ca, preload, close: () => new Promise((r) => { server.closeAllConnections(); server.close(() => r()); }) };
+}
+
 export async function startServer() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hearth-e2e-data-'));
   const port = await freePort();
@@ -58,9 +89,15 @@ export async function startServer() {
   // Emails go out over SMTP, as on a real server, to a mail sink in this process (read with mails()); no SMTP
   // login, as the sink offers none. PUBLIC_URL is what reset links point at.
   const sink = await startSmtpSink();
+  const site = await startPreviewSite(dir);
   const env = {
     ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', HTTPS: 'false', NODE_ENV: 'test',
     SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), SMTP_USER: '', SMTP_PASS: '', MAIL_FROM: 'hearth@chat.example.test', PUBLIC_URL: base,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --require ${site.preload}`.trim(), NODE_EXTRA_CA_CERTS: site.ca, LINK_PREVIEW_ALLOW_PRIVATE: site.host,
+    // Webhook avatars are shown only from known avatar hosts and ones the admin lists (files-10): this stand-in site.
+    WEBHOOK_AVATAR_HOSTS: site.host,
+    // The same stand-in site takes alert-channel webhooks (it's on 127.0.0.1, so it has to be named, port and all).
+    ALERT_PRIVATE_HOSTS: `${site.host}:${site.port}`,
   };
   let log = '';
   const child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -68,11 +105,11 @@ export async function startServer() {
   child.stderr.on('data', (d) => { log += d; });
   for (let i = 0; ; i++) {
     try { const r = await fetch(base + '/api/config'); if (r.ok) break; } catch { /* not up yet */ }
-    if (i > 300 || child.exitCode !== null) { await sink.close(); throw new Error(`Hearth didn't start:\n${log}`); }
+    if (i > 300 || child.exitCode !== null) { await sink.close(); await site.close(); throw new Error(`Hearth didn't start:\n${log}`); }
     await sleep(100);
   }
   return {
-    base, dir, port, get log() { return log; },
+    base, dir, port, site, get log() { return log; },
     // Every email the server has sent so far, oldest first: { to, subject, text }. Waits until mail has stopped
     // arriving first, since some are sent after the HTTP answer.
     async mails() { await sink.idle(); return sink.messages.map((m) => ({ ...m })); },
@@ -82,6 +119,12 @@ export async function startServer() {
       const Database = createRequire(path.join(ROOT, 'package.json'))('better-sqlite3');
       const d = new Database(path.join(dir, 'hearth.db'));
       try { d.pragma('busy_timeout = 5000'); return d.prepare(q).run(...args); } finally { d.close(); }
+    },
+    // Reads it the same way, for what no screen shows (which key a message the server holds is locked with, say).
+    rows(q, ...args) {
+      const Database = createRequire(path.join(ROOT, 'package.json'))('better-sqlite3');
+      const d = new Database(path.join(dir, 'hearth.db'), { readonly: true });
+      try { d.pragma('busy_timeout = 5000'); return d.prepare(q).all(...args); } finally { d.close(); }
     },
     // The newest email to this address that matches, once it arrives.
     async mail(to, match, timeout = 15000) {
@@ -97,7 +140,7 @@ export async function startServer() {
         for (let i = 0; i < 60 && child.exitCode === null; i++) await sleep(50);
         if (child.exitCode === null) child.kill('SIGKILL');
       }
-      await sink.close();
+      await sink.close(); await site.close();
       if (!keep) fs.rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -128,7 +171,8 @@ export class Person {
 
   static async open(browser, base, name) {
     const context = await browser.newContext({ viewport: { width: 1400, height: 900 }, acceptDownloads: true, permissions: ['microphone', 'camera'] });
-    // Nothing leaves this machine: fonts and other outside requests are refused (fast and the same every run).
+    // Nothing leaves this machine: outside requests are refused (fast and the same every run). A flow that needs an
+    // outside site answers for it with its own page.route, which takes precedence over this one.
     await context.route((url) => !url.href.startsWith(base), (route) => route.abort());
     // Every call connection the app makes, so the voice flow can check it really connected.
     await context.addInitScript(() => {
@@ -250,18 +294,25 @@ export class Person {
     await this.page.locator('#sidebar-head .server-head-name', { hasText: exact(serverName) }).waitFor();
     await this.noModals();
   }
-  async createServer(name) {
+  // Creating a server opens "Your server is ready. Invite your people." with a link made (app.js openInvite's
+  // welcome): closed with Done, or handed back open with keepInvite.
+  async createServer(name, { keepInvite = false } = {}) {
     await this.railButton('Add a server');
     await this.page.locator('.modal .choice', { hasText: 'Create my own' }).click();
     const m = await this.dialog('Create a server');
     await m.locator('input.input').fill(name);
     await m.locator('.modal-foot .btn.primary').click();
     await this.page.locator('#sidebar-head .server-head-name', { hasText: exact(name) }).waitFor();
+    const welcome = await this.dialog('Your server is ready. Invite your people.');
+    await this.page.waitForFunction(() => /\/invite\/\w+/.test((document.querySelector('.modal.invite-welcome input[aria-label="Invite link"]') || {}).value || ''));
+    if (keepInvite) return welcome;
+    await welcome.locator('.modal-foot .btn.primary', { hasText: 'Done' }).click();
     await this.noModals();
+    return null;
   }
   // Everything this person's app has open, for a failure report.
   async capture(dir) {
-    const safe = this.name.replace(/\W+/g, '_');
+    const safe = (this.tag || this.name).replace(/\W+/g, '_');
     for (const [i, p] of this.context.pages().entries()) {
       const tag = i ? `${safe}-${i}` : safe;
       await p.screenshot({ path: path.join(dir, `${tag}.png`) }).catch(() => {});

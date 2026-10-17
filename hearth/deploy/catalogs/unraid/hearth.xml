@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!-- Unraid Community Apps template for Hearth. Staging copy: see ../README.md for how it's submitted and updated. -->
+<!-- Hearth starts as root only long enough to hand /data to uid 1000, then drops to that user for good with no
+     capabilities left (deploy/docker-entrypoint.sh). The four capabilities below are all that takes. -->
+<Container version="2">
+  <Name>Hearth</Name>
+  <Repository>ghcr.io/pandabear445/hearth:1.29.0</Repository>
+  <Registry>https://github.com/Pandabear445/Hearth-chat/pkgs/container/hearth</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Pandabear445/Hearth-chat/issues</Support>
+  <Project>https://arc32.me</Project>
+  <ReadMe>https://github.com/Pandabear445/Hearth-chat/tree/main/hearth#readme</ReadMe>
+  <Overview>Hearth is a chat app for friend groups and small communities that you host yourself: servers with text and voice channels, roles, threads, direct messages and group chats, voice and video calls with screen sharing, and watching videos together. Messages, files and calls are end-to-end encrypted in the app, so the server stores only encrypted data (it still sees who talks to whom, and when). One process and a SQLite file; free and MIT licensed.[br][br]
+[b]First run:[/b] open the WebUI and click through the certificate warning once (Hearth makes its own certificate; browsers only allow encryption and microphones on https). The first account to sign up becomes the owner, so sign up before you share the address.[br][br]
+[b]Friends outside your network[/b] need a domain or a tunnel (Cloudflare Tunnel, Tailscale Funnel, or a reverse proxy with a real certificate). Behind a proxy that does https, set HTTPS to false and TRUST_PROXY to the proxy's address. Big group video calls don't scale: calls go directly between people (best with up to about 4 to 6 cameras).</Overview>
+  <Category>Network:Messenger Network:Voip Social:</Category>
+  <WebUI>https://[IP]:[PORT:3000]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Pandabear445/Hearth-chat/main/hearth/deploy/catalogs/unraid/hearth.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Pandabear445/Hearth-chat/main/hearth/public/icons/icon-512.png</Icon>
+  <ExtraParams>--read-only --tmpfs /tmp:size=64m,mode=1777 --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_READ_SEARCH --cap-add=SETUID --cap-add=SETGID --security-opt=no-new-privileges:true --pids-limit=512 --ulimit nofile=65535:65535 --log-opt max-size=10m --log-opt max-file=3</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI (https)" Target="3000" Default="3000" Mode="tcp" Description="Hearth's web app, desktop and Android apps, and invite links all use this port. It speaks https with its own certificate unless HTTPS is false." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/hearth" Mode="rw" Description="The database, uploads, the server's keys and certificate, and backups. Back this folder up." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/hearth</Config>
+  <Config Name="PUBLIC_HOSTS" Target="PUBLIC_HOSTS" Default="" Mode="" Description="Extra names or addresses for Hearth's own certificate, comma-separated: this server's LAN address, a public IP or a dynamic DNS name (e.g. 192.168.1.20,myhearth.duckdns.org). After changing it, delete cert.pem and key.pem from the Data folder and restart." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="HTTPS" Target="HTTPS" Default="true" Mode="" Description="true: Hearth serves https itself (self-signed certificate). false: only behind a reverse proxy or tunnel that does https; plain http from the internet is refused." Type="Variable" Display="always" Required="true" Mask="false">true</Config>
+  <Config Name="TRUST_PROXY" Target="TRUST_PROXY" Default="" Mode="" Description="Only with a reverse proxy or tunnel: its address or subnet, so each visitor keeps their own address for bans and sign-in limits. Leave empty without one. Never a number or Docker's gateway while the port is reachable from other machines." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="REGISTRATION_CODE" Target="REGISTRATION_CODE" Default="" Mode="" Description="Optional: a code people need to sign up. Registration can also be closed in Admin, Registration and Terms." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="INSTANCE_NAME" Target="INSTANCE_NAME" Default="Hearth" Mode="" Description="Name shown in the browser tab and on the sign-in screen." Type="Variable" Display="advanced" Required="false" Mask="false">Hearth</Config>
+</Container>

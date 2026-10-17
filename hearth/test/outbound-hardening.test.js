@@ -14,7 +14,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const zlib = require('node:zlib');
-const { startServer, hex, b64, sleep } = require('./helpers');
+const { startServer, enable2fa, hex, b64, sleep } = require('./helpers');
 const netguard = require('../server/netguard');
 
 const listen = (server, host = '127.0.0.1', port = 0) => new Promise((resolve) => server.listen(port, host, () => resolve(server.address().port)));
@@ -372,10 +372,10 @@ test('trackers and feeds: disguised and DNS-hidden private addresses are refused
     assert.equal(r.status, 400, `${q} → ${r.status} ${r.text}`);
     assert.match(r.json.error, /blocked on this server/, q);
   }
-  // The news picture proxy too.
+  // The news picture proxy too, even for an address the server signed (as if a feed had listed it).
   const t = (await as(strict, u, 'GET', '/bootstrap')).json.mediaToken;
   for (const q of [`http://[::ffff:7f00:1]:${feedPort}/a.png`, `http://rebind.test:${feedPort}/a.png`]) {
-    const r = await strict.call('GET', `/media/news?u=${encodeURIComponent(q)}&t=${encodeURIComponent(t)}`);
+    const r = await strict.call('GET', `${strict.mediaLink('news', q)}&t=${encodeURIComponent(t)}`);
     assert.equal(r.status, 404, q);
   }
   assert.equal(feedHits, 0, 'the private site never got a request');
@@ -403,14 +403,15 @@ test('picture proxy: allowed hosts still work through the guard; private answers
   try {
     const u = await strict.register();
     const t = (await as(strict, u, 'GET', '/bootstrap')).json.mediaToken;
-    const r = await strict.call('GET', `/media/art?u=${encodeURIComponent(`https://img.steamstatic.com:${pushPort}/x.png`)}&t=${encodeURIComponent(t)}`);
+    const r = await strict.call('GET', `${strict.mediaLink('art', `https://img.steamstatic.com:${pushPort}/x.png`)}&t=${encodeURIComponent(t)}`);
     assert.equal(r.status, 404);
     assert.equal(conns.length, 0, 'no connection was made');
   } finally { pushSrv.off('connection', watch); }
 
   const u = await loose.register();
   const t = encodeURIComponent((await as(loose, u, 'GET', '/bootstrap')).json.mediaToken);
-  const art = (p) => fetch(`${loose.base}/media/art?u=${encodeURIComponent(`http://127.0.0.1:${artPort}${p}`)}&t=${t}`);
+  // Links the server signed (as it does for album art it sends to apps), so this checks what happens after that.
+  const art = (p) => fetch(`${loose.base}${loose.mediaLink('art', `http://127.0.0.1:${artPort}${p}`)}&t=${t}`);
   const ok = await art('/cover.png');
   assert.equal(ok.status, 200);
   assert.equal(ok.headers.get('content-type'), 'image/png');
@@ -563,8 +564,9 @@ test('push: delivery works, and stops for a device once its session is revoked, 
   const tokC = (await loose.login(v)).json.token;
   assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}/devC`) }, tokC)).status, 200);
   const newKey = hex(32);
-  assert.equal((await as(loose, v, 'POST', '/me/password', { oldAuthKey: v.authKey, newAuthKey: newKey, encPrivateKey: b64(60), salt: b64(16) })).status, 200);
-  v.authKey = newKey;
+  const changed = await as(loose, v, 'POST', '/me/password', { oldAuthKey: v.authKey, newAuthKey: newKey, encPrivateKey: b64(60), salt: b64(16) });
+  assert.equal(changed.status, 200);
+  v.authKey = newKey; v.token = changed.json.token; // the main session goes on with a new token (auth-11)
   assert.equal(subRows(loose, v.id).length, 0);
   await send(); await sleep(600);
   assert.equal(hitsFor('/devC'), 0);
@@ -582,6 +584,56 @@ test('push: delivery works, and stops for a device once its session is revoked, 
   assert.equal((await as(loose, g, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}/gone-${hex(4)}`) })).status, 200);
   await sendG();
   assert.ok(await waitFor(() => subRows(loose, g.id).length === 0));
+});
+
+test('push: a subscription made with a copy of the sign-in token gets nothing once the token is replaced (auth-11)', async () => {
+  const hitsFor = (p) => pushHits.filter((h) => h.url === p).length;
+  const sha = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+  for (const [how, rotate] of [
+    ['a password change', async (v) => {
+      const newKey = hex(32);
+      const r = await as(loose, v, 'POST', '/me/password', { oldAuthKey: v.authKey, newAuthKey: newKey, encPrivateKey: b64(60), salt: b64(16) });
+      assert.equal(r.status, 200, r.text);
+      v.authKey = newKey;
+      return r.json.token;
+    }],
+    ['turning on two-factor', async (v) => { await enable2fa(loose, v); return v.token; }],
+    ['logging out the other devices with the password', async (v) => {
+      const r = await as(loose, v, 'POST', '/me/sessions/revoke-others', { authKey: v.authKey });
+      assert.equal(r.status, 200, r.text);
+      return r.json.token;
+    }],
+  ]) {
+    const v = await loose.register(); const friend = await loose.register();
+    const send = await dmLine(loose, friend, v);
+    const tag = hex(4);
+    const own = `/own-${tag}`; const copy = `/copy-${tag}`;
+    // This device's own subscription, and one made from somewhere else with a copy of its token.
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}${own}`) })).status, 200);
+    const old = v.token;
+    assert.equal((await as(loose, { ...v, ip: '198.51.100.77' }, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}${copy}`) })).status, 200);
+    await send();
+    assert.ok(await waitFor(() => hitsFor(own) === 1 && hitsFor(copy) === 1), `${how}: control, both delivered`);
+    v.token = await rotate(v);
+    assert.notEqual(v.token, old);
+    assert.equal(subRows(loose, v.id).length, 0, `${how}: the session's subscriptions go with the old token`);
+    // The app subscribes again with the new token as it reconnects; the copy can't any more.
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}${own}`) })).status, 200);
+    assert.equal((await as(loose, v, 'POST', '/push/subscribe', { subscription: pushSub(`https://127.0.0.1:${pushPort}${copy}`) }, old)).status, 401);
+    await send();
+    assert.ok(await waitFor(() => hitsFor(own) === 2), `${how}: this device still gets them`);
+    await sleep(300);
+    assert.equal(hitsFor(copy), 1, `${how}: nothing more reaches the copy`);
+    // One made with the old token that was still on its way in as the token changed (it passed the sign-in check
+    // just before) counts for nothing either: it's checked against the session's current token at send time.
+    const sid = loose.sql('SELECT id FROM sessions WHERE token_hash = ?', sha(v.token))[0].id;
+    loose.sql('INSERT INTO push_subs (endpoint, user_id, keys, ua, created_at, session_id, token_hash) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      `https://127.0.0.1:${pushPort}${copy}`, v.id, JSON.stringify(pushSub('x').keys), 't', Date.now(), sid, sha(old));
+    await send();
+    assert.ok(await waitFor(() => hitsFor(own) === 3));
+    assert.ok(await waitFor(() => !subRows(loose, v.id).some((x) => x.endpoint.endsWith(copy))), `${how}: dropped`);
+    assert.equal(hitsFor(copy), 1);
+  }
 });
 
 test('push: expired sessions, suspended accounts and pre-upgrade subscriptions', async () => {

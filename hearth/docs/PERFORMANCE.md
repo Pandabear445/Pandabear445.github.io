@@ -227,6 +227,63 @@ them all). `test/quality.test.js` asserts the plans above.
 - **Admin routes.** `/api/admin/servers` and other admin routes count messages per server with a join over all
   messages. They are rarely used and were not measured.
 
+### Threads list and thread unread counts (v19)
+
+The Threads panel (`GET /channels/:id/threads`) lists a channel's threads, the one with the latest reply first.
+Nothing on `messages` gives that order cheaply. Measured in-process on a channel with 5,000 threads and about
+120,000 replies plus one 20,000-reply thread, with candidate indexes on the replies:
+
+| Way to find the page | Cost per page |
+|---|---|
+| Group the channel's replies by thread, latest first | 15–17 ms: reads every reply |
+| Walk the newest replies until 25 threads have turned up | 0.2 ms usually, 17 ms when a busy thread's replies come first |
+| List the channel's threads one index step each (a recursive loose scan), then each one's newest reply | 12–23 ms: about 3 µs per thread, on every page |
+| **`thread_activity`: each thread's newest reply, indexed `(channel_id, last_reply_id)`** | one index range |
+
+`thread_activity` was kept. Keeping it with an `AFTER INSERT` trigger made every message insert, top-level ones
+included, about 50% slower in a bare table (11 → 18 µs; 300,000 inserts went from 5.0 to 8.6 s, which also broke the
+timing of the data-hardening start-up test). So the one route that writes replies records them itself, and only
+removals use triggers, which stay within the noise (3.3–3.8 µs per deleted message with or without them, deleting a
+100,000-message channel; one outlier run at 5.5 µs).
+
+Per-thread counts go through existing indexes: unread replies and the newest reply through `idx_messages_thread`,
+pings through a partial index on `mention_marks(thread_id, user_id, message_id)`, and a thread's marker through the
+`read_states` primary key. `/me/unread` adds each channel's thread pings, but first asks `thread_activity` whether any
+of its threads had a reply since they were last read (one index step), so most channels cost nothing more.
+
+`npm run bench -- --only threads`, scale 1, plus a channel with 5,000 threads (12,607 replies) over the last 30 days
+in the big server; base is `f9e417b`; three alternated runs each, p50:
+
+| | base | this change |
+|---|---|---|
+| Threads panel: first page (25) of the 5,000-thread channel | (none) | 5.3–6.9 ms |
+| Threads panel: paging back 25 at a time, 20 pages | (none) | 4.7–6.9 ms |
+| Threads panel of the channel with the 20,000-reply thread | (none) | 9.4–10.5 ms |
+| `/api/me/unread`, heavy user (250 channels) | 18.9, 19.0 ms (37.7 in a noisy first run) | 15.8–20.4 ms |
+
+The busy-thread channel costs more because counting a 20,000-reply thread's replies (`threadInfo`, unchanged) takes
+1–2 ms. Query plans (`--plans`): the list is `SEARCH thread_activity USING INDEX idx_thread_activity_channel
+(channel_id=? AND last_reply_id<?)`, with no sort; `test/threads.test.js` asserts these plans.
+
+A channel's thread pings (`threadMentions`) were first counted from every ping to you in its threads newer than the
+channel's "threads read up to" marker, checking each one against its thread's marker. Pings in threads you have
+already opened never fail that range, and the marker moves only on Mark as read, so the walk grew with every ping
+you ever read, and it ran on every channel read. Someone could grow it on purpose: replies with 50 mentions each add
+a ping for 50 people at a time. It now runs only where the count can change (thread reads and replies, `/me/unread`,
+opening a thread or the Threads panel, Mark as read), not on a plain channel read, and looks at your newest 500 pings
+in the channel: yours and @everyone, merged newest first from two ranges of `idx_mention_marks_conv` (`MERGE (UNION
+ALL)`, no sort), so it stops there. Measured in-process through the API with one real thread ping and then that many
+more of the same shape stored straight in the table, all in a thread already read; 25 calls each, p50:
+
+| Read pings piled up | `POST /me/read c:` before → after | `GET /me/unread` before → after | `POST /me/read t:` before → after |
+|---|---|---|---|
+| 1 | 2.6 → 3.3 ms | 2.2 → 3.5 ms | 2.6 → 3.6 ms |
+| 15,000 | 18.8 → 2.8 ms | 14.3 → 2.9 ms | 17.6 → 3.5 ms |
+| 60,000 | 40.6 → 2.8 ms | 38.9 → 4.0 ms | 65.4 → 3.9 ms |
+
+The small cases are within the noise of one run each. The price is in the count, not the time: an unread ping older
+than your newest 500 in the channel's threads is left out of the channel's badge (its thread still shows it).
+
 ### Limitations
 
 - The scale measured is the one in the dataset table: 2,000 users, one 1,000-member server, 520k messages, and
@@ -355,7 +412,8 @@ per message. The "after" run removed 0. No change was made to this path.
   from the same host. With fonts blocked entirely, sign-in was ready ~150–300 ms sooner on this network. But removing
   only the decorative one would save just the difference between the two requests, and the UI font has to block to
   avoid a flash of fallback text. Not changed. This is the biggest load-time lever left; self-hosting the fonts would
-  remove the third-party round trip.
+  remove the third-party round trip. (Done since, in 1.29.0, for privacy: the fonts are in `public/fonts`, served by
+  Hearth, and the interface fonts are kept in the offline copy. Not re-measured.)
 - **Lazy-loading `settings.js` (121 KB) and `admin.js` (91 KB).** Not attempted. The CPU profile of a signed-in load
   at 4× showed only ~60 ms of JS in total. Most of the time is native work (module loading, style, layout), so
   splitting these two wouldn't be measurable at this scale.
@@ -363,7 +421,8 @@ per message. The "after" run removed 0. No change was made to this path.
 ### Limitations
 
 - Only the sizes above were measured, on one shared machine, in Chromium, over loopback. Real networks add latency
-  that the 37-module waterfall and the Google Fonts request would feel more.
+  that the 37-module waterfall would feel more. (The Google Fonts request measured here is gone: since 1.29.0 the
+  fonts are served by Hearth.)
 - Phones weren't measured on real devices; 4× CPU throttling is a stand-in.
 - The member list still redraws all rows when someone's presence changes. That's batched per frame, and the server
   flushes presence once a second; it costs ~45 ms of JS per redraw at 1,000 members. An incremental update would

@@ -1,0 +1,18 @@
+[variables]
+main_domain = "${domain}"
+# A new random code for each install: a public domain shows up in certificate logs within minutes, and the first
+# account to sign up becomes the owner, so nobody but you can sign up until you've made yours.
+registration_code = "${password:16}"
+
+[config]
+[[config.domains]]
+serviceName = "hearth"
+port = 3000
+host = "${main_domain}"
+
+# REGISTRATION_CODE: the code people need to sign up. Read it in the service's Environment tab and sign up with it
+# first: the first account becomes the owner. Afterwards, Admin -> Registration & Terms decides (open, a code of your
+# choice, or closed). The generated domain is plain http: use your own domain with HTTPS on.
+[config.env]
+REGISTRATION_CODE = "${registration_code}"
+INSTANCE_NAME = "Hearth"

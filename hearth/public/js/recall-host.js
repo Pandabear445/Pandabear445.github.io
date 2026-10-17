@@ -27,7 +27,7 @@ async function sha256Hex(text) {
 }
 
 export function createRecall(ctx) {
-  // ctx: { S, onEnabled() }
+  // ctx: { S, onEnabled(), onActive() }
   const items = new Map(); // id -> { kind, obj, updatedAt }
   let key = null; let since = 0; let loading = null; let loaded = false;
   let layer = null; let frame = null; let ready = false; let slot = null; let raf = 0;
@@ -172,6 +172,9 @@ export function createRecall(ctx) {
     if (!frame || e.source !== frame.contentWindow) return;
     const m = e.data;
     if (!m || m.recall !== 1 || typeof m.t !== 'string') return;
+    // Someone is studying: keys and clicks in the frame never reach Hearth's page, so the frame says so (at most
+    // every 30 seconds, and nothing about what was pressed). Automatic Away counts it as using Hearth.
+    if (m.t === 'active') { if (ctx.onActive) ctx.onActive(); return; }
     if (m.t === 'ready') {
       ready = true;
       try {

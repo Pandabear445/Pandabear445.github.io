@@ -3,7 +3,7 @@
 #
 # docker-compose.yml starts the container as uid 1000 ("node"), so this just starts Hearth.
 # If the container is started as root instead (plain `docker run`, or an older docker-compose.yml without a
-# `user:` line — the update tool never replaces your docker-compose.yml), it first gives the data folder to
+# `user:` line — hearth-update never replaces your docker-compose.yml), it first gives the data folder to
 # uid 1000 (images before this change wrote it as root), then drops root for good and starts Hearth.
 set -eu
 if [ "$(id -u)" = 0 ]; then

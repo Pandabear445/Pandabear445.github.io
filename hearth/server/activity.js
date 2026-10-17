@@ -26,8 +26,15 @@ const BASE = {
   itunes: env.ITUNES_API_BASE || 'https://itunes.apple.com',
 };
 // Pictures are only ever fetched from these hosts (plus ART_PROXY_EXTRA_HOSTS), so the picture proxy can't be
-// pointed at anything else.
-const ART_HOSTS = /(^|\.)(steamstatic\.com|steampowered\.com|wikimedia\.org|rawg\.io|fastly\.net|last\.fm|lastfm\.freetls\.fastly\.net|mzstatic\.com|scdn\.co|spotifycdn\.com|ytimg\.com|ggpht\.com|googleusercontent\.com|sndcdn\.com|dzcdn\.net|tidal\.com|bcbits\.com)$/i;
+// pointed at anything else. Each is where one of the sources above serves its pictures:
+//   Steam: *.steamstatic.com (covers, banners; older ones on *.steampowered.com) · Wikipedia: upload.wikimedia.org ·
+//   RAWG: media.rawg.io · Last.fm: lastfm.freetls.fastly.net (and last.fm) · iTunes search and Apple Music:
+//   *.mzstatic.com · Spotify: i.scdn.co, *.spotifycdn.com · YouTube (Music): i.ytimg.com · SoundCloud: *.sndcdn.com ·
+//   Deezer: *.dzcdn.net · TIDAL: resources.tidal.com · Bandcamp: *.bcbits.com.
+// files-10: fastly.net, googleusercontent.com and ggpht.com used to be here too. Those are shared hosting for
+// anyone's content (any Fastly customer, Google Drive and Sites files, Blogger pictures), and none of the sources
+// gives pictures there: Last.fm's own Fastly name is listed exactly, and YouTube's oEmbed answers use i.ytimg.com.
+const ART_HOSTS = /(^|\.)(steamstatic\.com|steampowered\.com|wikimedia\.org|rawg\.io|last\.fm|lastfm\.freetls\.fastly\.net|mzstatic\.com|scdn\.co|spotifycdn\.com|ytimg\.com|sndcdn\.com|dzcdn\.net|tidal\.com|bcbits\.com)$/i;
 const EXTRA_ART_HOSTS = (env.ART_PROXY_EXTRA_HOSTS || '').split(',').map((x) => x.trim()).filter(Boolean);
 const artAllowed = (u) => { try { const x = new URL(u); return (x.protocol === 'https:' && ART_HOSTS.test(x.hostname)) || EXTRA_ART_HOSTS.includes(x.host); } catch { return false; } };
 
@@ -47,7 +54,7 @@ const GAME_ID = /^(steam:\d{1,10}|wiki:\d{1,12}|rawg:\d{1,10})$/;
 const NOT_GAMES = new Set(['431960', '250820', '228980', '1070560', '1391110', '1493710']);
 
 module.exports = function setupActivity(ctx) {
-  const { api, app, auth, db, fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, requireInstanceAdmin, checkWords, DATA_DIR, version,
+  const { api, app, auth, db, fail, wrap, rateLimit, isOnline, getUserRow, getSetting, setSetting, checkMediaToken, mediaLinks, requireInstanceAdmin, checkWords, DATA_DIR, version,
     sealSecret, openSecret, auditLog } = ctx;
   const UA = `Hearth/${version} (self-hosted chat; https://github.com/)`;
   const now = () => Date.now();
@@ -260,10 +267,13 @@ module.exports = function setupActivity(ctx) {
     res.status(404).end();
   }));
   // Album art and other activity pictures (signed links, only known music/game hosts).
+  // files-10: only addresses this server signed when it sent someone's activity to an app (artSrc in activityFor),
+  // each link for its own address and for about a day, and only with a live session's media token.
   app.get(['/media/art', '/media/art/:key'], wrap(async (req, res) => {
-    if (!checkMediaToken(req.query.t)) return res.status(403).end();
+    const href = mediaLinks.check('art', req.query.u, req.query.e, req.query.s);
+    if (!href || !checkMediaToken(req.query.t)) return res.status(403).end();
     rateLimit('artimg:' + req.ip, 600, 60000);
-    sendImage(res, await fetchImage(String(req.query.u || '')));
+    sendImage(res, await fetchImage(href));
   }));
 
   // ------------------------------------------------------------------ settings per person
@@ -297,7 +307,8 @@ module.exports = function setupActivity(ctx) {
     if (e.music && cfg.shareMusic) {
       const m = e.music;
       const plat = (Object.hasOwn(PLATFORMS, m.platform) && PLATFORMS[m.platform]) || PLATFORMS.other;
-      out.music = { title: m.title, artist: m.artist, album: m.album, art: m.art, platform: m.platform, platformName: plat.name, url: m.url || (plat.search ? plat.search(`${m.title} ${m.artist}`.trim()) : null), since: m.since };
+      // artSrc: the signed link the app loads the album art through (files-10).
+      out.music = { title: m.title, artist: m.artist, album: m.album, art: m.art, artSrc: m.art ? mediaLinks.sign('art', m.art) : null, platform: m.platform, platformName: plat.name, url: m.url || (plat.search ? plat.search(`${m.title} ${m.artist}`.trim()) : null), since: m.since };
     }
     return out.game || out.music ? out : null;
   }

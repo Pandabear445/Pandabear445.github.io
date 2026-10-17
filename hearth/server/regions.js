@@ -46,7 +46,21 @@ module.exports = function setupRegions(ctx) {
   }
   // Pin only when this server answers with its own self-signed certificate (no domain / Caddy in front).
   const pinFor = (origin) => (origin.startsWith('https:') && process.env.HTTPS !== 'false' ? pinnedKey() : '');
-  const cleanOrigin = (o) => { try { const u = new URL(String(o)); return /^https?:$/.test(u.protocol) ? u.origin : ''; } catch { return ''; } };
+  // Where a new region downloads its installer (which runs as root and carries the relay secret) and checks in:
+  // https only. Plain http only for this machine itself (localhost, 127.x.x.x, [::1]): a browser treats that as
+  // secure, and a command made from it can't reach anything from another machine.
+  const LOOPBACK = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/i;
+  const cleanOrigin = (o) => {
+    try {
+      const u = new URL(String(o));
+      return u.protocol === 'https:' || (u.protocol === 'http:' && LOOPBACK.test(u.hostname)) ? u.origin : '';
+    } catch { return ''; }
+  };
+  const originFrom = (o) => {
+    const origin = cleanOrigin(o);
+    if (!origin) fail(400, o ? 'Open Hearth over https to make an install command: the new region downloads its installer, which runs as root and carries the relay secret, from this address.' : 'Missing this server\u2019s address.');
+    return origin;
+  };
 
   function regionOut(r) {
     const st = parse(r.stats, {});
@@ -63,19 +77,28 @@ module.exports = function setupRegions(ctx) {
     requireInstanceAdmin(req.userId);
     res.json({ regions: rows().map(regionOut), mainTurn: String(getSetting('turnUrls') || process.env.TURN_URL || '').split(',').filter(Boolean), secretSet: !!(getSetting('turnSecret') || process.env.TURN_SECRET) });
   });
-  const installCommand = (origin, id, token) => { const pin = pinFor(origin); return `curl -fsSL${pin ? `k --pinnedpubkey '${pin}'` : ''} '${origin}/regions/install/${id}?k=${token}' | sudo bash`; };
+  // The install command downloads the installer to a private file, checks it against the SHA-256 it carries (of
+  // exactly what /regions/install/:id will send for this token) and only then runs it: nothing runs that changed on
+  // the way, or that arrived only in part. (Plain `curl | bash` would start running a cut-off download.)
+  const installCommand = (origin, id, token) => {
+    const pin = pinFor(origin);
+    const sum = sha(installScript(origin, id, token));
+    const fetchOpts = `${origin.startsWith('https:') ? " --proto '=https'" : ''}${pin ? ` -k --pinnedpubkey '${pin}'` : ''}`;
+    return `f="$(mktemp)" && curl -fsSL${fetchOpts} -o "$f" '${origin}/regions/install/${id}?k=${token}' && echo '${sum}  '"$f" | sha256sum -c - && sudo bash "$f"; rm -f "$f"`;
+  };
   // An install command hands the machine it runs on this server's relay secret, and a linked region becomes a
   // relay for everyone's calls and a place every backup is copied to. So making one needs the password again
   // (like seeing the backup key), and adding, reinstalling, renaming or removing a region is always logged.
   api.post('/admin/regions', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
-    await stepUp(req, req.body);
     const b = req.body || {};
     const name = String(b.name || '').trim().slice(0, 40);
     if (!name) fail(400, 'Give the region a name, like "Frankfurt" or "US West".');
     if (rows().length >= 12) fail(400, 'Up to 12 regions.');
-    const origin = cleanOrigin(b.origin);
-    if (!origin) fail(400, 'Missing this server’s address.');
+    const origin = originFrom(b.origin);
+    // (After the checks above, so a request that can't go through doesn't use up a two-factor code.)
+    await stepUp(req, req.body);
+    if (rows().length >= 12) fail(400, 'Up to 12 regions.'); // (again: the password check took a moment)
     ensureSecret();
     const id = newId(); const token = crypto.randomBytes(24).toString('hex');
     // Remember the address the admin uses: that's the one the region must check in at (behind a proxy, this
@@ -87,11 +110,11 @@ module.exports = function setupRegions(ctx) {
   // A new install command for an existing region (new token; the old one stops working).
   api.post('/admin/regions/:id/reinstall', auth, wrap(async (req, res) => {
     requireInstanceAdmin(req.userId);
-    await stepUp(req, req.body);
+    if (!db.prepare('SELECT 1 FROM regions WHERE id = ?').get(req.params.id)) fail(404, 'No such region.');
+    const origin = originFrom((req.body || {}).origin);
+    await stepUp(req, req.body); // (after the checks above, so they don't use up a two-factor code)
     const r = db.prepare('SELECT * FROM regions WHERE id = ?').get(req.params.id);
     if (!r) fail(404, 'No such region.');
-    const origin = cleanOrigin((req.body || {}).origin);
-    if (!origin) fail(400, 'Missing this server’s address.');
     ensureSecret();
     const token = crypto.randomBytes(24).toString('hex');
     db.prepare('UPDATE regions SET token_hash = ?, setup_until = ?, stats = ? WHERE id = ?').run(sha(token), now() + 24 * 3600000, JSON.stringify({ ...parse(r.stats, {}), origin }), r.id);
@@ -125,15 +148,22 @@ module.exports = function setupRegions(ctx) {
     const token = String(req.query.k || '');
     res.type('text/plain');
     if (!checkToken(r, token) || (r.setup_until || 0) < now()) return res.status(403).send('echo "This install link has expired or was replaced. Make a new one in Hearth: Admin → Regions." >&2; exit 1\n');
-    const origin = cleanOrigin(parse(r.stats, {}).origin) || `${req.protocol}://${req.get('host')}`;
+    const origin = cleanOrigin(parse(r.stats, {}).origin) || cleanOrigin(`${req.protocol}://${req.get('host')}`);
+    if (!origin) return res.status(403).send('echo "This install link isn\'t on an https:// address. Make a new one in Hearth, opened over https: Admin → Regions." >&2; exit 1\n');
+    res.send(installScript(origin, r.id, token));
+  });
+  // The installer itself. Everything in it is settled when the install command is made (the command carries its
+  // SHA-256), so it must come out byte for byte the same when it's downloaded: nothing in it may change in between
+  // (the region's name, which can, isn't in it).
+  function installScript(origin, id, token) {
     const turnScript = fs.readFileSync(path.join(ROOT, 'scripts', 'setup-turn.sh'), 'utf8');
     const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
-    res.send(`#!/usr/bin/env bash
-# Hearth region "${r.name.replace(/[^\w .,-]/g, '')}" — installs a call relay and links it to ${origin}
+    return `#!/usr/bin/env bash
+# Hearth region: installs a call relay and links it to ${origin}
 set -Eeuo pipefail
 [ "$(id -u)" = 0 ] || { echo "Run this as root (or with sudo)." >&2; exit 1; }
 MAIN=${q(origin)}
-REGION=${q(r.id)}
+REGION=${q(id)}
 TOKEN=${q(token)}
 PIN=${q(pinFor(origin))}
 
@@ -144,7 +174,10 @@ trap 'rm -rf "$SETUP_DIR"' EXIT
 cat > "$SETUP_DIR/setup-turn.sh" <<'HEARTH_TURN_EOF'
 ${turnScript}
 HEARTH_TURN_EOF
-bash "$SETUP_DIR/setup-turn.sh" --relay-only --managed --secret ${q(ensureSecret())}
+# The relay secret reaches setup-turn.sh in a file only root can read, never on a command line (ps shows those to
+# every account). printf is the shell's own, so the secret isn't another program's argument either.
+( umask 077 && printf '%s\\n' ${q(ensureSecret())} > "$SETUP_DIR/turn-secret" )
+bash "$SETUP_DIR/setup-turn.sh" --relay-only --managed --secret-file "$SETUP_DIR/turn-secret"
 rm -rf "$SETUP_DIR"
 
 # Off-site backups: an upload-only SFTP account that can write into one folder and nothing else. The main
@@ -259,8 +292,8 @@ else
   cat /etc/hearth-region/state 2>/dev/null || true; echo
 fi
 echo "If this VPS provider has its own firewall (in their control panel), open UDP+TCP 3478 and UDP 49160-49400 there."
-`);
-  });
+`;
+  }
 
   // ------------------------------------------------------------------ check-ins from the regions
   // A region's address becomes a relay address everyone's app is given, and the place this server copies backups

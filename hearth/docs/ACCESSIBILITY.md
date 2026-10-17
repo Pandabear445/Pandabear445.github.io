@@ -29,9 +29,10 @@ machine that checks them:
 3. **When something changed:** `test/visual/output/` gets the new screenshot and a `.diff.png`, with changed pixels
    in magenta. If the change is intended, accept it with `npm run test:visual -- --update`.
 
-Google Fonts requests are blocked during the run, so results don't depend on the network. Times, avatar colours
-(made from random ids) and the time-of-day greeting are blanked by a test-only stylesheet. Masking alone wasn't
-enough, because dialog backdrops blur what's behind them, smearing those colours past any mask.
+The app's fonts are served by Hearth itself (`public/fonts`), so results don't depend on the network. Baselines
+made before 1.29.0 (when the fonts came from Google Fonts and were blocked during the run) need `--update` once.
+Times, avatar colours (made from random ids) and the time-of-day greeting are blanked by a test-only stylesheet.
+Masking alone wasn't enough, because dialog backdrops blur what's behind them, smearing those colours past any mask.
 
 ## What the client guarantees
 
@@ -77,6 +78,16 @@ Each item is checked by `npm run test:a11y` unless marked otherwise.
   - before this change, Tab walked through every message's five toolbar buttons on the way to the message box.
   - The code is `roveMessage`, `setCurrentMessage`, `ensureCurrentMessage` and `messageListKeys` in `app.js`.
 - Header redraws keep focus on the same button. "Show members" becomes "Hide members" without dropping focus.
+- Sidebar redraws keep focus too: if a channel (its name or its gear) or a category name had it, the new one gets
+  it (`sidebarFocus` in `app.js`). That covers opening or closing a category and live updates from other people.
+- **Arranging channels without dragging.** Dragging channels and categories is mouse-only, so every move has a menu
+  item: a channel's menu (right-click, Shift+F10, or **More** in the channel header) and a category's menu have
+  **Move up** and **Move down**. At the top or bottom of its category, a channel's item moves it into the next
+  category and says so ("Move down · to Voice", read as part of the item's name). After a move the focus stays on
+  the channel, and a toast ("#news moved up.", in the polite live region) says what happened. Moving into a
+  collapsed category opens it, so the channel is still there to focus (and to move again). If a live update
+  redrew the sidebar while the menu was open, the focus goes to the moved channel rather than the page. Items that
+  would be refused (Manage Channels denied in that channel, or in one of a category's channels) aren't offered.
 - On phones, Esc closes the navigation drawer and returns focus to its button.
 
 ### Announcements
@@ -87,8 +98,21 @@ Each item is checked by `npm run test:a11y` unless marked otherwise.
 ### Not colour alone
 - Presence dots differ by shape as well as colour: a solid dot (online), a moon (idle), a bar (do not disturb) and
   a ring (offline or invisible). They carry the status as text (`role="img"`, `aria-label`), which is kept in sync
-  when presence changes.
+  when presence changes. Automatic Away uses the same moon and label; your own panel says "Away (inactive)" in words,
+  and changes in place, so keyboard focus on its buttons stays put when you go Away or come back (and other people
+  going Away leaves the friends and member search boxes, and focus in them, as they were).
+  The custom status dialog's "Clear after" choice has a label, and the line saying when it clears is a polite live
+  region.
 - Form errors are text, tied to their field. Key-change warnings use a shield icon plus a label.
+- The word filter (`wordfilter-app.js`) says what it did in words: a hidden message is a row "Hidden by your word
+  filter" (or "this server's") with a **Show** button; a blurred one has a real button on top ("Blurred by … word
+  filter · Show") and its content is `inert` until then, so screen readers don't read out what's blurred and
+  nothing in it takes focus. A hidden row names who wrote it (unless the row above does), and the next message
+  never groups under it, so a screen reader hears the right author. Hidden rows follow the one-Tab-stop rule of the
+  message list: their Show button is only in the Tab order on the current message. The list box marks itself
+  `aria-invalid` while an entry is wrong, the problems are a polite live list under it, and the **Try it** result is
+  a polite live region. After Save, focus goes back to the Save button (the section is drawn again); a change saved
+  on another device while you type here is a status note with a button, not a silent redraw.
 
 ### Labels
 - The suite checks every visible interactive element on every screen it opens. Each needs an accessible name; it

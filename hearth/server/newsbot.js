@@ -10,7 +10,9 @@
 // encryption, not end-to-end) and the app labels them that way. Everything people write stays end-to-end.
 const crypto = require('crypto');
 const netguard = require('./netguard');
+const { avatarHost } = require('./mediasign');
 const jobs = require('./jobs');
+const DISAPPEAR = require('./disappear');
 
 const BOT_ID = 'newsbot00000000000001';
 const KINDS = {
@@ -35,10 +37,11 @@ const MAX_POSTS_PER_CHECK = 3;
 const allowPrivate = () => process.env.FEED_ALLOW_PRIVATE === '1'; // tests only: they serve feeds from localhost
 const privateIp = netguard.blockedIp;
 const assertPublic = (urlStr) => netguard.checkPublicUrl(urlStr, { allowPrivate: allowPrivate() });
-async function safeGet(urlStr, { accept = 'application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.5, */*;q=0.1', max = 3 * 1024 * 1024, timeout = 12000 } = {}) {
+// allowUrl: an extra check on every hop (a list of allowed hosts); allowHost: lets a host an admin listed be private.
+async function safeGet(urlStr, { accept = 'application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.5, */*;q=0.1', max = 3 * 1024 * 1024, timeout = 12000, allowUrl = null, allowHost = null } = {}) {
   let r;
   try {
-    r = await netguard.request(urlStr, { allowPrivate: allowPrivate(), maxRedirects: 4, timeout, maxBytes: max, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HearthNewsBot/1.0; +self-hosted chat)', Accept: accept } });
+    r = await netguard.request(urlStr, { allowUrl, allowPrivate: allowHost ? (u) => allowPrivate() || allowHost(u) : allowPrivate(), maxRedirects: 4, timeout, maxBytes: max, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HearthNewsBot/1.0; +self-hosted chat)', Accept: accept } });
   } catch (e) {
     if (e.code === 'TOO_BIG') throw new Error('The feed is too big.');
     throw e;
@@ -180,8 +183,13 @@ function parseInWorker(xml) {
 }
 
 module.exports = function setupNewsbot(ctx) {
-  const { api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer, canManageServer, serializeMessage, toChannel, checkMediaToken, emitServerFeeds, searchSteam, notifyUser } = ctx;
+  const { api, app, auth, db, fail, wrap, rateLimit, seal, newId, requireServer, canManageServer, serializeMessage, toChannel, checkMediaToken, mediaLinks, emitServerFeeds, searchSteam, notifyUser } = ctx;
   const now = () => Date.now();
+  // files-10: the signed proxy link an app loads a feed item's picture through (see /media/news below), for items the
+  // bot itself found and kept: a server feed's posts and a tracker's items. A preview (a feed tried before it's
+  // followed, 20 times in 10 minutes) shows no pictures: it would have made the proxy fetch whatever picture any
+  // signed-in person's own feed named, at once and for anyone holding the link.
+  const imageSrc = (u) => (u ? mediaLinks.sign('news', u) : null);
 
   // The bot's account: can't sign in (no password), shows a BOT tag.
   if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(BOT_ID)) {
@@ -247,8 +255,12 @@ module.exports = function setupNewsbot(ctx) {
     if (!c || c.type !== 'text') return false;
     const id = newId();
     const embed = { title: item.title, url: item.link, summary: item.summary, image: item.image, source: item.source || feed.title, date: item.date, kind: feed.kind, feedId: feed.id };
-    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)')
-      .run(id, c.id, BOT_ID, seal({ content: item.title, attachments: [], embed, bot: true }), now());
+    // A disappearing channel's timer covers news posts too (a 1-hour channel shows the last hour of news).
+    const t = now();
+    const expiresAt = DISAPPEAR.stamp({ secs: c.disappear_secs, t });
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, body, ciphertext, epoch, reply_to, created_at, thread_id, expires_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?)')
+      .run(id, c.id, BOT_ID, seal({ content: item.title, attachments: [], embed, bot: true }), t, expiresAt);
+    DISAPPEAR.arm(expiresAt);
     toChannel(c).emit('message:new', serializeMessage(db.prepare('SELECT * FROM messages WHERE id = ?').get(id), c));
     db.prepare('UPDATE feeds SET posted = posted + 1 WHERE id = ?').run(feed.id);
     return true;
@@ -299,7 +311,7 @@ module.exports = function setupNewsbot(ctx) {
   const USER_MAX_PER_CHECK = 10;
   const trackerOut = (f, unread = 0) => ({ id: f.id, kind: f.kind, kindName: (KINDS[f.kind] || {}).name || f.kind, query: f.query, title: f.title, keywords: f.keywords,
     notify: !!f.notify, paused: !!f.paused, found: f.found, unread, lastCheck: f.last_check, lastOk: f.last_ok, lastError: f.last_error, createdAt: f.created_at });
-  const itemOut = (r) => { let d = {}; try { d = JSON.parse(r.data); } catch { /* */ } return { id: r.id, feedId: r.feed_id, ...d, foundAt: r.created_at, read: !!r.read_at }; };
+  const itemOut = (r) => { let d = {}; try { d = JSON.parse(r.data); } catch { /* */ } return { id: r.id, feedId: r.feed_id, ...d, imageSrc: imageSrc(d.image), foundAt: r.created_at, read: !!r.read_at }; };
   const unreadCount = (uid) => db.prepare('SELECT COUNT(*) n FROM user_feed_items WHERE user_id = ? AND new = 1 AND read_at IS NULL').get(uid).n;
   async function checkUserFeed(feed) {
     db.prepare('UPDATE user_feeds SET last_check = ? WHERE id = ?').run(now(), feed.id);
@@ -489,11 +501,15 @@ module.exports = function setupNewsbot(ctx) {
   });
 
   // Pictures in bot posts come through this server (signed links), so news sites don't see members' IPs.
-  app.get(['/media/news', '/media/news/:key'], wrap(async (req, res) => {
-    if (!checkMediaToken(req.query.t)) return res.status(403).end();
-    rateLimit('newsimg:' + req.ip, 300, 60000);
+  // files-10: this isn't a proxy for any address a signed-in person names. It fetches only addresses this server
+  // signed when it handed them to an app (the picture of an item the bot found in a feed and kept: a news post's or
+  // a tracker item's), each link for its own address and for about a day, and only with a live session's media
+  // token. Anything else is refused before a request is made. What stays: whoever writes a feed chooses its
+  // pictures, so someone who follows a feed of their own can still have this fetch a public picture of their
+  // choosing, a few items at a time (tracker and feed checks are rate limited).
+  async function sendPicture(res, href, opts = {}) {
     try {
-      const r = await safeGet(String(req.query.u || ''), { accept: 'image/*', max: 8 * 1024 * 1024 });
+      const r = await safeGet(href, { accept: 'image/*', max: 8 * 1024 * 1024, ...opts });
       if (!/^image\/(png|jpe?g|gif|webp|avif)/i.test(r.type)) return res.status(415).end();
       res.setHeader('Content-Type', r.type.split(';')[0]);
       res.setHeader('Cache-Control', 'public, max-age=86400');
@@ -501,6 +517,20 @@ module.exports = function setupNewsbot(ctx) {
       res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
       res.end(r.body);
     } catch { res.status(404).end(); }
+  }
+  app.get(['/media/news', '/media/news/:key'], wrap(async (req, res) => {
+    const href = mediaLinks.check('news', req.query.u, req.query.e, req.query.s);
+    if (!href || !checkMediaToken(req.query.t)) return res.status(403).end();
+    rateLimit('newsimg:' + req.ip, 300, 60000);
+    await sendPicture(res, href);
+  }));
+  // Webhook posts' avatars: links signed only for known avatar hosts (see avatarHost in mediasign.js), and fetched
+  // only from those hosts, every redirect included (Gravatar, for one, redirects to any "default picture" address).
+  app.get(['/media/avatar', '/media/avatar/:key'], wrap(async (req, res) => {
+    const href = mediaLinks.check('avatar', req.query.u, req.query.e, req.query.s);
+    if (!href || !checkMediaToken(req.query.t)) return res.status(403).end();
+    rateLimit('newsimg:' + req.ip, 300, 60000);
+    await sendPicture(res, href, { allowUrl: (u) => !!avatarHost(u), allowHost: (u) => avatarHost(u) === 'extra' });
   }));
 
   return { BOT_ID, parseFeed, KINDS: Object.fromEntries(Object.entries(KINDS).map(([k, v]) => [k, v.name])), unreadUpdates: unreadCount };

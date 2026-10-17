@@ -8,8 +8,9 @@ let onChange = () => {};
 export function initActivity({ mediaToken, changed }) { token = mediaToken; onChange = changed || onChange; }
 
 export const gameImg = (id, wide = false) => `/media/game/${encodeURIComponent(id)}${wide ? '?w=1' : ''}`;
-const artKey = (u) => { let x = 5381; for (let i = 0; i < u.length; i++) x = ((x * 33) ^ u.charCodeAt(i)) >>> 0; return x.toString(36); };
-export const artUrl = (u) => (u ? `/media/art/${artKey(u)}?u=${encodeURIComponent(u)}&t=${encodeURIComponent(token())}` : '');
+// Album art loads through this server's picture proxy, with the link the server signed for that one picture (artSrc,
+// files-10). The app only adds its sign-in media token, and ignores anything but a /media/art/ link from the server.
+export const artUrl = (src) => (typeof src === 'string' && /^\/media\/art\/[\w-]+\?/.test(src) ? `${src}&t=${encodeURIComponent(token())}` : '');
 
 const ago = (since) => {
   const m = Math.max(0, Math.floor((Date.now() - since) / 60000));
@@ -64,7 +65,7 @@ export function activityCards(u, { compact = false } = {}) {
     box.append(h('div', { class: 'act-card music' },
       h('div', { class: 'act-kind' }, `Listening${where}`),
       h('div', { class: 'act-row' },
-        picture(artUrl(music.art), 'art', music.title),
+        picture(artUrl(music.artSrc), 'art', music.title),
         h('div', { class: 'act-text' },
           h('div', { class: 'act-title' }, music.title),
           music.artist ? h('div', { class: 'act-sub' }, `by ${music.artist}`) : null,

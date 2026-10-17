@@ -25,7 +25,7 @@ const db = new Database(DB_FILE);
 // Each release that changes the schema bumps SCHEMA_VERSION. If this database is older and already
 // has accounts in it, a full copy goes to data/backups/ first, so an upgrade can always be undone
 // by stopping the server and copying the file back.
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 const fromVersion = db.pragma('user_version', { simple: true });
 // v17 (data): a database written by a newer Hearth (the code was rolled back by hand, or a newer backup was
 // restored) has columns and rules this code doesn't know. Running on it anyway can break sign-in or quietly ignore
@@ -39,6 +39,7 @@ if (fromVersion > SCHEMA_VERSION) {
 }
 db.pragma('journal_mode = WAL');
 const hasData = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").get();
+let upgradeCopy = null; // the copy this upgrade made or reused (never pruned below)
 if (hasData && fromVersion < SCHEMA_VERSION) {
   const dir = path.join(DATA_DIR, 'backups');
   fs.mkdirSync(dir, { recursive: true });
@@ -55,8 +56,10 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
   const changedAt = Math.max(st.mtimeMs, st.ctimeMs);
   for (const f of fs.readdirSync(dir)) if (f.startsWith('hearth-before-') && f.endsWith('.partial')) fs.rmSync(path.join(dir, f), { force: true });
   const fresh = settled && fs.readdirSync(dir).find((f) => f.startsWith(prefix) && f.endsWith('.db') && fs.statSync(path.join(dir, f)).mtimeMs > changedAt);
-  if (fresh) log.info('db', 'upgrade_backup', { msg: `The database was already backed up before this upgrade: ${path.join(dir, fresh)}` });
-  else {
+  if (fresh) {
+    upgradeCopy = fresh;
+    log.info('db', 'upgrade_backup', { msg: `The database was already backed up before this upgrade: ${path.join(dir, fresh)}` });
+  } else {
     // VACUUM INTO makes a consistent copy through SQLite (even if something else has the file open). It's written
     // under a temporary name first, so a copy that was cut short is never taken for a complete one.
     const file = path.join(dir, `${prefix}${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
@@ -64,10 +67,15 @@ if (hasData && fromVersion < SCHEMA_VERSION) {
       db.prepare('VACUUM INTO ?').run(`${file}.partial`);
       fs.renameSync(`${file}.partial`, file);
     } catch (e) { fs.rmSync(`${file}.partial`, { force: true }); throw e; }
+    upgradeCopy = path.basename(file);
     log.info('db', 'upgrade_backup', { msg: `Backed up the database before upgrading: ${file}`, outcome: 'ok' });
   }
 }
 db.pragma('foreign_keys = ON');
+// v19 (disappearing messages): deleted rows are overwritten with zeros, in their pages and in freed pages, instead of
+// staying readable in the file until the space is reused. Per connection and not saved in the file, so on every start
+// (and outside the upgrade transaction below).
+db.pragma('secure_delete = ON');
 
 // v17 (data): every step from here to the version bump at the end runs in one transaction. An upgrade that's cut
 // short (killed, out of memory, power cut) then leaves the database exactly as it was and simply runs again on the
@@ -342,6 +350,8 @@ CREATE TABLE IF NOT EXISTS bans (
 addColumn('servers', 'theme', "TEXT NOT NULL DEFAULT '{}'");
 addColumn('servers', 'description', "TEXT NOT NULL DEFAULT ''");
 addColumn('channels', 'slowmode', 'INTEGER NOT NULL DEFAULT 0');
+// Members can pick this role themselves (server/selfroles.js). Never one with moderator powers.
+addColumn('roles', 'self_assign', 'INTEGER NOT NULL DEFAULT 0');
 
 // Instance-wide settings an admin can change from the app (e.g. the GIPHY key), overriding .env.
 db.exec(`CREATE TABLE IF NOT EXISTS instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
@@ -417,6 +427,16 @@ CREATE TABLE IF NOT EXISTS admin_log (
   created_at INTEGER NOT NULL
 );
 `);
+// v19 (server audit): a report about a message or member inside a server also goes to that server's moderators
+// (server/serveraudit.js), unless the reporter opted out. server_id is set only then; server_status is the
+// moderators' own state ('open', 'handled', 'dismissed'), separate from staff's status above, so a moderator
+// closing it never closes it for instance staff.
+addColumn('reports', 'server_id', 'TEXT');
+addColumn('reports', 'server_status', 'TEXT');
+addColumn('reports', 'server_handled_by', 'TEXT');
+addColumn('reports', 'server_handled_at', 'INTEGER');
+addColumn('reports', 'server_note', "TEXT NOT NULL DEFAULT ''");
+db.exec('CREATE INDEX IF NOT EXISTS idx_reports_server ON reports(server_id, created_at) WHERE server_id IS NOT NULL');
 
 // v7: timed suspensions (staff roles live in instance_settings).
 addColumn('users', 'suspended_until', 'INTEGER');
@@ -501,6 +521,16 @@ CREATE TABLE IF NOT EXISTS event_rsvps (
   PRIMARY KEY (event_id, user_id)
 );
 `);
+// Repeating events: one row is the series, moved on to its next time when one ends (server/recurrence.js).
+// repeat: weekly | biweekly | monthly (NULL: once). repeat_left counts the times still to come including the
+// current one (NULL: no limit). repeat_tz is the time zone the times are kept in; repeat_anchor is the start the
+// rule was set from (its time of day, and for monthly its day of the month).
+addColumn('server_events', 'repeat', 'TEXT');
+addColumn('server_events', 'repeat_until', 'INTEGER');
+addColumn('server_events', 'repeat_left', 'INTEGER');
+addColumn('server_events', 'repeat_tz', 'TEXT');
+addColumn('server_events', 'repeat_anchor', 'INTEGER');
+db.exec('CREATE INDEX IF NOT EXISTS idx_events_repeat ON server_events(starts_at) WHERE repeat IS NOT NULL');
 
 // v11: games and music people play and like, linked regions (call relays), automatic supporter payments.
 db.exec(`
@@ -600,11 +630,13 @@ CREATE TABLE IF NOT EXISTS feed_seen (
 
 // v13: sessions get a public id, an expiry and a revocation time, and the columns say what they hold.
 //   id            random, shown to the account (Settings → Sessions) to pick a device; not usable to sign in
-//   token_hash    SHA-256 of the sign-in token (the token itself is never stored)
+//   token_hash    SHA-256 of the sign-in token (the token itself is never stored); replaced in place when the
+//                 password changes, two-factor is turned on or the other devices are signed out (auth-11)
 //   last_used_at  last request; a session unused for SESSION_IDLE_DAYS expires
 //   expires_at    when it stops working even if used (SESSION_MAX_DAYS after sign-in)
 //   revoked_at    signed out (by the person, a password change/reset, 2FA, staff); rows are purged later
-//   mfa_at        when this sign-in passed two-factor (recent → sensitive changes don't ask again)
+//   mfa_at        when this sign-in last passed two-factor (recent → the two low-risk step-up changes, a data
+//                 export and clearing unused files, don't ask again; every other one always does, auth-6)
 {
   const cols = () => db.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name);
   if (cols().includes('token')) db.exec('ALTER TABLE sessions RENAME COLUMN token TO token_hash');
@@ -652,6 +684,55 @@ CREATE TRIGGER IF NOT EXISTS admin_log_no_update BEFORE UPDATE ON admin_log BEGI
 CREATE TRIGGER IF NOT EXISTS admin_log_no_delete BEFORE DELETE ON admin_log BEGIN SELECT RAISE(ABORT, 'the audit log is append-only'); END;
 `);
 }
+
+// v19 (server audit): each server's own audit log (server/serveraudit.js): who kicked, banned, timed out, changed
+// roles, channels, permissions, invites, emoji, webhooks and settings, and who deleted whose messages. Metadata
+// only, never message text. seq counts a server's entries (1, 2, 3…), so "the newest 10,000" is a cheap range.
+// Like admin_log it's append-only: the database refuses every change, and refuses deletes except the ones the
+// retention rules allow (the job in serveraudit.js): the server itself was deleted (the cascade), the entry is over
+// a year old, or it's beyond the newest 10,000 and at least 7 days old. So a flood of new entries can't push the
+// last week out, with two limits on disk use: beyond the newest 50,000, entries anyone can cause cheaply and in
+// bulk (invites, pins, reordering, settings: everything but SERVER_AUDIT_KEPT) go whatever their age, and beyond
+// the newest 200,000 everything does.
+// Moderation, which stays for at least a week below 200,000: what was done to people (roles given or taken by
+// someone else; not ones members picked themselves or got with a membership; nicknames changed by someone else, not
+// their own), their messages, permissions and roles, ownership, webhooks and bots.
+const SERVER_AUDIT_KEPT = ['member_kick', 'member_ban', 'member_unban', 'member_timeout', 'member_timeout_remove', 'member_roles',
+  'member_nickname', 'message_delete', 'message_bulk_delete', 'channel_overrides', 'channel_delete', 'role_create', 'role_update', 'role_delete',
+  'server_transfer', 'voice_disconnect', 'voice_move', 'voice_mute', 'voice_unmute',
+  'webhook_create', 'webhook_update', 'webhook_rotate', 'webhook_delete', 'bot_add', 'bot_update', 'bot_remove'];
+// The same rule as SQL, for the trigger below and the retention job (p: 'OLD.' or ''). A nickname reset by instance
+// staff (no actor) counts as moderation, hence IS rather than = (NULL = x is NULL, which the trigger and the job
+// would each read their own way); a role with no actor came with a membership.
+const serverAuditKeptSql = (p = '') => `(${p}action IN (${SERVER_AUDIT_KEPT.map((a) => `'${a}'`).join(', ')})
+    AND NOT (${p}action = 'member_roles' AND (${p}actor_id IS NULL OR ${p}actor_id = ${p}target_id))
+    AND NOT (${p}action = 'member_nickname' AND ${p}actor_id IS ${p}target_id))`;
+db.exec(`
+CREATE TABLE IF NOT EXISTS server_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  actor_id TEXT,
+  action TEXT NOT NULL,
+  target_id TEXT,
+  channel_id TEXT,
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_server_audit_seq ON server_audit(server_id, seq);
+CREATE INDEX IF NOT EXISTS idx_server_audit_server ON server_audit(server_id, id);
+CREATE INDEX IF NOT EXISTS idx_server_audit_created ON server_audit(created_at);
+CREATE INDEX IF NOT EXISTS idx_server_audit_channel ON server_audit(channel_id, action) WHERE channel_id IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS server_audit_no_update BEFORE UPDATE ON server_audit BEGIN SELECT RAISE(ABORT, 'the server audit log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS server_audit_no_delete BEFORE DELETE ON server_audit
+  WHEN EXISTS (SELECT 1 FROM servers WHERE id = OLD.server_id)
+    AND OLD.created_at > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 31536000000
+    AND OLD.seq > (SELECT MAX(seq) FROM server_audit WHERE server_id = OLD.server_id) - 200000
+    AND (OLD.seq > (SELECT MAX(seq) FROM server_audit WHERE server_id = OLD.server_id) - 50000 OR ${serverAuditKeptSql('OLD.')})
+    AND (OLD.seq > (SELECT MAX(seq) FROM server_audit WHERE server_id = OLD.server_id) - 10000
+      OR OLD.created_at > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 604800000)
+  BEGIN SELECT RAISE(ABORT, 'the server audit log is append-only'); END;
+`);
 
 // v14: server folders (synced across your devices), personal update tracking, and study tools.
 addColumn('users', 'rail_layout', "TEXT NOT NULL DEFAULT ''");
@@ -777,6 +858,10 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(session_id)');
 // it may be tried again, so a dead or hostile push service sits out instead of holding up everyone's sends.
 addColumn('push_subs', 'fails', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('push_subs', 'retry_at', 'INTEGER');
+// v19 (auth-11): …and the SHA-256 of the sign-in token it was made with. A session's token can be replaced in place
+// (a password change, two-factor turned on, "log out all other devices" with the password); a subscription made
+// with a copy of the old token then gets nothing more. Older rows have none and follow their session alone.
+addColumn('push_subs', 'token_hash', 'TEXT');
 
 // v17 (admin): owner tools hardening.
 // Subscriptions of a deleted server that Stripe hasn't confirmed as cancelled yet. The membership rows go with the
@@ -1074,6 +1159,40 @@ CREATE INDEX IF NOT EXISTS idx_bot_deliveries_due ON bot_deliveries(status, next
 CREATE INDEX IF NOT EXISTS idx_bot_deliveries_bot ON bot_deliveries(bot_id, installation_id, created_at);
 `);
 
+// Incoming webhooks (server/webhooks.js): a secret address per channel that programs post to, the way they post to
+// Discord or Slack. Only a SHA-256 hash of the secret is kept. Each one posts as its own bot account (bot_user_id: a
+// users row with is_bot = 1 and no bots row, so it can't sign in or use the bot API). created_by is whoever made its
+// current address. A deleted webhook whose posts are still in the channel stays as a tombstone (deleted_at, with a
+// secret nobody has) so the posts keep their author. A row goes for good with its channel or server, or when a webhook
+// with no posts is deleted; nothing of its account is then shown anywhere, so the trigger wipes it like a deleted
+// person's account (a freed username, a placeholder name). Rows in users are never removed: each removal would scan
+// the whole messages table for that author.
+db.exec(`
+CREATE TABLE IF NOT EXISTS channel_webhooks (
+  id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  bot_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  allow_mentions INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  rotated_at INTEGER,
+  last_used_at INTEGER,
+  deleted_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_channel_webhooks_channel ON channel_webhooks(channel_id);
+CREATE INDEX IF NOT EXISTS idx_channel_webhooks_server ON channel_webhooks(server_id);
+CREATE INDEX IF NOT EXISTS idx_channel_webhooks_user ON channel_webhooks(bot_user_id);
+DROP TRIGGER IF EXISTS channel_webhooks_gone;
+CREATE TRIGGER IF NOT EXISTS channel_webhooks_retire AFTER DELETE ON channel_webhooks BEGIN
+  UPDATE users SET username = 'deleted-' || lower(hex(randomblob(6))), profile = '{"displayName":"Deleted webhook"}', avatar = NULL,
+    deleted_at = COALESCE(deleted_at, CAST(strftime('%s', 'now') AS INTEGER) * 1000)
+    WHERE id = OLD.bot_user_id AND is_bot = 1;
+END;
+`);
+
 // Test hook for the upgrade drill (scripts/upgrade-drill.sh, test/recovery-upgrade.test.js): the process dies here,
 // with every step above done but not committed, exactly like a crash or a power cut in the middle of an upgrade.
 // Only with NODE_ENV=test, so a stray variable on a real server does nothing.
@@ -1144,6 +1263,59 @@ CREATE TABLE IF NOT EXISTS member_timeouts (
 CREATE INDEX IF NOT EXISTS idx_member_timeouts_until ON member_timeouts(until);
 `);
 
+// v19 (threads): read state for threads. A thread's read marker is a read_states row keyed t:<root id>, and
+// "Mark as read" on a channel or server also writes ct:<channel id> ("every thread here is read up to"). A thread
+// reply's pings go in mention_marks under ct:<channel id> with the thread's root in thread_id, so they count in the
+// channel's badge until that thread is read. thread_activity is each thread's newest reply, so a channel's threads
+// list by latest reply is one index range instead of a look at every thread in it. Replies are only ever written by
+// POST /channels/:id/messages, which records them here; removals go through triggers, since messages are deleted in
+// many ways (a message, a thread, bulk and ban cleanups, deleted channels). An insert trigger would cost every message
+// insert (top-level ones too) about half as much again.
+addColumn('mention_marks', 'thread_id', 'TEXT');
+const hadThreadActivity = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_activity'").get();
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_mention_marks_thread ON mention_marks(thread_id, user_id, message_id) WHERE thread_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS thread_activity (
+  root_id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  last_reply_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_thread_activity_channel ON thread_activity(channel_id, last_reply_id);
+CREATE TRIGGER IF NOT EXISTS thread_activity_unreply AFTER DELETE ON messages WHEN OLD.thread_id IS NOT NULL BEGIN
+  DELETE FROM thread_activity WHERE root_id = OLD.thread_id AND NOT EXISTS (SELECT 1 FROM messages WHERE thread_id = OLD.thread_id);
+  UPDATE thread_activity SET last_reply_id = (SELECT MAX(id) FROM messages WHERE thread_id = OLD.thread_id)
+    WHERE root_id = OLD.thread_id AND last_reply_id = OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS thread_activity_root_gone AFTER DELETE ON messages WHEN OLD.thread_id IS NULL BEGIN
+  DELETE FROM thread_activity WHERE root_id = OLD.id;
+END;
+`);
+// Threads from before this table: filled once, from the replies already there (only those whose root still exists).
+if (!hadThreadActivity) {
+  db.prepare(`INSERT OR IGNORE INTO thread_activity (root_id, channel_id, last_reply_id)
+    SELECT t.thread_id, r.channel_id, t.last FROM (SELECT thread_id, MAX(id) AS last FROM messages WHERE thread_id IS NOT NULL GROUP BY thread_id) t
+    JOIN messages r ON r.id = t.thread_id AND r.thread_id IS NULL`).run();
+}
+
+// Server mutes (moderator toolkit): someone a moderator muted in voice for everyone. It stays when they leave the
+// call or the server and come back, until a moderator lifts it; it goes with the server or the account.
+db.exec(`
+CREATE TABLE IF NOT EXISTS voice_mutes (
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  by_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (server_id, user_id)
+);
+`);
+
+// v19 (away and status expiry): away_after is how many minutes without input before someone whose status is
+// Online shows as Away (5, 10, 15 or 30; 0 = never). status_expires_at is when their custom status clears by itself
+// (NULL = when they clear it); the sweep in server/presence.js finds the due ones through the partial index.
+addColumn('users', 'away_after', 'INTEGER NOT NULL DEFAULT 10');
+addColumn('users', 'status_expires_at', 'INTEGER');
+db.exec('CREATE INDEX IF NOT EXISTS idx_users_status_expires ON users(status_expires_at) WHERE status_expires_at IS NOT NULL;');
+
 // v18 (voice reliability): a version number for each call's region. Every change bumps it, so when two people
 // switch the region at the same moment the last write wins and every app settles on the newest one, whatever
 // order the announcements arrive in.
@@ -1165,10 +1337,273 @@ CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_dm_messages_created ON dm_messages(created_at);
 `);
 
+// v19 (disappearing messages): a timer per conversation (seconds, 0 = off) and a deadline per message, stamped when
+// the server stores it (NULL = never; see server/disappear.js). blobs carry their message's deadline, so /uploads/
+// can refuse an expired file with one lookup. disappear_log is who changed a conversation's timer, from what to what
+// and when (the line the apps show in the conversation); conv is 'c:<channel>' | 'd:<dm>' like read_states, and at
+// most 50 are kept per conversation. The partial indexes only ever hold disappearing messages (the sweep reads them
+// in deadline order); saved_messages and pin_log get an index by message, which the sweep deletes by.
+// Adding a column with a constant default doesn't rewrite the table, so this is quick on a big database.
+addColumn('channels', 'disappear_secs', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('dm_channels', 'disappear_secs', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('messages', 'expires_at', 'INTEGER');
+addColumn('dm_messages', 'expires_at', 'INTEGER');
+addColumn('blobs', 'expires_at', 'INTEGER');
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dm_messages_expires ON dm_messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_saved_messages_message ON saved_messages(message_id);
+CREATE INDEX IF NOT EXISTS idx_pin_log_message ON pin_log(message_id);
+CREATE TABLE IF NOT EXISTS disappear_log (
+  id TEXT PRIMARY KEY,
+  conv TEXT NOT NULL,
+  user_id TEXT,
+  secs INTEGER NOT NULL,
+  prev_secs INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disappear_log_conv ON disappear_log(conv, created_at);
+`);
+
+// v19 (discord import): imports into a server (server/imports.js). Phase 1 writes one 'discord_template' row per
+// server created from a Discord template, with its report (counts, what was skipped and why: names of roles and
+// channels, never file contents), and import_map rows from the template's keys to the roles and channels made.
+// The other kinds, statuses and columns are for the later phases (emoji, then history; docs/design/DISCORD-IMPORT.md),
+// so they won't need a table rebuild. A server's imports go with it.
+db.exec(`
+CREATE TABLE IF NOT EXISTS server_imports (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('discord_template','discord_emoji','discord_history')),
+  status TEXT NOT NULL DEFAULT 'done' CHECK (status IN ('running','done','failed','undone')),
+  source TEXT NOT NULL DEFAULT '',
+  epoch INTEGER,
+  channels TEXT NOT NULL DEFAULT '[]',
+  total INTEGER NOT NULL DEFAULT 0,
+  done INTEGER NOT NULL DEFAULT 0,
+  report TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_server_imports_server ON server_imports(server_id, created_at);
+CREATE TABLE IF NOT EXISTS import_map (
+  import_id TEXT NOT NULL REFERENCES server_imports(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('role','channel','emoji','message')),
+  source_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  PRIMARY KEY (import_id, kind, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_import_map_target ON import_map(kind, target_id);
+`);
+
+// v19 (voice chat): a server's voice channels have a text chat now (POST /channels/:id/messages takes them). Nobody
+// could be denied Send Messages on a voice channel before (the permission editor didn't offer it there), so without
+// this the limits a server had on posting wouldn't reach the chats of the voice channels it already had. Once, for
+// the voice channels there at the upgrade (marked done in instance_settings, in this same transaction):
+//   - whoever may not join its call (an override there denying Connect) may not post in its chat either;
+//   - whoever is denied Send Messages in every text channel they aren't hidden from (a "Muted" role, @everyone on a
+//     read-only server) is denied it in the server's voice chats too;
+//   - when every text channel has slow mode, the voice chats get the shortest of them.
+// Only ever more limits (an explicit allow is left alone), and each change goes in the server's audit log, by Hearth,
+// so its admins can see why and open a chat up in its Permissions. Voice channels made after this start open.
+if (!db.prepare("SELECT 1 FROM instance_settings WHERE key = 'voiceChatLimits'").get()) {
+  const { PERMS: PB } = require('./perms');
+  const ovOf = db.prepare('SELECT target_type AS type, target_id AS id, allow, deny FROM channel_overrides WHERE channel_id = ?');
+  const putDeny = db.prepare(`INSERT INTO channel_overrides (channel_id, target_type, target_id, allow, deny) VALUES (?, ?, ?, 0, ?)
+    ON CONFLICT(channel_id, target_type, target_id) DO UPDATE SET deny = excluded.deny`);
+  const audit = db.prepare(`INSERT INTO server_audit (server_id, seq, actor_id, action, target_id, channel_id, detail, created_at)
+    SELECT ?, COALESCE(MAX(seq), 0) + 1, NULL, ?, ?, ?, ?, ? FROM server_audit WHERE server_id = ?`);
+  const roleName = db.prepare('SELECT name FROM roles WHERE id = ?');
+  const everyoneRole = db.prepare('SELECT permissions FROM roles WHERE id = ?');
+  const same = (a, b) => a.type === b.type && a.id === b.id;
+  for (const s of db.prepare("SELECT id FROM servers WHERE kind != 'group'").all()) {
+    const chans = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, created_at').all(s.id);
+    const voice = chans.filter((c) => c.type === 'voice');
+    if (!voice.length) continue;
+    const text = chans.filter((c) => c.type === 'text').map((c) => ({ c, ov: ovOf.all(c.id) }));
+    const everyone = { type: 'role', id: s.id };
+    // Hidden from a target: its own override denies View, or @everyone's does and its own doesn't allow it back.
+    const hidden = (t, x) => {
+      const own = x.ov.find((o) => same(o, t)); const all = x.ov.find((o) => same(o, everyone));
+      return !!(own && own.deny & PB.VIEW_CHANNEL) || (!same(t, everyone) && !!(all && all.deny & PB.VIEW_CHANNEL) && !(own && own.allow & PB.VIEW_CHANNEL));
+    };
+    const cantPost = [];
+    for (const x of text) {
+      for (const o of x.ov) {
+        if (!(o.deny & PB.SEND_MESSAGES) || cantPost.some((t) => same(t, o))) continue;
+        const seen = text.filter((y) => !hidden(o, y));
+        if (seen.length && seen.every((y) => y.ov.some((p) => same(p, o) && p.deny & PB.SEND_MESSAGES && !(p.allow & PB.SEND_MESSAGES)))) cantPost.push({ type: o.type, id: o.id });
+      }
+    }
+    const slow = text.length && text.every((x) => x.c.slowmode > 0) ? Math.min(...text.map((x) => x.c.slowmode)) : 0;
+    const roleOk = everyoneRole.get(s.id);
+    for (const v of voice) {
+      const ov = ovOf.all(v.id);
+      const deny = new Map(); // `${type}:${id}` -> { target, was }
+      const add = (t) => {
+        const o = ov.find((x) => same(x, t)) || { type: t.type, id: t.id, allow: 0, deny: 0 };
+        if ((o.allow | o.deny) & PB.SEND_MESSAGES) return; // already decided for this channel
+        deny.set(`${t.type}:${t.id}`, o);
+      };
+      for (const o of ov) if (o.deny & PB.CONNECT) add(o);
+      for (const t of cantPost) add(t);
+      const changes = [];
+      for (const o of deny.values()) {
+        putDeny.run(v.id, o.type, o.id, o.deny | PB.SEND_MESSAGES);
+        const name = o.type === 'role' ? (o.id === s.id ? '@everyone' : (roleName.get(o.id) || {}).name || '') : '';
+        changes.push({ type: o.type, id: o.id, name, allow: o.allow, deny: o.deny | PB.SEND_MESSAGES, was: { allow: o.allow, deny: o.deny } });
+      }
+      // The same "private" mark the audit log gives channels some members can't see (perms.restricted).
+      const priv = (roleOk && !(roleOk.permissions & PB.VIEW_CHANNEL)) || ov.some((o) => o.deny & PB.VIEW_CHANNEL);
+      const channel = { id: v.id, name: v.name, ...(priv ? { private: true } : {}) };
+      const t = Date.now();
+      if (changes.length) audit.run(s.id, 'channel_overrides', v.id, v.id, JSON.stringify({ channel, changes: changes.slice(0, 25), voiceChat: true }), t, s.id);
+      if (slow && !v.slowmode) {
+        db.prepare('UPDATE channels SET slowmode = ? WHERE id = ?').run(slow, v.id);
+        audit.run(s.id, 'channel_update', v.id, v.id, JSON.stringify({ channel, changes: { slowmode: { from: 0, to: slow } }, voiceChat: true }), t, s.id);
+      }
+    }
+  }
+  db.prepare("INSERT INTO instance_settings (key, value) VALUES ('voiceChatLimits', ?)").run(String(Date.now()));
+}
+
+// v19 (scheduled messages): "Send later" (server/scheduled.js). The sender's app encrypts the message exactly as it
+// would to send it now; this holds the ciphertext until send_at, then posts it as a new message. Only ciphertext,
+// never text. channel_id and dm_id have no foreign key on purpose: when the channel or DM is gone by send time, the
+// row stays so the sender can be told (it fails then). epoch is the server key a channel message is locked with;
+// own_key and peer_key are fingerprints of the public keys it was written with (the sender's, and in a DM the other
+// person's), so a key change before send time is noticed and the message held for re-encrypting instead of being
+// posted unreadable. draft is the sender's own copy of what they scheduled, sealed with their personal vault key
+// and bound to ref (an id their app picks), the conversation and the thread: their app re-encrypts only from that
+// copy, so nothing else the server holds can be passed off as something they scheduled. session_id is the session
+// that last wrote it: when that session ends (logout, revoked, password changed), the message is held until the
+// person confirms it from one still signed in. ttl is the disappearing-messages timer the app encrypted it for (in
+// seconds, 0 = none; NULL from an app that didn't say): when it's posted, its deadline counts from then, by the
+// conversation's timer at that moment, and never later than ttl (server/disappear.js, sendSecs in index.js).
+// status: pending, held (needs re-encrypting or confirming by the sender's app) or failed (kept a week so the
+// sender sees why); told_at is when the sender was told one that came due is held. Attachments are blobs whose
+// message_id is this row's id until it's sent.
+db.exec(`
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  server_id TEXT,
+  channel_id TEXT,
+  dm_id TEXT,
+  thread_id TEXT,
+  reply_to TEXT,
+  ciphertext TEXT NOT NULL,
+  epoch INTEGER,
+  ref TEXT,
+  draft TEXT,
+  session_id TEXT,
+  own_key TEXT NOT NULL,
+  peer_key TEXT,
+  ttl INTEGER,
+  files TEXT NOT NULL DEFAULT '[]',
+  mentions TEXT NOT NULL DEFAULT '[]',
+  everyone INTEGER NOT NULL DEFAULT 0,
+  send_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','held','failed')),
+  reason TEXT,
+  told_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK ((channel_id IS NULL) != (dm_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_messages(status, send_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_user ON scheduled_messages(user_id, send_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_server ON scheduled_messages(server_id, status) WHERE server_id IS NOT NULL;
+`);
+
+// v19 (nicknames): the name someone goes by in one server (server/nicknames.js); NULL for none, so their display
+// name shows there. It belongs to the membership: leaving, a kick or a ban takes it away with the row.
+addColumn('members', 'nickname', 'TEXT');
+// Everyone may set their own nickname by default (Change Nickname is in @everyone for new servers). Servers from
+// before this version get it once, as they upgrade to it, so it's on for them too. This never runs again on a
+// database already at v19, so a server that turns it off later keeps it off.
+if (hasData && fromVersion < 19) {
+  db.prepare("UPDATE roles SET permissions = permissions | ? WHERE id = server_id AND server_id IN (SELECT id FROM servers WHERE COALESCE(kind, 'server') != 'group')")
+    .run(PERMS.CHANGE_NICKNAME);
+}
+
+// v19 (crypto-2): a password reset without the recovery key gives the account brand-new keys, which anyone who got
+// into its email could do. keys_reset_at says when, for as long as the account is still held back somewhere: in a
+// server or group where nobody who knew them before has checked the new keys (compared safety numbers and said so),
+// nobody's app hands them that server's or group's key, and they can't invite anyone there or add people to it.
+// key_vouches: where someone did, for which reset. A member's word only counts in the servers and groups they're in
+// themselves (keys they hold anyway), so a second account someone put in a public server can't open the private
+// ones. Once every server and group they were in before the reset has one (or an instance admin verifies them),
+// keys_reset_at goes and keys_vouched_by/_at say who did it last, and when. Only accounts that share a server or
+// group with someone are marked, and none retroactively (see docs/ENGINEERING-REPORT.md). The partial index holds
+// only the few marked accounts: every key-state lookup asks which members of a server are marked.
+addColumn('users', 'keys_reset_at', 'INTEGER');
+addColumn('users', 'keys_vouched_by', 'TEXT');
+addColumn('users', 'keys_vouched_at', 'INTEGER');
+db.exec(`CREATE INDEX IF NOT EXISTS idx_users_keys_reset ON users(keys_reset_at) WHERE keys_reset_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS key_vouches (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  reset_at INTEGER NOT NULL,
+  voucher_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, server_id)
+);`);
+
+// v19 (word filters): server/wordfilter.js. word_filters holds each person's own list, sealed by their app with their
+// personal vault key (ciphertext only: the server never sees a word of it); data NULL once they delete it. A server's
+// suggested list is plain text in servers.word_filter ({ words, action, updatedAt } as JSON, NULL for none): every
+// member's app reads it, and matching happens only on their devices.
+db.exec(`
+CREATE TABLE IF NOT EXISTS word_filters (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  data TEXT,
+  updated_at INTEGER NOT NULL
+);
+`);
+addColumn('servers', 'word_filter', 'TEXT');
+
+// v19 (join history): "New members can't read messages from before they joined", a server setting (off by default;
+// server/joinhistory.js). hide_history: the setting. join_rotate_at: when a join that's waiting for the next key may
+// have it (joins close together share one new key; NULL when nobody is waiting). members.key_from: for someone who
+// joined while it was on, the first key epoch they may hold (their history starts at joined_at with that key); NULL
+// for everyone else, who see everything as before. It belongs to the membership, so leaving takes it with the row.
+// The partial indexes only hold those members: the one live events check per message, and the ones a message from
+// before some people joined is kept from.
+addColumn('servers', 'hide_history', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('servers', 'join_rotate_at', 'INTEGER');
+addColumn('members', 'key_from', 'INTEGER');
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_members_key_from ON members(server_id, key_from) WHERE key_from IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_members_history_joined ON members(server_id, joined_at) WHERE key_from IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_servers_join_rotate ON servers(join_rotate_at) WHERE join_rotate_at IS NOT NULL;
+`);
+
+// v19 (invite link previews): whether a link to /invite/<code> shows this server's name and member count to people
+// who aren't signed in and to link-preview bots (server/invitepreview.js). Off by default: the card then only says
+// "You're invited to a server on <instance>".
+addColumn('servers', 'invite_preview', 'INTEGER NOT NULL DEFAULT 0');
+
 if (fromVersion < SCHEMA_VERSION) db.pragma(`user_version = ${SCHEMA_VERSION}`);
 db.exec('COMMIT');
 MIGRATING = false;
 if (anchorAfterCommit) writeAnchor(...anchorAfterCommit);
+
+// v19 (data-4 / crypto-8): the upgrade went through, so older pre-upgrade copies beyond the newest PRE_UPGRADE_KEEP
+// (3 by default, 0 = keep all) are removed; see server/upgradecopies.js. Only after the commit: while an upgrade can
+// still fail, every copy stays. The copy made (or reused) for this upgrade is never removed.
+if (upgradeCopy) {
+  const UC = require('./upgradecopies');
+  let keep = UC.keepSetting();
+  if (keep === null) {
+    keep = UC.DEFAULT_KEEP;
+    log.warn('db', 'upgrade_backup_keep', { msg: `PRE_UPGRADE_KEEP must be a whole number (0 keeps every copy); using ${keep}.` });
+  }
+  const removed = UC.pruneUpgradeCopies(path.join(DATA_DIR, 'backups'), { keep, protect: upgradeCopy });
+  if (removed.length) log.info('db', 'upgrade_backup_pruned', { msg: `Removed ${removed.length} older pre-upgrade database ${removed.length === 1 ? 'copy' : 'copies'} (keeping the newest ${keep}): ${removed.join(', ')}` });
+}
 
 // v17 (admin): where the audit log's keyed part starts, checked on every start. Only once the upgrade above has
 // committed: the anchor file is outside the database, so written during the upgrade it would outlive a rollback (a
@@ -1224,4 +1659,4 @@ db.prepare = (sql) => {
   return st;
 };
 
-module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION };
+module.exports = { db, seal, unseal, newId, DATA_DIR, UPLOAD_DIR, atRestKey, auditHash, auditAppend, auditVerify, sealSecret, openSecret, SCHEMA_VERSION, SERVER_AUDIT_KEPT, serverAuditKeptSql };
