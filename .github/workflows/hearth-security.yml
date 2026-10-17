@@ -1,5 +1,5 @@
 # Security checks for the Hearth server.
-#   Runs on every push and pull request that changes hearth/ or .github/, every Monday (new vulnerabilities
+#   Runs on every push and pull request that changes hearth/, .github/ or the landing site, every Monday (new vulnerabilities
 #   get published all the time, even when the code doesn't change), and from the Actions tab ("Run workflow").
 #   - tests:   Hearth's test suite (npm test).
 #   - audit:   known vulnerabilities in the server's npm dependencies (fails on high/critical).
@@ -21,10 +21,18 @@ on:
     paths:
       - 'hearth/**'
       - '.github/**'
+      - '*.html'
+      - 'sitemap.xml'
+      - 'robots.txt'
+      - '_config.yml'
   pull_request:
     paths:
       - 'hearth/**'
       - '.github/**'
+      - '*.html'
+      - 'sitemap.xml'
+      - 'robots.txt'
+      - '_config.yml'
   schedule:
     - cron: '17 5 * * 1'
   workflow_dispatch:
