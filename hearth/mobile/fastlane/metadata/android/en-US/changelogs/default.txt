@@ -1,0 +1,2 @@
+• The APK no longer carries Google's encrypted list of the app's libraries, so open-source app stores such as IzzyOnDroid can check it.
+• A store listing (text, icon and screenshots) for IzzyOnDroid, F-Droid and Google Play.

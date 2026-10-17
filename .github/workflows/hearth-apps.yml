@@ -343,6 +343,13 @@ jobs:
                   versionCode $VERSION_CODE
                   versionName "$VERSION_NAME"
               }
+              // Keep the build's list of libraries (encrypted so only Google can read it) out of the APK's signing
+              // block: IzzyOnDroid's scanner flags it and F-Droid's signature copying fails on it. The Play bundle
+              // keeps it, for Play Console's library checks.
+              dependenciesInfo {
+                  includeInApk = false
+                  includeInBundle = true
+              }
           }
           // Signed only with your own key (the ANDROID_KEYSTORE_* secrets); without one the release APK stays unsigned.
           if (System.getenv("HEARTH_KEYSTORE")) {

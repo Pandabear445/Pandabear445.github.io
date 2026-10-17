@@ -436,25 +436,34 @@ Hearth from the Play Store with no warnings, and get updates automatically.
 
 ### Google's developer verification (2026)
 
-Google is also starting to require that apps on certified Android phones come from **verified developers**,
-including apps installed outside Play. It starts with Brazil, Indonesia, Singapore and Thailand
-(scheduled for 30 September 2026) and is planned to reach everywhere in 2027. What it means for Hearth:
+Google is also starting to require that apps on certified Android phones come from **verified developers**.
+From 30 September 2026 that applies in Brazil, Indonesia, Singapore and Thailand, to apps installed or updated
+from participating app stores (Google Play and some phone makers' stores). Google's FAQ says an APK people install
+directly (from your server or GitHub) isn't covered yet; that's planned for every country in 2027, with no exact
+date. What it means for Hearth:
 
-- If you use Google Play (below), you're verified through your Play Console account. Register the package name
-  `app.hearth.mobile` there too, with the APK signed by the key from the `ANDROID_KEYSTORE_*` secrets, so the
-  APK from your server counts as yours.
-- Without Play, you can verify for free in Google's **Android Developer Console**. There's also a free
-  "limited distribution" account for students and hobbyists that allows installs on up to 20 devices.
-- Phones in those countries that install an app from an unverified developer get extra steps (an "advanced"
-  flow with a waiting period), and `adb install` keeps working for technical users.
+- If you use Google Play (below), you're verified through your Play Console account. Creating the app there
+  registers the package name `app.hearth.mobile`; with Play using your own key (step 4 below), the APK from your
+  server and GitHub, signed with the same key, counts as yours.
+- Without Play, you verify in Google's **Android Developer Console**: a **full distribution** account costs
+  **$25** and needs a government photo ID; a free **limited distribution** account (for students and hobbyists)
+  only allows installs on up to 20 devices that accept your invitation.
+- Once it applies, phones that install an app from an unverified developer get extra steps (an "advanced" flow
+  with a one-time waiting period), and `adb install` keeps working for technical users.
 
 Details change; see [developer.android.com/developer-verification](https://developer.android.com/developer-verification).
 
 ### Google Play internal testing: step by step
 
+The plain walkthrough for a first-time owner, with ready-to-paste answers for every Play Console form (and
+IzzyOnDroid): [ANDROID-STORES.md](ANDROID-STORES.md). This section is the short version.
+
 **Cost:** **$25 once** for a Google Play developer account. Google verifies your identity (government ID, and
 for new personal accounts an Android phone for verification). Internal testing has **no review wait and no
-"12 testers for 14 days" rule**; that rule only applies before publishing publicly (production).
+"12 testers for 14 days" rule**. That rule comes before publishing publicly (production): a personal account
+made after 13 November 2023 first runs a test on the **Closed testing** track, with at least 12 testers opted in
+for 14 days in a row. The workflow only uploads to internal testing, so you move a release to the closed track by
+hand (*Promote release*).
 
 1. **Add your signing key**, as described in `hearth/mobile/README.md` → *Signing* (without it the workflow
    only builds an unsigned APK): make `hearth.jks` and add the secrets `ANDROID_KEYSTORE_BASE64`,
@@ -476,9 +485,10 @@ for new personal accounts an Android phone for verification). Internal testing h
    the "upload key" and the two versions can't update each other.)
 5. **First upload by hand:** *Test and release → Testing → Internal testing → Create new release*, upload the
    `.aab` from the latest workflow run's **hearth-android-play-bundle** artifact, and roll it out.
-6. **Fill in the required forms** under *Policy → App content*: privacy policy (a URL; required because the app
-   uses the microphone and camera; your server's terms/privacy page is fine), data safety, ads (none),
-   content rating, target audience, and app access (give a test login, since the app needs an account).
+6. **Fill in the required forms** under *App content*: privacy policy (every app needs one:
+   `https://pandabear445.github.io/Hearth-chat/privacy.html`), data safety, ads (none), advertising ID (no),
+   content rating, target audience, foreground service (microphone, for calls) and app access (give a test login,
+   since the app needs an account). The answers, ready to paste: [ANDROID-STORES.md](ANDROID-STORES.md#46-app-content-the-forms-with-answers).
 7. **Add testers:** *Internal testing → Testers →* create an email list with your friends' Google account
    emails, save, and send them the **opt-in link**. They accept once, then install Hearth from the Play Store.
 8. **Automatic uploads from GitHub:**

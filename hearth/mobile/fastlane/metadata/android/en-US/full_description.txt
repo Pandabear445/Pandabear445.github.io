@@ -1,0 +1,35 @@
+Hearth is a chat app for friend groups and communities: servers with text and voice channels, direct messages, group chats, and voice and video calls.
+
+Messages and files are end-to-end encrypted on your phone before they are sent, so the server stores them in a form it can't read. Calls are encrypted between the people in them.
+
+The app connects to the free community server, kappachat.duckdns.org, by default. You can switch to any Hearth server you or your friends run: Settings → Apps & devices → Switch server. Hearth is open source (MIT), and the server runs on your own computer or a small VPS.
+
+WHAT THE ANDROID APP ADDS
+• Notifications about messages and calls, also after you swipe the app away. For that you need a UnifiedPush distributor app, such as ntfy (free). Without one, notifications only arrive while Hearth is open or in the background.
+• Calls keep going with the screen locked, with an "In a call" notification that has a Hang up button.
+• Invite links (hearth://invite/...) open in the app.
+• Attachments and exports save to Downloads/Hearth.
+• Links to other websites open in your browser. Only your Hearth server loads inside the app.
+• If your server uses a self-signed certificate, the app shows its fingerprint, asks once, and then remembers that exact certificate.
+
+IN HEARTH
+• Servers with categories, roles and permissions, threads, replies, reactions, pins, polls and events.
+• Direct messages, and group chats with up to 25 people.
+• Voice and video calls, voice messages, and watch together: a YouTube or Vimeo video, a Twitch stream or a video file, in sync for everyone in the call.
+• Profiles you can make your own: pictures, colors, fonts, effects and a full profile page.
+• Disappearing messages, scheduled messages and reminders.
+• Message search runs on your phone, so the server never sees the words you search for.
+• Report and block people. Server owners get moderation tools.
+• Two-factor sign-in and a recovery key.
+
+NOT IN THE ANDROID APP YET
+• Screen sharing.
+• A full-screen incoming call screen. Calls ring as a notification.
+
+PRIVACY
+No ads and no tracking. The app has no analytics or advertising code and no Google Play Services.
+The server you use can see who is in which server, who messages whom and when, profiles, online status and IP addresses, but not what your messages and files say.
+Some features contact other sites, which then see your IP address: the YouTube, Vimeo and Twitch players, pictures from other sites that you choose to load, and the STUN servers that help calls connect (Google's, unless the server's owner sets others).
+Details: https://github.com/Pandabear445/Hearth-chat/blob/main/hearth/SECURITY.md
+
+Source code: https://github.com/Pandabear445/Hearth-chat

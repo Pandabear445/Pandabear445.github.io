@@ -811,7 +811,126 @@ test('workflows: release secrets only in "production" jobs that install no npm p
     assert.match(steps[refuse], /nocaseglob/);
   }
 });
-const stepNamed = (f, name) => stepsOf(jobsOf(fs.readFileSync(f, 'utf8')).jobs['publish-to-vps'] || '').find((s) => s.includes(`name: ${name}`));
+
+// ------------------------------------------------------------------ the Android app in the stores (docs/ANDROID-STORES.md)
+// Top-level `name { ... }` blocks of a Gradle file, with what comes before each brace as its head.
+function gradleBlocks(src) {
+  const text = src.replace(/\/\/[^\n]*/g, '');
+  const out = []; let depth = 0; let start = -1; let head = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '{') {
+      if (depth === 0) { head = /([^\n;{}]*)$/.exec(text.slice(0, i))[1].trim(); start = i + 1; }
+      depth++;
+    } else if (text[i] === '}') {
+      depth--;
+      assert.ok(depth >= 0, 'braces balance');
+      if (depth === 0) out.push({ head, body: text.slice(start, i) });
+    }
+  }
+  assert.equal(depth, 0, 'braces balance');
+  return out;
+}
+const appsWorkflow = path.join(ROOT, '..', '.github', 'workflows', 'hearth-apps.yml');
+
+test('android build: the APK leaves out the dependency-info signing block (IzzyOnDroid, F-Droid), the Play bundle keeps it, and the APK keeps the name IzzyOnDroid looks for', { skip: (!fs.existsSync(appsWorkflow) || !has('bash')) && 'needs the apps workflow and bash' }, () => {
+  const { jobs } = jobsOf(fs.readFileSync(appsWorkflow, 'utf8'));
+  const step = stepsOf(jobs.android).find((s) => s.includes('name: Create the Android project'));
+  assert.ok(step, 'the android job creates the project');
+  // The heredoc appended to build.gradle, run as the runner runs it (YAML removes the block's indentation).
+  const lines = runScripts(step)[0].split('\n');
+  const ind = Math.min(...lines.filter((l) => l.trim()).map((l) => l.search(/\S/)));
+  const script = lines.map((l) => l.slice(ind)).join('\n');
+  const start = script.indexOf('cat >> android/app/build.gradle <<EOF');
+  const close = /\nEOF(?:\n|$)/.exec(script.slice(start));
+  assert.ok(start >= 0 && close, 'the build.gradle additions are one heredoc');
+  const end = start + close.index;
+  const t = tmp();
+  try {
+    fs.mkdirSync(path.join(t, 'android', 'app'), { recursive: true });
+    const r = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script.slice(start, end + 4)], { cwd: t, encoding: 'utf8', env: { ...process.env, VERSION_CODE: '12900100', VERSION_NAME: '1.29.1' } });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const gradle = fs.readFileSync(path.join(t, 'android', 'app', 'build.gradle'), 'utf8');
+    assert.match(gradle, /versionCode 12900100\n\s+versionName "1\.29\.1"/);
+    assert.match(gradle, /implementation "androidx\.webkit:webkit:\$androidxWebkitVersion"/, 'Gradle, not the shell, reads that version');
+    // In an android { } block of its own, not the one that only signed builds get.
+    const infos = gradleBlocks(gradle).filter((b) => b.head === 'android').flatMap((b) => gradleBlocks(b.body)).filter((b) => b.head === 'dependenciesInfo');
+    assert.equal(infos.length, 1, 'one dependenciesInfo block, for every build');
+    assert.match(infos[0].body, /^\s*includeInApk = false\s*$/m, 'not in the APK');
+    assert.match(infos[0].body, /^\s*includeInBundle = true\s*$/m, 'still in the Play bundle');
+    assert.doesNotMatch(gradle, /includeInApk = true/);
+  } finally { fs.rmSync(t, { recursive: true, force: true }); }
+  // IzzyOnDroid takes the release's Hearth-<version>.apk (pattern ^Hearth-[0-9.]+\.apk$), not the Hearth.apk copy.
+  assert.match(jobs.android, /cp app\/build\/outputs\/apk\/release\/app-release\.apk "\.\.\/dist\/Hearth-\$VERSION_NAME\.apk"/);
+  const izzy = /^Hearth-[0-9.]+\.apk$/;
+  assert.ok(izzy.test('Hearth-1.29.1.apk') && !izzy.test('Hearth.apk') && !izzy.test('Hearth-1.30.0-beta.1.apk'));
+  assert.match(read('docs/ANDROID-STORES.md'), /\^Hearth-\[0-9\.\]\+\\\.apk\$/);
+});
+
+// Width, height, bit depth and colour type (2: RGB, 6: RGB with alpha) from a PNG's header.
+function pngInfo(file) {
+  const b = fs.readFileSync(file);
+  assert.equal(b.toString('latin1', 1, 4), 'PNG', `${file} is a PNG`);
+  return { w: b.readUInt32BE(16), h: b.readUInt32BE(20), depth: b[24], color: b[25], size: b.length };
+}
+
+test('android store listing (fastlane): text within the stores\' limits and honest about the Android app; pictures in the sizes Google Play takes', () => {
+  const dir = path.join(ROOT, 'mobile', 'fastlane', 'metadata', 'android', 'en-US');
+  const text = (f) => fs.readFileSync(path.join(dir, f), 'utf8').replace(/\n$/, '');
+  const len = (s) => [...s].length;
+  const title = text('title.txt'); const short = text('short_description.txt'); const full = text('full_description.txt');
+  assert.ok(len(title) >= 1 && len(title) <= 30 && !title.includes('\n'), 'Play: a name of up to 30 characters');
+  assert.ok(len(short) <= 80 && !short.includes('\n'), 'Play: a short description of up to 80 characters');
+  assert.doesNotMatch(short, /\.$/, 'F-Droid: no full stop at the end of the summary');
+  assert.ok(len(full) <= 4000, 'Play and F-Droid: up to 4000 characters');
+  // No other company's trademark; screen sharing only where it says the Android app lacks it (mobile/README.md);
+  // closed-app notifications need a push app; the default server is the one the app opens.
+  assert.doesNotMatch(`${title}\n${short}\n${full}`, /discord/i);
+  const [does, lacks] = full.split('NOT IN THE ANDROID APP YET');
+  assert.ok(lacks, 'says what the Android app lacks');
+  assert.doesNotMatch(does, /screen.?shar/i);
+  assert.match(lacks, /Screen sharing/);
+  assert.match(read('mobile/README.md'), /^\* \*\*Screen sharing\*\* — Android's web view can't capture the screen/m);
+  assert.match(full, /UnifiedPush distributor app, such as ntfy/);
+  assert.ok(full.includes(new URL(JSON.parse(read('mobile/www/config.json')).defaultServer).host), 'names the server the app opens by default');
+  // Changelogs: default.txt (used when there's no file for the build's versionCode) or <versionCode>.txt.
+  const logs = fs.readdirSync(path.join(dir, 'changelogs'));
+  assert.ok(logs.includes('default.txt'));
+  for (const f of logs) {
+    assert.match(f, /^(default|\d+)\.txt$/);
+    assert.ok(len(text(`changelogs/${f}`)) <= 500, `F-Droid: ${f} up to 500 characters`);
+  }
+  // Pictures: 512 x 512 icon (32-bit PNG, up to 1 MB); 1024 x 500 feature graphic and 2 to 8 phone screenshots as
+  // 24-bit PNGs without alpha, sides 320 to 3840 pixels, the long side at most twice the short one.
+  const icon = pngInfo(path.join(dir, 'images', 'icon.png'));
+  assert.deepEqual([icon.w, icon.h, icon.depth, icon.color], [512, 512, 8, 6]);
+  assert.ok(icon.size <= 1024 * 1024);
+  const feature = pngInfo(path.join(dir, 'images', 'featureGraphic.png'));
+  assert.deepEqual([feature.w, feature.h, feature.depth, feature.color], [1024, 500, 8, 2]);
+  const shots = fs.readdirSync(path.join(dir, 'images', 'phoneScreenshots')).sort();
+  assert.ok(shots.length >= 2 && shots.length <= 8, 'Play: 2 to 8 phone screenshots');
+  for (const f of shots) {
+    assert.match(f, /^\d+\.png$/);
+    const s = pngInfo(path.join(dir, 'images', 'phoneScreenshots', f));
+    assert.deepEqual([s.depth, s.color], [8, 2], `${f}: 24-bit, no alpha`);
+    assert.ok(Math.min(s.w, s.h) >= 320 && Math.max(s.w, s.h) <= 3840, `${f}: ${s.w}x${s.h}`);
+    assert.ok(Math.max(s.w, s.h) <= 2 * Math.min(s.w, s.h), `${f}: ${s.w}x${s.h} is longer than 2:1`);
+  }
+  // Committed, not caught by the ignore rule for the generated Android project (mobile/.gitignore: /android/).
+  if (spawnSync('git', ['rev-parse', '--git-dir'], { cwd: ROOT }).status === 0) {
+    for (const f of ['title.txt', 'images/icon.png', 'images/phoneScreenshots/1.png']) {
+      assert.notEqual(spawnSync('git', ['check-ignore', '-q', '--no-index', path.join('mobile', 'fastlane', 'metadata', 'android', 'en-US', f)], { cwd: ROOT }).status, 0, `${f} isn't ignored`);
+    }
+    assert.equal(spawnSync('git', ['check-ignore', '-q', '--no-index', 'mobile/android/app/build.gradle'], { cwd: ROOT }).status, 0, 'the generated project still is');
+  }
+  // The publishing guide is linked from the signing guide and the app's README, and its own links lead somewhere.
+  assert.match(read('docs/SIGNING.md'), /\]\(ANDROID-STORES\.md\)/);
+  assert.match(read('mobile/README.md'), /\]\(\.\.\/docs\/ANDROID-STORES\.md\)/);
+  const guide = read('docs/ANDROID-STORES.md');
+  for (const m of guide.matchAll(/\]\((?!https?:|mailto:|#)([^)#\s]+)(#[^)\s]*)?\)/g)) {
+    assert.ok(fs.existsSync(path.join(ROOT, 'docs', m[1])), `ANDROID-STORES.md links to ${m[1]}, which exists`);
+  }
+});
+const stepNamed =(f, name) => stepsOf(jobsOf(fs.readFileSync(f, 'utf8')).jobs['publish-to-vps'] || '').find((s) => s.includes(`name: ${name}`));
 
 test('workflows: the server\'s SSH key only goes to the runner\'s own ssh, which only talks to the pinned host', { skip: !workflowFiles().length && 'no workflows in this checkout' }, () => {
   for (const f of workflowFiles()) {

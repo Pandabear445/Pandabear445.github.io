@@ -36,10 +36,16 @@ offer the app through Google Play's internal testing track, see [`../docs/SIGNIN
 To offer it to everyone, put the `.apk` in your server's `data/downloads/` folder — the `/download` page shows
 it to Android visitors (in a browser; opened inside the app, it lists no downloads).
 
-**Server address:** people type it on first launch (e.g. `chat.example.com` or `1.2.3.4:3000`). To build an
-app for your server only, set the repository variable `HEARTH_SERVER` (Settings → Secrets and variables →
-Actions → Variables), e.g. `https://chat.example.com`, or type it when running the workflow by hand. Set
-`"lockServer": true` in `www/config.json` to stop people changing it.
+**In app stores:** IzzyOnDroid and Google Play, step by step, with the store listing in
+[`fastlane/metadata/android/en-US/`](fastlane/metadata/android/en-US/):
+[`../docs/ANDROID-STORES.md`](../docs/ANDROID-STORES.md).
+
+**Server address:** the app connects to the community server `https://kappachat.duckdns.org` by itself on first
+launch (`defaultServer` in `www/config.json`). People can switch to any other Hearth server: Settings → Apps &
+devices → *Switch server* opens the connect screen, where they type its address (e.g. `chat.example.com` or
+`1.2.3.4:3000`). To build an app for your server instead, set the repository variable `HEARTH_SERVER` (Settings →
+Secrets and variables → Actions → Variables), e.g. `https://chat.example.com`, or type it when running the
+workflow by hand. Set `"lockServer": true` in `www/config.json` to stop people changing it.
 
 ## Signing (so updates install over the top)
 
@@ -196,7 +202,9 @@ Needs Node 22, JDK 21 and the Android SDK (Android Studio Otter 2025.2.1 or newe
 and targets Android 16 (API 36), which Google Play requires for new apps and updates. The workflow's *Create
 the Android project* step shows exactly what it does: `npm ci` (exactly what `package-lock.json` lists; use it
 locally too), `npx cap add android`, copy `native/*.java` in, add the microphone/camera/notification permissions
-and the `androidx.webkit` dependency, then `node scripts/patch-android.js android`, which adds:
+and the `androidx.webkit` dependency, keep Google's dependency-info block out of the APK
+(`includeInApk = false` in `dependenciesInfo`: IzzyOnDroid's scanner flags it; the Play bundle keeps it), then
+`node scripts/patch-android.js android`, which adds:
 
 * the UnifiedPush library at an exact version (`org.unifiedpush.android:connector:3.3.5`, from Maven Central);
 * `HearthPushService` (unexported, reachable only by the library) and `CallService` (a `microphone` foreground

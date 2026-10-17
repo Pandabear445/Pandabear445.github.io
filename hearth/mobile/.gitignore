@@ -1,3 +1,4 @@
 node_modules/
-android/
+# The Android project the build generates (npx cap add android), not fastlane/metadata/android.
+/android/
 dist/
